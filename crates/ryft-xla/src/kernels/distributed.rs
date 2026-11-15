@@ -27,6 +27,8 @@
 //! Cross-process in-place reference publication remains unsupported: all outputs are functional and private until
 //! successful completion. All-ready means native completion, not atomic delivery to every host after a network fault.
 
+// TODO(eaplatanios): Review this module.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -823,6 +825,7 @@ mod tests {
             if message == "invalid distributed runtime input"));
 
         let custom = Error::from(DistributedKernelError::Cancelled);
+        assert_eq!(custom.to_string(), "distributed kernel call cancelled");
         let roundtrip = Error::from(DistributedKernelError::from(custom.clone()));
         let roundtrip = Error::from(DistributedKernelError::from(roundtrip));
         assert!(matches!(

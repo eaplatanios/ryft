@@ -21,29 +21,31 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::CompilationError;
 use crate::domains::runtimes::builtin_requirement;
 use crate::domains::{RuntimeRequirement, normalize_runtime_requirements};
-use crate::experimental::lowering::compositions::{
+use crate::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
-use crate::experimental::lowering::regions::{lower_nested_program_inline, lower_program_outputs_with_inputs};
-use crate::experimental::lowering::signature::ExecutableSignature;
-use crate::experimental::lowering::types::{
+use crate::lowering::regions::{lower_nested_program_inline, lower_program_outputs_with_inputs};
+use crate::lowering::signature::ExecutableSignature;
+use crate::lowering::types::{
     lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
     lower_tensor_type, lower_unplaced_constant_output,
 };
-use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, Operation, Program, SessionConstant};
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
+use crate::operations::{FlatProgram, Program};
 use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardyTensorSharding};
-use crate::{Error, RaggedDotLoweringStrategy, ToMlir};
+use crate::values::ArrayConstant;
+use crate::{CompilationError, Constant, Error, Operation, RaggedDotLoweringStrategy, SessionConstant, ToMlir};
+
+// TODO(eaplatanios): Review this module.
 
 #[cfg(test)]
-use crate::experimental::lowering::regions::lower_plain_program_outputs;
+use crate::lowering::regions::lower_plain_program_outputs;
 #[cfg(test)]
 use ryft_core::Program as CoreProgram;
 
@@ -100,6 +102,8 @@ pub enum LoweringError {
     VerificationFailure,
 }
 
+/// Admission of data-dependent bounded-dynamic programs to lowering.
+pub(crate) mod admission;
 /// Named StableHLO compositions shared by composite operation lowerings (e.g., scaled dot).
 pub(crate) mod compositions;
 /// Lowering of nested programs and regions inline into an enclosing block.
@@ -601,7 +605,7 @@ macro_rules! lower_operation_variants {
     };
     // Projected member payload lowered at its own universe.
     (@arm $payload:ident, $lowerer:expr, $inputs:expr, $input_types:expr, $output_types:expr, projected($universe:ty)) => {
-        $crate::experimental::lowering::lower_projected_operation::<$universe, _, _, _>(
+        $crate::lowering::lower_projected_operation::<$universe, _, _, _>(
             $payload,
             $lowerer,
             $inputs,
@@ -1400,9 +1404,11 @@ where
     let session_count = session_constants.len();
     if session_count > 0
         && (capture_types.len() < session_count
-            || !capture_types[capture_types.len() - session_count..]
+            || !capture_types[capture_types.len() - session_count..].iter().eq(session_constants
                 .iter()
-                .eq(session_constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>().iter()))
+                .map(|constant| constant.r#type().into_owned())
+                .collect::<Vec<_>>()
+                .iter()))
     {
         return Err(ProgramError::MalformedProgram(format!(
             "the trailing capture types of the entry function must be the types of its {session_count} session \
@@ -1619,7 +1625,10 @@ where
         .enumerate()
         .map(|(index, sharding)| {
             let open = physical_open_results.get(index).copied().unwrap_or(false);
-            sharding.as_ref().map(|sharding| ShardyTensorSharding::new(sharding, open).to_mlir(location)).transpose()
+            sharding
+                .as_ref()
+                .map(|sharding| ShardyTensorSharding::new(sharding, open).to_mlir(location))
+                .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
     // The effect token of a signature side is annotated when any value of that side is, as each device threads its
@@ -2262,7 +2271,7 @@ fn merge_logical_meshes(existing: LogicalMesh, incoming: &LogicalMesh) -> Result
 
 /// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
 /// regions. Lowering materializes first-class dimension extents eagerly (refer to
-/// [`lower_dimension_extent`](crate::experimental::lowering::types::lower_dimension_extent)), while their consumers
+/// [`lower_dimension_extent`](crate::lowering::types::lower_dimension_extent)), while their consumers
 /// often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic result axes), so a
 /// static extent would otherwise remain in the lowered module as a dead constant. Constants are pure, so removing an
 /// unused one never changes the semantics of the module.

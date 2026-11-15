@@ -4,13 +4,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use ryft_core::DeviceId;
 use ryft_pjrt::Buffer;
 
-use crate::Error;
-use crate::domains::execution::ExecutionError;
+use crate::{Error, ExecutionError};
 
 // TODO(eaplatanios): Review this module.
 
 /// Renders the failures observed by an effect barrier in their original submission order.
-pub(super) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
+pub(crate) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
     failures
         .iter()
         .map(|(identity, error)| format!("submission {identity}: {error}"))
@@ -20,7 +19,7 @@ pub(super) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
 
 /// Completion-only state that is safe to retain in PJRT callbacks without retaining any client-borrowing resource.
 #[derive(Default)]
-pub(super) struct EffectCompletion {
+pub(crate) struct EffectCompletion {
     /// Immutable terminal outcome, published once after submission or cancellation.
     result: Mutex<Option<Result<(), Arc<str>>>>,
 
@@ -30,7 +29,7 @@ pub(super) struct EffectCompletion {
 
 impl EffectCompletion {
     /// Records completion without entering scope state or running user code.
-    pub(super) fn complete(&self, result: Result<(), Arc<str>>) {
+    pub(crate) fn complete(&self, result: Result<(), Arc<str>>) {
         *self.result.lock().expect("effect completion mutex poisoned") = Some(result);
         self.ready.notify_all();
     }
@@ -73,7 +72,7 @@ pub(super) struct EffectSubmission<'c> {
     ordered: bool,
 
     /// Buffer-free state retained by the completion observer.
-    pub(super) completion: Arc<EffectCompletion>,
+    completion: Arc<EffectCompletion>,
 
     /// Physical carrier publication or nonblocking forwarding of a cancelled reservation.
     carrier: Mutex<EffectCarrier<'c>>,
@@ -154,14 +153,14 @@ struct EffectScopeState<'c> {
 /// asynchronously. [`Self::barrier`] waits for earlier reservations and reports failures in submission order.
 /// [`Self::acknowledge`] permits recovery only after affected work has completed and its failures have been observed.
 #[derive(Default)]
-pub(super) struct EffectScope<'c> {
+pub(crate) struct EffectScope<'c> {
     /// Reservation, observation, and recovery state; never held across PJRT calls or device waits.
     state: Mutex<EffectScopeState<'c>>,
 }
 
 impl<'c> EffectScope<'c> {
     /// Reserves a position and snapshots the predecessor atomically before releasing the scope mutex.
-    pub(super) fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation<'c>, Error> {
+    pub(crate) fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation<'c>, Error> {
         ensure_effect_dispatch_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         if device.is_some()
@@ -283,15 +282,35 @@ impl<'c> EffectScope<'c> {
 }
 
 /// Client-borrowing reservation, released on every preparation or submission failure.
-pub(super) struct EffectReservation<'c> {
+pub(crate) struct EffectReservation<'c> {
     /// Invocation being prepared or published.
-    pub(super) submission: Arc<EffectSubmission<'c>>,
+    submission: Arc<EffectSubmission<'c>>,
 
     /// Predecessor whose carrier will be forwarded if submission fails before handoff.
-    pub(super) predecessor: Option<Arc<EffectSubmission<'c>>>,
+    predecessor: Option<Arc<EffectSubmission<'c>>>,
 
     /// Whether device work and its carrier have been published.
-    pub(super) published: bool,
+    published: bool,
+}
+
+impl<'c> EffectReservation<'c> {
+    /// Waits for the predecessor of this reservation to publish and returns its ordered carrier, which this submission
+    /// must consume. Returns [`None`] when the reservation has no predecessor or the predecessor carries no tokens.
+    pub(crate) fn predecessor_carrier(&self) -> Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>> {
+        self.predecessor.as_ref().map_or(Ok(None), |previous| previous.carrier())
+    }
+
+    /// Publishes the ordered carrier or the boundary failure of this submission to its successors, and returns the
+    /// completion that the caller must complete once the submitted device work is done.
+    pub(crate) fn publish(&self, carrier: Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>>) -> Arc<EffectCompletion> {
+        self.submission.publish(carrier);
+        Arc::clone(&self.submission.completion)
+    }
+
+    /// Marks this reservation as published, so that dropping it no longer cancels its submission.
+    pub(crate) fn commit(&mut self) {
+        self.published = true;
+    }
 }
 
 impl Drop for EffectReservation<'_> {
@@ -329,7 +348,7 @@ impl Drop for EffectCallbackGuard {
 }
 
 /// Rejects managed-callback reentrancy before any scope or reference locks are taken.
-pub(super) fn ensure_effect_dispatch_allowed() -> Result<(), Error> {
+pub(crate) fn ensure_effect_dispatch_allowed() -> Result<(), Error> {
     if EFFECT_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
         Err(ExecutionError::ReentrantDispatch.into())
     } else {
@@ -353,13 +372,11 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::domains::compilation::CompilationError;
-    use crate::domains::options::Options;
     use crate::domains::sessions::Session;
     use crate::domains::tests::*;
-    use crate::experimental::ops::{Constant, Operation, ProgramBuilder};
+    use crate::operations::ProgramBuilder;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt};
+    use crate::{Array, CompilationError, Constant, FromPjrt, Operation, Options};
 
     use super::*;
 
@@ -450,10 +467,10 @@ mod tests {
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = domain.compile_program(&lowered).unwrap();
-        assert!(compiled.signature.has_ordered_io());
+        assert!(compiled.signature().has_ordered_io());
         let serialized = compiled.serialize().unwrap().unwrap();
         let restored = domain.deserialize_compiled_program(&serialized).unwrap().unwrap();
-        assert_eq!(restored.signature, compiled.signature);
+        assert_eq!(restored.signature(), compiled.signature());
         let corrupted = corrupt_ordered_io_metadata(&serialized);
         assert!(matches!(
             domain.deserialize_compiled_program(&corrupted),
@@ -473,8 +490,8 @@ mod tests {
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
         let unordered = domain.compile_program(&lowered).unwrap();
-        assert!(unordered.signature.has_unordered_io());
-        assert!(!unordered.signature.has_ordered_io());
+        assert!(unordered.signature().has_unordered_io());
+        assert!(!unordered.signature().has_ordered_io());
         let manager = hold_predecessor.then(|| {
             let manager = client
                 .host_to_device_transfer_manager(
@@ -669,8 +686,8 @@ mod tests {
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = domain.lower_program(&source, 0, &Options::new(mesh)).unwrap();
         let program = domain.compile_program(&lowered).unwrap();
-        assert!(program.signature.has_device_ordered_io());
-        let devices = program.executable.addressable_devices().unwrap();
+        assert!(program.signature().has_device_ordered_io());
+        let devices = program.executable().addressable_devices().unwrap();
         let managers = devices
             .iter()
             .map(|device| {
@@ -1025,8 +1042,8 @@ mod tests {
             .unwrap();
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         // Only assertions create a local chain; ordered I/O is seeded from the hidden executable argument.
-        assert!(lowered.signature.has_ordered_io());
-        assert!(lowered.signature.requires_assertion_handler);
+        assert!(lowered.signature().has_ordered_io());
+        assert!(lowered.signature().requires_assertion_handler);
         assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_program(&lowered).unwrap();
         let input = |value: i64| {

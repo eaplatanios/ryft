@@ -339,10 +339,10 @@ mod tests {
     use ryft_core::{Clamp, DeviceMesh, Max, Min, Placeholder, Shape};
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
-    use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Domain, Session};
+    use crate::{Array, Constant, Domain, Session};
 
     use super::*;
 

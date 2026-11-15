@@ -10,15 +10,17 @@ use ryft_mlir::{
     TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
-use crate::Error;
-use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::experimental::lowering::types::{lower_array_ir_type, lower_tensor_type};
-use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
-use crate::experimental::ops::{Constant, FlatProgram, Program};
+use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::types::{lower_array_ir_type, lower_tensor_type};
+use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
+use crate::operations::{FlatProgram, Program};
+use crate::{Constant, Error};
+
+// TODO(eaplatanios): Review this module.
 
 /// Returns backend-local input types for a named decomposition after boundary validation and differentiation.
 ///

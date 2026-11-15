@@ -8,8 +8,8 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::types::lower_tensor_type;
+use crate::lowering::CollectiveLoweringState;
+use crate::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{
     collapse_singleton_axis, collective_replica_groups, refine_collective_result_dimensions,
 };

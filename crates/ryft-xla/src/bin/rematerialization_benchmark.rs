@@ -36,8 +36,9 @@ use ryft_core::{
     differentiate_at, rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::experimental::ops::Operation;
-use ryft_xla::{Array, Domain, FromPjrt, Options, Session, Value};
+use ryft_xla::{Array, Domain, FromPjrt, Operation, Options, Session, Value};
+
+// TODO(eaplatanios): Review this module.
 
 type Tracer<'c> = DomainTracer<Domain<'c>>;
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);

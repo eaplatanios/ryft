@@ -20,9 +20,9 @@ use ryft_core::{
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Region, Type, Value as MlirValue, ValueRef};
 
-use crate::experimental::lowering::EffectTokens;
-use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::experimental::lowering::types::{
+use crate::lowering::EffectTokens;
+use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::types::{
     lower_array_ir_type, lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, physical_bound_type,
 };
@@ -512,16 +512,16 @@ mod tests {
         PrintOperation, Shape, Sharding, ShardingDimension, SubOperation, TypedProgram, WhileOptions, batch, r#while,
     };
 
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, unproject_plain_program,
     };
-    use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt, Session, Value, to_mlir_module_for_program};
+    use crate::{Array, Constant, FromPjrt, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 

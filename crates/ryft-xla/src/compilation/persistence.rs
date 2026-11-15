@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use prost::Message;
@@ -11,126 +11,29 @@ use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{BufferType, LoadOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
-use crate::domains::Domain;
-use crate::domains::compilation::{CompilationError, CompilationKey, canonical_compilation_options_bytes};
-use crate::domains::execution::{ExecutionPlan, flatten_device_assignment};
-use crate::domains::programs::{CompiledProgram, LoweredProgram};
-use crate::domains::runtimes::{RuntimeRequirement, builtin_requirement, normalize_runtime_requirements};
-use crate::experimental::lowering::signature::ExecutableSignature;
+use crate::compilation::CompilationError;
+use crate::compilation::keys::COMPILER_IDENTITY;
+use crate::compilation::programs::CompiledProgram;
+use crate::domains::runtimes::builtin_requirement;
+use crate::domains::{RuntimeRequirement, normalize_runtime_requirements};
+use crate::execution::{ExecutionPlan, flatten_device_assignment};
+use crate::lowering::signature::ExecutableSignature;
+use crate::{Domain, Error};
 
 // TODO(eaplatanios): Review this module.
 
-/// Fixed header identifying the V10 executable envelope.
-const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXL10";
+/// Fixed header identifying the executable envelope.
+const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXL01";
 
 /// Metadata schema emitted by executable serialization.
-const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 10;
+const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 1;
 
 /// Required features for reference states, dynamic extents, effects, and runtime contracts.
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
 
-/// Schema used by canonical compilation keys.
-pub(super) const PERSISTENT_KEY_SCHEMA_VERSION: u32 = 10;
-
-/// Build identity shared by lowering, cache keys, and executable compatibility validation.
-pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "ryft-xla/{}/openxla/{}/jax/{}",
-        env!("CARGO_PKG_VERSION"),
-        ryft_xla_sys::XLA_COMMIT,
-        ryft_xla_sys::JAX_COMMIT,
-    )
-});
-
-/// Stable cache-key payload for the V10 executable and external-reference ABI.
-#[derive(Serialize)]
-struct PersistentKeyV10<'o> {
-    /// Version of this persistent record schema.
-    schema_version: u32,
-
-    /// Exact textual StableHLO/Shardy module submitted to PJRT.
-    stable_hlo: &'o str,
-
-    /// Canonical encoding of the complete PJRT compilation options.
-    compilation_options: &'o [u8],
-
-    /// Logical array types with shared dynamic dimension variables.
-    signature: PersistentCanonicalArraySignatureV3,
-
-    /// Physical executable argument position for each logical input, or `None` for erased arrays.
-    input_mapping: Vec<Option<u64>>,
-
-    /// Physical executable result position for each logical output, or `None` for erased arrays.
-    output_mapping: Vec<Option<u64>>,
-
-    /// Physical extent arguments for bounded dynamic input dimensions.
-    input_dimensions: Vec<PersistentBoundaryDimensionV5>,
-
-    /// Physical extent results for bounded dynamic output dimensions.
-    output_dimensions: Vec<PersistentBoundaryDimensionV5>,
-
-    /// Number of leading logical outputs in the public result.
-    output_count: u64,
-
-    /// External reference binding recipes without live reference handles.
-    reference_states: Vec<PersistentReferenceStateV6>,
-
-    /// Whether the executable requires the host runtime assertion handler.
-    requires_assertion_handler: bool,
-
-    /// Canonical runtime contracts resolved against the invoking session.
-    runtime_requirements: Vec<RuntimeRequirement>,
-
-    /// Whether a native ordered-I/O slot is present after the array and extent slots.
-    ordered_io: bool,
-
-    /// Whether completion includes unordered I/O without a boundary slot.
-    unordered_io: bool,
-
-    /// Whether every ordered-I/O occurrence is `DeviceOrderedIo`, permitting per-device execution.
-    device_ordered_io: bool,
-
-    /// Version of the hidden effect calling convention.
-    effect_abi_version: u32,
-
-    /// Donation flags for public logical inputs, excluding captures.
-    donation_flags: &'o [bool],
-
-    /// Number of leading logical inputs supplied by captures.
-    capture_count: u64,
-
-    /// Shardings of all physical executable arguments in argument order.
-    expected_argument_shardings: Vec<PersistentShardingV1>,
-
-    /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
-    output_shardings: Vec<PersistentShardingV1>,
-
-    /// Concrete compilation and execution mesh.
-    mesh: PersistentDeviceMeshV1,
-
-    /// PJRT device kinds in the concrete mesh order.
-    device_kinds: &'o [String],
-
-    /// Exact execution facts for selected kernels, absent for ordinary executables.
-    kernel_execution_facts: Option<&'o [u8]>,
-
-    /// PJRT platform name that must match the loading client.
-    platform_name: &'o str,
-
-    /// PJRT platform version that must match the loading client.
-    platform_version: &'o str,
-
-    /// Exact Ryft, OpenXLA, and JAX build identity required when loading.
-    compiler_identity: &'o str,
-
-    /// Process-level XLA flags required when loading.
-    xla_flags: &'o str,
-}
-
-/// Stable V10 metadata envelope stored before serialized PJRT executable bytes.
+/// Stable metadata envelope stored before serialized PJRT executable bytes.
 #[derive(Serialize, Deserialize)]
-struct PersistentExecutableMetadataV10 {
+struct PersistentExecutableMetadata {
     /// Version of this persistent record schema.
     schema_version: u32,
 
@@ -141,7 +44,7 @@ struct PersistentExecutableMetadataV10 {
     compilation_options: Vec<u8>,
 
     /// Logical array types with shared dynamic dimension variables.
-    signature: PersistentArraySignatureV3,
+    signature: PersistentArraySignature,
 
     /// Physical executable argument position for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
@@ -150,16 +53,16 @@ struct PersistentExecutableMetadataV10 {
     output_mapping: Vec<Option<u64>>,
 
     /// Physical extent arguments for bounded dynamic input dimensions.
-    input_dimensions: Vec<PersistentBoundaryDimensionV5>,
+    input_dimensions: Vec<PersistentBoundaryDimension>,
 
     /// Physical extent results for bounded dynamic output dimensions.
-    output_dimensions: Vec<PersistentBoundaryDimensionV5>,
+    output_dimensions: Vec<PersistentBoundaryDimension>,
 
     /// Number of leading logical outputs in the public result.
     output_count: u64,
 
     /// External reference binding recipes without live reference handles.
-    reference_states: Vec<PersistentReferenceStateV6>,
+    reference_states: Vec<PersistentReferenceState>,
 
     /// Whether the executable requires the host runtime assertion handler.
     requires_assertion_handler: bool,
@@ -186,13 +89,13 @@ struct PersistentExecutableMetadataV10 {
     capture_count: u64,
 
     /// Shardings of all physical executable arguments in argument order.
-    expected_argument_shardings: Vec<PersistentShardingV1>,
+    expected_argument_shardings: Vec<PersistentSharding>,
 
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
-    output_shardings: Vec<PersistentShardingV1>,
+    output_shardings: Vec<PersistentSharding>,
 
     /// Concrete compilation and execution mesh.
-    mesh: PersistentDeviceMeshV1,
+    mesh: PersistentDeviceMesh,
 
     /// PJRT device kinds in the concrete mesh order.
     device_kinds: Vec<String>,
@@ -228,7 +131,7 @@ struct PersistentExecutableMetadataV10 {
 /// Persisted source descriptor for one logical external reference state. It contains no runtime reference handle.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum PersistentReferenceSourceV6 {
+enum PersistentReferenceSource {
     /// Runtime capture position.
     Capture { index: u64 },
 
@@ -238,11 +141,11 @@ enum PersistentReferenceSourceV6 {
 
 /// Persisted logical reference-state binding recipe.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct PersistentReferenceStateV6 {
+pub(super) struct PersistentReferenceState {
     /// Capture or public-input source of the external reference.
-    source: PersistentReferenceSourceV6,
+    source: PersistentReferenceSource,
 
-    /// Redundant flat position retained solely for V6 wire compatibility and corruption detection.
+    /// Redundant flat position retained solely for corruption detection.
     logical_input_index: u64,
 
     /// Hidden logical result containing the final state, or `None` for a read-only reference.
@@ -251,7 +154,7 @@ struct PersistentReferenceStateV6 {
 
 /// Persisted logical-axis-to-hidden-physical-slot mapping for one bounded dynamic dimension.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct PersistentBoundaryDimensionV5 {
+pub(super) struct PersistentBoundaryDimension {
     /// Logical flattened input or output index containing the dynamic axis.
     logical_index: u64,
 
@@ -262,23 +165,23 @@ struct PersistentBoundaryDimensionV5 {
     physical_index: u64,
 }
 
-/// V3 logical boundary types with a shared dimension-variable table. Decoding recreates each variable once and
+/// Logical boundary types with a shared dimension-variable table. Decoding recreates each variable once and
 /// preserves its diagnostic name.
 #[derive(Serialize, Deserialize)]
-struct PersistentArraySignatureV3 {
+pub(super) struct PersistentArraySignature {
     /// Shared dynamic variables numbered by first occurrence across inputs and outputs.
-    variables: Vec<PersistentDimensionVariableV3>,
+    variables: Vec<PersistentDimensionVariable>,
 
     /// Logical input array types, including captures.
-    input_types: Vec<PersistentArrayTypeV3>,
+    input_types: Vec<PersistentArrayType>,
 
     /// Logical output array types, including hidden final reference states.
-    output_types: Vec<PersistentArrayTypeV3>,
+    output_types: Vec<PersistentArrayType>,
 }
 
-impl PersistentArraySignatureV3 {
+impl PersistentArraySignature {
     /// Encodes input and output types with shared dynamic dimension variables numbered by first occurrence.
-    fn encode(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
+    pub(super) fn encode(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
         let mut variables = Vec::<DimensionVariable>::new();
         let mut encode_type = |r#type: &ArrayType| {
             let shape = r#type
@@ -286,24 +189,24 @@ impl PersistentArraySignatureV3 {
                 .dimensions()
                 .iter()
                 .map(|dimension| match dimension {
-                    CoreDimension::Static(value) => PersistentDimensionV3::Static(*value as u64),
+                    CoreDimension::Static(value) => PersistentDimension::Static(*value as u64),
                     CoreDimension::Dynamic(variable) => {
                         let index = variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
                             variables.push(variable.clone());
                             variables.len() - 1
                         });
-                        PersistentDimensionV3::Dynamic { variable: index as u64 }
+                        PersistentDimension::Dynamic { variable: index as u64 }
                     }
                 })
                 .collect();
-            PersistentArrayTypeV3 {
+            PersistentArrayType {
                 data_type: encode_data_type(r#type.data_type()),
                 shape,
-                layout: r#type.layout().map(PersistentLayoutV1::from),
-                sharding: r#type.sharding().map(PersistentShardingV1::from),
+                layout: r#type.layout().map(PersistentLayout::from),
+                sharding: r#type.sharding().map(PersistentSharding::from),
                 memory: match r#type.memory() {
-                    Memory::Device => PersistentMemoryV1::Device,
-                    Memory::Host { pinned } => PersistentMemoryV1::Host(pinned),
+                    Memory::Device => PersistentMemory::Device,
+                    Memory::Host { pinned } => PersistentMemory::Host(pinned),
                 },
             }
         };
@@ -311,7 +214,7 @@ impl PersistentArraySignatureV3 {
         let output_types = output_types.iter().map(&mut encode_type).collect();
         let variables = variables
             .into_iter()
-            .map(|variable| PersistentDimensionVariableV3 {
+            .map(|variable| PersistentDimensionVariable {
                 name: variable.name().to_string(),
                 lower: variable.bounds().lower() as u64,
                 upper: variable.bounds().upper().map(|upper| upper as u64),
@@ -321,12 +224,12 @@ impl PersistentArraySignatureV3 {
     }
 
     /// Removes diagnostic-only variable names from the stable compilation-key representation.
-    fn into_canonical(self) -> PersistentCanonicalArraySignatureV3 {
-        PersistentCanonicalArraySignatureV3 {
+    pub(super) fn into_canonical(self) -> PersistentCanonicalArraySignature {
+        PersistentCanonicalArraySignature {
             variables: self
                 .variables
                 .into_iter()
-                .map(|variable| PersistentCanonicalDimensionVariableV3 { lower: variable.lower, upper: variable.upper })
+                .map(|variable| PersistentCanonicalDimensionVariable { lower: variable.lower, upper: variable.upper })
                 .collect(),
             input_types: self.input_types,
             output_types: self.output_types,
@@ -362,20 +265,20 @@ impl PersistentArraySignatureV3 {
                 Ok(DimensionVariable::new(variable.name, bounds))
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let decode_type = |r#type: PersistentArrayTypeV3| -> Result<ArrayType, Error> {
+        let decode_type = |r#type: PersistentArrayType| -> Result<ArrayType, Error> {
             let shape = Shape::new(
                 r#type
                     .shape
                     .into_iter()
                     .map(|dimension| match dimension {
-                        PersistentDimensionV3::Static(value) => usize::try_from(value)
+                        PersistentDimension::Static(value) => usize::try_from(value)
                             .map_err(|_| {
                                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                                     reason: format!("value {value} does not fit in usize"),
                                 })
                             })
                             .map(CoreDimension::Static),
-                        PersistentDimensionV3::Dynamic { variable } => variables
+                        PersistentDimension::Dynamic { variable } => variables
                             .get(usize::try_from(variable).map_err(|_| {
                                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                                     reason: format!("value {variable} does not fit in usize"),
@@ -392,8 +295,8 @@ impl PersistentArraySignatureV3 {
                     .collect::<Result<Vec<_>, _>>()?,
             );
             let memory = match r#type.memory {
-                PersistentMemoryV1::Device => Memory::Device,
-                PersistentMemoryV1::Host(pinned) => Memory::Host { pinned },
+                PersistentMemory::Device => Memory::Device,
+                PersistentMemory::Host(pinned) => Memory::Host { pinned },
             };
             ArrayType::new(decode_data_type(r#type.data_type)?, shape)
                 .with_layout(r#type.layout.map(Layout::try_from).transpose()?)
@@ -409,23 +312,23 @@ impl PersistentArraySignatureV3 {
     }
 }
 
-/// V3 cache identity for logical boundary types. Variable names are omitted and variables are numbered by first
+/// Cache identity for logical boundary types. Variable names are omitted and variables are numbered by first
 /// occurrence, preserving their sharing and bounds.
 #[derive(Serialize)]
-struct PersistentCanonicalArraySignatureV3 {
+pub(super) struct PersistentCanonicalArraySignature {
     /// Shared dynamic variables numbered by first occurrence across inputs and outputs.
-    variables: Vec<PersistentCanonicalDimensionVariableV3>,
+    variables: Vec<PersistentCanonicalDimensionVariable>,
 
     /// Logical input array types, including captures.
-    input_types: Vec<PersistentArrayTypeV3>,
+    input_types: Vec<PersistentArrayType>,
 
     /// Logical output array types, including hidden final reference states.
-    output_types: Vec<PersistentArrayTypeV3>,
+    output_types: Vec<PersistentArrayType>,
 }
 
-/// Named dynamic dimension and inclusive bounds in the V3 executable signature.
+/// Named dynamic dimension and inclusive bounds in the executable signature.
 #[derive(Serialize, Deserialize)]
-struct PersistentDimensionVariableV3 {
+struct PersistentDimensionVariable {
     /// Diagnostic name restored with this dynamic variable.
     name: String,
 
@@ -436,9 +339,9 @@ struct PersistentDimensionVariableV3 {
     upper: Option<u64>,
 }
 
-/// Dynamic dimension bounds in a canonical V3 key, with diagnostic names omitted.
+/// Dynamic dimension bounds in a canonical key, with diagnostic names omitted.
 #[derive(Serialize)]
-struct PersistentCanonicalDimensionVariableV3 {
+struct PersistentCanonicalDimensionVariable {
     /// Inclusive lower bound on the runtime extent.
     lower: u64,
 
@@ -446,29 +349,29 @@ struct PersistentCanonicalDimensionVariableV3 {
     upper: Option<u64>,
 }
 
-/// Stable V3 array type record, using explicit tags rather than Rust enum discriminants.
+/// Stable array type record, using explicit tags rather than Rust enum discriminants.
 #[derive(Serialize, Deserialize)]
-struct PersistentArrayTypeV3 {
+struct PersistentArrayType {
     /// Stable numeric element-type tag defined by `encode_data_type`.
     data_type: u8,
 
     /// Logical dimensions in array axis order.
-    shape: Vec<PersistentDimensionV3>,
+    shape: Vec<PersistentDimension>,
 
     /// Explicit physical layout, or `None` when unspecified.
-    layout: Option<PersistentLayoutV1>,
+    layout: Option<PersistentLayout>,
 
     /// Logical sharding, or `None` when unspecified.
-    sharding: Option<PersistentShardingV1>,
+    sharding: Option<PersistentSharding>,
 
     /// Memory placement of the array.
-    memory: PersistentMemoryV1,
+    memory: PersistentMemory,
 }
 
-/// Static extent or index into the shared V3 dynamic dimension table.
+/// Static extent or index into the shared dynamic dimension table.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum PersistentDimensionV3 {
+enum PersistentDimension {
     /// Concrete dimension extent.
     Static(u64),
 
@@ -476,18 +379,18 @@ enum PersistentDimensionV3 {
     Dynamic { variable: u64 },
 }
 
-/// Stable V1 encoding of tiled and strided physical layouts.
+/// Stable encoding of tiled and strided physical layouts.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum PersistentLayoutV1 {
+enum PersistentLayout {
     /// Minor-to-major axis order and tile dimensions from outermost to innermost tile.
-    Tiled { minor_to_major: Vec<u64>, tiles: Vec<Vec<PersistentTileDimensionV1>> },
+    Tiled { minor_to_major: Vec<u64>, tiles: Vec<Vec<PersistentTileDimension>> },
 
     /// Signed byte strides in logical axis order.
     Strided { strides: Vec<i64> },
 }
 
-impl From<&Layout> for PersistentLayoutV1 {
+impl From<&Layout> for PersistentLayout {
     fn from(value: &Layout) -> Self {
         match value {
             Layout::Tiled(layout) => Self::Tiled {
@@ -499,8 +402,8 @@ impl From<&Layout> for PersistentLayoutV1 {
                         tile.dimensions()
                             .iter()
                             .map(|dimension| match dimension {
-                                TileDimension::Sized(size) => PersistentTileDimensionV1::Sized(*size as u64),
-                                TileDimension::Combined => PersistentTileDimensionV1::Combined,
+                                TileDimension::Sized(size) => PersistentTileDimension::Sized(*size as u64),
+                                TileDimension::Combined => PersistentTileDimension::Combined,
                             })
                             .collect()
                     })
@@ -513,12 +416,12 @@ impl From<&Layout> for PersistentLayoutV1 {
     }
 }
 
-impl TryFrom<PersistentLayoutV1> for Layout {
+impl TryFrom<PersistentLayout> for Layout {
     type Error = Error;
 
-    fn try_from(value: PersistentLayoutV1) -> Result<Self, Self::Error> {
+    fn try_from(value: PersistentLayout) -> Result<Self, Self::Error> {
         Ok(match value {
-            PersistentLayoutV1::Tiled { minor_to_major, tiles } => TiledLayout::new(
+            PersistentLayout::Tiled { minor_to_major, tiles } => TiledLayout::new(
                 minor_to_major
                     .into_iter()
                     .map(|value| {
@@ -534,14 +437,14 @@ impl TryFrom<PersistentLayoutV1> for Layout {
                     .map(|tile| {
                         tile.into_iter()
                             .map(|dimension| match dimension {
-                                PersistentTileDimensionV1::Sized(size) => usize::try_from(size)
+                                PersistentTileDimension::Sized(size) => usize::try_from(size)
                                     .map_err(|_| {
                                         Error::Compilation(CompilationError::InvalidPersistentExecutable {
                                             reason: format!("value {size} does not fit in usize"),
                                         })
                                     })
                                     .map(TileDimension::Sized),
-                                PersistentTileDimensionV1::Combined => Ok(TileDimension::Combined),
+                                PersistentTileDimension::Combined => Ok(TileDimension::Combined),
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Tile::new)
@@ -549,7 +452,7 @@ impl TryFrom<PersistentLayoutV1> for Layout {
                     .collect::<Result<Vec<_>, _>>()?,
             )
             .into(),
-            PersistentLayoutV1::Strided { strides } => StridedLayout::new(
+            PersistentLayout::Strided { strides } => StridedLayout::new(
                 strides
                     .into_iter()
                     .map(|stride| {
@@ -566,10 +469,10 @@ impl TryFrom<PersistentLayoutV1> for Layout {
     }
 }
 
-/// Stable V1 encoding of a tile extent or a combined tile dimension.
+/// Stable encoding of a tile extent or a combined tile dimension.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum PersistentTileDimensionV1 {
+enum PersistentTileDimension {
     /// Fixed extent of one tile dimension.
     Sized(u64),
 
@@ -577,10 +480,10 @@ enum PersistentTileDimensionV1 {
     Combined,
 }
 
-/// Stable V1 encoding of device or host memory placement.
+/// Stable encoding of device or host memory placement.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "pinned", rename_all = "snake_case")]
-enum PersistentMemoryV1 {
+enum PersistentMemory {
     /// Default device memory.
     Device,
 
@@ -588,22 +491,22 @@ enum PersistentMemoryV1 {
     Host(bool),
 }
 
-/// Stable V1 logical sharding record. Conversions retain the mesh, dimension assignments, and reduction state.
+/// Stable logical sharding record. Conversions retain the mesh, dimension assignments, and reduction state.
 #[derive(Serialize, Deserialize)]
-struct PersistentShardingV1 {
+pub(super) struct PersistentSharding {
     /// Logical mesh used by the sharding.
-    mesh: PersistentLogicalMeshV1,
+    mesh: PersistentLogicalMesh,
 
     /// Sharding of each array dimension in axis order.
-    dimensions: Vec<PersistentShardingDimensionV1>,
+    dimensions: Vec<PersistentShardingDimension>,
 
     /// Mesh axes whose partial values await reduction.
     unreduced_axes: Vec<String>,
 
     /// Reduction required to combine partial values. A sum is omitted so earlier payloads still decode and cache
     /// keys for shardings using sums remain unchanged.
-    #[serde(default, skip_serializing_if = "PersistentUnreducedKindV1::is_sum")]
-    unreduced_kind: PersistentUnreducedKindV1,
+    #[serde(default, skip_serializing_if = "PersistentUnreducedKind::is_sum")]
+    unreduced_kind: PersistentUnreducedKind,
 
     /// Mesh axes along which the value has already been reduced.
     reduced_axes: Vec<String>,
@@ -612,17 +515,17 @@ struct PersistentShardingV1 {
     varying_manual_axes: Vec<String>,
 }
 
-impl From<&Sharding> for PersistentShardingV1 {
+impl From<&Sharding> for PersistentSharding {
     fn from(value: &Sharding) -> Self {
         Self {
-            mesh: PersistentLogicalMeshV1::from(value.mesh()),
+            mesh: PersistentLogicalMesh::from(value.mesh()),
             dimensions: value
                 .dimensions()
                 .iter()
                 .map(|dimension| match dimension {
-                    ShardingDimension::Replicated => PersistentShardingDimensionV1::Replicated,
-                    ShardingDimension::Sharded(axes) => PersistentShardingDimensionV1::Sharded(axes.clone()),
-                    ShardingDimension::Unconstrained => PersistentShardingDimensionV1::Unconstrained,
+                    ShardingDimension::Replicated => PersistentShardingDimension::Replicated,
+                    ShardingDimension::Sharded(axes) => PersistentShardingDimension::Sharded(axes.clone()),
+                    ShardingDimension::Unconstrained => PersistentShardingDimension::Unconstrained,
                 })
                 .collect(),
             unreduced_axes: value.unreduced_axes().iter().cloned().collect(),
@@ -633,19 +536,19 @@ impl From<&Sharding> for PersistentShardingV1 {
     }
 }
 
-impl TryFrom<PersistentShardingV1> for Sharding {
+impl TryFrom<PersistentSharding> for Sharding {
     type Error = Error;
 
-    fn try_from(value: PersistentShardingV1) -> Result<Self, Self::Error> {
+    fn try_from(value: PersistentSharding) -> Result<Self, Self::Error> {
         Sharding::new(
             LogicalMesh::try_from(value.mesh)?,
             value
                 .dimensions
                 .into_iter()
                 .map(|dimension| match dimension {
-                    PersistentShardingDimensionV1::Replicated => ShardingDimension::Replicated,
-                    PersistentShardingDimensionV1::Sharded(axes) => ShardingDimension::Sharded(axes),
-                    PersistentShardingDimensionV1::Unconstrained => ShardingDimension::Unconstrained,
+                    PersistentShardingDimension::Replicated => ShardingDimension::Replicated,
+                    PersistentShardingDimension::Sharded(axes) => ShardingDimension::Sharded(axes),
+                    PersistentShardingDimension::Unconstrained => ShardingDimension::Unconstrained,
                 })
                 .collect(),
         )
@@ -659,10 +562,11 @@ impl TryFrom<PersistentShardingV1> for Sharding {
     }
 }
 
-/// Stable reduction tag for partial values. An omitted tag decodes as a sum for compatibility with earlier V1 records.
+/// Stable reduction tag for partial values. An omitted tag decodes as a sum so that cache keys for shardings using
+/// sums stay compact.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PersistentUnreducedKindV1 {
+enum PersistentUnreducedKind {
     /// Partial values combined by addition. This is the default for older records.
     #[default]
     Sum,
@@ -674,14 +578,14 @@ enum PersistentUnreducedKindV1 {
     Min,
 }
 
-impl PersistentUnreducedKindV1 {
-    /// Returns whether the reduction tag can be omitted without changing its V1 meaning.
+impl PersistentUnreducedKind {
+    /// Returns whether the reduction tag can be omitted without changing its meaning.
     fn is_sum(&self) -> bool {
         *self == Self::Sum
     }
 }
 
-impl From<UnreducedKind> for PersistentUnreducedKindV1 {
+impl From<UnreducedKind> for PersistentUnreducedKind {
     fn from(value: UnreducedKind) -> Self {
         match value {
             UnreducedKind::Sum => Self::Sum,
@@ -691,20 +595,20 @@ impl From<UnreducedKind> for PersistentUnreducedKindV1 {
     }
 }
 
-impl From<PersistentUnreducedKindV1> for UnreducedKind {
-    fn from(value: PersistentUnreducedKindV1) -> Self {
+impl From<PersistentUnreducedKind> for UnreducedKind {
+    fn from(value: PersistentUnreducedKind) -> Self {
         match value {
-            PersistentUnreducedKindV1::Sum => Self::Sum,
-            PersistentUnreducedKindV1::Max => Self::Max,
-            PersistentUnreducedKindV1::Min => Self::Min,
+            PersistentUnreducedKind::Sum => Self::Sum,
+            PersistentUnreducedKind::Max => Self::Max,
+            PersistentUnreducedKind::Min => Self::Min,
         }
     }
 }
 
-/// Stable V1 sharding assignment for one array dimension.
+/// Stable sharding assignment for one array dimension.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "axes", rename_all = "snake_case")]
-enum PersistentShardingDimensionV1 {
+enum PersistentShardingDimension {
     /// Array dimension partitioned over no mesh axes.
     Replicated,
 
@@ -715,20 +619,20 @@ enum PersistentShardingDimensionV1 {
     Unconstrained,
 }
 
-/// Ordered logical mesh axes in the V1 transport format.
+/// Ordered logical mesh axes in the transport format.
 #[derive(Serialize, Deserialize)]
-struct PersistentLogicalMeshV1 {
+struct PersistentLogicalMesh {
     /// Mesh axes in their declared order.
-    axes: Vec<PersistentMeshAxisV1>,
+    axes: Vec<PersistentMeshAxis>,
 }
 
-impl From<&LogicalMesh> for PersistentLogicalMeshV1 {
+impl From<&LogicalMesh> for PersistentLogicalMesh {
     fn from(value: &LogicalMesh) -> Self {
         Self {
             axes: value
                 .axes()
                 .iter()
-                .map(|axis| PersistentMeshAxisV1 {
+                .map(|axis| PersistentMeshAxis {
                     name: axis.name().into(),
                     size: axis.size() as u64,
                     r#type: match axis.r#type() {
@@ -742,10 +646,10 @@ impl From<&LogicalMesh> for PersistentLogicalMeshV1 {
     }
 }
 
-impl TryFrom<PersistentLogicalMeshV1> for LogicalMesh {
+impl TryFrom<PersistentLogicalMesh> for LogicalMesh {
     type Error = Error;
 
-    fn try_from(value: PersistentLogicalMeshV1) -> Result<Self, Self::Error> {
+    fn try_from(value: PersistentLogicalMesh) -> Result<Self, Self::Error> {
         LogicalMesh::new(
             value
                 .axes
@@ -784,7 +688,7 @@ impl TryFrom<PersistentLogicalMeshV1> for LogicalMesh {
 
 /// Named mesh axis and its stable partitioning-kind tag.
 #[derive(Serialize, Deserialize)]
-struct PersistentMeshAxisV1 {
+struct PersistentMeshAxis {
     /// Name used to identify this mesh axis in shardings.
     name: String,
 
@@ -795,24 +699,24 @@ struct PersistentMeshAxisV1 {
     r#type: u8,
 }
 
-/// Logical mesh and ordered concrete device identities in the V1 transport format.
+/// Logical mesh and ordered concrete device identities in the transport format.
 #[derive(Serialize, Deserialize)]
-struct PersistentDeviceMeshV1 {
+pub(super) struct PersistentDeviceMesh {
     /// Logical shape and axis kinds of the mesh.
-    logical_mesh: PersistentLogicalMeshV1,
+    logical_mesh: PersistentLogicalMesh,
 
     /// Devices in the concrete mesh order.
-    devices: Vec<PersistentDeviceV1>,
+    devices: Vec<PersistentDevice>,
 }
 
-impl From<&DeviceMesh> for PersistentDeviceMeshV1 {
+impl From<&DeviceMesh> for PersistentDeviceMesh {
     fn from(value: &DeviceMesh) -> Self {
         Self {
-            logical_mesh: PersistentLogicalMeshV1::from(value.logical_mesh()),
+            logical_mesh: PersistentLogicalMesh::from(value.logical_mesh()),
             devices: value
                 .devices()
                 .iter()
-                .map(|device| PersistentDeviceV1 {
+                .map(|device| PersistentDevice {
                     id: device.id() as u64,
                     process_index: device.process_index() as u64,
                 })
@@ -821,10 +725,10 @@ impl From<&DeviceMesh> for PersistentDeviceMeshV1 {
     }
 }
 
-impl TryFrom<PersistentDeviceMeshV1> for DeviceMesh {
+impl TryFrom<PersistentDeviceMesh> for DeviceMesh {
     type Error = Error;
 
-    fn try_from(value: PersistentDeviceMeshV1) -> Result<Self, Self::Error> {
+    fn try_from(value: PersistentDeviceMesh) -> Result<Self, Self::Error> {
         DeviceMesh::new(
             LogicalMesh::try_from(value.logical_mesh)?,
             value
@@ -854,7 +758,7 @@ impl TryFrom<PersistentDeviceMeshV1> for DeviceMesh {
 
 /// Device identity used to reconstruct a concrete mesh without retaining live PJRT handles.
 #[derive(Serialize, Deserialize)]
-struct PersistentDeviceV1 {
+struct PersistentDevice {
     /// Global PJRT device identifier.
     id: u64,
 
@@ -863,7 +767,7 @@ struct PersistentDeviceV1 {
 }
 
 /// Converts an in-memory executable signature mapping to its stable persistent representation.
-fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Error> {
+pub(super) fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Error> {
     mapping
         .iter()
         .map(|index| {
@@ -880,23 +784,23 @@ fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Err
         .collect()
 }
 
-/// Encodes logical reference-state slots in the stable V6 shape without runtime reference handles.
+/// Encodes logical reference-state slots in their stable shape without runtime reference handles.
 ///
-/// V6 redundantly stores each flat logical input position. Deriving that coordinate from the canonical source keeps
-/// valid serialized bytes unchanged without reintroducing the redundant field into [`ExternalReferenceBinding`].
-fn persistent_reference_states(
+/// The record redundantly stores each flat logical input position. Deriving that coordinate from the canonical source
+/// keeps valid serialized bytes unchanged without reintroducing the redundant field into [`ExternalReferenceBinding`].
+pub(super) fn persistent_reference_states(
     states: &[ExternalReferenceBinding],
     capture_count: usize,
-) -> Result<Vec<PersistentReferenceStateV6>, Error> {
+) -> Result<Vec<PersistentReferenceState>, Error> {
     states
         .iter()
         .map(|state| {
             let logical_input_index = state.source().flat_input_index(capture_count)?;
             let source = match state.source() {
-                ReferenceSource::Capture { index } => PersistentReferenceSourceV6::Capture { index: index as u64 },
-                ReferenceSource::Input { index } => PersistentReferenceSourceV6::PublicInput { index: index as u64 },
+                ReferenceSource::Capture { index } => PersistentReferenceSource::Capture { index: index as u64 },
+                ReferenceSource::Input { index } => PersistentReferenceSource::PublicInput { index: index as u64 },
             };
-            Ok(PersistentReferenceStateV6 {
+            Ok(PersistentReferenceState {
                 source,
                 logical_input_index: logical_input_index as u64,
                 logical_output_index: state.output_index().map(|index| index as u64),
@@ -905,24 +809,24 @@ fn persistent_reference_states(
         .collect()
 }
 
-/// Decodes logical reference-state slots without runtime reference handles and validates the redundant V6 flat input
+/// Decodes logical reference-state slots without runtime reference handles and validates the redundant flat input
 /// coordinate.
 fn decode_persistent_reference_states(
-    states: Vec<PersistentReferenceStateV6>,
+    states: Vec<PersistentReferenceState>,
     capture_count: usize,
 ) -> Result<Vec<ExternalReferenceBinding>, Error> {
     states
         .into_iter()
         .map(|state| {
             let source = match state.source {
-                PersistentReferenceSourceV6::Capture { index } => ReferenceSource::Capture {
+                PersistentReferenceSource::Capture { index } => ReferenceSource::Capture {
                     index: usize::try_from(index).map_err(|_| {
                         Error::Compilation(CompilationError::InvalidPersistentExecutable {
                             reason: format!("value {index} does not fit in usize"),
                         })
                     })?,
                 },
-                PersistentReferenceSourceV6::PublicInput { index } => ReferenceSource::Input {
+                PersistentReferenceSource::PublicInput { index } => ReferenceSource::Input {
                     index: usize::try_from(index).map_err(|_| {
                         Error::Compilation(CompilationError::InvalidPersistentExecutable {
                             reason: format!("value {index} does not fit in usize"),
@@ -961,11 +865,11 @@ fn decode_persistent_reference_states(
 }
 
 /// Encodes the hidden bounded-input extent slots of one executable signature.
-fn persistent_input_dimensions(signature: &ExecutableSignature) -> Vec<PersistentBoundaryDimensionV5> {
+pub(super) fn persistent_input_dimensions(signature: &ExecutableSignature) -> Vec<PersistentBoundaryDimension> {
     signature
         .input_dimensions()
         .iter()
-        .map(|dimension| PersistentBoundaryDimensionV5 {
+        .map(|dimension| PersistentBoundaryDimension {
             logical_index: dimension.logical_input_index() as u64,
             axis: dimension.axis() as u64,
             physical_index: dimension.physical_input_index() as u64,
@@ -974,11 +878,11 @@ fn persistent_input_dimensions(signature: &ExecutableSignature) -> Vec<Persisten
 }
 
 /// Encodes the hidden bounded-output extent slots of one executable signature.
-fn persistent_output_dimensions(signature: &ExecutableSignature) -> Vec<PersistentBoundaryDimensionV5> {
+pub(super) fn persistent_output_dimensions(signature: &ExecutableSignature) -> Vec<PersistentBoundaryDimension> {
     signature
         .output_dimensions()
         .iter()
-        .map(|dimension| PersistentBoundaryDimensionV5 {
+        .map(|dimension| PersistentBoundaryDimension {
             logical_index: dimension.logical_output_index() as u64,
             axis: dimension.axis() as u64,
             physical_index: dimension.physical_output_index() as u64,
@@ -1072,67 +976,10 @@ fn decode_data_type(value: u8) -> Result<DataType, Error> {
     })
 }
 
-/// Encodes one boundary's input and output types using the persistent signature's canonical dimension-variable
-/// numbering.
-///
-/// [`ArrayType`] equality is dimension-variable identity equality, and two structurally identical lowerings (or one
-/// lowering and its cache-restored executable) never share variable identities, so boundary compatibility must be
-/// compared through the same identity-free canonical form the compilation cache key uses.
-pub(super) fn canonical_boundary_types(input_types: &[ArrayType], output_types: &[ArrayType]) -> Vec<u8> {
-    // Serializing the plain persistent data model cannot fail.
-    serde_json::to_vec(&PersistentArraySignatureV3::encode(input_types, output_types).into_canonical()).unwrap()
-}
-
-impl LoweredProgram {
-    /// Encodes the complete compilation contract as a deterministic cache key.
-    pub(super) fn compilation_key(&self) -> Result<CompilationKey, Error> {
-        let compilation_options = canonical_compilation_options_bytes(&self.compilation_options);
-        let key = PersistentKeyV10 {
-            schema_version: PERSISTENT_KEY_SCHEMA_VERSION,
-            stable_hlo: &self.stable_hlo,
-            compilation_options: compilation_options.as_slice(),
-            signature: PersistentArraySignatureV3::encode(&self.input_types, &self.output_types).into_canonical(),
-            input_mapping: persistent_mapping(self.signature.input_mapping())?,
-            output_mapping: persistent_mapping(self.signature.output_mapping())?,
-            input_dimensions: persistent_input_dimensions(&self.signature),
-            output_dimensions: persistent_output_dimensions(&self.signature),
-            output_count: self.output_count as u64,
-            reference_states: persistent_reference_states(&self.reference_states, self.capture_count)?,
-            requires_assertion_handler: self.requires_assertion_handler,
-            runtime_requirements: self.runtime_requirements.to_vec(),
-            ordered_io: self.signature.has_ordered_io(),
-            unordered_io: self.signature.has_unordered_io(),
-            device_ordered_io: self.signature.has_device_ordered_io(),
-            effect_abi_version: 1,
-            donation_flags: &self.donation_flags,
-            capture_count: self.capture_count as u64,
-            expected_argument_shardings: self
-                .expected_argument_shardings
-                .iter()
-                .map(PersistentShardingV1::from)
-                .collect(),
-            output_shardings: self.output_shardings.iter().map(PersistentShardingV1::from).collect(),
-            mesh: PersistentDeviceMeshV1::from(&self.mesh),
-            device_kinds: &self.device_kinds,
-            kernel_execution_facts: self.kernel_execution_facts.as_deref(),
-            platform_name: &self.platform_name,
-            platform_version: &self.platform_version,
-            compiler_identity: &self.compiler_identity,
-            xla_flags: &self.xla_flags,
-        };
-        let canonical_bytes = serde_json::to_vec(&key).map_err(|error| {
-            Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                reason: format!("failed to encode persistent key: {error}"),
-            })
-        })?;
-        Ok(CompilationKey { canonical_bytes: canonical_bytes.into() })
-    }
-}
-
 impl CompiledProgram<'_> {
     /// Serializes the executable and its versioned invocation contract, or returns `None` when PJRT does not support
     /// executable serialization. Persistent cache directories must be trusted sources of executable code.
-    pub(super) fn serialize(&self) -> Result<Option<Vec<u8>>, Error> {
+    pub(crate) fn serialize(&self) -> Result<Option<Vec<u8>>, Error> {
         let executable = match self.executable.executable() {
             Ok(executable) => executable,
             Err(ryft_pjrt::Error::Unimplemented { .. }) => return Ok(None),
@@ -1144,11 +991,11 @@ impl CompiledProgram<'_> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = self.executable.device_assignment()?;
-        let metadata = PersistentExecutableMetadataV10 {
+        let metadata = PersistentExecutableMetadata {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: self.compilation_options.encode_to_vec(),
-            signature: PersistentArraySignatureV3::encode(&self.input_types, &self.output_types),
+            signature: PersistentArraySignature::encode(&self.input_types, &self.output_types),
             input_mapping: persistent_mapping(self.signature.input_mapping())?,
             output_mapping: persistent_mapping(self.signature.output_mapping())?,
             input_dimensions: persistent_input_dimensions(&self.signature),
@@ -1166,10 +1013,10 @@ impl CompiledProgram<'_> {
             expected_argument_shardings: self
                 .expected_argument_shardings
                 .iter()
-                .map(PersistentShardingV1::from)
+                .map(PersistentSharding::from)
                 .collect(),
-            output_shardings: self.output_shardings.iter().map(PersistentShardingV1::from).collect(),
-            mesh: PersistentDeviceMeshV1::from(&self.mesh),
+            output_shardings: self.output_shardings.iter().map(PersistentSharding::from).collect(),
+            mesh: PersistentDeviceMesh::from(&self.mesh),
             device_kinds: self.device_kinds.to_vec(),
             kernel_execution_facts: self.kernel_execution_facts.clone(),
             replica_count: device_assignment.replica_count() as u64,
@@ -1207,7 +1054,7 @@ impl<'c> Domain<'c> {
     /// The envelope, target, runtime contracts, and signature mapping logical values to physical executable slots are
     /// validated before loading the native PJRT executable bytes. Persistent cache directories must be trusted sources
     /// of executable code.
-    pub(super) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram<'c>>, Error> {
+    pub(crate) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram<'c>>, Error> {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         if bytes.len() < header_size {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
@@ -1235,7 +1082,7 @@ impl<'c> Domain<'c> {
                 reason: "persistent executable metadata is truncated".into(),
             })
         })?;
-        let metadata: PersistentExecutableMetadataV10 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: PersistentExecutableMetadata = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| {
                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!("failed to decode metadata: {error}"),
@@ -1596,13 +1443,12 @@ mod tests {
     use ryft_pjrt::protos::CompilationOptions;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::domains::compilation::CompilationError;
-    use crate::domains::options::Options;
-    use crate::domains::sessions::Session;
+    use crate::compilation::CompilationError;
+    use crate::compilation::options::Options;
     use crate::domains::tests::*;
-    use crate::experimental::ops::{Constant, FlatProgram, ProgramBuilder};
+    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::values_to_bytes;
-    use crate::{Array, Error, FromPjrt, Value};
+    use crate::{Array, Constant, Error, FromPjrt, Session, Value};
 
     use super::*;
 
@@ -1662,7 +1508,7 @@ mod tests {
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
         // Reload validates the live facts before handing any native executable bytes to PJRT.
-        let encode = |metadata: PersistentExecutableMetadataV10| {
+        let encode = |metadata: PersistentExecutableMetadata| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut encoded = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             encoded.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -1670,33 +1516,33 @@ mod tests {
             encoded.extend_from_slice(&bytes[metadata_end..]);
             encoded
         };
-        let mut matching: PersistentExecutableMetadataV10 =
+        let mut matching: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(matching.kernel_execution_facts, None);
         let facts = crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh).unwrap();
         matching.kernel_execution_facts = Some(facts.configuration_key().unwrap());
         let matching = domain.deserialize_program(&encode(matching)).unwrap().unwrap();
         assert_eq!(matching.kernel_execution_facts, Some(facts.configuration_key().unwrap()));
-        let mut mismatch: PersistentExecutableMetadataV10 =
+        let mut mismatch: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         let mut changed_facts = facts;
         changed_facts.pjrt_version.minor += 1;
         mismatch.kernel_execution_facts = Some(changed_facts.configuration_key().unwrap());
         assert!(domain.deserialize_program(&encode(mismatch)).unwrap().is_none());
-        let mut corrupt: PersistentExecutableMetadataV10 =
+        let mut corrupt: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         corrupt.kernel_execution_facts = Some(vec![255]);
         assert!(domain.deserialize_program(&encode(corrupt)).unwrap().is_none());
         let baseline: serde_json::Value = serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(baseline["runtime_requirements"], serde_json::json!([]));
-        let mut missing: PersistentExecutableMetadataV10 = serde_json::from_value(baseline).unwrap();
+        let mut missing: PersistentExecutableMetadata = serde_json::from_value(baseline).unwrap();
         missing.runtime_requirements = vec![crate::domains::runtimes::builtin_requirement("test.missing-runtime")];
         assert!(matches!(
             domain.deserialize_program(&encode(missing)),
             Err(Error::Runtime(crate::domains::runtimes::RuntimeError::MissingProvider { identifier }))
                 if identifier == "test.missing-runtime"
         ));
-        let mut explicit: PersistentExecutableMetadataV10 =
+        let mut explicit: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         explicit.runtime_requirements =
             vec![builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")];
@@ -1708,7 +1554,7 @@ mod tests {
         assert!(!explicit.requires_assertion_handler);
         assert!(!explicit.signature.has_ordered_io());
 
-        let mut invalid_signature_metadata: PersistentExecutableMetadataV10 =
+        let mut invalid_signature_metadata: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -1721,7 +1567,7 @@ mod tests {
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { .. })),
         ));
 
-        let mut incompatible_metadata: PersistentExecutableMetadataV10 =
+        let mut incompatible_metadata: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -1801,7 +1647,7 @@ mod tests {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         let metadata_size = u64::from_le_bytes(bytes[8..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let baseline: PersistentExecutableMetadataV10 =
+        let baseline: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert!(baseline.requires_assertion_handler);
         assert!(baseline.ordered_io);
@@ -1809,7 +1655,7 @@ mod tests {
 
         for identifier in ["ryft.assert", "ryft.ordered-io"] {
             for replacement in [None, Some((2, Vec::new())), Some((1, vec![1]))] {
-                let mut metadata: PersistentExecutableMetadataV10 =
+                let mut metadata: PersistentExecutableMetadata =
                     serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
                 metadata.runtime_requirements.retain(|requirement| requirement.identifier() != identifier);
                 if let Some((version, configuration)) = replacement {
@@ -2003,11 +1849,11 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = PersistentExecutableMetadataV10 {
+        let metadata = PersistentExecutableMetadata {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
-            signature: PersistentArraySignatureV3::encode(&[], &[]),
+            signature: PersistentArraySignature::encode(&[], &[]),
             input_mapping: Vec::new(),
             output_mapping: Vec::new(),
             input_dimensions: Vec::new(),
@@ -2024,8 +1870,8 @@ mod tests {
             capture_count: 0,
             expected_argument_shardings: Vec::new(),
             output_shardings: Vec::new(),
-            mesh: PersistentDeviceMeshV1 {
-                logical_mesh: PersistentLogicalMeshV1 { axes: Vec::new() },
+            mesh: PersistentDeviceMesh {
+                logical_mesh: PersistentLogicalMesh { axes: Vec::new() },
                 devices: Vec::new(),
             },
             device_kinds: Vec::new(),
@@ -2047,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persistent_v6_round_trips_and_validates_external_reference_state() {
+    fn test_persistent_executable_round_trips_and_validates_external_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -2102,7 +1948,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let corrupt = |metadata: PersistentExecutableMetadataV10| {
+        let corrupt = |metadata: PersistentExecutableMetadata| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut corrupted = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -2110,11 +1956,11 @@ mod tests {
             corrupted.extend_from_slice(&bytes[metadata_end..]);
             corrupted
         };
-        let mut metadata: PersistentExecutableMetadataV10 =
+        let mut metadata: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        assert_eq!(metadata.reference_states[0].source, PersistentReferenceSourceV6::Capture { index: 0 });
+        assert_eq!(metadata.reference_states[0].source, PersistentReferenceSource::Capture { index: 0 });
         assert_eq!(metadata.reference_states[0].logical_input_index, 0);
-        assert_eq!(metadata.reference_states[1].source, PersistentReferenceSourceV6::PublicInput { index: 0 });
+        assert_eq!(metadata.reference_states[1].source, PersistentReferenceSource::PublicInput { index: 0 });
         assert_eq!(metadata.reference_states[1].logical_input_index, 1);
         metadata.reference_states[0].logical_input_index = 1;
         let corrupted = corrupt(metadata);
@@ -2124,9 +1970,9 @@ mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
-        let mut metadata: PersistentExecutableMetadataV10 =
+        let mut metadata: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
+        metadata.reference_states[0].source = PersistentReferenceSource::PublicInput { index: 1 };
         let corrupted = corrupt(metadata);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2135,7 +1981,7 @@ mod tests {
         ));
 
         // An output count beyond the decoded complete output arity cannot name a hidden final-state suffix at all.
-        let mut invalid_outputs: PersistentExecutableMetadataV10 =
+        let mut invalid_outputs: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_outputs.output_count = 3;
         let corrupted = corrupt(invalid_outputs);
@@ -2147,7 +1993,7 @@ mod tests {
 
         // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
         // no reference-state input could be checked against its own expected sharding.
-        let mut truncated_expected_shardings: PersistentExecutableMetadataV10 =
+        let mut truncated_expected_shardings: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
         truncated_expected_shardings.expected_argument_shardings.pop();
@@ -2158,7 +2004,7 @@ mod tests {
                 if reason == "expected argument shardings do not match the physical input count",
         ));
 
-        let mut reordered: PersistentExecutableMetadataV10 =
+        let mut reordered: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         reordered.reference_states.swap(0, 1);
         let corrupted = corrupt(reordered);
@@ -2168,7 +2014,7 @@ mod tests {
                 if reason == "reference states are not in canonical logical input order",
         ));
 
-        let mut foreign_process_mesh: PersistentExecutableMetadataV10 =
+        let mut foreign_process_mesh: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         foreign_process_mesh.mesh.devices[0].process_index += 1;
         let corrupted = corrupt(foreign_process_mesh);
@@ -2178,7 +2024,7 @@ mod tests {
                 if reason == "reference-state mesh does not include an addressable device of this process",
         ));
 
-        let mut mismatched_expected_sharding: PersistentExecutableMetadataV10 =
+        let mut mismatched_expected_sharding: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
@@ -2188,7 +2034,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_input: PersistentExecutableMetadataV10 =
+        let mut mismatched_input: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_input.signature.input_types[0]
             .sharding
@@ -2210,7 +2056,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_output: PersistentExecutableMetadataV10 =
+        let mut mismatched_output: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_output.signature.output_types[1]
             .sharding
@@ -2227,7 +2073,7 @@ mod tests {
         ));
 
         // The runtime placement of every output must agree with its type over the non-auto mesh axes.
-        let mut mismatched_output_sharding: PersistentExecutableMetadataV10 =
+        let mut mismatched_output_sharding: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_output_sharding.output_shardings[1].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_output_sharding);
@@ -2237,7 +2083,7 @@ mod tests {
                 if reason == "output shardings do not match the output types or the executable mesh",
         ));
 
-        let mut zero_space: PersistentExecutableMetadataV10 =
+        let mut zero_space: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         zero_space.signature.input_types[0].data_type = encode_data_type(DataType::Zero);
         let corrupted = corrupt(zero_space);
@@ -2247,9 +2093,9 @@ mod tests {
                 if reason == "reference-state input has a zero-space type",
         ));
 
-        let mut host_memory: PersistentExecutableMetadataV10 =
+        let mut host_memory: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        host_memory.signature.input_types[0].memory = PersistentMemoryV1::Host(true);
+        host_memory.signature.input_types[0].memory = PersistentMemory::Host(true);
         let corrupted = corrupt(host_memory);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2257,16 +2103,16 @@ mod tests {
                 if reason == "reference-state input is not in device memory",
         ));
 
-        let mut unbounded_dynamic: PersistentExecutableMetadataV10 =
+        let mut unbounded_dynamic: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        unbounded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
+        unbounded_dynamic.signature.variables.push(PersistentDimensionVariable {
             name: "unbounded".to_string(),
             lower: 0,
             upper: None,
         });
-        unbounded_dynamic.signature.input_types[1].shape = vec![PersistentDimensionV3::Dynamic { variable: 0 }];
+        unbounded_dynamic.signature.input_types[1].shape = vec![PersistentDimension::Dynamic { variable: 0 }];
         unbounded_dynamic.signature.input_types[1].sharding.as_mut().unwrap().dimensions =
-            vec![PersistentShardingDimensionV1::Replicated];
+            vec![PersistentShardingDimension::Replicated];
         let corrupted = corrupt(unbounded_dynamic);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2274,16 +2120,16 @@ mod tests {
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
 
-        let mut mutated_dynamic: PersistentExecutableMetadataV10 =
+        let mut mutated_dynamic: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        mutated_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
+        mutated_dynamic.signature.variables.push(PersistentDimensionVariable {
             name: "bounded_mutation".to_string(),
             lower: 0,
             upper: Some(5),
         });
-        mutated_dynamic.signature.input_types[0].shape = vec![PersistentDimensionV3::Dynamic { variable: 0 }];
+        mutated_dynamic.signature.input_types[0].shape = vec![PersistentDimension::Dynamic { variable: 0 }];
         mutated_dynamic.signature.input_types[0].sharding.as_mut().unwrap().dimensions =
-            vec![PersistentShardingDimensionV1::Replicated];
+            vec![PersistentShardingDimension::Replicated];
         let corrupted = corrupt(mutated_dynamic);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2292,16 +2138,16 @@ mod tests {
                               compatibility has not been verified",
         ));
 
-        let mut sharded_dynamic: PersistentExecutableMetadataV10 =
+        let mut sharded_dynamic: PersistentExecutableMetadata =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        sharded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
+        sharded_dynamic.signature.variables.push(PersistentDimensionVariable {
             name: "bounded_sharded".to_string(),
             lower: 0,
             upper: Some(5),
         });
-        sharded_dynamic.signature.input_types[1].shape = vec![PersistentDimensionV3::Dynamic { variable: 0 }];
+        sharded_dynamic.signature.input_types[1].shape = vec![PersistentDimension::Dynamic { variable: 0 }];
         sharded_dynamic.signature.input_types[1].sharding.as_mut().unwrap().dimensions =
-            vec![PersistentShardingDimensionV1::Sharded(vec!["x".to_string()])];
+            vec![PersistentShardingDimension::Sharded(vec!["x".to_string()])];
         let corrupted = corrupt(sharded_dynamic);
         assert!(matches!(
             domain.deserialize_compiled_program(corrupted.as_slice()),
@@ -2311,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persistent_v6_round_trips_bounded_dynamic_read_only_reference_state() {
+    fn test_persistent_executable_round_trips_bounded_dynamic_read_only_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -2354,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persistent_v6_preserves_static_sharded_reference_metadata_and_round_trips_when_supported() {
+    fn test_persistent_executable_preserves_static_sharded_reference_metadata_and_round_trips_when_supported() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -2430,8 +2276,8 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
             .unwrap();
-        let payload = serde_json::to_string(&PersistentShardingV1::from(&sharding)).unwrap();
-        let restored = Sharding::try_from(serde_json::from_str::<PersistentShardingV1>(&payload).unwrap()).unwrap();
+        let payload = serde_json::to_string(&PersistentSharding::from(&sharding)).unwrap();
+        let restored = Sharding::try_from(serde_json::from_str::<PersistentSharding>(&payload).unwrap()).unwrap();
         assert_eq!(restored, sharding);
     }
 
@@ -2439,9 +2285,9 @@ mod tests {
     fn test_persistent_sharding_unreduced_kinds() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sum = Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap();
-        let encode = |sharding: &Sharding| serde_json::to_string(&PersistentShardingV1::from(sharding)).unwrap();
+        let encode = |sharding: &Sharding| serde_json::to_string(&PersistentSharding::from(sharding)).unwrap();
         let decode =
-            |payload: &str| Sharding::try_from(serde_json::from_str::<PersistentShardingV1>(payload).unwrap()).unwrap();
+            |payload: &str| Sharding::try_from(serde_json::from_str::<PersistentSharding>(payload).unwrap()).unwrap();
 
         // A sum is omitted from the payload, so the payloads (and cache keys) of sums are unchanged, while other kinds
         // round trip through their names.
@@ -2456,7 +2302,7 @@ mod tests {
         // A kind without unreduced axes is malformed.
         let malformed = encode(&Sharding::replicated(sum.mesh().clone(), 1))
             .replace("\"reduced_axes\"", "\"unreduced_kind\":\"max\",\"reduced_axes\"");
-        assert!(Sharding::try_from(serde_json::from_str::<PersistentShardingV1>(&malformed).unwrap()).is_err());
+        assert!(Sharding::try_from(serde_json::from_str::<PersistentSharding>(&malformed).unwrap()).is_err());
     }
 
     #[test]
@@ -2519,7 +2365,7 @@ mod tests {
             ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(2)]));
 
         let (restored_inputs, restored_outputs) =
-            PersistentArraySignatureV3::encode(std::slice::from_ref(&array_type), std::slice::from_ref(&output_type))
+            PersistentArraySignature::encode(std::slice::from_ref(&array_type), std::slice::from_ref(&output_type))
                 .decode()
                 .unwrap();
 
@@ -2533,30 +2379,5 @@ mod tests {
         );
         assert_eq!(restored_outputs[0].data_type(), output_type.data_type());
         assert_eq!(restored_inputs[0].dimension(1), restored_outputs[0].dimension(0));
-    }
-
-    #[test]
-    fn test_persistent_array_signature_canonicalizes_names_but_preserves_variable_relationships() {
-        let bounds = DimensionBounds::non_negative(Some(4)).unwrap();
-        let batch = DimensionVariable::new("batch", bounds);
-        let renamed = DimensionVariable::new("renamed", bounds);
-        let shared = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Dynamic(batch)]),
-        );
-        let shared_renamed = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(renamed.clone()), CoreDimension::Dynamic(renamed)]),
-        );
-        let first = DimensionVariable::new("first", bounds);
-        let second = DimensionVariable::new("second", bounds);
-        let independent = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(first), CoreDimension::Dynamic(second)]),
-        );
-
-        let canonical = |r#type: &ArrayType| canonical_boundary_types(std::slice::from_ref(r#type), &[]);
-        assert_eq!(canonical(&shared), canonical(&shared_renamed));
-        assert_ne!(canonical(&shared), canonical(&independent));
     }
 }

@@ -6,7 +6,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_signed_one_bit_to_mlir, lower_tensor_type,
     physical_bound_type,
 };
@@ -156,11 +156,11 @@ mod tests {
 
     use crate::Session;
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
-    use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
 
     use super::*;
 

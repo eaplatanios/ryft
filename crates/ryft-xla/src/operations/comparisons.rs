@@ -6,7 +6,7 @@ use ryft_mlir::{
     Type, TypeRef, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::lower_signed_one_bit_to_mlir;
+use crate::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_operands;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
 

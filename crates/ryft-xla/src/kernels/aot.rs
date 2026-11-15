@@ -17,10 +17,12 @@ use ryft_pjrt::Execution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domains::CompiledProgram;
+use crate::compilation::CompiledProgram;
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::staging::{KernelCompilerBinding, KernelExecutionFacts, stage_kernel};
 use crate::{Array, CompilationAnalysis, Domain, Error, Options};
+
+// TODO(eaplatanios): Review this module.
 
 // TODO(eaplatanios): Promote kernel AOT errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
@@ -481,6 +483,7 @@ pub(crate) mod tests {
             if message == "invalid AOT runtime input"));
 
         let custom = Error::from(KernelAotError::Invalid { message: "invalid AOT bundle".into() });
+        assert_eq!(custom.to_string(), "invalid kernel AOT bundle: invalid AOT bundle");
         let roundtrip = Error::from(KernelAotError::from(custom.clone()));
         let roundtrip = Error::from(KernelAotError::from(roundtrip));
         assert!(matches!(roundtrip.downcast_custom::<KernelAotError>(),

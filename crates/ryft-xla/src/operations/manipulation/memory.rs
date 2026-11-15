@@ -108,10 +108,11 @@ mod tests {
         ZeroOperation,
     };
 
-    use crate::experimental::lowering::tests::{ProgramBuilder, test_vector_type};
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{ArrayConstant, Constant, Operation};
-    use crate::to_mlir_module_for_program;
+    use crate::lowering::tests::{ProgramBuilder, test_vector_type};
+    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::operations::Operation;
+    use crate::values::ArrayConstant;
+    use crate::{Constant, to_mlir_module_for_program};
 
     use super::*;
 

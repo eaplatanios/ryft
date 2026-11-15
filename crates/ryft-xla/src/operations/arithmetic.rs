@@ -7,9 +7,7 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue, ValueRef};
 
-use crate::experimental::lowering::types::{
-    lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type,
-};
+use crate::lowering::types::{lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type};
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
@@ -341,10 +339,10 @@ mod tests {
 
     use crate::Session;
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{ProgramBuilder, test_spmd_compilation_options};
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, test_spmd_compilation_options};
+    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
 
     use super::*;
 

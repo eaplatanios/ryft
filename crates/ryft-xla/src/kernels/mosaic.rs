@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
 
+// TODO(eaplatanios): Review this module.
+
 /// Embeds checked Mosaic GPU source using the pinned native binary-source and resource schemas.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct MosaicGpuEmbedding;

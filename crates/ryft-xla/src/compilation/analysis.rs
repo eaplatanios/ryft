@@ -6,10 +6,9 @@ use ryft_core::{AnalyzableCompilationDomain, ArrayIrType, ExecutableFunction, Pa
 use ryft_pjrt::Value as PjrtValue;
 use serde::Serialize;
 
-use crate::Error;
-use crate::domains::Domain;
-use crate::domains::compilation::CompilationError;
-use crate::domains::programs::CompiledProgram;
+use crate::compilation::CompilationError;
+use crate::compilation::programs::CompiledProgram;
+use crate::{Domain, Error};
 
 // TODO(eaplatanios): Review this module.
 
@@ -269,11 +268,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayIrType, ArrayType, DataType, StagedFunction as CoreStagedFunction};
 
-    use crate::Error;
-    use crate::domains::options::Options;
-    use crate::domains::sessions::Session;
+    use crate::compilation::options::Options;
     use crate::domains::tests::*;
     use crate::tests::execution_client;
+    use crate::{Error, Session};
 
     use super::*;
 

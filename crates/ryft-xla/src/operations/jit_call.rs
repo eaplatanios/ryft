@@ -31,13 +31,13 @@ use ryft_mlir::{
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
-use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::experimental::lowering::types::lower_array_ir_type;
-use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, collect_session_constants};
-use crate::experimental::ops::{Constant, FlatProgram, Operation, Program};
+use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::types::lower_array_ir_type;
+use crate::lowering::{CollectiveLoweringState, EffectTokens, collect_session_constants};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Value};
+use crate::operations::{FlatProgram, Operation, Program};
+use crate::{Constant, Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Value};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -2281,18 +2281,16 @@ mod tests {
 
     use crate::domains::runtimes::builtin_requirement;
     use crate::domains::with_runtime_requirements;
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, identity_branch,
         lower_replicated_shard_map_body, neg_branch, test_vector_type, unproject_plain_program,
     };
-    use crate::experimental::ops::tests::vector_type;
-    use crate::experimental::ops::{
-        ArrayConstant, Constant, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder,
-    };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, ToPjrt, to_mlir_module_for_program};
+    use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
+    use crate::values::ArrayConstant;
+    use crate::{Array, Constant, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 

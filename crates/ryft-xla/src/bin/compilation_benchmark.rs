@@ -14,6 +14,8 @@ use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, CompileTracer, CompiledFunctionDispatcher, Domain, FromPjrt, Options, Session, Value, jit};
 use serde_json::{Value as JsonValue, json};
 
+// TODO(eaplatanios): Review this module.
+
 type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
 type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
 

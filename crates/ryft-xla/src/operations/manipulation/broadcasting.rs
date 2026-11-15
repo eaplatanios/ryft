@@ -9,7 +9,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     dimension_extent_i64, lower_explicit_shape, lower_physical_bound_value, lower_physical_storage,
     lower_restore_dynamic_dimensions, lower_runtime_dimension_size_i64, lower_static_index_constants,
     lower_tensor_type, physical_bound_type,
@@ -364,14 +364,16 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::experimental::lowering::tests::{
+    use crate::execution::ExecutionArguments;
+    use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
         ragged_dot_cpu_compilation_options, shard_map_module, test_manual_mesh, test_vector_type,
     };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{ArrayConstant, Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Session, to_mlir_module_for_program};
+    use crate::values::ArrayConstant;
+    use crate::{Constant, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -998,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_exact_symbolic_extent_refinement_executes_on_cpu() {
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::lowering::tests::{MixedValue, execute_mixed_program};
 
         // Both broadcast forms can normalize proved symbolic extents to static storage. The unit axis must then
         // expand as a static singleton, while the exact nonunit axis preserves its distinct element values.
@@ -1258,7 +1260,7 @@ mod tests {
         .unwrap();
         let execution_devices = executable.addressable_devices().unwrap();
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], execution_device_ids.as_slice()).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()

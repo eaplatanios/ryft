@@ -10,8 +10,8 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::types::{
+use crate::lowering::CollectiveLoweringState;
+use crate::lowering::types::{
     lower_constant_elements_attribute, lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type,
     lower_u64_scalar_constant, physical_bound_type,
 };
@@ -582,8 +582,8 @@ mod tests {
     };
     use ryft_mlir::Location;
 
-    use crate::experimental::ArrayTracer;
-    use crate::experimental::lowering::tests::{shard_map_module, test_sharding};
+    use crate::lowering::tests::{shard_map_module, test_sharding};
+    use crate::tracing::ArrayTracer;
 
     use super::*;
 
@@ -597,7 +597,7 @@ mod tests {
     };
 
     #[cfg(feature = "cuda-13")]
-    use crate::experimental::lowering::tests::test_spmd_compilation_options;
+    use crate::lowering::tests::test_spmd_compilation_options;
     #[cfg(feature = "cuda-13")]
     use crate::tests::{values_from_bytes, values_to_bytes};
 

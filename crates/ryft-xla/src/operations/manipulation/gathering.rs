@@ -7,8 +7,8 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::MlirLowerableValue;
-use crate::experimental::lowering::types::{
+use crate::lowering::MlirLowerableValue;
+use crate::lowering::types::{
     lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, lower_unplaced_constant_output,
     physical_bound_type,
@@ -281,12 +281,10 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::domains::tests::{domain_mesh, read_f64s};
-    use crate::experimental::lowering::tests::{
-        ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program,
-    };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
+    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
     use crate::{Array, Options, Session, to_mlir_module_for_program};
 
     #[test]

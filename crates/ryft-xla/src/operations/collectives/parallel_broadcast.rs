@@ -8,8 +8,8 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::domains::Tracer;
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::regions::lower_nested_program_inline;
+use crate::lowering::CollectiveLoweringState;
+use crate::lowering::regions::lower_nested_program_inline;
 use crate::operations::collectives::collective_replica_groups;
 use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 

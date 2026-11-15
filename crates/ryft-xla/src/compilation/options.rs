@@ -250,7 +250,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_pjrt::protos::CompilationOptions;
 
-    use crate::domains::compilation::jit_compilation_options;
+    use crate::compilation::domains::jit_compilation_options;
 
     use super::*;
 

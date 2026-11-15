@@ -4,7 +4,7 @@ use ryft_core::{
 };
 use ryft_mlir::ValueRef;
 
-use crate::experimental::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::lower_nested_program_inline;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for StopGradientOperation<ArrayType> {
@@ -130,9 +130,9 @@ mod tests {
     };
 
     use crate::domains::Tracer;
-    use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{Constant, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::{Domain, Error, LoweringError, to_mlir_module_for_program};
+    use crate::lowering::tests::test_vector_type;
+    use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::{Constant, Domain, Error, LoweringError, to_mlir_module_for_program};
 
     #[test]
     fn test_rematerialize_lowering_inlines_body_effects_on_the_enclosing_token_chain() {

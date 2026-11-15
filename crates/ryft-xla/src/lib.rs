@@ -1,49 +1,46 @@
 pub mod arrays;
-pub mod arrays_v0;
 pub mod compilation;
 pub mod devices;
 pub mod distributed;
 pub mod domains;
 pub mod errors;
-pub mod experimental;
+pub mod execution;
 pub mod kernels;
+pub mod lowering;
 pub mod mlir;
 pub mod operations;
 pub mod pjrt;
-pub mod profile_guided;
 pub mod sharding;
 pub mod telemetry;
+pub mod tracing;
 pub mod types;
 pub mod values;
 
 pub use arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
 pub use compilation::{
-    CompileTracer, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction,
-    StatefulCompileTracer, StatefulCompiledFunction, StatefulCompiledFunctionDispatcher, StatefulValue, compile,
-    compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
-    infer_output_types, jit, jit_statefully, jit_statefully_with_options, jit_with_options, stage, stage_with_captures,
+    AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
+    AdaptiveProfileGuidedStatistics, AnalysisValue, CompilationAnalysis, CompilationError, CompileTracer,
+    CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FeedbackDirectedProfile, InputBoundBucketing,
+    MemoryAnalysis, OptimizedProgram, Options, StagedFunction, StatefulCompileTracer, StatefulCompiledFunction,
+    StatefulCompiledFunctionDispatcher, StatefulValue, compile, compile_statefully, compile_statefully_with_captures,
+    compile_with_captures, compile_with_options, infer_output_types, jit, jit_statefully, jit_statefully_with_options,
+    jit_with_options, stage, stage_with_captures,
 };
 pub use distributed::DistributedRuntime;
-pub use domains::{
-    AnalysisValue, CompilationAnalysis, CompilationError, Domain, ExecutionError, FeedbackDirectedProfile,
-    InputBoundBucketing, MemoryAnalysis, OptimizedProgram, Options, RuntimeError, Session, Target, TargetDevice,
-    ThroughSession,
-};
+pub use domains::{Domain, RuntimeError, Session, SessionConstant, Target, TargetDevice, ThroughSession};
 pub use errors::Error;
-pub use experimental::lowering::{
+pub use execution::ExecutionError;
+pub use lowering::{
     LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
     to_mlir_module_for_program,
 };
 pub use mlir::ToMlir;
+pub use operations::Operation;
 pub use operations::dot::RaggedDotLoweringStrategy;
 pub use pjrt::{FromPjrt, ToPjrt};
-pub use profile_guided::{
-    AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
-    AdaptiveProfileGuidedStatistics,
-};
 pub use sharding::OpShardingExtension;
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
-pub use values::{Dimension, Reference, Value};
+pub use values::{Constant, Dimension, Reference, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -54,14 +51,14 @@ pub(crate) mod tests {
     use std::sync::Once;
 
     use ryft_core::{
-        ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, StaticShape,
+        ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        StaticShape,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::{Array, Domain};
+    use crate::{Array, Domain, FromPjrt};
 
     /// Creates an execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
     ///
@@ -94,6 +91,23 @@ pub(crate) mod tests {
             eprintln!("execution test platform: {platform}; addressable devices: {devices:?}");
         });
         client
+    }
+
+    /// Returns the `f64` vector type with four elements that staged program fixtures use for their values.
+    pub(crate) fn vector_type() -> ArrayType {
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+    }
+
+    /// Returns a mesh with one auto axis `x` over the four addressable CPU devices of `client`.
+    pub(crate) fn four_device_mesh_x(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Auto).unwrap()]).unwrap(), devices)
+            .unwrap()
     }
 
     pub(crate) fn logical_mesh_2x2() -> LogicalMesh {

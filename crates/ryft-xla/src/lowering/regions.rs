@@ -9,21 +9,21 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::Error;
-use crate::experimental::lowering::types::lower_constant;
-use crate::experimental::lowering::{
-    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction,
-};
-use crate::experimental::ops::{Constant, FlatProgram, Program};
+use crate::lowering::types::lower_constant;
+use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction};
 use crate::operations::composites::lowers_without_regions;
 use crate::operations::jit_call::JitCallFunctionMap;
+use crate::operations::{FlatProgram, Program};
+use crate::{Constant, Error};
+
+// TODO(eaplatanios): Review this module.
 
 #[cfg(test)]
-use crate::experimental::lowering::types::lower_literal_value;
+use crate::Operation;
 #[cfg(test)]
-use crate::experimental::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
+use crate::lowering::types::lower_literal_value;
 #[cfg(test)]
-use crate::experimental::ops::Operation;
+use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
 #[cfg(test)]
 use ryft_core::ArrayType;
 #[cfg(test)]
@@ -407,9 +407,9 @@ mod tests {
     use ryft_mlir::dialects::func;
     use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, TypeAndAttributes, Value as MlirValue};
 
-    use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
-    use crate::experimental::lowering::types::lower_tensor_type;
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
+    use crate::lowering::types::lower_tensor_type;
+    use crate::values::ArrayConstant;
 
     use super::*;
 

@@ -25,16 +25,18 @@
 
 use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 
 use ryft_core::{
-    Add, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, Compare, CompareOperation,
-    ComparisonDirection, Concretizable, Context, DimensionType, DimensionValue, Div, Mul, Neg, Parameter, ProgramError,
-    ProjectedContext, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value as CoreValue, ValueDomainDispatch, ValueProjection, WhilePredicate,
+    Add, Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, CaptureConstant,
+    CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context, DataType, DimensionType,
+    DimensionValue, Div, EagerContext, LiteralIdentity, Mul, Neg, Parameter, ProgramError, ProjectedContext,
+    ProjectedValue, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed, Value as CoreValue,
+    ValueDirectDispatch, ValueDomainDispatch, ValueProjection, WhilePredicate,
 };
 use ryft_macros::Parameter;
 
-use crate::{Array, Domain};
+use crate::{Array, Domain, SessionConstant};
 
 /// First-class runtime dimension bound to the [`Domain`] session in which array results derived from it are
 /// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`].
@@ -211,7 +213,7 @@ impl Typed for Reference<'_> {
 /// # Dispatch and Transforms
 ///
 /// A [`Value`] dispatches and executes through the [`Domain`] of its member, so every capability binds an
-/// [`Operation`](crate::experimental::ops::Operation) that the domain executes eagerly (op by op, through its
+/// [`Operation`](crate::Operation) that the domain executes eagerly (op by op, through its
 /// eager dispatch cache), and free transform entry points recover that domain from the values. When several inputs
 /// carry different sessions, the receiver's domain executes, and it validates that its array inputs belong to its
 /// client and placement. Dimension inputs are host data and need no such validation.
@@ -540,25 +542,415 @@ impl std::ops::Div for Value<'_> {
     }
 }
 
+/// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
+/// literals preserve dimension-comparison proofs without allocating device storage or introducing a capture.
+/// Projection onto [`ArrayType`] is the identity and preserves both representations unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum ArrayConstant {
+    /// A reference to array data in the enclosing capture table.
+    Captured(CaptureReference<ArrayType>),
+
+    /// A handle to array data that the session retains (refer to [`SessionConstant`]).
+    Session(SessionConstant),
+
+    /// An immediate scalar Boolean predicate.
+    Boolean(bool),
+}
+
+impl From<CaptureReference<ArrayType>> for ArrayConstant {
+    fn from(value: CaptureReference<ArrayType>) -> Self {
+        Self::Captured(value)
+    }
+}
+
+impl TryFrom<bool> for ArrayConstant {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, ProgramError> {
+        Ok(Self::Boolean(value))
+    }
+}
+
+impl Display for ArrayConstant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Captured(value) => Display::fmt(value, formatter),
+            Self::Session(value) => Display::fmt(value, formatter),
+            Self::Boolean(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+impl Typed for ArrayConstant {
+    type Type = ArrayType;
+
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        match self {
+            Self::Captured(value) => value.r#type(),
+            Self::Session(value) => value.r#type(),
+            Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean)),
+        }
+    }
+}
+
+impl CoreValue for ArrayConstant {
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
+
+    fn domain(&self) -> Self::Domain {
+        EagerContext::new()
+    }
+
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        match self {
+            Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+            Self::Session(value) => Ok(Self::Session(value.rename_type_identities(renaming)?)),
+            Self::Boolean(value) => Ok(Self::Boolean(*value)),
+        }
+    }
+
+    fn capture_index(&self) -> Option<usize> {
+        match self {
+            Self::Captured(value) => Some(value.index()),
+            Self::Session(_) | Self::Boolean(_) => None,
+        }
+    }
+}
+
+impl ValueProjection<ArrayType> for ArrayConstant {
+    type Projected = Self;
+    type ProjectedRef<'v> = &'v Self;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        Ok(self)
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        Ok(self)
+    }
+}
+
+impl CaptureConstant for ArrayConstant {
+    fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
+        match self {
+            Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+            Self::Session(value) => Self::Session(value.clone()),
+            Self::Boolean(value) => Self::Boolean(*value),
+        }
+    }
+}
+
+impl Concretizable<bool> for ArrayConstant {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Captured(value) => value.concretize(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a session constant handle".to_string(),
+            }),
+            Self::Boolean(value) => Ok(*value),
+        }
+    }
+}
+
+impl AssertionValue for ArrayConstant {
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
+        match self {
+            Self::Captured(value) => value.assertion_array(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot inspect a session constant assertion array before execution".to_owned(),
+            }),
+            Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
+        }
+    }
+
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        match self {
+            Self::Captured(value) => value.assertion_observation(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot inspect a session constant assertion observation before execution".to_owned(),
+            }),
+            Self::Boolean(value) => Ok(value.to_string()),
+        }
+    }
+}
+
+/// Constant payload stored in the atom table of a staged XLA [`CoreProgram`](ryft_core::Program).
+///
+/// Staged XLA programs keep three kinds of constants apart, and this sum is the staged counterpart of the eager
+/// [`ArrayIrValue`] universe:
+///
+///   - **Captured runtime values:** array buffers and external references stay in the surrounding
+///     compiled function's capture table, while the program stores only a lifetime-free [`CaptureReference`] carrying
+///     its index and structural [`ArrayIrType`]. This keeps runtime storage out of literal IR payloads. A captured
+///     reference remains metadata only and must be validated and discharged before ordinary XLA lowering.
+///   - **Immediate first-class dimensions:** a [`DimensionValue`] is a checked host integer, so embedding it costs
+///     nothing and it lowers to a scalar `stablehlo.constant`. Unlike a capture reference it also stays usable inside
+///     a nested region — most importantly a `shard_map` manual computation, which owns no capture table of its own —
+///     and that is what lets shape arithmetic such as the explicit result extents of the collectives be staged
+///     against a manual region's shard-local values.
+///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
+///     composition, and assertion folding without requiring a captured device buffer.
+///   - **Session arrays:** a [`SessionConstant`] is a lifetime-free handle to an array that the session retains for a
+///     trace whose capture table cannot hold runtime arrays (e.g., the body of a rematerialized function or of a
+///     composite). Lowering turns it into a hidden executable argument, as it does for a capture.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum Constant {
+    /// Reference to a value held in the surrounding compiled function's capture table.
+    Captured(CaptureReference<ArrayIrType>),
+
+    /// Handle to an array that the session retains.
+    Session(SessionConstant),
+
+    /// Immediate checked host-side first-class dimension extent.
+    Dimension(DimensionValue),
+
+    /// Immediate scalar Boolean predicate.
+    Boolean(bool),
+}
+
+impl Display for Constant {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Captured(value) => Display::fmt(value, formatter),
+            Self::Session(value) => Display::fmt(value, formatter),
+            Self::Dimension(value) => Display::fmt(value, formatter),
+            Self::Boolean(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+// XLA program constants carry only immediate scalars and typed capture slots, so their ordinary equality is already
+// exact and serves as their literal identity.
+impl LiteralIdentity for Constant {
+    #[inline]
+    fn literal_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    #[inline]
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        self.hash(state);
+    }
+}
+
+impl Typed for Constant {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+        match self {
+            Self::Captured(value) => value.r#type(),
+            Self::Session(value) => Cow::Owned(ArrayIrType::Array(value.r#type().into_owned())),
+            Self::Dimension(value) => Cow::Owned(ArrayIrType::Dimension(value.r#type().into_owned())),
+            Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean).into()),
+        }
+    }
+}
+
+impl CoreValue for Constant {
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
+
+    #[inline]
+    fn domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        match self {
+            Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+            Self::Session(value) => Ok(Self::Session(value.rename_type_identities(renaming)?)),
+            Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
+            Self::Boolean(value) => Ok(Self::Boolean(*value)),
+        }
+    }
+
+    #[inline]
+    fn capture_index(&self) -> Option<usize> {
+        match self {
+            Self::Captured(value) => Some(value.index()),
+            Self::Session(_) | Self::Dimension(_) | Self::Boolean(_) => None,
+        }
+    }
+}
+
+impl CaptureConstant for Constant {
+    #[inline]
+    fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
+        match self {
+            Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+            Self::Session(value) => Self::Session(value.clone()),
+            Self::Dimension(value) => Self::Dimension(value.clone()),
+            Self::Boolean(value) => Self::Boolean(*value),
+        }
+    }
+}
+
+impl ValueProjection<ArrayType> for Constant {
+    type Projected = ArrayConstant;
+    type ProjectedRef<'v> = ProjectedValue<ArrayType, &'v Self>;
+
+    #[inline]
+    fn from_projected(value: ArrayConstant) -> Self {
+        match value {
+            ArrayConstant::Captured(value) => Self::Captured(ValueProjection::<ArrayType>::from_projected(value)),
+            ArrayConstant::Session(value) => Self::Session(value),
+            ArrayConstant::Boolean(value) => Self::Boolean(value),
+        }
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        Ok(ProjectedValue::new(self, <&ArrayType>::try_from(self.r#type().as_ref())?.clone()))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<ArrayConstant, TypeError> {
+        match self {
+            Self::Captured(value) => value.into_projected().map(ArrayConstant::Captured),
+            Self::Session(value) => Ok(ArrayConstant::Session(value)),
+            Self::Boolean(value) => Ok(ArrayConstant::Boolean(value)),
+            Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
+        }
+    }
+}
+
+impl ValueProjection<DimensionType> for Constant {
+    type Projected = DimensionValue;
+    type ProjectedRef<'v> = &'v DimensionValue;
+
+    #[inline]
+    fn from_projected(value: DimensionValue) -> Self {
+        Self::Dimension(value)
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<&'v DimensionValue, TypeError>
+    where
+        DimensionType: 'v,
+    {
+        match self {
+            Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Session(_) => Err(TypeError::invalid("expected an immediate dimension but got a session array")),
+            Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
+            Self::Dimension(value) => Ok(value),
+        }
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<DimensionValue, TypeError> {
+        match self {
+            Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Session(_) => Err(TypeError::invalid("expected an immediate dimension but got a session array")),
+            Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
+            Self::Dimension(value) => Ok(value),
+        }
+    }
+}
+
+impl From<CaptureReference<ArrayIrType>> for Constant {
+    #[inline]
+    fn from(value: CaptureReference<ArrayIrType>) -> Self {
+        Self::Captured(value)
+    }
+}
+
+impl From<DimensionValue> for Constant {
+    #[inline]
+    fn from(value: DimensionValue) -> Self {
+        Self::Dimension(value)
+    }
+}
+
+impl TryFrom<bool> for Constant {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, ProgramError> {
+        Ok(Self::Boolean(value))
+    }
+}
+
+impl Concretizable<bool> for Constant {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Boolean(value) => Ok(*value),
+            _ => Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from the staged xla constant `{self}`"),
+            }),
+        }
+    }
+}
+
+impl AssertionValue for Constant {
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
+        match self {
+            Self::Dimension(_) => Ok(None),
+            Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
+            Self::Captured(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a captured constant reference".to_owned(),
+            }),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a session constant handle".to_owned(),
+            }),
+        }
+    }
+
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        match self {
+            Self::Dimension(value) => Ok(value.extent().to_string()),
+            Self::Boolean(value) => Ok(value.to_string()),
+            Self::Captured(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a captured constant reference".to_owned(),
+            }),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a session constant handle".to_owned(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, Assert, BatchAxis, Compare, ComparisonDirection,
-        Concretizable, Context, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds, DimensionOperation,
-        DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation, DimensionValue,
-        DimensionVariable, Gather, GatherMode, LogicalMesh, Max, MeshAxis, MeshAxisType, Min, OneOperation,
+        Add, ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, BatchAxis,
+        CaptureReference, Compare, ComparisonDirection, Concretizable, Context, ConvertElementType, DataType, Device,
+        DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionOperation, DimensionSize,
+        DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, Gather, GatherMode, LogicalMesh, Max, Memory, MeshAxis, MeshAxisType, Min, OneOperation,
         OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite, Rem, SaturatingSub, Shape,
-        Sharding, Sort, SortDirection, Typed, WhileOperation, WhilePredicate, ZeroOperation, batch, differentiate_at,
+        ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceType, ReferenceWrite, Rem, SaturatingSub,
+        Shape, Sharding, Sort, SortDirection, TypeError, TypeIdentityRenaming, Typed, ValueProjection, WhileOperation,
+        WhilePredicate, ZeroOperation, batch, differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::experimental::ops::{Constant, Operation, ProgramBuilder};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, Session};
+    use crate::operations::ProgramBuilder;
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
+    use crate::{Array, FromPjrt, Operation, Session};
 
     use super::*;
 
@@ -1325,5 +1717,121 @@ mod tests {
             .unwrap();
         assert_eq!(read::<f32>(&value), vec![-0.5]);
         assert_eq!(read::<f32>(&derivative), vec![2.0]);
+    }
+
+    #[test]
+    fn test_array_constant_value_projection() {
+        let array_type = vector_type().with_memory(Memory::Host { pinned: true });
+        let captured = ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
+        let borrowed = ValueProjection::<ArrayType>::projected(&captured).unwrap();
+        assert!(std::ptr::eq(borrowed, &captured));
+        assert_eq!(borrowed.r#type().as_ref(), &array_type);
+        assert_eq!(borrowed.capture_index(), Some(2));
+        let owned = ValueProjection::<ArrayType>::into_projected(captured.clone()).unwrap();
+        assert_eq!(owned, captured);
+        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), captured);
+
+        let predicate = ArrayConstant::Boolean(true);
+        let borrowed = ValueProjection::<ArrayType>::projected(&predicate).unwrap();
+        assert!(std::ptr::eq(borrowed, &predicate));
+        assert_eq!(borrowed.capture_index(), None);
+        let owned = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
+        assert_eq!(owned, predicate);
+        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), predicate);
+    }
+
+    #[test]
+    fn test_constant() {
+        let array_type = vector_type();
+        let capture = CaptureReference::new(2, ArrayIrType::Array(array_type.clone()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let extent = DimensionValue::new(extent_type, 4).unwrap();
+
+        // Captures and dimensions are reachable through their payload conversions, report their member type, and render
+        // exactly like the payload they wrap.
+        let captured = Constant::from(capture.clone());
+        let immediate = Constant::from(extent.clone());
+        assert_eq!(captured, Constant::Captured(capture));
+        assert_eq!(immediate, Constant::Dimension(extent.clone()));
+        assert_eq!(captured.r#type().into_owned(), ArrayIrType::Array(array_type.clone()));
+        assert_eq!(immediate.r#type().into_owned(), ArrayIrType::Dimension(extent.r#type().into_owned()));
+        assert_eq!(captured.to_string(), "capture#2:f64[4]");
+        assert_eq!(immediate.to_string(), extent.to_string());
+
+        let predicate = Constant::try_from(true).unwrap();
+        assert_eq!(predicate, Constant::Boolean(true));
+        assert_eq!(predicate.r#type().into_owned(), ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        assert_eq!(predicate.to_string(), "true");
+        assert_eq!(ryft_core::Concretizable::<bool>::concretize(&predicate), Ok(true));
+        assert_eq!(predicate.capture_index(), None);
+        assert_eq!(predicate.map_capture_index(|_| 99), predicate);
+        let projected = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
+        assert_eq!(projected, ArrayConstant::Boolean(true));
+        assert_eq!(ryft_core::Concretizable::<bool>::concretize(&projected), Ok(true));
+        assert_eq!(projected.capture_index(), None);
+        assert_eq!(projected.map_capture_index(|_| 99), projected);
+        assert_eq!(<Constant as ValueProjection<ArrayType>>::from_projected(projected), predicate);
+
+        // Only the captured variant names a capture-table slot, and so only it is renumbered by capture bookkeeping.
+        // An immediate is index-free and passes through every remapping unchanged.
+        assert_eq!(captured.capture_index(), Some(2));
+        assert_eq!(immediate.capture_index(), None);
+        assert_eq!(
+            captured.map_capture_index(|index| index + 3),
+            Constant::Captured(CaptureReference::new(5, ArrayIrType::Array(array_type.clone()))),
+        );
+        assert_eq!(immediate.map_capture_index(|_| 7), immediate);
+
+        // The array-typed captured case and immediate-dimension case project to their corresponding member universes
+        // and reject the other one.
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
+            Ok(ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()))),
+        );
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::into_projected(immediate.clone()),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::from_projected(ArrayConstant::Captured(CaptureReference::new(
+                2, array_type
+            ))),
+            captured,
+        );
+        assert_eq!(<Constant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));
+        assert_eq!(<Constant as ValueProjection<DimensionType>>::into_projected(immediate), Ok(extent),);
+        assert_eq!(
+            <Constant as ValueProjection<DimensionType>>::projected(&captured),
+            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+        );
+
+        // A reference-typed capture carries only its capture-table index and structural type metadata. Identity
+        // renaming preserves that index, while ordinary array/dimension projections remain unavailable. (No
+        // reference-typed `ValueProjection` exists: capture lifting is its intended consumer and has not landed.)
+        let source = DimensionVariable::new("source", DimensionBounds::positive(Some(8)).unwrap());
+        let target = DimensionVariable::new("target", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type =
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(source.clone())])));
+        let reference = Constant::Captured(CaptureReference::new(7, ArrayIrType::Reference(reference_type.clone())));
+        assert_eq!(reference.capture_index(), Some(7));
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+        assert_eq!(
+            <Constant as ValueProjection<DimensionType>>::projected(&reference),
+            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+        );
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source, target.clone()).unwrap();
+        let renamed_reference = reference.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed_reference.capture_index(), Some(7));
+        assert_eq!(
+            renamed_reference.r#type().into_owned(),
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![CoreDimension::Dynamic(target)]),
+            ))),
+        );
     }
 }

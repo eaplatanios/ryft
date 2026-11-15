@@ -14,15 +14,13 @@ use ryft_mlir::{
 };
 
 use crate::domains::Tracer;
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::compositions::{
-    NamedCompositionKey, lower_decomposition_call, named_composition_input_types,
-};
-use crate::experimental::lowering::types::{
+use crate::lowering::CollectiveLoweringState;
+use crate::lowering::compositions::{NamedCompositionKey, lower_decomposition_call, named_composition_input_types};
+use crate::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_tensor_type, physical_bound_type,
 };
-use crate::experimental::ops::FlatProgram;
+use crate::operations::FlatProgram;
 use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Traces the canonical scaled-dot decomposition for one validated operation boundary.
@@ -549,13 +547,14 @@ mod tests {
     };
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
-    use crate::experimental::ops::{ArrayConstant, Constant, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, CompiledFunction, Domain, FromPjrt, Session, compile, to_mlir_module_for_program};
+    use crate::values::ArrayConstant;
+    use crate::{Array, CompiledFunction, Constant, Domain, FromPjrt, Session, compile, to_mlir_module_for_program};
 
     use super::*;
 

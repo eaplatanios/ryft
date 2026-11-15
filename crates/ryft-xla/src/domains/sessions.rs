@@ -1,20 +1,25 @@
+use std::borrow::Cow;
+use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ryft_core::{
     ArrayType, CapturingContext, CompilationContext, Context, DeviceMesh, DiskCache, ImportingContext,
-    NestedTracingContext, ProgramError, SpecializationCache, TracingContext, TypeError,
+    NestedTracingContext, Parameter, ProgramError, SpecializationCache, TracingContext, Type, TypeError,
+    TypeIdentityRenaming, Typed,
 };
+use ryft_macros::Parameter;
 use ryft_pjrt::Client;
 
 use crate::arrays::RetainedArray;
+use crate::compilation::keys::EagerDispatchKey;
 use crate::domains::Domain;
-use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchKey, EagerDispatchProgram};
+use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchProgram};
 use crate::domains::effects::EffectScope;
 use crate::domains::runtimes::{RuntimeExtensions, RuntimeRegistry};
 use crate::domains::targets::Target;
-use crate::experimental::ops::{Constant, Operation, SessionConstant, SessionConstantOwner};
-use crate::{Array, Error, Value};
+use crate::{Array, Constant, Error, Operation, Value};
 
 /// Source of the process-unique [`Session::id`]s.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -92,7 +97,7 @@ pub struct Session<'c> {
     pub(super) default_effect_scope: Arc<EffectScope<'c>>,
 
     /// Client-associated runtime extensions and ownership of launches borrowing their resources.
-    pub(super) runtimes: RuntimeRegistry<'c>,
+    runtimes: RuntimeRegistry<'c>,
 
     /// Arrays that [`SessionConstant`] handles refer to, indexed by [`SessionConstant::index`]. A [`None`] entry was
     /// reclaimed and may be reused. Refer to [`Self::retain_constant`] for information on how arrays enter and leave
@@ -176,6 +181,11 @@ impl<'c> Session<'c> {
     /// Returns the shared compilation cache.
     pub fn compilation_context(&self) -> &CompilationContext<'c, Domain<'c>> {
         &self.cache
+    }
+
+    /// Returns the runtime extension instances of this session and the launches that still borrow their resources.
+    pub(crate) fn runtimes(&self) -> &RuntimeRegistry<'c> {
+        &self.runtimes
     }
 
     /// Creates a domain sharing this session's cache and default scope, with the default
@@ -276,6 +286,119 @@ impl<'c> Session<'c> {
     }
 }
 
+/// Lifetime-free handle to an array that a [`Session`] retains on behalf of a trace whose capture table cannot hold
+/// runtime arrays. Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of a
+/// [`composite`](ryft_core::composite) and its rules, which are traced over constants alone) still needs to refer to
+/// the runtime arrays that a compiled function it calls has captured. Importing such an array (refer to
+/// [`ThroughSession`]) registers it in the session and stages this handle as an immediate constant, which can appear in
+/// any region of any program, including lazily traced derivative rules.
+///
+/// The handle resolves to the retained array through the session that registered it. An eager domain resolves it when
+/// lifting it, and lowering turns every distinct handle of a program into a hidden executable argument that follows the
+/// captures of the program, so that compiled executables depend only on the array's type and never on its data.
+///
+/// # Ownership
+///
+/// Every handle co-owns its table entry through a shared ownership token, and so the programs, regions,
+/// derivative rules, and caches that hold a handle (or a clone of it) keep the array alive. The session reclaims an
+/// entry once no handle to it remains, and only then may it reuse its position for another array. Handles compare and
+/// hash by their session, position, and type, which therefore identify one array for as long as any handle exists.
+#[derive(Clone, Debug, Parameter)]
+pub struct SessionConstant {
+    /// Identifier of the [`Session`] that retains the array.
+    session: u64,
+
+    /// Position of the array in the constant table of that session.
+    index: usize,
+
+    /// [`ArrayType`] of the retained array.
+    r#type: ArrayType,
+
+    /// Token shared by every handle to the retained array, whose last release lets the session reclaim it.
+    owner: Arc<SessionConstantOwner>,
+}
+
+/// Ownership token that every [`SessionConstant`] handle to one retained array shares. The session keeps only a weak
+/// reference to it, so the token is released together with the last handle.
+#[derive(Debug)]
+struct SessionConstantOwner;
+
+impl SessionConstant {
+    /// Creates a new [`SessionConstant`] for the array at `index` in the constant table of session `session`, which
+    /// co-owns that entry through `owner`.
+    #[inline]
+    fn new(session: u64, index: usize, r#type: ArrayType, owner: Arc<SessionConstantOwner>) -> Self {
+        Self { session, index, r#type, owner }
+    }
+
+    /// Returns the identifier of the session that retains the array.
+    #[inline]
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
+    /// Returns the position of the array in the constant table of its session.
+    #[inline]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns the ownership token that this handle shares with every other handle to the same retained array.
+    #[inline]
+    fn owner(&self) -> &Arc<SessionConstantOwner> {
+        &self.owner
+    }
+
+    /// Returns this handle with the identities of its type renamed by `renaming`.
+    pub(crate) fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            session: self.session,
+            index: self.index,
+            r#type: self.r#type.rename_identities(renaming)?,
+            owner: Arc::clone(&self.owner),
+        })
+    }
+}
+
+// Handles are identified by their session, position, and type. The ownership token is shared by every handle to one
+// array and carries no identity of its own.
+impl PartialEq for SessionConstant {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.session == other.session && self.index == other.index && self.r#type == other.r#type
+    }
+}
+
+impl Eq for SessionConstant {}
+
+impl Hash for SessionConstant {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.session.hash(state);
+        self.index.hash(state);
+        self.r#type.hash(state);
+    }
+}
+
+impl Display for SessionConstant {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session#{}:{}", self.index, self.r#type)
+    }
+}
+
+impl Typed for SessionConstant {
+    type Type = ArrayType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
 /// Entry of the constant table of a [`Session`].
 struct RetainedConstant<'c> {
     /// Weak reference to the token that every [`SessionConstant`] handle to this entry shares. The entry may be
@@ -328,22 +451,26 @@ where
 mod tests {
     #[cfg(feature = "cuda-13")]
     use pretty_assertions::assert_eq;
-    use ryft_core::DataType;
+    use ryft_core::{
+        ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, DiskCache, Shape, Sharding,
+        ShardingDimension,
+    };
     #[cfg(feature = "cuda-13")]
     use ryft_core::{EffectClass, ReferenceRead, ReferenceWrite, TracingContext};
+    use ryft_pjrt::protos::{CompilationOptions, Precision};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    #[cfg(feature = "cuda-13")]
-    use crate::domains::options::Options;
     use crate::domains::tests::domain_mesh;
     #[cfg(feature = "cuda-13")]
     use crate::domains::tests::*;
     #[cfg(feature = "cuda-13")]
-    use crate::experimental::ops::{Constant, Operation};
-    #[cfg(feature = "cuda-13")]
     use crate::tests::values_from_bytes;
+    use crate::tests::{four_device_mesh_x, logical_mesh_2x2, values_to_bytes};
+    use crate::{Array, FromPjrt, Session};
+    #[cfg(feature = "cuda-13")]
+    use crate::{Constant, Operation, Options};
 
     use super::*;
 
@@ -592,5 +719,218 @@ mod tests {
         assert_eq!(session.retained_constant_count(), 1);
         assert_eq!(handle.index(), 0);
         assert!(session.constant(&domain, &handle).is_ok());
+    }
+
+    #[test]
+    fn test_compilation_context_preserves_custom_base_options() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let mesh = four_device_mesh_x(&client);
+
+        // Construct sibling domains of one session with two distinct base option templates. Different `Debug`
+        // representations should produce different cache keys, so the same MLIR program compiles separately under each
+        // domain even though both domains share the session's compilation cache.
+        let mut custom_options = CompilationOptions::default();
+        custom_options.matrix_unit_operand_precision = Precision::Highest as i32;
+        let default_engine = Session::new(&client).domain();
+        let custom_engine = default_engine.with_compilation_options(custom_options);
+
+        let values = [200.0f32, 201.0, 202.0, 203.0];
+        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(replicated_sharding)
+            .unwrap();
+
+        // Reshard once per domain with identical inputs. Each domain compiles its own executable.
+        let sharded_target =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let source_for_default = Array::from_host_buffer(
+            &default_engine,
+            source_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let _ = source_for_default
+            .to_placement(
+                &default_engine,
+                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() },
+            )
+            .unwrap();
+        let source_for_custom = Array::from_host_buffer(
+            &custom_engine,
+            source_type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let _ = source_for_custom
+            .to_placement(&custom_engine, crate::arrays::DevicePutTarget::Placement { mesh, sharding: sharded_target })
+            .unwrap();
+
+        // Both domains observe the shared session cache, which holds one executable per option template.
+        assert_eq!(default_engine.program_count(), 2);
+        assert_eq!(custom_engine.program_count(), 2);
+        assert_eq!(
+            custom_engine.compilation_options().matrix_unit_operand_precision,
+            Precision::Highest as i32,
+            "custom CompilationContext should retain the requested base options",
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_lru_evicts_oldest_entry() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
+        // Capacity = 2 so that the third distinct reshard evicts the first.
+        let engine = Session::with_cache_capacity(&client, 2).domain();
+
+        // Replicated source on the 2x2 mesh. Three reshards to three different non-replicated
+        // shardings all force the compiled path (the fast path returns `None` because no destination
+        // shard matches a source shard exactly).
+        let values = (0..16).map(|index| index as f32).collect::<Vec<_>>();
+        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let source_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
+                .with_sharding(replicated_sharding)
+                .unwrap();
+        let make_source = || {
+            Array::from_host_buffer(
+                &engine,
+                source_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&values).as_slice(),
+            )
+            .unwrap()
+        };
+        let sharded_along_x = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let sharded_along_y = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let sharded_along_both = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+
+        assert_eq!(engine.program_count(), 0);
+        let _ = make_source()
+            .to_placement(
+                &engine,
+                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_x },
+            )
+            .unwrap();
+        assert_eq!(engine.program_count(), 1);
+        let _ = make_source()
+            .to_placement(
+                &engine,
+                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y },
+            )
+            .unwrap();
+        assert_eq!(engine.program_count(), 2);
+        let _ = make_source()
+            .to_placement(
+                &engine,
+                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_both },
+            )
+            .unwrap();
+        assert_eq!(engine.program_count(), 2, "third distinct reshard should evict the LRU entry");
+    }
+
+    #[test]
+    fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let mesh = four_device_mesh_x(&client);
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let values = [200.0f32, 201.0, 202.0, 203.0];
+        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(replicated_sharding)
+            .unwrap();
+        let target_sharding =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // First context: cold compile, disk cache picks up the serialized executable.
+        let engine_one = Session::with_disk_cache(&client, DiskCache::open(cache_dir.path()).unwrap()).domain();
+        let source = Array::from_host_buffer(
+            &engine_one,
+            source_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let _ = source
+            .to_placement(
+                &engine_one,
+                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
+            )
+            .unwrap();
+        assert_eq!(engine_one.program_count(), 1, "first reshard should populate the in-memory cache");
+        drop(source);
+        drop(engine_one);
+
+        // Second context starts with an empty in-memory cache but loads from the disk cache.
+        let engine_two = Session::with_disk_cache(&client, DiskCache::open(cache_dir.path()).unwrap()).domain();
+        assert_eq!(engine_two.program_count(), 0, "fresh context starts empty in-memory");
+        let source_two =
+            Array::from_host_buffer(&engine_two, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let _ = source_two
+            .to_placement(&engine_two, crate::arrays::DevicePutTarget::Placement { mesh, sharding: target_sharding })
+            .unwrap();
+        assert_eq!(
+            engine_two.program_count(),
+            1,
+            "second context should populate its in-memory cache via the disk hit (no recompile expected)",
+        );
+    }
+
+    #[test]
+    fn test_compilation_context_clear_cache() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let engine = Session::new(&client).domain();
+        let mesh = four_device_mesh_x(&client);
+
+        let values = [80.0f32, 81.0, 82.0, 83.0];
+        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(replicated_sharding)
+            .unwrap();
+        let source_array =
+            Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let target_sharding =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        let _ = source_array
+            .to_placement(&engine, crate::arrays::DevicePutTarget::Placement { mesh, sharding: target_sharding })
+            .unwrap();
+        assert_eq!(engine.program_count(), 1);
+        engine.clear_cache();
+        assert_eq!(engine.program_count(), 0);
     }
 }

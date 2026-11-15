@@ -9,9 +9,9 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
-use ryft_xla::experimental::ops::{Constant, Operation};
 use ryft_xla::{
-    Error, LowerableOperation, LowerableOperationFamily, Lowerer, lower_operation_variants, to_mlir_module_for_program,
+    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, Operation, lower_operation_variants,
+    to_mlir_module_for_program,
 };
 
 /// Downstream operation that doubles its input, which `ryft-xla` knows nothing about.

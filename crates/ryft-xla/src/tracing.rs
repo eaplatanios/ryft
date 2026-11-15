@@ -1,21 +1,24 @@
-//! General XLA program tracing: the [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a
-//! fresh root tracing context of [`Domain`](crate::Domain), and its [`TracedProgram`] result reports the
-//! statistics of the staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`] module.
+//! General XLA program tracing: the [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a fresh
+//! root tracing context of [`Domain`](crate::Domain), and its [`TracedProgram`] result reports the statistics of the
+//! staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`](crate::lowering) module.
 //! [`Error`](crate::Error) reports the failures of both stages.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
 //! semantics of `shard_map` (boundary metadata, validation, closure tracing, and transform rules) are owned by the
 //! [`shard_map`](mod@ryft_core::operations::sharding::shard_map) module of `ryft-core`, and its manual computations
-//! lower to Shardy `sdy.manual_computation` operations in the [`lowering`] module. A `shard_map` traced on its own is
-//! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
-//! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
-//! global input and output type that has one (refer to [`TracedProgram::to_mlir_module`]), so tracing it over
-//! input types placed as its input shardings place them yields arguments and results placed as its boundary.
+//! lower to Shardy `sdy.manual_computation` operations in the [`lowering`](crate::lowering) module. A `shard_map`
+//! traced on its own is simply a traced function whose body binds one `shard_map` (e.g., through
+//! [`ShardMap`](ryft_core::ShardMap) on the context that [`trace_with_context`] passes to it). The lowered function
+//! signature carries the sharding of every global input and output type that has one (refer to
+//! [`TracedProgram::to_mlir_module`]), so tracing it over input types placed as its input shardings place them yields
+//! arguments and results placed as its boundary.
 //!
 //! Core failures use [`Error::Core`](crate::Error::Core), and concrete lowering failures have their own
 //! [`Error`](crate::Error) variants. Logical shard-map errors raised while tracing or lowering remain
 //! [`ProgramError::Custom`](ryft_core::ProgramError::Custom) payloads, recoverable through
 //! [`ProgramError::downcast_custom`](ryft_core::ProgramError::downcast_custom).
+
+// TODO(eaplatanios): Review this module.
 
 use std::cell::RefCell;
 
@@ -25,8 +28,8 @@ use ryft_core::{
 };
 
 use crate::domains::Tracer;
-use crate::experimental::ops::{Constant, Program};
-use crate::{Domain, Error};
+use crate::operations::Program;
+use crate::{Constant, Domain, Error};
 
 /// Array value that closures traced through [`trace`] receive and return: a [`DomainTracer`](ryft_core::DomainTracer)
 /// of [`Domain`] projected onto its array member. The `shard_map` bodies traced in XLA programs (e.g., through
@@ -260,12 +263,11 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::experimental::lowering::tests::{
-        static_sharded_array_type, test_sharding, test_spmd_compilation_options,
-    };
-    use crate::experimental::ops::{Operation, ProgramBuilder};
+    use crate::execution::ExecutionArguments;
+    use crate::lowering::tests::{static_sharded_array_type, test_sharding, test_spmd_compilation_options};
+    use crate::operations::ProgramBuilder;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt, Session};
+    use crate::{Array, FromPjrt, Operation, Session};
 
     use super::*;
 
@@ -334,7 +336,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -695,7 +697,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            crate::experimental::lowering::lower_mlir_module_for_program(
+            crate::lowering::lower_mlir_module_for_program(
                 &traced.program,
                 &[],
                 &traced.global_input_types,
@@ -817,7 +819,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let execute_arguments = Array::into_execute_arguments(input_arrays, execution_device_ids.as_slice()).unwrap();
+        let execute_arguments = ExecutionArguments::from_arrays(input_arrays, execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -969,7 +971,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let gradient_arguments =
-            Array::into_execute_arguments(gradient_inputs, gradient_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(gradient_inputs, gradient_device_ids.as_slice()).unwrap();
         let gradients = gradient_executable
             .execute(
                 gradient_arguments.as_execution_device_inputs(),
@@ -1087,7 +1089,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 4);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -1282,7 +1284,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -1396,7 +1398,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -1681,7 +1683,7 @@ mod tests {
                 .iter()
                 .map(|device| device.id().unwrap())
                 .collect::<Vec<_>>();
-            let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+            let arguments = ExecutionArguments::from_arrays(inputs, &device_ids).unwrap();
             let outputs = executable
                 .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
                 .unwrap()
@@ -1886,7 +1888,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2048,7 +2050,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2073,7 +2075,7 @@ mod tests {
             EagerContext, differentiable_dot_product_attention,
         };
 
-        use crate::experimental::ops::ArrayConstant;
+        use crate::values::ArrayConstant;
 
         type AttentionDomain = EagerContext<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
@@ -2185,7 +2187,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2322,7 +2324,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2459,7 +2461,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2631,7 +2633,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -2756,7 +2758,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3049,7 +3051,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -3205,7 +3207,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -3528,7 +3530,7 @@ mod tests {
         let execution_devices = executable.addressable_devices().unwrap();
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3642,7 +3644,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()
@@ -3833,7 +3835,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3947,7 +3949,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4097,7 +4099,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4250,7 +4252,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4384,7 +4386,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4501,7 +4503,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4728,7 +4730,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -4862,7 +4864,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),

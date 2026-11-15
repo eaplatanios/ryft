@@ -6,8 +6,8 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::CollectiveLoweringState;
+use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::collectives::{collective_replica_groups, mesh_axis_replica_groups};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 

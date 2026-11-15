@@ -10,6 +10,8 @@ use crate::kernels::rocm::RocmKernelEmbedding;
 use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, ROCM_KERNEL_CUSTOM_CALL_TARGET};
 
+// TODO(eaplatanios): Review this module.
+
 /// Validates direct Triton output against the logical boundary and delegates concrete artifact execution.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TritonEmbedding;

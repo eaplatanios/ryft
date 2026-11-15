@@ -6,7 +6,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ComplexOperation<ArrayType> {

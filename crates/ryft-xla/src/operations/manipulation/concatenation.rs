@@ -8,8 +8,8 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::EffectTokens;
-use crate::experimental::lowering::types::{
+use crate::lowering::EffectTokens;
+use crate::lowering::types::{
     dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_physical_bound_value,
     lower_restore_dynamic_dimensions, lower_static_index_constants, physical_bound_type,
 };
@@ -227,14 +227,15 @@ mod tests {
         load_cpu_plugin,
     };
 
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type,
     };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::lowering::types::physical_bound_type;
-    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::lowering::types::physical_bound_type;
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, CompiledFunction, FromPjrt, Session, ToPjrt, compile, to_mlir_module_for_program};
+    use crate::values::ArrayConstant;
+    use crate::{Array, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, compile, to_mlir_module_for_program};
 
     use super::*;
 

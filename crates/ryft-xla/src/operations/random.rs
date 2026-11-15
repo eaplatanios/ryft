@@ -9,7 +9,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
@@ -238,12 +238,11 @@ mod tests {
     };
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{
-        MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program,
-    };
-    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, Session, to_mlir_module_for_program};
+    use crate::values::ArrayConstant;
+    use crate::{Array, Constant, Domain, Session, to_mlir_module_for_program};
 
     // Uploads one generator state to the device and builds the same state on the reference backend.
     fn rng_states<'c>(
@@ -303,7 +302,8 @@ mod tests {
             RngBitGeneratorOperation,
         };
 
-        use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+        use crate::Constant;
+        use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
 
         // An exact extent refines the declared dynamic bits axis to a static one, so the generator lowers at that
         // static shape and its redundant extent operand does not reach `stablehlo.rng_bit_generator`.
@@ -352,9 +352,10 @@ mod tests {
             RandomAlgorithm, RngBitGeneratorOperation, ZeroOperation,
         };
 
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+        use crate::Constant;
+        use crate::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::operations::assertions::ensure_assertion_handler_registered;
+        use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
         use crate::tests::execution_client;
 
         // An exact operand makes both repeated bits axes static, but the symbolic peer must still equal that extent.
@@ -456,8 +457,8 @@ mod tests {
         };
         use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
-        use crate::experimental::lowering::types::lower_tensor_type;
-        use crate::experimental::ops::Operation;
+        use crate::lowering::types::lower_tensor_type;
+        use crate::operations::Operation;
         use crate::{Error, LowerableOperation, Lowerer};
 
         // Input types are validated before they are split into the state type and the extent operand types.

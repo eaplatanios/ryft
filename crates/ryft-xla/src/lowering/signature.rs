@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, Shape, Sharding};
 
+// TODO(eaplatanios): Review this module.
+
 /// Logical-to-physical argument and result mapping of one XLA executable boundary.
 ///
 /// Ryft retains every logical leaf in its staged and compiled function metadata. Statically shaped
@@ -355,9 +357,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::Placeholder;
 
-    use crate::experimental::lowering::tests::dynamic_dimension;
-    use crate::experimental::lowering::to_mlir_module_for_program;
-    use crate::experimental::ops::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::tests::dynamic_dimension;
+    use crate::lowering::to_mlir_module_for_program;
+    use crate::operations::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
 
     use super::*;
 

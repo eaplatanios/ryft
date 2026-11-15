@@ -9,8 +9,8 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::MlirLowerableValue;
-use crate::experimental::lowering::types::{
+use crate::lowering::MlirLowerableValue;
+use crate::lowering::types::{
     lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type,
     stable_hlo_dynamic_dimension_bound,
 };
@@ -600,15 +600,16 @@ mod tests {
         load_cpu_plugin,
     };
 
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
         test_vector_type,
     };
-    use crate::experimental::lowering::{MlirLowerableValue, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::{MlirLowerableValue, to_mlir_module_for_plain_program};
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::to_mlir_module_for_program;
+    use crate::values::ArrayConstant;
+    use crate::{Constant, to_mlir_module_for_program};
 
     use super::*;
 

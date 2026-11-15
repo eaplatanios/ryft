@@ -9,8 +9,7 @@ use ryft_core::{
     TypedProgram, Value as CoreValue, batch,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::experimental::ops::{Constant, Operation};
-use ryft_xla::{Array, FromPjrt, Options, Reference, Session, Value, compile_statefully};
+use ryft_xla::{Array, Constant, FromPjrt, Operation, Options, Reference, Session, Value, compile_statefully};
 
 /// Returns the `f32` contents of the shard of `array` on each device of its mesh, in mesh order.
 fn device_shards(array: &Array<'_>) -> Vec<Vec<f32>> {

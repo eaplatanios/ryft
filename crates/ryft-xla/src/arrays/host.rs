@@ -1,13 +1,15 @@
+//! Readback of device arrays to host memory, including the merging of shards and of unreduced values.
+
 use std::ops::Range;
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, Layout, ProgramError, Typed, UnreducedKind};
-use ryft_pjrt::{Event, ExecutionFence, HostDestination, HostDestinationSlice};
+use ryft_core::{ArrayType, DataType, Layout, ProgramError, StaticShape, Typed, UnreducedKind};
+use ryft_pjrt::{DeviceId, Event, ExecutionFence, HostDestination, HostDestinationSlice};
 
-use crate::arrays::ArrayTypeExtension;
-use crate::{Array, Domain, Error, ToPjrt};
+use crate::arrays::{Array, ArrayError, ArrayShard, ArrayTypeExtension, ShardIndex};
+use crate::{Domain, Error, ToPjrt};
 
-use super::*;
+// TODO(eaplatanios): Review this module.
 
 /// Returns row-major element strides for `global_shape`. `strides[i]` is the number of logical
 /// elements skipped when incrementing dimension `i` by one in a dense major-to-minor layout.
@@ -176,140 +178,197 @@ impl DenseArrayHostCopy {
     }
 }
 
-/// Starts copies for the shards of `array` that hold its whole value without awaiting them: every shard, or only the
-/// addressable ones when some shard lives in another process but the addressable ones cover the array and it has no
-/// unreduced axes (e.g., a replicated array). Errors, before issuing any copy, when the current process does not hold
-/// the whole value.
-pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<DenseArrayHostCopy, Error> {
-    let completion = array.execution_fence().cloned();
-    // Empty arrays have no payload either. Avoid asking PJRT for a zero-byte dynamic copy, whose size-query
-    // fallback can expose the bound allocation and its trailer instead of the empty logical value.
-    if array.data_type().is_zero() || array.shape().as_slice().contains(&0) {
-        return Ok(DenseArrayHostCopy {
-            global_shape: array.shape(),
-            element_type: array.data_type(),
-            unreduced_kind: array.sharding().unreduced_kind(),
-            total_byte_count: 0,
-            shards: DenseShardHostCopies::Merged(Vec::new()),
-            completion: Some(match completion {
-                Some(completion) => completion,
-                None => ExecutionFence::new(
-                    array
-                        .addressable_shards()
-                        .filter_map(|shard| shard.buffer())
-                        .map(|buffer| buffer.ready())
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-            }),
-        });
-    }
-
-    let global_shape = array.shape();
-    let element_type = array.data_type();
-    let total_byte_count = array.r#type().size_in_bytes()?;
-    let mesh = array.mesh();
-    let unreduced_axis_indices = mesh
-        .logical_mesh()
-        .axes()
-        .iter()
-        .enumerate()
-        .filter(|(_, axis)| array.sharding().unreduced_axes().contains(axis.name()))
-        .map(|(axis_index, _)| axis_index)
-        .collect::<Vec<_>>();
-    // Select the shards to copy before issuing any copy, so that no copy is in flight when the selection fails. Every
-    // shard is needed when some shard lives in another process and the array has unreduced axes, whose per-device
-    // values must all be combined. Otherwise, the addressable shards suffice when their distinct tiles cover the whole
-    // array (e.g., for a replicated array, as JAX reads a value that the current process holds in full), because the
-    // tiles of a sharding are either disjoint or identical.
-    let all_shards = array.shards();
-    let shards = match all_shards.iter().find(|shard| shard.buffer().is_none()) {
-        None => all_shards.iter().collect::<Vec<_>>(),
-        Some(missing) => {
-            let addressable = all_shards.iter().filter(|shard| shard.buffer().is_some()).collect::<Vec<_>>();
-            let mut tiles = Vec::<&[Range<usize>]>::new();
-            for shard in &addressable {
-                if !tiles.contains(&shard.slice()) {
-                    tiles.push(shard.slice());
-                }
-            }
-            let covered =
-                tiles.iter().map(|slices| slices.iter().map(|slice| slice.len()).product::<usize>()).sum::<usize>();
-            if !unreduced_axis_indices.is_empty() || covered != global_shape.as_slice().iter().product::<usize>() {
-                return Err(Error::from(ArrayError::MissingShardBuffer {
-                    shard_index: missing.index(),
-                    device_id: missing.device().id(),
-                }));
-            }
-            addressable
-        }
-    };
-    let unreduced_kind = array.sharding().unreduced_kind();
-
-    // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile suffices,
-    // and when every tile occupies one contiguous byte range of the dense representation (e.g., when only the leading
-    // dimension is sharded, or for a replicated array), each is copied directly into that range of one destination.
-    if unreduced_axis_indices.is_empty() {
-        let mut tiles = Vec::<(&ArrayShard<'_>, Range<usize>)>::new();
-        let mut contiguous = true;
-        for shard in &shards {
-            if tiles.iter().any(|(tile, _)| tile.slice() == shard.slice()) {
-                continue;
-            }
-            match contiguous_tile_byte_range(shard.slice(), global_shape.as_slice(), element_type)? {
-                Some(range) => tiles.push((shard, range)),
-                None => {
-                    contiguous = false;
-                    break;
-                }
-            }
-        }
-        if contiguous {
-            let mut destination = HostDestination::new(total_byte_count);
-            let ranges = tiles.iter().map(|(_, range)| range.clone()).collect::<Vec<_>>();
-            let slices = destination.split(ranges.as_slice())?;
-            let copies = tiles
-                .iter()
-                .zip(slices)
-                .map(|((shard, _), slice)| {
-                    let layout = ryft_pjrt::Layout::dense_major_to_minor(shard.shape().rank());
-                    Ok(shard.buffer().unwrap().copy_to_host_buffer(Some(layout), slice)?)
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            let shards = DenseShardHostCopies::Direct { destination, copies };
+impl<'o> Array<'o> {
+    /// Starts copies for the shards of `array` that hold its whole value without awaiting them: every shard, or only the
+    /// addressable ones when some shard lives in another process but the addressable ones cover the array and it has no
+    /// unreduced axes (e.g., a replicated array). Errors, before issuing any copy, when the current process does not hold
+    /// the whole value.
+    pub(crate) fn begin_copy_to_host(&self) -> Result<DenseArrayHostCopy, Error> {
+        let completion = self.execution_fence().cloned();
+        // Empty arrays have no payload either. Avoid asking PJRT for a zero-byte dynamic copy, whose size-query
+        // fallback can expose the bound allocation and its trailer instead of the empty logical value.
+        if self.data_type().is_zero() || self.shape().as_slice().contains(&0) {
             return Ok(DenseArrayHostCopy {
-                global_shape,
-                element_type,
-                unreduced_kind,
-                total_byte_count,
-                shards,
-                completion,
+                global_shape: self.shape(),
+                element_type: self.data_type(),
+                unreduced_kind: self.sharding().unreduced_kind(),
+                total_byte_count: 0,
+                shards: DenseShardHostCopies::Merged(Vec::new()),
+                completion: Some(match completion {
+                    Some(completion) => completion,
+                    None => ExecutionFence::new(
+                        self
+                            .addressable_shards()
+                            .filter_map(|shard| shard.buffer())
+                            .map(|buffer| buffer.ready())
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                }),
             });
         }
+
+        let global_shape = self.shape();
+        let element_type = self.data_type();
+        let total_byte_count = self.r#type().size_in_bytes()?;
+        let mesh = self.mesh();
+        let unreduced_axis_indices = mesh
+            .logical_mesh()
+            .axes()
+            .iter()
+            .enumerate()
+            .filter(|(_, axis)| self.sharding().unreduced_axes().contains(axis.name()))
+            .map(|(axis_index, _)| axis_index)
+            .collect::<Vec<_>>();
+        // Select the shards to copy before issuing any copy, so that no copy is in flight when the selection fails. Every
+        // shard is needed when some shard lives in another process and the array has unreduced axes, whose per-device
+        // values must all be combined. Otherwise, the addressable shards suffice when their distinct tiles cover the whole
+        // array (e.g., for a replicated array, as JAX reads a value that the current process holds in full), because the
+        // tiles of a sharding are either disjoint or identical.
+        let all_shards = self.shards();
+        let shards = match all_shards.iter().find(|shard| shard.buffer().is_none()) {
+            None => all_shards.iter().collect::<Vec<_>>(),
+            Some(missing) => {
+                let addressable = all_shards.iter().filter(|shard| shard.buffer().is_some()).collect::<Vec<_>>();
+                let mut tiles = Vec::<&[Range<usize>]>::new();
+                for shard in &addressable {
+                    if !tiles.contains(&shard.slice()) {
+                        tiles.push(shard.slice());
+                    }
+                }
+                let covered =
+                    tiles.iter().map(|slices| slices.iter().map(|slice| slice.len()).product::<usize>()).sum::<usize>();
+                if !unreduced_axis_indices.is_empty() || covered != global_shape.as_slice().iter().product::<usize>() {
+                    return Err(Error::from(ArrayError::MissingShardBuffer {
+                        shard_index: missing.index(),
+                        device_id: missing.device().id(),
+                    }));
+                }
+                addressable
+            }
+        };
+        let unreduced_kind = self.sharding().unreduced_kind();
+
+        // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile suffices,
+        // and when every tile occupies one contiguous byte range of the dense representation (e.g., when only the leading
+        // dimension is sharded, or for a replicated array), each is copied directly into that range of one destination.
+        if unreduced_axis_indices.is_empty() {
+            let mut tiles = Vec::<(&ArrayShard<'_>, Range<usize>)>::new();
+            let mut contiguous = true;
+            for shard in &shards {
+                if tiles.iter().any(|(tile, _)| tile.slice() == shard.slice()) {
+                    continue;
+                }
+                match contiguous_tile_byte_range(shard.slice(), global_shape.as_slice(), element_type)? {
+                    Some(range) => tiles.push((shard, range)),
+                    None => {
+                        contiguous = false;
+                        break;
+                    }
+                }
+            }
+            if contiguous {
+                let mut destination = HostDestination::new(total_byte_count);
+                let ranges = tiles.iter().map(|(_, range)| range.clone()).collect::<Vec<_>>();
+                let slices = destination.split(ranges.as_slice())?;
+                let copies = tiles
+                    .iter()
+                    .zip(slices)
+                    .map(|((shard, _), slice)| {
+                        let layout = ryft_pjrt::Layout::dense_major_to_minor(shard.shape().rank());
+                        Ok(shard.buffer().unwrap().copy_to_host_buffer(Some(layout), slice)?)
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let shards = DenseShardHostCopies::Direct { destination, copies };
+                return Ok(DenseArrayHostCopy {
+                    global_shape,
+                    element_type,
+                    unreduced_kind,
+                    total_byte_count,
+                    shards,
+                    completion,
+                });
+            }
+        }
+
+        let shards = shards
+            .into_iter()
+            .map(|shard| {
+                let device = shard.device();
+                let shard_index = shard.index();
+                let buffer = shard.buffer().map(|buffer| buffer.as_ref()).unwrap();
+                let shard_shape = shard.shape();
+                Ok(PendingDenseShardHostCopy {
+                    // The merge consumes row-major bytes even when the device buffer has another physical layout.
+                    event: buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?,
+                    shard_index,
+                    device_id: device.id(),
+                    expected_byte_count: ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?,
+                    slices: shard.slice().to_vec(),
+                    unreduced_coordinates: match mesh.device_coordinates(shard_index) {
+                        Some(coordinates) => unreduced_axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
+                        None => Vec::new(),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let shards = DenseShardHostCopies::Merged(shards);
+        Ok(DenseArrayHostCopy { global_shape, element_type, unreduced_kind, total_byte_count, shards, completion })
     }
 
-    let shards = shards
-        .into_iter()
-        .map(|shard| {
-            let device = shard.device();
+    /// Converts `array` to `layout` by copying each of its addressable shards to the host and uploading it back to the same
+    /// memory in `layout`, so that every device keeps its own shard bytes. This is the host relayout for an array whose
+    /// sharding has unreduced axes, whose devices hold separate summands of its value: materializing it densely would add
+    /// them, and uploading the sum would replace them with a canonical decomposition of it, which an unchecked `shard_map`
+    /// body (which observes the summands) could tell apart.
+    pub(crate) fn relayout_through_host(&self, domain: &Domain<'o>, layout: &Layout) -> Result<Array<'o>, Error> {
+        let r#type = self.r#type().into_owned().with_layout(layout.clone());
+        let device_layout = layout.to_pjrt()?;
+        let buffer_type = Array::physical_buffer_type(self.data_type());
+        let client = domain.client();
+        let mut buffers = Vec::new();
+        for shard in self.addressable_shards() {
             let shard_index = shard.index();
-            let buffer = shard.buffer().map(|buffer| buffer.as_ref()).unwrap();
-            let shard_shape = shard.shape();
-            Ok(PendingDenseShardHostCopy {
-                // The merge consumes row-major bytes even when the device buffer has another physical layout.
-                event: buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?,
-                shard_index,
-                device_id: device.id(),
-                expected_byte_count: ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?,
-                slices: shard.slice().to_vec(),
-                unreduced_coordinates: match mesh.device_coordinates(shard_index) {
-                    Some(coordinates) => unreduced_axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
-                    None => Vec::new(),
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    let shards = DenseShardHostCopies::Merged(shards);
-    Ok(DenseArrayHostCopy { global_shape, element_type, unreduced_kind, total_byte_count, shards, completion })
+            let buffer = shard.buffer().ok_or_else(|| {
+                Error::from(ArrayError::MissingShardBuffer { shard_index, device_id: shard.device().id() })
+            })?;
+            let shape = shard.shape();
+            let bytes = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?.r#await()?;
+            let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            buffers.push(client.buffer(
+                Arc::<[u8]>::from(bytes),
+                buffer_type,
+                dimensions.as_slice(),
+                None,
+                buffer.memory()?,
+                Some(device_layout.clone()),
+            )?);
+        }
+        Array::from_addressable_buffers_with_sharding(
+            domain,
+            r#type,
+            self.sharding().clone(),
+            self.mesh().clone(),
+            buffers,
+        )
+    }
+
+    /// Rejects a dense host round trip of `array` for `purpose` (i.e., materializing its logical value on the host and
+    /// uploading a value derived from it) when the sharding of `array` has unreduced axes. The devices of such an array
+    /// hold separate summands of its value, which the round trip would replace with a canonical decomposition of their sum,
+    /// and an unchecked `shard_map` body observes those summands.
+    pub(crate) fn validate_host_round_trip(&self, purpose: &str) -> Result<(), Error> {
+        if self.sharding().unreduced_axes().is_empty() {
+            return Ok(());
+        }
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "cannot {purpose} an array of type `{}` through the host, because its devices hold separate summands \
+                 along its unreduced axes, which a dense host copy would not preserve",
+                self.r#type(),
+            ),
+        }
+        .into())
+    }
 }
 
 /// Returns the byte range that the tile covering `slices` of an array of shape `global_shape` and element type
@@ -341,76 +400,6 @@ fn contiguous_tile_byte_range(
     let strides = row_major_element_strides(global_shape, element_type)?;
     let start = slices.iter().zip(&strides).map(|(slice, stride)| slice.start * stride).sum::<usize>() * element_size;
     Ok(Some(start..start + tile_element_count * element_size))
-}
-
-/// Copies the shards of `array` that hold its whole value to host and merges them into one dense row-major byte buffer,
-/// combining the per-device values that the devices hold along the unreduced axes of its sharding with its unreduced
-/// kind (e.g., adding summands). Errors when the current process does not hold the whole value (refer to
-/// [`begin_materialize_dense_array_bytes`]).
-///
-/// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and compiled paths cannot
-/// satisfy the requested placement.
-pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, Error> {
-    begin_materialize_dense_array_bytes(array)?.finish()
-}
-
-/// Converts `array` to `layout` by copying each of its addressable shards to the host and uploading it back to the same
-/// memory in `layout`, so that every device keeps its own shard bytes. This is the host relayout for an array whose
-/// sharding has unreduced axes, whose devices hold separate summands of its value: materializing it densely would add
-/// them, and uploading the sum would replace them with a canonical decomposition of it, which an unchecked `shard_map`
-/// body (which observes the summands) could tell apart.
-pub(crate) fn relayout_shards_through_host<'o>(
-    domain: &Domain<'o>,
-    array: &Array<'o>,
-    layout: &Layout,
-) -> Result<Array<'o>, Error> {
-    let r#type = array.r#type().into_owned().with_layout(layout.clone());
-    let device_layout = layout.to_pjrt()?;
-    let buffer_type = Array::physical_buffer_type(array.data_type());
-    let client = domain.client();
-    let mut buffers = Vec::new();
-    for shard in array.addressable_shards() {
-        let shard_index = shard.index();
-        let buffer = shard.buffer().ok_or_else(|| {
-            Error::from(ArrayError::MissingShardBuffer { shard_index, device_id: shard.device().id() })
-        })?;
-        let shape = shard.shape();
-        let bytes = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?.r#await()?;
-        let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-        buffers.push(client.buffer(
-            Arc::<[u8]>::from(bytes),
-            buffer_type,
-            dimensions.as_slice(),
-            None,
-            buffer.memory()?,
-            Some(device_layout.clone()),
-        )?);
-    }
-    Array::from_addressable_buffers_with_sharding(
-        domain,
-        r#type,
-        array.sharding().clone(),
-        array.mesh().clone(),
-        buffers,
-    )
-}
-
-/// Rejects a dense host round trip of `array` for `purpose` (i.e., materializing its logical value on the host and
-/// uploading a value derived from it) when the sharding of `array` has unreduced axes. The devices of such an array
-/// hold separate summands of its value, which the round trip would replace with a canonical decomposition of their sum,
-/// and an unchecked `shard_map` body observes those summands.
-pub(crate) fn reject_unreduced_host_round_trip(array: &Array<'_>, purpose: &str) -> Result<(), Error> {
-    if array.sharding().unreduced_axes().is_empty() {
-        return Ok(());
-    }
-    Err(ProgramError::UnsupportedOperation {
-        message: format!(
-            "cannot {purpose} an array of type `{}` through the host, because its devices hold separate summands \
-             along its unreduced axes, which a dense host copy would not preserve",
-            array.r#type(),
-        ),
-    }
-    .into())
 }
 
 /// Combines the host copies of the shards of an array whose sharding has unreduced axes into one copy per tile, which
@@ -598,100 +587,4 @@ fn merge_dense_byte_segment(
     }
     written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
     Ok(())
-}
-
-pub(crate) trait DenseHostDevicePutLeaf {
-    fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>);
-}
-
-pub(crate) trait DenseHostElement {
-    const DATA_TYPE: DataType;
-
-    fn append_ne_bytes(&self, bytes: &mut Vec<u8>);
-}
-
-macro_rules! impl_dense_host_element {
-    ($ty:ty, $data_type:expr) => {
-        impl DenseHostElement for $ty {
-            const DATA_TYPE: DataType = $data_type;
-
-            fn append_ne_bytes(&self, bytes: &mut Vec<u8>) {
-                bytes.extend_from_slice(&self.to_ne_bytes());
-            }
-        }
-    };
-}
-
-impl DenseHostElement for bool {
-    const DATA_TYPE: DataType = DataType::Boolean;
-
-    fn append_ne_bytes(&self, bytes: &mut Vec<u8>) {
-        bytes.push(u8::from(*self));
-    }
-}
-
-impl DenseHostElement for bf16 {
-    const DATA_TYPE: DataType = DataType::BF16;
-
-    fn append_ne_bytes(&self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(&self.to_bits().to_ne_bytes());
-    }
-}
-
-impl DenseHostElement for f16 {
-    const DATA_TYPE: DataType = DataType::F16;
-
-    fn append_ne_bytes(&self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(&self.to_bits().to_ne_bytes());
-    }
-}
-
-impl_dense_host_element!(i8, DataType::I8);
-impl_dense_host_element!(i16, DataType::I16);
-impl_dense_host_element!(i32, DataType::I32);
-impl_dense_host_element!(i64, DataType::I64);
-impl_dense_host_element!(u8, DataType::U8);
-impl_dense_host_element!(u16, DataType::U16);
-impl_dense_host_element!(u32, DataType::U32);
-impl_dense_host_element!(u64, DataType::U64);
-impl_dense_host_element!(f32, DataType::F32);
-impl_dense_host_element!(f64, DataType::F64);
-
-macro_rules! impl_scalar_dense_host_leaf {
-    ($ty:ty) => {
-        impl DenseHostDevicePutLeaf for $ty {
-            fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
-                let mut bytes = Vec::with_capacity(size_of::<$ty>());
-                self.append_ne_bytes(&mut bytes);
-                (Vec::new(), <$ty as DenseHostElement>::DATA_TYPE, bytes)
-            }
-        }
-    };
-}
-
-impl_scalar_dense_host_leaf!(bool);
-impl_scalar_dense_host_leaf!(i8);
-impl_scalar_dense_host_leaf!(i16);
-impl_scalar_dense_host_leaf!(i32);
-impl_scalar_dense_host_leaf!(i64);
-impl_scalar_dense_host_leaf!(u8);
-impl_scalar_dense_host_leaf!(u16);
-impl_scalar_dense_host_leaf!(u32);
-impl_scalar_dense_host_leaf!(u64);
-impl_scalar_dense_host_leaf!(bf16);
-impl_scalar_dense_host_leaf!(f16);
-impl_scalar_dense_host_leaf!(f32);
-impl_scalar_dense_host_leaf!(f64);
-
-#[cfg(feature = "ndarray")]
-impl<T: Clone + DenseHostElement, D: ndarray::Dimension> DenseHostDevicePutLeaf for ndarray::Array<T, D> {
-    fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
-        let standard_layout = self.as_standard_layout().to_owned();
-        let element_count = standard_layout.len();
-        let mut bytes = Vec::with_capacity(element_count * size_of::<T>());
-        for element in standard_layout.iter() {
-            element.append_ne_bytes(&mut bytes);
-        }
-        (standard_layout.shape().to_vec(), T::DATA_TYPE, bytes)
-    }
 }

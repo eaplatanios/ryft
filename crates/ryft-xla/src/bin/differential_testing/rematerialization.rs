@@ -23,9 +23,11 @@ use ryft_core::{
     scan,
 };
 use ryft_xla::Domain;
-use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
 
 use super::{DifferentialObservation, SCHEMA};
+
+// TODO(eaplatanios): Review this module.
 
 /// Tracer over which the bodies of the eagerly evaluated rematerialized functions are traced.
 type CoreTracer = Tracer<TracingContext<CoreArray, ArrayOperation<CoreArray>>>;

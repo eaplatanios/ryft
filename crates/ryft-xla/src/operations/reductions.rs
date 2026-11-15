@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArgMaxOperation, ArgMinOperation, ArrayType, ComparisonDirection, DataType, MeshAxisType, ProgramError,
-    REDUCE_OPERATION_NAME, ReduceOperation, ReductionKind,
+    ArgMaxOperation, ArgMinOperation, ArrayType, ComparisonDirection, DataType, MeshAxisType, REDUCE_OPERATION_NAME,
+    ReduceOperation, ReductionKind,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
@@ -10,7 +10,7 @@ use ryft_mlir::{
     Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_constant_elements_attribute, lower_element_type, lower_f64_constant_splat,
     lower_f64_scalar_elements_attribute, lower_restore_dynamic_dimensions, lower_signed_one_bit_to_mlir,
     lower_tensor_type, lower_unplaced_constant_output, physical_bound_type, signed_integer_width,
@@ -957,14 +957,13 @@ mod tests {
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         ProgramBuilder, lowered_reduce_module, lowered_unary_module, unproject_plain_program,
     };
-    use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::ArrayConstant;
-    use crate::pjrt::FromPjrt;
+    use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, Session, to_mlir_module_for_program};
+    use crate::values::ArrayConstant;
+    use crate::{Array, Domain, FromPjrt, Session, to_mlir_module_for_program};
 
     use super::*;
 

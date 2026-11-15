@@ -20,11 +20,13 @@ use ryft_pjrt::{
     GpuPlatform, Program, load_cuda_13_plugin,
 };
 #[cfg(any(test, feature = "cuda-13"))]
-use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
 
 use super::DifferentialObservation;
 #[cfg(feature = "cuda-13")]
 use super::{SCHEMA, collective_compilation_options, f32_values_from_bytes};
+
+// TODO(eaplatanios): Review this module.
 
 /// One accelerator experiment shared with JAX and the independent host reference.
 #[derive(Clone, Debug, Deserialize)]

@@ -20,7 +20,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
     physical_bound_type, static_dimensions,
 };
@@ -999,11 +999,10 @@ mod tests {
 
     use crate::domains::Tracer;
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::ops::FlatProgram;
-    use crate::pjrt::FromPjrt;
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::operations::FlatProgram;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, Session, to_mlir_module_for_program};
+    use crate::{Array, Domain, FromPjrt, Session, to_mlir_module_for_program};
 
     use super::*;
 

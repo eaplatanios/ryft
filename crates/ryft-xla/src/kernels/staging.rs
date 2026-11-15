@@ -27,9 +27,11 @@ use ryft_kernels::{
 };
 use ryft_mlir::ValueRef;
 
-use crate::experimental::ops::{Constant, FlatProgram, Operation};
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Target};
+use crate::operations::FlatProgram;
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation, Target};
+
+// TODO(eaplatanios): Review this module.
 
 /// Adapter operation families enabled in this XLA integration.
 ///
@@ -1242,8 +1244,8 @@ pub(crate) mod tests {
     use ryft_core::{CustomCallOperation, EffectClass, TypedProgram};
     use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
 
-    use crate::experimental::ops::ProgramBuilder;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
+    use crate::operations::ProgramBuilder;
     use crate::{FromPjrt, Session};
 
     use super::*;
@@ -1716,7 +1718,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_rules() {
         use ryft_core::{ArrayOperation, CustomRuleDefinition, CustomRuleRegistration, LiftedCustomRules};
 
-        use crate::experimental::ops::ArrayConstant;
+        use crate::values::ArrayConstant;
 
         // A rule set registered in the XLA family (written against XLA tracers) and one registered in the array member
         // family (written against array tracers) both double the tangent of the identity kernel.

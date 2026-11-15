@@ -9,8 +9,8 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::EffectTokens;
-use crate::experimental::lowering::types::{
+use crate::lowering::EffectTokens;
+use crate::lowering::types::{
     dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape, lower_runtime_dimension_size_i64,
     lower_static_index_constants, lower_tensor_type, physical_bound_type, stable_hlo_dynamic_dimension_bound,
     static_dimensions,
@@ -312,18 +312,17 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::experimental::ArrayTracer;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
         ragged_dot_cpu_compilation_options, shard_map_module, test_matrix_type, test_vector_type,
         unproject_plain_program,
     };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{
-        ArrayConstant, Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder,
-    };
+    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::to_mlir_module_for_program;
+    use crate::tracing::ArrayTracer;
+    use crate::values::ArrayConstant;
+    use crate::{Constant, to_mlir_module_for_program};
 
     use super::*;
 

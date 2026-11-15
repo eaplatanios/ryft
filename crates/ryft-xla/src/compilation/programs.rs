@@ -6,15 +6,14 @@ use ryft_core::{ArrayIrType, ArrayType, DeviceMesh, ExternalReferenceBinding, Sh
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
-use crate::Error;
-use crate::domains::analysis::{CompilationAnalysis, OptimizedProgram};
-use crate::domains::compilation::CompilationError;
-use crate::domains::execution::ExecutionPlan;
-use crate::domains::options::FeedbackDirectedProfile;
-use crate::domains::persistence::canonical_boundary_types;
-use crate::domains::runtimes::RuntimeRequirement;
-use crate::experimental::lowering::signature::ExecutableSignature;
-use crate::experimental::ops::SessionConstant;
+use crate::compilation::CompilationError;
+use crate::compilation::analysis::{CompilationAnalysis, OptimizedProgram};
+use crate::compilation::keys::canonical_boundary_types;
+use crate::compilation::options::FeedbackDirectedProfile;
+use crate::domains::RuntimeRequirement;
+use crate::execution::ExecutionPlan;
+use crate::lowering::signature::ExecutableSignature;
+use crate::{Error, SessionConstant};
 
 // TODO(eaplatanios): Review this module.
 
@@ -145,6 +144,65 @@ impl LoweredProgram {
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
+    }
+
+    /// Returns the handles of the session constants that the executable receives as hidden arguments after its
+    /// captures. The handles are shared so that callers can retain them without copying.
+    #[inline]
+    pub(crate) fn session_constants(&self) -> &Arc<[SessionConstant]> {
+        &self.session_constants
+    }
+
+    /// Returns the effective PJRT compilation options that this program is compiled with.
+    #[inline]
+    pub fn compilation_options(&self) -> &CompilationOptions {
+        &self.compilation_options
+    }
+
+    /// Returns the default donation flag of each public logical input, excluding captures.
+    #[inline]
+    pub fn donation_flags(&self) -> &[bool] {
+        &self.donation_flags
+    }
+
+    /// Returns the name of the PJRT platform that this program was lowered for.
+    #[inline]
+    pub fn platform_name(&self) -> &str {
+        &self.platform_name
+    }
+
+    /// Returns the version of the PJRT platform that this program was lowered for.
+    #[inline]
+    pub fn platform_version(&self) -> &str {
+        &self.platform_version
+    }
+
+    /// Returns the PJRT device kinds of the mesh devices, in mesh order.
+    #[inline]
+    pub fn device_kinds(&self) -> &[String] {
+        &self.device_kinds
+    }
+
+    /// Returns the mapping between the logical boundary of the program and the physical boundary of its executable.
+    #[cfg(test)]
+    pub(crate) fn signature(&self) -> &ExecutableSignature {
+        &self.signature
+    }
+
+    /// Returns this program with `stable_hlo` in place of its lowered module, for tests that compile a module which
+    /// lowering itself would never produce.
+    #[cfg(test)]
+    pub(crate) fn with_stable_hlo(mut self, stable_hlo: impl Into<Arc<str>>) -> Self {
+        self.stable_hlo = stable_hlo.into();
+        self
+    }
+
+    /// Returns this program with `compilation_options` in place of its effective compilation options, for tests
+    /// that force a compilation mode which lowering would not select.
+    #[cfg(test)]
+    pub(crate) fn with_compilation_options(mut self, compilation_options: CompilationOptions) -> Self {
+        self.compilation_options = compilation_options;
+        self
     }
 }
 
@@ -284,6 +342,90 @@ impl<'c> CompiledProgram<'c> {
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
+    }
+
+    /// Returns every logical flat output type, i.e., the public outputs that [`Self::output_types`] returns followed by
+    /// the hidden final state outputs appended by reference discharge.
+    #[inline]
+    pub(crate) fn all_output_types(&self) -> &[ArrayType] {
+        &self.output_types
+    }
+
+    /// Returns the external reference bindings of the executable, whose final states are its hidden outputs.
+    #[inline]
+    pub(crate) fn reference_states(&self) -> &[ExternalReferenceBinding] {
+        &self.reference_states
+    }
+
+    /// Returns the mapping between the logical boundary of the program and the physical boundary of its executable.
+    #[inline]
+    pub(crate) fn signature(&self) -> &ExecutableSignature {
+        &self.signature
+    }
+
+    /// Returns the default donation flag of each public logical input, excluding captures.
+    #[inline]
+    pub(crate) fn donation_flags(&self) -> &[bool] {
+        &self.donation_flags
+    }
+
+    /// Returns the number of leading logical inputs that captures supply.
+    #[inline]
+    pub(crate) fn capture_count(&self) -> usize {
+        self.capture_count
+    }
+
+    /// Returns the sharding that the executable expects of each physical argument, in argument order.
+    #[inline]
+    pub(crate) fn expected_argument_shardings(&self) -> &[Sharding] {
+        &self.expected_argument_shardings
+    }
+
+    /// Returns the runtime placement of each logical output, including over auto mesh axes.
+    #[inline]
+    pub(crate) fn output_shardings(&self) -> &[Sharding] {
+        &self.output_shardings
+    }
+
+    /// Returns the execution facts that selected kernels were compiled against, or [`None`] for a program without
+    /// selected kernels.
+    #[inline]
+    pub(crate) fn kernel_execution_facts(&self) -> Option<&[u8]> {
+        self.kernel_execution_facts.as_deref()
+    }
+
+    /// Returns the execution metadata that was derived once when this program was compiled or loaded.
+    #[inline]
+    pub(crate) fn plan(&self) -> &ExecutionPlan {
+        &self.plan
+    }
+
+    /// Returns the effective PJRT compilation options that this program was compiled with.
+    #[inline]
+    pub fn compilation_options(&self) -> &CompilationOptions {
+        &self.compilation_options
+    }
+
+    /// Returns whether the executable requires the host runtime assertion handler.
+    #[inline]
+    pub fn requires_assertion_handler(&self) -> bool {
+        self.requires_assertion_handler
+    }
+
+    /// Returns this program with `kernel_execution_facts` in place of its recorded kernel execution facts, for tests
+    /// of execution admission that need no kernel compiler.
+    #[cfg(test)]
+    pub(crate) fn with_kernel_execution_facts(mut self, kernel_execution_facts: Option<Vec<u8>>) -> Self {
+        self.kernel_execution_facts = kernel_execution_facts;
+        self
+    }
+
+    /// Returns this program with `mesh` in place of the mesh that it was compiled for, for tests of execution
+    /// admission against a changed topology.
+    #[cfg(test)]
+    pub(crate) fn with_mesh(mut self, mesh: DeviceMesh) -> Self {
+        self.mesh = mesh;
+        self
     }
 
     /// Returns the backend's optimized program only when explicitly requested.
@@ -468,7 +610,7 @@ mod tests {
 
     use crate::Error;
     use crate::domains::tests::*;
-    use crate::experimental::lowering::signature::ExecutableSignature;
+    use crate::lowering::signature::ExecutableSignature;
 
     use super::*;
 

@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use ryft_core::{Device, DeviceId, DeviceMesh};
 use ryft_pjrt::{Client, Value as PjrtValue};
 
-use crate::FromPjrt;
-use crate::domains::compilation::CompilationError;
+use crate::{CompilationError, FromPjrt};
 
 // TODO(eaplatanios): Review this module.
 
@@ -166,7 +165,7 @@ impl Target {
     ///
     /// Returns [`CompilationError::InvalidPersistentExecutable`] if a mesh device identifier is absent from the
     /// snapshot.
-    pub(super) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, CompilationError> {
+    pub(crate) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, CompilationError> {
         mesh.devices()
             .iter()
             .map(|mesh_device| {
@@ -244,10 +243,10 @@ mod tests {
     use ryft_core::{ArrayIrType, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::domains::options::Options;
     use crate::domains::sessions::Session;
     use crate::domains::tests::*;
-    use crate::experimental::ops::{FlatProgram, Operation, ProgramBuilder};
+    use crate::operations::{FlatProgram, ProgramBuilder};
+    use crate::{Operation, Options};
 
     use super::*;
 
@@ -328,10 +327,10 @@ mod tests {
             .to_vec();
         let program: FlatProgram = builder.build(output, vec![Placeholder], vec![Placeholder]).unwrap();
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.platform_name.as_ref(), target.platform_name());
-        assert_eq!(lowered.platform_version.as_ref(), target.platform_version());
+        assert_eq!(lowered.platform_name(), target.platform_name());
+        assert_eq!(lowered.platform_version(), target.platform_version());
         let device_kinds = devices.iter().map(|device| device.kind().unwrap().into_owned()).collect::<Vec<_>>();
-        assert_eq!(lowered.device_kinds.as_ref(), device_kinds.as_slice());
+        assert_eq!(lowered.device_kinds(), device_kinds.as_slice());
     }
 
     #[test]

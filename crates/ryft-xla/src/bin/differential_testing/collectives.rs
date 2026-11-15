@@ -13,9 +13,11 @@ use ryft_core::{
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::FromPjrt;
-use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
 
 use super::{DifferentialObservation, SCHEMA, execute_collective_inputs};
+
+// TODO(eaplatanios): Review this module.
 
 /// One finite collective experiment shared with JAX and the independent host reference.
 #[derive(Clone, Debug, Deserialize)]

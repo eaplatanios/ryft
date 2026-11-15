@@ -31,6 +31,8 @@ use crate::domains::{
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
 use crate::{Error, Target, ToPjrt};
 
+// TODO(eaplatanios): Review this module.
+
 /// Registered handler for versioned ready CUDA artifacts embedded in StableHLO.
 pub const CUDA_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.cuda";
 
@@ -39,6 +41,12 @@ const CUDA_RUNTIME_TYPE_NAME: &str = "ryft.kernel.cuda.runtime";
 
 /// Explicit native type ID registered under [`CUDA_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
 const CUDA_RUNTIME_TYPE_ID: FfiTypeId = named_ffi_type_id(CUDA_RUNTIME_TYPE_NAME);
+
+impl From<ryft_cuda::Error> for Error {
+    fn from(error: ryft_cuda::Error) -> Self {
+        Self::custom(error)
+    }
+}
 
 /// Custom-call buffer supplying one logical CUDA array parameter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,6 +702,16 @@ mod tests {
     }
 
     #[test]
+    fn test_error_from_cuda_error() {
+        let error = Error::from(ryft_cuda::Error::integration("missing CUDA context"));
+        assert_eq!(error.to_string(), "missing CUDA context");
+        assert!(matches!(
+            error.downcast_custom::<ryft_cuda::Error>(),
+            Some(ryft_cuda::Error::Integration { message, .. }) if message == "missing CUDA context",
+        ));
+    }
+
+    #[test]
     fn test_cuda_kernel_embedding_new() {
         let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
         assert_eq!(embedding.parameters(), &[CudaKernelParameterBinding::Array(0)]);
@@ -784,8 +802,9 @@ mod tests {
     fn test_cuda_kernel_embedding_declares_runtime_without_external_effects() {
         use ryft_core::{ArrayType, DataType, Placeholder};
 
-        use crate::experimental::lowering::lower_mlir_module_for_program;
-        use crate::experimental::ops::{Constant, ProgramBuilder};
+        use crate::Constant;
+        use crate::lowering::lower_mlir_module_for_program;
+        use crate::operations::ProgramBuilder;
 
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -834,8 +853,9 @@ mod tests {
     fn test_cuda_kernel_embedding_with_row_major_layouts() {
         use ryft_core::{ArrayType, DataType, Placeholder};
 
-        use crate::experimental::lowering::lower_mlir_module_for_program;
-        use crate::experimental::ops::{Constant, ProgramBuilder};
+        use crate::Constant;
+        use crate::lowering::lower_mlir_module_for_program;
+        use crate::operations::ProgramBuilder;
 
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();

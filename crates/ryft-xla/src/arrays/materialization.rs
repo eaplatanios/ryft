@@ -1,9 +1,13 @@
+//! Cache of the padded copies of an [`Array`] that bounded dynamic executables consume.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
 use ryft_core::ArrayType;
 
-use crate::Array;
+use crate::arrays::Array;
+
+// TODO(eaplatanios): Review this module.
 
 /// Maximum number of ready bound-shaped materializations retained by one logical [`Array`].
 ///

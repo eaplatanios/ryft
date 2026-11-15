@@ -152,6 +152,21 @@ pub enum KernelEmbeddingError {
     },
 }
 
+// TODO(eaplatanios): Review this module.
+
+// Experimental kernel integrations retain their concrete error payloads in the common custom carrier.
+impl From<KernelEmbeddingError> for crate::Error {
+    fn from(error: KernelEmbeddingError) -> Self {
+        Self::custom(error)
+    }
+}
+
+impl From<ryft_kernels::KernelError> for crate::Error {
+    fn from(error: ryft_kernels::KernelError) -> Self {
+        Self::custom(error)
+    }
+}
+
 /// XLA-owned conversion of one adapter-owned compiler output into a canonical custom call.
 ///
 /// Implementations are trusted integration code: they must validate the output's version, physical argument map,
@@ -412,6 +427,7 @@ pub(crate) fn validate_kernel_sharding(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::convert::Infallible;
+    use std::error::Error as StandardError;
 
     use indoc::formatdoc;
     use pretty_assertions::assert_eq;
@@ -424,8 +440,9 @@ pub(crate) mod tests {
         KernelParameterAccess,
     };
 
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::ops::{Constant, ProgramBuilder};
+    use crate::Constant;
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::operations::ProgramBuilder;
 
     use super::*;
 
@@ -528,6 +545,26 @@ pub(crate) mod tests {
         ) -> Result<DeferredCopy, KernelCompilationError<Infallible>> {
             Ok(DeferredCopy { schema: 1 })
         }
+    }
+
+    #[test]
+    fn test_error_from_kernel_embedding_error() {
+        let error =
+            crate::Error::from(KernelEmbeddingError::Compiler(Box::new(std::io::Error::other("compiler failed"))));
+        assert_eq!(error.to_string(), "kernel compilation failed: compiler failed");
+        let kernel = error.downcast_custom::<KernelEmbeddingError>().unwrap();
+        assert!(matches!(kernel, KernelEmbeddingError::Compiler(_)));
+        assert_eq!(kernel.source().unwrap().to_string(), "compiler failed");
+    }
+
+    #[test]
+    fn test_error_from_kernel_error() {
+        let error = crate::Error::from(ryft_kernels::KernelError::ParameterRank { array_rank: 3, block_rank: 2 });
+        assert_eq!(error.to_string(), "kernel parameter has array rank 3 but block rank 2");
+        assert_eq!(
+            error.downcast_custom::<ryft_kernels::KernelError>(),
+            Some(&ryft_kernels::KernelError::ParameterRank { array_rank: 3, block_rank: 2 }),
+        );
     }
 
     #[test]

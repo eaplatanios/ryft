@@ -30,12 +30,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{DataType, Placeholder, Shape};
 
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::execution_client;
+    use crate::values::ArrayConstant;
 
     use super::*;
 

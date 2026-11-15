@@ -1,7 +1,5 @@
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,195 +9,28 @@ use ryft_core::{
     Constant as CoreConstant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DimensionFromScalar,
     DimensionOperation, DimensionSize, DimensionType, DimensionValue, EagerContext, EffectClass, EmptyRegionDriver,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation as CoreOperation,
-    OperationProvider, Placeholder, ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionKey, RegionRef,
-    Shape, Sharding, SpecializationCacheEntry, Type, TypeError, Typed, TypedProgram, ZERO_OPERATION_NAME, Zero,
-    ZeroOperation,
+    OperationProvider, Placeholder, ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionRef, Shape,
+    SpecializationCacheEntry, Type, TypeError, Typed, TypedProgram, ZERO_OPERATION_NAME, Zero, ZeroOperation,
 };
 use ryft_pjrt::Client;
-use ryft_pjrt::protos::CompilationOptions;
 
+use crate::compilation::CompiledProgram;
+use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::domains::Domain;
 use crate::domains::effects::ensure_effect_dispatch_allowed;
-use crate::domains::options::Options;
-use crate::domains::programs::CompiledProgram;
+use crate::domains::sessions::SessionConstant;
 use crate::domains::targets::Target;
-use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder, SessionConstant};
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::{Array, ArrayError, Dimension, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt, Value};
+use crate::operations::{FlatProgram, ProgramBuilder};
+use crate::{
+    Array, ArrayError, Constant, Dimension, Error, FromPjrt, Operation, Options, ShardDescriptor, ShardLayout, ToPjrt,
+    Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
 /// Maximum number of compiled operation applications retained in a session's eager dispatch cache.
 pub(super) const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
-
-/// Key of the eager dispatch cache of a [`Session`](crate::Session), which maps one eager operation application
-/// directly to its compiled program so that a repeated application skips tracing, lowering, and compilation-key
-/// construction, like JAX's per-primitive `(primitive, params)` cache in front of its dispatch path.
-///
-/// The key must capture everything that the eager lowering reads besides the session itself (whose client, and thus
-/// [`Target`], is fixed): the operation including all of its attributes, the contents of every attached region
-/// (for operations such as `condition`, `while`, `scan`, `jit_call`, or `shard_map`), the physical type of every array
-/// input (shardings included), the extent of every dimension input (because eager binding bakes dimension inputs into
-/// the traced program as constants), the device mesh that the lowering compiles against, and the domain's compilation
-/// options. Attached regions are keyed by their contents (refer to [`RegionKey`]), so applications whose closures are
-/// traced afresh on every call still hit the cache when they trace to the same regions. Instruction provenance is not
-/// part of a [`RegionKey`], so applications that differ only in provenance share one compiled program, whose debug
-/// locations are those of the first application.
-///
-/// Keys are compared and hashed through [`EagerDispatchKeyView`], which they share with the borrowed
-/// [`EagerDispatchQuery`] that eager dispatch uses to look up hits. Cache hits skip tracing and lowering while
-/// execution still uses the invoking domain's effect scope and runtime resources.
-#[derive(Clone)]
-pub(super) struct EagerDispatchKey {
-    /// Applied operation, compared and hashed with all of its attributes.
-    operation: Operation,
-
-    /// Keys of the regions attached to the application, in operation-defined order.
-    regions: Arc<[RegionKey<Constant, Operation>]>,
-
-    /// Inputs of the application, in order.
-    inputs: Arc<[EagerDispatchInput]>,
-
-    /// Mesh that eager lowering compiles against when it is not derived from the operation alone: the domain mesh if
-    /// it has one, and otherwise the mesh of the first array input. It is [`None`] only for an input-free operation of
-    /// a domain without a mesh, whose mesh is then determined by the operation and the session's client.
-    mesh: Option<DeviceMesh>,
-
-    /// Compilation options of the dispatching domain, compared and hashed by the address of their shared allocation.
-    /// Domains created through [`Session::domain`](crate::Session::domain) share one default allocation, so they
-    /// share eager dispatch cache entries, while each [`Domain::with_compilation_options`] call creates a distinct
-    /// identity. Options that are equal but separately allocated therefore only miss each other's entries.
-    compilation_options: Arc<CompilationOptions>,
-}
-
-/// One input of an [`EagerDispatchKey`].
-#[derive(Clone)]
-enum EagerDispatchInput {
-    /// Array input, keyed by its physical [`ArrayType`] (including its sharding) and by its runtime placement, which
-    /// also covers the auto mesh axes that its type never records.
-    Array(ArrayType, Sharding),
-
-    /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
-    Dimension(DimensionValue),
-}
-
-/// Borrowed form of one [`EagerDispatchInput`], which owned keys and borrowed queries compare and hash alike.
-#[derive(PartialEq, Eq, Hash)]
-enum EagerDispatchInputRef<'o> {
-    /// Array input, keyed by its physical [`ArrayType`] (including its sharding) and by its runtime placement.
-    Array(Cow<'o, ArrayType>, &'o Sharding),
-
-    /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
-    Dimension(&'o DimensionValue),
-}
-
-impl EagerDispatchInputRef<'_> {
-    /// Returns the owned [`EagerDispatchInput`] that this reference borrows from or describes.
-    fn into_owned(self) -> EagerDispatchInput {
-        match self {
-            Self::Array(r#type, sharding) => EagerDispatchInput::Array(r#type.into_owned(), sharding.clone()),
-            Self::Dimension(dimension) => EagerDispatchInput::Dimension(dimension.clone()),
-        }
-    }
-}
-
-/// Common view of an owned [`EagerDispatchKey`] and a borrowed [`EagerDispatchQuery`]. Both forms are compared
-/// and hashed through `dyn EagerDispatchKeyView`, so that equal keys and queries hash alike and an owned key can be
-/// [borrowed](std::borrow::Borrow) as a view for lookups in the eager dispatch cache.
-trait EagerDispatchKeyView {
-    /// Returns the applied operation.
-    fn operation(&self) -> &Operation;
-
-    /// Returns the keys of the regions attached to the application, in operation-defined order.
-    fn regions(&self) -> &[RegionKey<Constant, Operation>];
-
-    /// Returns the number of inputs of the application.
-    fn input_count(&self) -> usize;
-
-    /// Returns the input at `index`, which must be smaller than [`Self::input_count`].
-    fn input(&self, index: usize) -> EagerDispatchInputRef<'_>;
-
-    /// Returns the mesh that the eager lowering compiles against, if it is not derived from the operation alone.
-    fn mesh(&self) -> Option<&DeviceMesh>;
-
-    /// Returns the compilation options of the dispatching domain, which are compared by identity.
-    fn compilation_options(&self) -> &Arc<CompilationOptions>;
-}
-
-impl EagerDispatchKeyView for EagerDispatchKey {
-    fn operation(&self) -> &Operation {
-        &self.operation
-    }
-
-    fn regions(&self) -> &[RegionKey<Constant, Operation>] {
-        &self.regions
-    }
-
-    fn input_count(&self) -> usize {
-        self.inputs.len()
-    }
-
-    fn input(&self, index: usize) -> EagerDispatchInputRef<'_> {
-        match &self.inputs[index] {
-            EagerDispatchInput::Array(r#type, sharding) => {
-                EagerDispatchInputRef::Array(Cow::Borrowed(r#type), sharding)
-            }
-            EagerDispatchInput::Dimension(dimension) => EagerDispatchInputRef::Dimension(dimension),
-        }
-    }
-
-    fn mesh(&self) -> Option<&DeviceMesh> {
-        self.mesh.as_ref()
-    }
-
-    fn compilation_options(&self) -> &Arc<CompilationOptions> {
-        &self.compilation_options
-    }
-}
-
-impl PartialEq for dyn EagerDispatchKeyView + '_ {
-    fn eq(&self, other: &Self) -> bool {
-        self.operation() == other.operation()
-            && self.regions() == other.regions()
-            && self.input_count() == other.input_count()
-            && (0..self.input_count()).all(|index| self.input(index) == other.input(index))
-            && self.mesh() == other.mesh()
-            && Arc::ptr_eq(self.compilation_options(), other.compilation_options())
-    }
-}
-
-impl Eq for dyn EagerDispatchKeyView + '_ {}
-
-impl Hash for dyn EagerDispatchKeyView + '_ {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.operation().hash(state);
-        self.regions().hash(state);
-        self.input_count().hash(state);
-        (0..self.input_count()).for_each(|index| self.input(index).hash(state));
-        self.mesh().hash(state);
-        Arc::as_ptr(self.compilation_options()).hash(state);
-    }
-}
-
-impl PartialEq for EagerDispatchKey {
-    fn eq(&self, other: &Self) -> bool {
-        (self as &dyn EagerDispatchKeyView) == (other as &dyn EagerDispatchKeyView)
-    }
-}
-
-impl Eq for EagerDispatchKey {}
-
-impl Hash for EagerDispatchKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        (self as &dyn EagerDispatchKeyView).hash(state);
-    }
-}
-
-impl<'o> std::borrow::Borrow<dyn EagerDispatchKeyView + 'o> for EagerDispatchKey {
-    fn borrow(&self) -> &(dyn EagerDispatchKeyView + 'o) {
-        self
-    }
-}
 
 /// Compiled program that the eager dispatch cache retains for one [`EagerDispatchKey`].
 #[derive(Clone)]
@@ -225,55 +56,6 @@ enum EagerOutput {
     /// (e.g., the batch extent that a batched loop threads through its carry) is rebuilt from its type on the host
     /// rather than returned by the compiled program, which can only return arrays.
     Dimension(DimensionValue),
-}
-
-/// Borrowed [`EagerDispatchKey`] over the arguments of one eager application, used to look up cache hits without
-/// building an owned key.
-struct EagerDispatchQuery<'o, 'c> {
-    /// Applied operation.
-    operation: &'o Operation,
-
-    /// Keys of the regions attached to the application, in operation-defined order.
-    regions: &'o [RegionKey<Constant, Operation>],
-
-    /// Inputs of the application, which contain no references.
-    inputs: &'o [Value<'c>],
-
-    /// Mesh that the eager lowering compiles against (refer to [`EagerDispatchKey`] for more information).
-    mesh: Option<&'o DeviceMesh>,
-
-    /// Compilation options of the dispatching domain.
-    compilation_options: &'o Arc<CompilationOptions>,
-}
-
-impl EagerDispatchKeyView for EagerDispatchQuery<'_, '_> {
-    fn operation(&self) -> &Operation {
-        self.operation
-    }
-
-    fn regions(&self) -> &[RegionKey<Constant, Operation>] {
-        self.regions
-    }
-
-    fn input_count(&self) -> usize {
-        self.inputs.len()
-    }
-
-    fn input(&self, index: usize) -> EagerDispatchInputRef<'_> {
-        match &self.inputs[index] {
-            Value::Array(array) => EagerDispatchInputRef::Array(array.r#type(), array.sharding()),
-            Value::Dimension(dimension) => EagerDispatchInputRef::Dimension(dimension.value()),
-            Value::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
-        }
-    }
-
-    fn mesh(&self) -> Option<&DeviceMesh> {
-        self.mesh
-    }
-
-    fn compilation_options(&self) -> &Arc<CompilationOptions> {
-        self.compilation_options
-    }
 }
 
 impl<'c> Context for Domain<'c> {
@@ -660,13 +442,13 @@ impl<'c> Domain<'c> {
         // compilation-key construction and only revalidates its input placement. Hits are looked up through a
         // borrowed query, and the owned key is only built on a miss.
         let region_keys = regions.regions().map(RegionRef::key).collect::<Vec<_>>();
-        let query = EagerDispatchQuery {
-            operation: &operation,
-            regions: region_keys.as_slice(),
+        let query = EagerDispatchQuery::new(
+            &operation,
+            region_keys.as_slice(),
             inputs,
-            mesh: self.mesh.as_ref().or_else(|| array_inputs.first().map(Array::mesh)),
-            compilation_options: &self.compilation_options,
-        };
+            self.mesh.as_ref().or_else(|| array_inputs.first().map(Array::mesh)),
+            &self.compilation_options,
+        );
         let compiled = match self.session.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
                 self.validate_eager_placement(array_inputs.as_slice())?;
@@ -674,13 +456,15 @@ impl<'c> Domain<'c> {
             }
             None => {
                 // The query borrows `region_keys`, so the key takes them only after its last use of the query.
-                let key = EagerDispatchKey {
-                    operation: operation.clone(),
-                    inputs: (0..inputs.len()).map(|index| query.input(index).into_owned()).collect(),
-                    mesh: query.mesh.cloned(),
-                    compilation_options: Arc::clone(&self.compilation_options),
-                    regions: region_keys.into(),
-                };
+                let key_inputs = (0..inputs.len()).map(|index| query.input(index).into_owned()).collect();
+                let key_mesh = query.mesh().cloned();
+                let key = EagerDispatchKey::new(
+                    operation.clone(),
+                    region_keys.into(),
+                    key_inputs,
+                    key_mesh,
+                    Arc::clone(&self.compilation_options),
+                );
                 let entry = self
                     .session
                     .eager_dispatch_cache
@@ -812,7 +596,7 @@ impl<'c> Domain<'c> {
             .compilation_context()
             .compile(self, &lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(EagerDispatchProgram { program, session_constants: Arc::clone(&lowered.session_constants), outputs })
+        Ok(EagerDispatchProgram { program, session_constants: Arc::clone(lowered.session_constants()), outputs })
     }
 
     /// Validates that every input lives on this domain's PJRT client and that all inputs share one device placement,
@@ -1084,6 +868,7 @@ mod tests {
         Sharding, ShardingDimension, StaticShape, SubOperation, Typed, Value as CoreValue, WhileOperation,
         ZeroOperation, batch, differentiate_at,
     };
+    use ryft_pjrt::protos::CompilationOptions;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionFence, load_cpu_plugin};
 
     use crate::Reference;
@@ -1093,7 +878,7 @@ mod tests {
         read_booleans, read_f32s, read_f64s, read_i64s, read_u64s, replicated_scalar_type, replicated_vector_type,
     };
     use crate::operations::jit_call::JitCallOperation;
-    use crate::tests::{execution_client, hash_of, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -1970,53 +1755,6 @@ mod tests {
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![0.0, 0.0]);
         assert_eq!(domain.eager_dispatch_statistics().misses, 2);
         assert_eq!(domain.compilation_context().statistics().compilations, 2);
-    }
-
-    #[test]
-    fn test_eager_dispatch_query_compares_and_hashes_like_its_key() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let operation = Operation::Array(AddOperation::new().into());
-        let inputs = [
-            Value::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
-            Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), domain.clone())),
-        ];
-        let query = EagerDispatchQuery {
-            operation: &operation,
-            regions: &[],
-            inputs: &inputs,
-            mesh: Some(&mesh),
-            compilation_options: &domain.compilation_options,
-        };
-        let key = EagerDispatchKey {
-            operation: operation.clone(),
-            inputs: (0..inputs.len()).map(|index| query.input(index).into_owned()).collect(),
-            mesh: Some(mesh.clone()),
-            compilation_options: Arc::clone(&domain.compilation_options),
-            regions: Arc::new([]),
-        };
-        let query_hash = hash_of(&query as &dyn EagerDispatchKeyView);
-
-        // Owned keys borrow as views that equal, and hash like, the queries that they were built from.
-        let borrowed_key: &dyn EagerDispatchKeyView = std::borrow::Borrow::borrow(&key);
-        assert!(borrowed_key == &query as &dyn EagerDispatchKeyView);
-        assert_eq!(hash_of(borrowed_key), query_hash);
-        assert_eq!(hash_of(&key), query_hash);
-
-        // Compilation options are compared by identity, and every other component by value (dimensions by extent).
-        let other_options = Arc::new(domain.compilation_options.as_ref().clone());
-        let other_options_query = EagerDispatchQuery { compilation_options: &other_options, ..query };
-        assert!(borrowed_key != &other_options_query as &dyn EagerDispatchKeyView);
-        let other_inputs =
-            [inputs[0].clone(), Value::Dimension(Dimension::new(DimensionValue::constant(3).unwrap(), domain.clone()))];
-        let other_inputs_query = EagerDispatchQuery { inputs: &other_inputs, ..query };
-        assert!(borrowed_key != &other_inputs_query as &dyn EagerDispatchKeyView);
-        let meshless_query = EagerDispatchQuery { mesh: None, ..query };
-        assert!(borrowed_key != &meshless_query as &dyn EagerDispatchKeyView);
     }
 
     #[test]

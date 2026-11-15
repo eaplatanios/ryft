@@ -2,7 +2,7 @@ use ryft_core::{ArrayType, DataType, ErfOperation};
 use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 // [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation

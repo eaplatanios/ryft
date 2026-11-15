@@ -8,31 +8,29 @@ use ryft_core::{
     Layout, ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
     ReferenceCompletionBackend, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape, Sharding,
     ShardingDimension, StatefulCompilationDomain, StatefulExecution, StaticShape, Type, TypeRefinements, Typed,
-    ValueProjection, validate_reference_boundary,
+    TypedProgram, ValueProjection, validate_reference_boundary,
 };
 use ryft_pjrt::protos::CompilationOptions;
-use ryft_pjrt::{Buffer, BufferSpecification, BufferType, Execution, ExecutionFence, LoadedExecutable};
+use ryft_pjrt::{
+    Buffer, BufferSpecification, BufferType, Execution, ExecutionDeviceInputs, ExecutionFence, ExecutionInput,
+    LoadedExecutable,
+};
 
-use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
-use crate::arrays_v0::host::{
-    DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes,
-    reject_unreduced_host_round_trip, relayout_shards_through_host,
-};
-use crate::arrays_v0::{
+use crate::arrays::host::DenseArrayHostCopy;
+use crate::arrays::materialization::{
     BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
-    BoundedMaterializationWaiter, ExecuteArguments,
+    BoundedMaterializationWaiter,
 };
-use crate::domains::Domain;
-use crate::domains::compilation::CompilationError;
+use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
+use crate::compilation::CompiledProgram;
+use crate::domains::RuntimeRequirement;
 use crate::domains::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
-use crate::domains::programs::CompiledProgram;
-use crate::domains::runtimes::RuntimeRequirement;
 #[cfg(test)]
 use crate::domains::tests::{
     StatefulFailureInjection, take_stateful_completion_injection, take_stateful_failure_injection,
 };
-use crate::experimental::lowering::signature::ExecutableSignature;
-use crate::{Array, ArrayError, Error, FromPjrt, ToPjrt, Value};
+use crate::lowering::signature::ExecutableSignature;
+use crate::{Array, ArrayError, ArrayShard, CompilationError, Domain, Error, FromPjrt, ToPjrt, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -143,8 +141,8 @@ struct PreparedExecution<'c> {
 
 impl<'c> PreparedExecution<'c> {
     /// Consumes the materialized arrays into device-major PJRT arguments.
-    fn into_arguments(self) -> Result<(ExecuteArguments<'c>, <ArrayType as Type>::Refinements, usize), Error> {
-        let arguments = ExecuteArguments::from_arrays_with_donation(
+    fn into_arguments(self) -> Result<(ExecutionArguments<'c>, <ArrayType as Type>::Refinements, usize), Error> {
+        let arguments = ExecutionArguments::from_arrays_with_donation(
             self.inputs,
             self.addressable_device_ids,
             self.donation_flags.as_slice(),
@@ -302,18 +300,123 @@ impl ExecutionPlan {
     }
 }
 
+pub struct ExecutionArguments<'o> {
+    /// Addressable devices in the same order as [`Self::inputs_by_device`].
+    addressable_device_ids: Arc<[DeviceId]>,
+
+    /// Execution inputs grouped by addressable device.
+    inputs_by_device: Vec<Vec<ExecutionInput<'o>>>,
+}
+
+impl<'o> ExecutionArguments<'o> {
+    /// Creates execution arguments that pass `arrays` to [`ryft_pjrt::LoadedExecutable::execute`] without donating any
+    /// of them. The inputs of each device are in `addressable_device_ids` order, and
+    /// [`Self::as_execution_device_inputs`] converts the result to the form that PJRT consumes.
+    pub fn from_arrays(arrays: Vec<Array<'o>>, addressable_device_ids: &[DeviceId]) -> Result<Self, Error> {
+        let donation_flags = vec![false; arrays.len()];
+        Self::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
+    }
+
+    /// Creates execution arguments from `arrays`, honoring `donation_flags` only for arrays whose shard buffers are
+    /// uniquely owned. A requested donation is silently downgraded to a non-donating input when any shard buffer is
+    /// shared (for example, by another clone of the array or by a retained materialization cache); callers that need
+    /// to observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
+    pub fn from_arrays_with_donation(
+        arrays: Vec<Array<'o>>,
+        addressable_device_ids: Arc<[DeviceId]>,
+        donation_flags: &[bool],
+    ) -> Result<Self, Error> {
+        if donation_flags.len() != arrays.len() {
+            return Err(Error::Execution(ExecutionError::DonationFlagCountMismatch {
+                expected_count: arrays.len(),
+                actual_count: donation_flags.len(),
+            }));
+        }
+        for (position, &device_id) in addressable_device_ids.iter().enumerate() {
+            if addressable_device_ids[..position].contains(&device_id) {
+                return Err(ryft_core::ShardingError::DuplicateDeviceId { id: device_id }.into());
+            }
+        }
+
+        // Every array must have exactly one buffer on each addressable device and none elsewhere. Its shards are
+        // looked up by device in constant time, and counting its buffers detects buffers on other devices.
+        let mut inputs_by_device = (0..addressable_device_ids.len())
+            .map(|_| Vec::with_capacity(arrays.len()))
+            .collect::<Vec<Vec<ExecutionInput<'o>>>>();
+        for (array_index, (array, requested)) in arrays.iter().zip(donation_flags).enumerate() {
+            let donatable = *requested && array.has_unique_shard_buffers();
+            for (device_inputs, &device_id) in inputs_by_device.iter_mut().zip(addressable_device_ids.iter()) {
+                let buffer = array
+                    .device_shard(device_id)
+                    .and_then(ArrayShard::buffer)
+                    .ok_or(Error::Execution(ExecutionError::MissingArrayShardForDevice { array_index, device_id }))?;
+                device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable });
+            }
+            if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len() {
+                let device_id = array
+                    .shards()
+                    .iter()
+                    .filter(|shard| shard.buffer().is_some())
+                    .map(|shard| shard.device().id())
+                    .find(|device_id| !addressable_device_ids.contains(device_id))
+                    .unwrap();
+                return Err(Error::Execution(ExecutionError::UnexpectedArrayShardDevice { array_index, device_id }));
+            }
+        }
+
+        // Dropping the consumed arrays leaves the execution inputs as the only owners of donated buffers.
+        drop(arrays);
+        Ok(Self { addressable_device_ids, inputs_by_device })
+    }
+
+    /// Returns addressable device IDs corresponding to [`Self::inputs_by_device`].
+    pub fn addressable_device_ids(&self) -> &[DeviceId] {
+        &self.addressable_device_ids
+    }
+
+    /// Returns execution inputs grouped by device.
+    pub fn inputs_by_device(&self) -> &[Vec<ExecutionInput<'o>>] {
+        self.inputs_by_device.as_slice()
+    }
+
+    /// Creates PJRT `ExecutionDeviceInputs` in the same device order as [`Self::addressable_device_ids`].
+    pub fn as_execution_device_inputs<'l>(&'l self) -> Vec<ExecutionDeviceInputs<'o, 'l>> {
+        self.inputs_by_device.iter().map(|inputs| ExecutionDeviceInputs::from(inputs.as_slice())).collect()
+    }
+
+    /// Appends one non-donatable hidden input per addressable device. The execution boundary validates the device
+    /// assignment before calling this function; hidden tokens never pass through numerical array construction.
+    pub(crate) fn push_input_buffers(&mut self, buffers: Vec<Arc<Buffer<'o>>>) {
+        assert_eq!(buffers.len(), self.inputs_by_device.len());
+        for (inputs, buffer) in self.inputs_by_device.iter_mut().zip(buffers) {
+            inputs.push(ExecutionInput::from(buffer));
+        }
+    }
+}
+
+impl std::fmt::Debug for ExecutionArguments<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let input_counts = self.inputs_by_device.iter().map(Vec::len).collect::<Vec<_>>();
+        formatter
+            .debug_struct("ExecutionArguments")
+            .field("addressable_device_ids", &self.addressable_device_ids)
+            .field("input_counts_per_device", &input_counts)
+            .finish()
+    }
+}
+
 impl<'c> Domain<'c> {
     /// Initializes required extensions on the invoking session before compilation or native loading.
     pub(super) fn ensure_runtime_requirements(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
         if requirements.is_empty() {
             return Ok(());
         }
-        self.session.runtimes.ensure(requirements, self.target()?)
+        self.session().runtimes().ensure(requirements, self.target()?)
     }
 
     /// Validates that this domain's PJRT client owns `program`.
     pub(super) fn validate_program_owner(&self, program: &CompiledProgram<'c>) -> Result<(), Error> {
-        if program.executable.is_owned_by(self.client()) {
+        if program.executable().is_owned_by(self.client()) {
             Ok(())
         } else {
             Err(Error::Execution(ExecutionError::ClientMismatch))
@@ -348,12 +451,12 @@ impl<'c> Domain<'c> {
             program,
             &mut physical_outputs,
             fence.clone(),
-            0..program.output_types.len(),
+            0..program.all_output_types().len(),
         )?;
         // Static outputs cannot disagree with the input refinements, so only builds with debug assertions re-validate
         // them.
-        if program.plan.output_layouts.is_none() || cfg!(debug_assertions) {
-            validate_compiled_output_refinements(program, &input_refinements, program.output_types.as_ref(), &outputs)?;
+        if program.plan().output_layouts.is_none() || cfg!(debug_assertions) {
+            validate_compiled_output_refinements(program, &input_refinements, program.all_output_types(), &outputs)?;
         }
         if physical_outputs.iter().any(Option::is_some) {
             return Err(
@@ -372,23 +475,23 @@ impl<'c> Domain<'c> {
     ) -> Result<PreparedExecution<'c>, Error> {
         ensure_effect_dispatch_allowed()?;
         self.validate_program_owner(program)?;
-        if program.kernel_execution_facts.is_some() {
-            crate::kernels::distributed::validate_kernel_participants(self.client(), &program.mesh)?;
+        if program.kernel_execution_facts().is_some() {
+            crate::kernels::distributed::validate_kernel_participants(self.client(), program.mesh())?;
         }
-        self.ensure_runtime_requirements(&program.runtime_requirements)?;
-        if inputs.len() != program.input_types.len() {
+        self.ensure_runtime_requirements(program.runtime_requirements())?;
+        if inputs.len() != program.input_types().len() {
             return Err(Error::from(ProgramError::InvalidInputCount {
-                expected: program.input_types.len(),
+                expected: program.input_types().len(),
                 actual: inputs.len(),
             }));
         }
-        let plan = program.plan.as_ref();
+        let plan = program.plan();
 
         // Static input types establish no refinements, so refining them reduces to comparing every component except
         // the sharding, which is normalized separately at the executable boundary. Inputs that differ, as well as
         // dynamic input types, take the general path below, which also produces the precise diagnostic.
         let static_inputs_match = plan.static_inputs
-            && program.input_types.iter().zip(inputs.iter()).all(|(declared, input)| {
+            && program.input_types().iter().zip(inputs.iter()).all(|(declared, input)| {
                 let actual = input.r#type();
                 declared.data_type() == actual.data_type()
                     && declared.shape() == actual.shape()
@@ -400,7 +503,7 @@ impl<'c> Domain<'c> {
         } else {
             let actual_input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let refinement_input_types = program
-                .input_types
+                .input_types()
                 .iter()
                 .zip(actual_input_types.iter())
                 .map(|(declared, actual)| {
@@ -410,7 +513,7 @@ impl<'c> Domain<'c> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let input_refinements = <ArrayType as Type>::Refinements::from_local_declarations(
-                program.input_types.iter(),
+                program.input_types().iter(),
                 refinement_input_types.iter(),
             )
             .map_err(ProgramError::from)?;
@@ -419,7 +522,7 @@ impl<'c> Domain<'c> {
 
         // Erased zero-space inputs have no buffers through which PJRT could order consumer work after their
         // producers. Observe completion before dropping those inputs, including before any consumer effects run.
-        for (input, physical_index) in inputs.iter().zip(program.signature.input_mapping()) {
+        for (input, physical_index) in inputs.iter().zip(program.signature().input_mapping()) {
             if physical_index.is_none() {
                 input.block_until_ready()?;
             }
@@ -427,7 +530,7 @@ impl<'c> Domain<'c> {
 
         // Without hidden extent scalars, physical inputs are a projection of the logical inputs (which is the identity
         // for most programs); bounded-dynamic inputs are padded to their physical bounds instead.
-        let inputs = if program.signature.input_dimensions().is_empty() {
+        let inputs = if program.signature().input_dimensions().is_empty() {
             if plan.physical_input_logical_indices.iter().copied().eq(0..inputs.len()) {
                 inputs
             } else {
@@ -440,8 +543,8 @@ impl<'c> Domain<'c> {
             };
             materialize_bounded_dynamic_inputs(
                 self,
-                &program.signature,
-                &program.input_types,
+                program.signature(),
+                program.input_types(),
                 actual_input_types.as_slice(),
                 inputs,
             )?
@@ -452,7 +555,7 @@ impl<'c> Domain<'c> {
         } else {
             inputs
         };
-        let mut inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
+        let mut inputs = reshard_inputs_if_needed(self, program.mesh(), program.expected_argument_shardings(), inputs)?;
         // A logical input without a layout constraint admits any physical representation. Match the compiled
         // signature before handing buffers to PJRT, which otherwise reads their storage in its expected order.
         // Known layouts convert on device through the existing capability. Unknown layouts require observing the
@@ -483,9 +586,9 @@ impl<'c> Domain<'c> {
                 }
                 if needs_conversion && !input.sharding().unreduced_axes().is_empty() {
                     // The devices of an unreduced array hold separate summands, which a dense round trip would replace.
-                    *input = relayout_shards_through_host(self, input, expected)?;
+                    *input = input.relayout_through_host(self, expected)?;
                 } else if needs_conversion {
-                    let bytes = materialize_dense_array_bytes(input)?;
+                    let bytes = input.copy_to_host()?;
                     *input = Array::from_host_buffer(
                         self,
                         input.r#type().into_owned().with_layout(expected.clone()),
@@ -498,8 +601,8 @@ impl<'c> Domain<'c> {
         let donation_flags = if donation_overrides.is_empty() {
             plan.default_donation_flags.clone()
         } else {
-            let mut logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
-                .chain(program.donation_flags.iter().copied())
+            let mut logical_donation_flags = std::iter::repeat_n(false, program.capture_count())
+                .chain(program.donation_flags().iter().copied())
                 .collect::<Vec<_>>();
             for &(logical_input_index, donation) in donation_overrides {
                 let flag = logical_donation_flags.get_mut(logical_input_index).ok_or_else(|| {
@@ -509,8 +612,8 @@ impl<'c> Domain<'c> {
                 })?;
                 *flag = donation;
             }
-            let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
-            donation_flags.extend(std::iter::repeat_n(false, program.signature.input_dimensions().len()));
+            let mut donation_flags = program.signature().project_inputs(logical_donation_flags.as_slice());
+            donation_flags.extend(std::iter::repeat_n(false, program.signature().input_dimensions().len()));
             for (donation, input_type) in donation_flags.iter_mut().zip(plan.physical_input_types.iter()) {
                 if input_type.data_type().is_zero() {
                     *donation = false;
@@ -523,7 +626,7 @@ impl<'c> Domain<'c> {
             addressable_device_ids: Arc::clone(&plan.addressable_device_ids),
             donation_flags,
             input_refinements,
-            physical_output_count: program.signature.array_output_count(),
+            physical_output_count: program.signature().array_output_count(),
         })
     }
 
@@ -544,8 +647,8 @@ impl<'c> Domain<'c> {
         if program.requires_stateful_call() {
             return Err(Error::Execution(ExecutionError::StatefulInvocationRequired));
         }
-        check_count!("input", inputs, program.input_types.len(), ProgramError);
-        for (declared, input) in program.input_types.iter().zip(&inputs) {
+        check_count!("input", inputs, program.input_types().len(), ProgramError);
+        for (declared, input) in program.input_types().iter().zip(&inputs) {
             // Array inputs borrow their types, while the array IR type of other inputs is built only to report them.
             match input {
                 Value::Array(array) => validate_input_type(declared, &array.r#type())?,
@@ -561,7 +664,7 @@ impl<'c> Domain<'c> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
         let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() && !program.signature.has_effects() {
+        if execution.output().is_empty() && !program.signature().has_effects() {
             execution.fence().block_until_ready()?;
         }
         let (outputs, fence) = execution.into_parts();
@@ -593,7 +696,7 @@ impl<'c> Domain<'c> {
         if let Err(error) = ensure_effect_dispatch_allowed() {
             return StatefulExecution::ready(Err(error));
         }
-        if program.reference_states.is_empty() {
+        if program.reference_states().is_empty() {
             // A reference-free invocation binds no holders, but the completion contract still promises that awaiting
             // the result observes whole-invocation completion, so the execution fence rides along as the completion.
             return match self.execute_stateless(program, inputs) {
@@ -606,17 +709,17 @@ impl<'c> Domain<'c> {
             };
         }
         let prepared = (|| -> Result<_, Error> {
-            check_count!("input", inputs, program.input_types.len(), ProgramError);
+            check_count!("input", inputs, program.input_types().len(), ProgramError);
             let reference_state_input_indices = program
-                .reference_states
+                .reference_states()
                 .iter()
-                .map(|state| state.source().flat_input_index(program.capture_count))
+                .map(|state| state.source().flat_input_index(program.capture_count()))
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Discharge retains each reference's position but replaces its type with the referent's array type.
             // The compiled binding table restores that distinction without a caller-supplied signature. Its indices
             // are validated in increasing order during lowering and persistent executable restoration.
-            for (index, (declared, input)) in program.input_types.iter().zip(&inputs).enumerate() {
+            for (index, (declared, input)) in program.input_types().iter().zip(&inputs).enumerate() {
                 let expects_reference = reference_state_input_indices.binary_search(&index).is_ok();
                 match (expects_reference, input) {
                     (false, Value::Array(array)) => validate_input_type(declared, &array.r#type())?,
@@ -638,10 +741,10 @@ impl<'c> Domain<'c> {
                 }
             }
 
-            let (captures, public_inputs) = inputs.split_at(program.capture_count.min(inputs.len()));
+            let (captures, public_inputs) = inputs.split_at(program.capture_count().min(inputs.len()));
             validate_reference_boundary(public_inputs.iter(), captures.iter()).map_err(ProgramError::from)?;
             let mut bindings =
-                Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states.len());
+                Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states().len());
             for &logical_input_index in &reference_state_input_indices {
                 let reference = match inputs.get(logical_input_index) {
                     Some(Value::Reference(reference)) => reference.handle(),
@@ -655,15 +758,15 @@ impl<'c> Domain<'c> {
                     }
                     None => {
                         return Err(ProgramError::InvalidInputCount {
-                            expected: program.input_types.len(),
+                            expected: program.input_types().len(),
                             actual: inputs.len(),
                         }
                         .into());
                     }
                 };
-                let physical_input_index = program.signature.input_mapping()[logical_input_index].unwrap();
-                let expected_sharding = &program.expected_argument_shardings[physical_input_index];
-                let declared_type = &program.input_types[logical_input_index];
+                let physical_input_index = program.signature().input_mapping()[logical_input_index].unwrap();
+                let expected_sharding = &program.expected_argument_shardings()[physical_input_index];
+                let declared_type = &program.input_types()[logical_input_index];
                 let effective_type = if declared_type.sharding().is_some() {
                     declared_type.clone()
                 } else {
@@ -697,7 +800,7 @@ impl<'c> Domain<'c> {
                 bindings.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
 
             let mut mutated_outputs = BTreeMap::new();
-            for (state, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
+            for (state, &logical_input_index) in program.reference_states().iter().zip(&reference_state_input_indices) {
                 let Value::Reference(reference) = &inputs[logical_input_index] else {
                     unreachable!("reference bindings were validated before holder acquisition")
                 };
@@ -731,7 +834,7 @@ impl<'c> Domain<'c> {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
                     let snapshot = observations[guard_indices[&reference.handle().id()]].snapshot().clone();
-                    if snapshot.mesh() != &program.mesh {
+                    if snapshot.mesh() != program.mesh() {
                         return Err(Error::from(ProgramError::InvalidArgument {
                             message: format!(
                                 "external state input {logical_input_index} reference mesh does not match the compiled \
@@ -865,10 +968,11 @@ impl<'c> Domain<'c> {
                     program,
                     &mut physical_outputs,
                     fence.clone(),
-                    program.output_count..program.output_types.len(),
+                    program.output_count()..program.all_output_types().len(),
                 )?;
-                let mut hidden_outputs =
-                    (program.output_count..program.output_types.len()).zip(hidden_outputs).collect::<BTreeMap<_, _>>();
+                let mut hidden_outputs = (program.output_count()..program.all_output_types().len())
+                    .zip(hidden_outputs)
+                    .collect::<BTreeMap<_, _>>();
                 if replacement_transactions.len() != mutated_outputs.len() {
                     return Err(ProgramError::MalformedProgram(
                         "submitted reference replacement count does not match mutated reference count".to_string(),
@@ -940,8 +1044,13 @@ impl<'c> Domain<'c> {
                         "injected failure before public output reconstruction".to_string(),
                     )));
                 }
-                let public_outputs =
-                    reconstruct_compiled_outputs(self, program, &mut physical_outputs, fence, 0..program.output_count)?;
+                let public_outputs = reconstruct_compiled_outputs(
+                    self,
+                    program,
+                    &mut physical_outputs,
+                    fence,
+                    0..program.output_count(),
+                )?;
                 validate_compiled_output_refinements(
                     program,
                     &input_refinements,
@@ -981,13 +1090,13 @@ impl<'c> StatefulCompilationDomain for Domain<'c> {
 impl<'c> Domain<'c> {
     /// Executes a program with array inputs. Output arrays retain completion, while an execution without outputs or
     /// effects waits here so failures remain observable.
-    pub(super) fn execute_program(
+    pub(crate) fn execute_program(
         &self,
         program: &CompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Vec<Array<'c>>, Error> {
         let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() && !program.signature.has_effects() {
+        if execution.output().is_empty() && !program.signature().has_effects() {
             // No output array carries the execution fence out of this call, so an asynchronous execution error would
             // otherwise be unobservable. Block here so this synchronous entry point still reports it.
             let (outputs, fence) = execution.into_parts();
@@ -1063,7 +1172,7 @@ fn reshard_inputs_if_needed<'c>(
             if array.sharding() == expected {
                 Ok(array)
             } else {
-                crate::arrays_v0::compiled_reshard::reshard(&array, domain, mesh, expected)
+                array.reshard_on_devices(domain, mesh, expected, false)
             }
         })
         .collect()
@@ -1316,7 +1425,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                     physical_inputs[physical_input_index] = physical;
                 }
                 BoundedMaterializationProbe::Produce(producer) => {
-                    reject_unreduced_host_round_trip(input, "pad")?;
+                    input.validate_host_round_trip("pad")?;
                     report.retained_misses += 1;
                     pending_host_copies.push(PendingBoundedInputHostCopy {
                         logical_input_index,
@@ -1324,7 +1433,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                         physical_type,
                         actual_shape,
                         physical_shape,
-                        host_copy: begin_materialize_dense_array_bytes(input)?,
+                        host_copy: input.begin_copy_to_host()?,
                         producer,
                     });
                 }
@@ -1378,14 +1487,14 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                 // copy necessarily starts after that failure; the ordinary all-miss path above stays fully concurrent.
                 report.retained_misses += 1;
                 let input = &inputs[logical_input_index];
-                reject_unreduced_host_round_trip(input, "pad")?;
+                input.validate_host_round_trip("pad")?;
                 let pending = PendingBoundedInputHostCopy {
                     logical_input_index,
                     physical_input_index,
                     physical_type,
                     actual_shape,
                     physical_shape,
-                    host_copy: begin_materialize_dense_array_bytes(input)?,
+                    host_copy: input.begin_copy_to_host()?,
                     producer,
                 };
                 let publication = upload_bounded_input_host_copy(domain, input, pending, &mut report)?;
@@ -1560,11 +1669,11 @@ fn reconstruct_compiled_outputs<'c>(
 ) -> Result<Vec<Array<'c>>, Error> {
     // Programs with only static outputs build each output directly from its planned layout, without querying the
     // returned buffers or re-deriving their placement.
-    if let Some(layouts) = &program.plan.output_layouts {
+    if let Some(layouts) = &program.plan().output_layouts {
         return logical_indices
             .into_iter()
             .map(|logical_index| {
-                let buffers = match program.signature.output_mapping()[logical_index] {
+                let buffers = match program.signature().output_mapping()[logical_index] {
                     Some(physical_index) => {
                         physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
@@ -1580,10 +1689,10 @@ fn reconstruct_compiled_outputs<'c>(
             .collect();
     }
     let logical_indices = logical_indices.into_iter().collect::<Vec<_>>();
-    let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh)?;
+    let scalar_type = ArrayType::scalar(DataType::I64).replicated(program.mesh())?;
     let mut output_extents = BTreeMap::new();
     for output_dimension in program
-        .signature
+        .signature()
         .output_dimensions()
         .iter()
         .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
@@ -1602,11 +1711,11 @@ fn reconstruct_compiled_outputs<'c>(
             domain,
             scalar_type.clone(),
             None,
-            program.mesh.clone(),
+            program.mesh().clone(),
             physical_output,
         )?
         .with_execution_fence(fence.clone());
-        let bytes = materialize_dense_array_bytes(&scalar)?;
+        let bytes = scalar.copy_to_host()?;
         let extent = bytes
             .get(..size_of::<i64>())
             .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
@@ -1624,8 +1733,8 @@ fn reconstruct_compiled_outputs<'c>(
     logical_indices
         .into_iter()
         .map(|logical_index| {
-            let output_type = &program.output_types[logical_index];
-            match program.signature.output_mapping()[logical_index] {
+            let output_type = &program.all_output_types()[logical_index];
+            match program.signature().output_mapping()[logical_index] {
                 Some(physical_index) => {
                     let dimensions = output_type
                         .shape()
@@ -1650,8 +1759,8 @@ fn reconstruct_compiled_outputs<'c>(
                     Ok(Array::from_canonical_addressable_buffers(
                         domain,
                         output_type,
-                        Some(program.output_shardings[logical_index].clone()),
-                        program.mesh.clone(),
+                        Some(program.output_shardings()[logical_index].clone()),
+                        program.mesh().clone(),
                         physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "physical output {physical_index} for logical output {logical_index} is missing or was \
@@ -1664,10 +1773,10 @@ fn reconstruct_compiled_outputs<'c>(
                 None => Ok(Array::from_zero_space(
                     domain,
                     output_type.clone(),
-                    Some(program.output_shardings[logical_index].clone()),
-                    program.mesh.clone(),
+                    Some(program.output_shardings()[logical_index].clone()),
+                    program.mesh().clone(),
                 )?
-                    .with_execution_fence(fence.clone())),
+                .with_execution_fence(fence.clone())),
             }
         })
         .collect()
@@ -1681,7 +1790,9 @@ fn validate_compiled_output_refinements(
     outputs: &[Array<'_>],
 ) -> Result<(), Error> {
     let mut closed_identities = Vec::new();
-    for (_, identity) in program.input_types.iter().chain(program.output_types.iter()).flat_map(Type::identities) {
+    for (_, identity) in
+        program.input_types().iter().chain(program.all_output_types().iter()).flat_map(Type::identities)
+    {
         if !closed_identities.contains(identity) {
             closed_identities.push(identity.clone());
         }
@@ -1702,30 +1813,28 @@ impl<'c> Domain<'c> {
     fn execute_pjrt_buffers(
         &self,
         program: &CompiledProgram<'c>,
-        mut arguments: ExecuteArguments<'c>,
+        mut arguments: ExecutionArguments<'c>,
         array_output_count: usize,
         after_submission: impl FnOnce(&ExecutionFence),
     ) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, Error> {
         ensure_effect_dispatch_allowed()?;
         let addressable_device_count = arguments.addressable_device_ids().len();
-        let ordered = program.signature.has_ordered_io();
+        let ordered = program.signature().has_ordered_io();
         if ordered {
-            if !self.target()?.is_fully_addressable_single_process_mesh(&program.mesh) {
+            if !self.target()?.is_fully_addressable_single_process_mesh(program.mesh()) {
                 return Err(ExecutionError::UnsupportedEffectDeviceAssignment.into());
             }
-            if addressable_device_count > 1 && !program.signature.has_device_ordered_io() {
+            if addressable_device_count > 1 && !program.signature().has_device_ordered_io() {
                 return Err(ExecutionError::MissingDeviceOrderedEffect.into());
             }
         }
         let device = ordered.then(|| arguments.addressable_device_ids().to_vec());
         let mut reservation =
-            if program.signature.has_effects() { Some(self.effect_scope.reserve(device)?) } else { None };
+            if program.signature().has_effects() { Some(self.effect_scope().reserve(device)?) } else { None };
         if let Some(reservation) = &reservation {
             if ordered {
                 let predecessor = reservation
-                    .predecessor
-                    .as_ref()
-                    .map_or(Ok(None), |previous| previous.carrier())
+                    .predecessor_carrier()
                     .map_err(|reason| Error::Execution(ExecutionError::AsynchronousFailure { reason }))?;
                 let tokens = match predecessor {
                     Some(tokens) => tokens,
@@ -1761,7 +1870,7 @@ impl<'c> Domain<'c> {
             arguments
                 .inputs_by_device()
                 .iter()
-                .all(|inputs| inputs.len() == program.signature.physical_input_count())
+                .all(|inputs| inputs.len() == program.signature().physical_input_count())
         );
         #[cfg(test)]
         if take_stateful_failure_injection(StatefulFailureInjection::BeforeSubmission) {
@@ -1769,21 +1878,22 @@ impl<'c> Domain<'c> {
                 "injected failure before execution submission".to_string(),
             )));
         }
-        let resources = self.session.runtimes.prepare(&program.runtime_requirements, self.target()?, &program.mesh)?;
+        let resources =
+            self.session().runtimes().prepare(program.runtime_requirements(), self.target()?, program.mesh())?;
         let (context, retained_resources) = resources.into_parts();
         // These leases stay in this stack frame on every error path. PJRT destroys the context before returning an
         // error, and if submission succeeded it first waits for every device, so the leases outlive all native use.
         let (mut device_outputs, fence) = program
-            .executable
+            .executable()
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, None, None, None, &[])?
             .into_parts();
         // The fence releases the context before it reports readiness, and the session releases these leases only after
         // that, so pointees of the context's user data outlive native context destruction.
-        self.session.runtimes.retain(&fence, retained_resources);
+        self.session().runtimes().retain(&fence, retained_resources);
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(&fence);
-        let output_count = program.signature.physical_output_count();
-        debug_assert_eq!(array_output_count, program.signature.array_output_count());
+        let output_count = program.signature().physical_output_count();
+        debug_assert_eq!(array_output_count, program.signature().array_output_count());
         let invalid_count = device_outputs
             .iter()
             .find(|outputs| outputs.outputs.len() != output_count)
@@ -1792,9 +1902,8 @@ impl<'c> Domain<'c> {
             if let Some(actual) = invalid_count {
                 let reason: Arc<str> =
                     Arc::from(format!("expected {output_count} output(s) per device, but got {actual}"));
-                reservation.submission.publish(Err(Arc::clone(&reason)));
                 // Retain completion until the submitted work is done, then report the boundary failure.
-                let completion = Arc::clone(&reservation.submission.completion);
+                let completion = reservation.publish(Err(Arc::clone(&reason)));
                 fence.on_ready(move |_| completion.complete(Err(reason)));
             } else {
                 let carrier = if ordered {
@@ -1802,18 +1911,17 @@ impl<'c> Domain<'c> {
                         device_outputs
                             .iter_mut()
                             .map(|outputs| {
-                                Arc::new(outputs.outputs.remove(program.signature.ordered_io_output_index().unwrap()))
+                                Arc::new(outputs.outputs.remove(program.signature().ordered_io_output_index().unwrap()))
                             })
                             .collect(),
                     )
                 } else {
                     None
                 };
-                reservation.submission.publish(Ok(carrier));
-                let completion = Arc::clone(&reservation.submission.completion);
+                let completion = reservation.publish(Ok(carrier));
                 fence.on_ready(move |result| completion.complete(result.map_err(|error| Arc::from(error.to_string()))));
             }
-            reservation.published = true;
+            reservation.commit();
         }
         if let Some(actual) = invalid_count {
             return Err(Error::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
@@ -1840,27 +1948,32 @@ impl<'c> Domain<'c> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AndOperation, ArrayIrBatch, ArrayIrType, ArrayType, Assert, AssertOperation, BatchAxis, BatchableOperation,
         BatchingContext, CompareOperation, ComparisonDirection, CompilationCacheDomain, Context,
-        ConvertElementTypeOperation, DataType, Dimension as CoreDimension, DimensionBounds, DimensionDivOperation,
-        DimensionFromScalarOperation, DimensionOperation, DimensionRemOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation,
-        DynamicSliceOperation, EmptyRegionDriver, IotaOperation, LogicalMesh, MeshAxis, MeshAxisType,
-        Operation as CoreOperation, Placeholder, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation,
-        ReferenceReadOperation, ReferenceType, Reshape, Shape, Sharding, ShardingDimension,
-        StagedFunction as CoreStagedFunction, StagingContext, StaticShape, TiledLayout, TracingContext, Typed, batch,
+        ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds,
+        DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionRemOperation,
+        DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
+        DynamicBroadcastOperation, DynamicSliceOperation, EmptyRegionDriver, Error as CoreError, IotaOperation,
+        LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder, ReduceOperation, ReductionKind,
+        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType, Reshape, Shape, Sharding,
+        ShardingDimension, ShardingError, StagedFunction as CoreStagedFunction, StagingContext, StaticShape,
+        TiledLayout, TracingContext, Typed, batch,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_mlir::Block;
+    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::domains::compilation::jit_compilation_options;
-    use crate::domains::options::Options;
-    use crate::domains::sessions::Session;
+    use crate::compilation::domains::jit_compilation_options;
     use crate::domains::tests::*;
-    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder};
+    use crate::execution::ExecutionArguments;
+    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Value};
+    use crate::{Array, Constant, Error, ExecutionError, Operation, Options, Session, ToMlir, Value};
 
     use super::*;
 
@@ -1892,7 +2005,7 @@ mod tests {
             .unwrap()
             .into_inner();
         let donated_lowered = donated_staged.lower(&domain).unwrap();
-        assert_eq!(donated_lowered.lowered_program().donation_flags.as_ref(), &[false]);
+        assert_eq!(donated_lowered.lowered_program().donation_flags(), &[false]);
         assert_eq!(
             domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
             domain.compilation_key(donated_lowered.lowered_program()).unwrap(),
@@ -2087,7 +2200,8 @@ mod tests {
         let retained_storage = cold.inputs[0].clone();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let donation_arguments =
-            Array::into_execute_arguments_with_donation(vec![cold.inputs[0].clone()], &[device_id], &[true]).unwrap();
+            ExecutionArguments::from_arrays_with_donation(vec![cold.inputs[0].clone()], [device_id].into(), &[true])
+                .unwrap();
         assert!(!donation_arguments.inputs_by_device()[0][0].donatable);
         let warm =
             materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[smaller_type], vec![smaller])
@@ -2190,7 +2304,12 @@ mod tests {
         // axis.
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            client.addressable_devices().unwrap().iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
         )
         .unwrap();
         let domain = Session::new(&client).domain();
@@ -2312,12 +2431,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let row_major = BufferSpecification::new(BufferType::F64, [2, 3]).proto().unwrap();
         // Explicit argument layouts bypass the MLIR layout attributes in PJRT. A conflicting result override must
         // fail before its buffers can be wrapped in types that claim another layout.
-        lowered.compilation_options.argument_layouts = vec![row_major.clone()];
-        lowered.compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(row_major);
+        let mut compilation_options = lowered.compilation_options().clone();
+        compilation_options.argument_layouts = vec![row_major.clone()];
+        compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(row_major);
+        let lowered = lowered.with_compilation_options(compilation_options.clone());
         let Err(error) = domain.compile_program(&lowered) else {
             panic!("conflicting executable layout unexpectedly accepted");
         };
@@ -2330,10 +2451,11 @@ mod tests {
         let column_major = BufferSpecification::with_layout(BufferType::F64, [2, 3], layout.to_pjrt().unwrap())
             .proto()
             .unwrap();
-        lowered.compilation_options.executable_build_options.as_mut().unwrap().result_shape =
-            Some(column_major.clone());
+        compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(column_major.clone());
+        let lowered = lowered.with_compilation_options(compilation_options.clone());
         domain.compile_program(&lowered).unwrap();
-        lowered.compilation_options.argument_layouts = vec![column_major];
+        compilation_options.argument_layouts = vec![column_major];
+        let lowered = lowered.with_compilation_options(compilation_options);
         let compiled = domain.compile_program(&lowered).unwrap();
         let values = vec![1f64, 2., 3., 4., 5., 6.];
         let input = Array::from_host_buffer(
@@ -2344,8 +2466,8 @@ mod tests {
         )
         .unwrap();
         let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
-        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
-        let configured = domain.with_compilation_options(lowered.compilation_options.clone());
+        assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
+        let configured = domain.with_compilation_options(lowered.compilation_options().clone());
         let input = Array::from_host_buffer(
             &configured,
             ArrayType::new_static(DataType::F64, [2, 3])
@@ -2355,7 +2477,7 @@ mod tests {
         )
         .unwrap();
         let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
-        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
+        assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
     }
 
     #[test]
@@ -2512,10 +2634,10 @@ mod tests {
         let unique = ArrayReference::new(f32_scalar(&domain, &mesh, 1.0));
         let unique_guard = unique.lock_storage().unwrap();
         let mut inputs = vec![unique_guard.observe().unwrap().snapshot().clone()];
-        drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
+        drop(ExecutionArguments::from_arrays_with_donation(inputs.clone(), [device_id].into(), &[true]).unwrap());
         let (value, unique_taken) = unique_guard.wait_until_ready().unwrap().take().unwrap();
         inputs[0] = value;
-        let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
+        let arguments = ExecutionArguments::from_arrays_with_donation(inputs, [device_id].into(), &[true]).unwrap();
         assert!(arguments.inputs_by_device()[0][0].donatable);
         unique_taken.poison("test transaction consumed unique input");
 
@@ -2524,10 +2646,10 @@ mod tests {
         let shared = ArrayReference::new(shared_value);
         let shared_guard = shared.lock_storage().unwrap();
         let mut inputs = vec![shared_guard.observe().unwrap().snapshot().clone()];
-        drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
+        drop(ExecutionArguments::from_arrays_with_donation(inputs.clone(), [device_id].into(), &[true]).unwrap());
         let (value, shared_taken) = shared_guard.wait_until_ready().unwrap().take().unwrap();
         inputs[0] = value;
-        let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
+        let arguments = ExecutionArguments::from_arrays_with_donation(inputs, [device_id].into(), &[true]).unwrap();
         assert!(!arguments.inputs_by_device()[0][0].donatable);
         shared_taken.poison("test transaction consumed shared input");
         assert_eq!(read_f32s(&client, &retained), vec![2.0]);
@@ -2617,23 +2739,25 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let mut program = domain.compile_program(&lowered).unwrap();
+        let program = domain.compile_program(&lowered).unwrap();
         // Attach the same validated marker carried by native-kernel executables. The identity program isolates
         // submission admission from any backend-specific kernel compiler or custom-call handler.
-        program.kernel_execution_facts = Some(
+        let program = program.with_kernel_execution_facts(Some(
             crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh)
                 .unwrap()
                 .configuration_key()
                 .unwrap(),
-        );
+        ));
         let execution = domain.execute_compiled_async(&program, vec![input.clone()]).unwrap();
         execution.fence().block_until_ready().unwrap();
         assert_eq!(read_f32s(&client, &execution.output()[0]), vec![2.0, 5.0]);
-        program.mesh = DeviceMesh::new(
-            mesh.logical_mesh().clone(),
-            vec![Device::new(mesh.devices()[0].id(), client.process_index().unwrap() + 1)],
-        )
-        .unwrap();
+        let program = program.with_mesh(
+            DeviceMesh::new(
+                mesh.logical_mesh().clone(),
+                vec![Device::new(mesh.devices()[0].id(), client.process_index().unwrap() + 1)],
+            )
+            .unwrap(),
+        );
         // A topology change cannot reach resharding, donation, or PJRT execution; the retained input stays readable.
         assert!(matches!(
             domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
@@ -2669,7 +2793,7 @@ mod tests {
                 )
                 .unwrap();
             let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            assert_eq!(lowered.signature.input_mapping(), &[None, Some(0)]);
+            assert_eq!(lowered.signature().input_mapping(), &[None, Some(0)]);
             let compiled = domain.compile_program(&lowered).unwrap();
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
@@ -2777,6 +2901,63 @@ mod tests {
     }
 
     #[test]
+    fn test_reshard_inputs_if_needed() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let device_values = |array: &Array<'_>| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| {
+                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // An input that already has the expected sharding passes through.
+        let input = f32_vector(&domain, &mesh, &[1., 2., 3., 4.]);
+        let inputs = reshard_inputs_if_needed(&domain, &mesh, &[replicated.clone()], vec![input.clone()]).unwrap();
+        assert_eq!(inputs, vec![input.clone()]);
+
+        // An input on one device of the mesh is placed on every device by copying its shard, which compiles nothing.
+        let single_device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![mesh.devices()[0]],
+        )
+        .unwrap();
+        let single_device_input = f32_vector(&domain, &single_device_mesh, &[1., 2., 3., 4.]);
+        let inputs = reshard_inputs_if_needed(
+            &domain,
+            &mesh,
+            &[replicated.clone(), replicated],
+            vec![input.clone(), single_device_input.clone()],
+        )
+        .unwrap();
+        assert_eq!(inputs[0], input);
+        assert_eq!(inputs[1].r#type(), input.r#type());
+        assert_eq!(inputs[1].mesh(), &mesh);
+        assert!(Arc::ptr_eq(
+            inputs[1].shards()[0].buffer().unwrap(),
+            single_device_input.shards()[0].buffer().unwrap(),
+        ));
+        assert_eq!(device_values(&inputs[1]), vec![vec![1., 2., 3., 4.]; 4]);
+        assert_eq!(domain.program_count(), 0);
+
+        // An input whose shards have to be sliced goes through a compiled reshard.
+        let inputs = reshard_inputs_if_needed(&domain, &mesh, &[sharded.clone()], vec![input]).unwrap();
+        assert_eq!(inputs[0].sharding(), &sharded);
+        assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
+        assert_eq!(domain.program_count(), 1);
+    }
+
+    #[test]
     fn test_static_program_outputs_take_their_planned_layouts_on_multiple_cpu_devices() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2798,7 +2979,7 @@ mod tests {
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert!(compiled.compiled_program().plan.output_layouts.is_some());
+        assert!(compiled.compiled_program().plan().output_layouts.is_some());
 
         // Outputs are built from the program's planned layouts, which place every shard like the validating
         // constructors do and are shared by the outputs of every execution.
@@ -2871,7 +3052,7 @@ mod tests {
             .into_inner();
             let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
                 staged.lower(&domain).unwrap().compile(&domain).unwrap();
-            assert!(compiled.compiled_program().plan.output_layouts.is_none());
+            assert!(compiled.compiled_program().plan().output_layouts.is_none());
         }
     }
 
@@ -2906,7 +3087,7 @@ mod tests {
             .unwrap();
 
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let executable_options = lowered.compilation_options.executable_build_options.as_ref().unwrap();
+        let executable_options = lowered.compilation_options().executable_build_options.as_ref().unwrap();
         assert_eq!(executable_options.replica_count, 4);
         assert_eq!(executable_options.partition_count, 1);
         assert!(!executable_options.use_spmd_partitioning);
@@ -2930,7 +3111,7 @@ mod tests {
         // Shardy and compiling it with the Shardy partitioner enabled fails on the internal dynamic tensor, even
         // though every boundary type is static.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let annotated = crate::experimental::lowering::lower_mlir_module_for_program(
+        let annotated = crate::lowering::lower_mlir_module_for_program(
             &program,
             &[],
             &vec![size_type, value_type.clone()],
@@ -2941,10 +3122,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut shardy_lowered = lowered.clone();
-        shardy_lowered.stable_hlo = annotated.into_parts().0.into();
-        shardy_lowered.compilation_options =
-            jit_compilation_options(domain.compilation_options.as_ref(), 4, true, None);
+        let shardy_lowered = lowered
+            .clone()
+            .with_stable_hlo(annotated.into_parts().0)
+            .with_compilation_options(jit_compilation_options(domain.compilation_options(), 4, true, None));
         let Err(error) = domain.compile_program(&shardy_lowered) else {
             panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
         };
@@ -2984,12 +3165,12 @@ mod tests {
         let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&domain).unwrap().compile(&domain).unwrap();
         let executable_options =
-            compiled.compiled_program().compilation_options.executable_build_options.as_ref().unwrap();
+            compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
         assert_eq!(executable_options.replica_count, 4);
         assert_eq!(executable_options.partition_count, 1);
         assert!(!executable_options.use_spmd_partitioning);
         assert!(!executable_options.use_shardy_partitioner);
-        assert!(compiled.compiled_program().plan.output_layouts.is_none());
+        assert!(compiled.compiled_program().plan().output_layouts.is_none());
 
         for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
             let actual_type =
@@ -3364,14 +3545,14 @@ mod tests {
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_program(&lowered).unwrap();
-        assert!(compiled.requires_assertion_handler);
+        assert!(compiled.requires_assertion_handler());
         // Some PJRT plugins do not serialize executables containing host callbacks. When serialization is available,
         // exercise the cache-hit path and prove its runtime-feature metadata survives restoration.
         let compiled = match domain.serialize_program(&compiled).unwrap() {
             Some(bytes) => domain.deserialize_program(bytes.as_slice()).unwrap().unwrap(),
             None => compiled,
         };
-        assert!(compiled.requires_assertion_handler);
+        assert!(compiled.requires_assertion_handler());
 
         let valid =
             Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
@@ -3633,7 +3814,7 @@ mod tests {
         .into_inner();
         let lowered = domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
         let compiled = domain.compile_program(&lowered).unwrap();
-        assert!(!compiled.requires_assertion_handler);
+        assert!(!compiled.requires_assertion_handler());
         let outputs = domain.execute_program(&compiled, vec![values, limits]).unwrap();
         assert_eq!(
             outputs[0]
@@ -4139,5 +4320,215 @@ mod tests {
             (7, 0),
             "`dimension_rem` requires right > 0; got left=7, right=0",
         );
+    }
+
+    #[test]
+    fn test_execute_arguments_from_arrays_with_donation_rejects_flag_count() {
+        assert!(matches!(
+            ExecutionArguments::from_arrays_with_donation(Vec::new(), Arc::from([]), &[true]),
+            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 0, actual_count: 1 })),
+        ));
+    }
+
+    #[test]
+    fn test_execute_arguments_from_arrays_with_donation_reuses_duplicate_device_error() {
+        assert!(matches!(
+            ExecutionArguments::from_arrays_with_donation(Vec::new(), Arc::from([7, 7]), &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Sharding(ShardingError::DuplicateDeviceId { id: 7 }),
+            ),
+        ));
+    }
+
+    fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
+        CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: partition_count as i64,
+                use_spmd_partitioning: true,
+                use_shardy_partitioner: true,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+            compiler_variant: None,
+        }
+    }
+
+    #[test]
+    fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
+        // Use the same 8-device CPU setup as `ryft_pjrt` tests.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
+            .expect("failed to create 8-device CPU client");
+        let domain = Session::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 8);
+
+        // Build mesh used for runtime arrays. In a JIT setting, we derive StableHLO Shardy
+        // annotations directly from these arrays.
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+
+        let lhs_sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let rhs_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+
+        // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).
+        // Row i is [i, i+1, i+2, i+3].
+        let lhs_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(row_index, device)| {
+                let row = row_index as f32;
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&[row, row + 1.0, row + 2.0, row + 3.0]).as_slice(),
+                        BufferType::F32,
+                        [1u64, 4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // Global rhs matrix is replicated on each device.
+        // [[1, 2], [0, 1], [1, 0], [2, 1]]
+        let rhs_values = [1.0f32, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0];
+        let rhs_buffers = client_devices
+            .iter()
+            .map(|device| {
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(rhs_values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [4u64, 2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let lhs_array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)]));
+        let rhs_array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)]));
+        let lhs_array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            lhs_array_type,
+            lhs_sharding,
+            mesh.clone(),
+            lhs_buffers,
+        )
+        .unwrap();
+        let rhs_array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            rhs_array_type,
+            rhs_sharding,
+            mesh.clone(),
+            rhs_buffers,
+        )
+        .unwrap();
+
+        assert_eq!(lhs_array.data_type(), DataType::F32);
+        assert_eq!(rhs_array.data_type(), DataType::F32);
+        assert_eq!(lhs_array.addressable_shards().count(), 8);
+        assert!(lhs_array.shards().iter().all(|shard| shard.buffer().is_some()));
+
+        // Derive Shardy attributes from runtime arrays (JIT-style).
+        let context = ryft_mlir::Context::new();
+        let mesh_module = context.module(context.unknown_location()).unwrap();
+        let mesh_operation = mesh_module
+            .body()
+            .unwrap()
+            .append_operation(lhs_array.sharding().mesh().to_mlir(context.unknown_location()).unwrap())
+            .unwrap()
+            .to_string();
+        let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
+
+        assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
+        assert_eq!(lhs_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
+        assert_eq!(rhs_sharding_attribute, "#sdy.sharding<@mesh, [{}, {}]>");
+
+        let mlir_program = format!(
+            r#"
+                    module {{
+                        {mesh_operation}
+                        func.func @main(
+                            %arg0: tensor<8x4xf32> {{sdy.sharding = {lhs_sharding_attribute}}},
+                            %arg1: tensor<4x2xf32> {{sdy.sharding = {rhs_sharding_attribute}}}
+                        ) -> (tensor<8x2xf32> {{sdy.sharding = {output_sharding_attribute}}}) {{
+                            %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0]
+                                : (tensor<8x4xf32>, tensor<4x2xf32>) -> tensor<8x2xf32>
+                            return %0 : tensor<8x2xf32>
+                        }}
+                    }}
+                "#
+        );
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(8)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 8);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let row_start_by_device = execution_device_ids
+            .iter()
+            .map(|device_id| {
+                let row_start = lhs_array.device_shard(*device_id).unwrap().slice()[0].start;
+                (*device_id, row_start)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let execute_arguments =
+            ExecutionArguments::from_arrays(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Validate each output shard: row r should be [4r + 8, 4r + 4].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            let row = *row_start_by_device.get(&device_id).unwrap() as f32;
+            assert_eq!(values[0], 4.0 * row + 8.0);
+            assert_eq!(values[1], 4.0 * row + 4.0);
+        }
     }
 }

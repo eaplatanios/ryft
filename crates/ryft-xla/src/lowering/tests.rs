@@ -14,15 +14,17 @@ use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize}
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
 use crate::Domain;
-use crate::experimental::lowering::LoweringError;
-use crate::experimental::lowering::types::lower_array_ir_type;
-use crate::experimental::ops::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
-use crate::experimental::tracing::{ArrayTracer, TracedProgram, trace_with_context};
+use crate::lowering::LoweringError;
+use crate::lowering::types::lower_array_ir_type;
 use crate::operations::assertions::ensure_assertion_handler_registered;
 use crate::operations::jit_call::JitCallOperation;
+use crate::operations::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
 use crate::tests::{values_from_bytes, values_to_bytes};
+use crate::tracing::{ArrayTracer, TracedProgram, trace_with_context};
 
 use super::*;
+
+// TODO(eaplatanios): Review this module.
 
 /// Homogeneous builder retained only for tests of the test-only plain-program lowering helper.
 pub(crate) type ProgramBuilder = CoreProgramBuilder<ArrayConstant, ArrayOperation<ArrayConstant>>;
@@ -643,7 +645,7 @@ fn test_lowering_rejects_unresolved_reference_state_before_token_threading() {
     // The artifact-wide reference scan catches the reference atoms and intrinsic semantics before token threading,
     // so two representative reference operations are enough to pin the diagnostic.
     let array_type = ArrayType::scalar(DataType::F32);
-    let mut builder = crate::experimental::ops::ProgramBuilder::new();
+    let mut builder = crate::operations::ProgramBuilder::new();
     let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
     let reference = builder
         .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![input], None)
@@ -689,7 +691,7 @@ fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
     let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
     let state_type = ArrayType::new_static(DataType::F32, [4]);
-    let mut builder = crate::experimental::ops::ProgramBuilder::new();
+    let mut builder = crate::operations::ProgramBuilder::new();
     let _zero = builder.add_input(ArrayIrType::Array(zero_type.clone()));
     let mutated = builder.add_input(ArrayIrType::Array(state_type.clone()));
     let _read_only = builder.add_input(ArrayIrType::Array(state_type.clone()));
@@ -816,7 +818,7 @@ fn test_bounded_dynamic_reference_state_alias_is_rejected_before_lowering() {
     let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
     let sharding = Sharding::replicated(mesh, 1);
-    let mut builder = crate::experimental::ops::ProgramBuilder::new();
+    let mut builder = crate::operations::ProgramBuilder::new();
     let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
     let program: FlatProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
     let reference_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0));

@@ -13,8 +13,8 @@ use ryft_mlir::{
 };
 
 use crate::domains::{RUNTIME_REQUIREMENTS_ATTRIBUTE, runtime_requirements};
-use crate::experimental::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
-use crate::experimental::lowering::{EffectTokens, current_or_new_token};
+use crate::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
+use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation};
 
@@ -567,18 +567,19 @@ mod tests {
     use crate::domains::runtimes::builtin_requirement;
     use crate::domains::tests::domain_mesh;
     use crate::domains::{RuntimeRequirement, with_runtime_requirements};
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::{
+    use crate::kernels::KernelEmbeddingError;
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, test_matrix_type, unproject_plain_program,
     };
-    use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::kernels::KernelEmbeddingError;
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::{
         ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, replicated_array, values_from_bytes,
         values_to_bytes,
     };
-    use crate::{Array, Domain, RuntimeError, Session, Value, to_mlir_module_for_program};
+    use crate::values::ArrayConstant;
+    use crate::{Array, Constant, Domain, RuntimeError, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 

@@ -22,10 +22,10 @@ use ryft_pjrt::{Client, Error as PjrtError};
 use crate::domains::effects::EffectCallbackGuard;
 use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::domains::{RuntimeExtension, RuntimeProvider, RuntimeRequirement};
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
 };
-use crate::experimental::lowering::{EffectTokens, current_or_new_token};
+use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::{Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Target};
@@ -1609,11 +1609,10 @@ mod tests {
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::RuntimeError;
-    use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
-    use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::lower_mlir_module_for_program_with_reference_state;
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::dot::RaggedDotLoweringStrategy;
-    use crate::to_mlir_module_for_program;
+    use crate::{Constant, RuntimeError, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1788,7 +1787,7 @@ mod tests {
     fn test_lower_guard_orders_later_io_after_the_check() {
         use ryft_core::{DimensionType, PrintOperation, Shape};
 
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::operations::debugging::ensure_print_handler_registered;
         use crate::tests::execution_client;
 
@@ -1848,7 +1847,7 @@ mod tests {
     fn test_lower_guard_widens_values_to_retained_identities() {
         use ryft_core::{AddOperation, Typed};
 
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::tests::execution_client;
 
         // `[f64[m], f64[2], f64[k]]` entering `[f64[n], f64[n], f64[n]]` with a retained `m` checks `m = k = 2` and
@@ -1897,7 +1896,7 @@ mod tests {
     fn test_lower_guard_renames_values_to_retained_identities() {
         use ryft_core::{AddOperation, Typed};
 
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::tests::execution_client;
 
         // `[f64[m], f64[k]]` entering `[f64[n], f64[n]]` with a retained `m` checks `m = k` without an exact extent and
@@ -2030,8 +2029,8 @@ mod tests {
             AddOperation, ArrayReferenceDischarge, PartialValue, ReferenceReadOperation, ReferenceType, TracingContext,
         };
 
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::ops::Operation;
+        use crate::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::operations::Operation;
         use crate::tests::execution_client;
 
         let client = execution_client();

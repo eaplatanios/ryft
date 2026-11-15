@@ -1,177 +1,33 @@
-use std::collections::HashSet;
+//! Compilation lifecycle of the XLA [`Domain`], which implements [`CompilationDomain`] and [`CompilationCacheDomain`].
+//!
+//! `Domain::lower_staged_program` validates the boundary of a staged program against the sharding overrides of its
+//! [`Options`]. `Domain::lower_program` then selects kernels, discharges references, places every executable argument
+//! and result, and emits the StableHLO module together with its invocation contract. `Domain::compile_program` compiles
+//! that module through the PJRT client of the domain and derives the reusable execution plan. [`with_input_shardings`]
+//! applies input sharding overrides to input types before staging.
+
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use prost::Message;
 use ryft_core::{
-    ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Dimension as CoreDimension,
-    DimensionBounds, DimensionVariable, DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram,
-    Memory, MeshAxisType, Operation as CoreOperation, Parameterized, ProgramError, ReductionKind,
-    ReferenceDischargeResult, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection,
-    StagedProgram, Type, TypeError, Typed, TypedProgram,
+    ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, DispatchInputs,
+    ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, Parameterized, ProgramError,
+    ReferenceDischargeResult, Sharding, ShardingDimension, StagedProgram, Type, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{CompilationOptions, OpShardingType};
 use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
-use crate::domains::Domain;
-use crate::domains::execution::{ExecutionError, ExecutionPlan};
-use crate::domains::options::{FeedbackDirectedProfile, InputBoundBucketing, Options};
-use crate::domains::persistence::COMPILER_IDENTITY;
-use crate::domains::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
-use crate::experimental::lowering::{
-    collect_session_constants, contains_unresolved_references, contains_unresolved_state,
-};
-use crate::experimental::ops::{Constant, FlatProgram, Operation};
-use crate::{Error, OpShardingExtension, Value};
+use crate::compilation::CompilationError;
+use crate::compilation::keys::{COMPILER_IDENTITY, CompilationKey, DispatchKey, dispatch_signature};
+use crate::compilation::options::{FeedbackDirectedProfile, Options};
+use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
+use crate::execution::ExecutionPlan;
+use crate::lowering::admission::validate_data_dependent_compilation;
+use crate::lowering::{collect_session_constants, contains_unresolved_references, contains_unresolved_state};
+use crate::operations::FlatProgram;
+use crate::{Constant, Domain, Error, ExecutionError, OpShardingExtension, Operation, Value};
 
 // TODO(eaplatanios): Review this module.
-
-/// XLA option, executable compatibility, persistence, and analysis failures.
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum CompilationError {
-    /// A requested compilation option combination is invalid.
-    #[error("invalid compilation options: {reason}")]
-    InvalidOptions { reason: String },
-
-    /// Signature sharding metadata has a different arity than the values it describes.
-    #[error("invalid {kind} sharding count; expected {expected} but got {actual}")]
-    ShardingCountMismatch { kind: &'static str, expected: usize, actual: usize },
-
-    /// A valid external-reference configuration cannot be represented by this backend's executable ABI.
-    #[error("unsupported XLA reference ABI: {reason}")]
-    UnsupportedReferenceAbi { reason: String },
-
-    /// A compiled executable does not preserve its declared invocation contract.
-    #[error("incompatible XLA executable: {reason}")]
-    IncompatibleExecutable { reason: String },
-
-    /// Persistent executable bytes or metadata violate their versioned transport contract.
-    #[error("invalid persistent XLA executable: {reason}")]
-    InvalidPersistentExecutable { reason: String },
-
-    /// Compiler analysis properties cannot be interpreted according to their declared schema.
-    #[error("invalid XLA compilation analysis: {reason}")]
-    InvalidAnalysis { reason: String },
-}
-
-/// Opaque retained-JIT specialization key derived by [`Domain`].
-///
-/// Exact dispatch preserves nominal [`DimensionVariable`] identity and shares its type slice with the effective staged
-/// signature, so keying a call costs no deep type clone. Dispatch with input-bound bucketing instead uses a structural
-/// physical-bound signature with dimension variables numbered by first occurrence, so calls routed to the same bucket
-/// share one staged and compiled specialization. Bucketed keys exclude diagnostic names, which survive only in the
-/// effective staged types.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DispatchKey {
-    /// Signature component of this key.
-    kind: DispatchKeyKind,
-
-    /// Runtime placements of the public inputs of an executable specialization whose inputs are placed over auto mesh
-    /// axes, which their types never record (refer to [`Options::input_placements`]), or [`None`] when no input is.
-    placements: Option<Arc<[Option<Sharding>]>>,
-}
-
-impl DispatchKey {
-    /// Creates a [`DispatchKey`] without runtime placements.
-    fn new(kind: DispatchKeyKind) -> Self {
-        Self { kind, placements: None }
-    }
-}
-
-/// Internal representation of [`DispatchKey`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum DispatchKeyKind {
-    /// Exact runtime abstract signature used when bucketing is disabled, shared with the effective staged types.
-    Exact(Arc<[ArrayIrType]>),
-
-    /// Bounded signature using canonical variable indices when bucketing is enabled.
-    Bucketed(BucketedDispatchSignature),
-}
-
-/// Bounded input signature with dimension variables numbered by first occurrence, used as the retained-dispatch key.
-///
-/// Dimension variables are numbered by first occurrence across the whole input signature under
-/// [`DimensionVariable`] identity, and only their bounds are retained. Two bucketed signatures are therefore equal
-/// exactly when they agree on every input's data type, layout, sharding, memory space, rank, per-axis static extents,
-/// and per-axis variable-sharing pattern with matching bounds, regardless of how the variables are named.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BucketedDispatchSignature {
-    /// `(lower, upper)` bounds of each distinct dimension variable, in first-occurrence order.
-    variables: Vec<(usize, Option<usize>)>,
-
-    /// Bucketed input array types with their shapes rewritten into variable-index patterns.
-    input_types: Vec<BucketedArrayTypeKey>,
-}
-
-/// One bucketed input array type split into a shape-free carrier and a shape pattern using canonical variable indices.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BucketedArrayTypeKey {
-    /// Array type with an empty shape, retaining data type, layout, sharding, and memory identity.
-    carrier: ArrayType,
-
-    /// Per-axis static extents or canonical variable indices, which also fix the array's rank.
-    dimensions: Vec<BucketedDimensionKey>,
-}
-
-/// One static extent or canonical variable index of a [`BucketedArrayTypeKey`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum BucketedDimensionKey {
-    /// Statically known extent. Bucketing rewrites every static input axis into a bounded dynamic axis, so this
-    /// variant is unreachable for signatures produced today; it is retained so the normalization stays total over
-    /// [`CoreDimension`](ryft_core::Dimension).
-    Static(usize),
-
-    /// Index of the axis' dimension variable in [`BucketedDispatchSignature::variables`].
-    Variable(usize),
-}
-
-impl BucketedDispatchSignature {
-    /// Builds a dispatch key from the already bucketed `input_types`, numbering dimension variables by first
-    /// occurrence.
-    fn new(input_types: &[ArrayType]) -> Self {
-        let mut variables = Vec::<DimensionVariable>::new();
-        let input_types = input_types
-            .iter()
-            .map(|array_type| BucketedArrayTypeKey {
-                carrier: array_type.clone().with_shape(Shape::new(Vec::new())),
-                dimensions: array_type
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .map(|dimension| match dimension {
-                        CoreDimension::Static(extent) => BucketedDimensionKey::Static(*extent),
-                        CoreDimension::Dynamic(variable) => {
-                            let index =
-                                variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
-                                    variables.push(variable.clone());
-                                    variables.len() - 1
-                                });
-                            BucketedDimensionKey::Variable(index)
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-        let variables =
-            variables.iter().map(|variable| (variable.bounds().lower(), variable.bounds().upper())).collect();
-        Self { variables, input_types }
-    }
-}
-
-/// Exact process-local compilation key for an XLA lowering.
-///
-/// Unlike the former call-site fingerprint, this key carries the complete StableHLO computation and every
-/// execution-relevant field retained by [`LoweredProgram`]. Equality therefore means that cached compiled
-/// artifacts are interchangeable, even when unrelated call sites happen to share the same input signature.
-///
-/// Dynamic dimensions are numbered by first occurrence, so diagnostic variable names do not affect identity.
-/// Compilation options, shardings, target facts, runtime requirements, and effect metadata remain part of the key.
-/// This complete compilation identity is distinct from a [`DispatchKey`], which selects a retained specialization.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CompilationKey {
-    /// Complete canonical compilation contract, compared and hashed without reducing it to a fingerprint.
-    pub(super) canonical_bytes: Arc<[u8]>,
-}
 
 impl<'c> CompilationDomain for Domain<'c> {
     type DispatchKey = DispatchKey;
@@ -184,44 +40,34 @@ impl<'c> CompilationDomain for Domain<'c> {
         inputs: DispatchInputs<'_, '_, Self::Value>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>, Option<Self::Options>), Self::Error> {
-        let (input_types, values) = match inputs {
-            DispatchInputs::Types(input_types) => (input_types, None),
-            DispatchInputs::Values { values, types } => (types, Some(values)),
-        };
-        let input_count = input_types.len();
-        // Only independent executable requests apply bucketing. Staged calls retain their caller's signature.
-        let bucketing = values.as_ref().and(options.input_bound_bucketing);
-        let (key, input_types) = normalize_dispatch_signature(input_types, options, bucketing)?;
-        let Some(inputs) = values.filter(|_| options.input_shardings.is_none()) else {
-            return Ok((key, input_types, None));
-        };
-
-        // Only placements that name auto mesh axes are missing from the input types, and the placement vector is only
-        // allocated once such an input appears, so that ordinary calls pay for no allocation.
-        let mut placements = None::<Vec<Option<Sharding>>>;
-        for (index, input) in inputs.enumerate() {
-            match input {
-                Value::Array(array) if array.sharding().references_auto_axis() => {
-                    placements.get_or_insert_with(|| vec![None; index]).push(Some(array.sharding().clone()))
-                }
-                _ => {
-                    if let Some(placements) = &mut placements {
-                        placements.push(None);
-                    }
-                }
-            }
-        }
-        let Some(mut placements) = placements else {
-            return Ok((key, input_types, None));
-        };
-        placements.resize(input_count, None);
-        let placements: Arc<[_]> = placements.into();
-        let mut options = options.clone();
-        options.input_placements = Some(Arc::clone(&placements));
-        Ok((DispatchKey { placements: Some(placements), ..key }, input_types, Some(options)))
+        dispatch_signature(inputs, options)
     }
 
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Self::Error> {
+        self.lower_staged_program(staged)
+    }
+
+    // The cached executable depends only on the types of the session constants of `program`, so their arrays are
+    // resolved through this domain's session for every request, including cache hits (refer to `SessionConstant`).
+    fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram<'c>>, Vec<Value<'c>>), Self::Error> {
+        let session_arrays = program
+            .session_constants
+            .iter()
+            .map(|constant| Ok(Value::Array(self.session().constant(self, constant)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok((self.compilation_context().compile(self, program)?, session_arrays))
+    }
+
+    fn execute(&self, program: &CompiledProgram<'c>, inputs: Vec<Value<'c>>) -> Result<Vec<Value<'c>>, Self::Error> {
+        self.execute_stateless(program, inputs).map(|(outputs, _)| outputs)
+    }
+}
+
+impl<'c> Domain<'c> {
+    /// Lowers a staged program after validating that its boundary types carry the sharding overrides of its options and
+    /// that no reference crosses its output boundary. This function implements
+    /// [`CompilationDomain::lower`](ryft_core::CompilationDomain::lower).
+    pub(super) fn lower_staged_program(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Error> {
         let program = staged.lifted_program()?;
         let capture_count = staged.source_program().captures().len();
         let input_types = staged.input_types();
@@ -265,26 +111,9 @@ impl<'c> CompilationDomain for Domain<'c> {
         Ok(lowered_program)
     }
 
-    // The cached executable depends only on the types of the session constants of `program`, so their arrays are
-    // resolved through this domain's session for every request, including cache hits (refer to `SessionConstant`).
-    fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram<'c>>, Vec<Value<'c>>), Self::Error> {
-        let session_arrays = program
-            .session_constants
-            .iter()
-            .map(|constant| Ok(Value::Array(self.session().constant(self, constant)?)))
-            .collect::<Result<Vec<_>, Error>>()?;
-        Ok((self.compilation_context().compile(self, program)?, session_arrays))
-    }
-
-    fn execute(&self, program: &CompiledProgram<'c>, inputs: Vec<Value<'c>>) -> Result<Vec<Value<'c>>, Self::Error> {
-        self.execute_stateless(program, inputs).map(|(outputs, _)| outputs)
-    }
-}
-
-impl<'c> Domain<'c> {
     /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
     /// domain.
-    pub(super) fn lower_program(
+    pub(crate) fn lower_program(
         &self,
         program: &FlatProgram,
         capture_count: usize,
@@ -618,7 +447,7 @@ impl<'c> Domain<'c> {
             }
         }
         let compilation_options = jit_compilation_options(
-            self.compilation_options.as_ref(),
+            self.compilation_options(),
             options.mesh.devices().len(),
             use_shardy_partitioner,
             options.feedback_directed_profile.as_ref(),
@@ -650,7 +479,7 @@ impl<'c> Domain<'c> {
                     && !sharding.dimensions().contains(&ShardingDimension::Unconstrained)
             })
             .collect::<Vec<_>>();
-        let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state(
+        let lowered_module = crate::lowering::lower_mlir_module_for_program_with_reference_state(
             program,
             effective_capture_types.as_slice(),
             &effective_public_input_types,
@@ -825,127 +654,17 @@ impl<'c> CompilationCacheDomain for Domain<'c> {
     }
 }
 
-/// Applies input sharding declarations and optional executable bucketing, without inspecting runtime values.
-fn normalize_dispatch_signature(
-    input_types: Vec<ArrayIrType>,
-    options: &Options,
-    bucketing: Option<InputBoundBucketing>,
-) -> Result<(DispatchKey, Arc<[ArrayIrType]>), Error> {
-    let input_types = apply_input_shardings(input_types, options)?;
-    let Some(bucketing) = bucketing else {
-        let input_types: Arc<[ArrayIrType]> = input_types.into();
-        return Ok((DispatchKey::new(DispatchKeyKind::Exact(input_types.clone())), input_types));
-    };
-    if options.mesh.devices().len() > 1 {
-        return Err(Error::Compilation(CompilationError::InvalidOptions {
-            reason: "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
-                     signatures require disabling the Shardy partitioner"
-                .to_string(),
-        }));
-    }
-    let mut bucketed_array_types = Vec::with_capacity(input_types.len());
-    for (input_index, r#type) in input_types.iter().enumerate() {
-        let array_type = match r#type {
-            ArrayIrType::Array(array_type) => array_type,
-            ArrayIrType::Dimension(_) => {
-                return Err(Error::Compilation(CompilationError::InvalidOptions {
-                    reason: format!(
-                        "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
-                         type {}",
-                        input_index, r#type,
-                    ),
-                }));
-            }
-            ArrayIrType::Reference(_) => {
-                return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
-                    reason: format!("external reference input {input_index} does not support input-bound bucketing"),
-                }));
-            }
-        };
-        let dimensions = array_type
-            .shape()
-            .dimensions()
-            .iter()
-            .enumerate()
-            .map(|(axis, dimension)| match dimension {
-                CoreDimension::Static(extent) => {
-                    let bound = match bucketing {
-                        InputBoundBucketing::PowerOfTwo => extent.checked_next_power_of_two(),
-                    }
-                    .and_then(|bound| bound.checked_add(1))
-                    .ok_or_else(|| ProgramError::InvalidArgument {
-                        message: format!(
-                            "cannot select a finite input-bound bucket for input {input_index} axis {axis} with \
-                             extent {extent}",
-                        ),
-                    })?;
-                    let bounds = DimensionBounds::new(0, Some(bound))?;
-                    Ok(CoreDimension::Dynamic(DimensionVariable::new(
-                        format!("input_{input_index}_axis_{axis}"),
-                        bounds,
-                    )))
-                }
-                CoreDimension::Dynamic(variable) => Ok(CoreDimension::Dynamic(variable.clone())),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
-    }
-    let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
-    let input_types = bucketed_array_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>();
-    Ok((DispatchKey::new(DispatchKeyKind::Bucketed(key)), input_types.into()))
-}
-
-/// Returns the runtime placement of every output of `program` compiled as `executable`. The placement of an output
-/// that lowering left open over auto mesh axes (refer to [`LoweredProgram::open_outputs`]) is the placement that the
-/// compiler chose for it, which must agree with the placement that the output type records over the other mesh axes.
-fn resolve_output_shardings(
-    executable: &LoadedExecutable<'_>,
-    program: &LoweredProgram,
-) -> Result<Arc<[Sharding]>, Error> {
-    if !program.open_outputs.iter().any(|open| *open) {
-        return Ok(Arc::clone(&program.output_shardings));
-    }
-    let incompatible = |reason: String| Error::Compilation(CompilationError::IncompatibleExecutable { reason });
-    let op_shardings = executable.executable()?.output_shardings()?.ok_or_else(|| {
-        incompatible("the PJRT plugin does not report the output shardings that the compiler chose".to_string())
-    })?;
-    let op_shardings = match op_shardings.as_slice() {
-        [sharding] if sharding.r#type == OpShardingType::Tuple as i32 => sharding.tuple_shardings.clone(),
-        _ => op_shardings,
-    };
-    program
-        .output_shardings
-        .iter()
-        .zip(program.open_outputs.iter())
-        .enumerate()
-        .map(|(index, (declared, &open))| {
-            let Some(physical_index) = program.signature.output_mapping()[index].filter(|_| open) else {
-                return Ok(declared.clone());
-            };
-            let op_sharding = op_shardings.get(physical_index).ok_or_else(|| {
-                incompatible(format!("the executable reports no sharding for output {physical_index}"))
-            })?;
-            op_sharding
-                .to_sharding(declared.mesh(), declared.rank())
-                .filter(|sharding| sharding.without_auto_axes() == declared.without_auto_axes())
-                .ok_or_else(|| {
-                    incompatible(format!(
-                        "the compiler placed output {index} as {op_sharding:?}, which is not a placement over the mesh \
-                         axes that agrees with its declared sharding `{declared}`",
-                    ))
-                })
-        })
-        .collect()
-}
-
 /// Returns `input_types` with the input sharding overrides of `options` (i.e., [`Options::input_shardings`])
 /// applied, or `input_types` unchanged when `options` has none. The overrides must be applied before tracing, because
 /// tracers carry their input types and sharding-aware operations read them. Retained dispatch applies them through
-/// [`CompilationDomain::dispatch_signature`], the staging entry points of this crate apply them through
-/// [`with_input_shardings`], and lowering rejects staged functions whose input types do not carry them. External
-/// reference inputs are rejected when overrides are present, because holder state derives its effective sharding from
-/// the compiled reference ABI.
-fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &Options) -> Result<Vec<ArrayIrType>, Error> {
+/// [`CompilationDomain::dispatch_signature`](ryft_core::CompilationDomain::dispatch_signature), the staging entry
+/// points of this crate apply them through [`with_input_shardings`], and lowering rejects staged functions whose input
+/// types do not carry them. External reference inputs are rejected when overrides are present, because holder state
+/// derives its effective sharding from the compiled reference ABI.
+pub(super) fn apply_input_shardings(
+    input_types: Vec<ArrayIrType>,
+    options: &Options,
+) -> Result<Vec<ArrayIrType>, Error> {
     let Some(input_shardings) = options.input_shardings.as_deref() else {
         return Ok(input_types);
     };
@@ -978,9 +697,9 @@ fn apply_input_shardings(input_types: Vec<ArrayIrType>, options: &Options) -> Re
 ///     ShardingDimension,
 /// };
 /// use ryft_xla::Options;
-/// use ryft_xla::domains::with_input_shardings;
+/// use ryft_xla::compilation::with_input_shardings;
 ///
-/// let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto)?])?;
+/// let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit)?])?;
 /// let mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 0), Device::new(1, 0)])?;
 /// let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])])?;
 /// let options = Options::new(mesh).with_input_shardings(vec![sharding.clone()]);
@@ -1067,7 +786,7 @@ fn validate_reference_outputs(
 }
 
 /// Validates backend output arity and refinement of the declared logical array types.
-pub(super) fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), Error> {
+fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), Error> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
     }
@@ -1148,373 +867,10 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
     })
 }
 
-/// Padding contract used when admitting one staged operation to data-dependent bounded-dynamic lowering.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum DataDependentPaddingDiscipline {
-    /// StableHLO propagates the operation's logical dynamic dimensions without inspecting physical padding lanes.
-    Propagated,
-
-    /// Ryft delegates identity- or sentinel-masking of padding lanes to XLA's bounded-dynamic legalizer.
-    XlaMasked,
-
-    /// Ryft delegates zero-padding of contraction lanes to XLA's bounded-dynamic legalizer.
-    XlaZeroPadded,
-
-    /// Ryft explicitly materializes bounded physical operands with operation-specific padding values or masks and
-    /// restores dynamic result metadata after the physical computation.
-    RyftMasked,
-
-    /// Ryft lacks sufficient semantic or execution evidence to admit this operation safely.
-    Unsupported { reason: &'static str },
-}
-
-/// Returns the XLA masking contract for one reduction kind. The exhaustive match makes adding a reduction kind a
-/// compile-time update to the data-dependent inventory instead of silently inheriting another kind's padding rule.
-fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::{Unsupported, XlaMasked};
-
-    match kind {
-        ReductionKind::Sum
-        | ReductionKind::Product
-        | ReductionKind::Max
-        | ReductionKind::Min
-        | ReductionKind::Any
-        | ReductionKind::All => XlaMasked,
-        // A log-sum-exp `reduce` expands into maximum and summation reductions over the same axes, so it inherits
-        // the masking contract of exactly those two reduction kinds: XLA masks each reduction's
-        // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
-        // before they are summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
-        // data-derived extent on the kept axis, which is the admission's execution evidence.
-        ReductionKind::LogSumExp => XlaMasked,
-        ReductionKind::Mean => {
-            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" }
-        }
-    }
-}
-
-/// Returns the XLA masking contract for one sort direction. Keeping the match exhaustive makes sort-direction
-/// additions compile-forced inventory changes because ascending and descending sorts require opposite sentinels.
-fn sort_data_dependent_padding_discipline(direction: SortDirection) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::XlaMasked;
-
-    match direction {
-        SortDirection::Ascending | SortDirection::Descending => XlaMasked,
-    }
-}
-
-/// Rejects every scatter combiner until its padding behavior has kind-specific execution evidence. The exhaustive
-/// match deliberately forces new combiners through the same review rather than admitting them as ordinary shape-
-/// preserving operations.
-fn scatter_data_dependent_padding_discipline(kind: ScatterReductionKind) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::Unsupported;
-
-    match kind {
-        ScatterReductionKind::Overwrite => Unsupported {
-            reason: "overwrite-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Add => {
-            Unsupported { reason: "add-scatter padding semantics have not been verified for data-derived dimensions" }
-        }
-        ScatterReductionKind::Mul => Unsupported {
-            reason: "multiply-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Min => Unsupported {
-            reason: "minimum-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Max => Unsupported {
-            reason: "maximum-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-    }
-}
-
-/// Classifies every homogeneous array operation by the padding discipline required for data-derived dimensions.
-/// Keeping this match exhaustive makes a newly added operation a compile-time inventory update rather than silently
-/// assuming that arbitrary padding is safe.
-fn array_data_dependent_padding_discipline(
-    operation: &ArrayOperation<crate::experimental::ops::ArrayConstant>,
-) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
-
-    match operation {
-        ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
-        ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
-        // XLA pads every input of the variadic reduction that these lower to with that input's own initial value along
-        // a dynamic reduced axis (i.e., the extremum identity paired with index zero), which never beats a live element
-        // and ties only when every live element equals the identity, where index zero is correct. Dynamic axes that
-        // are not reduced pass through. `data_derived_padding_fixture` executes both configurations.
-        ArrayOperation::ArgMax(_) | ArrayOperation::ArgMin(_) => XlaMasked,
-        // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update lanes;
-        // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
-        // Other window shapes, modes, and combiners retain their independent admission requirements.
-        ArrayOperation::Scatter(operation)
-            if operation.kind() == ScatterReductionKind::Add
-                && operation.mode() == ScatterMode::PromiseInBounds
-                && operation.unique_indices()
-                && operation.dimensions().update_window_dimensions().is_empty() =>
-        {
-            XlaMasked
-        }
-        ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
-        // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
-        // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
-        // the same for every combining operator, and the prefix sum in `data_derived_padding_fixture` executes this arm
-        // with the data-derived extent on the unscanned axis.
-        ArrayOperation::Cumulative(_) => Propagated,
-        ArrayOperation::Dot(_) => XlaZeroPadded,
-        ArrayOperation::RaggedDot(_) => {
-            Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
-        }
-        ArrayOperation::ScaledDot(_) => RyftMasked,
-        ArrayOperation::RngBitGenerator(_) => Unsupported {
-            reason: "random generation advances state according to physical rather than logical element count",
-        },
-        ArrayOperation::Dropout(_) => {
-            Unsupported { reason: "dropout masks are drawn according to physical rather than logical extents" }
-        }
-        ArrayOperation::ParallelRaggedAllToAll(_) => {
-            Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
-        }
-        ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
-        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly: the physical buffer is sliced or
-        // padded, and every axis that stays dynamic gets its logical size back.
-        ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => RyftMasked,
-        ArrayOperation::Assert(_)
-        | ArrayOperation::Zero(_)
-        | ArrayOperation::ZeroLike(_)
-        | ArrayOperation::One(_)
-        | ArrayOperation::OneLike(_)
-        | ArrayOperation::Constant(_)
-        | ArrayOperation::FillLike(_)
-        | ArrayOperation::Iota(_)
-        | ArrayOperation::IotaLike(_)
-        | ArrayOperation::Abs(_)
-        | ArrayOperation::Neg(_)
-        | ArrayOperation::Add(_)
-        | ArrayOperation::Sub(_)
-        | ArrayOperation::SaturatingSub(_)
-        | ArrayOperation::Mul(_)
-        | ArrayOperation::Div(_)
-        | ArrayOperation::Sin(_)
-        | ArrayOperation::Cos(_)
-        | ArrayOperation::Tan(_)
-        | ArrayOperation::Atan2(_)
-        | ArrayOperation::Exp(_)
-        | ArrayOperation::ExpM1(_)
-        | ArrayOperation::Log(_)
-        | ArrayOperation::Ln1p(_)
-        | ArrayOperation::LogAddExp(_)
-        | ArrayOperation::Sqrt(_)
-        | ArrayOperation::Rsqrt(_)
-        | ArrayOperation::Tanh(_)
-        | ArrayOperation::Logistic(_)
-        | ArrayOperation::Erf(_)
-        | ArrayOperation::Pow(_)
-        | ArrayOperation::Sign(_)
-        | ArrayOperation::Floor(_)
-        | ArrayOperation::Ceil(_)
-        | ArrayOperation::Round(_)
-        | ArrayOperation::Max(_)
-        | ArrayOperation::Min(_)
-        | ArrayOperation::Clamp(_)
-        | ArrayOperation::Rem(_)
-        | ArrayOperation::Not(_)
-        | ArrayOperation::And(_)
-        | ArrayOperation::Or(_)
-        | ArrayOperation::Xor(_)
-        | ArrayOperation::Complex(_)
-        | ArrayOperation::Conjugate(_)
-        | ArrayOperation::Real(_)
-        | ArrayOperation::Imaginary(_)
-        | ArrayOperation::ParallelReduce(_)
-        | ArrayOperation::ParallelVary(_)
-        | ArrayOperation::ParallelCast(_)
-        | ArrayOperation::ParallelAllGather(_)
-        | ArrayOperation::ParallelSumScatter(_)
-        | ArrayOperation::ParallelPermute(_)
-        | ArrayOperation::ParallelBroadcast(_)
-        | ArrayOperation::ParallelAllToAll(_)
-        | ArrayOperation::AxisIndex(_)
-        | ArrayOperation::Reverse(_)
-        | ArrayOperation::Transpose(_)
-        | ArrayOperation::Reshape(_)
-        | ArrayOperation::Broadcast(_)
-        | ArrayOperation::BroadcastLike(_)
-        | ArrayOperation::Pad(_)
-        | ArrayOperation::Concatenate(_)
-        | ArrayOperation::Gather(_)
-        | ArrayOperation::Slice(_)
-        | ArrayOperation::UpdateSlice(_)
-        | ArrayOperation::DynamicSlice(_)
-        | ArrayOperation::DynamicUpdateSlice(_)
-        | ArrayOperation::Compare(_)
-        | ArrayOperation::Select(_)
-        | ArrayOperation::Condition(_)
-        | ArrayOperation::While(_)
-        | ArrayOperation::Scan(_)
-        | ArrayOperation::ConvertElementType(_)
-        | ArrayOperation::ReducePrecision(_)
-        | ArrayOperation::TransferToMemory(_)
-        | ArrayOperation::Reshard(_)
-        | ArrayOperation::ConstrainSharding(_)
-        | ArrayOperation::StopGradient(_)
-        | ArrayOperation::Tag(_)
-        | ArrayOperation::Rematerialize(_)
-        | ArrayOperation::Composite(_)
-        | ArrayOperation::CompositeTranspose(_)
-        | ArrayOperation::LinearCall(_) => Propagated,
-    }
-}
-
-/// Classifies every XLA operation by the bounded-dynamic padding discipline it requires.
-fn data_dependent_padding_discipline(operation: &Operation) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported};
-
-    match operation {
-        Operation::Array(operation) => array_data_dependent_padding_discipline(operation),
-        Operation::RngBitGenerator(_) => Unsupported {
-            reason: "random generation advances state according to physical rather than logical element count",
-        },
-        Operation::ParallelRaggedAllToAll(_) => {
-            Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
-        }
-        Operation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        Operation::ReferenceNew(_)
-        | Operation::ReferenceRead(_)
-        | Operation::ReferenceWrite(_)
-        | Operation::ReferenceSwap(_)
-        | Operation::ReferenceAddUpdate(_)
-        | Operation::ReferenceAtomicAddUpdate(_)
-        | Operation::ReferenceFreeze(_) => {
-            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
-        }
-        Operation::Kernel(_) => {
-            Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
-        }
-        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
-        Operation::Guard(_) | Operation::Cast(_) => RyftMasked,
-        Operation::ShardMap(_) => {
-            Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
-        }
-        Operation::Zero(_)
-        | Operation::DynamicOne(_)
-        | Operation::DynamicIota(_)
-        | Operation::Dimension(_)
-        | Operation::Compare(_)
-        | Operation::Assert(_)
-        | Operation::DimensionSize(_)
-        | Operation::DimensionFromScalar(_)
-        | Operation::DimensionToScalar(_)
-        | Operation::Reshape(_)
-        | Operation::Broadcast(_)
-        | Operation::Concatenate(_)
-        | Operation::Pad(_)
-        | Operation::DynamicSlice(_)
-        | Operation::ParallelAllGather(_)
-        | Operation::ParallelSumScatter(_)
-        | Operation::ParallelAllToAll(_)
-        | Operation::Condition(_)
-        | Operation::While(_)
-        | Operation::Scan(_)
-        | Operation::Composite(_)
-        | Operation::LinearCall(_)
-        | Operation::Rematerialize(_)
-        | Operation::CompositeTranspose(_)
-        | Operation::LiftedComposite(_)
-        | Operation::LiftedCompositeTranspose(_)
-        | Operation::JitCall(_) => Propagated,
-    }
-}
-
-/// Returns whether `r#type` carries an identity derived from `dimension_from_scalar`.
-fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<DimensionVariable>) -> bool {
-    r#type.identities().any(|(_, identity)| variables.contains(identity))
-}
-
-/// Validates the bounded-dynamic compilation contract for dimensions produced by `dimension_from_scalar`.
-///
-/// `XlaMasked` and `XlaZeroPadded` are explicit delegation decisions: the bounded-dynamic XLA legalizer owns those
-/// transformations. `RyftMasked` operations instead materialize their physical kernel inputs and restore logical
-/// extents in Ryft's lowering. Only configurations with execution evidence are admitted; unbounded gateways and
-/// unsupported consumers are rejected before MLIR construction.
-fn validate_data_dependent_compilation(program: &FlatProgram) -> Result<(), Error> {
-    let mut variables = HashSet::new();
-    for region in program.regions() {
-        for instruction in region.instructions() {
-            if let Operation::DimensionFromScalar(operation) = instruction.operation() {
-                // A static output defines no identity and is checked against its extent.
-                let Some(variable) = operation.output_type().variable() else {
-                    continue;
-                };
-                if variable.bounds().upper().is_none() {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!(
-                            "data-derived dimension `{variable}` with bounds {} needs a finite upper bound for XLA \
-                             compilation",
-                            variable.bounds(),
-                        ),
-                    }
-                    .into());
-                }
-                variables.insert(variable.clone());
-            }
-        }
-    }
-    if variables.is_empty() {
-        return Ok(());
-    }
-
-    // Dimension arithmetic produces fresh identities, so close the data-derived set transitively over dimension-typed
-    // instruction outputs before classifying the array operations that consume those identities.
-    loop {
-        let count = variables.len();
-        for region in program.regions() {
-            for instruction in region.instructions() {
-                if !instruction.inputs().iter().any(|input| {
-                    references_data_derived_dimension(region.atoms()[input.index()].r#type().as_ref(), &variables)
-                }) {
-                    continue;
-                }
-                for output in instruction.outputs() {
-                    if let ArrayIrType::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref() {
-                        variables.insert(r#type.variable().unwrap().clone());
-                    }
-                }
-            }
-        }
-        if variables.len() == count {
-            break;
-        }
-    }
-
-    for region in program.regions() {
-        for instruction in region.instructions() {
-            let consumes_data_derived_extent = instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
-                references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)
-            });
-            if consumes_data_derived_extent {
-                if let DataDependentPaddingDiscipline::Unsupported { reason } =
-                    data_dependent_padding_discipline(instruction.operation())
-                {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
-                             {reason}",
-                            instruction.operation().name(),
-                        ),
-                    }
-                    .into());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Overlays the selected multi-device execution mode on the base [`CompilationOptions`] template. Static programs
 /// use Shardy SPMD partitioning, while bounded-dynamic programs use one fully replicated executable replica per
 /// device because Shardy does not yet accept dynamic tensors.
-pub(super) fn jit_compilation_options(
+pub(crate) fn jit_compilation_options(
     base: &CompilationOptions,
     device_count: usize,
     use_shardy_partitioner: bool,
@@ -1537,126 +893,51 @@ pub(super) fn jit_compilation_options(
     options
 }
 
-/// Encodes compilation options deterministically even though Prost represents protobuf maps as randomly seeded
-/// `HashMap`s. Map entries are removed from a clone before normal protobuf encoding and appended as length-delimited,
-/// path-qualified records sorted by their encoded keys and values.
-pub(super) fn canonical_compilation_options_bytes(options: &CompilationOptions) -> Vec<u8> {
-    use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey};
-
-    /// Appends one sorted protobuf-map record with an explicit path and length delimiters.
-    fn append_record(output: &mut Vec<u8>, path: &[u8], mut entries: Vec<(Vec<u8>, Vec<u8>)>) {
-        entries.sort_unstable();
-        output.extend_from_slice(&(path.len() as u64).to_le_bytes());
-        output.extend_from_slice(path);
-        output.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        for (key, value) in entries {
-            output.extend_from_slice(&(key.len() as u64).to_le_bytes());
-            output.extend_from_slice(key.as_slice());
-            output.extend_from_slice(&(value.len() as u64).to_le_bytes());
-            output.extend_from_slice(value.as_slice());
-        }
+/// Returns the runtime placement of every output of `program` compiled as `executable`. The placement of an output
+/// that lowering left open over auto mesh axes (refer to [`LoweredProgram::open_outputs`]) is the placement that the
+/// compiler chose for it, which must agree with the placement that the output type records over the other mesh axes.
+fn resolve_output_shardings(
+    executable: &LoadedExecutable<'_>,
+    program: &LoweredProgram,
+) -> Result<Arc<[Sharding]>, Error> {
+    if !program.open_outputs.iter().any(|open| *open) {
+        return Ok(Arc::clone(&program.output_shardings));
     }
-
-    /// Removes tuning knobs from a protobuf algorithm key and appends their sorted canonical record.
-    fn drain_algorithm_map(output: &mut Vec<u8>, path: &[u8], algorithm: &mut ryft_pjrt::protos::AutoTuneAlgorithmKey) {
-        append_record(
-            output,
-            path,
-            std::mem::take(&mut algorithm.tuning_knobs)
-                .into_iter()
-                .map(|(key, value)| (key.to_le_bytes().to_vec(), value.to_le_bytes().to_vec()))
-                .collect(),
-        );
-    }
-
-    let mut options = options.clone();
-    let mut maps = Vec::new();
-    append_record(
-        &mut maps,
-        b"compilation.environment_option_overrides",
-        std::mem::take(&mut options.environment_option_overrides)
-            .into_iter()
-            .map(|(key, value)| (key.into_bytes(), value.encode_to_vec()))
-            .collect(),
-    );
-    if let Some(debug_options) =
-        options.executable_build_options.as_mut().and_then(|options| options.debug_options.as_mut())
-    {
-        append_record(
-            &mut maps,
-            b"executable.debug.analytical_latency_estimator",
-            std::mem::take(&mut debug_options.xla_gpu_analytical_latency_estimator_options)
-                .into_iter()
-                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
-                .collect(),
-        );
-        append_record(
-            &mut maps,
-            b"executable.debug.experimental_cost_model_gemm_tiling",
-            std::mem::take(&mut debug_options.xla_gpu_experimental_cost_model_gemm_tiling_options)
-                .into_iter()
-                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
-                .collect(),
-        );
-        append_record(
-            &mut maps,
-            b"executable.debug.backend_extra_options",
-            std::mem::take(&mut debug_options.xla_backend_extra_options)
-                .into_iter()
-                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
-                .collect(),
-        );
-    }
-    if let Some(target) = options.target_config.as_mut() {
-        if let Some(device) = target.gpu_device_information.as_mut() {
-            for (name, description) in [
-                (b"target.device.scalar_rates".as_slice(), device.scalar_unit_description.as_mut()),
-                (b"target.device.matrix_rates".as_slice(), device.matrix_unit_description.as_mut()),
-            ] {
-                if let Some(description) = description {
-                    append_record(
-                        &mut maps,
-                        name,
-                        std::mem::take(&mut description.rate_information)
-                            .into_iter()
-                            .map(|(key, value)| (key.to_le_bytes().to_vec(), value.encode_to_vec()))
-                            .collect(),
-                    );
-                }
-            }
-        }
-        if let Some(autotune_results) = target.autotune_results.as_mut() {
-            for (index, entry) in autotune_results.results.iter_mut().enumerate() {
-                let Some(result) = entry.result.as_mut() else {
-                    continue;
-                };
-                if let Some(AutoTuneResultKey::Algorithm(algorithm)) = result.key.as_mut() {
-                    drain_algorithm_map(&mut maps, format!("target.autotune.{index}.algorithm").as_bytes(), algorithm);
-                }
-                if let Some(AutoTuneReferenceKey::ReferenceAlgorithm(algorithm)) =
-                    result.failure.as_mut().and_then(|failure| failure.key.as_mut())
-                {
-                    drain_algorithm_map(
-                        &mut maps,
-                        format!("target.autotune.{index}.reference_algorithm").as_bytes(),
-                        algorithm,
-                    );
-                }
-            }
-        }
-    }
-
-    let protobuf = options.encode_to_vec();
-    let mut bytes = b"RYFT_XLA_COMPILATION_OPTIONS_V1".to_vec();
-    bytes.extend_from_slice(&(protobuf.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(protobuf.as_slice());
-    bytes.extend_from_slice(maps.as_slice());
-    bytes
+    let incompatible = |reason: String| Error::Compilation(CompilationError::IncompatibleExecutable { reason });
+    let op_shardings = executable.executable()?.output_shardings()?.ok_or_else(|| {
+        incompatible("the PJRT plugin does not report the output shardings that the compiler chose".to_string())
+    })?;
+    let op_shardings = match op_shardings.as_slice() {
+        [sharding] if sharding.r#type == OpShardingType::Tuple as i32 => sharding.tuple_shardings.clone(),
+        _ => op_shardings,
+    };
+    program
+        .output_shardings
+        .iter()
+        .zip(program.open_outputs.iter())
+        .enumerate()
+        .map(|(index, (declared, &open))| {
+            let Some(physical_index) = program.signature.output_mapping()[index].filter(|_| open) else {
+                return Ok(declared.clone());
+            };
+            let op_sharding = op_shardings.get(physical_index).ok_or_else(|| {
+                incompatible(format!("the executable reports no sharding for output {physical_index}"))
+            })?;
+            op_sharding
+                .to_sharding(declared.mesh(), declared.rank())
+                .filter(|sharding| sharding.without_auto_axes() == declared.without_auto_axes())
+                .ok_or_else(|| {
+                    incompatible(format!(
+                        "the compiler placed output {index} as {op_sharding:?}, which is not a placement over the mesh \
+                         axes that agrees with its declared sharding `{declared}`",
+                    ))
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     #[cfg(feature = "cuda-13")]
     use std::time::Instant;
 
@@ -1664,338 +945,112 @@ mod tests {
     use pretty_assertions::assert_eq;
     #[cfg(test)]
     use ryft_core::Array as CoreArray;
-    #[cfg(feature = "cuda-13")]
-    use ryft_core::dot_product_attention;
     use ryft_core::{
-        AddOperation, ArgMaxOperation, ArgMinOperation, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, AtomId,
-        AttentionConfiguration, AttentionImplementation, AttentionInputs, AxisIndexOperation, BatchAxis,
-        CaptureReference, CollectiveOptions, CompareOperation, ComparisonDirection, CompilationCacheDomain,
-        CompilationDomain, CompilationTracer, Compile, CompiledFunctionDispatcher, ConditionOperation,
-        ConstantOperation, Context, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind,
-        CumulativeOperation, CustomCallOperation, DataType, Device, DeviceMesh, Differentiate,
-        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionFromScalar,
-        DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionToScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers, DotOperation,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicSliceWithDimensions,
-        IotaOperation, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation,
+        AddOperation, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, AtomId, AxisIndexOperation, BatchAxis,
+        CaptureReference, CollectiveOptions, CompilationCacheDomain, CompilationTracer, ConditionOperation,
+        ConstantOperation, CotangentDestinationKind, DataType, Device, DeviceMesh, Dimension as CoreDimension,
+        DimensionAddOperation, DimensionBounds, DimensionFromScalar, DimensionFromScalarOperation, DimensionOperation,
+        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicSliceWithDimensions, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation,
         Operation as CoreOperation, OperationPayloadProjection, ParallelAllGatherOperation,
         ParallelAllGatherOutputVariance, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelReduceOperation,
         ParallelVaryOperation, Placeholder, PrintOperation, Program as CoreProgram,
         ProgramBuilder as CoreProgramBuilder, ProgramError, Provenance, ProvenanceScope, RaggedDotDimensionNumbers,
-        RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, ReshapeOperation, Reshard, RngBitGeneratorOperation, ScaledDotOperation,
-        ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary,
-        ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation,
-        StagedFunction as CoreStagedFunction, StagingContext, StaticShape, SubOperation, TiledLayout, TracingContext,
-        Type, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, batch,
-        differentiable_dot_product_attention, shard_map,
+        RaggedDotOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, ReshapeOperation, Reshard,
+        ScanOperation, Shape, ShardMapBoundary, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension,
+        SliceOperation, StagedFunction as CoreStagedFunction, StagingContext, TiledLayout, TracingContext, Type,
+        Value as CoreValue, ValueProjection, WhileOperation, batch, shard_map,
     };
-    use ryft_pjrt::protos::CompilationOptions;
+    #[cfg(feature = "cuda-13")]
+    use ryft_core::{AttentionConfiguration, AttentionInputs, dot_product_attention};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::arrays_v0::host::materialize_dense_array_bytes;
     use crate::domains::Tracer;
-    use crate::domains::persistence::PERSISTENT_KEY_SCHEMA_VERSION;
-    use crate::domains::sessions::Session;
     use crate::domains::tests::*;
-    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder};
-    use crate::experimental::tracing::ArrayTracer;
     use crate::operations::jit_call::JitCallOperation;
+    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Error, FromPjrt, RaggedDotLoweringStrategy, ToPjrt, Value};
+    use crate::tracing::ArrayTracer;
+    use crate::{Array, Constant, Error, FromPjrt, Operation, RaggedDotLoweringStrategy, Session, ToPjrt, Value};
 
     use super::*;
 
-    /// Reads the first addressable shard as `bfloat16` values converted to `f32`.
-    fn read_bf16s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let bytes = array
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
+    #[test]
+    fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
+        use crate::tests::{values_from_bytes, values_to_bytes};
+        use ryft_core::Sin;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        values_from_bytes::<u16>(bytes.as_slice())
-            .into_iter()
-            .map(|bits| half::bf16::from_bits(bits).to_f32())
-            .collect()
-    }
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain().with_mesh(mesh.clone());
 
-    /// Reads the first addressable shard as native-endian signed 32-bit integers.
-    fn read_i32s(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let bytes = array
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        values_from_bytes::<i32>(bytes.as_slice())
-    }
-
-    /// Builds the kind-sensitive bounded-dynamic padding fixture shared by CPU and CUDA execution tests.
-    fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatProgram {
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let index_type = dynamic_type.clone().with_data_type(DataType::U64);
-        let matrix_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(4)]),
-        );
-
-        // The iota and its negation make physical suffix lanes numerically distinguishable from every admitted live
-        // prefix. This catches both reduction identities and the opposite sentinels needed by ascending and descending
-        // sort. The boolean reductions cover their own false/true identities, and dot covers zero-padded contraction.
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let iota = builder
-            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let indices = builder
-            .add_instruction(IotaOperation::new(index_type, 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let negative = builder.add_instruction(NegOperation::new(), Vec::new(), vec![iota], None).unwrap()[0];
-        let sorted_ascending = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative], None)
-            .unwrap()[0];
-        let sorted_descending = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota], None)
-            .unwrap()[0];
-        let argmin_indices = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative, indices], None)
-            .unwrap()[1];
-        let argmax_indices = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota, indices], None)
-            .unwrap()[1];
-        let sum = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota], None)
-            .unwrap()[0];
-        // Shift the iota to nonzero factors so including physical padding changes the product.
-        let ones =
-            builder.add_instruction(OneOperation::new(dynamic_type), Vec::new(), vec![dimension], None).unwrap()[0];
-        let factors = builder.add_instruction(AddOperation::new(), Vec::new(), vec![iota, ones], None).unwrap()[0];
-        let product = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Product), Vec::new(), vec![factors], None)
-            .unwrap()[0];
-        let maximum = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Max), Vec::new(), vec![iota], None)
-            .unwrap()[0];
-        let minimum = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Min), Vec::new(), vec![negative], None)
-            .unwrap()[0];
-        let any_input = builder
-            .add_instruction(
-                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan)),
-                Vec::new(),
-                vec![negative, iota],
-                None,
-            )
-            .unwrap()[0];
-        let any = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Any), Vec::new(), vec![any_input], None)
-            .unwrap()[0];
-        let all_input = builder
-            .add_instruction(
-                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThanOrEqual)),
-                Vec::new(),
-                vec![iota, negative],
-                None,
-            )
-            .unwrap()[0];
-        let all = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::All), Vec::new(), vec![all_input], None)
-            .unwrap()[0];
-        let dot = builder
-            .add_instruction(
-                DotOperation::new(DotDimensionNumbers::inner_product()),
-                Vec::new(),
-                vec![iota, iota],
-                None,
-            )
-            .unwrap()[0];
-
-        // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
-        // touches, which is the configuration those two disciplines actually admit: a log-sum-exp `reduce` consumes
-        // the static axis and still produces a dynamically shaped output, and the prefix scan consumes the static
-        // axis while every row it emits keeps the dynamic extent.
-        let rows = builder
-            .add_instruction(IotaOperation::new(matrix_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let columns = builder
-            .add_instruction(IotaOperation::new(matrix_type, 1).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let matrix = builder.add_instruction(AddOperation::new(), Vec::new(), vec![rows, columns], None).unwrap()[0];
-        let log_sum_exp = builder
-            .add_instruction(ReduceOperation::new(vec![1], ReductionKind::LogSumExp), Vec::new(), vec![matrix], None)
-            .unwrap()[0];
-        let cumulative_sum = builder
-            .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![matrix], None)
-            .unwrap()[0];
-
-        // Index reductions over the data-derived axis would select a physical suffix lane if its padding were not
-        // masked, because the suffix lanes of the increasing iota are larger than every live lane and those of its
-        // negation are smaller. The matrix covers both a reduced data-derived axis and a data-derived axis that the
-        // reduction keeps.
-        let argmax = builder
-            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![iota], None)
-            .unwrap()[0];
-        let argmin = builder
-            .add_instruction(ArgMinOperation::new(0, DataType::I32), Vec::new(), vec![negative], None)
-            .unwrap()[0];
-        let row_argmax = builder
-            .add_instruction(ArgMaxOperation::new(1, DataType::I32), Vec::new(), vec![matrix], None)
-            .unwrap()[0];
-        let column_argmax = builder
-            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![matrix], None)
-            .unwrap()[0];
-        builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![
-                    sorted_ascending,
-                    sorted_descending,
-                    argmin_indices,
-                    argmax_indices,
-                    sum,
-                    maximum,
-                    minimum,
-                    any,
-                    all,
-                    dot,
-                    log_sum_exp,
-                    cumulative_sum,
-                    product,
-                    argmax,
-                    argmin,
-                    row_argmax,
-                    column_argmax,
-                ],
-                vec![Placeholder],
-                vec![Placeholder; 17],
-            )
+        let options = Options::new(mesh.clone());
+        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
             .unwrap()
-    }
+            .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
-    /// Builds the bounded-dynamic scaled-dot and attention proof fixture. The attention values vary along the
-    /// key/value sequence axis, so including any physical suffix lane changes every valid output row. Attention is
-    /// staged by the training function with the provided implementation, whose reverse mode differentiation calls the
-    /// forward attention definition with its residual and the backward attention definition.
-    fn data_derived_scaled_dot_attention_fixture(
-        size_type: ArrayType,
-        extent: DimensionVariable,
-        scaled_element_type: DataType,
-        scaled_scale_type: DataType,
-        attention_implementation: AttentionImplementation,
-    ) -> FlatProgram {
-        /// Binds `operation` to `inputs` in the context of `value` and returns its only output.
-        fn bind<O: Into<Operation>>(
-            value: &Tracer<'static>,
-            operation: O,
-            inputs: &[Tracer<'static>],
-        ) -> Tracer<'static> {
-            value.domain().bind(operation, Vec::<FlatProgram>::new(), inputs).unwrap().remove(0)
-        }
-
-        let scaled_block_size = match scaled_element_type {
-            DataType::F8E4M3FN | DataType::F8E5M2 => 32,
-            _ => 16,
-        };
-        let attention_batch = DimensionVariable::new("attention_batch", extent.bounds().clone());
-        let scaled_lhs_type = ArrayType::new(
-            scaled_element_type,
-            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(scaled_block_size)]),
-        );
-        let scaled_lhs_scale_type = ArrayType::new(
-            scaled_scale_type,
-            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(1)]),
-        );
-        let scaled_rhs_type = ArrayType::new(
-            scaled_element_type,
-            Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(scaled_block_size)]),
-        );
-        let scaled_rhs_scale_type =
-            ArrayType::new(scaled_scale_type, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
-        let attention_type = ArrayType::new(
-            DataType::BF16,
-            Shape::new(vec![
-                CoreDimension::Dynamic(attention_batch.clone()),
-                CoreDimension::Dynamic(extent.clone()),
-                CoreDimension::Static(1),
-                CoreDimension::Static(8),
-            ]),
-        );
-        let attention = differentiable_dot_product_attention::<Domain<'static>>(
-            AttentionConfiguration::new().with_scale(1.0).with_implementation(attention_implementation),
-        );
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
-                let size = &inputs[0];
-                let dimension = bind(size, DimensionFromScalarOperation::new(extent.clone().into()), &[size.clone()]);
-                let batch_dimension =
-                    bind(size, DimensionFromScalarOperation::new(attention_batch.clone().into()), &[size.clone()]);
-
-                // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share
-                // it, while the static right operand fixes one output column and the static block shape fixes
-                // `k = 16`.
-                let scaled_lhs = bind(size, OneOperation::new(scaled_lhs_type.clone()), &[dimension.clone()]);
-                let scaled_lhs_scales =
-                    bind(size, OneOperation::new(scaled_lhs_scale_type.clone()), &[dimension.clone()]);
-                let scaled_rhs = bind(size, OneOperation::new(scaled_rhs_type.clone()), &[]);
-                let scaled_rhs_scales = bind(size, OneOperation::new(scaled_rhs_scale_type.clone()), &[]);
-                let scaled_dot = bind(
-                    size,
-                    ScaledDotOperation::new(
-                        DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-                        DataType::F32,
-                        true,
-                        true,
-                    ),
-                    &[scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
-                );
-
-                // Attention: equal query/key scores make the live softmax uniform, while values equal their sequence
-                // index. Explicit lengths of `extent - 1` exercise the supported further-restriction contract: visible
-                // query rows return the mean `(extent - 2) / 2`, while the final logical row and all physical suffix
-                // lanes stay zero. Backward has exact `dQ = 0`, `dK[j] = 8 * (j - mean)`, and `dV = 1` on visible
-                // rows and zeros elsewhere.
-                let extents = [batch_dimension.clone(), dimension.clone()];
-                let query = bind(size, OneOperation::new(attention_type.clone()), &extents);
-                let key = bind(size, OneOperation::new(attention_type.clone()), &extents);
-                let value = bind(size, IotaOperation::new(attention_type.clone(), 1).unwrap(), &extents);
-                let output_cotangent = bind(size, OneOperation::new(attention_type.clone()), &extents);
-                let logical_length = bind(size, DimensionToScalarOperation, &[dimension.clone()]);
-                let logical_length =
-                    bind(size, ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, false), &[logical_length]);
-                let one = CoreArray::from_elements(ArrayType::scalar(DataType::I32), &[1i32]).unwrap();
-                let one = bind(size, ConstantOperation::new(one), &[]);
-                let length = bind(size, SubOperation::new(), &[logical_length, one]);
-                let lengths =
-                    bind(size, DynamicBroadcastOperation::new(Vec::new()), &[length, batch_dimension.clone()]);
-                let inputs = AttentionInputs {
-                    query_sequence_lengths: Some(lengths.clone()),
-                    key_value_sequence_lengths: Some(lengths),
-                    ..AttentionInputs::new(query, key, value)
-                };
-                let (output, pullback) = size.domain().differentiate_at(inputs).vjp(|inputs| attention.call(inputs))?;
-                let cotangents = pullback.apply_materialized(output_cotangent)?;
-                Ok(vec![scaled_dot, output, cotangents.query, cotangents.key, cotangents.value])
-            },
-            vec![ArrayIrType::from(size_type)],
+        // Round-trip a small input through the new CompilationDomain-driven pipeline.
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        program.into_flat_program()
+        let array = compiled.executable().execute(&engine, Value::Array(source)).unwrap();
+        let Value::Array(array) = array else {
+            panic!("array-only compiled function returned a first-class dimension");
+        };
+        array.block_until_ready().unwrap();
+
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
+        }
+
+        // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
+        let program_count_before = engine.program_count();
+        for _ in 0..3 {
+            let staged = crate::stage::<_, ArrayType, ArrayType>(
+                |x| x.sin().unwrap(),
+                input_type.clone(),
+                Options::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let _: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+                staged.lower(&engine).unwrap().compile(&engine).unwrap();
+        }
+        assert_eq!(
+            engine.program_count(),
+            program_count_before,
+            "equivalent repeat compilations should reuse the existing cache entry",
+        );
     }
 
     /// Kind of `shard_map` program that [`shard_map_differential_program`] builds to compare the reference backend's
@@ -2326,7 +1381,7 @@ mod tests {
         let outputs = outputs
             .iter()
             .map(|output| {
-                let bytes = materialize_dense_array_bytes(output).unwrap();
+                let bytes = output.copy_to_host().unwrap();
                 ArrayIrValue::Array(CoreArray::from_logical_bytes(output.r#type().into_owned(), &bytes).unwrap())
             })
             .collect::<Vec<_>>();
@@ -2409,7 +1464,7 @@ mod tests {
         let cotangents = execute(&xla.pullback().unwrap().into_program(), pullback_inputs)
             .iter()
             .map(|cotangent| {
-                let bytes = materialize_dense_array_bytes(cotangent).unwrap();
+                let bytes = cotangent.copy_to_host().unwrap();
                 ArrayIrValue::Array(CoreArray::from_logical_bytes(cotangent.r#type().into_owned(), &bytes).unwrap())
             })
             .collect::<Vec<_>>();
@@ -2573,78 +1628,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
-        use crate::tests::{values_from_bytes, values_to_bytes};
-        use ryft_core::Sin;
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain().with_mesh(mesh.clone());
-
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let options = Options::new(mesh.clone());
-        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
-            .unwrap()
-            .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&engine).unwrap().compile(&engine).unwrap();
-
-        // Round-trip a small input through the new CompilationDomain-driven pipeline.
-        let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = Array::from_host_buffer(
-            &engine,
-            input_type.clone(),
-            mesh.clone(),
-            values_to_bytes::<f32>(&values).as_slice(),
-        )
-        .unwrap();
-        let array = compiled.executable().execute(&engine, Value::Array(source)).unwrap();
-        let Value::Array(array) = array else {
-            panic!("array-only compiled function returned a first-class dimension");
-        };
-        array.block_until_ready().unwrap();
-
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let shard_bytes = array
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
-        for (got, &input) in observed.iter().zip(values.iter()) {
-            assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
-        }
-
-        // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
-        let program_count_before = engine.program_count();
-        for _ in 0..3 {
-            let staged = crate::stage::<_, ArrayType, ArrayType>(
-                |x| x.sin().unwrap(),
-                input_type.clone(),
-                Options::new(mesh.clone()),
-            )
-            .unwrap()
-            .into_inner();
-            let _: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-                staged.lower(&engine).unwrap().compile(&engine).unwrap();
-        }
-        assert_eq!(
-            engine.program_count(),
-            program_count_before,
-            "equivalent repeat compilations should reuse the existing cache entry",
-        );
-    }
-
-    #[test]
     #[allow(deprecated)] // Inspect the actual buffer, independently of the declared array type.
     fn test_lowering_preserves_cast_layouts() {
         use ryft_core::{Cast, CastOperation};
@@ -2673,19 +1656,19 @@ mod tests {
             // The next executable must consume the actual column-major buffer and return dense logical values.
             let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
             assert_eq!(read_f64s(&client, &consumed), values);
-            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&output).unwrap()), values);
+            assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
             let destination_mesh = domain_mesh(&client, "destination", 1);
             let moved = output
                 .to_placement(
                     &domain,
-                    crate::arrays_v0::DevicePutTarget::Placement {
+                    crate::arrays::DevicePutTarget::Placement {
                         sharding: Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
                         mesh: destination_mesh,
                     },
                 )
                 .unwrap();
             assert_eq!(moved.layout(), Some(&layout));
-            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&moved).unwrap()), values);
+            assert_eq!(values_from_bytes::<f64>(&moved.copy_to_host().unwrap()), values);
             // A raw buffer may have a known physical layout even when its logical type leaves that field open.
             let opaque = Array::from_addressable_buffers(
                 &domain,
@@ -2749,7 +1732,7 @@ mod tests {
                     outputs[1].addressable_shards().next().unwrap().buffer().unwrap().layout(),
                     Ok(layout.to_pjrt().unwrap())
                 );
-                assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[1]).unwrap()), values);
+                assert_eq!(values_from_bytes::<f64>(&outputs[1].copy_to_host().unwrap()), values);
                 assert_eq!(read_f64s(&client, &outputs[2]), values);
                 assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
             }
@@ -2816,7 +1799,7 @@ mod tests {
                 outputs[0].addressable_shards().next().unwrap().buffer().unwrap().layout(),
                 Ok(layout.to_pjrt().unwrap()),
             );
-            assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&outputs[0]).unwrap()), values);
+            assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
             assert_eq!(prints.len(), 1);
         }
     }
@@ -2861,489 +1844,7 @@ mod tests {
             assert_eq!(shard.shape().as_slice(), &[2, 3]);
             assert_eq!(shard.buffer().unwrap().layout(), Ok(layout.to_pjrt().unwrap()));
         }
-        assert_eq!(values_from_bytes::<f64>(&materialize_dense_array_bytes(&output).unwrap()), values);
-    }
-
-    #[test]
-    fn test_data_derived_compilation_rejects_unbounded_and_opaque_consumers() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let size_type = replicated_scalar_type(&mesh, DataType::I64);
-
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.clone().into());
-        let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
-                    if *message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
-                        for XLA compilation",
-            ),
-        ));
-
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.clone().into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let input = builder
-            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                CustomCallOperation::new("ryft.test.opaque_dynamic", vec![dynamic_type]),
-                Vec::new(),
-                vec![input, dimension],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                    if *message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
-                        because custom-call physical-padding semantics are opaque",
-            ),
-        ));
-
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.clone().into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let input = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Mean), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                    if *message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
-                        because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
-            ),
-        ));
-
-        // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic operand would
-        // become observable.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.clone().into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let input = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                    if *message
-                        == "operation `print` cannot consume data-derived \
-                        dimensions during XLA lowering because \
-                        print exposes the physical representation of its operand",
-            ),
-        ));
-
-        // Bit generation over a bounded-dynamic result would advance the functional generator state by the physical
-        // upper-bound element count rather than the logical one.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.clone().into());
-        let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type),
-                Vec::new(),
-                vec![state, dimension],
-                None,
-            )
-            .unwrap()[1];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                    if *message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
-                        lowering because random generation advances state according to physical rather than logical \
-                        element count",
-            ),
-        ));
-
-        // Every scatter combiner is unverified against physical padding, so a data-derived operand extent is rejected
-        // per kind rather than per operation name.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.into());
-        let indices = builder.add_input(indices_type.into());
-        let updates = builder.add_input(updates_type.into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let operand = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                ScatterOperation::new(
-                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0]),
-                    ScatterReductionKind::Add,
-                ),
-                Vec::new(),
-                vec![operand, indices, updates],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![output],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh)),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                    if *message
-                        == "operation `scatter` cannot consume data-derived \
-                        dimensions during XLA lowering because \
-                        add-scatter padding semantics have not been verified for data-derived dimensions",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_input_bound_bucketing_reuses_power_of_two_specializations() {
-        fn trace<'c>(input: CompilationTracer<Domain<'c>>) -> Result<CompilationTracer<Domain<'c>>, Error> {
-            let context = input.context().clone();
-            Ok(context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input])?.remove(0))
-        }
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<Domain<'_>, (), ArrayIrType, ArrayIrType, _> = domain
-            .jit_with_options(
-                |(), input| trace(input),
-                Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
-            );
-        let call = |values: &[f32]| {
-            let input = f32_vector(&domain, &mesh, values);
-            function.execute((), Value::Array(input)).unwrap()
-        };
-
-        let three = call(&[1.0, 2.0, 3.0]);
-        assert_eq!(program_array(&three).shape(), StaticShape::new(vec![3]));
-        assert_eq!(read_f32s(&client, program_array(&three)), vec![2.0, 4.0, 6.0]);
-        let four = call(&[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(program_array(&four).shape(), StaticShape::new(vec![4]));
-        assert_eq!(read_f32s(&client, program_array(&four)), vec![2.0, 4.0, 6.0, 8.0]);
-        let five = call(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(program_array(&five).shape(), StaticShape::new(vec![5]));
-        assert_eq!(read_f32s(&client, program_array(&five)), vec![2.0, 4.0, 6.0, 8.0, 10.0]);
-
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_hits, 1);
-        assert_eq!(statistics.dispatch_misses, 2);
-        assert_eq!(statistics.traces, 2);
-        assert_eq!(statistics.lowerings, 2);
-        assert_eq!(statistics.compilation_requests, 2);
-        assert_eq!(function.executable_specialization_count(), 2);
-        assert_eq!(domain.program_count(), 2);
-    }
-
-    #[test]
-    fn test_domain_dispatch_signature() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let input = Value::Array(
-            Array::from_host_buffer(
-                &domain,
-                ArrayType::new_static(DataType::F32, [3]),
-                mesh.clone(),
-                values_to_bytes(&[1f32, 2.0, 3.0]),
-            )
-            .unwrap(),
-        );
-        let input_types = vec![input.r#type().into_owned()];
-        let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
-
-        let (key, staged_types, specialized_options) =
-            Domain::dispatch_signature(DispatchInputs::Types(input_types.clone()), &options).unwrap();
-        assert_eq!(key, DispatchKey::new(DispatchKeyKind::Exact(input_types.clone().into())));
-        assert_eq!(staged_types.as_ref(), input_types.as_slice());
-        assert_eq!(specialized_options, None);
-
-        let (key, executable_types, specialized_options) = Domain::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&input), types: input_types.clone() },
-            &options,
-        )
-        .unwrap();
-        assert_eq!(key, normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing).unwrap().0);
-        let [ArrayIrType::Array(array_type)] = executable_types.as_ref() else {
-            panic!("the executable signature must contain one array");
-        };
-        let [CoreDimension::Dynamic(extent)] = array_type.shape().dimensions() else {
-            panic!("runtime values must select input-bound bucketing");
-        };
-        assert_eq!(extent.name(), "input_0_axis_0");
-        assert_eq!(extent.bounds(), DimensionBounds::new(0, Some(5)).unwrap());
-        assert_eq!(specialized_options, None);
-    }
-
-    #[test]
-    fn test_domain_dispatch_signature_runtime_placement() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 2);
-        let domain = Session::new(&client).domain();
-        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let tiled = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let replicated_input = Value::Array(
-            Array::from_host_buffer_with_sharding(
-                &domain,
-                ArrayType::new_static(DataType::F32, [4]),
-                replicated.clone(),
-                mesh.clone(),
-                values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
-            )
-            .unwrap(),
-        );
-        let tiled_input = Value::Array(
-            Array::from_host_buffer_with_sharding(
-                &domain,
-                ArrayType::new_static(DataType::F32, [4]),
-                tiled.clone(),
-                mesh.clone(),
-                values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
-            )
-            .unwrap(),
-        );
-        assert_eq!(replicated_input.r#type(), tiled_input.r#type());
-        let input_types = vec![replicated_input.r#type().into_owned()];
-        let options = Options::new(mesh);
-        let (replicated_key, replicated_types, replicated_options) = Domain::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
-            &options,
-        )
-        .unwrap();
-        let (tiled_key, tiled_types, tiled_options) = Domain::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types.clone() },
-            &options,
-        )
-        .unwrap();
-        assert_ne!(replicated_key, tiled_key);
-        assert_eq!(replicated_types, tiled_types);
-        assert_eq!(replicated_options, None);
-        assert_eq!(
-            tiled_options,
-            Some(Options { input_placements: Some(vec![Some(tiled)].into()), ..options.clone() }),
-        );
-
-        // A declared sharding determines placement instead of the actual placement of either input.
-        let options = options.with_input_shardings(vec![replicated]);
-        let replicated_signature = Domain::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
-            &options,
-        )
-        .unwrap();
-        let tiled_signature = Domain::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types },
-            &options,
-        )
-        .unwrap();
-        assert_eq!(replicated_signature, tiled_signature);
-        assert_eq!(replicated_signature.0, replicated_key);
-        assert_eq!(replicated_signature.2, None);
-    }
-
-    #[test]
-    fn test_input_bound_bucketing_rejects_unsupported_signatures() {
-        let plugin = load_cpu_plugin().unwrap();
-        let single_device_client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
-        let single_device_domain = Session::new(&single_device_client).domain().with_mesh(single_device_mesh.clone());
-        let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        assert!(matches!(
-            normalize_dispatch_signature(vec![dimension_type.clone().into()], &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
-            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
-                if reason == format!(
-                    "input-bound bucketing only supports array inputs, but input 0 has first-class dimension type {}",
-                    dimension_type,
-                ),
-        ));
-        // Exact dispatch admits structural reference types for the opt-in stateful call surface, while bucketed
-        // dispatch rejects them because holder state is not part of the array-only bucketing model.
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let reference_input_types: Arc<[ArrayIrType]> = vec![ArrayIrType::Reference(reference_type.clone())].into();
-        assert_eq!(
-            normalize_dispatch_signature(
-                reference_input_types.to_vec(),
-                &Options::new(single_device_mesh.clone()),
-                None
-            )
-            .unwrap(),
-            (DispatchKey::new(DispatchKeyKind::Exact(reference_input_types.clone())), reference_input_types,),
-        );
-        assert!(matches!(
-            normalize_dispatch_signature(vec![ArrayIrType::Reference(reference_type.clone())], &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
-            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
-                if reason == "external reference input 0 does not support input-bound bucketing",
-        ));
-        assert!(matches!(
-            single_device_domain.lower_program(
-                &external_reference_read_program(ArrayType::scalar(DataType::F32)),
-                1,
-                &Options::new(single_device_mesh.clone())
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
-            ),
-            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
-                if reason == "external reference inputs do not support input-bound bucketing",
-        ));
-
-        let multi_device_client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
-        let multi_device_mesh = domain_mesh(&multi_device_client, "x", 2);
-        assert!(matches!(
-            normalize_dispatch_signature(vec![ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).into()], &Options::new(multi_device_mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
-            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
-                if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
-                    signatures require disabling the Shardy partitioner",
-        ));
-
-        // Multi-device bucketing is rejected before inspecting individual input kinds.
-        assert!(matches!(
-            normalize_dispatch_signature(vec![ArrayIrType::Reference(reference_type.clone())], &Options::new(domain_mesh(&multi_device_client, "x", 2))
-                    .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo), Some(InputBoundBucketing::PowerOfTwo)),
-            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
-                if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
-                    signatures require disabling the Shardy partitioner",
-        ));
-    }
-
-    #[test]
-    fn test_input_bound_bucketing_alpha_normalizes_dispatch_keys() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
-        let bounds = DimensionBounds::new(0, Some(5)).unwrap();
-        let vector_type =
-            |dimension: CoreDimension| ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
-        let key = |input_types: Vec<ArrayIrType>| {
-            normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing).unwrap().0
-        };
-
-        // Two runtime signatures landing in the same power-of-two bucket share one key, and the effective staged
-        // types carry the generated per-axis variable names that the key itself excludes.
-        let (three_key, three_types) = normalize_dispatch_signature(
-            vec![vector_type(CoreDimension::Static(3))],
-            &options,
-            options.input_bound_bucketing,
-        )
-        .unwrap();
-        assert_eq!(three_key, key(vec![vector_type(CoreDimension::Static(4))]));
-        assert_ne!(three_key, key(vec![vector_type(CoreDimension::Static(5))]));
-        let [ArrayIrType::Array(three_type)] = three_types.as_ref() else {
-            panic!("bucketing must stage exactly one array input type");
-        };
-        let [CoreDimension::Dynamic(variable)] = three_type.shape().dimensions() else {
-            panic!("bucketing must stage a rank-one bounded dynamic axis");
-        };
-        assert_eq!(variable.name(), "input_0_axis_0");
-        assert_eq!(variable.bounds(), bounds);
-
-        // Signatures requested for staging preserve the caller's types without executable dispatch bucketing.
-        let (_, staged_types, _) =
-            Domain::dispatch_signature(DispatchInputs::Types(vec![vector_type(CoreDimension::Static(3))]), &options)
-                .unwrap();
-        assert_eq!(staged_types.as_ref(), &[vector_type(CoreDimension::Static(3))]);
-
-        // Dimension variables are keyed by their bounds and first-occurrence sharing pattern, not by their names, so
-        // renaming a variable preserves the key while resharing it across inputs does not.
-        let first = DimensionVariable::new("first", bounds);
-        let second = DimensionVariable::new("second", bounds);
-        let renamed = DimensionVariable::new("renamed", bounds);
-        assert_eq!(
-            key(vec![vector_type(first.clone().into()), vector_type(first.clone().into())]),
-            key(vec![vector_type(renamed.clone().into()), vector_type(renamed.into())]),
-        );
-        assert_ne!(
-            key(vec![vector_type(first.clone().into()), vector_type(first.clone().into())]),
-            key(vec![vector_type(first.clone().into()), vector_type(second.into())]),
-        );
-
-        // Everything the shape-free carrier retains still discriminates: element data type, and here the rank too.
-        assert_ne!(
-            key(vec![vector_type(first.clone().into())]),
-            key(vec![ArrayType::new(DataType::F64, Shape::new(vec![first.clone().into()])).into()]),
-        );
-        assert_ne!(
-            key(vec![vector_type(first.clone().into())]),
-            key(vec![ArrayType::new(DataType::F32, Shape::new(vec![first.clone().into(), first.into()])).into()]),
-        );
+        assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
     }
 
     #[test]
@@ -3411,82 +1912,6 @@ mod tests {
             "cannot lower `shard_map`: bounded-dynamic programs cannot contain shard_map regions because \
              sdy.manual_computation requires the Shardy partitioner",
         );
-    }
-
-    #[test]
-    fn test_compilation_key_is_canonical_and_stable() {
-        use ryft_core::Sin;
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
-            .unwrap()
-            .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
-        let independent_domain = Session::new(&client).domain();
-        let repeated = independent_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
-
-        assert_eq!(key, repeated);
-        assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
-        let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
-        assert_eq!(decoded["schema_version"], PERSISTENT_KEY_SCHEMA_VERSION);
-        assert_eq!(decoded["runtime_requirements"], serde_json::json!([]));
-        assert_eq!(decoded["compiler_identity"], COMPILER_IDENTITY.as_str());
-        assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::XLA_COMMIT));
-        assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::JAX_COMMIT));
-        assert_eq!(decoded["platform_name"], client.platform_name().unwrap().as_ref());
-        assert!(decoded["compilation_options"].as_array().is_some_and(|bytes| !bytes.is_empty()));
-        assert!(decoded["stable_hlo"].as_str().is_some_and(|module| module.contains("stablehlo.sine")));
-    }
-
-    #[test]
-    fn test_compilation_key_includes_runtime_abi_and_configuration() {
-        use crate::domains::runtimes::{RuntimeRequirement, with_runtime_requirements};
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let array_type = ArrayType::new_static(DataType::F32, [4])
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let lower = |requirements| {
-            let mut builder = ProgramBuilder::new();
-            let input = builder.add_input(array_type.clone().into());
-            let operation = with_runtime_requirements(
-                CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
-                requirements,
-            )
-            .unwrap();
-            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap()
-        };
-        let requirement =
-            |version, configuration| RuntimeRequirement::new("test.runtime", version, configuration).unwrap();
-        let first = lower(vec![requirement(1, vec![7])]);
-        let duplicate = lower(vec![requirement(1, vec![7]), requirement(1, vec![7])]);
-        let changed_abi = lower(vec![requirement(2, vec![7])]);
-        let changed_configuration = lower(vec![requirement(1, vec![8])]);
-
-        assert_eq!(first.stable_hlo(), changed_abi.stable_hlo());
-        assert_eq!(first.stable_hlo(), changed_configuration.stable_hlo());
-        assert_eq!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&duplicate).unwrap());
-        assert_ne!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&changed_abi).unwrap());
-        assert_ne!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&changed_configuration).unwrap());
     }
 
     #[test]
@@ -5013,7 +3438,7 @@ mod tests {
         fn build_program(
             input_type: &ArrayType,
             provenance: Provenance,
-        ) -> crate::experimental::ops::Program<Vec<Constant>, Vec<Constant>> {
+        ) -> crate::operations::Program<Vec<Constant>, Vec<Constant>> {
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let product = builder
@@ -5087,35 +3512,6 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_compilation_options_sorts_protobuf_maps() {
-        use ryft_pjrt::protos::{DebugOptions, ExecutableCompilationOptions, OptionOverride};
-
-        let mut left = CompilationOptions::default();
-        left.environment_option_overrides.insert("z".into(), OptionOverride::default());
-        left.environment_option_overrides.insert("a".into(), OptionOverride::default());
-        left.executable_build_options = Some(ExecutableCompilationOptions {
-            debug_options: Some(DebugOptions {
-                xla_backend_extra_options: [("z".into(), "2".into()), ("a".into(), "1".into())].into_iter().collect(),
-                ..DebugOptions::default()
-            }),
-            ..ExecutableCompilationOptions::default()
-        });
-        let mut right = CompilationOptions::default();
-        right.environment_option_overrides.insert("a".into(), OptionOverride::default());
-        right.environment_option_overrides.insert("z".into(), OptionOverride::default());
-        right.executable_build_options = Some(ExecutableCompilationOptions {
-            debug_options: Some(DebugOptions {
-                xla_backend_extra_options: [("a".into(), "1".into()), ("z".into(), "2".into())].into_iter().collect(),
-                ..DebugOptions::default()
-            }),
-            ..ExecutableCompilationOptions::default()
-        });
-
-        assert_eq!(left, right);
-        assert_eq!(canonical_compilation_options_bytes(&left), canonical_compilation_options_bytes(&right));
-    }
-
-    #[test]
     fn test_ragged_dot_lowering_strategy_is_compilation_policy() {
         use std::collections::HashMap;
 
@@ -5161,89 +3557,6 @@ mod tests {
         assert_eq!(options_by_representation.len(), 2);
         assert_eq!(options_by_representation.get(&decomposition_options), Some(&"decomposition"));
         assert_eq!(options_by_representation.get(&instruction_options), Some(&"instruction"));
-    }
-
-    #[test]
-    fn test_data_dependent_padding_inventory_is_kind_and_kernel_specific() {
-        use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked};
-
-        // Every reference operation shares one collapsed match arm, so one representative pins that arm.
-        assert_eq!(
-            data_dependent_padding_discipline(&Operation::ReferenceNew(ReferenceNewOperation::new())),
-            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
-        );
-
-        for kind in [
-            ReductionKind::Sum,
-            ReductionKind::Product,
-            ReductionKind::LogSumExp,
-            ReductionKind::Max,
-            ReductionKind::Min,
-            ReductionKind::Any,
-            ReductionKind::All,
-        ] {
-            assert_eq!(reduction_data_dependent_padding_discipline(kind), XlaMasked);
-        }
-        assert_eq!(
-            reduction_data_dependent_padding_discipline(ReductionKind::Mean),
-            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" },
-        );
-        for direction in [SortDirection::Ascending, SortDirection::Descending] {
-            assert_eq!(sort_data_dependent_padding_discipline(direction), XlaMasked);
-        }
-        for operation in [
-            ArrayOperation::ArgMax(ArgMaxOperation::new(0, DataType::I32)),
-            ArrayOperation::ArgMin(ArgMinOperation::new(0, DataType::I32)),
-        ] {
-            assert_eq!(array_data_dependent_padding_discipline(&operation), XlaMasked);
-        }
-        for kind in [
-            ScatterReductionKind::Overwrite,
-            ScatterReductionKind::Add,
-            ScatterReductionKind::Mul,
-            ScatterReductionKind::Min,
-            ScatterReductionKind::Max,
-        ] {
-            assert!(matches!(
-                scatter_data_dependent_padding_discipline(kind),
-                Unsupported { reason } if reason.contains("scatter padding semantics have not been verified"),
-            ));
-        }
-
-        assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::ScaledDot(ScaledDotOperation::new(
-                DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-                DataType::F32,
-                true,
-                true,
-            ))),
-            RyftMasked,
-        );
-
-        // A log-sum-exp `reduce` expands into maximum and summation reductions, so it carries the same masking
-        // contract as those two reduction kinds.
-        assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::Reduce(ReduceOperation::new(
-                vec![0],
-                ReductionKind::LogSumExp,
-            ))),
-            XlaMasked,
-        );
-
-        // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because the
-        // classification rests on type inference keeping the scanned axis static.
-        for kind in [
-            CumulativeKind::Sum,
-            CumulativeKind::Product,
-            CumulativeKind::Max,
-            CumulativeKind::Min,
-            CumulativeKind::LogSumExp,
-        ] {
-            assert_eq!(
-                array_data_dependent_padding_discipline(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
-                Propagated,
-            );
-        }
     }
 
     #[test]
@@ -5580,577 +3893,6 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Nested);
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_cuda_13_plugin_executes_bounded_dynamic_program_at_two_sizes() {
-        fn trace_data_derived<'c>(
-            extent: DimensionVariable,
-            inputs: Vec<CompilationTracer<Domain<'c>>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
-            let [size, value] = inputs.as_slice() else {
-                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
-            };
-            let dimension = size.to_dimension(extent)?;
-            let broadcast = size
-                .context()
-                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[value.clone(), dimension])?
-                .remove(0);
-            Ok(size
-                .context()
-                .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
-                .remove(0))
-        }
-
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let staged = crate::stage::<_, ArrayType, ArrayType>(
-            |input| input.clone() + input,
-            dynamic_type,
-            Options::new(mesh.clone()),
-        )
-        .unwrap()
-        .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert_eq!(domain.program_count(), 1);
-
-        for size in [4usize, 7] {
-            let input_type = replicated_vector_type(&mesh, size);
-            let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
-            let input = Array::from_host_buffer(
-                &domain,
-                input_type,
-                mesh.clone(),
-                values_to_bytes(values.as_slice()).as_slice(),
-            )
-            .unwrap();
-            for _ in 0..2 {
-                // Both launches use the same bounded executable. The second also proves that replay does not
-                // accidentally specialize or recompile the program for the concrete logical size.
-                let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
-                let Value::Array(output) = output else {
-                    panic!("array-only compiled function returned a first-class dimension");
-                };
-                output.block_until_ready().unwrap();
-                assert_eq!(output.shape().as_slice(), &[size]);
-                assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
-                assert_eq!(domain.program_count(), 1, "executing a loaded executable must not trigger recompilation");
-            }
-        }
-
-        // The same plugin route also accepts an extent born from device data inside the program. The gateway's
-        // ordered bounds assertion and the reduction's dynamic masking both survive compilation, and the scalar input
-        // values select different logical extents without producing another retained specialization.
-        let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
-        let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
-        let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: CompiledFunctionDispatcher<Domain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
-            .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
-        let call = |size: i64| {
-            let size =
-                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
-                    .unwrap();
-            function.execute((), vec![Value::Array(size), Value::Array(value)])
-        };
-        assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);
-        assert_eq!(read_f32s(&client, program_array(&call(7).unwrap())), vec![14.0]);
-        let invalid = call(8).unwrap();
-        let error = program_array(&invalid).block_until_ready().unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "`dimension_from_scalar` failed: input dimension `data_extent` = 8 is outside its declared bounds \
-                 [1, 8)",
-            ),
-            "{error}",
-        );
-        assert_eq!(function.executable_specialization_count(), 1);
-        assert_eq!(function.statistics().dispatch_misses, 1);
-        assert_eq!(function.statistics().dispatch_hits, 2);
-    }
-
-    #[test]
-    fn test_data_derived_extent_retained_jit_reuses_one_specialization() {
-        fn trace<'c>(
-            extent: DimensionVariable,
-            inputs: Vec<CompilationTracer<Domain<'c>>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
-            let [size, value] = inputs.as_slice() else {
-                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
-            };
-            let dimension = size.to_dimension(extent)?;
-            let broadcast = size
-                .context()
-                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[value.clone(), dimension])?
-                .remove(0);
-            Ok(size
-                .context()
-                .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
-                .remove(0))
-        }
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
-        let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let function: CompiledFunctionDispatcher<Domain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> =
-            domain.jit_with_options(move |(), inputs| trace(extent.clone(), inputs), Options::new(mesh.clone()));
-
-        let call = |size: i64| {
-            let size =
-                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
-                    .unwrap();
-            function.execute((), vec![Value::Array(size), Value::Array(value)]).unwrap()
-        };
-
-        assert_eq!(read_f32s(&client, program_array(&call(2))), vec![4.0]);
-        assert_eq!(read_f32s(&client, program_array(&call(4))), vec![8.0]);
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_misses, 1);
-        assert_eq!(statistics.dispatch_hits, 1);
-        assert_eq!(statistics.traces, 1);
-        assert_eq!(statistics.lowerings, 1);
-        assert_eq!(statistics.compilation_requests, 1);
-        assert_eq!(function.executable_specialization_count(), 1);
-        assert_eq!(domain.program_count(), 1);
-    }
-
-    #[test]
-    fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let size_type = replicated_scalar_type(&mesh, DataType::I64);
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let program = data_derived_padding_fixture(size_type.clone(), extent);
-
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let execute = |size: i64| {
-            let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            let eager = program
-                .interpret_in_context(&domain, vec![Value::Array(input.clone())])
-                .unwrap()
-                .into_iter()
-                .map(|value| match value {
-                    Value::Array(array) => array,
-                    Value::Dimension(_) => panic!("padding fixture returned a first-class dimension"),
-                    Value::Reference(_) => panic!("padding fixture returned a reference"),
-                })
-                .collect::<Vec<_>>();
-            let compiled = domain.execute_program(&compiled, vec![input]).unwrap();
-            assert_eq!(compiled.len(), eager.len());
-            for (compiled, eager) in compiled.iter().zip(&eager) {
-                assert_eq!(compiled.shape(), eager.shape());
-                assert_eq!(compiled.data_type(), eager.data_type());
-                let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-                let compiled_bytes = compiled
-                    .device_shard(device_id)
-                    .unwrap()
-                    .buffer()
-                    .unwrap()
-                    .copy_to_host(None)
-                    .unwrap()
-                    .r#await()
-                    .unwrap();
-                let eager_bytes = eager
-                    .device_shard(device_id)
-                    .unwrap()
-                    .buffer()
-                    .unwrap()
-                    .copy_to_host(None)
-                    .unwrap()
-                    .r#await()
-                    .unwrap();
-                assert_eq!(compiled_bytes, eager_bytes);
-            }
-            compiled
-        };
-
-        let small = execute(2);
-        assert_eq!(small[0].shape(), StaticShape::new(vec![2]));
-        assert_eq!(read_f32s(&client, &small[0]), vec![-1.0, 0.0]);
-        assert_eq!(read_f32s(&client, &small[1]), vec![1.0, 0.0]);
-        assert_eq!(read_u64s(&client, &small[2]), vec![1, 0]);
-        assert_eq!(read_u64s(&client, &small[3]), vec![1, 0]);
-        assert_eq!(read_f32s(&client, &small[4]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[5]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[6]), vec![-1.0]);
-        assert_eq!(read_booleans(&client, &small[7]), vec![true]);
-        assert_eq!(read_booleans(&client, &small[8]), vec![true]);
-        assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
-        assert_eq!(read_i32s(&client, &small[13]), vec![1]);
-        assert_eq!(read_i32s(&client, &small[14]), vec![1]);
-        assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
-        assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
-
-        // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
-        // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
-        // `exp` and `log`, not because the discipline is approximate: the byte comparison against the reference
-        // kernel inside `execute` is exact.
-        assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
-        let log_sum_exp = read_f32s(&client, &small[10]);
-        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-
-        // The prefix scan runs along the static axis, so row `i` accumulates `[i, 2i + 1, 3i + 3, 4i + 6]` while the
-        // data-derived extent rides through on the rows it never mixes.
-        assert_eq!(small[11].shape(), StaticShape::new(vec![2, 4]));
-        assert_eq!(read_f32s(&client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
-
-        // With a single live lane, every physical suffix lane of the data-derived axis is padding, which index
-        // reductions must still never select.
-        let single = execute(1);
-        assert_eq!(read_i32s(&client, &single[13]), vec![0]);
-        assert_eq!(read_i32s(&client, &single[14]), vec![0]);
-        assert_eq!(read_i32s(&client, &single[15]), vec![3]);
-        assert_eq!(read_i32s(&client, &single[16]), vec![0, 0, 0, 0]);
-
-        let at_bound = execute(4);
-        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
-        assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
-        assert_eq!(read_f32s(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
-        assert_eq!(read_u64s(&client, &at_bound[2]), vec![3, 2, 1, 0]);
-        assert_eq!(read_u64s(&client, &at_bound[3]), vec![3, 2, 1, 0]);
-        assert_eq!(read_f32s(&client, &at_bound[4]), vec![6.0]);
-        assert_eq!(read_f32s(&client, &at_bound[5]), vec![3.0]);
-        assert_eq!(read_f32s(&client, &at_bound[6]), vec![-3.0]);
-        assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
-        assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
-        assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
-        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
-        assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
-        assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
-        assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
-        assert_eq!(read_i32s(&client, &at_bound[16]), vec![3, 3, 3, 3]);
-
-        // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
-        // padded row silently participating at the smaller size.
-        assert_eq!(at_bound[10].shape(), StaticShape::new(vec![4]));
-        let log_sum_exp = read_f32s(&client, &at_bound[10]);
-        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[2] - 5.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[3] - 6.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert_eq!(at_bound[11].shape(), StaticShape::new(vec![4, 4]));
-        assert_eq!(
-            read_f32s(&client, &at_bound[11]),
-            vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0, 2.0, 5.0, 9.0, 14.0, 3.0, 7.0, 12.0, 18.0],
-        );
-    }
-
-    #[test]
-    fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let size_type = replicated_scalar_type(&mesh, DataType::I64);
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let program = data_derived_scaled_dot_attention_fixture(
-            size_type.clone(),
-            extent,
-            DataType::F32,
-            DataType::F32,
-            AttentionImplementation::Automatic,
-        );
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
-        assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let execute = |size: i64| {
-            let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            let eager = program
-                .interpret_in_context(&domain, vec![Value::Array(input.clone())])
-                .unwrap()
-                .into_iter()
-                .map(|value| match value {
-                    Value::Array(array) => array,
-                    Value::Dimension(_) => panic!("attention fixture returned a first-class dimension"),
-                    Value::Reference(_) => panic!("attention fixture returned a reference"),
-                })
-                .collect::<Vec<_>>();
-            let compiled = domain.execute_program(&compiled, vec![input]).unwrap();
-            assert_eq!(compiled.len(), eager.len());
-            for (compiled, eager) in compiled.iter().zip(&eager) {
-                assert_eq!(compiled.shape(), eager.shape());
-                assert_eq!(compiled.data_type(), eager.data_type());
-                let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-                assert_eq!(
-                    compiled
-                        .device_shard(device_id)
-                        .unwrap()
-                        .buffer()
-                        .unwrap()
-                        .copy_to_host(None)
-                        .unwrap()
-                        .r#await()
-                        .unwrap(),
-                    eager
-                        .device_shard(device_id)
-                        .unwrap()
-                        .buffer()
-                        .unwrap()
-                        .copy_to_host(None)
-                        .unwrap()
-                        .r#await()
-                        .unwrap(),
-                );
-            }
-            compiled
-        };
-
-        let small = execute(2);
-        assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
-        assert_eq!(read_f32s(&client, &small[0]), vec![16.0; 2]);
-        assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
-        assert_eq!(read_bf16s(&client, &small[1]), vec![0.0; 32]);
-        assert_eq!(read_bf16s(&client, &small[2]), vec![0.0; 32]);
-        assert_eq!(read_bf16s(&client, &small[3]), vec![0.0; 32]);
-        assert_eq!(
-            read_bf16s(&client, &small[4]),
-            [1.0, 0.0].into_iter().cycle().take(4).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-        );
-
-        let at_bound = execute(4);
-        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
-        assert_eq!(read_f32s(&client, &at_bound[0]), vec![16.0; 4]);
-        assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
-        assert_eq!(
-            read_bf16s(&client, &at_bound[1]),
-            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-        );
-        assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
-        // Three visible keys have equal scores and values 0, 1, 2. Each query contributes
-        // `dS[j] = (1 / 3) * 8 * (j - 1)`, so summing three visible queries gives `dK[j] = 8 * (j - 1)`
-        // and `dV[j] = 3 * (1 / 3) = 1`. The rounded BF16 residual must not rescale these probabilities.
-        assert_eq!(
-            read_bf16s(&client, &at_bound[3]),
-            [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            read_bf16s(&client, &at_bound[4]),
-            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-        );
-
-        let zero =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
-        let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
-            ),
-            "{error}",
-        );
-
-        // Eager execution replays the attention calls of the bounded-dynamic program at the exact types of their
-        // inputs, so a program that explicitly requests the fused kernels reports that it cannot use them instead of
-        // silently computing the portable result.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let fused = data_derived_scaled_dot_attention_fixture(
-            size_type.clone(),
-            extent,
-            DataType::F32,
-            DataType::F32,
-            AttentionImplementation::Fused,
-        );
-        let input = Array::from_host_buffer(&domain, size_type, mesh, 2i64.to_ne_bytes().as_slice()).unwrap();
-        let error = fused.interpret_in_context(&domain, vec![Value::Array(input)]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("the fused attention implementation is unavailable because the target platform is not CUDA"),
-            "{error}",
-        );
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_cuda_data_derived_padding_disciplines_execute_without_observable_padding() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let size_type = replicated_scalar_type(&mesh, DataType::I64);
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let program = data_derived_padding_fixture(size_type.clone(), extent);
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let execute = |size: i64| {
-            let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            domain.execute_program(&compiled, vec![input]).unwrap()
-        };
-
-        let small = execute(2);
-        assert_eq!(read_f32s(&client, &small[0]), vec![-1.0, 0.0]);
-        assert_eq!(read_f32s(&client, &small[1]), vec![1.0, 0.0]);
-        assert_eq!(read_u64s(&client, &small[2]), vec![1, 0]);
-        assert_eq!(read_u64s(&client, &small[3]), vec![1, 0]);
-        assert_eq!(read_f32s(&client, &small[4]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[5]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[6]), vec![-1.0]);
-        assert_eq!(read_booleans(&client, &small[7]), vec![true]);
-        assert_eq!(read_booleans(&client, &small[8]), vec![true]);
-        assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
-        assert_eq!(read_i32s(&client, &small[13]), vec![1]);
-        assert_eq!(read_i32s(&client, &small[14]), vec![1]);
-        assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
-        assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
-
-        let at_bound = execute(4);
-        assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
-        assert_eq!(read_f32s(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
-        assert_eq!(read_u64s(&client, &at_bound[2]), vec![3, 2, 1, 0]);
-        assert_eq!(read_u64s(&client, &at_bound[3]), vec![3, 2, 1, 0]);
-        assert_eq!(read_f32s(&client, &at_bound[4]), vec![6.0]);
-        assert_eq!(read_f32s(&client, &at_bound[5]), vec![3.0]);
-        assert_eq!(read_f32s(&client, &at_bound[6]), vec![-3.0]);
-        assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
-        assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
-        assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
-        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
-        assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
-        assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
-        assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
-        assert_eq!(read_i32s(&client, &at_bound[16]), vec![3, 3, 3, 3]);
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_cuda_data_derived_scaled_dot_and_attention_execute_fused_without_observable_padding() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        for (scaled_element_type, scaled_scale_type) in [
-            (DataType::F4E2M1FN, DataType::F8E4M3FN),
-            (DataType::F8E4M3FN, DataType::F8E8M0FNU),
-            (DataType::F8E5M2, DataType::F8E8M0FNU),
-        ] {
-            let scaled_dot_value = match scaled_element_type {
-                DataType::F8E4M3FN | DataType::F8E5M2 => 32.0,
-                _ => 16.0,
-            };
-            let size_type = replicated_scalar_type(&mesh, DataType::I64);
-            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-            let program = data_derived_scaled_dot_attention_fixture(
-                size_type.clone(),
-                extent,
-                scaled_element_type,
-                scaled_scale_type,
-                AttentionImplementation::Fused,
-            );
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            // cuDNN accepts the NVFP4 and `f8e4m3fn` MXFP8 pairs, which lower to the block-scaled-dot custom call, but
-            // not `f8e5m2` on both sides, which keeps the composite.
-            let uses_custom_call = scaled_element_type != DataType::F8E5M2;
-            assert_eq!(lowered.stable_hlo().contains("stablehlo.custom_call @__op$block_scaled_dot"), uses_custom_call);
-            assert_eq!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""), !uses_custom_call);
-            assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
-            assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let execute = |size: i64| {
-                let input =
-                    Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                        .unwrap();
-                domain.execute_program(&compiled, vec![input]).unwrap()
-            };
-
-            let small = execute(2);
-            assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
-            assert_eq!(read_f32s(&client, &small[0]), vec![scaled_dot_value; 2]);
-            assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
-            assert_eq!(read_bf16s(&client, &small[1]), vec![0.0; 32]);
-            assert_eq!(read_bf16s(&client, &small[2]), vec![0.0; 32]);
-            assert_eq!(read_bf16s(&client, &small[3]), vec![0.0; 32]);
-            assert_eq!(
-                read_bf16s(&client, &small[4]),
-                [1.0, 0.0].into_iter().cycle().take(4).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-            );
-
-            let at_bound = execute(4);
-            assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
-            assert_eq!(read_f32s(&client, &at_bound[0]), vec![scaled_dot_value; 4]);
-            assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
-            assert_eq!(
-                read_bf16s(&client, &at_bound[1]),
-                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-            );
-            assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
-            let actual_query_gradient = read_bf16s(&client, &at_bound[3]);
-            let expected_query_gradient =
-                [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
-            // cuDNN's fused BF16 backward-attention kernel is not bit-identical to the unfused reference
-            // composition, so compare its gradients with an explicit reduced-precision tolerance.
-            actual_query_gradient.iter().zip(&expected_query_gradient).for_each(|(actual, expected)| {
-                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
-            });
-            let actual_value_gradient = read_bf16s(&client, &at_bound[4]);
-            let expected_value_gradient =
-                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
-            actual_value_gradient.iter().zip(&expected_value_gradient).for_each(|(actual, expected)| {
-                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
-            });
-
-            let zero =
-                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
-            let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
-            assert!(
-                error.to_string().contains(
-                    "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
-                ),
-                "{error}",
-            );
-        }
     }
 
     #[cfg(feature = "cuda-13")]

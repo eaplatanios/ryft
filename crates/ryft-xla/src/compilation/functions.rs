@@ -60,7 +60,7 @@
 //! composites, and the regions nested in them. Their capture tables cannot hold runtime arrays, so calls in them
 //! import captures through [`ThroughSession`](crate::ThroughSession) instead. The [`Session`](crate::Session) of each
 //! such array retains it for as long as a handle to it exists, and the body stages a lifetime-free
-//! [`SessionConstant`](crate::experimental::ops::SessionConstant) handle to it, which keeps the callee closed. An
+//! [`SessionConstant`](crate::SessionConstant) handle to it, which keeps the callee closed. An
 //! eager parent resolves the handle when it lifts it, and lowering passes every distinct handle of a program as a
 //! hidden argument of the entry function after its captures, so the executable depends only on the types of these
 //! arrays. Composite bodies and rules must be `'static`, so they can only call compiled functions of a `'static`
@@ -199,13 +199,13 @@ use ryft_core::{
 };
 use ryft_pjrt::Execution;
 
-use crate::domains::execution::{validate_input_type, validate_runtime_outputs};
-use crate::domains::{CompiledProgram, with_input_shardings};
-use crate::experimental::ops::{Constant, Operation};
-use crate::{
-    AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, Array, CompilationError, Domain, Error,
-    ExecutionError, Options, Value,
-};
+use crate::compilation::CompilationError;
+use crate::compilation::domains::with_input_shardings;
+use crate::compilation::options::Options;
+use crate::compilation::profile_guided::{AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions};
+use crate::compilation::programs::CompiledProgram;
+use crate::execution::{validate_input_type, validate_runtime_outputs};
+use crate::{Array, Constant, Domain, Error, ExecutionError, Operation, Value};
 
 /// Array IR tracer retained by the experimental stateful XLA program.
 ///
@@ -1521,7 +1521,7 @@ where
     }
 
     /// Returns the device mesh the compiled program runs against. Delegates to the cached
-    /// [`CompiledProgram::mesh`](crate::domains::CompiledProgram::mesh).
+    /// [`CompiledProgram::mesh`](crate::compilation::CompiledProgram::mesh).
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         self.function.compiled_program().mesh()
@@ -2345,18 +2345,20 @@ pub(crate) mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::compilation::{
+    use crate::compilation::CompilationError;
+    use crate::compilation::functions::{
         CompileTracer, CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction,
         StatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
         compile_with_options, infer_output_types, jit, jit_statefully, jit_with_options, stage, stage_with_captures,
     };
+    use crate::compilation::options::Options;
+    use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
     use crate::domains::tests::{StatefulFailureInjection, inject_stateful_completion, inject_stateful_failure};
-    use crate::experimental::ops::{Constant, Operation};
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        AdaptiveProfileGuidedOptions, Array, ArrayError, CompilationError, Domain, Error, ExecutionError, FromPjrt,
-        Options, RaggedDotLoweringStrategy, Reference, Session, ThroughSession, Value,
+        Array, ArrayError, Constant, Domain, Error, ExecutionError, FromPjrt, Operation, RaggedDotLoweringStrategy,
+        Reference, Session, ThroughSession, Value,
     };
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
@@ -4819,7 +4821,7 @@ pub(crate) mod tests {
         let destination = destination.read().unwrap();
         assert_eq!(read_sharded_f32_array(&destination), vec![10.0, 14.0, 0.0, 0.0]);
         assert_eq!(
-            values_from_bytes::<f32>(&crate::arrays_v0::host::materialize_dense_array_bytes(&destination).unwrap()),
+            values_from_bytes::<f32>(&destination.copy_to_host().unwrap()),
             vec![10.0, 14.0],
         );
     }
@@ -7457,7 +7459,7 @@ pub(crate) mod tests {
     fn test_jvp_of_jit_call_preserves_boundary_and_matches_legacy_jvp() {
         use ryft_core::StagingContext;
 
-        use crate::experimental::ops::FlatProgram;
+        use crate::operations::FlatProgram;
         use crate::operations::jit_call::JitCallOperation;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -8276,7 +8278,7 @@ pub(crate) mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
         let read = |array: &Array<'_>| {
-            values_from_bytes::<f32>(&crate::arrays_v0::host::materialize_dense_array_bytes(array).unwrap())
+            values_from_bytes::<f32>(&array.copy_to_host().unwrap())
         };
         let assert_close = |actual: Vec<f32>, expected: Vec<f32>| {
             assert_eq!(actual.len(), expected.len());
@@ -8426,7 +8428,7 @@ pub(crate) mod tests {
         assert_eq!(output.r#type().sharding(), Some(&replicated));
         assert_eq!(output.sharding(), &sharded);
         assert_eq!(
-            values_from_bytes::<f32>(&crate::arrays_v0::host::materialize_dense_array_bytes(&output).unwrap()),
+            values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
             vec![0.0, 1.0, 2.0, 3.0],
         );
     }

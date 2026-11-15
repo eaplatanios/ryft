@@ -32,13 +32,13 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::experimental::lowering::types::{
+use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::types::{
     lower_array_ir_type, lower_constant_output, lower_static_index_constants, lower_tensor_type,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
-use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
-use crate::experimental::ops::FlatProgram;
+use crate::lowering::{CollectiveLoweringState, EffectTokens};
+use crate::operations::FlatProgram;
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
@@ -652,17 +652,17 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
 
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
     };
-    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
+        Array, CompiledFunction, Constant, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
         to_mlir_module_for_program,
     };
 

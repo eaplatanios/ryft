@@ -5,7 +5,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one traced sort to a `stablehlo.sort` with a synthesized comparator region: two scalar block arguments
@@ -224,9 +224,9 @@ mod tests {
     use ryft_core::{Array as CoreArray, Dimension as CoreDimension, Placeholder, Shape, Sort, TopK};
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
     use crate::{Session, to_mlir_module_for_program};
 
     use super::*;

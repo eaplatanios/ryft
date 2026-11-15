@@ -15,6 +15,8 @@ use crate::kernels::cuda::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, 
 use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
+// TODO(eaplatanios): Review this module.
+
 /// Embeds a validated cuTile artifact using the existing session-owned CUDA launcher.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CuTileEmbedding;

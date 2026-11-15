@@ -18,7 +18,9 @@ use ryft_core::{
     ShardMapOptions, Sharding, ShardingDimension, Sin, shard_map,
 };
 use ryft_xla::Error;
-use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
+
+// TODO(eaplatanios): Review this module.
 
 /// A requested structural-statistics case is absent from this binary's registry.
 #[derive(Debug, thiserror::Error)]
@@ -542,7 +544,7 @@ mod tests {
 
     /// Verifies the exact expected statistics for every shard-map case, including the nested case's shared-arena
     /// attachment edges. The `shard_map_basic` expectation is anchored against a program rendering by the
-    /// `test_traced_program_statistics` owner-module test in `experimental::tracing`; the other two fixtures were
+    /// `test_traced_program_statistics` owner-module test in `ryft_xla::tracing`; the other two fixtures were
     /// pinned from the binary's emitted values after checking them for internal consistency, so they serve as
     /// change detectors rather than independently derived ground truth.
     #[test]

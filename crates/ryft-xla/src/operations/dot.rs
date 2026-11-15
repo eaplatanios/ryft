@@ -11,7 +11,7 @@ use ryft_mlir::{
     Region, Type as MlirType, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_element_type, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
     lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
 };
@@ -606,20 +606,22 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Dot, DotAlgorithm, Operation as CoreOperation,
-        Placeholder, RaggedDot, Sharding, Typed, bf16, f8e4m3fn, f8e5m2, f16,
+        Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Dot, DotAlgorithm, Einsum, EinsumOptions,
+        EinsumPathStrategy, EinsumSpecification, Operation as CoreOperation, Placeholder, ProjectedContext, RaggedDot,
+        Sharding, Typed, bf16, differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
     };
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
-    use crate::experimental::lowering::{
+    use crate::lowering::{
         lower_mlir_module_for_program, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
     };
-    use crate::experimental::ops::ArrayConstant;
-    use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Session, ToPjrt, to_mlir_module_for_program};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tracing::{ArrayTracer, TracedProgram, trace};
+    use crate::values::ArrayConstant;
+    use crate::{Domain, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1839,5 +1841,152 @@ mod tests {
         );
         assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[1f32, 1.25, 2.5, 2.75]));
         assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+    }
+
+    #[test]
+    fn test_einsum_matches_reference_backend() {
+        // An einsum is staged as dots, sums, diagonals, squeezes, and transposes, which lower and execute like the
+        // reference backend. Every input holds small integers, so all results are exact on both backends. Elements
+        // are compared as values, because a dot without contracting dimensions keeps the sign of a zero product on
+        // XLA, while the reference kernel adds every product to a positive zero.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let cases: &[(&str, &[&[usize]])] = &[
+            ("ij,jk->ik", &[&[2, 3], &[3, 4]]),
+            ("ijk,kl->jil", &[&[2, 3, 4], &[4, 2]]),
+            ("...ij,...jk->...ik", &[&[2, 2, 3], &[2, 3, 2]]),
+            ("ij,jk,kl->il", &[&[2, 3], &[3, 4], &[4, 2]]),
+            ("ii->", &[&[3, 3]]),
+            ("iij,j->i", &[&[2, 2, 3], &[3]]),
+            ("ij,ij->ij", &[&[2, 3], &[1, 3]]),
+            ("ij,k->i", &[&[2, 3], &[4]]),
+            ("ab,bc,cd,de,ef->af", &[&[2, 3], &[3, 2], &[2, 3], &[3, 2], &[2, 2]]),
+            ("ij->ji", &[&[2, 3]]),
+        ];
+        for (subscripts, shapes) in cases {
+            let mut inputs = Vec::new();
+            let mut reference_inputs = Vec::new();
+            for (index, shape) in shapes.iter().enumerate() {
+                let count = shape.iter().product::<usize>();
+                let values = (0..count).map(|value| ((value * (index + 2)) % 7) as f32 - 3.0).collect::<Vec<_>>();
+                reference_inputs.push(
+                    CoreArray::from_elements(ArrayType::new_static(DataType::F32, shape.to_vec()), &values).unwrap(),
+                );
+                inputs.push(replicated_array(&domain, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
+            }
+            let output = Einsum::einsum(subscripts, inputs.iter()).unwrap();
+            let reference_output = CoreArray::einsum(subscripts, reference_inputs.iter()).unwrap();
+            assert_eq!(output.r#type().shape(), reference_output.r#type().shape(), "{subscripts}");
+            assert_eq!(
+                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                reference_output.elements::<f32>().unwrap(),
+                "{subscripts}",
+            );
+        }
+
+        // The options select the path, the precision, and the accumulation type of the staged contractions.
+        let values = [3.0f32, 0.5, 2.0, 4.0].map(bf16::from_f32);
+        let reference = CoreArray::matrix(2, 2, values.to_vec()).unwrap();
+        let input = replicated_array(&domain, &mesh, DataType::BF16, &[2, 2], &reference.logical_bytes());
+        let specification = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
+        let options = EinsumOptions::new()
+            .with_path(EinsumPathStrategy::Unoptimized)
+            .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+            .with_accumulation_type(DataType::F32);
+        let output = Einsum::einsum_with_options(&specification, [&input, &input, &input], &options).unwrap();
+        let reference_output =
+            CoreArray::einsum_with_options(&specification, [&reference, &reference, &reference], &options).unwrap();
+        assert_eq!(reference_output.r#type().data_type(), DataType::F32);
+        assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes());
+    }
+
+    #[test]
+    fn test_einsum_composite_matches_reference_backend() {
+        // An einsum function with multiple steps executes each call as one eager dispatch of its whole body, where
+        // the capability dispatches every step separately. Both agree with the reference backend.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let shapes: [&[usize]; 3] = [&[2, 3], &[3, 4], &[4, 2]];
+        let mut inputs = Vec::new();
+        let mut reference_inputs = Vec::new();
+        for (index, shape) in shapes.iter().enumerate() {
+            let count = shape.iter().product::<usize>();
+            let values = (0..count).map(|value| ((value * (index + 2)) % 7) as f32 - 3.0).collect::<Vec<_>>();
+            reference_inputs
+                .push(CoreArray::from_elements(ArrayType::new_static(DataType::F32, shape.to_vec()), &values).unwrap());
+            inputs.push(replicated_array(&domain, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
+        }
+        let function = einsum::<ProjectedContext<Domain<'_>, ArrayType>>("ij,jk,kl->il").unwrap();
+        let reference_output = CoreArray::einsum("ij,jk,kl->il", reference_inputs.iter()).unwrap();
+        let dispatches = || {
+            let statistics = domain.eager_dispatch_statistics();
+            (statistics.misses, statistics.hits)
+        };
+
+        let first = function.call(inputs.clone()).unwrap();
+        assert_eq!(dispatches(), (1, 0));
+        let second = function.call(inputs.clone()).unwrap();
+        assert_eq!(dispatches(), (1, 1));
+        for output in [first, second] {
+            assert_eq!(output.r#type().shape(), reference_output.r#type().shape());
+            assert_eq!(
+                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                reference_output.elements::<f32>().unwrap(),
+            );
+        }
+        let inline = Einsum::einsum("ij,jk,kl->il", inputs.iter()).unwrap();
+        assert_eq!(dispatches(), (3, 1));
+        assert_eq!(
+            values_from_bytes::<f32>(&inline.copy_to_host().unwrap()),
+            reference_output.elements::<f32>().unwrap(),
+        );
+
+        // The derived rules differentiate the body of the call.
+        let gradient = differentiate_at(inputs[0].clone())
+            .with_captures((inputs[1].clone(), inputs[2].clone()))
+            .gradient(|lhs, (middle, rhs)| function.call(vec![lhs, middle, rhs])?.einsum_with("il->", []))
+            .unwrap();
+        let reference_gradient = differentiate_at(reference_inputs[0].clone())
+            .with_captures((reference_inputs[1].clone(), reference_inputs[2].clone()))
+            .gradient(|lhs, (middle, rhs)| Einsum::einsum("ij,jk,kl->", [&lhs, &middle, &rhs]))
+            .unwrap();
+        assert_eq!(
+            values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()),
+            reference_gradient.elements::<f32>().unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_einsum_composite_lowering_shares_one_function() {
+        // Calls of one einsum function with equal input types lower to calls of one shared function, which holds the
+        // decomposition once.
+        let function = einsum::<ProjectedContext<Domain<'static>, ArrayType>>("ij,jk,kl->il").unwrap();
+        let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
+            move |inputs: Vec<ArrayTracer>| {
+                let first = function.call(inputs.clone()).unwrap();
+                function.call(vec![first, inputs[1].clone(), inputs[2].clone()]).unwrap()
+            },
+            vec![ArrayType::new_static(DataType::F32, [2, 2]); 3],
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func private @ryft.einsum.v1(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.dot_general %arg1, %arg0, contracting_dims = [0] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    %1 = stablehlo.dot_general %0, %arg2, contracting_dims = [0] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
+                  }
+                  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                    %0 = call @ryft.einsum.v1(%arg0, %arg1, %arg2) : (tensor<2x2xf32>, tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    %1 = call @ryft.einsum.v1(%0, %arg1, %arg2) : (tensor<2x2xf32>, tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
+                  }
+                }
+            "#},
+        );
     }
 }

@@ -41,9 +41,9 @@ mod tests {
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::domains::tests::{domain_mesh, read_f64s};
-    use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{Array, Options, Session};
+    use crate::{Array, Constant, Options, Session};
 
     /// Checks compiled basic and broadcast advanced reads and repeated indexed updates on the provided backend.
     fn assert_compiled_indexing(client: &Client<'_>) {

@@ -26,8 +26,11 @@ use ryft_core::{
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::experimental::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::execution::ExecutionArguments;
+use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
 use ryft_xla::{Array, Domain, FromPjrt, Session};
+
+// TODO(eaplatanios): Review this module.
 
 #[path = "differential_testing/collectives.rs"]
 mod collectives;
@@ -278,7 +281,7 @@ fn execute_collective_inputs(
     )?;
     let execution_device_ids =
         executable.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<Vec<_>, _>>()?;
-    let arguments = Array::into_execute_arguments(arrays, execution_device_ids.as_slice())?;
+    let arguments = ExecutionArguments::from_arrays(arrays, execution_device_ids.as_slice())?;
     let outputs = executable
         .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])?
         .block_until_ready()?;

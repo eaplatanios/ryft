@@ -22,17 +22,20 @@
 //! Drop order matters: keep the [`DistributedRuntime`] alive at least as long as the
 //! [`ryft_pjrt::Client`] it produced, because the client borrows the runtime's key-value store.
 
+// TODO(eaplatanios): Review this module.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use ryft_core::{CompilationArtifactExchange, CompilationArtifactExchangeError};
 use ryft_pjrt::{
     Client, ClientOptions, DistributedKeyValueStore, DistributedRuntimeClientOptions, DistributedRuntimeService,
     DistributedRuntimeServiceOptions, KeyValueStore, Plugin,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 const DEFAULT_ARTIFACT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_ARTIFACT_SIZE: usize = 2 * 1024 * 1024 * 1024;
@@ -500,13 +503,11 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
 
-    use crate::arrays_v0::host::materialize_dense_array_bytes;
-    use crate::compilation::compile_statefully;
-    use crate::compilation::tests::doubling_reduced_reference_program;
+    use crate::compilation::functions::tests::doubling_reduced_reference_program;
     #[cfg(feature = "cuda-13")]
-    use crate::experimental::lowering::tests::test_spmd_compilation_options;
+    use crate::lowering::tests::test_spmd_compilation_options;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayError, Domain, Error, FromPjrt, Options, Reference, Session, Value};
+    use crate::{Array, ArrayError, Domain, Error, FromPjrt, Options, Reference, Session, Value, compile_statefully};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -580,12 +581,12 @@ mod tests {
         // both devices and otherwise names a shard of the other process before issuing any copy, as JAX rejects fetching
         // arrays whose value spans non-addressable devices.
         if local_positions.len() == 2 {
-            let materialized = materialize_dense_array_bytes(&input).unwrap();
+            let materialized = input.copy_to_host().unwrap();
             assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![1.0, 2.0, 3.0, 4.0]);
         } else {
             let remote_position = 1 - local_positions[0];
             assert!(matches!(
-                materialize_dense_array_bytes(&input),
+                input.copy_to_host(),
                 Err(Error::Array(error)) if matches!(
                     *error,
                     ArrayError::MissingShardBuffer { shard_index, device_id }
@@ -628,7 +629,7 @@ mod tests {
 
         // A replicated array spans every process, but each process holds its whole value, so dense host reads succeed
         // in every process, as JAX reads a value that the current process holds in full.
-        let materialized = materialize_dense_array_bytes(&sum).unwrap();
+        let materialized = sum.copy_to_host().unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![4.0, 6.0]);
 
         // Batching a map along its only manual axis for a caller over an `Explicit` copy of the mesh places one item on
@@ -708,7 +709,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read_addressable_f32s(&reference.read().unwrap()), vec![vec![2.0, 4.0]; local_positions.len()]);
-        let materialized = materialize_dense_array_bytes(&reference.read().unwrap()).unwrap();
+        let materialized = reference.read().unwrap().copy_to_host().unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![2.0, 4.0]);
     }
 

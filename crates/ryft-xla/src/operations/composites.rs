@@ -12,7 +12,7 @@ use ryft_mlir::ValueRef;
 #[cfg(test)]
 use ryft_mlir::{Block as _, Operation as _, Value as _};
 
-use crate::experimental::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::lower_nested_program_inline;
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
@@ -318,11 +318,11 @@ mod tests {
     };
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::test_vector_type;
-    use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::test_vector_type;
+    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, Error, Session, to_mlir_module_for_program};
+    use crate::{Array, Constant, Domain, Error, Session, to_mlir_module_for_program};
 
     // Value that composite rules see when a composite executes through the projection of the eager domain onto arrays.
     type ArrayTracer<'c> = DomainTracer<ProjectedContext<Domain<'c>, ArrayType>>;
@@ -656,7 +656,7 @@ mod tests {
 
     /// Lowers `program`, whose outputs all have the test vector type, for `target_platform`.
     fn lower_named_calls(
-        program: &crate::experimental::ops::FlatProgram,
+        program: &crate::operations::FlatProgram,
         target_platform: Option<&str>,
     ) -> Result<String, Error> {
         let input_types = vec![test_vector_type(4)];

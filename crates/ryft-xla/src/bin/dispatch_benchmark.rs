@@ -19,9 +19,13 @@ use ryft_core::{
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
-use ryft_xla::experimental::ops::{Constant, Operation, ProgramBuilder};
-use ryft_xla::{Array, CompileTracer, CompiledFunctionDispatcher, Dimension, FromPjrt, Session, Value, jit};
+use ryft_xla::operations::ProgramBuilder;
+use ryft_xla::{
+    Array, CompileTracer, CompiledFunctionDispatcher, Constant, Dimension, FromPjrt, Operation, Session, Value, jit,
+};
 use serde_json::json;
+
+// TODO(eaplatanios): Review this module.
 
 /// Command-line arguments of this benchmark.
 #[derive(Debug)]

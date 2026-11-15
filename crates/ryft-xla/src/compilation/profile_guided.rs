@@ -14,9 +14,11 @@ use ryft_core::{ArrayIrType, ArrayType, CompilationCacheDomain, Parameterized, P
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile as PjrtFeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
-use crate::domains::LoweredProgram;
-use crate::experimental::ops::Constant;
-use crate::{Array, CompilationError, Domain, Error, ExecutableFunction, FeedbackDirectedProfile, Options, Value};
+use crate::compilation::CompilationError;
+use crate::compilation::functions::ExecutableFunction;
+use crate::compilation::options::{FeedbackDirectedProfile, Options};
+use crate::compilation::programs::LoweredProgram;
+use crate::{Array, Constant, Domain, Error, Value};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 

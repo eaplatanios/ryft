@@ -28,11 +28,19 @@ use crate::kernels::{
 };
 use crate::{Error, Target, ToPjrt};
 
+// TODO(eaplatanios): Review this module.
+
 /// Name of the native type through which the built-in ROCm artifact handler recovers its session runtime.
 const ROCM_RUNTIME_TYPE_NAME: &str = "ryft.kernel.rocm.runtime";
 
 /// Explicit native type ID registered under [`ROCM_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
 const ROCM_RUNTIME_TYPE_ID: FfiTypeId = named_ffi_type_id(ROCM_RUNTIME_TYPE_NAME);
+
+impl From<ryft_rocm::Error> for Error {
+    fn from(error: ryft_rocm::Error) -> Self {
+        Self::custom(error)
+    }
+}
 
 /// Custom-call buffer supplying one physical HIP pointer argument.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +491,16 @@ mod tests {
             RocmKernelLaunchDimensions::new([1; 3], [256, 1, 1], 0).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_error_from_rocm_error() {
+        let error = Error::from(ryft_rocm::Error::Unavailable { message: "missing HIP runtime".into() });
+        assert_eq!(error.to_string(), "missing HIP runtime");
+        assert!(matches!(
+            error.downcast_custom::<ryft_rocm::Error>(),
+            Some(ryft_rocm::Error::Unavailable { message }) if message == "missing HIP runtime",
+        ));
     }
 
     #[test]

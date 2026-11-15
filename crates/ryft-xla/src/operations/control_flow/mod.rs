@@ -13,19 +13,17 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::regions::lower_nested_program_inline;
-use crate::experimental::lowering::types::{
+use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::types::{
     dimension_extent_i64, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
     physical_bound_type,
 };
-use crate::experimental::lowering::{
-    CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects,
-};
-use crate::experimental::ops::{Constant, FlatProgram, Program};
+use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperationFamily};
+use crate::operations::{FlatProgram, Program};
+use crate::{Constant, Error, LowerableOperationFamily};
 
 /// StableHLO lowering of `condition`.
 pub(crate) mod condition;
@@ -518,10 +516,11 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
-    use crate::experimental::lowering::lower_mlir_module_for_program;
-    use crate::experimental::lowering::tests::{test_spmd_compilation_options, test_vector_type};
-    use crate::experimental::ops::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::execution::ExecutionArguments;
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::{test_spmd_compilation_options, test_vector_type};
     use crate::operations::jit_call::JitCallOperation;
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt, Session, to_mlir_module_for_program};
 
@@ -702,7 +701,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let arguments = Array::into_execute_arguments(inputs, device_ids.as_slice()).unwrap();
+        let arguments = ExecutionArguments::from_arrays(inputs, device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None, &[])
             .unwrap()

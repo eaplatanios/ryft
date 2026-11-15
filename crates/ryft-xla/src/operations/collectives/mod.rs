@@ -5,8 +5,8 @@ use ryft_mlir::{
 };
 
 use crate::Error;
-use crate::experimental::lowering::CollectiveLoweringState;
-use crate::experimental::lowering::types::lower_tensor_type;
+use crate::lowering::CollectiveLoweringState;
+use crate::lowering::types::lower_tensor_type;
 
 /// StableHLO lowering of `axis_index`.
 pub(crate) mod axis_index;
@@ -204,10 +204,10 @@ mod tests {
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
-    use crate::experimental::ArrayTracer;
-    use crate::experimental::lowering::tests::{shard_map_module, test_manual_mesh, test_vector_type};
-    use crate::experimental::lowering::types::lower_array_ir_type;
-    use crate::experimental::ops::Operation;
+    use crate::lowering::tests::{shard_map_module, test_manual_mesh, test_vector_type};
+    use crate::lowering::types::lower_array_ir_type;
+    use crate::operations::Operation;
+    use crate::tracing::ArrayTracer;
     use crate::{LowerableOperation, Lowerer, MemberLowerableOperation};
 
     use super::*;

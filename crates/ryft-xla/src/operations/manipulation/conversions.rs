@@ -9,7 +9,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_f64_constant_splat, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
     lower_signed_one_bit_to_mlir, lower_tensor_type, lower_unplaced_constant_output, physical_bound_type,
     static_dimensions,
@@ -1068,16 +1068,17 @@ mod tests {
 
     use crate::domains::Tracer;
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module,
         test_spmd_compilation_options,
     };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::{ArrayConstant, Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::experimental::tracing::ArrayTracer;
+    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::jit_call::JitCallOperation;
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Domain, Session, ToPjrt, to_mlir_module_for_program};
+    use crate::tracing::ArrayTracer;
+    use crate::values::ArrayConstant;
+    use crate::{Constant, Domain, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 

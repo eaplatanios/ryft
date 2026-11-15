@@ -8,7 +8,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::types::{
+use crate::lowering::types::{
     lower_explicit_shape, lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_static_index_constants,
     lower_tensor_type, lower_unplaced_constant_output,
 };
@@ -738,10 +738,10 @@ mod tests {
 
     use crate::Session;
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module};
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module};
+    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
 
     use super::*;
 

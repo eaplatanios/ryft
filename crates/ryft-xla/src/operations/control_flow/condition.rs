@@ -13,7 +13,7 @@ use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation as CoreOpe
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::experimental::lowering::{current_or_new_token, token_threaded_effects};
+use crate::lowering::{current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::{
     lower_control_flow_region, lower_explicit_sharding_constraints, lower_refined_region_input, lower_region_guard,
     lowered_effect_classes, set_threaded_effect_tokens,
@@ -164,18 +164,18 @@ mod tests {
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::experimental::lowering::tests::{
+    use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch,
         ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
-    use crate::experimental::ops::{Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt, Session, Value, to_mlir_module_for_program};
+    use crate::{Array, Constant, FromPjrt, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 

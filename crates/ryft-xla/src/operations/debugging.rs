@@ -18,7 +18,7 @@ use ryft_pjrt::{Client, Error as PjrtError};
 use crate::domains::effects::EffectCallbackGuard;
 use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::domains::{RuntimeExtension, RuntimeProvider, RuntimeRequirement};
-use crate::experimental::lowering::{EffectTokens, current_or_new_token};
+use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::{Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, Target};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -539,13 +539,12 @@ mod tests {
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin,
     };
 
-    use crate::RuntimeError;
-    use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
-    use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::lower_mlir_module_for_program_with_reference_state;
+    use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::to_mlir_module_for_program;
+    use crate::values::ArrayConstant;
+    use crate::{RuntimeError, to_mlir_module_for_program};
 
     use super::*;
 

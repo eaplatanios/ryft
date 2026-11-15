@@ -183,8 +183,6 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::kernels::{DistributedKernelError, KernelAotError, KernelTuningError};
-
     use super::*;
 
     #[test]
@@ -222,24 +220,6 @@ mod tests {
         assert!(error.downcast_custom::<PjrtError>().is_none());
         assert!(Error::from(ArrayError::MissingMesh).downcast_custom::<io::Error>().is_none());
         assert!(Error::from(io::Error::other("ordinary I/O failure")).downcast_custom::<io::Error>().is_none());
-
-        let aot = Error::from(KernelAotError::Invalid { message: "invalid manifest".into() });
-        assert_eq!(aot.to_string(), "invalid kernel AOT bundle: invalid manifest");
-        assert!(matches!(
-            aot.downcast_custom::<KernelAotError>(),
-            Some(KernelAotError::Invalid { message }) if message == "invalid manifest",
-        ));
-
-        let tuning = Error::from(KernelTuningError::Busy);
-        assert_eq!(tuning.to_string(), "kernel tuner is busy");
-        assert!(matches!(tuning.downcast_custom::<KernelTuningError>(), Some(KernelTuningError::Busy)));
-
-        let distributed = Error::from(DistributedKernelError::Cancelled);
-        assert_eq!(distributed.to_string(), "distributed kernel call cancelled");
-        assert!(matches!(
-            distributed.downcast_custom::<DistributedKernelError>(),
-            Some(DistributedKernelError::Cancelled),
-        ));
     }
 
     #[test]

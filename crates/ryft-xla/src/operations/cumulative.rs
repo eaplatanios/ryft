@@ -9,9 +9,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::types::{
-    lower_f64_constant_splat, lower_tensor_type, lower_unplaced_constant_output,
-};
+use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type, lower_unplaced_constant_output};
 use crate::operations::complex::lower_principal_phase_to_mlir;
 use crate::operations::exponential::lower_log_add_exp_to_mlir;
 use crate::operations::extrema::FloatExtremumForm;
@@ -356,10 +354,10 @@ mod tests {
     };
 
     use crate::domains::tests::{domain_mesh, read_f32s};
-    use crate::experimental::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
-    use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::experimental::ops::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
+    use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
     use crate::{Array, Domain, Options, Session, Value};
 
     use super::*;

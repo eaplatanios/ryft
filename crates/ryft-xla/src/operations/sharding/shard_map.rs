@@ -15,15 +15,13 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::experimental::lowering::regions::lower_program_outputs_with_inputs;
-use crate::experimental::lowering::types::lower_tensor_type;
-use crate::experimental::lowering::{
-    CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects,
-};
-use crate::experimental::ops::{Constant, Program};
+use crate::lowering::regions::lower_program_outputs_with_inputs;
+use crate::lowering::types::lower_tensor_type;
+use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
+use crate::operations::Program;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
 
 /// Lowers one `sdy.manual_computation` operation, threading per-device effect tokens across its boundary. Assertions
 /// remain local to an executable, and the only ordered I/O that reaches this function is per-device
@@ -398,7 +396,6 @@ mod tests {
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
-
     use ryft_core::{
         AxisIndexOperation, BatchAxis, BatchAxisSpecification, BatchedProgram, BroadcastOperation, CompositeOperation,
         Context, ConvertElementType, ConvertElementTypeOperation, CotangentDestinationKind, CustomCallOperation,
@@ -415,18 +412,18 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
     use crate::domains::Tracer;
-    use crate::experimental::ArrayTracer;
-    use crate::experimental::lowering::tests::{
+    use crate::execution::ExecutionArguments;
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::{
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_spmd_compilation_options, test_vector_type,
     };
-    use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_program};
-    use crate::experimental::ops::{Operation as ArrayIrOperation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::experimental::tracing::{TracedProgram, trace_with_context};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
+    use crate::operations::{Operation as ArrayIrOperation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, FromPjrt, Options, Session, ToMlir, Value};
+    use crate::tracing::{ArrayTracer, TracedProgram, trace_with_context};
+    use crate::{Array, Domain, FromPjrt, Options, Session, ToMlir, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1214,7 +1211,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
 
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -1326,7 +1323,7 @@ mod tests {
         use ryft_core::CotangentDestinationKind;
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
-        use crate::experimental::lowering::to_mlir_module_for_program;
+        use crate::to_mlir_module_for_program;
 
         let mesh = test_logical_mesh_2x2();
         let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
@@ -1443,7 +1440,7 @@ mod tests {
         use ryft_core::{CotangentDestinationKind, ParallelReduce, ReductionKind};
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
-        use crate::experimental::lowering::to_mlir_module_for_program;
+        use crate::to_mlir_module_for_program;
 
         // The primal is x -> 4*x. Its reverse rule divides each replicated seed by four, transposes the physical
         // collective, and sums the replicated input contributions. Both all-reduces must survive lowering.
@@ -2451,7 +2448,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_with_inferred_input_shardings_executes_on_cpu() {
-        use crate::experimental::tracing::{TracedProgram, trace_with_context};
+        use crate::tracing::{TracedProgram, trace_with_context};
 
         // The input sharding comes from the input type, which is sharded along `x`, and each device doubles its shard.
         let mesh = test_manual_mesh("x", 2);
@@ -2495,7 +2492,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_with_shard_map_along_executes_on_cpu() {
-        use crate::experimental::tracing::{TracedProgram, trace_with_context};
+        use crate::tracing::{TracedProgram, trace_with_context};
 
         // Each device receives one row of the input mapped along `x` at dimension 0 and returns it doubled, placed along
         // `x` at dimension 1 of the output, so the rows of the input become the column blocks of the output.
@@ -2543,7 +2540,7 @@ mod tests {
     fn test_to_mlir_module_for_program_without_manual_variation_passes_unreduced_summands_between_maps_on_cpu() {
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
-        use crate::experimental::tracing::{TracedProgram, trace_with_context};
+        use crate::tracing::{TracedProgram, trace_with_context};
 
         // The first map returns each device's shard of `x = [1, 2]` as its summand of an unreduced output, and the
         // second map squares each summand of its unreduced input. The summands survive between the maps, so the
@@ -2679,7 +2676,7 @@ mod tests {
         .unwrap();
         assert_eq!(squares.r#type().sharding(), Some(&unreduced));
         assert_eq!(read_device_f32s(&squares), vec![vec![1.0], vec![4.0]]);
-        let materialized = crate::arrays_v0::host::materialize_dense_array_bytes(&squares).unwrap();
+        let materialized = squares.copy_to_host().unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![5.0]);
     }
 
@@ -2973,7 +2970,7 @@ mod tests {
         use ryft_core::CotangentDestinationKind;
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
-        use crate::experimental::lowering::to_mlir_module_for_program;
+        use crate::to_mlir_module_for_program;
 
         // The primal is `x -> 2x` over a reduced input and output. Its pullback receives one summand of the unreduced
         // seed on each device, here `[1]` and `[2]` for the seed `3`, and returns one summand of the unreduced input
@@ -3430,7 +3427,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         let execute_arguments =
-            Array::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),
@@ -3696,7 +3693,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
 
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(
                 execute_arguments.as_execution_device_inputs(),

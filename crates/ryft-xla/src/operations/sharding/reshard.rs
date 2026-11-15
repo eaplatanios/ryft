@@ -33,11 +33,11 @@ mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::compilation::{CompileTracer, CompiledFunction, compile, compile_with_options};
-    use crate::experimental::ArrayTracer;
-    use crate::experimental::tracing::{TracedProgram, trace};
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, FromPjrt, Options, Session};
+    use crate::tracing::{ArrayTracer, TracedProgram, trace};
+    use crate::{
+        Array, CompileTracer, CompiledFunction, Domain, FromPjrt, Options, Session, compile, compile_with_options,
+    };
 
     /// Four-device mesh whose axes `x` and `y` are both explicit.
     fn explicit_mesh() -> LogicalMesh {
@@ -250,7 +250,7 @@ mod tests {
         // the compiler chooses its runtime placement over them.
         let expected = vec![1.5403022766113281f32, -1.4061393737792969, -0.36998140811920166, 1.7140724658966064];
         let read = |array: &Array<'_>| {
-            values_from_bytes::<f32>(&crate::arrays_v0::host::materialize_dense_array_bytes(array).unwrap())
+            values_from_bytes::<f32>(&array.copy_to_host().unwrap())
         };
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             {
@@ -387,7 +387,7 @@ mod tests {
         let gradient = compiled.executable().execute(&domain, input.clone()).unwrap();
         assert_eq!(gradient.r#type(), input.r#type());
         assert_eq!(gradient.sharding(), &input_placement);
-        let gradient = crate::arrays_v0::host::materialize_dense_array_bytes(&gradient).unwrap();
+        let gradient = gradient.copy_to_host().unwrap();
         let expected = [1.0f32, -0.30116868, -2.2347417, -1.4133525, 2.3735664, 5.078284, 2.6366632, -3.8450038];
         for (actual, expected) in values_from_bytes::<f32>(gradient.as_slice()).iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-5, "expected {expected} but got {actual}");

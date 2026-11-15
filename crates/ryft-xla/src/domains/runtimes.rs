@@ -516,7 +516,7 @@ impl<'c> ExecutionResources<'c> {
     }
 
     /// Separates native context ownership from the session-owned resource lease.
-    pub(super) fn into_parts(mut self) -> (Option<ExecutionContext>, RetainedExecutionResources<'c>) {
+    pub(crate) fn into_parts(mut self) -> (Option<ExecutionContext>, RetainedExecutionResources<'c>) {
         let context = self.context.take();
         let needed = context.is_some() || !self.retained.is_empty();
         let retained = std::mem::take(&mut self.retained);
@@ -531,7 +531,7 @@ impl Drop for ExecutionResources<'_> {
 }
 
 /// Invocation ownership retained by the session only when extensions borrow runtime data.
-pub(super) struct RetainedExecutionResources<'c> {
+pub(crate) struct RetainedExecutionResources<'c> {
     /// Whether the invocation borrowed data, even if its owner is the session's runtime instance itself.
     needed: bool,
 
@@ -588,7 +588,7 @@ struct PendingExecution<'c> {
 }
 
 /// Per-session runtime instances and pending resource ownership.
-pub(super) struct RuntimeRegistry<'c> {
+pub(crate) struct RuntimeRegistry<'c> {
     /// Externally owned client associated with all initialized instances.
     client: &'c Client<'c>,
 
@@ -609,7 +609,7 @@ impl<'c> RuntimeRegistry<'c> {
     }
 
     /// Initializes all required providers before native compilation or loading.
-    pub(super) fn ensure(&self, requirements: &[RuntimeRequirement], target: &Target) -> Result<(), Error> {
+    pub(crate) fn ensure(&self, requirements: &[RuntimeRequirement], target: &Target) -> Result<(), Error> {
         for requirement in normalize_runtime_requirements(requirements.iter().cloned())? {
             self.instance(&requirement, target)?;
         }
@@ -617,7 +617,7 @@ impl<'c> RuntimeRegistry<'c> {
     }
 
     /// Validates the selected invocation and composes all requested extension state into at most one context.
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         &self,
         requirements: &[RuntimeRequirement],
         target: &Target,
@@ -634,7 +634,7 @@ impl<'c> RuntimeRegistry<'c> {
     }
 
     /// Retains successful submission resources before any fallible result reconstruction.
-    pub(super) fn retain(&self, fence: &ExecutionFence, resources: RetainedExecutionResources<'c>) {
+    pub(crate) fn retain(&self, fence: &ExecutionFence, resources: RetainedExecutionResources<'c>) {
         if !resources.needed {
             return;
         }
@@ -1018,11 +1018,11 @@ mod tests {
         let first = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration.clone());
         let second = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
         let requirement = builtin_requirement("test.provider");
-        assert!(first.runtimes.ensure(std::slice::from_ref(&requirement), first.target().unwrap()).is_err());
-        first.runtimes.ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
-        first.runtimes.ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
+        assert!(first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).is_err());
+        first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
+        first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        second.runtimes.ensure(&[requirement], second.target().unwrap()).unwrap();
+        second.runtimes().ensure(&[requirement], second.target().unwrap()).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -1045,7 +1045,7 @@ mod tests {
             for _ in 0..8 {
                 let session = &session;
                 threads
-                    .spawn(move || session.runtimes.ensure(&[builtin_requirement("test.provider")], target).unwrap());
+                    .spawn(move || session.runtimes().ensure(&[builtin_requirement("test.provider")], target).unwrap());
             }
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1076,7 +1076,7 @@ mod tests {
                 match self.calls.fetch_add(1, Ordering::SeqCst) {
                     0 => {
                         let session = self.session.lock().unwrap().upgrade().unwrap();
-                        session.runtimes.ensure(std::slice::from_ref(requirement), target)?;
+                        session.runtimes().ensure(std::slice::from_ref(requirement), target)?;
                         unreachable!()
                     }
                     1 => panic!("fixture initializer unwound"),
@@ -1092,7 +1092,7 @@ mod tests {
         let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
         *provider.session.lock().unwrap() = Arc::downgrade(&session);
         let requirement = builtin_requirement("test.recursive");
-        let ensure = || session.runtimes.ensure(std::slice::from_ref(&requirement), session.target().unwrap());
+        let ensure = || session.runtimes().ensure(std::slice::from_ref(&requirement), session.target().unwrap());
         assert!(
             matches!(ensure(), Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier })) if identifier == "test.recursive")
         );
@@ -1136,7 +1136,7 @@ mod tests {
                 if self.reenter.swap(false, Ordering::SeqCst) {
                     self.started.wait();
                     let session = self.session.lock().unwrap().upgrade().unwrap();
-                    session.runtimes.ensure(&[builtin_requirement(self.dependency)], target)?;
+                    session.runtimes().ensure(&[builtin_requirement(self.dependency)], target)?;
                 }
                 Ok(Arc::new(CountingRuntime { client, drops: None }))
             }
@@ -1168,7 +1168,7 @@ mod tests {
         *right.session.lock().unwrap() = Arc::downgrade(&session);
         std::thread::scope(|threads| {
             let run =
-                |identifier| session.runtimes.ensure(&[builtin_requirement(identifier)], session.target().unwrap());
+                |identifier| session.runtimes().ensure(&[builtin_requirement(identifier)], session.target().unwrap());
             let left = threads.spawn(move || run("test.left"));
             let right = threads.spawn(move || run("test.right"));
             let results = [left.join().unwrap(), right.join().unwrap()];
@@ -1179,7 +1179,7 @@ mod tests {
             )));
         });
         session
-            .runtimes
+            .runtimes()
             .ensure(&[builtin_requirement("test.left"), builtin_requirement("test.right")], session.target().unwrap())
             .unwrap();
     }
@@ -1189,7 +1189,7 @@ mod tests {
         let client = execution_client();
         let session = Session::with_runtime_extensions(&client, CompilationContext::new(), RuntimeExtensions::empty());
         assert!(
-            matches!(session.runtimes.ensure(&[builtin_requirement("test.missing")], session.target().unwrap()), Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing")
+            matches!(session.runtimes().ensure(&[builtin_requirement("test.missing")], session.target().unwrap()), Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing")
         );
     }
 
@@ -1209,14 +1209,14 @@ mod tests {
         let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
         let mesh = domain_mesh(&client, "x", 1);
         for requirements in [Vec::new(), vec![builtin_requirement("test.provider")]] {
-            let resources = session.runtimes.prepare(&requirements, session.target().unwrap(), &mesh).unwrap();
+            let resources = session.runtimes().prepare(&requirements, session.target().unwrap(), &mesh).unwrap();
             let (context, lease) = resources.into_parts();
             assert!(context.is_none());
             assert!(!lease.needed);
             let (event, promise) = client.event(()).unwrap();
             let fence = ExecutionFence::new(vec![event]);
-            session.runtimes.retain(&fence, lease);
-            assert!(session.runtimes.pending.lock().unwrap().is_empty());
+            session.runtimes().retain(&fence, lease);
+            assert!(session.runtimes().pending.lock().unwrap().is_empty());
             promise.set(None).unwrap();
             fence.block_until_ready().unwrap();
         }
@@ -1238,14 +1238,14 @@ mod tests {
             .unwrap();
         let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
         let resources = session
-            .runtimes
+            .runtimes()
             .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
             .unwrap();
         let (_, lease) = resources.into_parts();
         let (first, first_promise) = client.event(()).unwrap();
         let (second, second_promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![first, second]);
-        session.runtimes.retain(&fence, lease);
+        session.runtimes().retain(&fence, lease);
         drop(fence);
         std::thread::scope(|threads| {
             let (started, waiting) = std::sync::mpsc::channel();
@@ -1288,22 +1288,22 @@ mod tests {
             .unwrap();
         let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
         let resources = session
-            .runtimes
+            .runtimes()
             .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
             .unwrap();
         let (_, lease) = resources.into_parts();
         let (event, promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![event]);
-        session.runtimes.retain(&fence, lease);
+        session.runtimes().retain(&fence, lease);
         promise.set(None).unwrap();
         fence.block_until_ready().unwrap();
         let resources = session
-            .runtimes
+            .runtimes()
             .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
             .unwrap();
         let (_, lease) = resources.into_parts();
-        session.runtimes.retain(&fence, lease);
+        session.runtimes().retain(&fence, lease);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
-        assert!(session.runtimes.pending.lock().unwrap().is_empty());
+        assert!(session.runtimes().pending.lock().unwrap().is_empty());
     }
 }

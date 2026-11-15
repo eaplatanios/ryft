@@ -19,6 +19,8 @@ use thiserror::Error;
 use crate::kernels::staging::{KernelExecutionFacts, KernelTarget};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
+// TODO(eaplatanios): Review this module.
+
 // TODO(eaplatanios): Promote kernel tuning errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
 /// Invalid tuning input, incomplete execution, or incompatible persisted measurements.
@@ -549,6 +551,13 @@ mod tests {
                 |message| KernelTuningError::Invalid { message: message.to_string() },
             )
         }
+    }
+
+    #[test]
+    fn test_error_from_kernel_tuning_error() {
+        let error = crate::Error::from(KernelTuningError::Busy);
+        assert_eq!(error.to_string(), "kernel tuner is busy");
+        assert!(matches!(error.downcast_custom::<KernelTuningError>(), Some(KernelTuningError::Busy)));
     }
 
     #[test]

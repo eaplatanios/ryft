@@ -10,11 +10,13 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
-use crate::experimental::ops::{ArrayConstant, Constant};
+use crate::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::memory::annotate_output_memory;
-use crate::{ArrayError, Error, ToPjrt};
+use crate::values::ArrayConstant;
+use crate::{ArrayError, Constant, Error, ToPjrt};
+
+// TODO(eaplatanios): Review this module.
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub(crate) fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
@@ -875,8 +877,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ConvertElementTypeOperation, Placeholder};
 
-    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension};
-    use crate::experimental::lowering::to_mlir_module_for_plain_program;
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension};
+    use crate::lowering::to_mlir_module_for_plain_program;
 
     use super::*;
 

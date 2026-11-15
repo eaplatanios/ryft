@@ -10,10 +10,8 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::experimental::lowering::EffectTokens;
-use crate::experimental::lowering::types::{
-    lower_constant_elements_attribute, lower_dimension_extent, lower_static_index_constants,
-};
+use crate::lowering::EffectTokens;
+use crate::lowering::types::{lower_constant_elements_attribute, lower_dimension_extent, lower_static_index_constants};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND,
     ASSERT_KIND_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_MUL_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND,
@@ -386,10 +384,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType, DimensionBounds, DimensionVariable, Placeholder};
 
-    use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-    use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::tests::{MixedValue, execute_mixed_program};
+    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::execution_client;
-    use crate::to_mlir_module_for_program;
+    use crate::{Constant, to_mlir_module_for_program};
 
     use super::*;
 
