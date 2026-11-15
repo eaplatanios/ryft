@@ -226,7 +226,9 @@ impl EinsumSpecification {
     /// have extent one where others have another extent (static or dynamic), in which case they are broadcast. The
     /// axes of a label that one input repeats must have equal extents. Extents are equal when they provably are
     /// (i.e., as computed by [`Dimension::has_equal_extents`]), and a dynamic extent is one when its bounds admit
-    /// nothing else. Dynamic extents take part in the path search as extent `8`, like in JAX.
+    /// nothing else. A dynamic extent takes part in the path search as the largest extent that its bounds admit. JAX
+    /// has no such bounds and uses extent `8`, which an extent without an upper bound uses here as well, unless its
+    /// lower bound is larger.
     ///
     /// # Errors
     ///
@@ -251,12 +253,17 @@ impl EinsumSpecification {
         let ranks = input_types.iter().map(ArrayType::rank).collect::<Vec<_>>();
         let (input_names, output_names) = self.expand(&ranks)?;
 
-        // The path search uses the largest extent of every label and treats a dynamic extent as extent 8,
-        // like JAX does.
+        // The path search uses the largest extent of every label. A dynamic extent counts as the largest extent that
+        // its bounds admit, which is the cost that the selected path must be good for. Without an upper bound it
+        // counts as extent 8, like every dynamic extent does in JAX, or as its lower bound when that is larger.
         let extents = label_extents(&input_names, input_types)?;
         let sizes = extents
             .iter()
-            .map(|(name, extent)| (*name, extent.value().map_or(8, |extent| extent as u128)))
+            .map(|(name, extent)| {
+                let bounds = extent.bounds();
+                let size = bounds.upper().map_or(bounds.lower().max(8), |upper| upper.saturating_sub(1));
+                (*name, size as u128)
+            })
             .collect::<BTreeMap<_, _>>();
 
         // A single input is reduced on its own, and two inputs have only one contraction. More inputs are contracted
@@ -3439,7 +3446,25 @@ mod tests {
             ))),
         );
 
-        // Dynamic extents take part in the path search as extent 8, and labels must share the same dynamic extent.
+        // A dynamic extent takes part in the path search as the largest extent that its bounds admit, which selects
+        // another path below than extent 8 does.
+        let bounded = |lower: usize, upper: Option<usize>| {
+            let n = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(lower, upper).unwrap()));
+            let types = [
+                ArrayType::new(DataType::F32, Shape::new(vec![2.into(), n.clone()])),
+                ArrayType::new(DataType::F32, Shape::new(vec![n, 2.into()])),
+                ArrayType::new_static(DataType::F32, [2, 9]),
+            ];
+            "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap().plan(&types, &EinsumOptions::new()).unwrap()
+        };
+        let static_path = |extent: usize| {
+            planned_path("ij,jk,kl->il", &[&[2, extent], &[extent, 2], &[2, 9]], EinsumPathStrategy::Auto)
+        };
+        assert_eq!(bounded(0, Some(1001)).path(), static_path(1000));
+        assert_ne!(static_path(1000), static_path(8));
+        assert_eq!(bounded(1000, None).path(), static_path(1000));
+
+        // An extent without an upper bound counts as extent 8, and labels must share the same dynamic extent.
         let extent = |name: &str| Dimension::Dynamic(DimensionVariable::new(name, DimensionBounds::unbounded()));
         let dynamic = |dimensions: Vec<Dimension>| ArrayType::new(DataType::F32, Shape::new(dimensions));
         let chain = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
