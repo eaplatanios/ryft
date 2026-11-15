@@ -344,11 +344,11 @@ mod tests {
 
                 // Create the `case` operation.
                 let index = block.argument(0).unwrap();
-                let op = case(index, vec![branch_0_region.into(), branch_1_region.into()], location).unwrap();
-                assert_eq!(op.branches().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                let op = case(index, vec![branch_0_region, branch_1_region], location).unwrap();
+                assert_eq!(op.branches().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 let op = block.append_operation(op).unwrap();
 
                 // Create a function that contains that `case` operation and returns its output.
@@ -437,13 +437,13 @@ mod tests {
 
                 // Create the `if` operation.
                 let predicate = block.argument(0).unwrap();
-                let if_op = r#if(predicate, true_branch_region.into(), false_branch_region.into(), location).unwrap();
+                let if_op = r#if(predicate, true_branch_region, false_branch_region, location).unwrap();
                 assert_eq!(if_op.predicate().unwrap(), predicate);
                 assert_eq!(if_op.true_branch().unwrap().blocks().unwrap().count(), 1);
                 assert_eq!(if_op.false_branch().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(if_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(if_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(if_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(if_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(if_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(if_op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 let if_op = block.append_operation(if_op).unwrap();
 
                 // Create a function that contains that `if` operation and returns its output.
@@ -548,16 +548,16 @@ mod tests {
                 // Create the `while` operation.
                 let while_op = r#while(
                     block.arguments().collect::<Result<Vec<_>, _>>().unwrap().as_slice(),
-                    condition_region.into(),
-                    body_region.into(),
+                    condition_region,
+                    body_region,
                     location,
                 )
                 .unwrap();
                 assert_eq!(while_op.condition().unwrap().blocks().unwrap().count(), 1);
                 assert_eq!(while_op.body().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(while_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(while_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(while_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(while_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(while_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(while_op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 let while_block = block.append_operation(while_op).unwrap();
 
                 // Create a function that contains that `while` operation and returns its outputs.
@@ -628,8 +628,8 @@ mod tests {
                 assert_eq!(op.predicate().unwrap(), predicate);
                 assert_eq!(op.on_true().unwrap(), on_true);
                 assert_eq!(op.on_false().unwrap(), on_false);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), value_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();

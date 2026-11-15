@@ -1221,8 +1221,8 @@ mod tests {
                 let mut block = context.block_with_no_arguments();
                 let value = context.dense_i64_elements_attribute(tensor_type, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
                 let op = constant(value, location).unwrap();
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.value().unwrap().to_string(), value.to_string());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -1263,8 +1263,8 @@ mod tests {
                 let mut block = context.block_with_no_arguments();
                 let op = iota(tensor_type, 1, location).unwrap();
                 assert_eq!(op.iota_dimension().unwrap(), 1);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), tensor_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -1306,8 +1306,8 @@ mod tests {
                 let mut block = context.block(&[(shape_tensor_type, location)]);
                 let op = dynamic_iota(block.argument(0).unwrap(), tensor_type, 1, location).unwrap();
                 assert_eq!(op.iota_dimension().unwrap(), 1);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1383,9 +1383,9 @@ mod tests {
                 .unwrap();
                 assert_eq!(op.dimension().unwrap(), 1);
                 assert!(op.is_stable().unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block
                     .append_operation(
@@ -1446,8 +1446,8 @@ mod tests {
                 let mut block = context.block(&[(input_tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let op = reverse(input, &[0, 2], location).unwrap();
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.reverse_dimensions().unwrap(), vec![0, 2]);
                 assert_eq!(op.reverse_dimensions().unwrap(), vec![0, 2]);
                 let op = block.append_operation(op).unwrap();
@@ -1499,13 +1499,12 @@ mod tests {
                 let negate_op = stable_hlo::negate(input, location).unwrap();
                 let negate_op = map_block.append_operation(negate_op).unwrap();
                 let return_op = r#return(&[negate_op.result(0).unwrap()], location).unwrap();
-                assert_eq!(return_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(return_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(return_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(return_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(return_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(return_op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 map_block.append_operation(return_op).unwrap();
                 map_region.append_block(map_block).unwrap();
-                let map_op =
-                    stable_hlo::map(&[block.argument(0).unwrap()], &[0, 1], map_region.into(), location).unwrap();
+                let map_op = stable_hlo::map(&[block.argument(0).unwrap()], &[0, 1], map_region, location).unwrap();
                 let map_op = block.append_operation(map_op).unwrap();
                 block.append_operation(func::r#return(&[map_op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1552,8 +1551,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
                 let op =
                     optimization_barrier(&block.arguments().collect::<Result<Vec<_>, _>>().unwrap(), location).unwrap();
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 let op = block.append_operation(op).unwrap();
                 block
                     .append_operation(
@@ -1647,7 +1646,7 @@ mod tests {
                     Some(&composite_attributes),
                     &block.arguments().collect::<Result<Vec<_>, _>>().unwrap(),
                     "my_op",
-                    vec![composite_region.into()],
+                    vec![composite_region],
                     &[tensor_type],
                     location,
                 )
@@ -1656,13 +1655,10 @@ mod tests {
                 assert_eq!(composite_op.composite_version().unwrap(), 1);
                 assert_eq!(composite_op.composite_attributes().unwrap(), composite_attributes);
                 assert_eq!(composite_op.composite_decomposition().unwrap().as_str().unwrap(), "my_op");
-                assert_eq!(
-                    composite_op.composite_regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1,
-                );
-                assert_eq!(composite_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(composite_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(composite_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(composite_op.composite_regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1,);
+                assert_eq!(composite_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(composite_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(composite_op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let composite_op = block.append_operation(composite_op).unwrap();
                 block
                     .append_operation(func::r#return(&[composite_op.result(0).unwrap()], location).unwrap())
@@ -1805,9 +1801,9 @@ mod tests {
                 );
                 assert_eq!(op.custom_call_output_operand_aliases().unwrap().len(), 2);
                 assert_eq!(op.custom_call_result_tilings().unwrap(), Some(vec![vec![vec![2, 4], vec![1, 2]]]));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 let op = block.append_operation(op).unwrap();
 
                 // Add a couple more custom calls testing the XLA GPU built-in constructors.

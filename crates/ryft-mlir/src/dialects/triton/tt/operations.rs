@@ -1736,6 +1736,7 @@ mlir_op_trait!(DotScaled, ZeroRegions);
 mlir_op_trait!(DotScaled, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DotScaledOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     a: ValueRef<'v, 'c, 't>,
     b: ValueRef<'v, 'c, 't>,

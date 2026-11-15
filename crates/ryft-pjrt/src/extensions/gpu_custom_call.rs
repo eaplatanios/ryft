@@ -431,6 +431,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Gpu_Register_Custom_Call_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             function_name: *const std::ffi::c_char,
             function_name_size: usize,
@@ -530,7 +531,7 @@ mod tests {
                 ExecutionInput {
                     buffer: Arc::new(
                         client
-                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, [1], None, device.clone(), None)
                             .unwrap(),
                     ),
                     donatable: false,
@@ -538,7 +539,7 @@ mod tests {
                 ExecutionInput {
                     buffer: Arc::new(
                         client
-                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, [1], None, device.clone(), None)
                             .unwrap(),
                     ),
                     donatable: false,
@@ -686,7 +687,7 @@ mod tests {
                                         Ok(FfiInput::Buffer { buffer })
                                             if buffer.element_type() == FfiBufferType::I32
                                                 && buffer.rank() == 1
-                                                && buffer.dimensions() == &[1]
+                                                && buffer.dimensions() == [1]
                                                 && !buffer.data().is_null(),
                                     ) {
                                         return FfiError::internal("failed to decode inputs as scalar i32 buffers")
@@ -698,7 +699,7 @@ mod tests {
                                         Ok(FfiInput::Buffer { buffer })
                                             if buffer.element_type() == FfiBufferType::I32
                                                 && buffer.rank() == 1
-                                                && buffer.dimensions() == &[1]
+                                                && buffer.dimensions() == [1]
                                                 && !buffer.data().is_null(),
                                     ) {
                                         return FfiError::internal("failed to decode inputs as scalar i32 buffers")
@@ -710,7 +711,7 @@ mod tests {
                                         Ok(FfiOutput::Buffer { buffer })
                                             if buffer.element_type() == FfiBufferType::I32
                                                 && buffer.rank() == 1
-                                                && buffer.dimensions() == &[1]
+                                                && buffer.dimensions() == [1]
                                                 && !buffer.data().is_null(),
                                     ) {
                                         return FfiError::internal(

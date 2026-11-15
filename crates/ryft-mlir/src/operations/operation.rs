@@ -1699,7 +1699,7 @@ mod tests {
 
         // Operation with no operands.
         let op = OperationBuilder::new("foo", location).build().unwrap();
-        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
 
         // Operation with three operands.
         let block = context.block(&[(index_type, location)]);
@@ -1726,7 +1726,7 @@ mod tests {
         assert!(op.operand_value(3).is_err());
         assert_eq!(
             op.operand_values().collect::<Result<Vec<_>, _>>().unwrap().into_iter().skip(1).collect::<Vec<_>>(),
-            vec![argument_0.clone(), argument_0]
+            vec![argument_0, argument_0]
         );
         assert_eq!(op.operand_type(0).unwrap(), index_type);
         assert_eq!(op.operand_type(1).unwrap(), index_type);
@@ -2080,13 +2080,13 @@ mod tests {
         block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
         let op = func::func("test_func", func::FuncAttributes::default(), block.try_into().unwrap(), location).unwrap();
         let bytecode = op.bytecode();
-        assert!(bytecode.len() > 0);
+        assert!(!bytecode.is_empty());
         let bytecode = op.bytecode_with_configuration(&BytecodeWriterConfiguration { version: Some(0) });
         assert!(bytecode.is_some());
-        assert!(bytecode.unwrap().len() > 0);
+        assert!(!bytecode.unwrap().is_empty());
         let bytecode = op.bytecode_for_version(0);
         assert!(bytecode.is_some());
-        assert!(bytecode.unwrap().len() > 0);
+        assert!(!bytecode.unwrap().is_empty());
     }
 
     #[test]
@@ -2185,6 +2185,8 @@ mod tests {
         assert_ne!(op_0, op_1_ref);
 
         // Test hashing of detached operations.
+        // The keys hash by the identity of the MLIR object that they refer to, which never changes.
+        #[allow(clippy::mutable_key_type)]
         let mut map = HashMap::new();
         assert_eq!(map.insert(&op_0, "op_0"), None);
         assert_eq!(map.insert(&op_1, "op_1"), None);
@@ -2193,6 +2195,8 @@ mod tests {
         assert_eq!(map.get(&op_1), Some(&"op_1"));
 
         // Test hashing of operation references.
+        // The keys hash by the identity of the MLIR object that they refer to, which never changes.
+        #[allow(clippy::mutable_key_type)]
         let mut map = HashMap::new();
         assert_eq!(map.insert(&op_0_ref, "op_0"), None);
         assert_eq!(map.insert(&op_1_ref, "op_1"), None);

@@ -353,6 +353,7 @@ pub trait InvokeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Invoke);
 
 /// Constructs a new detached `llvm.invoke` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn invoke<'b, 'c: 'b, 't: 'c, B1: Block<'b, 'c, 't>, B2: Block<'b, 'c, 't>, L: Location<'c, 't>>(
     callee_operands: &[ValueRef<'c, 'c, 't>],
     normal_destination: &B1,
@@ -513,6 +514,7 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Switch);
 
 /// Constructs a new detached `llvm.switch` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn switch<'b, 'c: 'b, 't: 'c, V1: Value<'c, 'c, 't>, B: Block<'b, 'c, 't>, L: Location<'c, 't>>(
     value: V1,
     default_destination: &B,
@@ -653,8 +655,8 @@ mod tests {
                 let op = block_tag(tag, location).unwrap();
                 assert_eq!(op.operation_name(), "llvm.blocktag");
                 assert_eq!(op.tag().unwrap(), tag);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
                 func::func(
@@ -718,9 +720,9 @@ mod tests {
                 assert_eq!(op.false_destination().unwrap(), false_block.as_ref());
                 assert_eq!(op.true_destination_operands().unwrap(), vec![true_value]);
                 assert_eq!(op.false_destination_operands().unwrap(), vec![false_value]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 entry_block.append_operation(op).unwrap();
                 true_block
                     .append_operation(func::r#return(&[true_block.argument(0).unwrap()], location).unwrap())
@@ -951,8 +953,8 @@ mod tests {
                 let op = resume(block.argument(0).unwrap(), location).unwrap();
                 assert_eq!(op.operation_name(), "llvm.resume");
                 assert_eq!(op.value().unwrap(), block.argument(0).unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 func::func(
                     "llvm_resume_test",

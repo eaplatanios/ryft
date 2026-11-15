@@ -4132,7 +4132,7 @@ mod tests {
                 tile_dimensions,
                 tile_dimension_sizes,
                 tile_count: 0,
-            })) if minor_to_major == &[0] && tile_dimensions.is_empty() && tile_dimension_sizes.is_empty(),
+            })) if minor_to_major == [0] && tile_dimensions.is_empty() && tile_dimension_sizes.is_empty(),
         ));
         assert!(matches!(
             buffer.specification(),
@@ -4145,7 +4145,7 @@ mod tests {
                     tile_dimension_sizes,
                     tile_count: 0,
                 }),
-            }) if minor_to_major == &[0] && tile_dimensions.is_empty() && tile_dimension_sizes.is_empty(),
+            }) if minor_to_major == [0] && tile_dimensions.is_empty() && tile_dimension_sizes.is_empty(),
         ));
         assert_eq!(buffer.on_device_size_in_bytes(), Ok(4));
         assert_eq!(buffer.ready().unwrap().r#await(), Ok(()));
@@ -4267,13 +4267,17 @@ mod tests {
 
         // Out-of-bounds, overlapping, and repeated splits are rejected.
         let mut destination = HostDestination::new(4);
-        assert!(matches!(destination.split(&[2..5]), Err(Error::InvalidArgument { .. })));
+        #[allow(clippy::single_range_in_vec_init)]
+        let out_of_bounds = destination.split(&[2..5]);
+        assert!(matches!(out_of_bounds, Err(Error::InvalidArgument { .. })));
         assert!(matches!(
             destination.split(&[0..3, 2..4]),
             Err(Error::InvalidArgument { message, .. }) if message == "host destination slices 0..3 and 2..4 overlap",
         ));
         let slices = destination.split(&[0..2, 2..2, 2..4]).unwrap();
-        assert!(matches!(destination.split(&[0..1]), Err(Error::FailedPrecondition { .. })));
+        #[allow(clippy::single_range_in_vec_init)]
+        let repeated = destination.split(&[0..1]);
+        assert!(matches!(repeated, Err(Error::FailedPrecondition { .. })));
         drop(slices);
         assert_eq!(destination.into_bytes().ok().unwrap(), vec![0; 4]);
     }
@@ -4396,7 +4400,7 @@ mod tests {
             let memory_0 = client.addressable_memories().unwrap()[0];
             let data = [101u8, 102u8, 103u8, 104u8];
             let buffer = client
-                .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, memory_0.clone(), None)
+                .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, memory_0, None)
                 .unwrap();
             assert_eq!(buffer.memory().unwrap(), memory_0);
             let buffer = buffer.copy_to_memory(memory_0).unwrap();
@@ -4742,8 +4746,8 @@ mod tests {
                     Err(Error::Aborted { message, .. }) if message.contains("test error"),
                 ));
             }
-            Err(Error::Aborted { message, .. }) if message.contains("test error") => assert!(true),
-            _ => assert!(false),
+            Err(Error::Aborted { message, .. }) if message.contains("test error") => {}
+            result => panic!("expected the test error from fulfilling the alias buffer, got {result:?}"),
         }
     }
 }

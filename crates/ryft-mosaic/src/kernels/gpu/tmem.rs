@@ -453,10 +453,10 @@ mod tests {
         ];
         assert_eq!(TmemOperation::Mma { accumulate: false }.infer_output_types(&inputs, &[]), Ok(vec![token.clone()]));
         assert_eq!(TmemOperation::Mma { accumulate: true }.infer_output_types(&inputs, &[]), Ok(vec![token.clone()]));
-        assert_eq!(TmemOperation::Commit.infer_output_types(&[token.clone()], &[]), Ok(vec![]));
+        assert_eq!(TmemOperation::Commit.infer_output_types(std::slice::from_ref(&token), &[]), Ok(vec![]));
         assert_eq!(TmemOperation::Wait.infer_output_types(&[token], &[]), Ok(vec![]));
         assert_eq!(
-            TmemOperation::Load.infer_output_types(&[destination.clone()], &[]),
+            TmemOperation::Load.infer_output_types(std::slice::from_ref(&destination), &[]),
             Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [128, 32]))])
         );
         assert_eq!(TmemOperation::Release.infer_output_types(&[destination], &[]), Ok(vec![]));

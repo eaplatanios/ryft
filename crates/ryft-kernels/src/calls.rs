@@ -484,7 +484,7 @@ impl KernelCallOperation {
                     .mapping
                     .program()
                     .input_types()
-                    .into_iter()
+                    .iter()
                     .skip(self.grid.dimensions().len())
                     .zip(values)
                     .map(|(r#type, value)| {

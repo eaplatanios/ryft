@@ -21,7 +21,7 @@ pub trait ExecuteOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the async token dependencies that gate execution of the body region.
     fn dependencies(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let dependency_count = self.dense_integer_32_array_attribute_usize_value(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
-        self.operand_values().take(dependency_count as usize).collect()
+        self.operand_values().take(dependency_count).collect()
     }
 
     /// Returns the async body operands unwrapped as block arguments in the body region.

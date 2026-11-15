@@ -2316,8 +2316,8 @@ mod tests {
                 assert_eq!(op.dimensions().unwrap(), dimensions);
                 assert_eq!(op.precision().unwrap(), None);
                 assert_eq!(op.algorithm().unwrap(), Some(algorithm));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
 
                 // Test the precision attribute using a dummy op.
                 let dummy_op = dot_general(
@@ -2335,8 +2335,8 @@ mod tests {
                 assert_eq!(dummy_op.dimensions().unwrap(), dimensions);
                 assert_eq!(dummy_op.precision().unwrap(), Some((Precision::High, Precision::Highest)));
                 assert_eq!(dummy_op.algorithm().unwrap(), None);
-                assert_eq!(dummy_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(dummy_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(dummy_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(dummy_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
 
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2499,8 +2499,8 @@ mod tests {
                 assert_eq!(op.rhs_dilation().unwrap(), Some(vec![1, 1]));
                 assert_eq!(op.window_reversal().unwrap(), Some(vec![false, false]));
                 assert_eq!(op.precision().unwrap(), Some((Precision::Default, Precision::Highest)));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2675,8 +2675,8 @@ mod tests {
                 assert_eq!(op.lhs_dilation().unwrap(), Some(vec![1, 1]));
                 assert_eq!(op.rhs_dilation().unwrap(), Some(vec![1, 1]));
                 assert_eq!(op.window_reversal().unwrap(), Some(vec![false, false]));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2734,8 +2734,8 @@ mod tests {
                 let input = block.argument(0).unwrap();
                 let op = cholesky(input, true, location).unwrap();
                 assert!(op.lower().unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2836,8 +2836,8 @@ mod tests {
                 assert!(op.lower().unwrap());
                 assert!(!op.unit_diagonal().unwrap());
                 assert_eq!(op.transpose_a().unwrap(), TriangularSolveTransposeType::NoTranspose);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2925,8 +2925,8 @@ mod tests {
                 let fft_op = fft(input, FftType::FFT, &[4], location).unwrap();
                 assert_eq!(fft_op.fft_type().unwrap(), FftType::FFT);
                 assert_eq!(fft_op.fft_length().unwrap(), vec![4]);
-                assert_eq!(fft_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(fft_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(fft_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(fft_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let fft_block = block.append_operation(fft_op).unwrap();
                 block.append_operation(func::r#return(&[fft_block.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

@@ -598,6 +598,7 @@ mlir_op_trait!(DmaStart, ZeroRegions);
 mlir_op_trait!(DmaStart, ZeroSuccessors);
 
 /// Constructs a new detached [`DmaStartOperation`].
+#[allow(clippy::too_many_arguments)]
 pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     source_indices: &[ValueRef<'v, 'c, 't>],

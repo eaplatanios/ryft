@@ -85,8 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rhs = [7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0];
     let lhs_bytes = lhs.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
     let rhs_bytes = rhs.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
-    let lhs_buffer = client.buffer(lhs_bytes.as_slice(), BufferType::F32, &[2, 3], None, device.clone(), None)?;
-    let rhs_buffer = client.buffer(rhs_bytes.as_slice(), BufferType::F32, &[3, 2], None, device, None)?;
+    let lhs_buffer = client.buffer(lhs_bytes.as_slice(), BufferType::F32, [2, 3], None, device.clone(), None)?;
+    let rhs_buffer = client.buffer(rhs_bytes.as_slice(), BufferType::F32, [3, 2], None, device, None)?;
     let inputs = [
         ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false },
         ExecutionInput { buffer: Arc::new(rhs_buffer), donatable: false },
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .remove(0)
         .copy_to_host(None)?
         .r#await()?
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|chunk| {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(chunk);

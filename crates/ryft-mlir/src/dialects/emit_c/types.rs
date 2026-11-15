@@ -56,8 +56,8 @@ impl ArrayTypeRef<'_, '_> {
                 "emitc array type dimension {dimension} is out of bounds for rank {rank}"
             )));
         }
-        Ok(usize::try_from(unsafe { mlirShapedTypeGetDimSize(self.handle, dimension.cast_signed()) })
-            .map_err(|_| Error::internal("invalid EmitC array dimension"))?)
+        usize::try_from(unsafe { mlirShapedTypeGetDimSize(self.handle, dimension.cast_signed()) })
+            .map_err(|_| Error::internal("invalid EmitC array dimension"))
     }
 
     /// Returns the element [`Type`] of this array type.

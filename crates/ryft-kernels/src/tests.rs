@@ -32,8 +32,8 @@ impl MaskedCopyCase {
                 for bits in 0..(1usize << block) {
                     for pattern in 0..2 {
                         cases.push(Self {
-                            input: (0..extent).map(|index| (index as i32 - 2) * (pattern + 1)).collect(),
-                            initial: (0..extent).map(|index| 7 - index as i32 * (pattern + 1)).collect(),
+                            input: (0..extent).map(|index| (index - 2) * (pattern + 1)).collect(),
+                            initial: (0..extent).map(|index| 7 - index * (pattern + 1)).collect(),
                             mask: (0..block).map(|lane| bits & (1 << lane) != 0).collect(),
                         });
                     }

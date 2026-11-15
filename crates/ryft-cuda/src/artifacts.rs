@@ -97,10 +97,9 @@ impl CudaTargetArchitecture {
     fn parse(target: &str) -> Option<Self> {
         let (constructor, digits): (fn(u32) -> Self, &str) = if let Some(digits) = target.strip_prefix("sm_") {
             (Self::Real, digits)
-        } else if let Some(digits) = target.strip_prefix("compute_") {
-            (Self::Virtual, digits)
         } else {
-            return None;
+            let digits = target.strip_prefix("compute_")?;
+            (Self::Virtual, digits)
         };
         let digit_count = digits.bytes().take_while(u8::is_ascii_digit).count();
         if digit_count == 0 || !digits[digit_count..].bytes().all(|byte| byte.is_ascii_lowercase()) {

@@ -79,6 +79,7 @@ pub trait AtomicCmpXchgOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(AtomicCmpXchg);
 
 /// Constructs a new detached `llvm.cmpxchg` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn cmp_xchg<
     'c,
     't: 'c,
@@ -191,6 +192,7 @@ pub trait AtomicRmwOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(AtomicRmw);
 
 /// Constructs a new detached `llvm.atomicrmw` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn atomic_rmw<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     pointer: V1,
     value: V2,
@@ -320,8 +322,8 @@ mod tests {
                 assert_eq!(op.output_type().unwrap(), result_type);
                 assert!(op.weak());
                 assert!(op.is_volatile());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -380,8 +382,8 @@ mod tests {
                 assert_eq!(op.value().unwrap(), block.argument(1).unwrap());
                 assert_eq!(op.output_type().unwrap(), i32_type);
                 assert!(op.is_volatile());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -429,8 +431,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(op.operation_name(), "llvm.fence");
                 assert!(op.syncscope().unwrap().is_some());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
                 func::func(

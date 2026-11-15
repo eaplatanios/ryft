@@ -1367,10 +1367,10 @@ mod tests {
     #[test]
     fn test_wait_operation_infer_output_types() {
         let token = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
-        assert_eq!(WaitOperation.infer_output_types(&[token.clone()], &[]), Ok(vec![]));
+        assert_eq!(WaitOperation.infer_output_types(std::slice::from_ref(&token), &[]), Ok(vec![]));
         let invalid = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)));
         assert_eq!(
-            WaitOperation.infer_output_types(&[invalid.clone()], &[]),
+            WaitOperation.infer_output_types(std::slice::from_ref(&invalid), &[]),
             Err(TypeError::invalid(format!("`wait` input type `{invalid}` must be `{token}`"))),
         );
     }

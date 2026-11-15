@@ -323,6 +323,7 @@ impl XlaTransformCallbackRegistration {
 
     /// Returns the [`PJRT_XlaTransform_Callbacks`](ffi::PJRT_XlaTransform_Callbacks) pointer that corresponds to this
     /// [`XlaTransformCallbackRegistration`] and that is expected by the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     fn to_c_api(&mut self) -> *mut ffi::PJRT_XlaTransform_Callbacks {
         (self.table.as_mut() as *mut XlaTransformCallbackTable).cast()
     }
@@ -710,8 +711,8 @@ mod tests {
     fn test_xla_transform_extension() {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
-                TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10 => {
-                    if plugin.xla_transform_extension().is_ok() {
+                TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10
+                    if plugin.xla_transform_extension().is_ok() => {
                         assert!(
                             plugin
                                 .register_xla_transform(
@@ -722,11 +723,7 @@ mod tests {
                                 .is_ok()
                         );
                         assert!(client.xla_transform_extension().is_ok());
-                    } else {
-                        assert!(matches!(plugin.xla_transform_extension(), Err(Error::Unimplemented { .. })));
-                        assert!(matches!(client.xla_transform_extension(), Err(Error::Unimplemented { .. })));
                     }
-                }
                 _ => {
                     assert!(matches!(plugin.xla_transform_extension(), Err(Error::Unimplemented { .. })));
                     assert!(matches!(client.xla_transform_extension(), Err(Error::Unimplemented { .. })));

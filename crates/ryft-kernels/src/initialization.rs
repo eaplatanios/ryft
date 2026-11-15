@@ -357,13 +357,12 @@ where
         }
     }
     for (root, operation, axes) in &initialization.unmasked_accesses {
-        if let Some(valid_shape) = valid_shapes.get(root) {
-            if !axes.iter().any(|axis| axis.size() == 0)
+        if let Some(valid_shape) = valid_shapes.get(root)
+            && !axes.iter().any(|axis| axis.size() == 0)
                 && axes.iter().zip(valid_shape).any(|(axis, &valid)| axis.start() + axis.size() > valid)
             {
                 return Err(KernelMemoryError::UnmaskedWindowAccess { operation }.into());
             }
-        }
     }
 
     Ok(())

@@ -119,6 +119,7 @@ mlir_op_trait!(For, SingleBlockRegions);
 mlir_op_trait!(For, ZeroSuccessors);
 
 /// Constructs a new detached [`ForOperation`].
+#[allow(clippy::too_many_arguments)]
 pub fn r#for<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     lower_bound_map: AffineMap<'c, 't>,
     lower_bound_operands: &[ValueRef<'v, 'c, 't>],
@@ -417,6 +418,7 @@ mlir_op_trait!(Parallel, MemRefsNormalizable);
 mlir_op_trait!(Parallel, ZeroSuccessors);
 
 /// Constructs a new detached [`ParallelOperation`].
+#[allow(clippy::too_many_arguments)]
 pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     lower_bounds_map: AffineMap<'c, 't>,
     lower_bounds_groups: &[i32],
@@ -935,6 +937,7 @@ mlir_op_trait!(DmaStart, ZeroSuccessors);
 mlir_op_trait!(DmaStart, MemRefsNormalizable);
 
 /// Constructs a new detached [`DmaStartOperation`].
+#[allow(clippy::too_many_arguments)]
 pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     source_map: AffineMap<'c, 't>,

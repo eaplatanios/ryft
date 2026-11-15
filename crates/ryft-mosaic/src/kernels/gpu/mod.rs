@@ -121,7 +121,7 @@ pub struct Target {
 impl Target {
     /// Creates an exact Hopper or Blackwell target with 32 threads and a conservative 48 KiB shared-memory limit.
     pub fn new(major: u32, minor: u32) -> Result<Self, Error> {
-        if !matches!(major, 9 | 10 | 11 | 12) || minor > 9 {
+        if !matches!(major, 9..=12) || minor > 9 {
             return Err(Error::Invalid {
                 message: format!("unsupported compute capability `{major}.{minor}`; expected Hopper or Blackwell"),
             });
@@ -546,7 +546,7 @@ mod tests {
             value.context().bind(
                 ArrayIrOperation::from(ArrayOperation::Sqrt(SqrtOperation::new())),
                 vec![],
-                &[value.clone()],
+                std::slice::from_ref(&value),
             )?;
             Ok(())
         })
@@ -654,7 +654,7 @@ mod tests {
                     DimensionVariable::new("extent", DimensionBounds::new(0, Some(8)).unwrap()).into(),
                 )),
                 vec![],
-                &[value.clone()],
+                std::slice::from_ref(&value),
             )?;
             references[0].write(&value)?;
             Ok(())

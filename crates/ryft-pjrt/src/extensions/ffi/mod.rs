@@ -540,7 +540,7 @@ pub(crate) mod tests {
         let inputs = ExecutionDeviceInputs {
             inputs: &[ExecutionInput {
                 buffer: Arc::new(
-                    client.buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device, None).unwrap(),
+                    client.buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, [1], None, device, None).unwrap(),
                 ),
                 donatable: false,
             }],
@@ -740,7 +740,7 @@ pub(crate) mod tests {
                 ExecutionInput {
                     buffer: Arc::new(
                         client
-                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, [1], None, device.clone(), None)
                             .unwrap(),
                     ),
                     donatable: false,
@@ -748,7 +748,7 @@ pub(crate) mod tests {
                 ExecutionInput {
                     buffer: Arc::new(
                         client
-                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, [1], None, device.clone(), None)
                             .unwrap(),
                     ),
                     donatable: false,

@@ -853,6 +853,7 @@ impl<'c> LoadedExecutable<'c> {
     ///
     /// If native submission succeeds but a later step of this function fails or unwinds, this function waits for every
     /// participating device to complete before returning, so borrowed resources are never released early.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute<'l>(
         &self,
         inputs: Vec<ExecutionDeviceInputs<'c, 'l>>,
@@ -3853,14 +3854,14 @@ mod tests {
             lhs_bytes.extend_from_slice(&7i32.to_ne_bytes());
             lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
             let lhs_bytes = lhs_bytes.as_slice();
-            let lhs_buffer = client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+            let lhs_buffer = client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
             // Create the second input tensor: `[35, -41]`.
             let mut rhs_bytes = Vec::with_capacity(8);
             rhs_bytes.extend_from_slice(&35i32.to_ne_bytes());
             rhs_bytes.extend_from_slice(&(-41i32).to_ne_bytes());
             let rhs_bytes = rhs_bytes.as_slice();
-            let rhs_buffer = client.buffer(rhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+            let rhs_buffer = client.buffer(rhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
             // Construct the execution device inputs that consist of our two tensors.
             let inputs = ExecutionDeviceInputs {
@@ -4770,13 +4771,13 @@ mod tests {
         ));
 
         let device_0_inputs: Vec<ExecutionInput> = vec![
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[0].clone(), None).unwrap().into(),
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[0].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[0].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[0].clone(), None).unwrap().into(),
         ];
 
         let device_1_inputs: Vec<ExecutionInput> = vec![
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap().into(),
         ];
 
         // `LoadedExecutable::execute` expects a `Vec` of inputs per device, where each `Vec` contains two inputs.
@@ -4837,11 +4838,11 @@ mod tests {
         let device_1_inputs: Vec<ExecutionInput> = vec![
             ExecutionInput {
                 buffer: Arc::new(
-                    client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap(),
+                    client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap(),
                 ),
                 donatable: true,
             },
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap().into(),
         ];
         let inputs = vec![
             ExecutionDeviceInputs { inputs: &device_0_inputs, ..Default::default() },
@@ -4882,7 +4883,7 @@ mod tests {
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_bytes = lhs_bytes.as_slice();
                     let lhs_buffer =
-                        client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create the second input tensor: `[35, -41]`.
                     let mut rhs_bytes = Vec::with_capacity(8);
@@ -4890,7 +4891,7 @@ mod tests {
                     rhs_bytes.extend_from_slice(&(-41i32).to_ne_bytes());
                     let rhs_bytes = rhs_bytes.as_slice();
                     let rhs_buffer =
-                        client.buffer(rhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(rhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create a _send_ callback that simply records the values it receives.
                     let observed_value = Arc::new(Mutex::new(None));
@@ -4974,7 +4975,7 @@ mod tests {
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_bytes = lhs_bytes.as_slice();
                     let lhs_buffer =
-                        client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create a _receive_ callback that streams the second input tensor to the device in two chunks.
                     let receive_callback = client.receive_callback(1, move |stream| {
@@ -5074,7 +5075,7 @@ mod tests {
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_bytes = lhs_bytes.as_slice();
                     let lhs_buffer =
-                        client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create a _send_ callback that records the values observed from the device.
                     let observed_value = Arc::new(Mutex::new(None));
@@ -5136,7 +5137,6 @@ mod tests {
                         inputs: &[ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false }],
                         send_callbacks: vec![send_callback],
                         receive_callbacks: vec![receive_callback],
-                        ..Default::default()
                     };
 
                     // Execute the test program.

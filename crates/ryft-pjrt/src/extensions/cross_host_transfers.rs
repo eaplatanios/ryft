@@ -593,6 +593,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Transfers_PJRT_Client_CrossHostSendBuffers_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             client: *mut PJRT_Client,
             num_buffers: usize,

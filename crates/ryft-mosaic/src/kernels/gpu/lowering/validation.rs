@@ -685,7 +685,7 @@ mod tests {
                 context.bind(
                     KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Commit)),
                     vec![],
-                    &[token.clone()],
+                    std::slice::from_ref(&token),
                 )?;
             }
             context.bind(KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Wait)), vec![], &[token])?;

@@ -74,7 +74,7 @@ pub(super) fn requirements(inputs: &[ArrayType]) -> Result<[ArrayType; 2], Error
 
 /// Returns the native column quota for the replicated scale layout, rounded to a legal tensor-memory allocation.
 pub(super) fn scale_columns(rows: usize, blocks: usize) -> Result<usize, Error> {
-    if !(32..=256).contains(&rows) || rows % 32 != 0 || blocks == 0 || blocks > 128 {
+    if !(32..=256).contains(&rows) || !rows.is_multiple_of(32) || blocks == 0 || blocks > 128 {
         return Err(unsupported("scale storage requires rows divisible by 32 in [32, 256] and blocks in [1, 128]"));
     }
     Ok((rows.div_ceil(128) * blocks.div_ceil(4) * 4).max(32).next_power_of_two())
@@ -131,6 +131,7 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 
     /// Packs immutable operands, initializes the completion barrier, and issues native asynchronous matrix products.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn tmem_mma(
         &mut self,
         block: &mut DetachedBlock<'c, 't>,
@@ -956,14 +957,14 @@ mod tests {
                 context.bind(
                     KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Commit)),
                     vec![],
-                    &[token.clone()],
+                    std::slice::from_ref(&token),
                 )?;
                 context.bind(KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Wait)), vec![], &[token])?;
                 let result = context
                     .bind(
                         KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Load)),
                         vec![],
-                        &[destination.clone()],
+                        std::slice::from_ref(&destination),
                     )?
                     .remove(0);
                 references[2].write(&result)?;
@@ -1112,7 +1113,7 @@ mod tests {
                     context.bind(
                         KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Commit)),
                         vec![],
-                        &[token.clone()],
+                        std::slice::from_ref(&token),
                     )?;
                     context.bind(
                         KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Wait)),
@@ -1145,14 +1146,14 @@ mod tests {
                 context.bind(
                     KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Commit)),
                     vec![],
-                    &[token.clone()],
+                    std::slice::from_ref(&token),
                 )?;
                 context.bind(KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Wait)), vec![], &[token])?;
                 let result = context
                     .bind(
                         KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::Load)),
                         vec![],
-                        &[destination.clone()],
+                        std::slice::from_ref(&destination),
                     )?
                     .remove(0);
                 let result = if post_scale {

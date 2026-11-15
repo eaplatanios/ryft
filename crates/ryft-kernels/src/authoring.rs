@@ -208,7 +208,7 @@ pub fn tile_load<
                     .bind(
                         ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(variable.into())),
                         vec![],
-                        &[index.clone()],
+                        std::slice::from_ref(index),
                     )?
                     .remove(0)
             }

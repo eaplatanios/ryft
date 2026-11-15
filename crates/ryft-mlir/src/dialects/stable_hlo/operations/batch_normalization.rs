@@ -449,8 +449,8 @@ mod tests {
                 let variance = block.argument(4).unwrap();
                 let batch_norm_op =
                     batch_norm_inference(operand, scale, offset, mean, variance, 0.001, 2, location).unwrap();
-                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
-                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 5);
+                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(batch_norm_op.epsilon().unwrap(), 0.001);
                 assert_eq!(batch_norm_op.feature_index().unwrap(), 2);
                 let batch_norm_op = block.append_operation(batch_norm_op).unwrap();
@@ -520,8 +520,8 @@ mod tests {
                 let scale = block.argument(1).unwrap();
                 let offset = block.argument(2).unwrap();
                 let batch_norm_op = batch_norm_training(operand, scale, offset, 0.001, 2, location).unwrap();
-                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
                 assert_eq!(batch_norm_op.epsilon().unwrap(), 0.001);
                 assert_eq!(batch_norm_op.feature_index().unwrap(), 2);
                 let batch_norm_op = block.append_operation(batch_norm_op).unwrap();
@@ -603,8 +603,8 @@ mod tests {
                 let grad_output = block.argument(4).unwrap();
                 let batch_norm_op =
                     batch_norm_grad(operand, scale, mean, variance, grad_output, 0.001, 2, location).unwrap();
-                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
-                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(batch_norm_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 5);
+                assert_eq!(batch_norm_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
                 assert_eq!(batch_norm_op.epsilon().unwrap(), 0.001);
                 assert_eq!(batch_norm_op.feature_index().unwrap(), 2);
                 let batch_norm_op = block.append_operation(batch_norm_op).unwrap();

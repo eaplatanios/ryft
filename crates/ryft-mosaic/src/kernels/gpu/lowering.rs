@@ -1753,7 +1753,7 @@ mod tests {
             value.context().bind(
                 ArrayIrOperation::from(ArrayOperation::Sqrt(ryft_core::SqrtOperation::new())),
                 vec![],
-                &[value.clone()],
+                std::slice::from_ref(&value),
             )?;
             Ok(())
         })
@@ -1778,7 +1778,7 @@ mod tests {
             predicate.context().bind(
                 ArrayIrOperation::Assert(ryft_core::AssertOperation::new("check")),
                 vec![],
-                &[predicate.clone()],
+                std::slice::from_ref(&predicate),
             )?;
             Ok(())
         })

@@ -95,6 +95,7 @@ fn kernel_argument<'c, 't>(
 /// row-major layouts are accepted. Global and shared memrefs are flattened to one dimension, including scalar arrays
 /// as a one-element memref. `shared_alignments` supplies one validated alignment per attribution, or an empty slice
 /// for the 16-byte baseline. Alignment is transferred to the actual outlined shared-memory globals.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build<'c, 't, B>(
     context: &'c Context<'t>,
     target: &Target,
@@ -125,7 +126,7 @@ where
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     let compute_capability = target.compute_capability();
     let clustered = target.blocks_per_cluster() != 1;
-    if grid[0] % target.blocks_per_cluster() as usize != 0 {
+    if !grid[0].is_multiple_of(target.blocks_per_cluster() as usize) {
         return Err(Error::Invalid { message: "physical grid must be divisible by the cluster dimensions".to_owned() });
     }
     let block = [target.threads_per_block() as usize, 1, 1];

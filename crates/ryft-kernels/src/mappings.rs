@@ -168,7 +168,7 @@ impl BlockMapping {
             .map(|r#type| builder.add_input(r#type))
             .collect::<Vec<_>>();
         let mut bindings = DimensionRefinements::default();
-        for (offset, (formal, value)) in self.program.input_types().into_iter().skip(remaining).zip(values).enumerate()
+        for (offset, (formal, value)) in self.program.input_types().iter().skip(remaining).zip(values).enumerate()
         {
             let ArrayIrType::Dimension(formal) = formal else { unreachable!() };
             let position = remaining + offset;

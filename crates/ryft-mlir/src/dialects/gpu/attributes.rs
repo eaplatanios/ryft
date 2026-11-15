@@ -271,6 +271,7 @@ macro_rules! gpu_enum_attribute {
             }
 
             /// Parses the MLIR spelling of this enum value.
+            #[allow(clippy::should_implement_trait)]
             pub fn from_str(value: &str) -> Option<Self> {
                 match value {
                     $($value => Some(Self::$variant),)+
@@ -557,6 +558,7 @@ impl MappingId {
     }
 
     /// Parses the MLIR spelling of this mapping identifier.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "x" => Some(Self::DimensionX),
@@ -807,6 +809,7 @@ impl Processor {
     }
 
     /// Parses the MLIR spelling of this processor identifier.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "block_x" => Some(Self::BlockX),

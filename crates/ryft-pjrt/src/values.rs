@@ -272,8 +272,8 @@ mod tests {
         let value_m100i64: Value = (-100).into();
         let value_i64_list: Value = [3, 2, 2].into();
         let value_3p14f32: Value = std::f32::consts::PI.into();
-        let value_3p15f32 = Value::f32(3.15);
-        let value_0f32 = Value::f32(0.0);
+        let value_3p15f32 = Value::f32(3.15f32);
+        let value_0f32 = Value::f32(0.0f32);
         let value_empty_string = Value::string("");
         let value_hello_string: Value = "hello".into();
         assert_eq!(value_true, Value::r#bool(true));
@@ -301,9 +301,9 @@ mod tests {
         assert!(Value::i64(2) > Value::i64(1));
         assert!(Value::i64(1) <= Value::i64(1));
         assert!(Value::i64(1) >= Value::i64(1));
-        assert!(Value::f32(1.0) < Value::f32(2.0));
+        assert!(Value::f32(1.0f32) < Value::f32(2.0f32));
         assert!(Value::string("a") < Value::string("b"));
-        assert!(Value::f32(1.0) < Value::string("b"));
+        assert!(Value::f32(1.0f32) < Value::string("b"));
 
         let value_0 = Value::string("");
         let value_1 = Value::string("hello");

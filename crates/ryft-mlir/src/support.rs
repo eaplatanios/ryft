@@ -546,12 +546,12 @@ mod tests {
         assert!(success.is_success());
         assert!(!success.is_failure());
         assert_eq!(LogicalResult::from(true), success);
-        assert_eq!(bool::from(success), true);
+        assert!(bool::from(success));
         let failure = LogicalResult::failure();
         assert!(failure.is_failure());
         assert!(!failure.is_success());
         assert_eq!(failure, LogicalResult::from(false));
-        assert_eq!(bool::from(failure), false);
+        assert!(!bool::from(failure));
 
         // Test display and debug.
         assert_eq!(format!("{}", success), "success");
@@ -562,7 +562,7 @@ mod tests {
     fn test_thread_pool() {
         let pool = ThreadPool::new();
         let pool_ref = ThreadPoolRef::from(&pool);
-        let _ = pool_ref.clone();
+        let _ = pool_ref;
         let handle = unsafe { pool.to_c_api() };
         std::mem::forget(pool);
         let _ = unsafe { ThreadPool::from_c_api(handle) };

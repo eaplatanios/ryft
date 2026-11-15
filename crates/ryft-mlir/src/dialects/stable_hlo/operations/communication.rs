@@ -1994,7 +1994,7 @@ mod tests {
                     .append_operation(stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap())
                     .unwrap();
                 computation_region.append_block(computation_block).unwrap();
-                let computation = computation_region.into();
+                let computation = computation_region;
                 let op = all_reduce(
                     &[block.argument(0).unwrap()],
                     ReplicaGroups::dense(&[&[0, 2], &[1]]),
@@ -2245,7 +2245,7 @@ mod tests {
                     .append_operation(stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap())
                     .unwrap();
                 computation_region.append_block(computation_block).unwrap();
-                let computation = computation_region.into();
+                let computation = computation_region;
                 let op = collective_reduce(
                     &[block.argument(0).unwrap()],
                     None,
@@ -2416,7 +2416,7 @@ mod tests {
                     Some(1),
                     Some(ChannelHandleType::DeviceToDevice),
                     false,
-                    region.into(),
+                    region,
                     output_type,
                     location,
                 )
@@ -2430,8 +2430,8 @@ mod tests {
                 assert_eq!(reduce_scatter_op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
                 assert_eq!(reduce_scatter_op.use_global_device_ids(), false);
                 assert_eq!(reduce_scatter_op.computation().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(reduce_scatter_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(reduce_scatter_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(reduce_scatter_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(reduce_scatter_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let reduce_scatter_op = block.append_operation(reduce_scatter_op).unwrap();
                 block
                     .append_operation(func::r#return(&[reduce_scatter_op.result(0).unwrap()], location).unwrap())

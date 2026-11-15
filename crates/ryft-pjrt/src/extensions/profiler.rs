@@ -756,13 +756,13 @@ mod tests {
                     lhs_bytes.extend_from_slice(&7i32.to_ne_bytes());
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_buffer = client
-                        .buffer(lhs_bytes.as_slice(), BufferType::I32, &[2u64, 1], None, device.clone(), None)
+                        .buffer(lhs_bytes.as_slice(), BufferType::I32, [2u64, 1], None, device.clone(), None)
                         .unwrap();
                     let mut rhs_bytes = Vec::with_capacity(8);
                     rhs_bytes.extend_from_slice(&35i32.to_ne_bytes());
                     rhs_bytes.extend_from_slice(&(-41i32).to_ne_bytes());
                     let rhs_buffer = client
-                        .buffer(rhs_bytes.as_slice(), BufferType::I32, &[2u64, 1], None, device.clone(), None)
+                        .buffer(rhs_bytes.as_slice(), BufferType::I32, [2u64, 1], None, device.clone(), None)
                         .unwrap();
                     let inputs = ExecutionDeviceInputs {
                         inputs: &[

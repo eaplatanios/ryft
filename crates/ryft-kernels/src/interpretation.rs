@@ -1737,10 +1737,10 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(destination.read(), Ok(Array::vector(vec![0i32, 0]).unwrap()));
-        assert_eq!(context.bind(WaitOperation, vec![], &[token.clone()]), Ok(vec![]));
+        assert_eq!(context.bind(WaitOperation, vec![], std::slice::from_ref(&token)), Ok(vec![]));
         assert_eq!(destination.read(), Ok(Array::vector(vec![11i32, 13]).unwrap()));
         let ArrayIrValue::Reference(reference) = &token else { unreachable!() };
-        let error = context.bind(WaitOperation, vec![], &[token.clone()]).unwrap_err();
+        let error = context.bind(WaitOperation, vec![], std::slice::from_ref(&token)).unwrap_err();
         assert_eq!(
             error.downcast_custom::<KernelInterpretationError>(),
             Some(&KernelInterpretationError::UnknownCopyToken { token: reference.id() }),

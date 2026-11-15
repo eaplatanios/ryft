@@ -334,8 +334,8 @@ mod xla_backend {
             .copy_to_host(None)?
             .r#await()?;
         Ok(bytes
-            .chunks_exact(size_of::<f32>())
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<{ size_of::<f32>() }>().0.iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect())
     }
 

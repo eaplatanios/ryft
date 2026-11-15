@@ -148,7 +148,7 @@ mod tests {
         region.append_block(context.block_with_no_arguments()).unwrap();
         let module = module(region, location).unwrap();
         assert_eq!(&context, module.context());
-        assert_eq!(module.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+        assert_eq!(module.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
         assert!(module.verify());
         assert_eq!(module.to_string(), "module {\n}\n");
     }
@@ -169,7 +169,7 @@ mod tests {
         region.append_block(context.block_with_no_arguments()).unwrap();
         let module = named_module("test_module", SymbolVisibility::Public, region, location).unwrap();
         assert_eq!(&context, module.context());
-        assert_eq!(module.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+        assert_eq!(module.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
         assert!(module.verify());
         assert_eq!(module.to_string(), "module @test_module {\n}\n");
     }
@@ -208,8 +208,8 @@ mod tests {
         let location = context.unknown_location();
         let i32_type = context.signless_integer_type(32);
         let op = unrealized_conversion_cast::<ValueRef, _, _>(&[], &[i32_type], location).unwrap();
-        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-        assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+        assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+        assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
         assert_eq!(op.result_type(0).unwrap(), i32_type);
         assert!(op.verify());
         assert_eq!(op.to_string(), "%0 = unrealized_conversion_cast to i32\n");

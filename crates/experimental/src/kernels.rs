@@ -86,13 +86,13 @@ fn attention_definition(data_type: DataType, rows: usize, columns: usize, depth:
             bind(ArrayOperation::Constant(ConstantOperation::new(Array::scalar((depth as f32).sqrt().recip())?)), &[])?;
         let scores = bind(ArrayOperation::Mul(MulOperation::new()), &[scores, scale])?;
         let maximum =
-            bind(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)), &[scores.clone()])?;
+            bind(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)), std::slice::from_ref(&scores))?;
         let maximum =
             bind(ArrayOperation::Broadcast(BroadcastOperation::new(scores_type.clone(), vec![0])), &[maximum])?;
         let centered = bind(ArrayOperation::Sub(SubOperation::new()), &[scores, maximum])?;
         let exponentials = bind(ArrayOperation::Exp(ExpOperation::new()), &[centered])?;
         let sum =
-            bind(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)), &[exponentials.clone()])?;
+            bind(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)), std::slice::from_ref(&exponentials))?;
         let sum = bind(ArrayOperation::Broadcast(BroadcastOperation::new(scores_type, vec![0])), &[sum])?;
         let probabilities = bind(ArrayOperation::Div(DivOperation::new()), &[exponentials, sum])?;
         let probabilities = if data_type == DataType::F32 {
@@ -2059,7 +2059,7 @@ mod stress {
         fn new(seed: u64, iteration: u64) -> Self {
             let mut state = seed.wrapping_add(iteration.wrapping_mul(0x9e3779b97f4a7c15));
             let edges = [1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1003, 2049];
-            let rows = if iteration % 2 == 0 {
+            let rows = if iteration.is_multiple_of(2) {
                 edges[(next(&mut state) % edges.len() as u64) as usize]
             } else {
                 (next(&mut state) % 2049) as usize + 1
