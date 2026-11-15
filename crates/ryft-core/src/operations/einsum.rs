@@ -1381,10 +1381,8 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Creates an Einstein summation function for `subscripts` with the default [`EinsumOptions`]. Refer to
-/// [`einsum_with_options`] for more information.
+/// Creates an Einstein summation function for `subscripts` with the default [`EinsumOptions`].
+/// Refer to [`einsum_with_options`] for more information.
 ///
 /// # Example
 ///
@@ -1409,6 +1407,7 @@ where
 /// # Errors
 ///
 /// Returns a [`ProgramError`] if `subscripts` cannot be parsed into an [`EinsumSpecification`].
+#[inline]
 pub fn einsum<D>(subscripts: &str) -> Result<EinsumComposite<D>, ProgramError>
 where
     D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>,
@@ -1433,8 +1432,8 @@ where
 /// to prefer it over the [`Einsum`] capability, and to [`EinsumSpecification`] for the subscripts.
 ///
 /// The [`CompositeKey`] of the composite has the name [`EINSUM_COMPOSITE_NAME`] and the version
-/// [`EINSUM_COMPOSITE_VERSION`], and its attributes encode the subscripts, the path strategy, the accumulation type,
-/// the precision, and a requested output sharding, so that equal keys describe equal computations.
+/// [`EINSUM_COMPOSITE_VERSION`], and its attributes encode the subscripts, the path strategy, the accumulation
+/// type, the precision, and a requested output sharding, so that equal keys describe equal computations.
 ///
 /// # Errors
 ///
@@ -1473,6 +1472,8 @@ where
     .with_jvp_from_primal();
     Ok(EinsumComposite { plans, composite })
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Invokes `execute`, which executes the plan of an einsum on `inputs`, inside the provided [`ProvenanceScope`],
 /// which is named after the specification of the einsum. The scope is purely diagnostic. It attributes every
@@ -8007,6 +8008,46 @@ mod tests {
             program.interpret(vec![singleton.clone(), matrix.clone()]),
             Array::einsum("ij,ij->i", [&singleton, &matrix]),
         );
+
+        // The sums that take a diagonal and that remove an axis of extent one for inputs with dynamic extents need a
+        // zero, which `f8e8m0fnu` does not have. Its values are therefore summed at `f32` and converted back, so that
+        // such inputs give the results of their static counterparts, with and without an accumulation type.
+        let ones = |shape: &[usize]| {
+            let count = shape.iter().product::<usize>();
+            let ones = Array::from_elements(ArrayType::new_static(DataType::F32, shape.to_vec()), &vec![1.0f32; count]);
+            ones.unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap()
+        };
+        let n = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let s = Dimension::Dynamic(DimensionVariable::new("s", DimensionBounds::new(1, Some(2)).unwrap()));
+        let narrow = |dimensions: Vec<Dimension>| ArrayType::new(DataType::F8E8M0FNU, Shape::new(dimensions));
+        let cases = [
+            ("ii->i", vec![narrow(vec![n.clone(), n.clone()])], vec![ones(&[2, 2])]),
+            (
+                "ij,ij->j",
+                vec![narrow(vec![s, 2.into()]), narrow(vec![3.into(), 2.into()])],
+                vec![ones(&[1, 2]), ones(&[3, 2])],
+            ),
+        ];
+        for (subscripts, input_types, inputs) in cases {
+            for accumulation_type in [Some(DataType::F32), None] {
+                // Without an accumulation type, the contraction of the second einsum cannot sum at `f8e8m0fnu`.
+                if accumulation_type.is_none() && inputs.len() == 2 {
+                    continue;
+                }
+                let specification = subscripts.parse::<EinsumSpecification>().unwrap();
+                let options = EinsumOptions::new().with_accumulation_type(accumulation_type);
+                let expected = Array::einsum_with_options(&specification, inputs.iter(), &options);
+                assert!(expected.is_ok(), "{subscripts} {accumulation_type:?}");
+                let plan = specification.plan(&input_types, &options).unwrap();
+                let (output_type, program) = ArrayContext::trace(
+                    |inputs: Vec<DomainTracer<ArrayContext>>| plan.execute(&inputs),
+                    input_types.clone(),
+                )
+                .unwrap();
+                assert_eq!(plan.output_type(), Ok(output_type), "{subscripts} {accumulation_type:?}");
+                assert_eq!(program.interpret(inputs.clone()), expected, "{subscripts} {accumulation_type:?}");
+            }
+        }
 
         // Homogeneous array values with a dynamic extent stage the same sum, including through a composite.
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
