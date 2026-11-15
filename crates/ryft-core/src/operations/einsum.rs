@@ -142,8 +142,6 @@ pub struct EinsumSpecification {
     output: Option<Vec<EinsumLabel>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl EinsumSpecification {
     /// Creates a new [`EinsumSpecification`] from the label lists of its inputs and, optionally, of its output.
     ///
@@ -164,6 +162,7 @@ impl EinsumSpecification {
         if inputs.is_empty() {
             return Err(TypeError::invalid(format!("`{EINSUM_NAME}` subscripts must have at least one input")));
         }
+
         for subscript in inputs.iter().chain(&output) {
             for label in subscript {
                 if let EinsumLabel::Named(label) = label
@@ -174,12 +173,14 @@ impl EinsumSpecification {
                     )));
                 }
             }
+
             if subscript.iter().filter(|label| **label == EinsumLabel::Ellipsis).count() > 1 {
                 return Err(TypeError::invalid(format!(
                     "`{EINSUM_NAME}` subscripts contain more than one ellipsis in one subscript",
                 )));
             }
         }
+
         if let Some(output) = &output {
             for (position, label) in output.iter().enumerate() {
                 let EinsumLabel::Named(label) = label else { continue };
@@ -188,6 +189,7 @@ impl EinsumSpecification {
                         "`{EINSUM_NAME}` output label `{label}` appears more than once",
                     )));
                 }
+
                 if !inputs.iter().any(|input| input.contains(&EinsumLabel::Named(*label))) {
                     return Err(TypeError::invalid(format!(
                         "`{EINSUM_NAME}` output label `{label}` does not appear in any input",
@@ -195,23 +197,24 @@ impl EinsumSpecification {
                 }
             }
         }
+
         Ok(Self { inputs, output })
     }
 
-    /// Returns the subscript of each input of this [`EinsumSpecification`].
+    /// Returns the [`EinsumLabel`] of each input of this [`EinsumSpecification`].
     #[inline]
     pub fn inputs(&self) -> &[Vec<EinsumLabel>] {
         &self.inputs
     }
 
-    /// Returns the subscript of the output of this [`EinsumSpecification`], or [`None`] for the implicit form.
+    /// Returns the [`EinsumLabel`] of the output of this [`EinsumSpecification`], or [`None`] for the implicit form.
     #[inline]
     pub fn output(&self) -> Option<&[EinsumLabel]> {
         self.output.as_deref()
     }
 
-    /// Plans this einsum for inputs of the provided types. This expands the ellipses for the ranks of the inputs,
-    /// validates the subscripts against the input types, and selects the [`EinsumPathStep`]s with the
+    /// Plans this einsum for inputs of the provided types. This expands the ellipses for the ranks of the
+    /// inputs, validates the subscripts against the input types, and selects the [`EinsumPathStep`]s with the
     /// [`EinsumPathStrategy`] of `options`. This is the analogue of `jax.numpy.einsum_path`, and the returned
     /// [`EinsumPlan`] can be executed or staged any number of times.
     ///
@@ -222,8 +225,8 @@ impl EinsumSpecification {
     /// accumulation type. Each label must have one extent across all inputs that contain it, except that inputs may
     /// have extent one where others have another extent (static or dynamic), in which case they are broadcast. The
     /// axes of a label that one input repeats must have equal extents. Extents are equal when they provably are
-    /// (refer to [`Dimension::has_equal_extents`]), and a dynamic extent is one when its bounds admit nothing else. Dynamic extents take part in the path search
-    /// as extent 8, like in JAX.
+    /// (i.e., as computed by [`Dimension::has_equal_extents`]), and a dynamic extent is one when its bounds admit
+    /// nothing else. Dynamic extents take part in the path search as extent `8`, like in JAX.
     ///
     /// # Errors
     ///
@@ -240,14 +243,16 @@ impl EinsumSpecification {
             ))
             .into());
         }
+
         if options.accumulation_type.is_none() {
             promoted_type(input_types)?;
         }
+
         let ranks = input_types.iter().map(ArrayType::rank).collect::<Vec<_>>();
         let (input_names, output_names) = self.expand(&ranks)?;
 
-        // The path search uses the largest extent of every label and treats a dynamic extent as extent 8, like JAX
-        // does.
+        // The path search uses the largest extent of every label and treats a dynamic extent as extent 8,
+        // like JAX does.
         let extents = label_extents(&input_names, input_types)?;
         let sizes = extents
             .iter()
@@ -297,7 +302,8 @@ impl EinsumSpecification {
             EinsumPathStrategy::DynamicProgramming => dynamic_programming_path(&input_sets, &output_set, &sizes)?,
             EinsumPathStrategy::Branch(Some(0)) | EinsumPathStrategy::RandomGreedy(0) => {
                 return Err(TypeError::invalid(format!(
-                    "`{EINSUM_NAME}` path strategy `{:?}` requires a positive count",
+                    "`{}` path strategy `{:?}` requires a positive count",
+                    EINSUM_NAME,
                     options.path(),
                 ))
                 .into());
@@ -408,6 +414,7 @@ impl EinsumSpecification {
                     "`{EINSUM_NAME}` subscript {index} of `{self}` does not match the rank {rank} of its input",
                 )));
             }
+
             let ellipsis_count = rank - named_count;
             longest = longest.max(ellipsis_count);
             input_names.push(
@@ -449,6 +456,7 @@ impl EinsumSpecification {
                     .collect()
             }
         };
+
         Ok((input_names, output_names))
     }
 }
@@ -508,6 +516,8 @@ impl FromStr for EinsumSpecification {
         Self::from_labels(inputs.split(',').map(parse).collect::<Result<Vec<_>, _>>()?, output.map(parse).transpose()?)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One step of the path of an einsum. Its positions refer to the list of the remaining inputs, which starts as the
 /// inputs of the einsum. A step removes its inputs from that list and appends its result to it, so the last step

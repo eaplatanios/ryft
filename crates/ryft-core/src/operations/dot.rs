@@ -877,9 +877,9 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// that the contraction computes with, so the inputs are rounded to the algorithm's input types and each result is
 /// rounded to its accumulation type before it is converted to the output element type. The eager [`Array`] kernel
 /// applies both roundings but still accumulates at `f32` or `f64`, whereas a backend may round intermediate sums at
-/// the accumulation type, decompose the inputs, or use TensorFloat-32. A backend also rounds inputs that a preset
-/// computes with at a wider storage type (e.g., `f32` inputs of the `bf16` presets), which the eager kernel keeps
-/// at that storage type.
+/// the accumulation type, decompose the inputs, or use TensorFloat-32. The `BF16_BF16_BF16` and `BF16_BF16_F32`
+/// presets also round the inputs that are stored as `f32` to `bf16`, in the eager kernel and in XLA backends alike.
+/// The eager kernel keeps the `f32` inputs of the presets that decompose them or use TensorFloat-32 as they are.
 ///
 /// A dot is bilinear, so for `y = dot(a, b)`, forward mode differentiation computes `ẏ = dot(ȧ, b) + dot(a, ḃ)`.
 /// Transposition accepts exactly one linear input and contracts the output cotangent `ȳ` with the other, known input
@@ -1449,6 +1449,14 @@ impl Dot for Array {
         } else {
             DataType::F32
         };
+
+        // The plain `bf16` presets also compute with inputs that are stored as `f32`, which a backend rounds to `bf16`
+        // itself, so those inputs are rounded here as well.
+        let rounds_to_bf16 = matches!(
+            precision,
+            DotPrecision::Preset(DotAlgorithmPreset::BF16_BF16_BF16 | DotAlgorithmPreset::BF16_BF16_F32),
+        );
+        let (lhs_type, rhs_type) = if rounds_to_bf16 { (DataType::BF16, DataType::BF16) } else { (lhs_type, rhs_type) };
         let lhs = self.convert_element_type(lhs_type)?.convert_element_type(kernel_type)?;
         let rhs = rhs.convert_element_type(rhs_type)?.convert_element_type(kernel_type)?;
 
@@ -5037,7 +5045,8 @@ mod tests {
             Ok(Array::scalar(1.0f64).unwrap()),
         );
 
-        // The same preset computes with `f32` inputs as they are stored, because a backend rounds those itself.
+        // The same preset also rounds inputs that are stored as `f32`, like XLA backends do. The presets that
+        // decompose such inputs to emulate a higher precision keep them as they are stored.
         let lhs = Array::vector(vec![1.0009765625f32]).unwrap();
         let rhs = Array::vector(vec![1.0f32]).unwrap();
         assert_eq!(
@@ -5045,6 +5054,14 @@ mod tests {
                 &rhs,
                 &DotDimensionNumbers::inner_product(),
                 DotAlgorithmPreset::BF16_BF16_F32.into(),
+            ),
+            Ok(Array::scalar(1.0f32).unwrap()),
+        );
+        assert_eq!(
+            lhs.dot_with_precision(
+                &rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::BF16_BF16_F32_X3.into(),
             ),
             Ok(Array::scalar(1.0009765625f32).unwrap()),
         );
