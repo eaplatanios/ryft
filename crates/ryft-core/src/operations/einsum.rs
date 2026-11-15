@@ -812,8 +812,6 @@ pub struct EinsumPlan {
     steps: Vec<EinsumStep>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl EinsumPlan {
     /// Returns the [`EinsumSpecification`] that this plan was created from.
     #[inline]
@@ -854,9 +852,12 @@ impl EinsumPlan {
     ///
     /// Returns a [`ProgramError`] if a step is invalid for its input types (e.g., a pairwise contraction whose
     /// [`DotPrecision`] does not support them, or a requested output sharding that it rejects).
+    #[inline]
     pub fn output_type(&self) -> Result<ArrayType, ProgramError> {
         Ok(self.infer()?.0)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Executes or stages this plan on `inputs` with [`Dot`] as the pairwise contraction, which uses the precision,
     /// accumulation type, and requested output sharding of the [`EinsumOptions`] of this plan. Concrete values compute
