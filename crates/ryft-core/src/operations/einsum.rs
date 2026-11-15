@@ -524,16 +524,14 @@ impl FromStr for EinsumSpecification {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// One step of the path of an einsum. Its positions refer to the list of the remaining inputs, which starts as the
 /// inputs of the einsum. A step removes its inputs from that list and appends its result to it, so the last step
 /// leaves the output of the einsum as the only remaining input.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EinsumPathStep {
-    /// Reduces the remaining input at the provided position on its own, which sums the labels that neither the
-    /// output nor another remaining input contains and takes the diagonals of its repeated labels. This is a step with
-    /// one position in the paths of `opt_einsum` (e.g., `(0,)`).
+    /// Reduces the remaining input at the provided position on its own, which sums the labels that neither the output
+    /// nor another remaining input contains and takes the diagonals of its repeated labels. This is a step with one
+    /// position in the paths of `opt_einsum` (e.g., `(0,)`).
     Reduction(usize),
 
     /// Contracts the two remaining inputs at the provided positions.
@@ -574,6 +572,8 @@ impl From<(usize, usize)> for EinsumPathStep {
         Self::Contraction(first, second)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Strategy that selects the path of an einsum with more than two inputs (i.e., the order in which its inputs are
 /// contracted). The path does not change the result, up to floating-point rounding, but it determines the sizes of the
@@ -3451,14 +3451,14 @@ mod tests {
         let bounded = |lower: usize, upper: Option<usize>| {
             let n = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(lower, upper).unwrap()));
             let types = [
-                ArrayType::new(DataType::F32, Shape::new(vec![2.into(), n.clone()])),
-                ArrayType::new(DataType::F32, Shape::new(vec![n, 2.into()])),
-                ArrayType::new_static(DataType::F32, [2, 9]),
+                ArrayType::new(DataType::F32, Shape::new(vec![10.into(), n.clone()])),
+                ArrayType::new(DataType::F32, Shape::new(vec![n, 10.into()])),
+                ArrayType::new_static(DataType::F32, [10, 6]),
             ];
             "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap().plan(&types, &EinsumOptions::new()).unwrap()
         };
         let static_path = |extent: usize| {
-            planned_path("ij,jk,kl->il", &[&[2, extent], &[extent, 2], &[2, 9]], EinsumPathStrategy::Auto)
+            planned_path("ij,jk,kl->il", &[&[10, extent], &[extent, 10], &[10, 6]], EinsumPathStrategy::Auto)
         };
         assert_eq!(bounded(0, Some(1001)).path(), static_path(1000));
         assert_ne!(static_path(1000), static_path(8));
