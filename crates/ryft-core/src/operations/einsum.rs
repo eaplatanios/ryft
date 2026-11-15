@@ -766,16 +766,14 @@ impl EinsumOptions {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Plan of an einsum for inputs of particular types, which [`EinsumSpecification::plan`] creates. It holds the labels
 /// of every input and output axis after expanding ellipses, the selected path, and the steps that realize it.
 ///
 /// Every step consumes one or two of the remaining inputs and appends its result to them, following
 /// `jax.numpy.einsum` step for step, so that equal paths stage the same contractions:
 ///
-///   1. Axes of extent one whose label has another extent in the other input are squeezed away. A dynamic axis
-///      whose bounds admit only extent one is summed away instead, because a reshape cannot remove it.
+///   1. Axes of extent one whose label has another extent in the other input are squeezed away. A dynamic axis whose
+///      bounds admit only extent one is summed away instead, because a reshape cannot remove it.
 ///   2. Labels that only one input contains once and that no later step needs are summed out of that input.
 ///   3. Labels that one input repeats are replaced by their [`Diagonal`], which reads only the elements of the
 ///      diagonal, where JAX masks the whole input and sums it. An input with a dynamic extent uses that masked sum
@@ -813,6 +811,8 @@ pub struct EinsumPlan {
     /// Steps that realize the path.
     steps: Vec<EinsumStep>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl EinsumPlan {
     /// Returns the [`EinsumSpecification`] that this plan was created from.
@@ -6690,6 +6690,13 @@ mod tests {
 
     #[test]
     fn test_einsum() {
+        // Labels are not limited to letters. JAX computes the same value for each of these subscripts.
+        let lhs = Array::vector(vec![2i64, 3]).unwrap();
+        let rhs = Array::vector(vec![4i64, 5]).unwrap();
+        for subscripts in ["0,0->", "_,_->", "😀,😀->", "0,0"] {
+            assert_eq!(Array::einsum(subscripts, [&lhs, &rhs]), Ok(Array::scalar(23i64).unwrap()), "{subscripts}");
+        }
+
         // These results were recorded from `numpy.einsum` for the inputs that `reference_input` creates. The first
         // table covers every kind of step, and the second one is a seeded random corpus of one to nine inputs with
         // repeated labels and implicit outputs.
