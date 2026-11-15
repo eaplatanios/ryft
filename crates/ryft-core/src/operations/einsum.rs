@@ -573,24 +573,22 @@ impl From<(usize, usize)> for EinsumPathStep {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Strategy that selects the path of an einsum with more than two inputs (i.e., the order in which its inputs are
-/// contracted). The path does not change the result, up to floating-point rounding, but it determines the sizes of the
-/// intermediate results and so the cost of the einsum. The searches are ports of the path optimizers of
+/// contracted). The path does not change the result, up to floating-point rounding, but it determines the sizes of
+/// the intermediate results and so the cost of the einsum. The searches are ports of the path optimizers of
 /// [`opt_einsum`](https://dgasmith.github.io/opt_einsum/paths/introduction/) that `jax.numpy.einsum` accepts by name,
 /// and they select the same paths, except for [`Self::RandomGreedy`], whose choices are random in `opt_einsum`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EinsumPathStrategy {
-    /// Selects the search by the number of inputs, aiming to keep it fast. Up to four inputs use
-    /// [`Self::Optimal`], up to fourteen use [`Self::Branch`] (with all contractions up to six inputs, two up to
-    /// eight, and one beyond), and more inputs use [`Self::Greedy`]. This is the default and the `"auto"` strategy
-    /// that `jax.numpy.einsum` uses by default.
+    /// Selects the search by the number of inputs, aiming to keep it fast. Up to 4 inputs use [`Self::Optimal`], up
+    /// to 14 use [`Self::Branch`] (with all contractions up to six inputs, two up to eight, and one beyond), an more
+    /// inputs use [`Self::Greedy`]. This is the default and the `"auto"` strategy that `jax.numpy.einsum` uses by
+    /// default.
     #[default]
     Auto,
 
-    /// Selects the search by the number of inputs like [`Self::Auto`], but spends more time for better paths. Up to
-    /// five inputs use [`Self::Optimal`], up to sixteen use [`Self::DynamicProgramming`], and more inputs use
+    /// Selects the search by the number of inputs like [`Self::Auto`], but spends more time for better paths.
+    /// Up to 5 inputs use [`Self::Optimal`], up to 16 use [`Self::DynamicProgramming`], and more inputs use
     /// [`Self::RandomGreedy`] with 128 repetitions. This is the `"auto-hq"` strategy of `opt_einsum`.
     AutoHighQuality,
 
@@ -602,15 +600,15 @@ pub enum EinsumPathStrategy {
     Optimal,
 
     /// Finds the pairwise contractions with the fewest scalar operations among the orders that take no outer product
-    /// of connected inputs, by combining the best contractions of ever larger subsets of the inputs. Inputs that
-    /// share no summed label are contracted separately and combined last, and labels that only one input contains
-    /// are summed first with an [`EinsumPathStep::Reduction`]. Its cost grows exponentially with the number of
-    /// connected inputs. This is the `"dp"` strategy of `opt_einsum`.
+    /// of connected inputs, by combining the best contractions of ever larger subsets of the inputs. Inputs that share
+    /// no summed label are contracted separately and combined last, and labels that only one input contains are summed
+    /// first with an [`EinsumPathStep::Reduction`]. Its cost grows exponentially with the number of connected inputs.
+    /// This is the `"dp"` strategy of `opt_einsum`.
     DynamicProgramming,
 
-    /// Explores the provided number of most promising contractions at every step, or all of them without a number,
-    /// and abandons orders that fall far behind the best one found so far. These are the `"branch-all"`,
-    /// `"branch-2"`, and `"branch-1"` strategies of `opt_einsum`.
+    /// Explores the provided number of most promising contractions at every step, or all of them without a number, and
+    /// abandons orders that fall far behind the best one found so far. These are the `"branch-all"`, `"branch-2"`, and
+    /// `"branch-1"` strategies of `opt_einsum`.
     Branch(Option<usize>),
 
     /// Repeatedly contracts the pair of inputs that reduces the total size of the remaining inputs the most.
@@ -636,12 +634,15 @@ pub enum EinsumPathStrategy {
 
 impl EinsumPathStrategy {
     /// Creates an [`EinsumPathStrategy::Explicit`] strategy from the provided steps, each of which is a pair of
-    /// positions for an [`EinsumPathStep::Contraction`] or one position for an [`EinsumPathStep::Reduction`] (e.g.,
-    /// `EinsumPathStrategy::explicit([(1, 2), (0, 1)])`).
+    /// positions for an [`EinsumPathStep::Contraction`] or one position for an [`EinsumPathStep::Reduction`]
+    /// (e.g., `EinsumPathStrategy::explicit([(1, 2), (0, 1)])`).
+    #[inline]
     pub fn explicit<S: Into<EinsumPathStep>, I: IntoIterator<Item = S>>(steps: I) -> Self {
         Self::Explicit(steps.into_iter().map(Into::into).collect())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Options of an einsum, which select how its contractions are ordered and computed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -708,7 +709,9 @@ impl EinsumOptions {
     /// contraction to the types that it computes with and accumulates at its own type, so the inputs are not
     /// converted first and every accumulation type is supported (e.g., `i16` inputs are contracted at `f32` by the
     /// `F32_F32_F32` preset and the result is converted to an `f16` accumulation type). Two inputs of different
-    /// element types are converted to the types that the algorithm computes with.
+    /// element types are converted to the types that the algorithm computes with, after the algorithm is validated
+    /// for the types that they have, so complex inputs are rejected like they are by a `dot`. Real and Boolean
+    /// inputs support a complex accumulation type, which only the output is converted to.
     ///
     /// This is the `preferred_element_type` argument of `jax.numpy.einsum`.
     #[inline]
@@ -1763,10 +1766,25 @@ impl<S> EinsumExecution<'_, S> {
         }
     }
 
+    /// Returns the element type that values of the element type `data_type` have at `accumulation_type` before the
+    /// output is converted to it. That is the accumulation type itself, except that an algorithm never contracts
+    /// complex values (refer to [`DotPrecision::validate`]). With an algorithm, real and Boolean values at a complex
+    /// accumulation type are therefore kept at the type of its components, which represents them equally, where
+    /// JAX makes them complex and discards their zero imaginary components again in the next contraction.
+    fn accumulation_representation(&self, data_type: DataType, accumulation_type: DataType) -> DataType {
+        let is_algorithm = !matches!(self.precision, DotPrecision::Inputs { .. });
+        match accumulation_type {
+            DataType::C64 if is_algorithm && !data_type.is_complex() => DataType::F32,
+            DataType::C128 if is_algorithm && !data_type.is_complex() => DataType::F64,
+            accumulation_type => accumulation_type,
+        }
+    }
+
     /// Converts `value` to the accumulation type when one is requested, unless the element type of `value` is the
     /// type that the two promote to. This is the conversion that JAX applies before it sums, which sums at the
     /// element type of `value` only when the accumulation type adds nothing to it. Types without a common promotion
-    /// (i.e., the 8-bit floating-point types with any other type) are converted as well.
+    /// (i.e., the 8-bit floating-point types with any other type) are converted as well. The value is converted to
+    /// the [`Self::accumulation_representation`] of the accumulation type.
     fn accumulated<V>(&mut self, value: V) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
@@ -1777,7 +1795,8 @@ impl<S> EinsumExecution<'_, S> {
                 if data_type != accumulation_type
                     && DataType::promoted(&[data_type, accumulation_type]).ok() != Some(data_type) =>
             {
-                self.steps.convert_element_type(&value, accumulation_type)
+                let representation = self.accumulation_representation(data_type, accumulation_type);
+                self.convert(value, representation)
             }
             _ => Ok(value),
         }
@@ -1924,7 +1943,9 @@ impl<S> EinsumExecution<'_, S> {
     /// when those types still differ, the rounded inputs are converted to their promotion (e.g., an `i32` input of
     /// the `BF16_BF16_F32` preset is rounded to `bf16` before it meets an `f32` input at `f32`). A floating-point
     /// accumulation type is then produced by the `dot` itself. Every other one is converted from the type that the
-    /// algorithm accumulates at, which keeps the `dot` differentiable.
+    /// algorithm accumulates at, which keeps the `dot` differentiable, and a complex one is represented by the type
+    /// of its components until the output (refer to [`Self::accumulation_representation`]). The algorithm is
+    /// validated for the element types of inputs of different element types before they are converted.
     fn contract<V: Clone>(
         &mut self,
         lhs: &V,
@@ -1945,6 +1966,11 @@ impl<S> EinsumExecution<'_, S> {
             let (lhs, rhs, lhs_type, rhs_type) = if lhs_type == rhs_type || is_native_f8_pair {
                 (lhs.clone(), rhs.clone(), lhs_type, rhs_type)
             } else {
+                // The algorithm is validated for the element types that the two inputs have, because the
+                // conversions below would otherwise hide an input that it does not support (e.g., a complex input,
+                // or an input of the `Any_F8` presets that is not an 8-bit floating-point type).
+                self.precision.validate(EINSUM_NAME, lhs_type, rhs_type)?;
+
                 // Each input is first converted to the type that the algorithm computes with for it, which rounds
                 // it like the algorithm does. Those types differ only when the algorithm supports both input types
                 // or rounds its two inputs differently, and the rounded inputs are then converted to the promotion
@@ -1964,7 +1990,8 @@ impl<S> EinsumExecution<'_, S> {
             }
             let result_type = self.precision.computation_types(lhs_type, rhs_type, accumulation_type).2;
             let output = self.steps.contract(&lhs, &rhs, dimensions, Some(result_type), output_sharding)?;
-            return self.convert(output, accumulation_type);
+            let representation = self.accumulation_representation(result_type, accumulation_type);
+            return self.convert(output, representation);
         }
         let (converts_inputs, converts_output) = if lhs_type != rhs_type {
             (!is_native_f8_pair, false)
@@ -7182,6 +7209,71 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid(
                 "`dot` algorithms require real or Boolean inputs but got `c64` and `c64`",
             ))),
+        );
+
+        // That also holds when the unsupported input meets an input of another element type, although the two are
+        // converted before they are contracted. JAX discards the imaginary component of the complex input below.
+        let specification = "i,i->".parse::<EinsumSpecification>().unwrap();
+        let reals = Array::vector(vec![1.0f32, 1.0]).unwrap();
+        let mixed = Err(ProgramError::Type(TypeError::invalid(
+            "`einsum` algorithms require real or Boolean inputs but got `c64` and `f32`",
+        )));
+        assert_eq!(Array::einsum_with_options(&specification, [&complex, &reals], &options), mixed);
+        let options = options.with_accumulation_type(DataType::F32);
+        assert_eq!(Array::einsum_with_options(&specification, [&complex, &reals], &options), mixed);
+        let input_types = [complex.r#type().into_owned(), reals.r#type().into_owned()];
+        assert_eq!(specification.plan(&input_types, &options).unwrap().output_type().map(|_| ()), mixed.map(|_| ()));
+        let function = einsum_with_options::<ArrayContext>(specification.clone(), options).unwrap();
+        assert_eq!(
+            function.call(vec![complex.clone(), reals.clone()]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` algorithms require real or Boolean inputs but got `c64` and `f32`",
+            ))),
+        );
+
+        // The `Any_F8` presets require 8-bit floating-point inputs, like in JAX.
+        let wide = Array::vector(vec![1.5f32]).unwrap();
+        let narrow = wide.convert_element_type(DataType::F8E4M3FN).unwrap();
+        let options = EinsumOptions::new()
+            .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_F32)
+            .with_accumulation_type(DataType::F8E4M3FN);
+        assert_eq!(
+            Array::einsum_with_options(&specification, [&narrow, &narrow], &options),
+            Array::scalar(2.25f32).unwrap().convert_element_type(DataType::F8E4M3FN),
+        );
+        let unsupported = Err(ProgramError::Type(TypeError::invalid(
+            "`einsum` algorithm preset `any_f8_any_f8_f32` requires 8-bit floating-point inputs but got `f32` and \
+             `f8e4m3fn`",
+        )));
+        assert_eq!(Array::einsum_with_options(&specification, [&wide, &narrow], &options), unsupported);
+        let input_types = [wide.r#type().into_owned(), narrow.r#type().into_owned()];
+        assert_eq!(
+            specification.plan(&input_types, &options).unwrap().output_type().map(|_| ()),
+            unsupported.map(|_| ()),
+        );
+
+        // Real inputs support a complex accumulation type with an algorithm in every path, including after a sum
+        // and between earlier results, because only the output is converted to it. JAX computes the same values.
+        let vector = Array::vector(vec![1.4140625f32, 0.5]).unwrap();
+        let matrix = Array::matrix(2, 2, vec![1.4140625f32, 0.5, 2.0, 3.0]).unwrap();
+        let options = EinsumOptions::new()
+            .with_precision(DotAlgorithmPreset::F32_F32_F32)
+            .with_accumulation_type(DataType::C64);
+        let complex_scalar = |real: f32| Ok(Array::scalar(Complex::new(real, 0.0)).unwrap());
+        let chain = options.clone().with_path(EinsumPathStrategy::explicit([(0, 1), (0, 1)]));
+        assert_eq!(
+            Array::einsum_with_options(&"i,i,i->".parse().unwrap(), [&vector, &vector, &vector], &chain),
+            complex_scalar(2.952_520_8),
+        );
+        let pairs = options.clone().with_path(EinsumPathStrategy::explicit([(0, 1), (0, 1), (0, 1)]));
+        assert_eq!(
+            Array::einsum_with_options(&"i,i,i,i->".parse().unwrap(), [&vector; 4], &pairs),
+            complex_scalar(4.060791015625),
+        );
+        let summed = options.with_path(EinsumPathStrategy::explicit([(1, 2), (0, 1)]));
+        assert_eq!(
+            Array::einsum_with_options(&"ij,j,j->".parse().unwrap(), [&matrix, &vector, &vector], &summed),
+            complex_scalar(7.701_666_4),
         );
     }
 
