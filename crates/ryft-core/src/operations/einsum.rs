@@ -55,7 +55,7 @@ use crate::operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, DotPrecision, is_dot_accumulation_type, is_native_f8_dot_type,
 };
 use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
-use crate::operations::manipulation::diagonal::{Diagonal, diagonal_type};
+use crate::operations::manipulation::diagonal::Diagonal;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
@@ -279,49 +279,53 @@ impl EinsumSpecification {
             .map(|(name, extent)| (*name, extent.value().map_or(8, |extent| extent as u128)))
             .collect::<BTreeMap<_, _>>();
 
-        // A single input needs no contraction, and two inputs have only one. More inputs are contracted pairwise in
-        // the order that the strategy selects, where each pair of positions refers to the list of the remaining
-        // inputs followed by the results of the earlier contractions.
+        // A single input is reduced on its own, and two inputs have only one contraction. More inputs are contracted
+        // in the order that the strategy selects, where the positions of each step refer to the list of the remaining
+        // inputs followed by the results of the earlier steps.
         let input_sets = input_names.iter().map(|names| names.iter().copied().collect()).collect::<Vec<LabelSet>>();
         let output_set = output_names.iter().copied().collect::<LabelSet>();
         let input_count = input_names.len();
+        let pairwise = |path: Vec<(usize, usize)>| path.into_iter().map(EinsumPathStep::from).collect::<Vec<_>>();
         let path = match options.path() {
             EinsumPathStrategy::Explicit(path) => {
                 let mut remaining = input_count;
-                for (first, second) in path {
-                    if first == second || *first >= remaining || *second >= remaining {
+                for step in path {
+                    let positions = step.positions();
+                    if positions.iter().any(|position| *position >= remaining)
+                        || matches!(step, EinsumPathStep::Contraction(first, second) if first == second)
+                    {
                         return Err(TypeError::invalid(format!(
-                            "`{EINSUM_NAME}` path contracts the positions {first} and {second}, which must be two \
-                             distinct positions among its {remaining} remaining inputs",
+                            "`{EINSUM_NAME}` path step {step} must hold distinct positions among its {remaining} \
+                             remaining inputs",
                         ))
                         .into());
                     }
-                    remaining -= 1;
+                    remaining -= positions.len() - 1;
                 }
-                if remaining != 1 {
+                if path.is_empty() || remaining != 1 {
                     return Err(TypeError::invalid(format!(
-                        "`{}` path must have {} pairwise contractions for {} inputs but has {}",
+                        "`{}` path must leave one remaining input but its {} steps leave {} of its {} inputs",
                         EINSUM_NAME,
-                        input_count - 1,
-                        input_count,
                         path.len(),
+                        remaining,
+                        input_count,
                     ))
                     .into());
                 }
                 path.clone()
             }
-            _ if input_count == 1 => Vec::new(),
-            _ if input_count == 2 => vec![(0, 1)],
-            EinsumPathStrategy::Unoptimized => vec![(0, 1); input_count - 1],
-            EinsumPathStrategy::Optimal => ssa_to_linear(&optimal_ssa_path(&input_sets, &output_set, &sizes)),
-            EinsumPathStrategy::Greedy => ssa_to_linear(&greedy_ssa_path(&input_sets, &output_set, &sizes)),
-            EinsumPathStrategy::Auto => ssa_to_linear(&match input_count {
+            _ if input_count == 1 => vec![EinsumPathStep::Reduction(0)],
+            _ if input_count == 2 => vec![EinsumPathStep::Contraction(0, 1)],
+            EinsumPathStrategy::Unoptimized => pairwise(vec![(0, 1); input_count - 1]),
+            EinsumPathStrategy::Optimal => pairwise(ssa_to_linear(&optimal_ssa_path(&input_sets, &output_set, &sizes))),
+            EinsumPathStrategy::Greedy => pairwise(ssa_to_linear(&greedy_ssa_path(&input_sets, &output_set, &sizes))),
+            EinsumPathStrategy::Auto => pairwise(ssa_to_linear(&match input_count {
                 ..=4 => optimal_ssa_path(&input_sets, &output_set, &sizes),
                 5..=6 => branch_ssa_path(&input_sets, &output_set, &sizes, None),
                 7..=8 => branch_ssa_path(&input_sets, &output_set, &sizes, Some(2)),
                 9..=14 => branch_ssa_path(&input_sets, &output_set, &sizes, Some(1)),
                 _ => greedy_ssa_path(&input_sets, &output_set, &sizes),
-            }),
+            })),
         };
 
         // Each step contracts one or two of the remaining inputs, removes the labels that neither the output nor any
@@ -331,11 +335,7 @@ impl EinsumSpecification {
         // last step produces the output order. This is the contraction list of `opt_einsum.contract_path`.
         let mut remaining_sets = input_sets;
         let mut remaining_names = input_names.clone();
-        let positions = if input_count == 1 {
-            vec![vec![0]]
-        } else {
-            path.iter().map(|(first, second)| vec![*first.max(second), *first.min(second)]).collect()
-        };
+        let positions = path.iter().map(EinsumPathStep::positions).collect::<Vec<_>>();
         let step_count = positions.len();
         let mut steps = Vec::with_capacity(step_count);
         for (index, positions) in positions.into_iter().enumerate() {
@@ -508,6 +508,55 @@ impl FromStr for EinsumSpecification {
     }
 }
 
+/// One step of the path of an einsum. Its positions refer to the list of the remaining inputs, which starts as the
+/// inputs of the einsum. A step removes its inputs from that list and appends its result to it, so the last step
+/// leaves the output of the einsum as the only remaining input.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EinsumPathStep {
+    /// Reduces the remaining input at the provided position on its own, which sums the labels that neither the
+    /// output nor another remaining input contains and takes the diagonals of its repeated labels. This is a step with
+    /// one position in the paths of `opt_einsum` (e.g., `(0,)`).
+    Reduction(usize),
+
+    /// Contracts the two remaining inputs at the provided positions.
+    Contraction(usize, usize),
+}
+
+impl EinsumPathStep {
+    /// Returns the positions of the inputs of this step with the larger one first, so that each position is valid
+    /// after the inputs at the positions before it are removed.
+    fn positions(&self) -> Vec<usize> {
+        match *self {
+            Self::Reduction(position) => vec![position],
+            Self::Contraction(first, second) => vec![first.max(second), first.min(second)],
+        }
+    }
+}
+
+impl Display for EinsumPathStep {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reduction(position) => write!(formatter, "({position},)"),
+            Self::Contraction(first, second) => write!(formatter, "({first}, {second})"),
+        }
+    }
+}
+
+impl From<usize> for EinsumPathStep {
+    #[inline]
+    fn from(position: usize) -> Self {
+        Self::Reduction(position)
+    }
+}
+
+impl From<(usize, usize)> for EinsumPathStep {
+    #[inline]
+    fn from((first, second): (usize, usize)) -> Self {
+        Self::Contraction(first, second)
+    }
+}
+
 /// Strategy that selects the order of the pairwise contractions of an einsum with more than two inputs. The order
 /// does not change the result, up to floating-point rounding, but it determines the sizes of the intermediate results
 /// and so the cost of the einsum. The searches are ports of the path optimizers of
@@ -534,10 +583,19 @@ pub enum EinsumPathStrategy {
     /// last, and not from left to right.
     Unoptimized,
 
-    /// Uses the provided pairwise contractions. Each pair holds two positions in the list of the remaining inputs,
-    /// from which a contraction removes its two inputs and to which it appends its result. This is the form of the
-    /// paths that [`EinsumPlan::path`] returns.
-    Explicit(Vec<(usize, usize)>),
+    /// Uses the provided [`EinsumPathStep`]s, which must leave one remaining input. This is the form of the paths
+    /// that [`EinsumPlan::path`] returns and the analogue of an explicit `optimize` path of `jax.numpy.einsum`.
+    /// Refer to [`Self::explicit`] for a convenient way to create it.
+    Explicit(Vec<EinsumPathStep>),
+}
+
+impl EinsumPathStrategy {
+    /// Creates an [`EinsumPathStrategy::Explicit`] strategy from the provided steps, each of which is a pair of
+    /// positions for an [`EinsumPathStep::Contraction`] or one position for an [`EinsumPathStep::Reduction`] (e.g.,
+    /// `EinsumPathStrategy::explicit([(1, 2), (0, 1)])`).
+    pub fn explicit<S: Into<EinsumPathStep>, I: IntoIterator<Item = S>>(steps: I) -> Self {
+        Self::Explicit(steps.into_iter().map(Into::into).collect())
+    }
 }
 
 /// Options of an einsum, which select how its contractions are ordered and computed.
@@ -596,12 +654,14 @@ impl EinsumOptions {
         self
     }
 
-    /// Returns these options with a requested output [`Sharding`], which the last pairwise contraction receives (refer
-    /// to [`DotOperation::with_output_sharding`]), reordered to the order of its axes when a transpose follows it.
-    /// An einsum whose last step is not a pairwise contraction (i.e., an einsum of one input) rejects the request.
-    /// The sharding must cover every axis of the output, and the results of the earlier contractions infer their
-    /// shardings from their inputs. This is the `out_sharding` argument of `jax.numpy.einsum`, which additionally
-    /// accepts a sharding of fewer axes and stages its earlier contractions with automatic sharding.
+    /// Returns these options with a requested output [`Sharding`], which the last operation of the last step
+    /// receives, reordered to the order of its axes when a transpose follows it. That operation is the pairwise
+    /// contraction of an [`EinsumPathStep::Contraction`] (refer to [`DotOperation::with_output_sharding`]) and the
+    /// last sum of an [`EinsumPathStep::Reduction`] (refer to [`ReduceOperation::with_output_sharding`]), such as
+    /// the sum of an einsum of one input. A last step that ends with neither (e.g., the einsum `ij->ji`) rejects the
+    /// request, where JAX ignores it. The sharding must cover every axis of the output, and the results of the earlier
+    /// steps infer their shardings from their inputs. This is the `out_sharding` argument of `jax.numpy.einsum`,
+    /// which additionally accepts a sharding of fewer axes and stages its earlier steps with automatic sharding.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
@@ -668,8 +728,8 @@ pub struct EinsumPlan {
     /// Labels of the axes of the output, with ellipses expanded.
     output_labels: Vec<char>,
 
-    /// Selected pairwise contractions. Refer to [`EinsumPathStrategy::Explicit`] for their form.
-    path: Vec<(usize, usize)>,
+    /// Selected steps. Refer to [`EinsumPathStep`] for their form.
+    path: Vec<EinsumPathStep>,
 
     /// Steps that realize the path.
     steps: Vec<EinsumStep>,
@@ -700,11 +760,11 @@ impl EinsumPlan {
         &self.output_labels
     }
 
-    /// Returns the selected pairwise contractions, which is empty for an einsum of one input. Each pair holds two
-    /// positions in the list of the remaining inputs, from which a contraction removes its two inputs and to which it
-    /// appends its result. The path can be passed to [`EinsumPathStrategy::Explicit`].
+    /// Returns the selected steps, which are one [`EinsumPathStep::Reduction`] for an einsum of one input and
+    /// [`EinsumPathStep::Contraction`]s for the strategies that search for an order of pairwise contractions. The
+    /// path can be passed to [`EinsumPathStrategy::Explicit`].
     #[inline]
-    pub fn path(&self) -> &[(usize, usize)] {
+    pub fn path(&self) -> &[EinsumPathStep] {
         &self.path
     }
 
@@ -743,14 +803,17 @@ impl EinsumPlan {
         F: FnMut(&V, usize, usize) -> Result<V, ProgramError>,
     {
         let precision = self.options.precision;
-        let accumulation_type = self.options.accumulation_type;
         let mut steps = ValueSteps {
-            contraction: |lhs: &V, rhs: &V, dimensions: &DotDimensionNumbers, output_sharding: Option<&Sharding>| {
+            contraction: |lhs: &V,
+                          rhs: &V,
+                          dimensions: &DotDimensionNumbers,
+                          accumulation_type: Option<DataType>,
+                          output_sharding: Option<&Sharding>| {
                 lhs.dot_with_configuration(rhs, dimensions, precision, accumulation_type, output_sharding)
             },
             main_diagonal,
         };
-        self.execute(inputs, accumulation_type, &mut steps)
+        self.execute(inputs, self.options.accumulation_type, &mut steps)
     }
 
     /// Executes or stages this plan on `inputs` like [`Self::contract`], but with `contraction` as the pairwise
@@ -769,21 +832,26 @@ impl EinsumPlan {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if the number of inputs or their ranks do not match this plan, or if a step fails.
-    pub fn contract_with<V, F>(&self, inputs: &[V], contraction: F) -> Result<V, ProgramError>
+    pub fn contract_with<V, F>(&self, inputs: &[V], mut contraction: F) -> Result<V, ProgramError>
     where
         V: Value<Type = ArrayType> + ConvertElementType + Diagonal + Reduce + Reshape + Transpose,
         F: FnMut(&V, &V, &DotDimensionNumbers, Option<&Sharding>) -> Result<V, ProgramError>,
     {
         let main_diagonal = |value: &V, kept_axis, removed_axis| value.diagonal(0, kept_axis, removed_axis);
+        let contraction =
+            |lhs: &V,
+             rhs: &V,
+             dimensions: &DotDimensionNumbers,
+             _: Option<DataType>,
+             output_sharding: Option<&Sharding>| { contraction(lhs, rhs, dimensions, output_sharding) };
         self.execute(inputs, None, &mut ValueSteps { contraction, main_diagonal })
     }
 
     /// Infers the type of the output of [`Self::contract`] for the input types of this plan, together with the number
     /// of instructions that it stages, by running the steps of this plan over types.
     fn infer(&self) -> Result<(ArrayType, usize), ProgramError> {
-        let accumulation_type = self.options.accumulation_type;
-        let mut steps = TypeSteps { precision: self.options.precision, accumulation_type, instruction_count: 0 };
-        let output_type = self.execute(&self.input_types, accumulation_type, &mut steps)?;
+        let mut steps = TypeSteps { precision: self.options.precision, instruction_count: 0 };
+        let output_type = self.execute(&self.input_types, self.options.accumulation_type, &mut steps)?;
         Ok((output_type, steps.instruction_count))
     }
 
@@ -824,23 +892,36 @@ impl EinsumPlan {
             let output_sharding = if is_last { self.options.output_sharding.as_ref() } else { None };
             let (value, names) = match step.positions.as_slice() {
                 [position] => {
-                    if output_sharding.is_some() {
-                        return Err(TypeError::invalid(format!(
-                            "`{EINSUM_NAME}` output sharding requires a pairwise contraction as the last step, which \
-                             an einsum of one input does not have",
-                        ))
-                        .into());
-                    }
-
                     // Labels that appear once and are not in the output are summed with a single reduction, and
                     // repeated labels are replaced by their diagonal, which is summed when it is not in the output.
                     let value = values.remove(*position);
                     let names = step.input_names[0].clone();
                     let counts = count_names(&names);
-                    let uniques =
-                        step.contracted_names.iter().copied().filter(|name| count_of(&counts, name) == 1).collect();
-                    let (value, names) = state.sum_uniques(value, names, uniques)?;
-                    state.sum_repeats(value, names, &counts, &step.result_names)?
+                    let uniques = step
+                        .contracted_names
+                        .iter()
+                        .copied()
+                        .filter(|name| count_of(&counts, name) == 1)
+                        .collect::<Vec<_>>();
+
+                    // A requested output sharding goes to the sum that ends the step, which is the sum of the last
+                    // repeated label or, without repeated labels, the sum of the labels that appear once.
+                    let last_repeated = counts.iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).next_back();
+                    let ends_with_sum = match last_repeated {
+                        Some(name) => !step.result_names.contains(name),
+                        None => !uniques.is_empty(),
+                    };
+                    if output_sharding.is_some() && !ends_with_sum {
+                        return Err(TypeError::invalid(format!(
+                            "`{EINSUM_NAME}` output sharding requires the last step to end with a contraction or a \
+                             sum",
+                        ))
+                        .into());
+                    }
+                    let output = output_sharding.map(|output_sharding| (output_sharding, step.result_names.as_slice()));
+                    let uniques_output = output.filter(|_| last_repeated.is_none());
+                    let (value, names) = state.sum_uniques(value, names, uniques, uniques_output)?;
+                    state.sum_repeats(value, names, &counts, &step.result_names, output)?
                 }
                 [lhs_position, rhs_position] => {
                     let lhs = values.remove(*lhs_position);
@@ -865,21 +946,21 @@ impl EinsumPlan {
                         .copied()
                         .filter(|name| count_of(&lhs_counts, name) == 1 && count_of(&rhs_counts, name) == 0)
                         .collect();
-                    let (lhs, lhs_names) = state.sum_uniques(lhs, lhs_names, lhs_uniques)?;
+                    let (lhs, lhs_names) = state.sum_uniques(lhs, lhs_names, lhs_uniques, None)?;
                     let rhs_uniques = step
                         .contracted_names
                         .iter()
                         .copied()
                         .filter(|name| count_of(&rhs_counts, name) == 1 && count_of(&lhs_counts, name) == 0)
                         .collect();
-                    let (rhs, rhs_names) = state.sum_uniques(rhs, rhs_names, rhs_uniques)?;
+                    let (rhs, rhs_names) = state.sum_uniques(rhs, rhs_names, rhs_uniques, None)?;
 
                     // Labels that one input repeats are replaced by their diagonal, which is kept when the result or
                     // the other input contains the label and summed otherwise.
                     let keep_names = step.result_names.iter().chain(&rhs_names).copied().collect::<Vec<_>>();
-                    let (lhs, lhs_names) = state.sum_repeats(lhs, lhs_names, &lhs_counts, &keep_names)?;
+                    let (lhs, lhs_names) = state.sum_repeats(lhs, lhs_names, &lhs_counts, &keep_names, None)?;
                     let keep_names = step.result_names.iter().chain(&lhs_names).copied().collect::<Vec<_>>();
-                    let (rhs, rhs_names) = state.sum_repeats(rhs, rhs_names, &rhs_counts, &keep_names)?;
+                    let (rhs, rhs_names) = state.sum_repeats(rhs, rhs_names, &rhs_counts, &keep_names, None)?;
 
                     // The shared labels that the result needs are batching dimensions, in the order of the result,
                     // and the remaining shared labels are contracting dimensions, in the order of their characters.
@@ -922,12 +1003,9 @@ impl EinsumPlan {
                         // A requested output sharding describes the axes of the output, so the contraction receives
                         // it in the order of its own axes when a transpose follows.
                         let names = [batch_names.as_slice(), &remaining_lhs_names, &remaining_rhs_names].concat();
-                        let output_sharding = match output_sharding {
-                            Some(output_sharding) if names != step.result_names => Some(output_sharding.transpose(
-                                names.iter().map(|name| position(&step.result_names, name)).collect::<Vec<_>>(),
-                            )?),
-                            output_sharding => output_sharding.cloned(),
-                        };
+                        let output_sharding = output_sharding
+                            .map(|output_sharding| sharding_in_order(output_sharding, &names, &step.result_names))
+                            .transpose()?;
                         let dimensions =
                             DotDimensionNumbers::new(lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
                         (state.contract(&lhs, &rhs, &dimensions, output_sharding.as_ref())?, names)
@@ -1098,8 +1176,8 @@ pub const EINSUM_COMPOSITE_VERSION: u32 = 1;
 ///
 /// A plan that stages at most one instruction (e.g., a matrix product) gains nothing from the composite, so such
 /// calls contract inline. Create the function once and reuse it, because a new function plans and traces its body
-/// again and shares no compiled unit with another one. Use the [`Einsum`] capability instead for a custom pairwise
-/// contraction or for a requested output sharding, neither of which the key of a named composite can describe.
+/// again and shares no compiled unit with another one. Use [`EinsumPlan::contract_with`] instead for a custom
+/// pairwise contraction, which the key of a named composite cannot describe.
 ///
 /// # Performance
 ///
@@ -1221,12 +1299,12 @@ where
 ///
 /// The [`CompositeKey`] of the composite has the name [`EINSUM_COMPOSITE_NAME`] and the version
 /// [`EINSUM_COMPOSITE_VERSION`], and its attributes encode the subscripts, the path strategy, the accumulation type,
-/// and the precision, so that equal keys describe equal computations.
+/// the precision, and a requested output sharding, so that equal keys describe equal computations.
 ///
 /// # Errors
 ///
-/// Returns a [`ProgramError`] if `options` request an output sharding, which the key of a named composite cannot
-/// describe.
+/// This function returns no error at present. It is fallible so that options that a named composite cannot describe
+/// can be rejected when the function is created.
 pub fn einsum_with_options<D>(
     specification: EinsumSpecification,
     options: EinsumOptions,
@@ -1236,14 +1314,6 @@ where
     DomainTracer<D>: ConvertElementType + Diagonal + Dot + Reduce + Reshape + Transpose,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    if options.output_sharding.is_some() {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{EINSUM_NAME}` composites do not support a requested output sharding; use the `Einsum` capability \
-                 instead",
-            ),
-        });
-    }
     let key = einsum_composite_key(&specification, &options);
     let plans = Arc::new(EinsumPlans { specification, options, planned: Mutex::new(VecDeque::new()) });
     let body_plans = plans.clone();
@@ -1362,18 +1432,21 @@ trait EinsumSteps<V> {
     /// Removes the provided axes of `value`, which have extent one.
     fn squeeze(&mut self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError>;
 
-    /// Sums `value` along the provided axes.
-    fn reduce_sum(&mut self, value: &V, axes: &[usize]) -> Result<V, ProgramError>;
+    /// Sums `value` along the provided axes, optionally requesting an output sharding. The sum of Boolean values is
+    /// their disjunction, like in JAX.
+    fn reduce_sum(&mut self, value: &V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>;
 
     /// Returns the diagonal of `value` along `kept_axis` and `removed_axis`, in place of `kept_axis`.
     fn diagonal(&mut self, value: &V, kept_axis: usize, removed_axis: usize) -> Result<V, ProgramError>;
 
-    /// Contracts `lhs` and `rhs` with the provided dimension numbers, optionally requesting an output sharding.
+    /// Contracts `lhs` and `rhs` with the provided dimension numbers, optionally accumulating at the provided type
+    /// and requesting an output sharding.
     fn contract(
         &mut self,
         lhs: &V,
         rhs: &V,
         dimensions: &DotDimensionNumbers,
+        accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<V, ProgramError>;
 
@@ -1398,7 +1471,7 @@ struct ValueSteps<Contraction, MainDiagonal> {
 impl<V, Contraction, MainDiagonal> EinsumSteps<V> for ValueSteps<Contraction, MainDiagonal>
 where
     V: Value<Type = ArrayType> + ConvertElementType + Reduce + Reshape + Transpose,
-    Contraction: FnMut(&V, &V, &DotDimensionNumbers, Option<&Sharding>) -> Result<V, ProgramError>,
+    Contraction: FnMut(&V, &V, &DotDimensionNumbers, Option<DataType>, Option<&Sharding>) -> Result<V, ProgramError>,
     MainDiagonal: FnMut(&V, usize, usize) -> Result<V, ProgramError>,
 {
     #[inline]
@@ -1412,8 +1485,8 @@ where
     }
 
     #[inline]
-    fn reduce_sum(&mut self, value: &V, axes: &[usize]) -> Result<V, ProgramError> {
-        value.reduce_sum(axes, None)
+    fn reduce_sum(&mut self, value: &V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError> {
+        value.reduce_with_output_sharding(axes, sum_kind(value.r#type().data_type()), output_sharding.cloned())
     }
 
     #[inline]
@@ -1427,9 +1500,10 @@ where
         lhs: &V,
         rhs: &V,
         dimensions: &DotDimensionNumbers,
+        accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<V, ProgramError> {
-        (self.contraction)(lhs, rhs, dimensions, output_sharding)
+        (self.contraction)(lhs, rhs, dimensions, accumulation_type, output_sharding)
     }
 
     #[inline]
@@ -1449,9 +1523,6 @@ struct TypeSteps {
     /// Precision of every pairwise contraction.
     precision: DotPrecision,
 
-    /// Optional accumulation type of every pairwise contraction.
-    accumulation_type: Option<DataType>,
-
     /// Number of instructions that the steps inferred so far stage.
     instruction_count: usize,
 }
@@ -1467,9 +1538,15 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         value.squeeze(axes)
     }
 
-    fn reduce_sum(&mut self, value: &ArrayType, axes: &[usize]) -> Result<ArrayType, ProgramError> {
+    fn reduce_sum(
+        &mut self,
+        value: &ArrayType,
+        axes: &[usize],
+        output_sharding: Option<&Sharding>,
+    ) -> Result<ArrayType, ProgramError> {
         self.instruction_count += 1;
-        let operation = ReduceOperation::new(axes.to_vec(), ReductionKind::Sum);
+        let operation = ReduceOperation::new(axes.to_vec(), sum_kind(value.data_type()))
+            .with_output_sharding(output_sharding.cloned())?;
         Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
     }
 
@@ -1481,7 +1558,7 @@ impl EinsumSteps<ArrayType> for TypeSteps {
     ) -> Result<ArrayType, ProgramError> {
         // The main diagonal of two axes that share one extent is an iota and a gather.
         self.instruction_count += 2;
-        diagonal_type(value, 0, kept_axis, removed_axis)
+        value.diagonal(0, kept_axis, removed_axis)
     }
 
     fn contract(
@@ -1489,6 +1566,7 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         lhs: &ArrayType,
         rhs: &ArrayType,
         dimensions: &DotDimensionNumbers,
+        accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<ArrayType, ProgramError> {
         // The `Dot` capability of staged values aligns the manual variation of its inputs before it stages their
@@ -1516,7 +1594,7 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         self.instruction_count = instruction_count.get();
         let operation = DotOperation::new(dimensions.clone())
             .with_precision(self.precision)
-            .with_accumulation_type(self.accumulation_type)
+            .with_accumulation_type(accumulation_type)
             .with_output_sharding(output_sharding.cloned());
         Ok(operation.infer_output_types(&aligned, &[])?.remove(0))
     }
@@ -1559,7 +1637,7 @@ impl<S> EinsumExecution<'_, S> {
     /// element type of `value` is the type that the two promote to. This is the conversion rule of JAX, which sums at
     /// the element type of `value` only when the accumulation type adds nothing to it. Types without a common
     /// promotion (i.e., the 8-bit floating-point types with any other type) are converted as well.
-    fn sum<V>(&mut self, value: V, axes: &[usize]) -> Result<V, ProgramError>
+    fn sum<V>(&mut self, value: V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
     {
@@ -1573,15 +1651,18 @@ impl<S> EinsumExecution<'_, S> {
             }
             _ => value,
         };
-        self.steps.reduce_sum(&value, axes)
+        self.steps.reduce_sum(&value, axes, output_sharding)
     }
 
-    /// Sums the labels `uniques`, each of which names one axis of `value`, with a single reduction.
+    /// Sums the labels `uniques`, each of which names one axis of `value`, with a single reduction. With an
+    /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the reduction
+    /// receives that sharding in the order of its own axes.
     fn sum_uniques<V>(
         &mut self,
         value: V,
         mut names: Vec<char>,
         uniques: Vec<char>,
+        output: Option<(&Sharding, &[char])>,
     ) -> Result<(V, Vec<char>), ProgramError>
     where
         S: EinsumSteps<V>,
@@ -1593,34 +1674,45 @@ impl<S> EinsumExecution<'_, S> {
             .iter()
             .map(|unique| names.iter().position(|name| name == unique).unwrap())
             .collect::<Vec<_>>();
-        let value = self.sum(value, &axes)?;
         names.retain(|name| !uniques.contains(name));
+        let output_sharding = output
+            .map(|(sharding, output_names)| sharding_in_order(sharding, &names, output_names))
+            .transpose()?;
+        let value = self.sum(value, &axes, output_sharding.as_ref())?;
         Ok((value, names))
     }
 
     /// Replaces every label that `counts` records as repeated in `value` by its diagonal, which takes the place of
-    /// the last axis of the label, and sums the diagonals of the labels that `keep_names` does not contain.
+    /// the last axis of the label, and sums the diagonals of the labels that `keep_names` does not contain. With an
+    /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the sum of
+    /// the last repeated label receives that sharding in the order of its own axes.
     fn sum_repeats<V>(
         &mut self,
         mut value: V,
         mut names: Vec<char>,
         counts: &[(char, usize)],
         keep_names: &[char],
+        output: Option<(&Sharding, &[char])>,
     ) -> Result<(V, Vec<char>), ProgramError>
     where
         S: EinsumSteps<V>,
     {
-        for (repeated, _) in counts.iter().filter(|(_, count)| *count > 1) {
+        let repeated = counts.iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).collect::<Vec<_>>();
+        for (index, repeated_name) in repeated.iter().enumerate() {
             loop {
-                let axes = (0..names.len()).filter(|axis| names[*axis] == *repeated).collect::<Vec<_>>();
+                let axes = (0..names.len()).filter(|axis| names[*axis] == **repeated_name).collect::<Vec<_>>();
                 let [removed_axis, .., kept_axis] = axes.as_slice() else { break };
                 value = self.steps.diagonal(&value, *kept_axis, *removed_axis)?;
                 names.remove(*removed_axis);
             }
-            if !keep_names.contains(repeated) {
-                let axis = names.iter().position(|name| name == repeated).unwrap();
-                value = self.sum(value, &[axis])?;
+            if !keep_names.contains(repeated_name) {
+                let axis = names.iter().position(|name| name == *repeated_name).unwrap();
                 names.remove(axis);
+                let output_sharding = output
+                    .filter(|_| index + 1 == repeated.len())
+                    .map(|(sharding, output_names)| sharding_in_order(sharding, &names, output_names))
+                    .transpose()?;
+                value = self.sum(value, &[axis], output_sharding.as_ref())?;
             }
         }
         Ok((value, names))
@@ -1658,13 +1750,18 @@ impl<S> EinsumExecution<'_, S> {
         Ok((value, names))
     }
 
-    /// Contracts `lhs` and `rhs` after converting both to the accumulation type when one is requested and a `dot`
-    /// cannot accumulate them at it itself. A `dot` accumulates two inputs of one element type as
-    /// [`is_dot_accumulation_type`] describes, and two distinct 8-bit floating-point types natively. Inputs of
-    /// different element types are converted otherwise, which happens when an earlier result at the accumulation type
-    /// meets an input. Inputs of one element type are converted when JAX accepts the accumulation type for them
-    /// (i.e., integers at a type that is at least as wide, and every type that promotes to it), and the remaining
-    /// combinations are left for the `dot` to reject.
+    /// Contracts `lhs` and `rhs` at the accumulation type when one is requested, converting element types where a
+    /// `dot` cannot accumulate its inputs at that type itself. A `dot` accumulates two inputs of one element type as
+    /// [`is_dot_accumulation_type`] describes, and two distinct 8-bit floating-point types natively. The remaining
+    /// cases follow what JAX computes for them:
+    ///
+    ///   - Inputs of different element types are both converted to the accumulation type first, which happens when
+    ///     an earlier result at the accumulation type meets an input.
+    ///   - Floating-point inputs with any other kind of accumulation type are contracted at their own type and the
+    ///     result is converted, so a fractional product is truncated once.
+    ///   - Integer and Boolean inputs are converted first when the accumulation type is numeric and at least as
+    ///     wide, and so is every other element type that promotes to the accumulation type.
+    ///   - Every other combination is left for the `dot` to reject.
     fn contract<V: Clone>(
         &mut self,
         lhs: &V,
@@ -1675,26 +1772,31 @@ impl<S> EinsumExecution<'_, S> {
     where
         S: EinsumSteps<V>,
     {
+        let Some(accumulation_type) = self.accumulation_type else {
+            return self.steps.contract(lhs, rhs, dimensions, None, output_sharding);
+        };
         let lhs_type = self.steps.array_type(lhs).data_type();
         let rhs_type = self.steps.array_type(rhs).data_type();
-        let converts = self.accumulation_type.filter(|accumulation_type| {
-            if lhs_type != rhs_type {
-                !(is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type))
-            } else if is_dot_accumulation_type(lhs_type, *accumulation_type) {
-                false
-            } else if lhs_type.is_integer() {
-                accumulation_type.bit_width() >= lhs_type.bit_width()
-            } else {
-                lhs_type.is_promotable_to(*accumulation_type)
-            }
-        });
-        match converts {
-            Some(accumulation_type) => {
-                let lhs = self.convert(lhs.clone(), accumulation_type)?;
-                let rhs = self.convert(rhs.clone(), accumulation_type)?;
-                self.steps.contract(&lhs, &rhs, dimensions, output_sharding)
-            }
-            None => self.steps.contract(lhs, rhs, dimensions, output_sharding),
+        let (converts_inputs, converts_output) = if lhs_type != rhs_type {
+            (!(is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type)), false)
+        } else if is_dot_accumulation_type(lhs_type, accumulation_type) {
+            (false, false)
+        } else if lhs_type.is_floating_point() {
+            (false, true)
+        } else if lhs_type.is_integer() || lhs_type == DataType::Boolean {
+            (accumulation_type.is_numeric() && accumulation_type.bit_width() >= lhs_type.bit_width(), false)
+        } else {
+            (lhs_type.is_promotable_to(accumulation_type), false)
+        };
+        if converts_inputs {
+            let lhs = self.convert(lhs.clone(), accumulation_type)?;
+            let rhs = self.convert(rhs.clone(), accumulation_type)?;
+            self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding)
+        } else if converts_output {
+            let output = self.steps.contract(lhs, rhs, dimensions, None, output_sharding)?;
+            self.convert(output, accumulation_type)
+        } else {
+            self.steps.contract(lhs, rhs, dimensions, Some(accumulation_type), output_sharding)
         }
     }
 }
@@ -2297,6 +2399,25 @@ fn ssa_to_linear(ssa_path: &[(usize, usize)]) -> Vec<(usize, usize)> {
     path
 }
 
+/// Returns the reduction that sums values of the provided element type, which is their disjunction for Boolean
+/// values, like in JAX.
+fn sum_kind(data_type: DataType) -> ReductionKind {
+    if data_type == DataType::Boolean { ReductionKind::Any } else { ReductionKind::Sum }
+}
+
+/// Returns `sharding`, which describes axes with the labels `output_names`, in the order of the labels `names`, which
+/// are a permutation of `output_names`.
+fn sharding_in_order(sharding: &Sharding, names: &[char], output_names: &[char]) -> Result<Sharding, ProgramError> {
+    if names == output_names {
+        return Ok(sharding.clone());
+    }
+    let permutation = names
+        .iter()
+        .map(|name| output_names.iter().position(|other| other == name).unwrap())
+        .collect::<Vec<_>>();
+    Ok(sharding.transpose(permutation)?)
+}
+
 /// Returns the number of elements of an array whose axes have the provided labels, saturating on overflow.
 fn size_of(labels: &LabelSet, sizes: &BTreeMap<char, u128>) -> u128 {
     labels.iter().fold(1u128, |size, label| size.saturating_mul(sizes[label]))
@@ -2339,7 +2460,8 @@ fn einsum_symbol(index: usize) -> char {
 /// Returns the [`CompositeKey`] of the named composite of an einsum with the provided specification and options.
 /// The attributes encode everything that determines its computation for given input types. Labels are encoded by
 /// their code points and an ellipsis by `-1`, the path strategy by its position among the strategies followed by the
-/// positions of an explicit path, and the precision by its kind followed by its fields.
+/// positions of every step of an explicit path, the precision by its kind followed by its fields, and a requested
+/// output sharding by the code points of its rendering, which distinguishes every pair of different shardings.
 fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOptions) -> CompositeKey {
     let integer = |value: usize| CompositeAttribute::Integer(value as i128);
     let subscript = |subscript: &[EinsumLabel]| {
@@ -2359,9 +2481,18 @@ fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOpt
         EinsumPathStrategy::Greedy => vec![integer(2)],
         EinsumPathStrategy::Unoptimized => vec![integer(3)],
         EinsumPathStrategy::Explicit(path) => std::iter::once(integer(4))
-            .chain(path.iter().flat_map(|(first, second)| [integer(*first), integer(*second)]))
+            .chain(path.iter().map(|step| match *step {
+                EinsumPathStep::Reduction(position) => CompositeAttribute::Sequence(vec![integer(position)]),
+                EinsumPathStep::Contraction(first, second) => {
+                    CompositeAttribute::Sequence(vec![integer(first), integer(second)])
+                }
+            }))
             .collect(),
     };
+    let output_sharding = options
+        .output_sharding
+        .as_ref()
+        .map(|sharding| sharding.to_string().chars().map(|character| u32::from(character) as i128).collect::<Vec<_>>());
     let precision = match options.precision {
         DotPrecision::Inputs { lhs, rhs } => vec![integer(0), integer(lhs as usize), integer(rhs as usize)],
         DotPrecision::Algorithm(algorithm) => vec![
@@ -2388,6 +2519,7 @@ fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOpt
         .with_attribute("path", CompositeAttribute::Sequence(path))
         .with_attribute("accumulation_type", options.accumulation_type)
         .with_attribute("precision", CompositeAttribute::Sequence(precision))
+        .with_attribute("output_sharding", output_sharding)
 }
 
 #[cfg(test)]
@@ -2424,8 +2556,13 @@ mod tests {
         Array::from_elements(ArrayType::new_static(DataType::F64, shape.to_vec()), &values).unwrap()
     }
 
+    /// Returns the [`EinsumPathStep`]s of the provided positions or pairs of positions.
+    fn steps<S: Copy + Into<EinsumPathStep>>(steps: &[S]) -> Vec<EinsumPathStep> {
+        steps.iter().map(|step| (*step).into()).collect()
+    }
+
     /// Plans `subscripts` for `f32` inputs with the provided static shapes and returns the selected path.
-    fn planned_path(subscripts: &str, shapes: &[&[usize]], strategy: EinsumPathStrategy) -> Vec<(usize, usize)> {
+    fn planned_path(subscripts: &str, shapes: &[&[usize]], strategy: EinsumPathStrategy) -> Vec<EinsumPathStep> {
         let input_types =
             shapes.iter().map(|shape| ArrayType::new_static(DataType::F32, shape.to_vec())).collect::<Vec<_>>();
         let specification = subscripts.parse::<EinsumSpecification>().unwrap();
@@ -2508,15 +2645,15 @@ mod tests {
             (inputs.join(","), plan.output_labels().iter().collect::<String>())
         };
 
-        // One input needs no pairwise contraction and two inputs need one.
+        // One input is reduced on its own and two inputs need one pairwise contraction.
         let trace = plan("ii", &[&[3, 3]]).unwrap();
         assert_eq!(labels(&trace), ("ii".to_string(), String::new()));
-        assert_eq!(trace.path(), &[]);
+        assert_eq!(trace.path(), steps(&[0]));
         assert_eq!(trace.specification().to_string(), "ii");
         assert_eq!(trace.options(), &EinsumOptions::new());
         let matmul = plan("ij,jk->ik", &[&[2, 3], &[3, 4]]).unwrap();
         assert_eq!(labels(&matmul), ("ij,jk".to_string(), "ik".to_string()));
-        assert_eq!(matmul.path(), &[(0, 1)]);
+        assert_eq!(matmul.path(), steps(&[(0, 1)]));
 
         // The implicit output holds the labels that appear once, in the order of their characters, so uppercase
         // labels precede lowercase ones.
@@ -2533,7 +2670,7 @@ mod tests {
         assert_eq!(labels(&plan("i...->...", &[&[2]]).unwrap()), ("i".to_string(), String::new()));
 
         // A chain of matrix products contracts its smallest product first.
-        assert_eq!(plan("ij,jk,kl->il", &[&[2, 3], &[3, 4], &[4, 2]]).unwrap().path(), &[(1, 2), (0, 1)]);
+        assert_eq!(plan("ij,jk,kl->il", &[&[2, 3], &[3, 4], &[4, 2]]).unwrap().path(), steps(&[(1, 2), (0, 1)]));
 
         // The number of inputs, their ranks, and their element types must match the subscripts.
         assert_eq!(
@@ -2564,7 +2701,7 @@ mod tests {
         );
 
         // Every label has one extent, except for inputs of extent one, which are broadcast.
-        assert_eq!(plan("ij,jk", &[&[2, 1], &[3, 4]]).unwrap().path(), &[(0, 1)]);
+        assert_eq!(plan("ij,jk", &[&[2, 1], &[3, 4]]).unwrap().path(), steps(&[(0, 1)]));
         assert_eq!(
             plan("ij,jk", &[&[2, 3], &[4, 5]]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -2657,14 +2794,15 @@ mod tests {
         let shapes: &[&[usize]] = &[&[2, 3], &[3, 4], &[4, 5], &[5, 2]];
         assert_eq!(
             planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::Unoptimized),
-            vec![(0, 1), (0, 1), (0, 1)],
+            steps(&[(0, 1), (0, 1), (0, 1)]),
         );
         assert_eq!(
-            planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::Explicit(vec![(2, 3), (0, 1), (0, 1)])),
-            vec![(2, 3), (0, 1), (0, 1)],
+            planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::explicit([(2, 3), (0, 1), (0, 1)])),
+            steps(&[(2, 3), (0, 1), (0, 1)]),
         );
-        assert_eq!(planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::Optimal), vec![(2, 3), (1, 2), (0, 1)]);
-        assert_eq!(planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::Greedy), vec![(2, 3), (1, 2), (0, 1)]);
+        let searched = steps(&[(2, 3), (1, 2), (0, 1)]);
+        assert_eq!(planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::Optimal), searched);
+        assert_eq!(planned_path("ij,jk,kl,lm->im", shapes, EinsumPathStrategy::Greedy), searched);
 
         // An explicit path must contract every input once with valid positions.
         let plan = |path: Vec<(usize, usize)>| {
@@ -2672,44 +2810,63 @@ mod tests {
             "ij,jk,kl,lm->im"
                 .parse::<EinsumSpecification>()
                 .unwrap()
-                .plan(&types.collect::<Vec<_>>(), &EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(path)))
+                .plan(&types.collect::<Vec<_>>(), &EinsumOptions::new().with_path(EinsumPathStrategy::explicit(path)))
         };
         assert_eq!(
             plan(vec![(0, 1), (0, 1)]).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` path must have 3 pairwise contractions for 4 inputs but has 2",
+                "`einsum` path must leave one remaining input but its 2 steps leave 2 of its 4 inputs",
             ))),
         );
         assert_eq!(
             plan(vec![(0, 1), (0, 3), (0, 1)]).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` path contracts the positions 0 and 3, which must be two distinct positions among its 3 \
-                 remaining inputs",
+                "`einsum` path step (0, 3) must hold distinct positions among its 3 remaining inputs",
             ))),
         );
         assert_eq!(
             plan(vec![(1, 1), (0, 1), (0, 1)]).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` path contracts the positions 1 and 1, which must be two distinct positions among its 4 \
-                 remaining inputs",
+                "`einsum` path step (1, 1) must hold distinct positions among its 4 remaining inputs",
             ))),
         );
 
-        // One input takes an empty explicit path and two inputs take their one contraction in either order.
-        assert_eq!(planned_path("ij->ji", &[&[2, 3]], EinsumPathStrategy::Explicit(Vec::new())), vec![]);
+        // One input takes reductions only, and two inputs take their one contraction in either order.
+        assert_eq!(planned_path("ij->ji", &[&[2, 3]], EinsumPathStrategy::explicit([0, 0])), steps(&[0, 0]));
         let shapes: &[&[usize]] = &[&[2, 3], &[3, 4]];
-        assert_eq!(planned_path("ij,jk", shapes, EinsumPathStrategy::Explicit(vec![(1, 0)])), vec![(1, 0)]);
+        assert_eq!(planned_path("ij,jk", shapes, EinsumPathStrategy::explicit([(1, 0)])), steps(&[(1, 0)]));
         let types = shapes.iter().map(|shape| ArrayType::new_static(DataType::F32, shape.to_vec())).collect::<Vec<_>>();
+        let plan = |path: EinsumPathStrategy| {
+            "ij,jk".parse::<EinsumSpecification>().unwrap().plan(&types, &EinsumOptions::new().with_path(path))
+        };
         assert_eq!(
-            "ij,jk"
-                .parse::<EinsumSpecification>()
-                .unwrap()
-                .plan(&types, &EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(Vec::new())))
-                .map(|_| ()),
+            plan(EinsumPathStrategy::Explicit(Vec::new())).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` path must have 1 pairwise contractions for 2 inputs but has 0",
+                "`einsum` path must leave one remaining input but its 0 steps leave 2 of its 2 inputs",
             ))),
         );
+
+        // A reduction keeps the number of remaining inputs, so reductions alone never finish a path of two inputs,
+        // and a path may reduce an input before or after it contracts it.
+        assert_eq!(
+            plan(EinsumPathStrategy::explicit([0, 1])).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` path must leave one remaining input but its 2 steps leave 2 of its 2 inputs",
+            ))),
+        );
+        assert_eq!(
+            plan(EinsumPathStrategy::explicit([2])).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` path step (2,) must hold distinct positions among its 2 remaining inputs",
+            ))),
+        );
+        let reduced =
+            vec![EinsumPathStep::Reduction(0), EinsumPathStep::Contraction(0, 1), EinsumPathStep::Reduction(0)];
+        assert_eq!(plan(EinsumPathStrategy::Explicit(reduced.clone())).unwrap().path(), reduced);
+        assert_eq!(EinsumPathStep::Reduction(2).to_string(), "(2,)");
+        assert_eq!(EinsumPathStep::Contraction(1, 0).to_string(), "(1, 0)");
+        assert_eq!(EinsumPathStep::from(3), EinsumPathStep::Reduction(3));
+        assert_eq!(EinsumPathStep::from((1, 2)), EinsumPathStep::Contraction(1, 2));
     }
 
     #[test]
@@ -4290,13 +4447,13 @@ mod tests {
             ),
         ];
         for (subscripts, shapes, path) in auto {
-            assert_eq!(planned_path(subscripts, shapes, EinsumPathStrategy::Auto), path.to_vec(), "{subscripts}");
+            assert_eq!(planned_path(subscripts, shapes, EinsumPathStrategy::Auto), steps(path), "{subscripts}");
         }
         for (subscripts, shapes, path) in optimal {
-            assert_eq!(planned_path(subscripts, shapes, EinsumPathStrategy::Optimal), path.to_vec(), "{subscripts}");
+            assert_eq!(planned_path(subscripts, shapes, EinsumPathStrategy::Optimal), steps(path), "{subscripts}");
         }
         for (subscripts, shapes, path) in greedy {
-            assert_eq!(planned_path(subscripts, shapes, EinsumPathStrategy::Greedy), path.to_vec(), "{subscripts}");
+            assert_eq!(planned_path(subscripts, shapes, EinsumPathStrategy::Greedy), steps(path), "{subscripts}");
         }
     }
 
@@ -4801,7 +4958,56 @@ mod tests {
             .trim_end(),
         );
 
-        // An einsum of one input has no contraction to place.
+        // The sum that ends the reduction of one input receives the request as well, in the order of its own axes.
+        let input_sharding = sharding(vec![
+            ShardingDimension::sharded(["x"]),
+            ShardingDimension::Replicated,
+            ShardingDimension::sharded(["y"]),
+        ]);
+        let input_type = ArrayType::new_static(DataType::F64, [2, 4, 6]).with_sharding(input_sharding).unwrap();
+        let output_sharding = sharding(vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])]);
+        let sum_sharding = sharding(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]);
+        let options = EinsumOptions::new().with_output_sharding(output_sharding.clone());
+        let plan = "ijk->ki".parse::<EinsumSpecification>().unwrap().plan(&[input_type.clone()], &options).unwrap();
+        assert_eq!(
+            plan.output_type(),
+            Ok(ArrayType::new_static(DataType::F64, [6, 2]).with_sharding(output_sharding.clone()).unwrap()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| plan.contract(&inputs),
+            vec![input_type.clone()],
+        )
+        .unwrap();
+        let sum_type = ArrayType::new_static(DataType::F64, [2, 6]).with_sharding(sum_sharding.clone()).unwrap();
+        let output_type = ArrayType::new_static(DataType::F64, [6, 2]).with_sharding(output_sharding).unwrap();
+        assert_eq!(
+            program.to_flat_program().to_string(),
+            formatdoc! {"
+                lambda %0:{input_type} .
+                let %1:{sum_type} = reduce [
+                    kind=sum,
+                    axes=[1],
+                    output_sharding={sum_sharding},
+                ] %0
+                    %2:{output_type} = transpose [permutation=[1, 0]] %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // A composite describes the request in its key, so its calls receive it too.
+        let options = EinsumOptions::new().with_output_sharding(sum_sharding.clone());
+        let function = einsum_with_options::<ArrayContext>("ijk,jl,l->ik".parse().unwrap(), options.clone()).unwrap();
+        let input_types =
+            vec![input_type, ArrayType::new_static(DataType::F64, [4, 3]), ArrayType::new_static(DataType::F64, [3])];
+        let (output_type, _) =
+            ArrayContext::trace(|inputs: Vec<DomainTracer<ArrayContext>>| function.call(inputs), input_types.clone())
+                .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::F64, [2, 6]).with_sharding(sum_sharding).unwrap());
+        let plan = "ijk,jl,l->ik".parse::<EinsumSpecification>().unwrap().plan(&input_types, &options).unwrap();
+        assert_eq!(plan.output_type(), Ok(output_type));
+
+        // A last step that ends with neither a contraction nor a sum has nothing to place.
         let plan = "ij->ji"
             .parse::<EinsumSpecification>()
             .unwrap()
@@ -4813,8 +5019,7 @@ mod tests {
         assert_eq!(
             plan.output_type(),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` output sharding requires a pairwise contraction as the last step, which an einsum of one \
-                 input does not have",
+                "`einsum` output sharding requires the last step to end with a contraction or a sum",
             ))),
         );
     }
@@ -5084,7 +5289,7 @@ mod tests {
             EinsumPathStrategy::Optimal,
             EinsumPathStrategy::Greedy,
             EinsumPathStrategy::Unoptimized,
-            EinsumPathStrategy::Explicit(vec![(0, 2), (0, 1)]),
+            EinsumPathStrategy::explicit([(0, 2), (0, 1)]),
         ] {
             let options = EinsumOptions::new().with_path(path.clone());
             assert_eq!(
@@ -5175,6 +5380,38 @@ mod tests {
             ))),
         );
 
+        // Floating-point inputs are contracted at their own type and the result is converted to an accumulation type
+        // of another kind, so `1.5² + 2.5² = 8.5` is truncated once. The results of a chain are converted after each
+        // contraction, and the inputs that they meet are converted before the next one, like in JAX.
+        let fractions = Array::vector(vec![1.5f32, 2.5]).unwrap();
+        let fraction_matrix = Array::matrix(2, 2, vec![1.5f32, 2.5, 0.5, 0.5]).unwrap();
+        let options = EinsumOptions::new().with_accumulation_type(DataType::I32);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&fractions, &fractions], &options),
+            Ok(Array::scalar(8i32).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(&"i->".parse().unwrap(), [&fractions], &options),
+            Ok(Array::scalar(4i32).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(&"ij,j->i".parse().unwrap(), [&fraction_matrix, &fractions], &options),
+            Ok(Array::vector(vec![8i32, 2]).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(
+                &"ij,jk,kl->il".parse().unwrap(),
+                [&fraction_matrix, &fraction_matrix, &fraction_matrix],
+                &options,
+            ),
+            Ok(Array::matrix(2, 2, vec![3i32, 6, 1, 2]).unwrap()),
+        );
+        let small = Array::matrix(2, 2, vec![1u8, 2, 3, 4]).unwrap();
+        assert_eq!(
+            Array::einsum_with_options(&"ij,jk,kl->il".parse().unwrap(), [&small, &small, &small], &options),
+            Ok(Array::matrix(2, 2, vec![37i32, 54, 81, 118]).unwrap()),
+        );
+
         // Distinct 8-bit floating-point types are contracted natively when an accumulation type is requested.
         let matrix = Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let lhs = matrix.convert_element_type(DataType::F8E4M3FN).unwrap();
@@ -5184,13 +5421,11 @@ mod tests {
             Array::einsum_with_options(&"ij,jk->ik".parse().unwrap(), [&lhs, &rhs], &options),
             Ok(Array::matrix(2, 2, vec![7.0f32, 10.0, 15.0, 22.0]).unwrap()),
         );
+        let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let narrow_vector = vector.convert_element_type(DataType::F8E4M3FN).unwrap();
         assert_eq!(
-            Array::einsum_with_options(
-                &"ij,jk,k->i".parse().unwrap(),
-                [&lhs, &rhs, &lhs.einsum_with("ij->j", [])?],
-                &options
-            ),
-            Array::einsum("ij,jk,k->i", [&matrix, &matrix, &matrix.einsum_with("ij->j", []).unwrap()]),
+            Array::einsum_with_options(&"ij,jk,k->i".parse().unwrap(), [&lhs, &rhs, &narrow_vector], &options),
+            Array::einsum("ij,jk,k->i", [&matrix, &matrix, &vector]),
         );
         assert_eq!(
             Array::einsum("ij,jk->ik", [&lhs, &rhs]),
@@ -5207,6 +5442,138 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid(
                 "`dot` algorithms require floating-point inputs but got `i32` and `i32`",
             ))),
+        );
+    }
+
+    #[test]
+    fn test_einsum_with_options_reductions() {
+        // A path may reduce an input on its own before it is contracted, like the paths of `opt_einsum` with steps
+        // of one position that JAX accepts. The reduction sums the labels that nothing else needs.
+        let specification = "ij,k->k".parse::<EinsumSpecification>().unwrap();
+        let inputs = [reference_input(0, &[2, 3]), reference_input(1, &[4])];
+        let options = EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(vec![
+            EinsumPathStep::Reduction(0),
+            EinsumPathStep::Contraction(0, 1),
+        ]));
+        assert_eq!(
+            Array::einsum_with_options(&specification, inputs.iter(), &options),
+            Array::einsum("ij,k->k", inputs.iter()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| {
+                DomainTracer::<ArrayContext>::einsum_with_options(&specification, inputs.iter(), &options)
+            },
+            vec![ArrayType::new_static(DataType::F64, [2, 3]), ArrayType::new_static(DataType::F64, [4])],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3], %1:f64[4] .
+                let %2:f64[] = reduce [kind=sum, axes=[0, 1]] %0
+                    %3:f64[4] = dot [
+                        dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                    ] %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Reductions also take diagonals, and a path may end with one.
+        let specification = "iij,jk->k".parse::<EinsumSpecification>().unwrap();
+        let inputs = [reference_input(0, &[2, 2, 3]), reference_input(1, &[3, 4])];
+        for path in [
+            vec![EinsumPathStep::Reduction(0), EinsumPathStep::Contraction(0, 1)],
+            vec![EinsumPathStep::Reduction(1), EinsumPathStep::Reduction(0), EinsumPathStep::Contraction(1, 0)],
+            vec![EinsumPathStep::Contraction(0, 1), EinsumPathStep::Reduction(0)],
+        ] {
+            let options = EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(path.clone()));
+            assert_eq!(
+                Array::einsum_with_options(&specification, inputs.iter(), &options),
+                Array::einsum("iij,jk->k", inputs.iter()),
+                "{path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_einsum_boolean() {
+        // Boolean inputs contract to the disjunction of the conjunctions of their paired elements, and their sums
+        // are disjunctions, like in JAX.
+        let lhs = Array::matrix(2, 2, vec![true, false, false, false]).unwrap();
+        let rhs = Array::matrix(2, 2, vec![false, true, true, true]).unwrap();
+        let (first, second) = (Array::vector(vec![true, false]).unwrap(), Array::vector(vec![false, true]).unwrap());
+        assert_eq!(
+            Array::einsum("ij,jk->ik", [&lhs, &rhs]),
+            Ok(Array::matrix(2, 2, vec![false, true, false, false]).unwrap()),
+        );
+        assert_eq!(Array::einsum("ij->i", [&lhs]), Ok(Array::vector(vec![true, false]).unwrap()));
+        assert_eq!(Array::einsum("ij->", [&rhs]), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(Array::einsum("ii->", [&lhs]), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(Array::einsum("ii->i", [&rhs]), Ok(Array::vector(vec![false, true]).unwrap()));
+        assert_eq!(
+            Array::einsum("i,j->ij", [&first, &second]),
+            Ok(Array::matrix(2, 2, vec![false, true, false, false]).unwrap()),
+        );
+        assert_eq!(Array::einsum("i,i->", [&first, &second]), Ok(Array::scalar(false).unwrap()));
+        assert_eq!(Array::einsum("i,i->", [&first, &first]), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(
+            Array::einsum("ij,jk,kl->il", [&rhs, &lhs, &rhs]),
+            Ok(Array::matrix(2, 2, vec![false, false, false, true]).unwrap()),
+        );
+        let ones = Array::from_elements(ArrayType::new_static(DataType::Boolean, [2, 2, 3]), &[true; 12]).unwrap();
+        assert_eq!(Array::einsum("iij->j", [&ones]), Ok(Array::vector(vec![true, true, true]).unwrap()));
+
+        // A numeric accumulation type counts instead, because the inputs are converted to it first.
+        let options = EinsumOptions::new().with_accumulation_type(DataType::I32);
+        assert_eq!(
+            Array::einsum_with_options(&"ij,jk->ik".parse().unwrap(), [&rhs, &rhs], &options),
+            Ok(Array::matrix(2, 2, vec![1i32, 1, 1, 2]).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(&"ij->".parse().unwrap(), [&rhs], &options),
+            Ok(Array::scalar(3i32).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(&"ij,jk,kl->il".parse().unwrap(), [&rhs, &rhs, &rhs], &options),
+            Ok(Array::matrix(2, 2, vec![1i32, 2, 2, 3]).unwrap()),
+        );
+
+        // The staged program holds disjunctions for the sums and a `dot` of the Boolean values.
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| Einsum::einsum("ij,k->i", inputs.iter()),
+            vec![ArrayType::new_static(DataType::Boolean, [2, 2]), ArrayType::new_static(DataType::Boolean, [3])],
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), "");
+        assert_eq!(
+            program.interpret(vec![lhs.clone(), Array::vector(vec![true, false, false]).unwrap()]),
+            Ok(Array::vector(vec![true, false]).unwrap()),
+        );
+
+        // Each batch item is contracted independently.
+        let batched = batch(
+            |(lhs, rhs)| Einsum::einsum("ij,jk->ik", [&lhs, &rhs]),
+            (
+                Array::from_elements(
+                    ArrayType::new_static(DataType::Boolean, [2, 2, 2]),
+                    &[true, false, false, false, false, true, true, true],
+                )
+                .unwrap(),
+                rhs.clone(),
+            ),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            batched,
+            Array::from_elements(
+                ArrayType::new_static(DataType::Boolean, [2, 2, 2]),
+                &[false, true, false, false, true, true, true, true],
+            )
+            .unwrap(),
         );
     }
 
@@ -5240,6 +5607,8 @@ mod tests {
         let varying = Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["x"]).unwrap();
         let lhs_type = ArrayType::new_static(DataType::F64, [2, 3]).with_sharding(varying.clone()).unwrap();
         let rhs_type = ArrayType::new_static(DataType::F64, [3, 4]);
+        let placed_type = rhs_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 2)).unwrap();
+        let varying_type = rhs_type.clone().with_sharding(varying.clone()).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(varying).unwrap();
         let (outputs, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
             |inputs| Ok(vec![Einsum::einsum("ij,jk->ik", inputs.iter())?]),
@@ -5248,7 +5617,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs, vec![output_type.clone()]);
-        assert_eq!(program.to_string(), "");
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{lhs_type}, %1:{rhs_type} .
+                let %2:{placed_type} = broadcast [
+                    output_type={placed_type},
+                    output_axes=[0, 1],
+                ] %1
+                    %3:{varying_type} = parallel_vary [axis_name=\"x\"] %2
+                    %4:{output_type} = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
         let plan = "ij,jk->ik"
             .parse::<EinsumSpecification>()
             .unwrap()
@@ -5373,7 +5757,20 @@ mod tests {
             vec![ArrayIrType::from(batched_type.clone())],
         )
         .unwrap();
-        assert_eq!(program.to_string(), "");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 2, 2] .
+                let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
+                    %2:i64[n, 2, 1] = iota [type=i64[n, 2, 1], dimension=1] %1
+                    %3:f64[n, 2] = gather [
+                        dimensions=(offset=[], collapsed_slice=[1], start_index_map=[1], batching=[(0, 0), (2, 1)]),
+                        slice_sizes=[1, 1, 1],
+                    ] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
         let batched = reference_input(0, &[3, 2, 2]);
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Array(batched.clone())]),
@@ -5390,7 +5787,21 @@ mod tests {
             vec![ArrayIrType::from(square_type)],
         )
         .unwrap();
-        assert_eq!(program.to_string(), "");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n, n, 3] .
+                let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=1] %0
+                    %2:i64[n, 3, 1] = iota [type=i64[n, 3, 1], dimension=0] %1
+                    %3:f64[n, 3] = gather [
+                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0), (2, 1)]),
+                        slice_sizes=[1, 1, 1],
+                    ] %0 %2
+                    %4:f64[3] = reduce [kind=sum, axes=[0]] %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
         let square = reference_input(0, &[2, 2, 3]);
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Array(square.clone())]),
@@ -5424,16 +5835,12 @@ mod tests {
         // Invalid subscripts are rejected when the function is created.
         assert!(matches!(einsum::<ArrayContext>("ij,jk->ik->i"), Err(ProgramError::Type(TypeError::Invalid { .. })),));
 
-        // The key of a named composite cannot describe a sharding, so a requested output sharding is rejected.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        // A requested output sharding is part of the options and of the key of the composite.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let options = EinsumOptions::new().with_output_sharding(sharding.unwrap());
-        assert!(matches!(
-            einsum_with_options::<ArrayContext>("ij,jk".parse().unwrap(), options),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "`einsum` composites do not support a requested output sharding; use the `Einsum` \
-                    capability instead",
-        ));
+        let function = einsum_with_options::<ArrayContext>("ij,jk".parse().unwrap(), options.clone()).unwrap();
+        assert_eq!(function.options(), &options);
     }
 
     #[test]
@@ -5506,7 +5913,7 @@ mod tests {
                 lambda %0:f64[2, 2], %1:f64[2, 2], %2:f64[2, 2] .
                 let %3:f64[2, 2] = composite [
                     key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107], [107, 108]], output = some([105, 108]), \
-                    path = [0], accumulation_type = none, precision = [0, 0, 0]}\",
+                    path = [0], accumulation_type = none, precision = [0, 0, 0], output_sharding = none}\",
                 ] %0 %1 %2 [
                     primal=^0={
                         lambda %0:f64[2, 2], %1:f64[2, 2], %2:f64[2, 2] .
@@ -5521,7 +5928,8 @@ mod tests {
                 ]
                     %4:f64[2, 2] = composite [
                         key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107], [107, 108]], \
-                        output = some([105, 108]), path = [0], accumulation_type = none, precision = [0, 0, 0]}\",
+                        output = some([105, 108]), path = [0], accumulation_type = none, precision = [0, 0, 0], \
+                        output_sharding = none}\",
                     ] %3 %1 %2 [
                         primal=^0,
                     ]
@@ -5565,7 +5973,7 @@ mod tests {
                 lambda %0:f64[2, 3], %1:f64[1, 4] .
                 let %2:f64[2, 4] = composite [
                     key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
-                    accumulation_type = none, precision = [0, 0, 0]}\",
+                    accumulation_type = none, precision = [0, 0, 0], output_sharding = none}\",
                 ] %0 %1 [
                     primal={
                         lambda %0:f64[2, 3], %1:f64[1, 4] .
@@ -5624,7 +6032,7 @@ mod tests {
                 lambda %0:f64[2, 2], %1:f64[2, 2], %2:f64[2, 2] .
                 let %3:f64[2, 2] = composite [
                     key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107], [107, 108]], output = some([105, 108]), \
-                    path = [0], accumulation_type = none, precision = [0, 0, 0]}\",
+                    path = [0], accumulation_type = none, precision = [0, 0, 0], output_sharding = none}\",
                 ] %0 %1 %2 [
                     primal={
                         lambda %0:f64[2, 2], %1:f64[2, 2], %2:f64[2, 2] .
@@ -5766,7 +6174,7 @@ mod tests {
         // A type signature is planned once, and its plan carries the output type and the instruction count.
         let first = plans.planned(&input_types(1)).unwrap();
         assert!(Arc::ptr_eq(&first, &plans.planned(&input_types(1)).unwrap()));
-        assert_eq!(first.plan.path(), &[(1, 2), (0, 1)]);
+        assert_eq!(first.plan.path(), steps(&[(1, 2), (0, 1)]));
         assert_eq!(first.output_type, ArrayType::new_static(DataType::F64, [2, 2]));
         assert_eq!(first.instruction_count, 2);
 
@@ -5792,19 +6200,19 @@ mod tests {
         assert_eq!(
             key("ij,jk->ik", EinsumOptions::new()).to_string(),
             "ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
-             accumulation_type = none, precision = [0, 0, 0]}",
+             accumulation_type = none, precision = [0, 0, 0], output_sharding = none}",
         );
         assert_eq!(
             key(
                 "...i,i",
                 EinsumOptions::new()
-                    .with_path(EinsumPathStrategy::Explicit(vec![(0, 1)]))
+                    .with_path(EinsumPathStrategy::explicit([(0, 1)]))
                     .with_accumulation_type(DataType::F32)
                     .with_precision(DotAlgorithmPreset::BF16_BF16_F32),
             )
             .to_string(),
-            "ryft.einsum.v1 {inputs = [[-1, 105], [105]], output = none, path = [4, 0, 1], \
-             accumulation_type = some(f32), precision = [2, 7]}",
+            "ryft.einsum.v1 {inputs = [[-1, 105], [105]], output = none, path = [4, [0, 1]], \
+             accumulation_type = some(f32), precision = [2, 7], output_sharding = none}",
         );
         assert_eq!(
             key(
@@ -5818,10 +6226,14 @@ mod tests {
             )
             .to_string(),
             "ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = none, path = [0], accumulation_type = none, \
-             precision = [1, bf16, bf16, f32, 1, 2, 3, true]}",
+             precision = [1, bf16, bf16, f32, 1, 2, 3, true], output_sharding = none}",
         );
 
         // Equal specifications and options have equal keys, and every difference in them changes the key.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = |dimension: ShardingDimension| {
+            Sharding::new(mesh.clone(), vec![dimension, ShardingDimension::Replicated]).unwrap()
+        };
         assert_eq!(key("ij,jk->ik", EinsumOptions::new()), key("ij , jk -> ik", EinsumOptions::new()));
         let keys = [
             key("ij,jk->ik", EinsumOptions::new()),
@@ -5830,9 +6242,12 @@ mod tests {
             key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Optimal)),
             key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Greedy)),
             key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Unoptimized)),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(vec![(0, 1)]))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([(0, 1)]))),
             key("ij,jk->ik", EinsumOptions::new().with_accumulation_type(DataType::F64)),
             key("ij,jk->ik", EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
+            key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::sharded(["x"])))),
+            key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::Replicated))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([(1, 0)]))),
         ];
         for (index, first) in keys.iter().enumerate() {
             for second in &keys[index + 1..] {

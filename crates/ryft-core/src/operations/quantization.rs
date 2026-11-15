@@ -1278,6 +1278,7 @@ impl Operation for ScaledDotOperation {
             &self.dimensions,
             Some(self.accumulation_type),
             None,
+            false,
         )?;
 
         // Each present scale matches its element array along non-contracting dimensions. Along contracting dimensions,
@@ -2651,6 +2652,7 @@ impl<'o> BlockScaledDotRules<'o> {
             dimensions,
             None,
             None,
+            false,
         )?;
         let output_shape = output_type.static_shape().unwrap().dimensions().to_vec();
 

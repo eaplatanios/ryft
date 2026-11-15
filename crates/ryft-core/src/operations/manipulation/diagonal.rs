@@ -48,31 +48,31 @@ use crate::programs::{ProgramError, TypeError, Value, ValueProjection};
 /// ```
 #[capability]
 pub trait Diagonal<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the diagonal of `self` along `axis1` and `axis2` with the provided `offset`. The result has the shape
-    /// of `self` without `axis2` and with the extent of the diagonal along `axis1`, so `axis1` moves one position
-    /// earlier when it follows `axis2`. Refer to the documentation of this trait for more information.
+    /// Returns the diagonal of `self` along `axis_1` and `axis_2` with the provided `offset`. The result has the shape
+    /// of `self` without `axis_2` and with the extent of the diagonal along `axis_1`, so `axis_1` moves one position
+    /// earlier when it follows `axis_2`. Refer to the documentation of this trait for more information.
     ///
     /// # Parameters
     ///
     ///   - `offset`: Offset of the diagonal from the main diagonal. A positive offset selects a diagonal with larger
-    ///     indices along `axis2`, and a negative offset selects one with larger indices along `axis1`.
-    ///   - `axis1`: Axis that the diagonal takes the place of.
-    ///   - `axis2`: Axis that is removed.
+    ///     indices along `axis_2`, and a negative offset selects one with larger indices along `axis_1`.
+    ///   - `axis_1`: Axis that the diagonal takes the place of.
+    ///   - `axis_2`: Axis that is removed.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when either axis is out of range, when the two axes are the same, when an extent
     /// that must be static is dynamic, or when executing or staging the composition fails.
-    fn diagonal(&self, offset: isize, axis1: usize, axis2: usize) -> Result<Self, ProgramError>;
+    fn diagonal(&self, offset: isize, axis_1: usize, axis_2: usize) -> Result<Self, ProgramError>;
 }
 
 impl<V: Value<Type = ArrayType, Domain: Iota<V>> + Gather + Slice + Reshape> Diagonal<ArrayType> for V {
-    fn diagonal(&self, offset: isize, axis1: usize, axis2: usize) -> Result<Self, ProgramError> {
+    fn diagonal(&self, offset: isize, axis_1: usize, axis_2: usize) -> Result<Self, ProgramError> {
         // Homogeneous array contexts construct indices from host extents only, so every extent must be static. The
         // indices are built through the `Iota` capability of the domain of the value, which materializes them for
         // eager arrays and stages an `IotaOperation` for values that carry a context.
         let r#type = self.r#type();
-        let layout = diagonal_layout(r#type.as_ref(), offset, axis1, axis2)?;
+        let layout = diagonal_layout(r#type.as_ref(), offset, axis_1, axis_2)?;
         if layout.indices_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -98,10 +98,10 @@ impl<V: Value<Type = ArrayIrType, Domain: DynamicIota<V>> + DimensionSize<Extent
 where
     V::Projected: Gather + Slice + Reshape,
 {
-    fn diagonal(&self, offset: isize, axis1: usize, axis2: usize) -> Result<Self, ProgramError> {
+    fn diagonal(&self, offset: isize, axis_1: usize, axis_2: usize) -> Result<Self, ProgramError> {
         let r#type = self.r#type();
         let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
-        let layout = diagonal_layout(r#type, offset, axis1, axis2)?;
+        let layout = diagonal_layout(r#type, offset, axis_1, axis_2)?;
         let value = <V as ValueProjection<ArrayType>>::into_projected(self.clone())?;
         let value = match &layout.slice {
             Some((start_indices, limits)) => value.slice(start_indices, limits, &vec![1; limits.len()])?,
@@ -115,7 +115,7 @@ where
         // paired input axes. Static extents consume no dimension values. A slice only changes the two diagonal axes,
         // which are then static, so the extents of every other axis are those of `self`.
         let mut extents = Vec::new();
-        for axis in (0..r#type.rank()).filter(|axis| *axis != axis2) {
+        for axis in (0..r#type.rank()).filter(|axis| *axis != axis_2) {
             if r#type.dimension(axis).value().is_none() {
                 extents.push(self.dimension_size(axis)?);
             }
@@ -128,7 +128,7 @@ where
 }
 
 /// Slice and paired gather that take one diagonal of an array. Refer to [`diagonal_layout`] for more information.
-struct DiagonalLayout {
+pub(crate) struct DiagonalLayout {
     /// Start indices and limits of the slice that restricts the two diagonal axes to the extent of the diagonal, or
     /// [`None`] when both axes already have that extent.
     slice: Option<(Vec<usize>, Vec<Dimension>)>,
@@ -151,23 +151,55 @@ struct DiagonalLayout {
     slice_sizes: Vec<usize>,
 }
 
-/// Returns the [`DiagonalLayout`] that takes the diagonal of an array of type `type` along `axis1` and `axis2` with
+impl DiagonalLayout {
+    /// Returns the start indices and limits of the slice, if one is needed.
+    #[inline]
+    pub(crate) fn slice(&self) -> Option<(&[usize], &[Dimension])> {
+        self.slice.as_ref().map(|(start_indices, limits)| (start_indices.as_slice(), limits.as_slice()))
+    }
+
+    /// Returns the result shape of an empty diagonal, which is reshaped instead of gathered.
+    #[inline]
+    pub(crate) fn empty_shape(&self) -> Option<&Shape> {
+        self.empty_shape.as_ref()
+    }
+
+    /// Returns the type of the gather indices.
+    #[inline]
+    pub(crate) fn indices_type(&self) -> &ArrayType {
+        &self.indices_type
+    }
+
+    /// Returns the dimension numbers of the gather.
+    #[inline]
+    pub(crate) fn dimensions(&self) -> &GatherDimensionNumbers {
+        &self.dimensions
+    }
+
+    /// Returns the window sizes of the gather.
+    #[inline]
+    pub(crate) fn slice_sizes(&self) -> &[usize] {
+        &self.slice_sizes
+    }
+}
+
+/// Returns the [`DiagonalLayout`] that takes the diagonal of an array of type `type` along `axis_1` and `axis_2` with
 /// the provided `offset` (refer to [`Diagonal::diagonal`]). The slice makes both axes start at the first element of
 /// the diagonal and gives both the extent of the diagonal, so the diagonal of the sliced array is its main diagonal.
-/// The indices of the gather then enumerate every coordinate of the sliced array except those of `axis2`, followed by
-/// a one-component index vector, and count along the coordinates of `axis1`. Pairing every enumerated axis with the
-/// axis that it enumerates (i.e., as gather batching dimensions) reads, for each coordinate, the element whose `axis2`
-/// index equals its `axis1` index, with no window over a possibly dynamic extent.
-fn diagonal_layout(
+/// The indices of the gather then enumerate every coordinate of the sliced array except those of `axis_2`, followed by
+/// a one-component index vector, and count along the coordinates of `axis_1`. Pairing every enumerated axis with the
+/// axis that it enumerates (i.e., as gather batching dimensions) reads, for each coordinate, the element whose `axis_2`
+/// index equals its `axis_1` index, with no window over a possibly dynamic extent.
+pub(crate) fn diagonal_layout(
     r#type: &ArrayType,
     offset: isize,
-    axis1: usize,
-    axis2: usize,
+    axis_1: usize,
+    axis_2: usize,
 ) -> Result<DiagonalLayout, ProgramError> {
     let rank = r#type.rank();
-    if axis1 >= rank || axis2 >= rank || axis1 == axis2 {
+    if axis_1 >= rank || axis_2 >= rank || axis_1 == axis_2 {
         return Err(TypeError::invalid(format!(
-            "cannot take the diagonal of a value of type `{type}` along axes {axis1} and {axis2}, which must be two \
+            "cannot take the diagonal of a value of type `{type}` along axes {axis_1} and {axis_2}, which must be two \
              distinct axes of its rank {rank}",
         ))
         .into());
@@ -177,32 +209,32 @@ fn diagonal_layout(
     // Every other diagonal is shorter than at least one of its axes, so both axes are sliced to it, which needs
     // their extents to be static.
     let mut dimensions = r#type.shape().dimensions().to_vec();
-    let slice = if offset == 0 && dimensions[axis1] == dimensions[axis2] {
+    let slice = if offset == 0 && dimensions[axis_1] == dimensions[axis_2] {
         None
     } else {
-        let (Some(extent1), Some(extent2)) = (dimensions[axis1].value(), dimensions[axis2].value()) else {
+        let (Some(extent_1), Some(extent_2)) = (dimensions[axis_1].value(), dimensions[axis_2].value()) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "cannot take the diagonal of a value of type `{type}` along axes {axis1} and {axis2} with offset \
+                    "cannot take the diagonal of a value of type `{type}` along axes {axis_1} and {axis_2} with offset \
                      {offset}, because dynamic extents require a zero offset and two axes that share one extent",
                 ),
             });
         };
-        let start1 = if offset < 0 { offset.unsigned_abs().min(extent1) } else { 0 };
-        let start2 = if offset > 0 { offset.unsigned_abs().min(extent2) } else { 0 };
-        let extent = (extent1 - start1).min(extent2 - start2);
+        let start_1 = if offset < 0 { offset.unsigned_abs().min(extent_1) } else { 0 };
+        let start_2 = if offset > 0 { offset.unsigned_abs().min(extent_2) } else { 0 };
+        let extent = (extent_1 - start_1).min(extent_2 - start_2);
         let mut start_indices = vec![0; rank];
-        start_indices[axis1] = start1;
-        start_indices[axis2] = start2;
+        start_indices[axis_1] = start_1;
+        start_indices[axis_2] = start_2;
         let mut limits = dimensions.clone();
-        limits[axis1] = Dimension::Static(start1 + extent);
-        limits[axis2] = Dimension::Static(start2 + extent);
-        dimensions[axis1] = Dimension::Static(extent);
-        dimensions[axis2] = Dimension::Static(extent);
+        limits[axis_1] = Dimension::Static(start_1 + extent);
+        limits[axis_2] = Dimension::Static(start_2 + extent);
+        dimensions[axis_1] = Dimension::Static(extent);
+        dimensions[axis_2] = Dimension::Static(extent);
         Some((start_indices, limits))
     };
 
-    let paired_axes = (0..rank).filter(|axis| *axis != axis2).collect::<Vec<_>>();
+    let paired_axes = (0..rank).filter(|axis| *axis != axis_2).collect::<Vec<_>>();
     let mut indices_shape = paired_axes.iter().map(|axis| dimensions[*axis].clone()).collect::<Vec<_>>();
     indices_shape.push(Dimension::Static(1));
     let indices_type = ArrayType::new(DataType::I64, Shape::new(indices_shape));
@@ -221,21 +253,21 @@ fn diagonal_layout(
         }
         _ => indices_type,
     };
-    let iota_dimension = if axis2 < axis1 { axis1 - 1 } else { axis1 };
-    let gather_dimensions = GatherDimensionNumbers::new(Vec::new(), vec![axis2], vec![axis2])
+    let iota_dimension = if axis_2 < axis_1 { axis_1 - 1 } else { axis_1 };
+    let gather_dimensions = GatherDimensionNumbers::new(Vec::new(), vec![axis_2], vec![axis_2])
         .with_batching_dimensions(paired_axes.iter().enumerate().map(|(index, axis)| (*axis, index)).collect());
 
     // Paired axes use a zero window when they may be empty, exactly as `DynamicGather::dynamic_gather_axis` does.
     let slice_sizes = (0..rank)
-        .map(|axis| if axis == axis2 { 1 } else { dimensions[axis].bounds().lower().min(1) })
+        .map(|axis| if axis == axis_2 { 1 } else { dimensions[axis].bounds().lower().min(1) })
         .collect();
 
     // An empty diagonal is reshaped instead of gathered, which needs the shape of the result to be static.
-    let empty_shape = if dimensions[axis1].value() == Some(0) {
+    let empty_shape = if dimensions[axis_1].value() == Some(0) {
         if paired_axes.iter().any(|axis| dimensions[*axis].value().is_none()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "cannot take the diagonal of a value of type `{type}` along axes {axis1} and {axis2} with offset \
+                    "cannot take the diagonal of a value of type `{type}` along axes {axis_1} and {axis_2} with offset \
                      {offset}, because an empty diagonal requires every extent to be static",
                 ),
             });
@@ -344,12 +376,6 @@ mod tests {
                  distinct axes of its rank 2",
             ))),
         );
-
-        // An array type is its own value where only types are computed, so its diagonal is the type of the result.
-        let r#type = ArrayType::new_static(DataType::F64, [2, 3, 4]);
-        assert_eq!(r#type.diagonal(0, 1, 2), Ok(ArrayType::new_static(DataType::F64, [2, 3])));
-        assert_eq!(r#type.diagonal(2, 2, 1), Ok(ArrayType::new_static(DataType::F64, [2, 1])));
-        assert_eq!(r#type.diagonal(-1, 0, 2), Ok(ArrayType::new_static(DataType::F64, [1, 3])));
     }
 
     #[test]

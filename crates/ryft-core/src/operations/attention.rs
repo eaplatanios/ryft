@@ -1576,6 +1576,7 @@ fn attention_inferred_output_shardings(
         &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
         None,
         None,
+        false,
     )?;
     let score_sharding = attention_score_sharding(
         operation_name,
@@ -1591,6 +1592,7 @@ fn attention_inferred_output_shardings(
         &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
         None,
         None,
+        false,
     )?;
 
     // The scores have the `BNTS` form and the attended values have the `BNTH` form, which the body transposes to the
@@ -2353,15 +2355,16 @@ fn contract_cotangent<V: Value<Type: ArrayMemberType> + Dot + Reshard>(
 ) -> Result<V, ProgramError> {
     let lhs_type = lhs.r#type().as_array_type()?.clone();
     let rhs_type = rhs.r#type().as_array_type()?.clone();
-    let contraction = if infer_dot_output_type(operation_name, &lhs_type, &rhs_type, dimensions, None, None).is_ok() {
-        lhs.dot(rhs, dimensions)?
-    } else if cotangent_is_lhs {
-        let axes = (0..lhs_type.rank()).collect::<Vec<_>>();
-        replicate_dimensions(lhs.clone(), axes.as_slice())?.dot(rhs, dimensions)?
-    } else {
-        let axes = (0..rhs_type.rank()).collect::<Vec<_>>();
-        lhs.dot(&replicate_dimensions(rhs.clone(), axes.as_slice())?, dimensions)?
-    };
+    let contraction =
+        if infer_dot_output_type(operation_name, &lhs_type, &rhs_type, dimensions, None, None, false).is_ok() {
+            lhs.dot(rhs, dimensions)?
+        } else if cotangent_is_lhs {
+            let axes = (0..lhs_type.rank()).collect::<Vec<_>>();
+            replicate_dimensions(lhs.clone(), axes.as_slice())?.dot(rhs, dimensions)?
+        } else {
+            let axes = (0..rhs_type.rank()).collect::<Vec<_>>();
+            lhs.dot(&replicate_dimensions(rhs.clone(), axes.as_slice())?, dimensions)?
+        };
     match sharding {
         Some(sharding) if contraction.r#type().as_array_type()?.sharding() != Some(sharding) => {
             contraction.reshard(sharding)

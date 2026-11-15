@@ -857,10 +857,12 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// Primitive representing a generalized dot operation (i.e., a tensor contraction) of two numeric inputs. The inputs
 /// have identical element types, except that two distinct 8-bit floating-point types other than `f8e4m3b11fnuz` are
 /// accepted together with an accumulation type, because XLA backends contract such pairs natively. JAX converts every
-/// other pair of distinct types to the output type itself, which callers do explicitly here. Boolean, token, and
-/// structural zero element types are rejected. [`DotOperation`] is the unified primitive for matrix multiplication,
-/// batched matrix multiplication, vector inner products, and arbitrary tensor contractions. The XLA backend lowers
-/// it to StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) instruction.
+/// other pair of distinct types to the output type itself, which callers do explicitly here. Boolean inputs are
+/// accepted as well and contract to the disjunction of the conjunctions of their paired elements (i.e., a logical
+/// matrix product), like in StableHLO and JAX. Token and structural zero element types are rejected. [`DotOperation`]
+/// is the unified primitive for matrix multiplication, batched matrix multiplication, vector inner products, and
+/// arbitrary tensor contractions. The XLA backend lowers it to StableHLO's
+/// [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) instruction.
 ///
 /// Without an accumulation type, the output keeps the input element type. The eager [`Array`] kernel accumulates
 /// floating-point contractions at `f64` when an input or the output is `f64` and at `f32` otherwise, and it rounds
@@ -1047,6 +1049,7 @@ impl Operation for DotOperation {
             &self.dimensions,
             self.accumulation_type,
             self.output_sharding.as_ref(),
+            true,
         )?;
         self.precision
             .validate(DOT_OPERATION_NAME, input_types[0].data_type(), input_types[1].data_type())?;
@@ -1416,6 +1419,14 @@ impl Dot for Array {
             .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?
             .remove(0)
             .data_type();
+
+        // Boolean inputs contract to the disjunction of the conjunctions of their paired elements, which holds
+        // exactly when the number of pairs of true elements is not zero.
+        if output_type == DataType::Boolean {
+            let lhs = self.convert_element_type(DataType::U64)?;
+            let rhs = rhs.convert_element_type(DataType::U64)?;
+            return lhs.dot_elements::<u64>(&rhs, dimensions, output_sharding)?.convert_element_type(DataType::Boolean);
+        }
 
         // The precision selects the element types that the inputs are rounded to and the type that each result is
         // rounded to before it is converted to the output type. Floating-point contractions accumulate at `f64` when
@@ -1921,7 +1932,7 @@ impl Operation for RaggedDotOperation {
 
         let mode = dimensions.validate(lhs.rank(), rhs.rank())?;
         let mut output =
-            infer_dot_output_type(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None)?;
+            infer_dot_output_type(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None, false)?;
         let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
         if group_sizes.rank() != 1 {
             let expected_prefix = Shape::new(prefix_axes.iter().map(|axis| lhs.dimension(*axis)).collect());
@@ -2651,6 +2662,24 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
     }
 }
 
+/// Returns whether `data_type` is an 8-bit floating-point type that backends contract natively with another such
+/// type. That excludes `f8e4m3b11fnuz`, which JAX also converts first.
+pub(crate) fn is_native_f8_dot_type(data_type: DataType) -> bool {
+    data_type.is_floating_point() && data_type.bit_width() == 8 && data_type != DataType::F8E4M3B11FNUZ
+}
+
+/// Returns whether a `dot` whose inputs have the element type `input_type` can accumulate at `accumulation_type`.
+/// An identical type is valid. Floating-point inputs may accumulate at every floating-point type, and integer inputs
+/// may accumulate at an integer type with the same signedness that is at least as wide.
+pub(crate) fn is_dot_accumulation_type(input_type: DataType, accumulation_type: DataType) -> bool {
+    input_type == accumulation_type
+        || (input_type.is_floating_point() && accumulation_type.is_floating_point())
+        || (input_type.is_integer()
+            && accumulation_type.is_integer()
+            && input_type.is_signed() == accumulation_type.is_signed()
+            && accumulation_type.bit_width() >= input_type.bit_width())
+}
+
 /// Infers the output type of one generalized dot product operation, naming `operation_name` in diagnostics. The result
 /// shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes that are
 /// neither batching nor contracting, in their original order. The output element type is the requested compatible
@@ -2658,6 +2687,9 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
 /// match, except that two distinct 8-bit floating-point types other than `f8e4m3b11fnuz` are accepted together with
 /// an accumulation type, which XLA backends contract natively without converting either input. These are the pairs
 /// that JAX leaves unconverted when it lowers a dot.
+///
+/// Boolean inputs are accepted only when `accepts_boolean_inputs` is true, as for [`DotOperation`]. The other
+/// operations that share this rule compute with numeric elements only.
 ///
 /// Floating-point compatibility deliberately does not use the standard elementwise promotion lattice. Backend dot
 /// instructions expose an independent preferred accumulator type, so floating-point inputs may accumulate at every
@@ -2692,20 +2724,21 @@ pub(crate) fn infer_dot_output_type(
     dimensions: &DotDimensionNumbers,
     accumulation_type: Option<DataType>,
     output_sharding: Option<&Sharding>,
+    accepts_boolean_inputs: bool,
 ) -> Result<ArrayType, TypeError> {
     ArrayType::check_matching_manual_variation(operation_name, &[lhs, rhs])?;
 
     // Backends contract two distinct 8-bit floating-point types natively, except for `f8e4m3b11fnuz`, which JAX also
     // converts first. Such a pair has no common input type to default the output to, so it needs an accumulation type.
     // Every other pair of distinct types must be converted explicitly by the caller.
-    let is_native_f8_pair = [lhs.data_type(), rhs.data_type()].into_iter().all(|data_type| {
-        data_type.is_floating_point() && data_type.bit_width() == 8 && data_type != DataType::F8E4M3B11FNUZ
-    });
+    let is_native_f8_pair = is_native_f8_dot_type(lhs.data_type()) && is_native_f8_dot_type(rhs.data_type());
     if lhs.data_type() != rhs.data_type() && !(accumulation_type.is_some() && is_native_f8_pair) {
         return Err(TypeError::invalid(format!("`{operation_name}` input element types are incompatible")));
     }
 
-    validate_dot_data_type(operation_name, lhs.data_type())?;
+    if !(accepts_boolean_inputs && lhs.data_type() == DataType::Boolean) {
+        validate_dot_data_type(operation_name, lhs.data_type())?;
+    }
 
     // A contraction never moves values between memory spaces, so its inputs must share one, which its output keeps.
     if lhs.memory() != rhs.memory() {
@@ -2718,17 +2751,9 @@ pub(crate) fn infer_dot_output_type(
     }
 
     if let Some(accumulation_type) = accumulation_type {
-        // An identical type is valid. Floating-point inputs may accumulate at every floating-point type, and integer
-        // inputs may accumulate at an integer type with the same signedness that is at least as wide. Two distinct
-        // 8-bit floating-point inputs are both floating-point, so checking the left-hand side covers them.
+        // Two distinct 8-bit floating-point inputs are both floating-point, so checking the left-hand side covers them.
         let input_type = lhs.data_type();
-        let compatible = input_type == accumulation_type
-            || (input_type.is_floating_point() && accumulation_type.is_floating_point())
-            || (input_type.is_integer()
-                && accumulation_type.is_integer()
-                && input_type.is_signed() == accumulation_type.is_signed()
-                && accumulation_type.bit_width() >= input_type.bit_width());
-        if !compatible {
+        if !is_dot_accumulation_type(input_type, accumulation_type) {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` input data type `{input_type}` cannot accumulate at data type \
                  `{accumulation_type}`",
@@ -3873,6 +3898,13 @@ mod tests {
             cases = [
                 { input_types = [plain_array(&[2, 3]), plain_array(&[3, 4])], output_types = [plain_array(&[2, 4])], },
                 { input_types = [plain_array(&[2, 0]), plain_array(&[0, 4])], output_types = [plain_array(&[2, 4])], },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::Boolean, [2, 3]),
+                        ArrayType::new_static(DataType::Boolean, [3, 4]),
+                    ],
+                    output_types = [ArrayType::new_static(DataType::Boolean, [2, 4])],
+                },
                 { input_types = [plain_array(&[2, 3])], error = "expected 2 inputs but got 1", },
                 {
                     input_types = [plain_array(&[2, 3]), plain_array(&[4, 2])],
@@ -3888,9 +3920,9 @@ mod tests {
                 {
                     input_types = [
                         ArrayType::new_static(DataType::Boolean, [2, 3]),
-                        ArrayType::new_static(DataType::Boolean, [3, 4]),
+                        ArrayType::new_static(DataType::I32, [3, 4]),
                     ],
-                    error = format!("`{DOT_OPERATION_NAME}` does not support input data type `bool`"),
+                    error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
                 },
                 {
                     input_types = [
@@ -4648,6 +4680,18 @@ mod tests {
             Ok(Array::matrix(2, 2, vec![58.0, 64.0, 139.0, 154.0]).unwrap()),
         );
 
+        // Boolean inputs contract to the disjunction of the conjunctions of their paired elements.
+        let lhs = Array::matrix(2, 2, vec![true, false, false, false]).unwrap();
+        let rhs = Array::matrix(2, 2, vec![false, true, true, true]).unwrap();
+        assert_eq!(
+            lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+            Ok(Array::matrix(2, 2, vec![false, true, false, false]).unwrap()),
+        );
+        assert_eq!(
+            rhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+            Ok(Array::matrix(2, 2, vec![true, true, true, true]).unwrap()),
+        );
+
         // Both inputs are decoded through their physical layouts rather than through dense logical payload copies.
         let lhs_type =
             ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
@@ -4712,13 +4756,13 @@ mod tests {
         assert_eq!(product.elements::<bf16>(), Ok(vec![bf16::from_f32(1.0078125)]));
 
         let lhs = Array::vector(
-            [1.0f32, 0.000244140625, 0.000244140625, 0.000244140625, 0.000244140625].map(f16::from_f32).to_vec(),
+            [1.0f32, 0.00024414063, 0.00024414063, 0.00024414063, 0.00024414063].map(f16::from_f32).to_vec(),
         )
         .unwrap();
         let rhs = Array::vector(vec![f16::from_f32(1.0); 5]).unwrap();
         let product = lhs.dot(&rhs, &DotDimensionNumbers::inner_product()).unwrap();
         assert_eq!(product.r#type().into_owned(), ArrayType::scalar(DataType::F16));
-        assert_eq!(product.elements::<f16>(), Ok(vec![f16::from_f32(1.0009765625)]));
+        assert_eq!(product.elements::<f16>(), Ok(vec![f16::from_f32(1.0009766)]));
     }
 
     #[test]
@@ -4750,9 +4794,9 @@ mod tests {
         );
         let boolean = Array::matrix(1, 1, vec![true]).unwrap();
         assert_eq!(
-            boolean.dot(&boolean, &DotDimensionNumbers::matmul()),
+            boolean.dot_with_accumulation_type(&boolean, &DotDimensionNumbers::matmul(), DataType::I32),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` does not support input data type `bool`",
+                "`{DOT_OPERATION_NAME}` input data type `bool` cannot accumulate at data type `i32`",
             )))),
         );
     }
