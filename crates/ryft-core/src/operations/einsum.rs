@@ -661,12 +661,12 @@ pub struct EinsumOptions {
     /// Optional requested [`Sharding`] of the output.
     output_sharding: Option<Sharding>,
     // TODO(eaplatanios): Revisit the `reduction_order` option of `jax.numpy.einsum` once JAX releases and stabilizes
-    // it. JAX added it on its `main` branch in November 2026, after version 0.12, and marks it as experimental (refer
-    // to `jax/_src/reduction_order.py` there). It pins down the order in which floating-point values are accumulated
-    // (e.g., strictly from left to right, or in tiles with an inner and an outer order), so that results are
-    // reproducible bit for bit. The option belongs to the primitives and not to einsum, which only forwards it to a
-    // single sum or contraction. Supporting it therefore means adding reduction orders to `ReduceOperation` and
-    // `DotOperation` first, including a lowering that keeps backends from reordering the accumulation.
+    //  it. JAX added it on its `main` branch in November 2026, after version 0.12, and marks it as experimental (refer
+    //  to `jax/_src/reduction_order.py` there). It pins down the order in which floating-point values are accumulated
+    //  (e.g., strictly from left to right, or in tiles with an inner and an outer order), so that results are
+    //  reproducible bit for bit. The option belongs to the primitives and not to einsum, which only forwards it to a
+    //  single sum or contraction. Supporting it therefore means adding reduction orders to `ReduceOperation` and
+    //  `DotOperation` first, including a lowering that keeps backends from reordering the accumulation.
 }
 
 impl EinsumOptions {
