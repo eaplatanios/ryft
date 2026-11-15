@@ -50,7 +50,9 @@ unsafe impl Sync for CrossHostTransfersExtension {}
 /// Unique global identifier of a device across all hosts that are participating in the current job.
 pub type GlobalDeviceId = i32;
 
-/// Unique identifier of a cross-host transfer. Each cross-host transfer is assigned a unique ID by PJRT.
+/// Rendezvous key of a cross-host transfer, which its sender and its receiver both pass. A plugin need not match
+/// transfers by this key. The CUDA plugin pairs the sends and the receives between two devices by the order in which
+/// they are issued and ignores the keys, so both sides must issue the transfers between two devices in the same order.
 pub type CrossHostTransferKey = i64;
 
 impl Buffer<'_> {
@@ -155,16 +157,19 @@ impl Client<'_> {
         self.api().cross_host_transfers_extension()
     }
 
-    /// Initiates a cross-host transfer for the provided [`Buffer`]s.
-    /// This function is the counterpart to [`Client::cross_host_receive_buffers`].
+    /// Initiates a cross-host transfer for the provided [`Buffer`]s. This function is the counterpart to
+    /// [`Client::cross_host_receive_buffers`]. On the CUDA plugin, the first transfer between two devices blocks the
+    /// calling thread until the other process issues its matching receive, and a later send can complete without any
+    /// receive matching it (the next receive between the two devices then obtains its data). Callers must therefore
+    /// issue exactly matching sends and receives, in the same order.
     ///
     /// # Parameters
     ///
     ///   - `buffers`: [`Buffer`]s to send. For each index `i`, `buffers[i]` is paired with
     ///     `destination_devices[i]` and `transfer_keys[i]`.
     ///   - `destination_devices`: IDs of the destination [`Device`]s for each [`Buffer`].
-    ///   - `transfer_keys`: Transfer rendezvous keys that correspond to each [`Buffer`].
-    ///     Each key must match the receiver-side key for the same transfer.
+    ///   - `transfer_keys`: Transfer rendezvous keys that correspond to each [`Buffer`]. Each key should equal the
+    ///     receiver-side key for the same transfer (refer to [`CrossHostTransferKey`] for how plugins use it).
     ///   - `incarnation_ids`: Last known live task IDs paired with their incarnation IDs. Duplicate task IDs use
     ///     the first incarnation. An empty slice omits the snapshot.
     ///
@@ -236,8 +241,8 @@ impl Client<'_> {
     ///   - `device`: Destination [`Device`] on the current host, on which the received [`Buffer`]s
     ///     will be materialized.
     ///   - `source_devices`: IDs of the source [`Device`]s for each [`Buffer`].
-    ///   - `transfer_keys`: Transfer rendezvous keys that correspond to each [`Buffer`].
-    ///     Each key must match the sender-side key for the same transfer.
+    ///   - `transfer_keys`: Transfer rendezvous keys that correspond to each [`Buffer`]. Each key should equal the
+    ///     sender-side key for the same transfer (refer to [`CrossHostTransferKey`] for how plugins use it).
     ///   - `incarnation_ids`: Last known live task IDs paired with their incarnation IDs. Duplicate task IDs use
     ///     the first incarnation. An empty slice omits the snapshot.
     ///
@@ -834,8 +839,8 @@ mod tests {
     use crate::tests::{TestPlatform, test_for_each_platform};
     use crate::{BufferType, Error};
 
-    #[test]
     #[allow(deprecated)]
+    #[test]
     fn test_buffer_copy_to_remote_host_descriptor_lifetime() {
         unsafe extern "C" fn copy(args: *mut super::ffi::PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice_Args) {
             unsafe {
@@ -992,8 +997,8 @@ mod tests {
         });
     }
 
-    #[test]
     #[allow(deprecated)]
+    #[test]
     fn test_cross_host_transfers_deprecated() {
         test_for_each_platform!(|_plugin, client, platform| {
             match platform {

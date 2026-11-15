@@ -6,6 +6,10 @@
 //! flow. Padded parameter windows admit ordinary reads only through views valid in every invocation; masked accesses
 //! use explicit fallbacks.
 
+// Initialized element intervals are lists of ranges that often hold one interval, which this lint mistakes for a
+// range to collect.
+#![allow(clippy::single_range_in_vec_init)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -359,10 +363,10 @@ where
     for (root, operation, axes) in &initialization.unmasked_accesses {
         if let Some(valid_shape) = valid_shapes.get(root)
             && !axes.iter().any(|axis| axis.size() == 0)
-                && axes.iter().zip(valid_shape).any(|(axis, &valid)| axis.start() + axis.size() > valid)
-            {
-                return Err(KernelMemoryError::UnmaskedWindowAccess { operation }.into());
-            }
+            && axes.iter().zip(valid_shape).any(|(axis, &valid)| axis.start() + axis.size() > valid)
+        {
+            return Err(KernelMemoryError::UnmaskedWindowAccess { operation }.into());
+        }
     }
 
     Ok(())

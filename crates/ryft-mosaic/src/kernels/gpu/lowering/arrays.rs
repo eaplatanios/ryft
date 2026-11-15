@@ -784,7 +784,9 @@ mod tests {
     fn test_validate_like_operations_ignore_exemplar_element_types() {
         let exemplar = ArrayType::new_static(DataType::F16, [2, 3]);
         let iota = ArrayOperation::IotaLike(IotaLikeOperation::new(1, DataType::I64).unwrap());
-        assert!(validate(&iota, std::slice::from_ref(&exemplar), &ArrayType::new_static(DataType::I64, [2, 3])).is_ok());
+        assert!(
+            validate(&iota, std::slice::from_ref(&exemplar), &ArrayType::new_static(DataType::I64, [2, 3])).is_ok()
+        );
         let broadcast = ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(vec![1]));
         let inputs = [ArrayType::new_static(DataType::I32, [3]), exemplar];
         assert!(validate(&broadcast, &inputs, &ArrayType::new_static(DataType::I32, [2, 3])).is_ok());

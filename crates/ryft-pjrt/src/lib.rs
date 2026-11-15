@@ -654,10 +654,12 @@ mod tests {
         assert!(hash_map_from_c_api(std::ptr::null(), 0).is_empty());
 
         // Test using a non-empty list of `NamedValue`s.
-        let values = [NamedValue::new("boolean", true),
+        let values = [
+            NamedValue::new("boolean", true),
             NamedValue::new("integer", 42_i64),
             NamedValue::new("list", vec![1_i64, 2_i64, 3_i64]),
-            NamedValue::new("string", "hello")];
+            NamedValue::new("string", "hello"),
+        ];
         let values = values.iter().map(|value| unsafe { value.to_c_api() }).collect::<Vec<_>>();
         let hash_map = hash_map_from_c_api(values.as_ptr(), values.len());
         assert_eq!(hash_map.len(), 4);

@@ -440,8 +440,8 @@ impl KernelCodeGenerator {
                 #[allow(unused_imports)]
                 use super::*;
 
-                #[doc = #definition_documentation]
                 #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
+                #[doc = #definition_documentation]
                 pub fn definition(#(#inputs: &#core::arrays::ArrayType),*)
                     -> ::core::result::Result<#kernels::KernelDefinition, #kernels::KernelError>
                 {
@@ -1416,8 +1416,8 @@ mod tests {
                     #[allow(unused_imports)]
                     use super::*;
 
-                    #[doc = #definition_documentation]
                     #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
+                    #[doc = #definition_documentation]
                     pub fn definition(input: &kernels::__private::core::arrays::ArrayType)
                         -> ::core::result::Result<kernels::KernelDefinition, kernels::KernelError>
                     {
@@ -1682,9 +1682,9 @@ mod tests {
             generator().generate_callable(&function()).to_string(),
             quote! {
                 /// Gathers rows.
+                #[allow(clippy::cloned_ref_to_slice_refs)]
                 #[cfg(feature = "kernels")]
                 #[cfg_attr(feature = "kernels", inline)]
-                #[allow(clippy::cloned_ref_to_slice_refs)]
                 pub fn gather<__KernelValue: kernels::KernelCall>(left: &__KernelValue, indices: &__KernelValue)
                     -> ::core::result::Result<__KernelValue, kernels::__private::core::programs::ProgramError>
                 {
@@ -1731,8 +1731,8 @@ mod tests {
                     #[allow(unused_imports)]
                     use super::*;
 
-                    #[doc = #definition_documentation]
                     #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
+                    #[doc = #definition_documentation]
                     pub fn definition(
                         left: &kernels::__private::core::arrays::ArrayType,
                         indices: &kernels::__private::core::arrays::ArrayType

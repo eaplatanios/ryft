@@ -2295,10 +2295,10 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
             mlir_op_trait!($name, ZeroRegions);
             mlir_op_trait!($name, ZeroSuccessors);
 
+            #[allow(clippy::too_many_arguments)]
             #[doc = "Constructs a new detached/owned [`"]
             #[doc = stringify!($name)]
             #[doc = "Operation`] at the specified [`Location`]."]
-            #[allow(clippy::too_many_arguments)]
             pub fn $function_name<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
                 async_dependencies: &[ValueRef<'o, 'c, 't>],
                 $($method: ValueRef<'o, 'c, 't>,)+

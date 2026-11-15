@@ -598,10 +598,7 @@ fn execute_slice(
         .remove(0);
     let output = device_outputs.outputs.remove(0);
     let output_bytes = output.copy_to_host(None).unwrap().r#await().unwrap();
-    let output = output_bytes
-        .as_chunks::<4>().0.iter()
-        .map(|bytes| f32::from_ne_bytes(*bytes))
-        .collect::<Vec<_>>();
+    let output = output_bytes.as_chunks::<4>().0.iter().map(|bytes| f32::from_ne_bytes(*bytes)).collect::<Vec<_>>();
     assert_eq!(output, slice.expected);
 }
 

@@ -712,18 +712,19 @@ mod tests {
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
                 TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm10
-                    if plugin.xla_transform_extension().is_ok() => {
-                        assert!(
-                            plugin
-                                .register_xla_transform(
-                                    "ryft_test_no_op",
-                                    XlaTransformPipelineStage::PreScheduler,
-                                    NoOpTransform,
-                                )
-                                .is_ok()
-                        );
-                        assert!(client.xla_transform_extension().is_ok());
-                    }
+                    if plugin.xla_transform_extension().is_ok() =>
+                {
+                    assert!(
+                        plugin
+                            .register_xla_transform(
+                                "ryft_test_no_op",
+                                XlaTransformPipelineStage::PreScheduler,
+                                NoOpTransform,
+                            )
+                            .is_ok()
+                    );
+                    assert!(client.xla_transform_extension().is_ok());
+                }
                 _ => {
                     assert!(matches!(plugin.xla_transform_extension(), Err(Error::Unimplemented { .. })));
                     assert!(matches!(client.xla_transform_extension(), Err(Error::Unimplemented { .. })));

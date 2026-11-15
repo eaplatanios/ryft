@@ -23,8 +23,8 @@ use quote::quote;
 ///   - `code`: [`TokenStream`] to wrap in a `const _: () = { ... }` block.
 pub fn const_block(code: TokenStream) -> TokenStream {
     quote! {
+        #[allow(non_upper_case_globals, unused_attributes, unused_qualifications, clippy::redundant_field_names)]
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
         const _: () = {
             #code
         };

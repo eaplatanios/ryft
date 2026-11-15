@@ -8,8 +8,8 @@ use std::ffi::{c_char, c_void};
 /// Native device properties returned by `hipGetDevicePropertiesR0600`.
 ///
 /// The bitfield-only `hipDeviceArch_t` occupies one native unsigned integer; no bitfields are inspected.
-#[repr(C)]
 #[allow(non_snake_case)]
+#[repr(C)]
 pub(super) struct HipDeviceProperties {
     /// Native `name` field from the pinned HIP 7.13 `hipDeviceProp_tR0600`.
     pub(super) name: [c_char; 256],

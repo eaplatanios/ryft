@@ -4399,9 +4399,8 @@ mod tests {
         test_for_each_platform!(|_plugin, client, _platform| {
             let memory_0 = client.addressable_memories().unwrap()[0];
             let data = [101u8, 102u8, 103u8, 104u8];
-            let buffer = client
-                .buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, memory_0, None)
-                .unwrap();
+            let buffer =
+                client.buffer(data.as_slice(), BufferType::U8, [data.len() as u64], None, memory_0, None).unwrap();
             assert_eq!(buffer.memory().unwrap(), memory_0);
             let buffer = buffer.copy_to_memory(memory_0).unwrap();
             assert_eq!(buffer.memory().unwrap(), memory_0);

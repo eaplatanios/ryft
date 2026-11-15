@@ -274,7 +274,8 @@ where
             .into_iter()
             .zip(axes)
             .map(|(value, axis)| ArrayIrBatch::new(value, axis.map(|axis| axis as isize)))
-            .collect::<Result<Vec<_>, _>>()}
+            .collect::<Result<Vec<_>, _>>()
+    }
 }
 
 #[cfg(test)]

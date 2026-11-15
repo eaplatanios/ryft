@@ -85,14 +85,18 @@ fn attention_definition(data_type: DataType, rows: usize, columns: usize, depth:
         let scale =
             bind(ArrayOperation::Constant(ConstantOperation::new(Array::scalar((depth as f32).sqrt().recip())?)), &[])?;
         let scores = bind(ArrayOperation::Mul(MulOperation::new()), &[scores, scale])?;
-        let maximum =
-            bind(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)), std::slice::from_ref(&scores))?;
+        let maximum = bind(
+            ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)),
+            std::slice::from_ref(&scores),
+        )?;
         let maximum =
             bind(ArrayOperation::Broadcast(BroadcastOperation::new(scores_type.clone(), vec![0])), &[maximum])?;
         let centered = bind(ArrayOperation::Sub(SubOperation::new()), &[scores, maximum])?;
         let exponentials = bind(ArrayOperation::Exp(ExpOperation::new()), &[centered])?;
-        let sum =
-            bind(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)), std::slice::from_ref(&exponentials))?;
+        let sum = bind(
+            ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)),
+            std::slice::from_ref(&exponentials),
+        )?;
         let sum = bind(ArrayOperation::Broadcast(BroadcastOperation::new(scores_type, vec![0])), &[sum])?;
         let probabilities = bind(ArrayOperation::Div(DivOperation::new()), &[exponentials, sum])?;
         let probabilities = if data_type == DataType::F32 {

@@ -168,8 +168,7 @@ impl BlockMapping {
             .map(|r#type| builder.add_input(r#type))
             .collect::<Vec<_>>();
         let mut bindings = DimensionRefinements::default();
-        for (offset, (formal, value)) in self.program.input_types().iter().skip(remaining).zip(values).enumerate()
-        {
+        for (offset, (formal, value)) in self.program.input_types().iter().skip(remaining).zip(values).enumerate() {
             let ArrayIrType::Dimension(formal) = formal else { unreachable!() };
             let position = remaining + offset;
             for (input, r#type) in self.program.input_types().iter().take(remaining).enumerate() {
@@ -727,6 +726,8 @@ mod tests {
         let same_mapping = BlockMapping::new(program.clone(), vec![4], BoundaryPolicy::InBounds).unwrap();
         assert_eq!(mapping, same_mapping);
         assert_eq!(hash_of(&mapping), hash_of(&same_mapping));
+        // A mapping hashes by its program structure, which its interior caches never change.
+        #[allow(clippy::mutable_key_type)]
         let mappings = HashMap::from([(mapping.clone(), "mapping")]);
         assert_eq!(mappings.get(&same_mapping), Some(&"mapping"));
 

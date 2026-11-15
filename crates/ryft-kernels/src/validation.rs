@@ -41,9 +41,10 @@ use thiserror::Error;
 pub enum KernelValidationError {
     /// The array view overlay or the generic reference analysis rejected the body. This covers reference-typed
     /// constants (kernel bodies capture no references) and consumption of an entering kernel input, both of which the
-    /// generic lifetime and capture rules reject before any kernel-specific rule runs.
+    /// generic lifetime and capture rules reject before any kernel-specific rule runs. The payload is boxed to keep
+    /// this error, and the kernel errors that embed it, compact.
     #[error(transparent)]
-    Analysis(#[from] ReferenceViewAnalysisError),
+    Analysis(#[from] Box<ReferenceViewAnalysisError>),
 
     /// The contract declares a different number of parameters than the body has inputs.
     #[error("kernel boundary contract declares {actual} parameters but the kernel body has {expected} inputs")]
@@ -105,6 +106,13 @@ pub enum KernelValidationError {
         /// Instruction performing the access.
         instruction: InstructionId,
     },
+}
+
+impl From<ReferenceViewAnalysisError> for KernelValidationError {
+    #[inline]
+    fn from(error: ReferenceViewAnalysisError) -> Self {
+        Self::Analysis(Box::new(error))
+    }
 }
 
 /// Operation-local reference semantics used by kernel boundary validation. Implementations identify an old-value
@@ -927,7 +935,7 @@ mod tests {
         let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadWrite)]);
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
-            Some(KernelValidationError::Analysis(ReferenceViewAnalysisError::Analysis(
+            Some(KernelValidationError::from(ReferenceViewAnalysisError::Analysis(
                 ReferenceAnalysisError::ExternalReferenceConsumption {
                     operation: "reference_freeze",
                     instruction: id(0, 0),
@@ -956,7 +964,7 @@ mod tests {
         let contract = KernelBoundaryContract::new(Vec::new());
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
-            Some(KernelValidationError::Analysis(ReferenceViewAnalysisError::Analysis(
+            Some(KernelValidationError::from(ReferenceViewAnalysisError::Analysis(
                 ReferenceAnalysisError::InvalidReferenceCapture {
                     region: RegionId::new(0),
                     atom: AtomId::new(0),
