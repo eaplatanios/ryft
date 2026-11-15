@@ -1540,7 +1540,7 @@ mod cutile {
     #[test]
     fn test_shard_map_on_cuda() {
         use ryft_core::{ProjectedValue, ShardMapOptions, Sharding, ShardingDimension, Typed, shard_map};
-        use ryft_xla::experimental::ArrayTracer;
+        use ryft_xla::tracing::ArrayTracer;
         use ryft_xla::{CompileTracer, CompiledFunction, Options, compile_with_options};
 
         if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {

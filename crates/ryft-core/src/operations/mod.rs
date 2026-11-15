@@ -24,6 +24,7 @@ pub mod debugging;
 pub mod differentiation;
 pub mod dimensions;
 pub mod dot;
+pub mod einsum;
 pub mod exponential;
 pub mod extrema;
 pub mod logical;
@@ -126,6 +127,10 @@ pub use dot::{
     DOT_OPERATION_NAME, Dot, DotAlgorithm, DotAlgorithmPreset, DotDimensionNumbers, DotInputPrecision, DotOperation,
     DotOperations, DotPrecision, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode,
     RaggedDotOperation,
+};
+pub use einsum::{
+    EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION, Einsum, EinsumComposite, EinsumLabel, EinsumOptions,
+    EinsumPathStrategy, EinsumPlan, EinsumSpecification, einsum, einsum_with_options,
 };
 pub use exponential::{
     EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, Exp, ExpM1, ExpM1Operation, ExpOperation, ExponentialOperations,

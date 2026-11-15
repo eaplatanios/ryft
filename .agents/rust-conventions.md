@@ -18,6 +18,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.
+- Keep struct fields private, including from sibling modules of the same crate. Expose construction through
+  constructors and `with_*` builder functions and reads through accessor functions instead of marking fields `pub`,
+  `pub(crate)`, or `pub(super)`. Structs that mirror a C layout in an `ffi` module are the exception.
 - Give trait function arguments descriptive names without a leading underscore. When a default implementation does
   not use them, start its body with `let _ = (...);` to mark the unused arguments explicitly.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.

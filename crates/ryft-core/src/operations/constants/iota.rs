@@ -248,6 +248,15 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
     }
 }
 
+impl<O: Operation<Type = ArrayType>> Iota<ArrayType> for EagerContext<ArrayType, O> {
+    #[inline]
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<ArrayType, ProgramError> {
+        // An `ArrayType` is its own value where only types are computed (refer to its `Value` implementation), so its
+        // iota is the validated type itself. This lets compositions that create index arrays infer their types.
+        Ok(IotaOperation::new(r#type.clone(), dimension)?.infer_output_types(&[], &[])?.remove(0))
+    }
+}
+
 impl<C: ContextProjection<ArrayType>> Iota<<C::Value as ValueProjection<ArrayType>>::Projected>
     for ProjectedContext<C, ArrayType>
 where
@@ -835,6 +844,18 @@ mod tests {
                 in (%0)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_eager_context_iota() {
+        // The value of a context over array types is the validated type of the iota.
+        let context = EagerContext::<ArrayType, IotaOperation<ArrayType>>::new();
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        assert_eq!(context.iota(&output_type, 1), Ok(output_type.clone()));
+        assert_eq!(
+            context.iota(&output_type, 2),
+            Err(ProgramError::Type(TypeError::invalid("`iota` dimension 2 is out of bounds for rank 2"))),
         );
     }
 

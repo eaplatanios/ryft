@@ -34,7 +34,7 @@ relative to the repository root, not a requirement to read every file for every 
 | Shared production and testing macros                    | `crates/ryft-core/src/macros.rs`, `src/arrays/macros.rs`                     |
 | Derives and capability projection generation            | `crates/ryft-macros/src/{operations,capabilities}.rs`                        |
 | Transform contracts and replay                          | `crates/ryft-core/src/partial/`, `src/batching.rs`, `src/differentiation/`   |
-| Backend conversion and lowering                         | `crates/ryft-xla/src/operations/`, `src/experimental/{ops.rs,lowering/}`     |
+| Backend conversion and lowering                         | `crates/ryft-xla/src/operations/`, `src/lowering/`                           |
 
 In a row with a shortened `src/...` path, use the same crate as the first path. Confirm paths and contracts in the
 current checkout; examples are implementation references, not permission to perpetuate a defect or stale convention.

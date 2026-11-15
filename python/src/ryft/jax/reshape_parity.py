@@ -19,7 +19,7 @@ from ryft.jax.extraction import ProgramCase, lower_to_stablehlo
 ROOT = Path(__file__).resolve().parents[4]
 RESHAPE_TEST_SOURCES = (
     ROOT / "crates/ryft-xla/src/operations/manipulation/reshaping.rs",
-    ROOT / "crates/ryft-xla/src/experimental/tracing.rs",
+    ROOT / "crates/ryft-xla/src/tracing.rs",
 )
 # Matches a test that asserts that a rendered module (i.e., a `module` binding or a traced program's
 # `to_mlir_module("main")` rendering) equals an `indoc!` literal, without crossing into the next function.

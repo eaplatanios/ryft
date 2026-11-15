@@ -344,6 +344,12 @@ mod tests {
                  distinct axes of its rank 2",
             ))),
         );
+
+        // An array type is its own value where only types are computed, so its diagonal is the type of the result.
+        let r#type = ArrayType::new_static(DataType::F64, [2, 3, 4]);
+        assert_eq!(r#type.diagonal(0, 1, 2), Ok(ArrayType::new_static(DataType::F64, [2, 3])));
+        assert_eq!(r#type.diagonal(2, 2, 1), Ok(ArrayType::new_static(DataType::F64, [2, 1])));
+        assert_eq!(r#type.diagonal(-1, 0, 2), Ok(ArrayType::new_static(DataType::F64, [1, 3])));
     }
 
     #[test]
