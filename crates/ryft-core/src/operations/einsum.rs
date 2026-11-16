@@ -551,14 +551,18 @@ pub enum EinsumPathStrategy {
     Optimal,
 
     /// Finds, for every group of inputs that summed labels connect, the pairwise contractions with the fewest scalar
-    /// operations among the orders that take no outer product within the group, by combining the best contractions
-    /// of ever larger subsets of its inputs. Labels that only one input contains are summed first with an
-    /// [`EinsumPathStep::Reduction`]. The results of the groups are then combined one after the other from
-    /// the smallest one up, which is a heuristic and can cost more than another order of combining them (e.g.,
-    /// `ab,ab,cd,cd->abcd` with extents of 10 has four groups, and combining them in that order takes 20,100
-    /// scalar operations where multiplying each pair of equally labeled inputs first takes 10,200). Its cost
-    /// grows exponentially with the number of connected inputs. This is the `"dp"` strategy of `opt_einsum`,
-    /// which combines the groups in the same way.
+    /// multiplications among the orders that take no outer product within the group, by combining the best contractions
+    /// of ever larger subsets of its inputs. Its cost of a contraction is the number of combinations of the labels of
+    /// its two inputs, which leaves out the additions of a contraction that sums a label. The other searches count
+    /// those additions, so they can prefer another path within a group (e.g., for `ad,ade,abcde,ac->bc` with the
+    /// extents `a = d = 2`, `b = c = 5`, and `e = 3`, this search selects a path of 712 multiplications and additions
+    /// where another path without outer products takes 672). Labels that only one input contains are summed first with
+    /// an [`EinsumPathStep::Reduction`]. The results of the groups are then combined one after the other from the
+    /// smallest one up, which is a heuristic and can cost more than another order of combining them (e.g.,
+    /// `ab,ab,cd,cd->abcd` with extents of 10 has four groups, and combining them in that order takes 20,100 scalar
+    /// operations where multiplying each pair of equally labeled inputs first takes 10,200). Its cost grows
+    /// exponentially with the number of connected inputs. This is the `"dp"` strategy of`opt_einsum`, which
+    /// uses the same cost and combines the groups in the same way.
     DynamicProgramming,
 
     /// Explores the provided number of most promising contractions at every step, or all of them without a number, and
@@ -694,9 +698,10 @@ impl EinsumPathStrategy {
     }
 
     /// Returns a path for the `inputs` and `output` of an einsum that contracts every group of connected inputs with
-    /// the fewest scalar operations among the orders that take no outer product within the group, and that combines
-    /// the results of the groups heuristically. This is a port of the `DynamicProgramming` optimizer of `opt_einsum`
-    /// with its default options and without a memory limit:
+    /// the fewest scalar multiplications among the orders that take no outer product within the group, and that
+    /// combines the results of the groups heuristically. The cost of a contraction is the number of combinations of
+    /// the labels of its two inputs, without the additions that the other searches count for a summed label. This is a
+    /// port of the `DynamicProgramming` optimizer of `opt_einsum` with its default options and without a memory limit:
     ///
     ///   1. Labels that only one input contains are summed first. An input that keeps no label is finished by that,
     ///      and every other input takes part in the search with its remaining labels.
@@ -2559,10 +2564,11 @@ impl EinsumSteps<ArrayType> for TypeSteps {
     }
 
     fn diagonal(&self, value: &ArrayType, kept_axis: usize, removed_axis: usize) -> Result<ArrayType, ProgramError> {
-        // The main diagonal of two axes that share one extent is an iota and a gather for static extents. Otherwise,
-        // a masked sum stages two index arrays, their comparison, the zeros, the selection, and the sum.
+        // The main diagonal of two axes that share one extent is an iota and a gather for static extents, or a single
+        // reshape when that extent is zero, because an empty diagonal reads nothing. Otherwise, a masked sum stages two
+        // index arrays, their comparison, the zeros, the selection, and the sum.
         if value.shape().dimensions().iter().all(|dimension| dimension.value().is_some()) {
-            self.stage(2);
+            self.stage(if value.dimension(kept_axis).value() == Some(0) { 1 } else { 2 });
             value.diagonal(0, kept_axis, removed_axis)
         } else {
             self.stage(6);
@@ -3711,6 +3717,19 @@ mod tests {
         assert_eq!(path_cost(&plan).0, 20_100);
         let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(0, 1), (0, 1), (0, 1)]));
         assert_eq!(path_cost(&specification.plan(&input_types, &options).unwrap()).0, 10_200);
+
+        // Within a group, the search minimizes multiplications and leaves out the additions of contractions that
+        // sum a label, like `opt_einsum`. Counting both, another path without outer products is cheaper below.
+        let shapes: &[&[usize]] = &[&[2, 2], &[2, 2, 3], &[2, 5, 5, 2, 3], &[2, 5]];
+        let input_types =
+            shapes.iter().map(|shape| ArrayType::new_static(DataType::F32, shape.to_vec())).collect::<Vec<_>>();
+        let specification = "ad,ade,abcde,ac->bc".parse::<EinsumSpecification>().unwrap();
+        let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::DynamicProgramming);
+        let plan = specification.plan(&input_types, &options).unwrap();
+        assert_eq!(plan.path(), steps(&[(0, 1), (0, 2), (0, 1)]));
+        assert_eq!(path_cost(&plan).0, 712);
+        let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(0, 1), (1, 2), (0, 1)]));
+        assert_eq!(path_cost(&specification.plan(&input_types, &options).unwrap()).0, 672);
     }
 
     #[test]
@@ -7524,7 +7543,22 @@ mod tests {
         let first = Array::einsum("ij,jk,kl->il", inputs.iter()).unwrap();
         assert_eq!(program.interpret(inputs.clone()), Array::einsum("ij,jk,kl->il", [&first, &inputs[1], &inputs[2]]),);
 
-        // A plan that stages one instruction contracts inline.
+        // A plan that stages one instruction contracts inline. That includes an empty diagonal, which is a reshape.
+        let function = einsum::<ArrayContext>("ii->i").unwrap();
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| function.call(inputs),
+            vec![ArrayType::new_static(DataType::F64, [0, 0])],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[0, 0] .
+                let %1:f64[0] = reshape [shape=[0]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
         let function = einsum::<ArrayContext>("ij,jk->ik").unwrap();
         let (_, program) = ArrayContext::trace(
             |inputs: Vec<DomainTracer<ArrayContext>>| function.call(inputs),
