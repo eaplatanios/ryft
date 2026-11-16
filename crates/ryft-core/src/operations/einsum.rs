@@ -2150,7 +2150,71 @@ where
         + ZeroLike,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    let key = einsum_composite_key(&specification, &options);
+    // The attributes encode everything that determines the computation for given input types. Labels are encoded by
+    // their code points and an ellipsis by `-1`, the path strategy by a fixed index followed by its parameters (i.e.,
+    // a count, or the positions of every step of an explicit path), the precision by its kind followed by its fields,
+    // and a requested output sharding by the code points of its rendering, which distinguishes different shardings.
+    let integer = |value: usize| CompositeAttribute::Integer(value as i128);
+    let subscript = |subscript: &[EinsumLabel]| {
+        CompositeAttribute::Sequence(
+            subscript
+                .iter()
+                .map(|label| match label {
+                    EinsumLabel::Named(label) => CompositeAttribute::Integer(u32::from(*label) as i128),
+                    EinsumLabel::Ellipsis => CompositeAttribute::Integer(-1),
+                })
+                .collect(),
+        )
+    };
+    let path = match &options.path_strategy {
+        EinsumPathStrategy::Auto => vec![integer(0)],
+        EinsumPathStrategy::AutoHighQuality => vec![integer(5)],
+        EinsumPathStrategy::Optimal => vec![integer(1)],
+        EinsumPathStrategy::DynamicProgramming => vec![integer(6)],
+        EinsumPathStrategy::Branch(branch_count) => vec![integer(7), CompositeAttribute::from(*branch_count)],
+        EinsumPathStrategy::Greedy => vec![integer(2)],
+        EinsumPathStrategy::RandomGreedy(repetitions) => vec![integer(8), integer(*repetitions)],
+        EinsumPathStrategy::Unoptimized => vec![integer(3)],
+        EinsumPathStrategy::Explicit(path) => std::iter::once(integer(4))
+            .chain(path.iter().map(|step| match *step {
+                EinsumPathStep::Reduction(position) => CompositeAttribute::Sequence(vec![integer(position)]),
+                EinsumPathStep::Contraction(first, second) => {
+                    CompositeAttribute::Sequence(vec![integer(first), integer(second)])
+                }
+            }))
+            .collect(),
+    };
+    let output_sharding = options
+        .output_sharding
+        .as_ref()
+        .map(|sharding| sharding.to_string().chars().map(|character| u32::from(character) as i128).collect::<Vec<_>>());
+    let precision = match options.precision {
+        DotPrecision::Inputs { lhs, rhs } => vec![integer(0), integer(lhs as usize), integer(rhs as usize)],
+        DotPrecision::Algorithm(algorithm) => vec![
+            integer(1),
+            CompositeAttribute::DataType(algorithm.lhs_precision_type()),
+            CompositeAttribute::DataType(algorithm.rhs_precision_type()),
+            CompositeAttribute::DataType(algorithm.accumulation_type()),
+            integer(algorithm.lhs_component_count()),
+            integer(algorithm.rhs_component_count()),
+            integer(algorithm.primitive_operation_count()),
+            CompositeAttribute::Boolean(algorithm.allow_imprecise_accumulation()),
+        ],
+        DotPrecision::Preset(preset) => vec![integer(2), integer(preset as usize)],
+    };
+    let key = CompositeKey::new(EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION)
+        .with_attribute(
+            "inputs",
+            CompositeAttribute::Sequence(specification.inputs.iter().map(|input| subscript(input)).collect()),
+        )
+        .with_attribute(
+            "output",
+            CompositeAttribute::Optional(specification.output.as_deref().map(|output| Box::new(subscript(output)))),
+        )
+        .with_attribute("path", CompositeAttribute::Sequence(path))
+        .with_attribute("accumulation_type", options.accumulation_type)
+        .with_attribute("precision", CompositeAttribute::Sequence(precision))
+        .with_attribute("output_sharding", output_sharding);
     let plans = Arc::new(EinsumPlans { specification, options, planned: Mutex::new(VecDeque::new()) });
     let body_plans = plans.clone();
     let rule_plans = plans.clone();
@@ -3188,75 +3252,6 @@ fn einsum_symbol(index: usize) -> Option<char> {
             char::from_u32(code_point.checked_add(skipped)?)
         }
     }
-}
-
-/// Returns the [`CompositeKey`] of the named composite of an einsum with the provided specification and options. The
-/// attributes encode everything that determines its computation for given input types. Labels are encoded by their code
-/// points and an ellipsis by `-1`, the path strategy by a fixed index followed by its parameters (i.e., a count, or the
-/// positions of every step of an explicit path), the precision by its kind followed by its fields, and a requested
-/// output sharding by the code points of its rendering, which distinguishes every pair of different shardings.
-fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOptions) -> CompositeKey {
-    let integer = |value: usize| CompositeAttribute::Integer(value as i128);
-    let subscript = |subscript: &[EinsumLabel]| {
-        CompositeAttribute::Sequence(
-            subscript
-                .iter()
-                .map(|label| match label {
-                    EinsumLabel::Named(label) => CompositeAttribute::Integer(u32::from(*label) as i128),
-                    EinsumLabel::Ellipsis => CompositeAttribute::Integer(-1),
-                })
-                .collect(),
-        )
-    };
-    let path = match &options.path_strategy {
-        EinsumPathStrategy::Auto => vec![integer(0)],
-        EinsumPathStrategy::AutoHighQuality => vec![integer(5)],
-        EinsumPathStrategy::Optimal => vec![integer(1)],
-        EinsumPathStrategy::DynamicProgramming => vec![integer(6)],
-        EinsumPathStrategy::Branch(branch_count) => vec![integer(7), CompositeAttribute::from(*branch_count)],
-        EinsumPathStrategy::Greedy => vec![integer(2)],
-        EinsumPathStrategy::RandomGreedy(repetitions) => vec![integer(8), integer(*repetitions)],
-        EinsumPathStrategy::Unoptimized => vec![integer(3)],
-        EinsumPathStrategy::Explicit(path) => std::iter::once(integer(4))
-            .chain(path.iter().map(|step| match *step {
-                EinsumPathStep::Reduction(position) => CompositeAttribute::Sequence(vec![integer(position)]),
-                EinsumPathStep::Contraction(first, second) => {
-                    CompositeAttribute::Sequence(vec![integer(first), integer(second)])
-                }
-            }))
-            .collect(),
-    };
-    let output_sharding = options
-        .output_sharding
-        .as_ref()
-        .map(|sharding| sharding.to_string().chars().map(|character| u32::from(character) as i128).collect::<Vec<_>>());
-    let precision = match options.precision {
-        DotPrecision::Inputs { lhs, rhs } => vec![integer(0), integer(lhs as usize), integer(rhs as usize)],
-        DotPrecision::Algorithm(algorithm) => vec![
-            integer(1),
-            CompositeAttribute::DataType(algorithm.lhs_precision_type()),
-            CompositeAttribute::DataType(algorithm.rhs_precision_type()),
-            CompositeAttribute::DataType(algorithm.accumulation_type()),
-            integer(algorithm.lhs_component_count()),
-            integer(algorithm.rhs_component_count()),
-            integer(algorithm.primitive_operation_count()),
-            CompositeAttribute::Boolean(algorithm.allow_imprecise_accumulation()),
-        ],
-        DotPrecision::Preset(preset) => vec![integer(2), integer(preset as usize)],
-    };
-    CompositeKey::new(EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION)
-        .with_attribute(
-            "inputs",
-            CompositeAttribute::Sequence(specification.inputs.iter().map(|input| subscript(input)).collect()),
-        )
-        .with_attribute(
-            "output",
-            CompositeAttribute::Optional(specification.output.as_deref().map(|output| Box::new(subscript(output)))),
-        )
-        .with_attribute("path", CompositeAttribute::Sequence(path))
-        .with_attribute("accumulation_type", options.accumulation_type)
-        .with_attribute("precision", CompositeAttribute::Sequence(precision))
-        .with_attribute("output_sharding", output_sharding)
 }
 
 // TODO(eaplatanios): Review from here onwards.
@@ -7749,8 +7744,29 @@ mod tests {
 
     #[test]
     fn test_einsum_composite_key() {
-        let key =
-            |subscripts: &str, options: EinsumOptions| einsum_composite_key(&subscripts.parse().unwrap(), &options);
+        let key = |subscripts: &str, options: EinsumOptions| {
+            let specification = subscripts.parse::<EinsumSpecification>().unwrap();
+            let input_types = specification
+                .inputs()
+                .iter()
+                .map(|labels| {
+                    let rank = labels.iter().filter(|label| matches!(label, EinsumLabel::Named(_))).count();
+                    ArrayType::new_static(DataType::F32, vec![2; rank])
+                })
+                .collect::<Vec<_>>();
+            let function = einsum_with_options::<ArrayContext>(specification, options).unwrap();
+            // Call the underlying composite so that one-instruction einsums also retain their key.
+            let (_, program) = ArrayContext::trace(
+                |inputs: Vec<DomainTracer<ArrayContext>>| function.composite.call(inputs),
+                input_types,
+            )
+            .unwrap();
+            assert_eq!(program.instructions().len(), 1);
+            let ArrayOperation::Composite(operation) = program.instructions()[0].operation() else {
+                panic!("expected a named einsum composite");
+            };
+            operation.key().unwrap().clone()
+        };
         assert_eq!(
             key("ij,jk->ik", EinsumOptions::new()).to_string(),
             "ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
@@ -7804,7 +7820,14 @@ mod tests {
             key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Unoptimized)),
             key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(0, 1)]))),
             key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(1, 0)]))),
-            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([1, 0]))),
+            key(
+                "ij,jk->ik",
+                EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Explicit(vec![
+                    EinsumPathStep::Reduction(1),
+                    EinsumPathStep::Reduction(0),
+                    EinsumPathStep::Contraction(0, 1),
+                ])),
+            ),
             key("ij,jk->ik", EinsumOptions::new().with_accumulation_type(DataType::F64)),
             key("ij,jk->ik", EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
             key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::sharded(["x"])))),
