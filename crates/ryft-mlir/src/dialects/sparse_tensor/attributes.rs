@@ -663,6 +663,7 @@ impl<'t> Context<'t> {
     }
 
     /// Creates a new sparse tensor encoding attribute owned by this [`Context`].
+    #[allow(clippy::too_many_arguments)]
     pub fn sparse_tensor_encoding_attribute<'c>(
         &'c self,
         level_types: &[LevelType],

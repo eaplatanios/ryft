@@ -2750,8 +2750,7 @@ mod tests {
                 body.append_operation(r#yield(Some(add_op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
                     .unwrap();
                 region.append_block(body).unwrap();
-                let op = expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region.into(), true, location)
-                    .unwrap();
+                let op = expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region, true, location).unwrap();
                 assert_eq!(op.definitions().unwrap(), vec![lhs.as_ref(), rhs.as_ref()]);
                 assert!(op.do_not_inline());
                 assert_eq!(op.output().unwrap().r#type().unwrap(), i32_type.as_ref());
@@ -3759,8 +3758,7 @@ mod tests {
                 region.append_block(body).unwrap();
                 let expression_op = block
                     .append_operation(
-                        expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region.into(), true, location)
-                            .unwrap(),
+                        expression(&[lhs.as_ref(), rhs.as_ref()], i32_type.as_ref(), region, true, location).unwrap(),
                     )
                     .unwrap();
                 block
@@ -4065,9 +4063,7 @@ mod tests {
                     .unwrap();
                 expression_region.append_block(expression_body).unwrap();
                 let expression_op = condition
-                    .append_operation(
-                        expression(&[], i1_type.as_ref(), expression_region.into(), false, location).unwrap(),
-                    )
+                    .append_operation(expression(&[], i1_type.as_ref(), expression_region, false, location).unwrap())
                     .unwrap();
                 condition
                     .append_operation(

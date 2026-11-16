@@ -1578,7 +1578,10 @@ mod tests {
         "}
             .trim_end(),
         );
-        assert_eq!(unknown.interpret(&EagerContext::new(), &[input.clone()]), Ok(vec![input.softmax(0).unwrap()]));
+        assert_eq!(
+            unknown.interpret(&EagerContext::new(), std::slice::from_ref(&input)),
+            Ok(vec![input.softmax(0).unwrap()])
+        );
     }
 
     #[test]
@@ -2015,7 +2018,10 @@ mod tests {
         "}
             .trim_end(),
         );
-        assert_eq!(unknown.interpret(&EagerContext::new(), &[input.clone()]), Ok(vec![input.log_softmax(0).unwrap()]));
+        assert_eq!(
+            unknown.interpret(&EagerContext::new(), std::slice::from_ref(&input)),
+            Ok(vec![input.log_softmax(0).unwrap()])
+        );
     }
 
     #[test]
@@ -2534,7 +2540,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            known.interpret(&EagerContext::new(), &[targets.clone()]),
+            known.interpret(&EagerContext::new(), std::slice::from_ref(&targets)),
             Ok(vec![logits.softmax_cross_entropy(&targets, 0).unwrap()]),
         );
     }
@@ -3301,7 +3307,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            known.interpret(&EagerContext::new(), &[logits.clone()]),
+            known.interpret(&EagerContext::new(), std::slice::from_ref(&logits)),
             Ok(vec![logits.softmax_cross_entropy_with_integer_labels(&labels, 0).unwrap()]),
         );
     }
@@ -3678,7 +3684,7 @@ mod tests {
         let gradient = gradient.elements::<f64>().unwrap();
 
         // Each oracle normalizes the four classes of one original middle-axis coordinate independently.
-        for row in 0..3 {
+        for (row, &loss) in losses.iter().enumerate() {
             let indices = [2 * row, 2 * row + 1, 6 + 2 * row, 7 + 2 * row];
             let denominator = indices.iter().map(|&index| logits_values[index].exp()).sum::<f64>();
             let target_denominator = indices.iter().map(|&index| target_values[index].exp()).sum::<f64>();
@@ -3688,7 +3694,7 @@ mod tests {
                     target_values[index].exp() / target_denominator * (denominator.ln() - logits_values[index])
                 })
                 .sum::<f64>();
-            assert_abs_diff_eq!(losses[row], expected_loss, epsilon = 1e-14);
+            assert_abs_diff_eq!(loss, expected_loss, epsilon = 1e-14);
             for index in indices {
                 let expected =
                     logits_values[index].exp() / denominator - target_values[index].exp() / target_denominator;
@@ -4247,7 +4253,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            unknown.interpret(&EagerContext::new(), &[student.clone()]),
+            unknown.interpret(&EagerContext::new(), std::slice::from_ref(&student)),
             Ok(vec![function.call(student, teacher).unwrap()]),
         );
     }

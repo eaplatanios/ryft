@@ -825,6 +825,7 @@ fn test_map_parameters() {
         }
     }
 
+    #[allow(clippy::upper_case_acronyms)]
     #[derive(Parameterized, Clone)]
     struct MLP<P: Parameter, const N: usize> {
         layers: [Linear<P>; N],

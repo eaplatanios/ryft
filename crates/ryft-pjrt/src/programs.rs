@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Poll, Waker};
 
 use prost::Message;
 
@@ -851,6 +853,7 @@ impl<'c> LoadedExecutable<'c> {
     ///
     /// If native submission succeeds but a later step of this function fails or unwinds, this function waits for every
     /// participating device to complete before returning, so borrowed resources are never released early.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute<'l>(
         &self,
         inputs: Vec<ExecutionDeviceInputs<'c, 'l>>,
@@ -1522,6 +1525,39 @@ impl ExecutionFence {
             completion = state.ready.wait(completion).expect("execution fence completion mutex poisoned while waiting");
         }
         completion.result.clone().unwrap()
+    }
+
+    /// Waits asynchronously until every participating [`Event`] is completed and returns the first execution error, if
+    /// any. Unlike [`Self::block_until_ready`], this function never parks the calling thread: a pending fence suspends
+    /// the task and wakes it from the thread that completes the last participating event (refer to [`Self::on_ready`]).
+    /// Use it from asynchronous code, where a fence may stay pending for a long time (e.g., a fence over transfers that
+    /// complete only once another process receives them).
+    pub async fn ready(&self) -> Result<(), Error> {
+        // The completion callback wakes the most recent waker of the task, which each pending poll replaces.
+        let waker = Arc::new(Mutex::new(None::<Waker>));
+        let mut registered = false;
+        poll_fn(|context| match self.is_ready() {
+            Ok(true) => Poll::Ready(Ok(())),
+            Err(error) => Poll::Ready(Err(error)),
+            Ok(false) => {
+                *waker.lock().expect("execution fence waker mutex poisoned") = Some(context.waker().clone());
+                if !registered {
+                    registered = true;
+                    let waker = Arc::clone(&waker);
+
+                    // A fence that completed since the readiness check runs this callback inline, which wakes the
+                    // task so that it is polled again and observes the terminal result.
+                    self.on_ready(move |_| {
+                        if let Some(waker) = waker.lock().expect("execution fence waker mutex poisoned").take() {
+                            waker.wake();
+                        }
+                    });
+                }
+
+                Poll::Pending
+            }
+        })
+        .await
     }
 
     /// Registers `callback` to run exactly once with this fence's terminal result. If the fence is already terminal,
@@ -3149,9 +3185,12 @@ pub(crate) mod ffi {
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::mem::ManuallyDrop;
+    use std::pin::pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
+    use std::task::{Context, Wake};
     use std::time::Duration;
 
     use indoc::indoc;
@@ -3815,14 +3854,14 @@ mod tests {
             lhs_bytes.extend_from_slice(&7i32.to_ne_bytes());
             lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
             let lhs_bytes = lhs_bytes.as_slice();
-            let lhs_buffer = client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+            let lhs_buffer = client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
             // Create the second input tensor: `[35, -41]`.
             let mut rhs_bytes = Vec::with_capacity(8);
             rhs_bytes.extend_from_slice(&35i32.to_ne_bytes());
             rhs_bytes.extend_from_slice(&(-41i32).to_ne_bytes());
             let rhs_bytes = rhs_bytes.as_slice();
-            let rhs_buffer = client.buffer(rhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+            let rhs_buffer = client.buffer(rhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
             // Construct the execution device inputs that consist of our two tensors.
             let inputs = ExecutionDeviceInputs {
@@ -4541,6 +4580,48 @@ mod tests {
     }
 
     #[test]
+    fn test_execution_fence_ready() {
+        /// Waker that records whether it was woken.
+        struct RecordingWaker(AtomicBool);
+
+        impl Wake for RecordingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let client = test_cpu_client();
+        let recorder = Arc::new(RecordingWaker(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&recorder));
+        let mut context = Context::from_waker(&waker);
+
+        // A pending fence suspends the task instead of blocking it, and completion wakes the task.
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let mut ready = pin!(fence.ready());
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Pending);
+        assert!(!recorder.0.load(Ordering::SeqCst));
+        promise.set(None).unwrap();
+        fence.block_until_ready().unwrap();
+        assert!(recorder.0.load(Ordering::SeqCst));
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Ready(Ok(())));
+
+        // A completed fence is ready within one poll, and a failed one returns its error.
+        assert_eq!(pin!(ExecutionFence::new(Vec::new()).ready()).poll(&mut context), Poll::Ready(Ok(())));
+        let expected = Error::aborted("asynchronous execution failed");
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(expected.clone())).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        fence.block_until_ready().unwrap_err();
+        let Poll::Ready(Err(error)) = pin!(fence.ready()).poll(&mut context) else {
+            panic!("expected the failed fence to be ready with its error");
+        };
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.message(), expected.message());
+    }
+
+    #[test]
     fn test_execution_fence_notifies_callbacks_before_and_after_completion() {
         let client = test_cpu_client();
         let (event, promise) = client.event(()).unwrap();
@@ -4690,13 +4771,13 @@ mod tests {
         ));
 
         let device_0_inputs: Vec<ExecutionInput> = vec![
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[0].clone(), None).unwrap().into(),
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[0].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[0].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[0].clone(), None).unwrap().into(),
         ];
 
         let device_1_inputs: Vec<ExecutionInput> = vec![
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap().into(),
         ];
 
         // `LoadedExecutable::execute` expects a `Vec` of inputs per device, where each `Vec` contains two inputs.
@@ -4757,11 +4838,11 @@ mod tests {
         let device_1_inputs: Vec<ExecutionInput> = vec![
             ExecutionInput {
                 buffer: Arc::new(
-                    client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap(),
+                    client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap(),
                 ),
                 donatable: true,
             },
-            client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
+            client.buffer(&[0u8; 4], BufferType::I32, [], None, devices[1].clone(), None).unwrap().into(),
         ];
         let inputs = vec![
             ExecutionDeviceInputs { inputs: &device_0_inputs, ..Default::default() },
@@ -4802,7 +4883,7 @@ mod tests {
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_bytes = lhs_bytes.as_slice();
                     let lhs_buffer =
-                        client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create the second input tensor: `[35, -41]`.
                     let mut rhs_bytes = Vec::with_capacity(8);
@@ -4810,7 +4891,7 @@ mod tests {
                     rhs_bytes.extend_from_slice(&(-41i32).to_ne_bytes());
                     let rhs_bytes = rhs_bytes.as_slice();
                     let rhs_buffer =
-                        client.buffer(rhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(rhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create a _send_ callback that simply records the values it receives.
                     let observed_value = Arc::new(Mutex::new(None));
@@ -4894,7 +4975,7 @@ mod tests {
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_bytes = lhs_bytes.as_slice();
                     let lhs_buffer =
-                        client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create a _receive_ callback that streams the second input tensor to the device in two chunks.
                     let receive_callback = client.receive_callback(1, move |stream| {
@@ -4994,7 +5075,7 @@ mod tests {
                     lhs_bytes.extend_from_slice(&(-1i32).to_ne_bytes());
                     let lhs_bytes = lhs_bytes.as_slice();
                     let lhs_buffer =
-                        client.buffer(lhs_bytes, BufferType::I32, &[2, 1], None, device.clone(), None).unwrap();
+                        client.buffer(lhs_bytes, BufferType::I32, [2, 1], None, device.clone(), None).unwrap();
 
                     // Create a _send_ callback that records the values observed from the device.
                     let observed_value = Arc::new(Mutex::new(None));
@@ -5056,7 +5137,6 @@ mod tests {
                         inputs: &[ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false }],
                         send_callbacks: vec![send_callback],
                         receive_callbacks: vec![receive_callback],
-                        ..Default::default()
                     };
 
                     // Execute the test program.

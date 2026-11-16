@@ -3951,6 +3951,7 @@ mod tests {
         // application is retained is decided entirely by the summaries of its attached regions. `Effectful`
         // supplies each explicit effect class for the bodies, `Deferred` supplies deferred work, and `Native`
         // supplies the reference primitives.
+        #[allow(clippy::large_enum_variant)]
         #[derive(Clone, Debug)]
         enum TestOperation {
             Native(ArrayIrOperation<Array>),

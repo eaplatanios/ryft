@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn test_tag_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.tag("residual")?),
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| input.tag("residual"),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();

@@ -1929,6 +1929,7 @@ impl DiskCacheDigest {
     }
 
     /// Returns the lowercase hexadecimal encoding of this digest, which is suitable for filenames.
+    #[allow(clippy::wrong_self_convention)]
     #[inline]
     fn to_hex(&self) -> String {
         self.bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -2003,6 +2004,9 @@ mod tests {
         }
     }
 
+    /// One-shot backend compiler that a [`TestDomain`] runs in place of real compilation.
+    type TestCompiler = Box<dyn FnOnce() -> Result<TestCompiledProgram, ProgramError> + Send>;
+
     /// Compilation domain whose flags select the persistence and codec behavior that each test exercises.
     #[derive(Clone, Default)]
     struct TestDomain {
@@ -2025,7 +2029,7 @@ mod tests {
         accept_all_programs: bool,
 
         /// One-shot backend compiler shared by clones of this fixture domain.
-        compiler: Option<Arc<Mutex<Option<Box<dyn FnOnce() -> Result<TestCompiledProgram, ProgramError> + Send>>>>>,
+        compiler: Option<Arc<Mutex<Option<TestCompiler>>>>,
     }
 
     impl TestDomain {

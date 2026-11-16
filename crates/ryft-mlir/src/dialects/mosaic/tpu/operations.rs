@@ -58,8 +58,7 @@ pub fn all_reduce<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAllReduceOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.all_reduce", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(DIM_ATTRIBUTE, dim)?;
     builder = builder.add_attribute(KIND_ATTRIBUTE, kind)?;
@@ -113,8 +112,7 @@ pub fn reduce_index<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReduceIndexOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.reduce_index", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(AXIS_ATTRIBUTE, axis)?;
     builder = builder.add_attribute(KIND_ATTRIBUTE, kind)?;
@@ -169,7 +167,6 @@ pub fn scan<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.push(input);
     if let Some(mask) = mask {
         operands.push(mask);
-    } else {
     }
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(KIND_ATTRIBUTE, kind)?;
@@ -254,7 +251,6 @@ pub fn sort<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.push(values);
     if let Some(mask) = mask {
         operands.push(mask);
-    } else {
     }
     builder = builder.add_operands(&operands)?;
     if let Some(descending) = descending {
@@ -1141,8 +1137,7 @@ pub fn rotate<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRotateOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.rotate", location);
-    let mut operands = Vec::new();
-    operands.push(value);
+    let operands = vec![value];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(AMOUNT_ATTRIBUTE, amount)?;
     builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
@@ -1209,9 +1204,7 @@ pub fn dynamic_rotate<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDynamicRotateOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.dynamic_rotate", location);
-    let mut operands = Vec::new();
-    operands.push(value);
-    operands.push(amount);
+    let operands = vec![value, amount];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
     if let Some(stride) = stride {
@@ -1262,9 +1255,7 @@ pub fn scan_count<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedScanCountOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.scan_count", location);
-    let mut operands = Vec::new();
-    operands.push(in_mask);
-    operands.push(values);
+    let operands = vec![in_mask, values];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(out_mask_type)?;
     builder = builder.add_result(counts_type)?;
@@ -1330,8 +1321,7 @@ pub fn reshape<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.reshape", location);
-    let mut operands = Vec::new();
-    operands.push(source);
+    let operands = vec![source];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -1377,8 +1367,7 @@ pub fn repeat<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRepeatOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.repeat", location);
-    let mut operands = Vec::new();
-    operands.push(source);
+    let operands = vec![source];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
     builder = builder.add_attribute(TIMES_ATTRIBUTE, times)?;
@@ -1420,8 +1409,7 @@ pub fn broadcast_in_sublanes<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBroadcastInSublanesOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.broadcast_in_sublanes", location);
-    let mut operands = Vec::new();
-    operands.push(source);
+    let operands = vec![source];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(LANE_ATTRIBUTE, lane)?;
     builder = builder.add_result(output_type)?;
@@ -1524,8 +1512,7 @@ pub fn unpack_subelements<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedUnpackSubelementsOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.unpack_subelements", location);
-    let mut operands = Vec::new();
-    operands.push(source);
+    let operands = vec![source];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(INDEX_ATTRIBUTE, index)?;
     builder = builder.add_attribute(PACK_FORMAT_ATTRIBUTE, pack_format)?;
@@ -1549,7 +1536,7 @@ pub trait PackSubelementsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `sources` operands.
     fn sources(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `positions` attribute.
@@ -1619,7 +1606,7 @@ pub trait PackElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `sources` operands.
     fn sources(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `target_type` attribute.
@@ -1694,8 +1681,7 @@ pub fn unpack_elementwise<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedUnpackElementwiseOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.unpack_elementwise", location);
-    let mut operands = Vec::new();
-    operands.push(source);
+    let operands = vec![source];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(SOURCE_TYPE_ATTRIBUTE, source_type)?;
     builder = builder.add_attribute(INDEX_ATTRIBUTE, index)?;
@@ -1729,8 +1715,7 @@ pub fn relayout<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRelayoutOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.relayout", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
@@ -1742,7 +1727,7 @@ pub trait PackMaskOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `sources` operands.
     fn sources(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `positions` attribute.
@@ -1816,8 +1801,7 @@ pub fn gather<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedGatherOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.gather", location);
-    let mut operands = Vec::new();
-    operands.push(source);
+    let operands = vec![source];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(INDICES_ATTRIBUTE, indices)?;
     builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
@@ -1862,9 +1846,7 @@ pub fn dynamic_gather<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDynamicGatherOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.dynamic_gather", location);
-    let mut operands = Vec::new();
-    operands.push(source);
-    operands.push(indices);
+    let operands = vec![source, indices];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(DIMENSIONS_ATTRIBUTE, dimensions)?;
     builder = builder.add_result(output_type)?;
@@ -1912,8 +1894,7 @@ pub fn fp_to_si<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedFpToSiOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.fptosi", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
     builder = builder.add_result(output_type)?;
@@ -1957,8 +1938,7 @@ pub fn fp_to_ui<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedFpToUiOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.fptoui", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
     builder = builder.add_result(output_type)?;
@@ -2002,8 +1982,7 @@ pub fn si_to_fp<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSiToFpOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sitofp", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
     builder = builder.add_result(output_type)?;
@@ -2047,8 +2026,7 @@ pub fn ui_to_fp<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedUiToFpOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.uitofp", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
     builder = builder.add_result(output_type)?;
@@ -2080,8 +2058,7 @@ pub fn ext_f<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedExtFOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.extf", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(out_type)?;
     let operation = builder.build()?;
@@ -2124,8 +2101,7 @@ pub fn trunc_f<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedTruncFOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.truncf", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
     builder = builder.add_result(out_type)?;
@@ -2221,6 +2197,7 @@ mlir_op_trait!(Matmul, ZeroRegions);
 mlir_op_trait!(Matmul, ZeroSuccessors);
 
 /// Creates a detached Mosaic TPU [`Operation`] for `tpu.matmul`.
+#[allow(clippy::too_many_arguments)]
 pub fn matmul<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     lhs: ValueRef<'o, 'c, 't>,
     rhs: ValueRef<'o, 'c, 't>,
@@ -2233,10 +2210,7 @@ pub fn matmul<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMatmulOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.matmul", location);
-    let mut operands = Vec::new();
-    operands.push(lhs);
-    operands.push(rhs);
-    operands.push(acc);
+    let operands = vec![lhs, rhs, acc];
     builder = builder.add_operands(&operands)?;
     if let Some(transpose_lhs) = transpose_lhs {
         builder = builder.add_attribute(TRANSPOSE_LHS_ATTRIBUTE, transpose_lhs)?;
@@ -2328,8 +2302,7 @@ pub fn matmul_push_rhs<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMatmulPushRhsOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.matmul_push_rhs", location);
-    let mut operands = Vec::new();
-    operands.push(rhs);
+    let operands = vec![rhs];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index)?;
     if let Some(staging_register) = staging_register {
@@ -2389,8 +2362,7 @@ pub fn matmul_acc_lhs<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMatmulAccLhsOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.matmul_acc_lhs", location);
-    let mut operands = Vec::new();
-    operands.push(lhs);
+    let operands = vec![lhs];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(ACC_ATTRIBUTE, acc)?;
     builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index)?;
@@ -2445,7 +2417,7 @@ pub trait ConcatenateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `sources` operands.
     fn sources(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `dimension` attribute.
@@ -2504,8 +2476,7 @@ pub fn bitcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBitcastOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.bitcast", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
@@ -2536,8 +2507,7 @@ pub fn bitcast_vreg<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBitcastVregOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.bitcast_vreg", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
@@ -2568,8 +2538,7 @@ pub fn weird<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedWeirdOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.weird", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
@@ -2646,8 +2615,7 @@ pub fn reciprocal<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReciprocalOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.reciprocal", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     if let Some(approx) = approx {
         builder = builder.add_attribute(APPROX_ATTRIBUTE, approx)?;
@@ -2690,9 +2658,7 @@ pub fn stochastic_convert<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedStochasticConvertOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.stochastic_convert", location);
-    let mut operands = Vec::new();
-    operands.push(input);
-    operands.push(random);
+    let operands = vec![input, random];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
@@ -2739,9 +2705,7 @@ pub fn stochastic_convert_elementwise<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedStochasticConvertElementwiseOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.stochastic_convert_elementwise", location);
-    let mut operands = Vec::new();
-    operands.push(input);
-    operands.push(random);
+    let operands = vec![input, random];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(DST_TYPE_ATTRIBUTE, dst_type)?;
     builder = builder.add_result(output_type)?;
@@ -2755,7 +2719,7 @@ pub trait RollVectorsOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `input` operands.
     fn input(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `output` result.
@@ -2807,8 +2771,7 @@ pub fn unroll_vectors<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedUnrollVectorsOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.unroll_vectors", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_results(result_types)?;
     let operation = builder.build()?;
@@ -2821,13 +2784,13 @@ pub trait CreateMaskOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `low` operands.
     fn low(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0) / 2;
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `high` operands.
     fn high(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0) / 2;
-        (0..count).map(|index| self.operand_value(0 + count + index)).collect()
+        (0..count).map(|index| self.operand_value(count + index)).collect()
     }
 
     /// Returns the `output` result.
@@ -2935,8 +2898,7 @@ pub fn assume_multiple<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAssumeMultipleOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.assume_multiple", location);
-    let mut operands = Vec::new();
-    operands.push(value);
+    let operands = vec![value];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(MULTIPLE_ATTRIBUTE, multiple)?;
     builder = builder.add_result(result_type)?;
@@ -3033,8 +2995,7 @@ pub fn mem_ref_squeeze<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMemRefSqueezeOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.memref_squeeze", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3066,8 +3027,7 @@ pub fn mem_ref_reshape<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMemRefReshapeOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.memref_reshape", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3099,8 +3059,7 @@ pub fn mem_ref_bitcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMemRefBitcastOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.memref_bitcast", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3132,8 +3091,7 @@ pub fn reinterpret_cast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReinterpretCastOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.reinterpret_cast", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3165,8 +3123,7 @@ pub fn assume_layout<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAssumeLayoutOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.assume_layout", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3198,8 +3155,7 @@ pub fn erase_layout<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedEraseLayoutOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.erase_memref_layout", location);
-    let mut operands = Vec::new();
-    operands.push(operand);
+    let operands = vec![operand];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3254,8 +3210,7 @@ pub fn semaphore_read<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSemaphoreReadOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sem_read", location);
-    let mut operands = Vec::new();
-    operands.push(semaphore);
+    let operands = vec![semaphore];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -3287,9 +3242,7 @@ pub fn semaphore_wait<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSemaphoreWaitOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sem_wait", location);
-    let mut operands = Vec::new();
-    operands.push(semaphore);
-    operands.push(amount);
+    let operands = vec![semaphore, amount];
     builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSemaphoreWaitOperation>() }
@@ -3481,8 +3434,7 @@ pub fn barrier<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedBarrierOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.barrier", location);
-    let mut operands = Vec::new();
-    operands.push(barrier_id);
+    let operands = vec![barrier_id];
     builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedBarrierOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3632,6 +3584,7 @@ mlir_op_trait!(EnqueueDma, ZeroRegions);
 mlir_op_trait!(EnqueueDma, ZeroSuccessors);
 
 /// Creates a detached Mosaic TPU [`Operation`] for `tpu.enqueue_dma`.
+#[allow(clippy::too_many_arguments)]
 pub fn enqueue_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'o, 'c, 't>,
     source_semaphore: Option<ValueRef<'o, 'c, 't>>,
@@ -3756,14 +3709,9 @@ pub fn enqueue_indirect_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedEnqueueIndirectDmaOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.enqueue_indirect_dma", location);
-    let mut operands = Vec::new();
-    operands.push(source);
-    operands.push(target);
-    operands.push(offsets);
-    operands.push(semaphore);
+    let mut operands = vec![source, target, offsets, semaphore];
     if let Some(offset_filter) = offset_filter {
         operands.push(offset_filter);
-    } else {
     }
     builder = builder.add_operands(&operands)?;
     if let Some(add) = add {
@@ -3938,10 +3886,7 @@ pub fn wait_indirect_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedWaitIndirectDmaOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.wait_indirect_dma", location);
-    let mut operands = Vec::new();
-    operands.push(semaphore);
-    operands.push(source);
-    operands.push(destination);
+    let operands = vec![semaphore, source, destination];
     builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedWaitIndirectDmaOperation>() }
@@ -4093,8 +4038,7 @@ pub fn trace_value<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedTraceValueOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.trace_value", location);
-    let mut operands = Vec::new();
-    operands.push(value);
+    let operands = vec![value];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(LABEL_ATTRIBUTE, label)?;
     let operation = builder.build()?;
@@ -4106,7 +4050,7 @@ pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `results` operands.
     fn results(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -4145,8 +4089,7 @@ pub fn delay<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDelayOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.delay", location);
-    let mut operands = Vec::new();
-    operands.push(nanoseconds);
+    let operands = vec![nanoseconds];
     builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedDelayOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -4176,8 +4119,7 @@ pub fn mask_cast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMaskCastOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.mask_cast", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
@@ -4246,7 +4188,7 @@ pub trait PrngSeed32Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `seeds` operands.
     fn seeds(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -4331,9 +4273,7 @@ pub fn sublane_shuffle<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedSublaneShuffleOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sublane_shuffle", location);
-    let mut operands = Vec::new();
-    operands.push(lhs);
-    operands.push(rhs);
+    let operands = vec![lhs, rhs];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(PATTERN_ATTRIBUTE, pattern)?;
     builder = builder.add_result(result_type)?;
@@ -4375,8 +4315,7 @@ pub fn transpose<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedTransposeOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.transpose", location);
-    let mut operands = Vec::new();
-    operands.push(vector);
+    let operands = vec![vector];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(PERMUTATION_ATTRIBUTE, permutation)?;
     builder = builder.add_result(result_type)?;
@@ -4395,7 +4334,7 @@ pub trait LogOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `inputs` operands.
     fn inputs(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
         let count = self.operand_count().saturating_sub(0);
-        (0..count).map(|index| self.operand_value(0 + index)).collect()
+        (0..count).map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the `tag` attribute.
@@ -4479,8 +4418,7 @@ pub fn log_buffer<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedLogBufferOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.log_buffer", location);
-    let mut operands = Vec::new();
-    operands.push(input);
+    let operands = vec![input];
     builder = builder.add_operands(&operands)?;
     builder = builder.add_attribute(SHAPE_ATTRIBUTE, shape)?;
     builder = builder.add_attribute(TAG_ATTRIBUTE, tag)?;
@@ -4504,7 +4442,7 @@ pub trait FetchAndAddSyncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `value` operand.
     fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         let count = self.operand_count().saturating_sub(3);
-        self.operand_value(1 + count + 0)
+        self.operand_value(1 + count)
     }
 
     /// Returns the `core_id` operand.

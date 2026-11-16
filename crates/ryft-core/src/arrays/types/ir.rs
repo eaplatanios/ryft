@@ -1151,7 +1151,7 @@ mod tests {
             &[vector(m.clone().into()), vector(Dimension::Static(2))],
         )
         .unwrap();
-        assert_eq!(scoped.identities_needing_runtime_checks(), &[n.clone()]);
+        assert_eq!(scoped.identities_needing_runtime_checks(), std::slice::from_ref(&n));
         assert_eq!(scoped.refine_actual(&vector(m.clone().into()), &[]), Ok(vector(Dimension::Static(2))));
         let wide = DimensionVariable::new("wide", DimensionBounds::positive(Some(16)).unwrap());
         assert!(

@@ -1701,7 +1701,7 @@ mod tests {
     ) -> Result<TestTracer, ProgramError> {
         fn expand<V: Dot + Tag + Broadcast + Typed<Type = ArrayType>>(w: V, u: V) -> Result<V, ProgramError> {
             let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
-            Ok(w.dot(&u, &dimensions)?.tag("compact")?.broadcast_to(StaticShape::new(vec![4, 8]))?)
+            w.dot(&u, &dimensions)?.tag("compact")?.broadcast_to(StaticShape::new(vec![4, 8]))
         }
 
         let (w, u, us) = (w.stop_gradient()?, u.stop_gradient()?, us.stop_gradient()?);
@@ -1712,7 +1712,7 @@ mod tests {
                 |(w, u)| expand(w, u),
                 |(w, u)| {
                     let e = expand(w, u)?;
-                    Ok(e.add(&e)?)
+                    e.add(&e)
                 },
                 (w, u),
             )?
@@ -1735,7 +1735,7 @@ mod tests {
                             |(w, u)| expand(w, u),
                             |(w, u)| {
                                 let e = expand(w, u)?;
-                                Ok(e.add(&e)?)
+                                e.add(&e)
                             },
                             (w.clone(), u),
                         )?
@@ -1751,7 +1751,7 @@ mod tests {
             )?;
             e
         };
-        Ok(x.mul(&e)?.reduce(&[0, 1], ReductionKind::Sum)?)
+        x.mul(&e)?.reduce(&[0, 1], ReductionKind::Sum)
     }
 
     /// Asserts that [`compact_expansion`] over `region`, rematerialized with `policy`, saves the `expected` residuals
@@ -1788,7 +1788,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_with_policy() {
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSavable);
+        let function = rematerialize(|x: TestTracer| x.sin()).with_policy(DotsSavable);
         let program = trace(|x| function.call(x));
         assert_eq!(operation(&program, 0).policy().name(), DOTS_SAVABLE_POLICY_NAME);
         assert_eq!(
@@ -1814,7 +1814,7 @@ mod tests {
         .with_name("configured");
         let policy = ResidualPolicyReference::new(policy)
             .with_projection_fallback::<ArrayIrType, _>(|_| Ok(ResidualDecision::Save));
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy_reference(policy.clone());
+        let function = rematerialize(|x: TestTracer| x.sin()).with_policy_reference(policy.clone());
         let clone = function.clone();
         let program = trace(|x| clone.call(function.call(x)?));
         assert_eq!(
@@ -1905,7 +1905,7 @@ mod tests {
     fn test_rematerialized_function_with_optimization_barrier() {
         // Calls place an optimization barrier on all of their inputs by default, and the selection carries over to
         // every staged call.
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
+        let function = rematerialize(|x: TestTracer| x.sin());
         assert_eq!(
             operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
             &RematerializationOptimizationBarrier::All,
@@ -1926,7 +1926,7 @@ mod tests {
     fn test_rematerialized_function_call() {
         // Each call stages one `rematerialize` operation, whose body is the traced closure, into the domain of its
         // inputs. Repeated calls of one function stage equal operations because they share the reference to its policy.
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
+        let function = rematerialize(|x: TestTracer| x.sin());
         let program = trace(|x| function.call(function.call(x)?));
         assert_eq!(
             program.to_string(),
@@ -1982,11 +1982,11 @@ mod tests {
         // only choosing among the values that ordinary linearization would save.
         let x = Array::vector(vec![0.1f64, 0.2]).unwrap();
         let sine_of_dot = |x: TestTracer| -> Result<TestTracer, ProgramError> {
-            Ok(x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?)
+            x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()
         };
         let function = rematerialize(sine_of_dot);
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
-        assert_eq!(pullback.residuals(), &[x.clone()]);
+        assert_eq!(pullback.residuals(), std::slice::from_ref(&x));
         let function = rematerialize(sine_of_dot).with_policy(DotsSavable);
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.residuals(), &[x, Array::scalar(0.1f64 * 0.1 + 0.2 * 0.2).unwrap()]);
@@ -1997,15 +1997,15 @@ mod tests {
         // Saving everything for `x ↦ exp(x)` saves only `exp(x)`, as differentiating `exp` directly does, and
         // linearization saves the same values as reverse mode differentiation, according to the policy.
         let x = Array::scalar(0.7f64).unwrap();
-        let (_, direct) = differentiate_at(x.clone()).vjp(|x| Ok(x.exp()?)).unwrap();
-        let function = rematerialize(|x: TestTracer| Ok(x.exp()?)).with_policy(EverythingSavable);
+        let (_, direct) = differentiate_at(x.clone()).vjp(|x| x.exp()).unwrap();
+        let function = rematerialize(|x: TestTracer| x.exp()).with_policy(EverythingSavable);
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.residuals(), direct.residuals());
         assert_eq!(pullback.residuals(), &[Array::scalar(0.7f64.exp()).unwrap()]);
-        let function = rematerialize(|x: TestTracer| Ok((x.clone() * x).sin()?));
+        let function = rematerialize(|x: TestTracer| (x.clone() * x).sin());
         let (_, pushforward) = differentiate_at(x.clone()).linearize(|x| function.call(x)).unwrap();
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
-        assert_eq!(pushforward.residuals(), &[x.clone()]);
+        assert_eq!(pushforward.residuals(), std::slice::from_ref(&x));
         assert_eq!(pullback.residuals(), &[x]);
 
         // A zero that `zero_like` produces from a value without a tangent contributes no tangent term, so
@@ -2078,7 +2078,7 @@ mod tests {
         let function = rematerialize(move |(_reference, x): (TestIrTracer, TestIrTracer)| sine_of_square(x));
         let reference = TestIrValue::Reference(ArrayReference::new(Array::scalar(0.0f32).unwrap()));
         let (_, with_reference) = differentiate_at((reference, x.clone())).vjp(|inputs| function.call(inputs)).unwrap();
-        assert_eq!(without_reference.residuals(), &[x.clone()]);
+        assert_eq!(without_reference.residuals(), std::slice::from_ref(&x));
         assert_eq!(with_reference.residuals(), &[x]);
     }
 
@@ -2144,7 +2144,7 @@ mod tests {
         let w = Array::scalar(3.0f64).unwrap();
         let function = rematerialize(|x: TestTracer| {
             let w = x.context().lift(w.clone())?;
-            Ok(x.mul(&w)?.sin()?)
+            x.mul(&w)?.sin()
         });
         let x = Array::scalar(0.5f64).unwrap();
         assert_eq!(function.call(x.clone()), Ok(Array::scalar(1.5f64.sin()).unwrap()));
@@ -2160,7 +2160,7 @@ mod tests {
     fn test_rematerialized_function_call_with_outer_values() {
         // A rematerialized function nested in another one receives the outer value `w` as an explicit input, so the
         // gradient of `(x, w) ↦ sin(x · w)` covers both `x` and `w`.
-        let inner = rematerialize(|(x, w): (TestTracer, TestTracer)| Ok(x.mul(&w)?.sin()?));
+        let inner = rematerialize(|(x, w): (TestTracer, TestTracer)| x.mul(&w)?.sin());
         let outer = rematerialize(|(x, w): (TestTracer, TestTracer)| inner.call((x, w)));
         let inputs = (Array::scalar(0.5f64).unwrap(), Array::scalar(3.0f64).unwrap());
         assert_eq!(
@@ -2170,7 +2170,7 @@ mod tests {
 
         // Closing over the tracer `w` of the outer body instead mixes the traces of the two bodies, which is rejected.
         let outer = rematerialize(|(x, w): (TestTracer, TestTracer)| {
-            rematerialize(move |x: TestTracer| Ok(x.mul(&w)?.sin()?)).call(x)
+            rematerialize(move |x: TestTracer| x.mul(&w)?.sin()).call(x)
         });
         assert_eq!(outer.call(inputs).map(|_| ()), Err(ProgramError::MismatchedProgramBuilders));
     }
@@ -2192,7 +2192,7 @@ mod tests {
         // An explicit context stages the same call as the domain recovered by `call`.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let function = rematerialize(|inputs: Vec<TestTracer>| -> Result<Vec<TestTracer>, ProgramError> {
-            inputs.into_iter().map(|x| Ok(x.sin()?)).collect()
+            inputs.into_iter().map(|x| x.sin()).collect()
         });
         assert_eq!(
             function.call_in_context(&context, vec![Array::scalar(0.5f64).unwrap()]),
@@ -2245,7 +2245,7 @@ mod tests {
     #[test]
     fn test_rematerialized_function_clone() {
         // Clones share the reference to the policy of the function, so their calls stage equal operations.
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSavable);
+        let function = rematerialize(|x: TestTracer| x.sin()).with_policy(DotsSavable);
         let clone = function.clone();
         let program = trace(|x| clone.call(function.call(x)?));
         assert_eq!(operation(&program, 0), operation(&program, 1));
@@ -2258,7 +2258,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_debug() {
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?))
+        let function = rematerialize(|x: TestTracer| x.sin())
             .with_optimization_barrier(RematerializationOptimizationBarrier::None);
         assert_eq!(
             format!("{function:?}"),
@@ -2274,7 +2274,7 @@ mod tests {
     #[test]
     fn test_rematerialize() {
         // Functions that use the default policy share its reference, so their calls stage equal operations.
-        let sine = rematerialize(|x: TestTracer| Ok(x.sin()?));
+        let sine = rematerialize(|x: TestTracer| x.sin());
         let identity = rematerialize(|x: TestTracer| Ok(x));
         let program = trace(|x| identity.call(sine.call(x)?));
         assert_eq!(operation(&program, 0), operation(&program, 1));
@@ -2342,7 +2342,7 @@ mod tests {
         let input = SavedResidual::new(vector_type.clone(), ResidualSource::Input { index: 0 });
         let sine_of_dot = |x: TestTracer| -> Result<TestTracer, ProgramError> {
             let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
-            Ok(x.dot(&x, &dimensions)?.tag("dot")?.sin()?)
+            x.dot(&x, &dimensions)?.tag("dot")?.sin()
         };
         let function = rematerialize(sine_of_dot);
         assert_eq!(saved_residuals(|x: TestTracer| function.call(x), vector_type.clone()), Ok(vec![input.clone()]));
@@ -2374,7 +2374,7 @@ mod tests {
         );
 
         // Reverse mode rules decide what is saved: a composite with only a reverse mode rule saves its residual.
-        let sine = composite(|x: TestTracer| Ok(x.sin()?))
+        let sine = composite(|x: TestTracer| x.sin())
             .with_vjp(|x: TestTracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
         let function = rematerialize(move |x: TestTracer| sine.call(x)).with_policy(EverythingSavable);
         assert_eq!(

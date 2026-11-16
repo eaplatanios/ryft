@@ -527,14 +527,8 @@ mod tests {
 
         // Each selected axis varies independently and repeats along every other axis.
         let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
-        assert_eq!(
-            context.iota(&output_type, 0),
-            Array::from_elements(output_type.clone(), &[0i32, 0, 0, 1, 1, 1]).map_err(Into::into),
-        );
-        assert_eq!(
-            context.iota(&output_type, 1),
-            Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).map_err(Into::into),
-        );
+        assert_eq!(context.iota(&output_type, 0), Array::from_elements(output_type.clone(), &[0i32, 0, 0, 1, 1, 1]),);
+        assert_eq!(context.iota(&output_type, 1), Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]),);
 
         // Iota uses the checked element codecs for sub-byte values.
         assert_eq!(
@@ -568,9 +562,9 @@ mod tests {
 
         // Empty arrays do not compute coordinates or unused strides, even if the nonzero sizes would overflow.
         let empty_type = ArrayType::new_static(DataType::I32, [0, usize::MAX, usize::MAX]);
-        assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]).map_err(Into::into));
+        assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]));
         let empty_type = ArrayType::new_static(DataType::I32, [usize::MAX, usize::MAX, 0]);
-        assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]).map_err(Into::into));
+        assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]));
 
         // Nonempty oversized shapes are rejected before allocating storage, in both debug and release builds.
         let oversized_type = ArrayType::new_static(DataType::I32, [1, usize::MAX, 2]);
@@ -775,7 +769,7 @@ mod tests {
     fn test_iota_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::new_static(DataType::F64, [2]));
-        let input_cotangents = IotaOperation::new(ArrayType::new_static(DataType::F64, [2]), 0)
+        IotaOperation::new(ArrayType::new_static(DataType::F64, [2]), 0)
             .unwrap()
             .transpose(
                 &mut TranspositionContext::new(context),
@@ -785,7 +779,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(input_cotangents, ());
+        assert_eq!((), ());
     }
 
     #[test]

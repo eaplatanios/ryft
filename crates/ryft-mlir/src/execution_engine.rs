@@ -130,7 +130,7 @@ pub enum OptimizationLevel {
 ///     // Obtain function pointers in Rust and invoke them manually. Note that the type signatures in the `transmute`
 ///     // invocations must match exactly the underlying LLVM function type signatures. Mismatched type signatures
 ///     // result in undefined behavior.
-///     let example_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(
+///     let example_fn = std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(i32) -> i32>(
 ///         engine.get_function("example").ok_or_else(|| {
 ///             std::io::Error::new(std::io::ErrorKind::NotFound, "missing example function")
 ///         })?,
@@ -138,7 +138,7 @@ pub enum OptimizationLevel {
 ///     assert_eq!(example_fn(42), 253);
 ///
 ///     // You can also obtain function pointers to registered external functions.
-///     let callback_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(
+///     let callback_fn = std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(i32) -> i32>(
 ///         engine.get_function("callback").ok_or_else(|| {
 ///             std::io::Error::new(std::io::ErrorKind::NotFound, "missing callback function")
 ///         })?,
@@ -395,13 +395,13 @@ mod tests {
 
             // Verify that we can obtain a pointer to the `@example` function and invoke it.
             let example_fn = engine.get_function("example").unwrap();
-            let example_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(example_fn);
+            let example_fn = std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(i32) -> i32>(example_fn);
             assert_eq!(example_fn(42), 84);
 
             // Verify that we can dump the compiled object into a file.
             let object_file = tempfile::NamedTempFile::new().unwrap();
             let object_file_path = object_file.path();
-            engine.dump_to_object_file(&object_file_path);
+            engine.dump_to_object_file(object_file_path);
             assert!(object_file_path.exists());
             assert!(std::fs::metadata(object_file_path).unwrap().len() > 0);
         }
@@ -431,18 +431,18 @@ mod tests {
 
             // Verify that we can obtain a pointer to the `@example` function and invoke it.
             let example_fn = engine.get_function("example").unwrap();
-            let example_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(example_fn);
+            let example_fn = std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(i32) -> i32>(example_fn);
             assert_eq!(example_fn(42), 253);
 
             // Verify that we can obtain a pointer to the `@callback` function and invoke it.
             let callback_fn = engine.get_function("callback").unwrap();
-            let callback_fn = std::mem::transmute::<_, extern "C" fn(i32) -> i32>(callback_fn);
+            let callback_fn = std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(i32) -> i32>(callback_fn);
             assert_eq!(callback_fn(42), 211);
 
             // Verify that we can dump the compiled object into a file.
             let object_file = tempfile::NamedTempFile::new().unwrap();
             let object_file_path = object_file.path();
-            engine.dump_to_object_file(&object_file_path);
+            engine.dump_to_object_file(object_file_path);
             assert!(object_file_path.exists());
             assert!(std::fs::metadata(object_file_path).unwrap().len() > 0);
         }
@@ -479,7 +479,7 @@ mod tests {
             let engine = engine.initialize();
             let object_file = tempfile::NamedTempFile::new().unwrap();
             let object_file_path = object_file.path();
-            engine.dump_to_object_file(&object_file_path);
+            engine.dump_to_object_file(object_file_path);
             assert!(object_file_path.exists());
             assert_eq!(std::fs::metadata(object_file_path).unwrap().len(), 0);
         }

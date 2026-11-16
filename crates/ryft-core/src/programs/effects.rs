@@ -1084,12 +1084,26 @@ mod tests {
             Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
 
         // Well-typed declarations on existing positions are accepted, and so is the empty declaration on anything.
-        assert_eq!(read.validate_application("test.read", &[reference.clone()], &[array.clone()]), Ok(()));
         assert_eq!(
-            allocation.validate_application("test.reference_new", &[array.clone()], &[reference.clone()]),
+            read.validate_application("test.read", std::slice::from_ref(&reference), std::slice::from_ref(&array)),
             Ok(())
         );
-        assert_eq!(Effects::empty().validate_application("test.add", &[array.clone()], &[array.clone()]), Ok(()));
+        assert_eq!(
+            allocation.validate_application(
+                "test.reference_new",
+                std::slice::from_ref(&array),
+                std::slice::from_ref(&reference)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            Effects::empty().validate_application(
+                "test.add",
+                std::slice::from_ref(&array),
+                std::slice::from_ref(&array)
+            ),
+            Ok(())
+        );
 
         // Out-of-range positions are rejected with the application's arity.
         assert_eq!(
@@ -1099,7 +1113,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            allocation.validate_application("test.reference_new", &[array.clone()], &[]),
+            allocation.validate_application("test.reference_new", std::slice::from_ref(&array), &[]),
             Err(ProgramError::MalformedProgram(
                 "operation `test.reference_new` classifies output 0 but the application output count is 0".to_string(),
             )),
@@ -1107,13 +1121,17 @@ mod tests {
 
         // Non-reference endpoints are rejected for accesses and allocations alike.
         assert_eq!(
-            read.validate_application("test.read", &[array.clone()], &[array.clone()]),
+            read.validate_application("test.read", std::slice::from_ref(&array), std::slice::from_ref(&array)),
             Err(ProgramError::MalformedProgram(
                 "operation `test.read` names an accessed input 0 but it has non-reference type `f32[]`".to_string(),
             )),
         );
         assert_eq!(
-            allocation.validate_application("test.reference_new", &[array.clone()], &[array]),
+            allocation.validate_application(
+                "test.reference_new",
+                std::slice::from_ref(&array),
+                std::slice::from_ref(&array),
+            ),
             Err(ProgramError::MalformedProgram(
                 "operation `test.reference_new` classifies output 0 but it has non-reference type `f32[]`".to_string(),
             )),

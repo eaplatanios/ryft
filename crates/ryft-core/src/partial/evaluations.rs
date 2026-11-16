@@ -657,7 +657,7 @@ mod tests {
         let context = EagerContext::<TestValue, TestOperation>::new();
         let matching = TestValue::Array(Array::vector(vec![4f32; 2]).unwrap());
         assert_eq!(
-            evaluation.interpret(&context, &[matching.clone()]),
+            evaluation.interpret(&context, std::slice::from_ref(&matching)),
             program.interpret(vec![extent.clone(), matching]),
         );
         let mismatching = TestValue::Array(Array::vector(vec![4f32; 3]).unwrap());
@@ -1600,7 +1600,7 @@ mod tests {
         let dimension = TestValue::Dimension(DimensionValue::constant(3).unwrap());
         let output = TestValue::Array(Array::vector(vec![0f32; 3]).unwrap());
         let context = EagerContext::<TestValue, TestOperation>::new();
-        assert_eq!(evaluation.interpret(&context, &[dimension.clone()]), Ok(vec![output.clone()]));
+        assert_eq!(evaluation.interpret(&context, std::slice::from_ref(&dimension)), Ok(vec![output.clone()]));
         let outer = TracingContext::<TestValue, TestOperation>::new();
         let staged = program.partially_evaluate_in_context(&outer, &[PartialValue::Unknown(q.clone().into())]).unwrap();
         assert_eq!(staged.program().to_string(), expected);

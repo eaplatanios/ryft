@@ -2208,7 +2208,7 @@ mod tests {
         let selected =
             SelectedFoldOperation { output_types: vec![wide.clone()], outputs: vec![OperationFoldOutput::Singleton] };
         assert_eq!(
-            selected.resolve_fold::<DimensionValue>(&inputs, &[], &[wide.clone()]),
+            selected.resolve_fold::<DimensionValue>(&inputs, &[], std::slice::from_ref(&wide)),
             Err(TypeError::invalid(format!(
                 "`selected_fold` fold declares a singleton output but its type `{wide}` does not determine a value",
             ))),
@@ -2219,7 +2219,7 @@ mod tests {
         let selected =
             SelectedFoldOperation { output_types: vec![scalar.clone()], outputs: vec![OperationFoldOutput::Singleton] };
         assert_eq!(
-            selected.resolve_fold::<Array>(&[scalar.clone()], &[], &[scalar.clone()]),
+            selected.resolve_fold::<Array>(std::slice::from_ref(&scalar), &[], std::slice::from_ref(&scalar)),
             Err(TypeError::invalid(format!(
                 "`selected_fold` fold declares a singleton output but its type `{scalar}` does not determine a value",
             ))),

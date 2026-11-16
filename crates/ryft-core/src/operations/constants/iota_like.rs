@@ -362,7 +362,7 @@ mod tests {
             .with_sharding(sharding.clone())
             .unwrap();
         assert_eq!(
-            iota_like(0, DataType::F32).infer_output_types(&[exemplar_type.clone()], &[]),
+            iota_like(0, DataType::F32).infer_output_types(std::slice::from_ref(&exemplar_type), &[]),
             Ok(vec![exemplar_type.clone()]),
         );
         assert_eq!(
@@ -375,7 +375,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
-            iota_like(0, DataType::I64).infer_output_types(&[unreduced.clone()], &[]),
+            iota_like(0, DataType::I64).infer_output_types(std::slice::from_ref(&unreduced), &[]),
             Err(TypeError::invalid(format!(
                 "`{IOTA_LIKE_OPERATION_NAME}` cannot produce coordinates of type `{unreduced}` because it is \
                  unreduced over mesh axes",
@@ -514,7 +514,7 @@ mod tests {
         // The coordinates do not depend on the values of their exemplar, so their tangent is zero.
         assert_eq!(
             differentiate_at(Array::vector(vec![2.0f32, 3.0]).unwrap())
-                .jvp(Array::vector(vec![5.0f32, 7.0]).unwrap(), |x| Ok(x.add(&x.iota_like(0, DataType::F32)?)?)),
+                .jvp(Array::vector(vec![5.0f32, 7.0]).unwrap(), |x| x.add(&x.iota_like(0, DataType::F32)?)),
             Ok((Array::vector(vec![2.0f32, 4.0]).unwrap(), Array::vector(vec![5.0f32, 7.0]).unwrap())),
         );
     }
@@ -647,7 +647,7 @@ mod tests {
         let matrix = |values: Vec<f32>| ArrayIrValue::Array(Array::matrix(2, 2, values).unwrap());
         assert_eq!(
             batch(
-                |item| Ok(item.iota_like(0, DataType::F32)?),
+                |item| item.iota_like(0, DataType::F32),
                 matrix(vec![5.0, 6.0, 7.0, 8.0]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),

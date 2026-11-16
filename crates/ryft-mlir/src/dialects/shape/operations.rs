@@ -2116,7 +2116,7 @@ mod tests {
                     assuming(witness, &[size_type.as_ref()], assuming_block.try_into().unwrap(), location).unwrap();
                 assert_eq!(assuming_op.witness().unwrap(), witness);
                 assert_eq!(assuming_op.as_ref().region(0).unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(assuming_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(assuming_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let assuming_op = block.append_operation(assuming_op).unwrap();
                 let assuming_value = assuming_op.as_ref().result(0).unwrap().as_ref();
 

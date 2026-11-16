@@ -265,6 +265,7 @@ mlir_op_trait!(ForAll, SingleBlockRegions);
 mlir_op_trait!(ForAll, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ForAllOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn for_all<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     dynamic_lower_bounds: &[ValueRef<'v, 'c, 't>],
     dynamic_upper_bounds: &[ValueRef<'v, 'c, 't>],
@@ -1050,7 +1051,7 @@ mod tests {
                 let mut body_block = context.block(&[(index_type, location)]);
                 let reduce_op = reduce(&[initial_value], vec![reduction_region], location).unwrap();
                 assert_eq!(reduce_op.values().unwrap().collect::<Result<Vec<_>, _>>().unwrap(), vec![initial_value]);
-                assert_eq!(reduce_op.reductions().unwrap().into_iter().count(), 1);
+                assert_eq!(reduce_op.reductions().unwrap().count(), 1);
                 body_block.append_operation(reduce_op).unwrap();
                 body.append_block(body_block).unwrap();
 
@@ -1154,7 +1155,7 @@ mod tests {
                 assert_eq!(switch_op.argument().unwrap(), argument);
                 assert_eq!(switch_op.cases().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
                 assert_eq!(switch_op.default_region().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(switch_op.case_regions().unwrap().into_iter().count(), 2);
+                assert_eq!(switch_op.case_regions().unwrap().count(), 2);
                 let switch_op = block.append_operation(switch_op).unwrap();
                 block
                     .append_operation(func::r#return(&[switch_op.result(0).unwrap().as_ref()], location).unwrap())

@@ -1223,7 +1223,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(pattern_op.benefit().unwrap(), 7);
                 assert_eq!(pattern_op.symbol_name().unwrap().unwrap().as_str().unwrap(), "pattern_test");
-                assert_eq!(pattern_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(pattern_op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 pattern_op
             })
             .unwrap();

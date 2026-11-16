@@ -279,7 +279,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelCastOperation>>, P: Ar
             }
             .into());
         }
-        Ok(context.forward_to_parent(self.clone().into(), inputs)?)
+        context.forward_to_parent(self.clone().into(), inputs)
     }
 }
 

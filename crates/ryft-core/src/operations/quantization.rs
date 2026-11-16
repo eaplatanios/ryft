@@ -65,7 +65,9 @@ use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::dot::{Dot, DotDimensionNumbers, infer_dot_output_type, validate_common_mapped_dimension};
+use crate::operations::dot::{
+    Dot, DotDimensionNumbers, DotPrecision, infer_dot_output_type, validate_common_mapped_dimension,
+};
 use crate::operations::extrema::Clamp;
 use crate::operations::logical::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
@@ -1260,6 +1262,15 @@ impl Operation for ScaledDotOperation {
             }
         }
 
+        // The scaled matrix units accumulate their `bf16` dequantized inputs at `bf16`, `f32`, or `f64` only,
+        // which is narrower than what an ordinary dot accepts, so the accumulation type is validated here.
+        if !matches!(self.accumulation_type, DataType::BF16 | DataType::F32 | DataType::F64) {
+            return Err(TypeError::invalid(format!(
+                "`{}` input data type `bf16` cannot accumulate at data type `{}`",
+                SCALED_DOT_OPERATION_NAME, self.accumulation_type,
+            )));
+        }
+
         // The contraction is a dot of the `bf16` dequantized element arrays, so the dot type inference rule validates
         // the dimension numbers and placements and determines the output type.
         let output_type = infer_dot_output_type(
@@ -1267,8 +1278,10 @@ impl Operation for ScaledDotOperation {
             &lhs.clone().with_data_type(DataType::BF16),
             &rhs.clone().with_data_type(DataType::BF16),
             &self.dimensions,
+            DotPrecision::default(),
             Some(self.accumulation_type),
             None,
+            false,
         )?;
 
         // Each present scale matches its element array along non-contracting dimensions. Along contracting dimensions,
@@ -1392,7 +1405,12 @@ where
             .iter()
             .map(|input| P::match_axis(context, input, Axis::from(0)))
             .collect::<Result<Vec<_>, _>>()?;
-        let (dimensions, output_axis) = self.dimensions.batched(Some(0), Some(0)).unwrap();
+        let (dimensions, output_axis) = self.dimensions.batched(
+            inputs[0].unbatched_type().rank(),
+            inputs[1].unbatched_type().rank(),
+            Some(0),
+            Some(0),
+        );
         let lifted_operation = Self::new(dimensions, self.accumulation_type, self.has_lhs_scale, self.has_rhs_scale);
         lifted_operation.interpret_with_batch_axes(
             context,
@@ -1717,14 +1735,14 @@ where
 }
 
 /// Validates both representations and infers the contraction output before any operations are staged.
-fn validate_scaled_dot_inputs<P: Parameter>(
+fn validate_scaled_dot_inputs<P>(
     lhs: &BlockQuantizedValue<P>,
     rhs: &BlockQuantizedValue<P>,
     dimensions: Option<&DotDimensionNumbers>,
     accumulation_type: Option<DataType>,
 ) -> Result<ArrayType, ProgramError>
 where
-    P: Typed<Type: ArrayMemberType>,
+    P: Parameter + Typed<Type: ArrayMemberType>,
 {
     for (name, global_scale) in [("left", &lhs.global_scale), ("right", &rhs.global_scale)] {
         if let Some(global_scale) = global_scale {
@@ -1779,12 +1797,12 @@ where
 }
 
 /// Validates the rank-3 element and block-scale arrays required by the matrix-product frontend.
-fn validate_scaled_matmul_inputs<P: Parameter>(
+fn validate_scaled_matmul_inputs<P>(
     lhs: &BlockQuantizedValue<P>,
     rhs: &BlockQuantizedValue<P>,
 ) -> Result<(), ProgramError>
 where
-    P: Typed<Type: ArrayMemberType>,
+    P: Parameter + Typed<Type: ArrayMemberType>,
 {
     for value in [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales] {
         if value.r#type().as_array_type()?.rank() != 3 {
@@ -2635,8 +2653,10 @@ impl<'o> BlockScaledDotRules<'o> {
             &lhs_type.as_ref().clone().with_data_type(computation_type),
             &rhs_type.as_ref().clone().with_data_type(computation_type),
             dimensions,
+            DotPrecision::default(),
             None,
             None,
+            false,
         )?;
         let output_shape = output_type.static_shape().unwrap().dimensions().to_vec();
 
@@ -5104,12 +5124,12 @@ mod tests {
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
-            Ok(Array::scalar(1.0078277587890625f32).unwrap()),
+            Ok(Array::scalar(1.007_827_8_f32).unwrap()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
                 .block_dequantize(Axes::default(), DataType::F32),
-            Ok(ArrayIrValue::Array(Array::scalar(1.0078277587890625f32).unwrap())),
+            Ok(ArrayIrValue::Array(Array::scalar(1.007_827_8_f32).unwrap())),
         );
 
         // Boolean elements dequantize to zero or their block scale.
@@ -6000,6 +6020,15 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
+            operation = ScaledDotOperation::new(dimensions.clone(), DataType::F16, false, false),
+            cases = [{
+                input_types = [lhs.clone(), rhs.clone()],
+                error = format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` input data type `bf16` cannot accumulate at data type `f16`",
+                ),
+            }],
+        );
+        check_operation_type_inference!(
             @reject @unreduced,
             operation = ScaledDotOperation::new(dimensions, DataType::BF16, true, true),
             input_types = [lhs, rhs, lhs_scale, rhs_scale],
@@ -6444,9 +6473,9 @@ mod tests {
             Array::matrix(1, 1, vec![1.0f32]).unwrap(),
         );
         for (lhs_global_scale, rhs_global_scale, expected) in [
-            (Some(1.00390625f32), None, 3.015625f32),
-            (None, Some(1.00390625f32), 3.015625),
-            (Some(1.00390625f32), Some(1.00390625f32), 3.03125),
+            (Some(1.003_906_3_f32), None, 3.015625f32),
+            (None, Some(1.003_906_3_f32), 3.015625),
+            (Some(1.003_906_3_f32), Some(1.003_906_3_f32), 3.03125),
         ] {
             let lhs = BlockQuantizedValue {
                 global_scale: lhs_global_scale.map(|scale| Array::scalar(scale).unwrap()),
@@ -7147,7 +7176,7 @@ mod tests {
                 Array::matrix(1, 2, vec![0.5f32, 0.0]).unwrap(),
                 Array::matrix(2, 1, vec![6.0234375f32, 0.0]).unwrap(),
                 None,
-                Some(Array::scalar(1.00390625f32).unwrap()),
+                Some(Array::scalar(1.003_906_3_f32).unwrap()),
                 None,
                 None,
             ),
@@ -7999,7 +8028,8 @@ mod tests {
         let expected = (0..16)
             .flat_map(|row: u32| {
                 (0..16u32).map(move |column| {
-                    expected_signs[row as usize] * if (row & column).count_ones() % 2 == 0 { 0.25 } else { -0.25 }
+                    expected_signs[row as usize]
+                        * if (row & column).count_ones().is_multiple_of(2) { 0.25 } else { -0.25 }
                 })
             })
             .collect::<Vec<_>>();

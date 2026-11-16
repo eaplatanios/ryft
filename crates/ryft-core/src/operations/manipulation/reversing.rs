@@ -135,9 +135,11 @@ where
             .into_iter()
             .map(|axis| if batch_axis.is_some_and(|batch_axis| axis >= batch_axis) { axis + 1 } else { axis })
             .collect::<Vec<_>>();
-        Ok(ReverseOperation::new(axes)
-            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(batch_axis)])?
-            .into())
+        ReverseOperation::new(axes).interpret_with_batch_axes(
+            context,
+            inputs,
+            &[BatchAxis::from_optional_position(batch_axis)],
+        )
     }
 }
 

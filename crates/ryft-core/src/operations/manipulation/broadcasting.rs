@@ -2549,8 +2549,10 @@ mod tests {
         let target_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(target.clone())]));
         let target_output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(target)]));
-        let instantiated =
-            program.with_instantiated_type_identities(&[target_input_type.clone()]).unwrap().into_owned();
+        let instantiated = program
+            .with_instantiated_type_identities(std::slice::from_ref(&target_input_type))
+            .unwrap()
+            .into_owned();
         assert_eq!(instantiated.output_types(), vec![target_output_type.clone()]);
         assert_eq!(
             instantiated.to_string(),

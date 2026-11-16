@@ -1080,7 +1080,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
         if !context.axis_name().is_some_and(|axis_name| self.axes().contains(axis_name)) {
-            return Ok(context.forward_collective(self, array, output_extents)?);
+            return context.forward_collective(self, array, output_extents);
         }
 
         self.reject_mesh_form()?;
@@ -1851,7 +1851,7 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingCont
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
         let Some(batch_axis) = input.batch_axis_position() else {
-            return Ok(self.forward_to_parent(operation.clone().into(), inputs)?);
+            return self.forward_to_parent(operation.clone().into(), inputs);
         };
         let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
         let mut outputs = self.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
@@ -2062,14 +2062,15 @@ mod tests {
 
     /// Applies the batching rule of `operation` to `input` at an [`eager_collective_context`] level of extent
     /// `axis_size` that binds the axis `axis_name`, returning the batched outputs.
-    pub(super) fn batch_collective<O: Operation<Type = ArrayType>>(
+    pub(super) fn batch_collective<O>(
         operation: &O,
         axis_name: &str,
         axis_size: usize,
         input: ArrayBatch<Array>,
     ) -> Result<Vec<ArrayBatch<Array>>, BatchingError>
     where
-        O: BatchableOperation<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
+        O: Operation<Type = ArrayType>
+            + BatchableOperation<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
     {
         let context = eager_collective_context(axis_name, axis_size);
         operation.batch(&context, &EmptyRegionDriver, &[input])
@@ -2081,8 +2082,12 @@ mod tests {
         operation: O,
         input_type: ArrayType,
     ) -> String {
-        let cotangent_type =
-            operation.infer_output_types(&[input_type.clone()], &[]).unwrap().remove(0).cotangent().unwrap();
+        let cotangent_type = operation
+            .infer_output_types(std::slice::from_ref(&input_type), &[])
+            .unwrap()
+            .remove(0)
+            .cotangent()
+            .unwrap();
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let mut context = TranspositionContext::new(trace.clone());
         let inputs = [PartialValue::Unknown(input_type.clone())];

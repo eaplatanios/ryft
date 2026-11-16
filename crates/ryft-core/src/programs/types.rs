@@ -1116,7 +1116,7 @@ mod tests {
 
         // Exact conditional facts do not prove the relationship: the symbolic input can still have another extent.
         assert!(refinements.identity_classes().next().unwrap().is_exact());
-        assert_eq!(refinements.identities_needing_runtime_checks(), &[n.clone()]);
+        assert_eq!(refinements.identities_needing_runtime_checks(), std::slice::from_ref(&n));
         assert_eq!(refinements.refine_declared(&declared[0], &[]).unwrap(), exact);
         assert!(ArrayType::derive_identity_renaming(&declared, &actual).is_err());
 

@@ -174,7 +174,7 @@ mod tests {
         let packed_type = context.mosaic_gpu_p2b6_type(element_type).unwrap();
         assert_eq!(packed_type.element_type().unwrap(), element_type);
         assert_eq!(packed_type.context(), &context);
-        assert_eq!(context.parse_type(&packed_type.to_string()).unwrap(), packed_type);
+        assert_eq!(context.parse_type(packed_type.to_string()).unwrap(), packed_type);
         assert!(matches!(
             context.mosaic_gpu_p2b6_type(context.float32_type()),
             Err(Error::InvalidArgument { message, .. })
@@ -195,7 +195,7 @@ mod tests {
         let packed_type = context.mosaic_gpu_b6x16_p32_type(element_type).unwrap();
         assert_eq!(packed_type.element_type().unwrap(), element_type);
         assert_eq!(packed_type.context(), &context);
-        assert_eq!(context.parse_type(&packed_type.to_string()).unwrap(), packed_type);
+        assert_eq!(context.parse_type(packed_type.to_string()).unwrap(), packed_type);
         assert!(matches!(
             context.mosaic_gpu_b6x16_p32_type(context.float32_type()),
             Err(Error::InvalidArgument { message, .. })

@@ -159,6 +159,7 @@ mlir_op_trait!(Generic, OneRegion);
 mlir_op_trait!(Generic, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`GenericOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn generic<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     inputs: &[ValueRef<'v, 'c, 't>],
     outputs: &[ValueRef<'v, 'c, 't>],
@@ -927,6 +928,7 @@ mlir_op_trait!(Pack, ZeroRegions);
 mlir_op_trait!(Pack, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`PackOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn pack<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     destination: ValueRef<'v, 'c, 't>,
@@ -3325,8 +3327,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
                 assert_eq!(op.init().unwrap(), init);
                 assert_eq!(op.inputs().unwrap(), vec![lhs, rhs]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3385,8 +3387,8 @@ mod tests {
                 assert_eq!(op.inits().unwrap(), vec![init]);
                 assert_eq!(op.dimensions().unwrap().values().collect::<Vec<_>>(), vec![1]);
                 assert_eq!(op.inputs().unwrap(), vec![input]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3441,8 +3443,8 @@ mod tests {
                 assert_eq!(op.init().unwrap(), init);
                 assert_eq!(op.permutation().unwrap().values().collect::<Vec<_>>(), vec![1, 0]);
                 assert_eq!(op.input().unwrap(), input);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3494,8 +3496,8 @@ mod tests {
                 assert_eq!(op.init().unwrap(), init);
                 assert_eq!(op.dimensions().unwrap().values().collect::<Vec<_>>(), vec![1]);
                 assert_eq!(op.input().unwrap(), input);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3551,8 +3553,8 @@ mod tests {
                 assert_eq!(op.kind().unwrap(), ElementwiseKind::Add);
                 assert_eq!(op.indexing_maps().unwrap().unwrap().len(), 3);
                 assert_eq!(op.result_tensors().unwrap()[0].r#type().unwrap(), tensor_type.as_ref(),);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3609,8 +3611,8 @@ mod tests {
                 assert_eq!(op.indexing_maps().unwrap(), None);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3674,8 +3676,8 @@ mod tests {
                 assert_eq!(op.indexing_maps().unwrap(), Some(indexing_maps));
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3734,8 +3736,8 @@ mod tests {
                 assert_eq!(op.indexing_maps().unwrap(), None);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3794,8 +3796,8 @@ mod tests {
                 assert_eq!(op.indexing_maps().unwrap(), None);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastSigned);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3846,8 +3848,8 @@ mod tests {
                 assert_eq!(op.output_operand().unwrap(), output);
                 assert_eq!(op.dimension().unwrap(), 1);
                 assert_eq!(op.input().unwrap(), input);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3912,8 +3914,8 @@ mod tests {
                 assert_eq!(op.output_operand().unwrap(), output);
                 assert_eq!(op.fmr().unwrap(), WinogradConv2DFmr::F2R3);
                 assert_eq!(op.filter().unwrap(), filter);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3978,8 +3980,8 @@ mod tests {
                 assert_eq!(op.output_operand().unwrap(), output);
                 assert_eq!(op.fmr().unwrap(), WinogradConv2DFmr::F2R3);
                 assert_eq!(op.input().unwrap(), input);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4044,8 +4046,8 @@ mod tests {
                 assert_eq!(op.output_operand().unwrap(), output);
                 assert_eq!(op.fmr().unwrap(), WinogradConv2DFmr::F2R3);
                 assert_eq!(op.value().unwrap(), value);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4108,8 +4110,8 @@ mod tests {
                 assert_eq!(op.inner_dims_pos().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
                 assert_eq!(op.static_inner_tiles().unwrap().values().collect::<Vec<_>>(), vec![4, 8]);
                 assert_eq!(op.source().unwrap(), source);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4171,8 +4173,8 @@ mod tests {
                 assert_eq!(op.inner_dims_pos().unwrap().values().collect::<Vec<_>>(), vec![0, 1]);
                 assert_eq!(op.static_inner_tiles().unwrap().values().collect::<Vec<_>>(), vec![4, 8]);
                 assert_eq!(op.source().unwrap(), source);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4225,8 +4227,8 @@ mod tests {
                 assert_eq!(op.outputs().unwrap(), vec![output]);
                 assert_eq!(LinalgCastedOperation::cast(&op).unwrap(), TypeFn::CastUnsigned);
                 assert_eq!(op.inputs().unwrap(), vec![input]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4298,14 +4300,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4392,14 +4388,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4480,14 +4470,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4574,14 +4558,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4649,14 +4627,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4718,14 +4690,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4791,14 +4757,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4864,14 +4824,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4930,14 +4884,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -4997,14 +4945,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5070,14 +5012,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5143,14 +5079,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5231,14 +5161,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5319,14 +5243,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5422,14 +5340,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5525,14 +5437,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5634,14 +5540,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5749,14 +5649,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5864,14 +5758,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -5973,14 +5861,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6076,14 +5958,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6179,14 +6055,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6282,14 +6152,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6391,14 +6255,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6506,14 +6364,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6615,14 +6467,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6724,14 +6570,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6833,14 +6673,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -6921,14 +6755,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7009,14 +6837,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7102,14 +6924,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7200,14 +7016,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7298,14 +7108,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7407,14 +7211,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7516,14 +7314,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7626,14 +7418,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7735,14 +7521,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7838,14 +7618,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -7942,14 +7716,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8040,14 +7808,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8138,14 +7900,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8236,14 +7992,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8334,14 +8084,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8432,14 +8176,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8530,14 +8268,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8628,14 +8360,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 2],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8714,14 +8440,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8800,14 +8520,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8886,14 +8600,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -8984,14 +8692,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9070,14 +8772,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9156,14 +8852,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9254,14 +8944,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 1],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9352,14 +9036,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9450,14 +9128,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9548,14 +9220,8 @@ mod tests {
                     unsafe { op.dilations().unwrap().unwrap().i64_elements().collect::<Result<Vec<_>, _>>().unwrap() },
                     vec![1; 3],
                 );
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9607,14 +9273,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -9677,14 +9337,8 @@ mod tests {
                 assert_eq!(op.inputs().unwrap(), inputs);
                 assert_eq!(op.outputs().unwrap(), outputs);
                 assert_eq!(op.inputs().unwrap(), inputs);
-                assert_eq!(
-                    op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    inputs.len() + outputs.len()
-                );
-                assert_eq!(
-                    op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    result_types.len()
-                );
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), inputs.len() + outputs.len());
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), result_types.len());
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

@@ -2040,7 +2040,7 @@ mod tests {
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("x"),
                 )?;
-                Ok(broadcast.reduce(&[0], ReductionKind::Sum)?)
+                broadcast.reduce(&[0], ReductionKind::Sum)
             }),
             Ok((Array::scalar(6.0).unwrap(), Array::vector(vec![0.0, 3.0, 0.0]).unwrap())),
         );

@@ -70,6 +70,7 @@ pub trait CallIntrinsicOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(CallIntrinsic);
 
 /// Constructs a new detached `llvm.call_intrinsic` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn call_intrinsic<'c, 't: 'c, L: Location<'c, 't>>(
     arguments: &[ValueRef<'c, 'c, 't>],
     op_bundle_operands: &[ValueRef<'c, 'c, 't>],
@@ -192,6 +193,7 @@ pub trait CallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Call);
 
 /// Constructs a new detached `llvm.call` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn call<'c, 't: 'c, L: Location<'c, 't>>(
     callee_operands: &[ValueRef<'c, 'c, 't>],
     op_bundle_operands: &[ValueRef<'c, 'c, 't>],
@@ -316,6 +318,7 @@ pub trait InlineAsmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(InlineAsm);
 
 /// Constructs a new detached `llvm.inline_asm` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn inline_asm<'c, 't: 'c, L: Location<'c, 't>>(
     operands: &[ValueRef<'c, 'c, 't>],
     result_type: TypeRef<'c, 't>,
@@ -395,8 +398,8 @@ mod tests {
                 assert_eq!(op.arguments().unwrap(), vec![block.argument(0).unwrap()]);
                 assert!(op.op_bundle_operands().unwrap().is_empty());
                 assert_eq!(op.output_type().unwrap(), f32_type);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

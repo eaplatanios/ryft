@@ -33,12 +33,6 @@ pub use transfers::*;
 pub use values::*;
 pub use versions::*;
 
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-pub mod cuda;
-
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-pub use cuda::*;
-
 pub(crate) mod macros;
 
 pub(crate) use macros::{
@@ -654,7 +648,7 @@ mod tests {
         assert!(hash_map_from_c_api(std::ptr::null(), 0).is_empty());
 
         // Test using a non-empty list of `NamedValue`s.
-        let values = vec![
+        let values = [
             NamedValue::new("boolean", true),
             NamedValue::new("integer", 42_i64),
             NamedValue::new("list", vec![1_i64, 2_i64, 3_i64]),

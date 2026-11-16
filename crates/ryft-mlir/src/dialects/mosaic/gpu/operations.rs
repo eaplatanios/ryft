@@ -364,6 +364,7 @@ mlir_op_trait!(AsyncLoad, ZeroSuccessors);
 ///
 /// `indices` and `slice_lengths` must have equal lengths. `collective` contains Mosaic GPU dimension attributes;
 /// `leader_tracked` selects an optional copy partition strategy, and `oob_fill_mode` controls out-of-bounds loads.
+#[allow(clippy::too_many_arguments)]
 pub fn async_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     destination: ValueRef<'v, 'c, 't>,
@@ -580,6 +581,7 @@ mlir_op_trait!(AsyncStore, ZeroRegions);
 mlir_op_trait!(AsyncStore, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AsyncStoreOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn async_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     destination: ValueRef<'v, 'c, 't>,
@@ -1203,6 +1205,7 @@ mlir_op_trait!(TcGen05Mma, ZeroRegions);
 mlir_op_trait!(TcGen05Mma, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`TcGen05MmaOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn tcgen05_mma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     accumulator: ValueRef<'v, 'c, 't>,
     a: ValueRef<'v, 'c, 't>,
@@ -2425,6 +2428,7 @@ mlir_op_trait!(AsyncLoadIm2col, ZeroSuccessors);
 ///
 /// `indices` contains one `i32` value per source dimension, while `filter_offsets` contains one `i16` value per spatial
 /// dimension. The three window attribute slices have the same length as `filter_offsets`.
+#[allow(clippy::too_many_arguments)]
 pub fn async_load_im2col<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     destination: ValueRef<'v, 'c, 't>,

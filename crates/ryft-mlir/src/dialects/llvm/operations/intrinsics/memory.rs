@@ -1862,8 +1862,8 @@ mod tests {
                 assert_eq!(op.bound().unwrap(), arg_1);
                 assert_eq!(op.output_type().unwrap(), mask_type);
                 assert_eq!(op.operation_name(), "llvm.intr.get.active.lane.mask");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1914,8 +1914,8 @@ mod tests {
                 assert_eq!(op.pointer().unwrap(), arg_1);
                 assert_eq!(op.size().unwrap(), size);
                 assert_eq!(op.operation_name(), "llvm.intr.invariant.end");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -1967,8 +1967,8 @@ mod tests {
                 assert_eq!(op.size().unwrap(), size);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.invariant.start");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2015,8 +2015,8 @@ mod tests {
                 assert_eq!(op.pointer().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.launder.invariant.group");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2062,8 +2062,8 @@ mod tests {
                 let op = intr_lifetime_end(arg_0, location).unwrap();
                 assert_eq!(op.pointer().unwrap(), arg_0);
                 assert_eq!(op.operation_name(), "llvm.intr.lifetime.end");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2111,8 +2111,8 @@ mod tests {
                 let op = intr_lifetime_start(arg_0, location).unwrap();
                 assert_eq!(op.pointer().unwrap(), arg_0);
                 assert_eq!(op.operation_name(), "llvm.intr.lifetime.start");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2175,8 +2175,8 @@ mod tests {
                 assert_eq!(op.nontemporal().unwrap(), nontemporal);
                 assert_eq!(op.output_type().unwrap(), vector_i32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.masked.load");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2239,8 +2239,8 @@ mod tests {
                 assert_eq!(op.mask().unwrap(), arg_2);
                 assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.operation_name(), "llvm.intr.masked.store");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2303,8 +2303,8 @@ mod tests {
                 assert_eq!(op.columns().unwrap(), columns);
                 assert_eq!(op.output_type().unwrap(), vector_i32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.matrix.column.major.load");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2368,8 +2368,8 @@ mod tests {
                 assert_eq!(op.rows().unwrap(), rows);
                 assert_eq!(op.columns().unwrap(), columns);
                 assert_eq!(op.operation_name(), "llvm.intr.matrix.column.major.store");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2430,8 +2430,8 @@ mod tests {
                 assert_eq!(op.rhs_columns().unwrap(), rhs_columns);
                 assert_eq!(op.output_type().unwrap(), vector_f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.matrix.multiply");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2483,8 +2483,8 @@ mod tests {
                 assert_eq!(op.columns().unwrap(), columns);
                 assert_eq!(op.output_type().unwrap(), vector_f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.matrix.transpose");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2537,8 +2537,8 @@ mod tests {
                 assert_eq!(op.len().unwrap(), len);
                 assert_eq!(op.is_volatile().unwrap(), is_volatile);
                 assert_eq!(op.operation_name(), "llvm.intr.memcpy.inline");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2597,8 +2597,8 @@ mod tests {
                 assert_eq!(op.length().unwrap(), arg_2);
                 assert_eq!(op.is_volatile().unwrap(), is_volatile);
                 assert_eq!(op.operation_name(), "llvm.intr.memcpy");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2657,8 +2657,8 @@ mod tests {
                 assert_eq!(op.length().unwrap(), arg_2);
                 assert_eq!(op.is_volatile().unwrap(), is_volatile);
                 assert_eq!(op.operation_name(), "llvm.intr.memmove");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2714,8 +2714,8 @@ mod tests {
                 assert_eq!(op.len().unwrap(), len);
                 assert_eq!(op.is_volatile().unwrap(), is_volatile);
                 assert_eq!(op.operation_name(), "llvm.intr.memset.inline");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2775,8 +2775,8 @@ mod tests {
                 assert_eq!(op.length().unwrap(), arg_2);
                 assert_eq!(op.is_volatile().unwrap(), is_volatile);
                 assert_eq!(op.operation_name(), "llvm.intr.memset");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2823,8 +2823,8 @@ mod tests {
                 let op = intr_experimental_noalias_scope_decl(scope, location).unwrap();
                 assert_eq!(op.scope().unwrap(), scope);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.noalias.scope.decl");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2877,8 +2877,8 @@ mod tests {
                 assert_eq!(op.hint().unwrap(), hint);
                 assert_eq!(op.cache().unwrap(), cache);
                 assert_eq!(op.operation_name(), "llvm.intr.prefetch");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -2942,8 +2942,8 @@ mod tests {
                 assert_eq!(PtrAnnotationOperation::attribute(&op).unwrap(), arg_4);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.ptr.annotation");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 5);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2999,8 +2999,8 @@ mod tests {
                 assert_eq!(op.mask().unwrap(), arg_1);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.ptrmask");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3046,8 +3046,8 @@ mod tests {
                 let op = intr_stack_restore(arg_0, location).unwrap();
                 assert_eq!(op.pointer().unwrap(), arg_0);
                 assert_eq!(op.operation_name(), "llvm.intr.stackrestore");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -3094,8 +3094,8 @@ mod tests {
                 let op = intr_stack_save(pointer_type.as_ref(), location).unwrap();
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.stacksave");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3142,8 +3142,8 @@ mod tests {
                 assert_eq!(op.global().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.threadlocal.address");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3191,8 +3191,8 @@ mod tests {
                 assert_eq!(op.destination_list().unwrap(), arg_0);
                 assert_eq!(op.source_list().unwrap(), arg_1);
                 assert_eq!(op.operation_name(), "llvm.intr.vacopy");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -3240,8 +3240,8 @@ mod tests {
                 let op = intr_va_end(arg_0, location).unwrap();
                 assert_eq!(op.argument_list().unwrap(), arg_0);
                 assert_eq!(op.operation_name(), "llvm.intr.vaend");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -3289,8 +3289,8 @@ mod tests {
                 let op = intr_va_start(arg_0, location).unwrap();
                 assert_eq!(op.argument_list().unwrap(), arg_0);
                 assert_eq!(op.operation_name(), "llvm.intr.vastart");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -3348,8 +3348,8 @@ mod tests {
                 assert_eq!(op.pointer().unwrap(), arg_1);
                 assert_eq!(op.mask().unwrap(), arg_2);
                 assert_eq!(op.operation_name(), "llvm.intr.masked.compressstore");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -3408,8 +3408,8 @@ mod tests {
                 assert_eq!(op.passthru().unwrap(), arg_2);
                 assert_eq!(op.output_type().unwrap(), vector_i32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.masked.expandload");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3467,8 +3467,8 @@ mod tests {
                 assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.output_type().unwrap(), vector_i32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.masked.gather");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3531,8 +3531,8 @@ mod tests {
                 assert_eq!(op.mask().unwrap(), arg_2);
                 assert_eq!(op.alignment().unwrap(), Some(alignment));
                 assert_eq!(op.operation_name(), "llvm.intr.masked.scatter");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())

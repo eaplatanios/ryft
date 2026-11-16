@@ -1577,7 +1577,7 @@ mod tests {
         let operation = alternatives(Some(target), &[handle_type], vec![context.region()], location).unwrap();
         assert_operation_name(&operation, "transform.alternatives");
         assert_eq!(operation.scope().unwrap(), Some(target));
-        assert_eq!(operation.alternatives().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+        assert_eq!(operation.alternatives().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
 
         let operation = annotate(target, "ryft.annotation", Some(target), location).unwrap();
         assert_operation_name(&operation, "transform.annotate");

@@ -324,8 +324,8 @@ mod tests {
                 let shape = block.argument(2).unwrap();
                 let rng_op = rng(a, b, shape, RngDistribution::Uniform, location).unwrap();
                 assert_eq!(rng_op.rng_distribution().unwrap(), RngDistribution::Uniform);
-                assert_eq!(rng_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(rng_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(rng_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(rng_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let rng_block = block.append_operation(rng_op).unwrap();
                 block.append_operation(func::r#return(&[rng_block.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -377,8 +377,8 @@ mod tests {
                 let initial_state = block.argument(0).unwrap();
                 let rng_op = rng_bit_generator(initial_state, RngAlgorithm::ThreeFry, output_type, location).unwrap();
                 assert_eq!(rng_op.rng_algorithm().unwrap(), RngAlgorithm::ThreeFry);
-                assert_eq!(rng_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(rng_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(rng_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(rng_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 let rng_block = block.append_operation(rng_op).unwrap();
                 block
                     .append_operation(

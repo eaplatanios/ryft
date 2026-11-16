@@ -2298,6 +2298,7 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
             #[doc = "Constructs a new detached/owned [`"]
             #[doc = stringify!($name)]
             #[doc = "Operation`] at the specified [`Location`]."]
+            #[allow(clippy::too_many_arguments)]
             pub fn $function_name<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
                 async_dependencies: &[ValueRef<'o, 'c, 't>],
                 $($method: ValueRef<'o, 'c, 't>,)+
@@ -2727,6 +2728,7 @@ mlir_op_trait!(Spmv, ZeroRegions);
 mlir_op_trait!(Spmv, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SpmvOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn spmv<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     mode_a: MatrixTransposeMode,
@@ -2850,6 +2852,7 @@ mlir_op_trait!(SpmmBufferSize, ZeroRegions);
 mlir_op_trait!(SpmmBufferSize, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SpmmBufferSizeOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn spmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     mode_a: MatrixTransposeMode,
@@ -2987,6 +2990,7 @@ mlir_op_trait!(Spmm, ZeroRegions);
 mlir_op_trait!(Spmm, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SpmmOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn spmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     mode_a: MatrixTransposeMode,
@@ -3102,6 +3106,7 @@ mlir_op_trait!(SddmmBufferSize, ZeroRegions);
 mlir_op_trait!(SddmmBufferSize, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SddmmBufferSizeOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn sddmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     mode_a: MatrixTransposeMode,
@@ -3214,6 +3219,7 @@ mlir_op_trait!(Sddmm, ZeroRegions);
 mlir_op_trait!(Sddmm, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SddmmOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn sddmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     mode_a: MatrixTransposeMode,
@@ -3417,6 +3423,7 @@ mlir_op_trait!(SpGemmWorkEstimationOrCompute, ZeroRegions);
 mlir_op_trait!(SpGemmWorkEstimationOrCompute, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SpGemmWorkEstimationOrComputeOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn sp_gemm_work_estimation_or_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     descriptor: ValueRef<'o, 'c, 't>,
@@ -3537,6 +3544,7 @@ mlir_op_trait!(SpGemmCopy, ZeroRegions);
 mlir_op_trait!(SpGemmCopy, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SpGemmCopyOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn sp_gemm_copy<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     async_dependencies: &[ValueRef<'o, 'c, 't>],
     descriptor: ValueRef<'o, 'c, 't>,

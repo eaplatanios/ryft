@@ -3716,7 +3716,7 @@ mod tests {
                 let mut outputs = item.context().bind(
                     TestOperation::While(while_operation),
                     while_regions.clone(),
-                    &[item.clone()],
+                    std::slice::from_ref(&item),
                 )?;
                 Ok(outputs.remove(0))
             },
@@ -4083,7 +4083,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
         let counter_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let vector_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)])));
-        let state_types = vec![counter_type.clone(), vector_type];
+        let state_types = [counter_type.clone(), vector_type];
 
         let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let condition_inputs =
@@ -16343,7 +16343,7 @@ mod tests {
         // The traced regions are validated as a whole before binding. The predicate must be Boolean, and the body must
         // return every reference carry as the reference that it received.
         assert_eq!(
-            r#while(|value| Ok(value), |value| Ok(value), Array::scalar(0f32).unwrap(), WhileOptions::new()),
+            r#while(Ok, Ok, Array::scalar(0f32).unwrap(), WhileOptions::new()),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got `f32[]`",
             )))),
@@ -16401,7 +16401,7 @@ mod tests {
                     let limit = StagingContext::constant(counter.context(), array(Array::scalar(3f32).unwrap()));
                     counter.read()?.less_than(&limit)
                 },
-                |counter| Ok(counter),
+                Ok,
                 TestIrValue::Reference(reference.clone()),
                 WhileOptions::new(),
             ),
@@ -16420,7 +16420,7 @@ mod tests {
                         let limit = StagingContext::constant(counter.context(), array(Array::scalar(3f32).unwrap()));
                         counter.read()?.less_than(&limit)
                     },
-                    |counter| Ok(counter),
+                    Ok,
                     reference,
                     WhileOptions::new(),
                 )?;

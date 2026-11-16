@@ -2784,9 +2784,13 @@ mod tests {
 
         // Instruction inputs of the declared types require no specialization.
         assert!(
-            FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[dynamic_type.clone()], regions())
-                .unwrap()
-                .is_none()
+            FlatArrayProgram::specialize_attached_regions(
+                instruction.operation(),
+                std::slice::from_ref(&dynamic_type),
+                regions()
+            )
+            .unwrap()
+            .is_none()
         );
 
         // Static instruction inputs specialize the forward region, and the inputs of the transpose region, which

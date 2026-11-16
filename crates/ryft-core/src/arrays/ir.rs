@@ -28,8 +28,8 @@ use crate::programs::{
 /// [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume only the member
 /// it understands. Reference operations remain family-native because their signatures cross member kinds. Ordinary
 /// numeric operations still project only the array member.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[allow(clippy::large_enum_variant, reason = "keep member values inline to avoid extra allocation and indirection")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
     /// Ordinary backend [`ArrayType`]-typed [`Value`].
     Array(A),

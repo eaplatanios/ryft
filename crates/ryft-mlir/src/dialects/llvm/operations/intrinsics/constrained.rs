@@ -918,8 +918,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fadd");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -981,8 +981,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fdiv");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1051,8 +1051,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fma");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1121,8 +1121,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmuladd");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1184,8 +1184,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fmul");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1236,8 +1236,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f64_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fpext");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1296,8 +1296,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fptrunc");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1359,8 +1359,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.frem");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1422,8 +1422,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.fsub");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1483,8 +1483,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.sitofp");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1544,8 +1544,8 @@ mod tests {
                 assert_eq!(op.fp_exception_behavior().unwrap(), fp_exception_behavior);
                 assert_eq!(op.output_type().unwrap(), f32_type);
                 assert_eq!(op.operation_name(), "llvm.intr.experimental.constrained.uitofp");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

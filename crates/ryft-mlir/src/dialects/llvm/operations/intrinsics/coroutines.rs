@@ -537,8 +537,8 @@ mod tests {
                 let op = intr_coro_align(i64_type.as_ref(), location).unwrap();
                 assert_eq!(op.output_type().unwrap(), i64_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.align");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -588,8 +588,8 @@ mod tests {
                 assert_eq!(op.memory().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.begin");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -647,8 +647,8 @@ mod tests {
                 assert_eq!(op.return_values().unwrap(), token);
                 assert_eq!(op.output_type().unwrap(), i1_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.end");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -703,8 +703,8 @@ mod tests {
                 assert_eq!(op.handle().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.free");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -765,8 +765,8 @@ mod tests {
                 assert_eq!(op.function_addresses().unwrap(), arg_3);
                 assert_eq!(op.output_type().unwrap(), token_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.id");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 4);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 // Note that token values cannot cross function boundaries (i.e., `func.return` does not have the
                 // `TokenConsumerTrait`), and so the produced token is not returned from the function.
                 block.append_operation(op).unwrap();
@@ -825,8 +825,8 @@ mod tests {
                 assert_eq!(op.from().unwrap(), arg_2);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.promise");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -872,8 +872,8 @@ mod tests {
                 let op = intr_coro_resume(arg_0, location).unwrap();
                 assert_eq!(op.handle().unwrap(), arg_0);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.resume");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block
                     .append_operation(func::r#return::<crate::ValueRef<'_, '_, '_>, _>(&[], location).unwrap())
@@ -923,8 +923,8 @@ mod tests {
                 assert_eq!(op.handle().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), token_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.save");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 // Note that token values cannot cross function boundaries (i.e., `func.return` does not have the
                 // `TokenConsumerTrait`), and so the produced token is not returned from the function.
                 block.append_operation(op).unwrap();
@@ -971,8 +971,8 @@ mod tests {
                 let op = intr_coro_size(i64_type.as_ref(), location).unwrap();
                 assert_eq!(op.output_type().unwrap(), i64_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.size");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -1023,8 +1023,8 @@ mod tests {
                 assert_eq!(op.final_suspend().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), i8_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.suspend");
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

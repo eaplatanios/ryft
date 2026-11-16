@@ -12,11 +12,11 @@
 //!     arrays along an axis, and [`Pad`] adds, removes, or interleaves edge and interior padding.
 //!   - **Selecting and Updating Elements:** [`Slice`] and [`UpdateSlice`] take static windows, [`DynamicSlice`] and
 //!     [`DynamicUpdateSlice`] take runtime start indices, [`DynamicSliceWithDimensions`] takes dimension-valued
-//!     windows, [`Gather`] and [`Scatter`] read and write arbitrary coordinates, and [`Indexing`] composes all of
-//!     these behind an [`index!`](crate::index) selector list with
-//!     [NumPy-style](https://numpy.org/doc/stable/user/basics.indexing.html) integers, ranges, strides, new axes,
-//!     array indices, and masks. On array values the selection reads or returns updated copies, and on reference
-//!     values it derives a view that is read and written in place.
+//!     windows, [`Gather`] and [`Scatter`] read and write arbitrary coordinates, [`Diagonal`] reads the elements
+//!     whose indices along two axes agree, and [`Indexing`] composes all of these behind an [`index!`](crate::index)
+//!     selector list with [NumPy-style](https://numpy.org/doc/stable/user/basics.indexing.html) integers, ranges,
+//!     strides, new axes, array indices, and masks. On array values the selection reads or returns updated copies,
+//!     and on reference values it derives a view that is read and written in place.
 //!   - **Changing Representation and Placement:** [`ConvertElementType`] changes the element data type,
 //!     [`ReducePrecision`] rounds floating-point elements to a narrower simulated format within their data type,
 //!     [`Cast`] returns a value at a related type representation (e.g., an `f32[n]` value as `f32[2]`), checking
@@ -75,6 +75,7 @@ use crate::operations::Capability;
 pub mod broadcasting;
 pub mod concatenation;
 pub mod conversions;
+pub mod diagonal;
 pub mod gathering;
 pub mod indexing;
 pub mod memory;
@@ -95,6 +96,7 @@ pub use conversions::{
     ConvertElementTypeOperation, ElementType, REDUCE_PRECISION_OPERATION_NAME, ReducePrecision,
     ReducePrecisionOperation,
 };
+pub use diagonal::Diagonal;
 pub use gathering::{
     DynamicGather, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions,
 };
@@ -115,9 +117,9 @@ pub use slicing::{
 pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};
 
 /// Group of the array manipulation capabilities: [`Transpose`], [`Reverse`], [`Reshape`], [`Broadcast`],
-/// [`BroadcastLike`], [`Pad`], [`Concatenate`], [`Gather`], [`Scatter`], [`Slice`], [`UpdateSlice`], [`DynamicSlice`],
-/// [`DynamicUpdateSlice`], [`ConvertElementType`], [`ReducePrecision`], and [`TransferToMemory`]. It is implemented
-/// automatically for every type that implements all of its members.
+/// [`BroadcastLike`], [`Pad`], [`Concatenate`], [`Gather`], [`Diagonal`], [`Scatter`], [`Slice`], [`UpdateSlice`],
+/// [`DynamicSlice`], [`DynamicUpdateSlice`], [`ConvertElementType`], [`ReducePrecision`], and [`TransferToMemory`].
+/// It is implemented automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and array IR values
@@ -132,6 +134,7 @@ pub trait ManipulationOperations<T = <Self as Capability>::Universe>:
     + Pad<T>
     + Concatenate<T>
     + Gather<Array, T>
+    + Diagonal<T>
     + Scatter<T>
     + Slice<T>
     + UpdateSlice<T>
@@ -153,6 +156,7 @@ impl<
         + Pad<T>
         + Concatenate<T>
         + Gather<Array, T>
+        + Diagonal<T>
         + Scatter<T>
         + Slice<T>
         + UpdateSlice<T>

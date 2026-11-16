@@ -1057,6 +1057,8 @@ mod tests {
         assert_eq!(reference, registration.reference());
         assert_ne!(reference, other);
         assert_eq!(hash_of(&reference), hash_of(&registration.reference()));
+        // Rule references hash and compare by the immutable ID of their definition, not its mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let references = HashSet::from([reference.clone(), other.clone()]);
         drop(registration);
         assert!(references.contains(&reference));

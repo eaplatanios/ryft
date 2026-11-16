@@ -158,7 +158,7 @@ use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::dot::{Dot, DotDimensionNumbers, infer_dot_output_type};
+use crate::operations::dot::{Dot, DotDimensionNumbers, DotPrecision, infer_dot_output_type};
 use crate::operations::exponential::{Exp, Log};
 use crate::operations::logical::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastLike, DynamicBroadcast};
@@ -1574,8 +1574,10 @@ fn attention_inferred_output_shardings(
         &query,
         &key,
         &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
+        DotPrecision::default(),
         None,
         None,
+        false,
     )?;
     let score_sharding = attention_score_sharding(
         operation_name,
@@ -1589,8 +1591,10 @@ fn attention_inferred_output_shardings(
         &scores,
         &value,
         &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
+        DotPrecision::default(),
         None,
         None,
+        false,
     )?;
 
     // The scores have the `BNTS` form and the attended values have the `BNTH` form, which the body transposes to the
@@ -2353,7 +2357,19 @@ fn contract_cotangent<V: Value<Type: ArrayMemberType> + Dot + Reshard>(
 ) -> Result<V, ProgramError> {
     let lhs_type = lhs.r#type().as_array_type()?.clone();
     let rhs_type = rhs.r#type().as_array_type()?.clone();
-    let contraction = if infer_dot_output_type(operation_name, &lhs_type, &rhs_type, dimensions, None, None).is_ok() {
+    let precision = DotPrecision::default();
+    let contraction = if infer_dot_output_type(
+        operation_name,
+        &lhs_type,
+        &rhs_type,
+        dimensions,
+        precision,
+        None,
+        None,
+        false,
+    )
+    .is_ok()
+    {
         lhs.dot(rhs, dimensions)?
     } else if cotangent_is_lhs {
         let axes = (0..lhs_type.rank()).collect::<Vec<_>>();
@@ -2401,7 +2417,8 @@ fn restore_cotangent_type<V: Value<Type: ArrayMemberType> + Broadcast + Reshard>
 /// followed by the log-sum-exp residual when `return_residual` is set. Its constants, coordinates, and broadcasts
 /// take their shapes from existing values, and its reshapes keep the batch and sequence dimensions, so the same
 /// body supports static and dynamic extents and backends need no attention mathematics of their own.
-fn forward_definition<V: Value, O: Operation<Type = V::Type>>(
+#[allow(clippy::type_complexity)]
+fn forward_definition<V: Value + 'static, O: Operation<Type = V::Type> + 'static>(
     configuration: AttentionConfiguration,
     return_residual: bool,
 ) -> AttentionFunction<
@@ -2409,9 +2426,7 @@ fn forward_definition<V: Value, O: Operation<Type = V::Type>>(
     Composite<V, O, AttentionInputs<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>>,
 >
 where
-    V: 'static,
     V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
-    O: 'static,
     CustomRuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2609,7 +2624,8 @@ where
 /// padded query rows are zeroed. With dropout, `P` is the dropped probabilities in `dV`, and the cotangent of the
 /// dropped probabilities is mapped back through the same dropout mask, which the same random state and probability
 /// shape reproduce.
-fn backward_definition<V: Value, O: Operation<Type = V::Type>>(
+#[allow(clippy::type_complexity)]
+fn backward_definition<V: Value + 'static, O: Operation<Type = V::Type> + 'static>(
     configuration: AttentionConfiguration,
 ) -> AttentionFunction<
     BatchedComposite<
@@ -2621,9 +2637,7 @@ fn backward_definition<V: Value, O: Operation<Type = V::Type>>(
     Composite<V, O, (AttentionResiduals<CustomRuleTracer<V, O>>, CustomRuleTracer<V, O>), Vec<CustomRuleTracer<V, O>>>,
 >
 where
-    V: 'static,
     V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
-    O: 'static,
     CustomRuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -4757,7 +4771,7 @@ mod tests {
                 attention_forward_output_types(
                     DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                     AttentionConfiguration::new(),
-                    input_structure.clone(),
+                    input_structure,
                     true,
                     types.parameters().cloned().collect::<Vec<_>>().as_slice(),
                 ),
@@ -5727,7 +5741,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.clone().into(), 1.into(), 1.into()]));
         let (_, program) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
-                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)
             },
             AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
@@ -5738,14 +5752,9 @@ mod tests {
             f32_array(&[2, 2, 1, 1], &[0.25, -0.5, 1.5, 1.0]),
             f32_array(&[2, 2, 1, 1], &[3.0, 5.0, 7.0, 11.0]),
         );
-        let expected = batch(
-            |inputs: AttentionInputs<_>| function.call(inputs),
-            inputs.clone(),
-            axes.clone(),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
+        let expected =
+            batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs.clone(), axes, BatchAxis::new(0), None)
+                .unwrap();
         assert_eq!(program.interpret(inputs), Ok(expected));
 
         // Rank-4 attention folds its mapped axis into its batch axis with a reshape, whose output extents must be
@@ -5754,7 +5763,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 1.into(), length.into(), 1.into(), 1.into()]));
         let result = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
-                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)
             },
             AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
@@ -5912,7 +5921,7 @@ mod tests {
         let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
         let (_, program) = ArrayIrContext::trace(
             |inputs: AttentionInputs<_>| {
-                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)
             },
             AttentionInputs::new(r#type(1), r#type(2), r#type(2)),
@@ -6570,7 +6579,7 @@ mod tests {
         };
         let batched = differentiate_at(inputs)
             .gradient(|inputs| {
-                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)?;
                 outputs.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)
             })
@@ -6613,7 +6622,7 @@ mod tests {
         };
         let batched = differentiate_at(inputs)
             .gradient(|inputs| {
-                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)?;
                 outputs.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
             })
@@ -6660,7 +6669,7 @@ mod tests {
         };
         let batched = differentiate_at(inputs)
             .gradient(|inputs| {
-                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)?;
                 outputs.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
             })
@@ -6737,7 +6746,7 @@ mod tests {
             batch(
                 |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
                 inputs(r#type),
-                axes.clone(),
+                axes,
                 (BatchAxis::new(0), BatchAxis::new(0)),
                 None,
             )
@@ -6775,7 +6784,7 @@ mod tests {
                     Array::from_elements(replicated(key_value_type), &[1.0f32, -1.0, 0.5, 2.0]).unwrap(),
                     Array::from_elements(value_type, &[1.0f32, 3.0, 5.0, 9.0]).unwrap(),
                 ),
-                axes.clone(),
+                axes,
                 BatchAxis::new(0),
                 None,
             )
@@ -6787,7 +6796,7 @@ mod tests {
         let gradients = |r#type: &ArrayType| -> AttentionInputs<Array> {
             differentiate_at(inputs(r#type))
                 .gradient(|inputs| {
-                    let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    let outputs = batch(|inputs| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                         .map_err(ProgramError::from)?;
                     outputs.mul(&outputs)?.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)
                 })
@@ -6822,7 +6831,7 @@ mod tests {
             differentiate_at(inputs(r#type))
                 .gradient(|inputs| {
                     let query = inputs.query.clone();
-                    let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    let outputs = batch(|inputs| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                         .map_err(ProgramError::from)?;
                     let loss = outputs.mul(&outputs)?.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)?;
                     match square_query {
@@ -6866,7 +6875,7 @@ mod tests {
         };
         let batched = differentiate_at(inputs)
             .gradient(|inputs| {
-                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)?;
                 outputs.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)
             })

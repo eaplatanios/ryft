@@ -3735,7 +3735,7 @@ pub(crate) mod tests {
             vec![0],
         );
         let signature = forwarded.type_identity_signature().unwrap();
-        assert_eq!(signature.input_identities(), &[first.clone()]);
+        assert_eq!(signature.input_identities(), std::slice::from_ref(&first));
         assert_eq!(signature.internal_identities(), &[]);
 
         let operation = SupplementalIdentityOperation { definitions: vec![first.clone(), second.clone()], outputs };
@@ -3760,7 +3760,7 @@ pub(crate) mod tests {
         );
         let signature = region.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[]);
-        assert_eq!(signature.internal_identities(), &[identity.clone()]);
+        assert_eq!(signature.internal_identities(), std::slice::from_ref(&identity));
 
         // One instruction may own several occurrences, but a separate instruction cannot acquire that owner
         // without consuming it. Declaring the name again must not bypass freshness or dominance.
@@ -3887,7 +3887,7 @@ pub(crate) mod tests {
             ],
         );
         let signature = repeated_readers.type_identity_signature().unwrap();
-        assert_eq!(signature.input_identities(), &[boundary.clone()]);
+        assert_eq!(signature.input_identities(), std::slice::from_ref(&boundary));
         assert_eq!(signature.internal_identities(), &[]);
 
         // A result definition absent from the inputs establishes one fresh internal identity.
@@ -3911,7 +3911,7 @@ pub(crate) mod tests {
         );
         let signature = constant.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[]);
-        assert_eq!(signature.internal_identities(), &[constant_identity.clone()]);
+        assert_eq!(signature.internal_identities(), std::slice::from_ref(&constant_identity));
 
         // Constant references may precede their definition in the atom table because constants have no execution
         // order and are all available before the first instruction.
@@ -4865,8 +4865,8 @@ pub(crate) mod tests {
             vec![scalar.clone()],
             EffectClasses::single(EffectClass::OrderedIo),
         );
-        assert_eq!(interface.input_types(), &[scalar.clone()]);
-        assert_eq!(interface.output_types(), &[scalar.clone()]);
+        assert_eq!(interface.input_types(), std::slice::from_ref(&scalar));
+        assert_eq!(interface.output_types(), std::slice::from_ref(&scalar));
         assert_eq!(interface.effects(), EffectClasses::single(EffectClass::OrderedIo));
         assert!(!interface.has_deferred_work());
         assert!(interface.clone().with_deferred_work(true).has_deferred_work());

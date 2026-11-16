@@ -354,9 +354,12 @@ mod tests {
         let unreduced = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
-        assert_eq!(Operation::infer_output_types(&f32_fill_like(2.5), &[varying.clone()], &[]), Ok(vec![varying]));
         assert_eq!(
-            Operation::infer_output_types(&f32_fill_like(2.5), &[unreduced.clone()], &[]),
+            Operation::infer_output_types(&f32_fill_like(2.5), std::slice::from_ref(&varying), &[]),
+            Ok(vec![varying])
+        );
+        assert_eq!(
+            Operation::infer_output_types(&f32_fill_like(2.5), std::slice::from_ref(&unreduced), &[]),
             Err(TypeError::invalid(format!(
                 "`{FILL_LIKE_OPERATION_NAME}` cannot fill type `{unreduced}` because it is unreduced over mesh axes",
             ))),
@@ -367,7 +370,10 @@ mod tests {
         let sharded = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["y"])]).unwrap())
             .unwrap();
-        assert_eq!(Operation::infer_output_types(&f32_fill_like(2.5), &[sharded.clone()], &[]), Ok(vec![sharded]));
+        assert_eq!(
+            Operation::infer_output_types(&f32_fill_like(2.5), std::slice::from_ref(&sharded), &[]),
+            Ok(vec![sharded])
+        );
     }
 
     #[test]
@@ -470,7 +476,7 @@ mod tests {
         // The fill does not depend on the values of its exemplar, so its tangent is zero.
         assert_eq!(
             differentiate_at(Array::vector(vec![2.0f32, 3.0]).unwrap())
-                .jvp(Array::vector(vec![5.0f32, 7.0]).unwrap(), |x| Ok(x.add(&x.fill_like(1.5f32)?)?)),
+                .jvp(Array::vector(vec![5.0f32, 7.0]).unwrap(), |x| x.add(&x.fill_like(1.5f32)?)),
             Ok((Array::vector(vec![3.5f32, 4.5]).unwrap(), Array::vector(vec![5.0f32, 7.0]).unwrap())),
         );
     }
@@ -516,8 +522,7 @@ mod tests {
         // batched exemplar, whose type is static too, is again a constant and a broadcast.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
-        let output =
-            batch(|item| Ok(item.fill_like(2.5f64)?), input, BatchAxis::new(1), BatchAxis::new(0), None).unwrap();
+        let output = batch(|item| item.fill_like(2.5f64), input, BatchAxis::new(1), BatchAxis::new(0), None).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -609,13 +614,7 @@ mod tests {
         ));
         let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
         assert_eq!(
-            batch(
-                |item| Ok(item.fill_like(0.5f32)?),
-                vector(vec![2.0, 3.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None
-            ),
+            batch(|item| item.fill_like(0.5f32), vector(vec![2.0, 3.0]), BatchAxis::new(0), BatchAxis::new(0), None),
             Ok(vector(vec![0.5, 0.5])),
         );
     }
