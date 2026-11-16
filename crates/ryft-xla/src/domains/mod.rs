@@ -1,9 +1,8 @@
-//! XLA execution domains and the shared resources used to stage, compile, and execute array programs.
-//!
-//! A [`Domain`] implements [`ryft_core::Domain`] over [`ArrayIrType`], with [`Value`]s that hold device arrays,
-//! checked dimensions, or mutable references. Values retain their domain, so eager operations and transforms recover
-//! the execution context from their inputs. [`Constant`] and [`Operation`] provide the corresponding families of
-//! stored constants and operations for traced programs.
+//! XLA execution domains and the shared resources used to stage, compile, and execute array programs. A [`Domain`]
+//! implements [`ryft_core::Domain`] over [`ArrayIrType`], with [`Value`]s that hold device arrays, checked dimensions,
+//! or mutable references. Values retain their domain, so eager operations and transforms recover the execution context
+//! from their inputs. [`Constant`] and [`Operation`] provide the corresponding families of stored constants and
+//! operations for traced programs.
 //!
 //! # Sessions and Domains
 //!
@@ -20,20 +19,20 @@
 //!
 //! # Compilation and Execution
 //!
-//! The [`crate::compilation`] module implements compilation for a domain and [`crate::execution`] implements
-//! execution. Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained dispatcher
-//! that specializes on its runtime inputs. The backend also implements the generic lifecycle in
-//! [`ryft_core::compilation`]. When staging directly through [`ryft_core::StagedFunction::stage`], apply
-//! [`with_input_shardings`](crate::compilation::with_input_shardings) to the input types first if the options specify
-//! input sharding overrides.
+//! The [`crate::compilation`] module implements compilation for a domain and [`crate::execution`] implements execution.
+//! Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained dispatcher that
+//! specializes on its runtime inputs. The backend also implements the generic lifecycle in [`ryft_core::compilation`].
+//! When staging directly through [`ryft_core::StagedFunction::stage`], apply
+//! [`with_input_shardings`](crate::with_input_shardings) to the input types
+//! first if the options specify input sharding overrides.
 //!
-//! [`LoweredProgram`](crate::compilation::LoweredProgram) contains StableHLO and the metadata needed for compilation.
-//! [`CompiledProgram`](crate::compilation::CompiledProgram) contains the loaded executable and its invocation contract.
-//! These flat artifacts are distinct from the typed function handles in [`crate::compilation::functions`], which also
-//! retain input and output container structures. The session's [`CompilationContext`] coordinates artifact reuse, and
-//! [`CompilationKey`](crate::compilation::CompilationKey) records the exact computation and compilation configuration.
-//! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram) expose
-//! compiler diagnostics for a compiled program.
+//! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
+//! [`CompiledProgram`](crate::CompiledProgram) contains the loaded executable and its invocation contract. These flat
+//! artifacts are distinct from the typed function handles in [`crate::compilation::functions`], which also retain input
+//! and output container structures. The session's [`CompilationContext`] coordinates artifact reuse, and
+//! [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation configuration.
+//! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
+//! expose compiler diagnostics for a compiled program.
 //!
 //! # Effects and Completion
 //!
@@ -42,10 +41,8 @@
 //! domain's scope. Mutable references also retain their own coordination across calls, based on their identities.
 //!
 //! Array readiness observes completion of the work that produced that array. [`Domain::effects_barrier`] observes
-//! previously submitted effects, including work whose outputs were discarded. Call it before dropping the client
-//! when those effects must be observed. Sessions, domains, and their values borrow the client and cannot outlive it.
-
-// TODO(eaplatanios): Review this module.
+//! previously submitted effects, including work whose outputs were discarded. Call it before dropping the client when
+//! those effects must be observed. Sessions, domains, and their values borrow the client and cannot outlive it.
 
 use std::sync::{Arc, LazyLock};
 
@@ -71,6 +68,8 @@ pub use runtimes::{
 };
 pub use sessions::{Session, SessionConstant, ThroughSession};
 pub use targets::{Target, TargetDevice};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
 /// [`Client`].

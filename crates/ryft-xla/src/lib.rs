@@ -37,12 +37,13 @@ pub mod values;
 pub use arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
-    AdaptiveProfileGuidedStatistics, AnalysisValue, CompilationAnalysis, CompilationError, CompileTracer,
-    CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FeedbackDirectedProfile, InputBoundBucketing,
-    MemoryAnalysis, OptimizedProgram, Options, StagedFunction, StatefulCompileTracer, StatefulCompiledFunction,
-    StatefulCompiledFunctionDispatcher, StatefulValue, compile, compile_statefully, compile_statefully_with_captures,
-    compile_with_captures, compile_with_options, infer_output_types, jit, jit_statefully, jit_statefully_with_options,
-    jit_with_options, stage, stage_with_captures,
+    AdaptiveProfileGuidedStatistics, AnalysisValue, CompilationAnalysis, CompilationError, CompilationKey,
+    CompileTracer, CompiledFunction, CompiledFunctionDispatcher, CompiledProgram, ExecutableFunction,
+    FeedbackDirectedProfile, InputBoundBucketing, LoweredProgram, MemoryAnalysis, OptimizedProgram, Options,
+    StagedFunction, StatefulCompileTracer, StatefulCompiledFunction, StatefulCompiledFunctionDispatcher, StatefulValue,
+    compile, compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
+    infer_output_types, jit, jit_statefully, jit_statefully_with_options, jit_with_options, stage, stage_with_captures,
+    with_input_shardings,
 };
 pub use distributed::DistributedRuntime;
 pub use domains::{Domain, RuntimeError, Session, SessionConstant, Target, TargetDevice, ThroughSession};
