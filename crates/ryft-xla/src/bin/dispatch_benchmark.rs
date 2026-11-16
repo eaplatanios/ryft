@@ -22,9 +22,9 @@ use ryft_core::{
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
-use ryft_xla::operations::ProgramBuilder;
 use ryft_xla::{
-    Array, CompileTracer, CompiledFunctionDispatcher, Constant, Dimension, FromPjrt, Operation, Session, Value, jit,
+    Array, CompileTracer, CompiledFunctionDispatcher, Constant, Dimension, FromPjrt, Operation, ProgramBuilder,
+    Session, Value, jit,
 };
 
 // TODO(eaplatanios): Review this module.

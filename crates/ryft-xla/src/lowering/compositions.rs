@@ -17,8 +17,7 @@ use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
-use crate::operations::{FlatProgram, Program};
-use crate::{Constant, Error};
+use crate::{Constant, Error, FlatProgram, Program};
 
 // TODO(eaplatanios): Review this module.
 

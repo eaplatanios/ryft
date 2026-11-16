@@ -959,8 +959,7 @@ mod tests {
     };
     use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Array, CompiledFunction, Domain, Session, compile, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, CompiledFunction, Domain, Session, compile, to_mlir_module_for_program};
 
     use super::*;
 

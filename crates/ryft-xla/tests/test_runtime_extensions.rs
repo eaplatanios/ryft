@@ -14,11 +14,10 @@ use ryft_pjrt::extensions::ffi::{
     FfiTypeId, FfiTypeInformation, FfiUserData, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::domains::{
-    ExecutionResources, RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id,
-    with_runtime_requirements,
+use ryft_xla::{
+    Domain, Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension, RuntimeExtensions,
+    RuntimeProvider, RuntimeRequirement, Session, Target, Value, named_ffi_type_id, with_runtime_requirements,
 };
-use ryft_xla::{Domain, Error, FromPjrt, Options, RuntimeError, Session, Target, Value};
 
 /// Native target that consumes both independently installed states.
 const TARGET: &str = "ryft.test.runtime_extensions.add_states";

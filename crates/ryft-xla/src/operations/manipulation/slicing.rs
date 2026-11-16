@@ -705,8 +705,7 @@ mod tests {
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Array, Constant, Options, Session, Value, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Constant, Options, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 

@@ -206,15 +206,16 @@ mod tests {
     use ryft_mlir::{Block, Location, Value as MlirValue};
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{
         shard_map_module, static_sharded_array_type, test_manual_mesh, test_spmd_compilation_options, test_vector_type,
     };
     use crate::operations::Operation;
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
-    use crate::{Array, FromPjrt, LowerableOperation, Lowerer, Session};
+    use crate::{
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableOperation, Lowerer, Session, TracedProgram, trace,
+        trace_with_context,
+    };
 
     use super::*;
 

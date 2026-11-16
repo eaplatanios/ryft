@@ -33,15 +33,16 @@ use ryft_pjrt::{
 
 use crate::arrays::ArrayOutputLayout;
 use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
-use crate::compilation::CompiledProgram;
-use crate::domains::RuntimeRequirement;
 use crate::domains::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
 #[cfg(test)]
 use crate::domains::tests::{
     StatefulFailureInjection, take_stateful_completion_injection, take_stateful_failure_injection,
 };
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Array, ArrayError, ArrayShard, CompilationError, Domain, Error, FromPjrt, ToPjrt, Value};
+use crate::{
+    Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Domain, Error, FromPjrt, RuntimeRequirement,
+    ToPjrt, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1550,11 +1551,10 @@ mod tests {
     };
     use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
-    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Error, ExecutionError, Options, Reference, Session, ToMlir, Value, compile_statefully,
-        compile_statefully_with_captures,
+        Array, Constant, Error, ExecutionError, FlatProgram, Options, ProgramBuilder, Reference, Session, ToMlir,
+        Value, compile_statefully, compile_statefully_with_captures,
     };
 
     use super::*;

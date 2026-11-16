@@ -19,8 +19,7 @@ use crate::lowering::types::lower_tensor_type;
 use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::Program;
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir};
 
 impl LowerableOperation for ShardMapOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -405,7 +404,6 @@ pub(crate) mod tests {
 
     use crate::domains::Tracer;
     use crate::domains::tests::{read_sharded_f32_array, two_device_mesh};
-    use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_spmd_compilation_options, test_vector_type,
@@ -419,10 +417,9 @@ pub(crate) mod tests {
         FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
     };
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
-    use crate::values::ArrayConstant;
     use crate::{
-        Array, Domain, FromPjrt, Options, Reference, Session, Value, compile_statefully, to_mlir_module_for_program,
+        Array, ArrayConstant, ArrayTracer, Domain, ExecutionArguments, FromPjrt, Options, Reference, Session,
+        TracedProgram, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
     };
 
     use super::*;

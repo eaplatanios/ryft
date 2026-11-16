@@ -390,12 +390,11 @@ mod tests {
 
     use crate::domains::sessions::Session;
     use crate::domains::tests::{domain_mesh, f64_vector};
-    use crate::operations::ProgramBuilder;
-    use crate::operations::debugging::{
-        PRINT_CUSTOM_CALL_TARGET, ensure_print_handler_registered, with_captured_prints,
-    };
     use crate::tests::{cpu_client, execution_client, values_to_bytes};
-    use crate::{Array, CompilationError, Constant, FromPjrt, Operation, Options};
+    use crate::{
+        Array, CompilationError, Constant, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
+        ensure_print_handler_registered, with_captured_prints,
+    };
 
     use super::*;
 

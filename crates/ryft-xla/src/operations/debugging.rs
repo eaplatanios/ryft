@@ -17,9 +17,11 @@ use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::domains::effects::EffectCallbackGuard;
 use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
-use crate::domains::{RuntimeExtension, RuntimeProvider, RuntimeRequirement};
 use crate::lowering::{EffectTokens, current_or_new_token};
-use crate::{Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, Target};
+use crate::{
+    Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension, RuntimeProvider,
+    RuntimeRequirement, Target,
+};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
@@ -563,9 +565,9 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
     use crate::{
-        Array, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile, to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile,
+        to_mlir_module_for_program,
     };
 
     use super::*;

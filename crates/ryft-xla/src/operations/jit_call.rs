@@ -2322,7 +2322,6 @@ mod tests {
 
     use crate::domains::runtimes::builtin_requirement;
     use crate::domains::tests::{domain_mesh, read_f32s};
-    use crate::domains::with_runtime_requirements;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, identity_branch,
@@ -2331,10 +2330,9 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
-    use crate::values::ArrayConstant;
     use crate::{
-        Array, CompiledFunction, Constant, Options, Session, StagedFunction, ToPjrt, Value, compile, stage,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, Options, Session, StagedFunction, ToPjrt, Value, compile,
+        stage, to_mlir_module_for_program, with_runtime_requirements,
     };
 
     use super::*;

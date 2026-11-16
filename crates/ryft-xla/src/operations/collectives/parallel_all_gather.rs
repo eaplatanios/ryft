@@ -164,11 +164,9 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace};
-    use crate::{Array, FromPjrt, Session};
+    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
     use super::*;
 

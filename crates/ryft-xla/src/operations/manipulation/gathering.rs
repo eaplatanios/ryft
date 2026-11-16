@@ -279,8 +279,7 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Array, Options, Session, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Options, Session, to_mlir_module_for_program};
 
     #[test]
     fn test_gather_operation_lower() {

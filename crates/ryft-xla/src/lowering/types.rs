@@ -13,8 +13,7 @@ use ryft_mlir::{
 use crate::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::memory::annotate_output_memory;
-use crate::values::ArrayConstant;
-use crate::{ArrayError, Constant, Error, ToPjrt};
+use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 

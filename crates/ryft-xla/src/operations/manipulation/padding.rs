@@ -346,8 +346,7 @@ mod tests {
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Constant, ToPjrt, to_mlir_module_for_program};
+    use crate::{ArrayConstant, Constant, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 

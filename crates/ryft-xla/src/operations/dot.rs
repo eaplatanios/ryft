@@ -628,9 +628,10 @@ mod tests {
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace};
-    use crate::values::ArrayConstant;
-    use crate::{Array, Constant, Domain, Options, Session, ToPjrt, to_mlir_module_for_program};
+    use crate::{
+        Array, ArrayConstant, ArrayTracer, Constant, Domain, Options, Session, ToPjrt, TracedProgram,
+        to_mlir_module_for_program, trace,
+    };
 
     use super::*;
 

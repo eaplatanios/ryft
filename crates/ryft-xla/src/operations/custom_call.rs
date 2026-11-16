@@ -12,11 +12,13 @@ use ryft_mlir::{
     Operation as MlirOperation, Region as MlirRegion, Size as MlirSize, StringRef, Type, Value as MlirValue, ValueRef,
 };
 
-use crate::domains::{RUNTIME_REQUIREMENTS_ATTRIBUTE, runtime_requirements};
 use crate::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation};
+use crate::{
+    Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
+    RUNTIME_REQUIREMENTS_ATTRIBUTE, runtime_requirements,
+};
 
 impl LowerableOperation for CustomCallOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -556,9 +558,6 @@ mod tests {
 
     use crate::domains::runtimes::builtin_requirement;
     use crate::domains::tests::domain_mesh;
-    use crate::domains::{RuntimeRequirement, with_runtime_requirements};
-    use crate::execution::ExecutionArguments;
-    use crate::kernels::KernelEmbeddingError;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, static_sharded_array_type, test_matrix_type,
@@ -570,9 +569,11 @@ mod tests {
         ADD_ONE_CUSTOM_CALL_TARGET, cpu_client, ensure_add_one_handler_registered, replicated_array, values_from_bytes,
         values_to_bytes,
     };
-    use crate::tracing::{ArrayTracer, TracedProgram, trace};
-    use crate::values::ArrayConstant;
-    use crate::{Array, Constant, Domain, FromPjrt, RuntimeError, Session, Value, to_mlir_module_for_program};
+    use crate::{
+        Array, ArrayConstant, ArrayTracer, Constant, Domain, ExecutionArguments, FromPjrt, KernelEmbeddingError,
+        RuntimeError, RuntimeRequirement, Session, TracedProgram, Value, to_mlir_module_for_program, trace,
+        with_runtime_requirements,
+    };
 
     use super::*;
 

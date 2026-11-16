@@ -37,9 +37,9 @@ mod tests {
     use crate::domains::tests::{read_f32s, two_device_mesh};
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace};
     use crate::{
-        Array, CompileTracer, CompiledFunction, Domain, FromPjrt, Options, Session, compile, compile_with_options,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Domain, FromPjrt, Options, Session, TracedProgram,
+        compile, compile_with_options, trace,
     };
 
     /// Returns `logical_mesh` over the addressable devices of `client`.

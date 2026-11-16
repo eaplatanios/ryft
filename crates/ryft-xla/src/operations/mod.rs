@@ -46,11 +46,9 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::kernels::KernelOperation;
 use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
 use crate::operations::constants::lower_layout_constraint;
-use crate::operations::jit_call::JitCallOperation;
-use crate::{Constant, Error, LoweringError};
+use crate::{Constant, Error, KernelOperation, LoweringError};
 
 // TODO(eaplatanios): Review this module.
 
@@ -124,6 +122,12 @@ pub(crate) mod special;
 pub(crate) mod tagging;
 /// StableHLO lowering of trigonometric and hyperbolic operations.
 pub(crate) mod trigonometric;
+
+pub use debugging::{
+    PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
+};
+pub use dot::RaggedDotLoweringStrategy;
+pub use jit_call::{JIT_CALL_OPERATION_NAME, JitCallOperation, transpose_primal_jit_call};
 
 /// Ordinary universe of staged operations that the XLA backend owns.
 ///
@@ -863,9 +867,7 @@ mod tests {
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type};
-    use crate::tracing::ArrayTracer;
-    use crate::values::ArrayConstant;
-    use crate::{Array, Constant, Domain, Session, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Domain, Session, to_mlir_module_for_program};
 
     use super::*;
 

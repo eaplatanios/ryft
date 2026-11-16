@@ -295,9 +295,8 @@ pub(crate) mod tests {
     use ryft_pjrt::protos::CompilationOptions;
 
     use crate::domains::sessions::Session;
-    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{cpu_client, execution_client, four_device_mesh_x, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, ExecutionError, FromPjrt, Operation, Value};
+    use crate::{Array, Constant, ExecutionError, FlatProgram, FromPjrt, Operation, ProgramBuilder, Value};
 
     use super::*;
 

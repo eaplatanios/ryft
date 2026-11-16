@@ -26,9 +26,7 @@ use ryft_core::{
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::execution::ExecutionArguments;
-use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
-use ryft_xla::{Array, Domain, FromPjrt, Session};
+use ryft_xla::{Array, ArrayTracer, Domain, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
 // TODO(eaplatanios): Review this module.
 

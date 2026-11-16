@@ -115,8 +115,10 @@ mod tests {
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::Operation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Array, ArrayError, CompiledFunction, Constant, Error, Session, compile, to_mlir_module_for_program};
+    use crate::{
+        Array, ArrayConstant, ArrayError, CompiledFunction, Constant, Error, Session, compile,
+        to_mlir_module_for_program,
+    };
 
     use super::*;
 

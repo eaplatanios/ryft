@@ -12,8 +12,7 @@ use ryft_core::{
     Value as CoreValue, ValueProjection, batch, shard_map,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::FromPjrt;
-use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::{ArrayTracer, FromPjrt, TracedProgram, trace};
 
 use super::{DifferentialObservation, SCHEMA, execute_collective_inputs};
 

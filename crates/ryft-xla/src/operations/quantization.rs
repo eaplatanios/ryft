@@ -552,9 +552,8 @@ mod tests {
     };
     use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
     use crate::{
-        Array, CompiledFunction, Constant, Domain, FromPjrt, LoweringError, Session, compile,
+        Array, ArrayConstant, CompiledFunction, Constant, Domain, FromPjrt, LoweringError, Session, compile,
         to_mlir_module_for_program,
     };
 

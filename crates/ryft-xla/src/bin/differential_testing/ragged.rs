@@ -20,7 +20,7 @@ use ryft_pjrt::{
     GpuPlatform, Program, load_cuda_13_plugin,
 };
 #[cfg(any(test, feature = "cuda-13"))]
-use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::{ArrayTracer, TracedProgram, trace};
 
 use super::DifferentialObservation;
 #[cfg(feature = "cuda-13")]

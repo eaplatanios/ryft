@@ -17,8 +17,7 @@ use ryft_core::{
     MeshAxis, MeshAxisType, Program as CoreProgram, ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape,
     ShardMapOptions, Sharding, ShardingDimension, Sin, shard_map,
 };
-use ryft_xla::Error;
-use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::{ArrayTracer, Error, TracedProgram, trace};
 
 // TODO(eaplatanios): Review this module.
 

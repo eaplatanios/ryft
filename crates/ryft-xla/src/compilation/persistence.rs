@@ -31,10 +31,9 @@ use crate::compilation::CompilationError;
 use crate::compilation::keys::COMPILER_IDENTITY;
 use crate::compilation::programs::CompiledProgram;
 use crate::domains::runtimes::builtin_requirement;
-use crate::domains::{RuntimeRequirement, normalize_runtime_requirements};
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Domain, Error};
+use crate::{Domain, Error, RuntimeRequirement, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1460,9 +1459,8 @@ mod tests {
         domain_mesh, external_reference_read_program, f32_scalar, f64_vector, program_array, read_f32s,
         replicated_scalar_type, replicated_vector_type,
     };
-    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{cpu_client, values_to_bytes};
-    use crate::{Array, Constant, Error, FromPjrt, Session, Value};
+    use crate::{Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Value};
 
     use super::*;
 

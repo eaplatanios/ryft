@@ -24,8 +24,7 @@ use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredP
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::{collect_session_constants, contains_unresolved_references, contains_unresolved_state};
-use crate::operations::FlatProgram;
-use crate::{Constant, Domain, Error, ExecutionError, OpShardingExtension, Operation, Value};
+use crate::{Constant, Domain, Error, ExecutionError, FlatProgram, OpShardingExtension, Operation, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -932,10 +931,10 @@ mod tests {
         boolean_scalar, domain_mesh, external_reference_read_program, f32_scalar, f32_vector, read_f32s, read_f64s,
         replicated_scalar_type, replicated_vector_type,
     };
-    use crate::operations::jit_call::JitCallOperation;
-    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, Error, FromPjrt, Operation, Session, Value};
+    use crate::{
+        Array, Constant, Error, FlatProgram, FromPjrt, JitCallOperation, Operation, ProgramBuilder, Session, Value,
+    };
 
     use super::*;
 

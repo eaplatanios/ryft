@@ -28,8 +28,7 @@ use ryft_core::{
 };
 
 use crate::domains::Tracer;
-use crate::operations::Program;
-use crate::{Constant, Domain, Error};
+use crate::{Constant, Domain, Error, Program};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Domain`] projected onto its array member. The `shard_map` bodies
@@ -266,8 +265,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
 
     use crate::lowering::tests::{test_sharding, test_spmd_compilation_options};
-    use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::{ensure_print_handler_registered, with_captured_prints};
 
     use super::*;
 

@@ -559,7 +559,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[cfg(feature = "cuda-13")]
-    use crate::arrays::DevicePutTarget;
+    use crate::DevicePutTarget;
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::test_spmd_compilation_options;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;

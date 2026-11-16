@@ -26,8 +26,7 @@ use crate::compilation::persistence::{
     PersistentReferenceState, PersistentSharding, persistent_mapping,
 };
 use crate::compilation::programs::LoweredProgram;
-use crate::domains::RuntimeRequirement;
-use crate::{Constant, Error, Operation, Value};
+use crate::{Constant, Error, Operation, RuntimeRequirement, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -813,10 +812,11 @@ mod tests {
     use crate::domains::tests::{
         domain_mesh, external_reference_read_program, f32_vector, program_array, read_f32s, replicated_scalar_type,
     };
-    use crate::domains::{RuntimeRequirement, with_runtime_requirements};
-    use crate::operations::ProgramBuilder;
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
-    use crate::{Array, Constant, Dimension, Domain, Error, Operation, Session, Value};
+    use crate::{
+        Array, Constant, Dimension, Domain, Error, Operation, ProgramBuilder, RuntimeRequirement, Session, Value,
+        with_runtime_requirements,
+    };
 
     use super::*;
 

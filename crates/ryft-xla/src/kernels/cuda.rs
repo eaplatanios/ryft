@@ -24,12 +24,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
-use crate::domains::{
-    ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, named_ffi_type_id,
-    with_runtime_requirements,
-};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
-use crate::{Error, Target, ToPjrt};
+use crate::{
+    Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, Target, ToPjrt,
+    named_ffi_type_id, with_runtime_requirements,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -695,12 +694,10 @@ mod tests {
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::domains::runtime_requirements;
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::operations::ProgramBuilder;
-    use crate::{Constant, RuntimeError};
+    use crate::{Constant, ProgramBuilder, RuntimeError, runtime_requirements};
 
     use super::*;
 

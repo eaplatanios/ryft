@@ -254,9 +254,8 @@ mod tests {
 
     use crate::domains::sessions::Session;
     use crate::domains::tests::{domain_mesh, replicated_vector_type};
-    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::cpu_client;
-    use crate::{Operation, Options};
+    use crate::{FlatProgram, Operation, Options, ProgramBuilder};
 
     use super::*;
 

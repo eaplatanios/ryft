@@ -25,7 +25,7 @@ use ryft_pjrt::{
 #[cfg(feature = "cuda-13")]
 use ryft_xla::DistributedRuntime;
 #[cfg(any(test, feature = "cuda-13"))]
-use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::{ArrayTracer, TracedProgram, trace};
 
 use super::DifferentialObservation;
 #[cfg(feature = "cuda-13")]

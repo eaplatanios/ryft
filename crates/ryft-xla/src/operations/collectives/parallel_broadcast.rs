@@ -162,8 +162,7 @@ mod tests {
     use crate::lowering::tests::{test_manual_mesh, test_spmd_compilation_options};
     use crate::operations::sharding::shard_map::tests::{execute_inputs_on_cpu_devices, test_logical_mesh_2x2};
     use crate::tests::cpu_client;
-    use crate::to_mlir_module_for_program;
-    use crate::tracing::{ArrayTracer, TracedProgram, trace_with_context};
+    use crate::{ArrayTracer, TracedProgram, to_mlir_module_for_program, trace_with_context};
 
     use super::*;
 

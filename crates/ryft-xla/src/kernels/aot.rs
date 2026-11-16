@@ -17,10 +17,9 @@ use ryft_pjrt::Execution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::compilation::CompiledProgram;
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::staging::{KernelCompilerBinding, KernelExecutionFacts, stage_kernel};
-use crate::{Array, CompilationAnalysis, Domain, Error, Options};
+use crate::{Array, CompilationAnalysis, CompiledProgram, Domain, Error, Options};
 
 // TODO(eaplatanios): Review this module.
 

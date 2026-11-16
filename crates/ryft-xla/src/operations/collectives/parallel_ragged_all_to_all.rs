@@ -589,16 +589,14 @@ mod tests {
         GpuPlatform, Program as PjrtProgram, load_cuda_13_plugin,
     };
 
-    #[cfg(feature = "cuda-13")]
-    use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{shard_map_module, test_sharding};
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     #[cfg(feature = "cuda-13")]
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace};
     #[cfg(feature = "cuda-13")]
-    use crate::{Array, FromPjrt, Session};
+    use crate::{Array, ExecutionArguments, FromPjrt, Session};
+    use crate::{ArrayTracer, TracedProgram, trace};
 
     use super::*;
 

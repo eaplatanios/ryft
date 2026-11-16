@@ -13,8 +13,7 @@ use crate::lowering::types::lower_constant;
 use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction};
 use crate::operations::composites::lowers_without_regions;
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::operations::{FlatProgram, Program};
-use crate::{Constant, Error};
+use crate::{Constant, Error, FlatProgram, Program};
 
 // TODO(eaplatanios): Review this module.
 
@@ -399,9 +398,9 @@ mod tests {
     use ryft_mlir::dialects::func;
     use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, TypeAndAttributes, Value as MlirValue};
 
+    use crate::ArrayConstant;
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::lowering::types::lower_tensor_type;
-    use crate::values::ArrayConstant;
 
     use super::*;
 

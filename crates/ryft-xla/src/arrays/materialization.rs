@@ -807,9 +807,8 @@ mod tests {
     use ryft_pjrt::BufferType;
 
     use crate::domains::tests::{domain_mesh, replicated_vector_type};
-    use crate::execution::ExecutionArguments;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::{FromPjrt, Session};
+    use crate::{ExecutionArguments, FromPjrt, Session};
 
     use super::*;
 

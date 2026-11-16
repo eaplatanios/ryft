@@ -742,12 +742,11 @@ mod tests {
         differentiate_at,
     };
 
-    use crate::Session;
     use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module};
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
+    use crate::{ArrayConstant, Session};
 
     use super::*;
 

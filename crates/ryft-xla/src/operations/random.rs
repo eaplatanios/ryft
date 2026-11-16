@@ -244,9 +244,9 @@ mod tests {
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
     use crate::{
-        Array, Constant, Domain, Error, LowerableOperation, Lowerer, LoweringError, Session, to_mlir_module_for_program,
+        Array, ArrayConstant, Constant, Domain, Error, LowerableOperation, Lowerer, LoweringError, Session,
+        to_mlir_module_for_program,
     };
 
     // Uploads one generator state to the device and builds the same state on the reference backend.

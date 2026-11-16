@@ -2326,11 +2326,10 @@ mod tests {
         domain_mesh, read_f32s, read_f64s, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         two_device_mesh,
     };
-    use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{assert_send_sync, cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Domain, Error, ExecutionError, Operation, RaggedDotLoweringStrategy, Reference, Session,
-        ThroughSession, Value,
+        Array, Constant, Domain, Error, ExecutionError, JitCallOperation, Operation, RaggedDotLoweringStrategy,
+        Reference, Session, ThroughSession, Value,
     };
 
     use super::*;

@@ -34,11 +34,14 @@ pub mod tracing;
 pub mod types;
 pub mod values;
 
-pub use arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
+pub use arrays::{
+    Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutTarget, ShardDescriptor, ShardIndex,
+    ShardLayout, block_until_ready, ready,
+};
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
     AdaptiveProfileGuidedStatistics, AnalysisValue, CompilationAnalysis, CompilationError, CompilationKey,
-    CompileTracer, CompiledFunction, CompiledFunctionDispatcher, CompiledProgram, ExecutableFunction,
+    CompileTracer, CompiledFunction, CompiledFunctionDispatcher, CompiledProgram, DispatchKey, ExecutableFunction,
     FeedbackDirectedProfile, InputBoundBucketing, LoweredProgram, MemoryAnalysis, OptimizedProgram, Options,
     StagedFunction, StatefulCompileTracer, StatefulCompiledFunction, StatefulCompiledFunctionDispatcher, StatefulValue,
     compile, compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
@@ -46,20 +49,46 @@ pub use compilation::{
     with_input_shardings,
 };
 pub use distributed::DistributedRuntime;
-pub use domains::{Domain, RuntimeError, Session, SessionConstant, Target, TargetDevice, ThroughSession};
+pub use domains::{
+    Domain, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError,
+    RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, SessionConstant, Target,
+    TargetDevice, ThroughSession, named_ffi_type_id, normalize_runtime_requirements, runtime_requirements,
+    with_runtime_requirements,
+};
 pub use errors::Error;
-pub use execution::ExecutionError;
+pub use execution::{ExecutionArguments, ExecutionError};
+#[cfg(feature = "cutile")]
+pub use kernels::CuTileEmbedding;
+#[cfg(feature = "mosaic-gpu")]
+pub use kernels::MosaicGpuEmbedding;
+#[cfg(feature = "rocm")]
+pub use kernels::RocmKernelEmbedding;
+#[cfg(feature = "triton")]
+pub use kernels::TritonEmbedding;
+pub use kernels::{
+    CUDA_KERNEL_CUSTOM_CALL_TARGET, CompiledKernel, CudaKernelBufferBinding, CudaKernelEmbedding,
+    CudaKernelParameterBinding, DistributedKernel, DistributedKernelError, DistributedKernelOptions, KernelAotBundle,
+    KernelAotError, KernelCompilationReport, KernelCompilerBinding, KernelDeviceFacts, KernelEmbeddingError,
+    KernelExecutionFacts, KernelExtension, KernelOperation, KernelOutputEmbedding, KernelTarget, KernelTuner,
+    KernelTuningBudget, KernelTuningError, KernelTuningRequest, KernelTuningResult, KernelTuningRunner, LoadedKernel,
+    ROCM_KERNEL_CUSTOM_CALL_TARGET, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp,
+    stage_kernel_with_rules, stage_kernel_with_vjp,
+};
 pub use lowering::{
     LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
-    to_mlir_module_for_program,
+    lower_projected_operation, to_mlir_module_for_program,
 };
 pub use mlir::ToMlir;
-pub use operations::Operation;
-pub use operations::dot::RaggedDotLoweringStrategy;
+pub use operations::{
+    FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE,
+    Program, ProgramBuilder, RaggedDotLoweringStrategy, ensure_print_handler_registered, transpose_primal_jit_call,
+    with_captured_prints,
+};
 pub use pjrt::{FromPjrt, ToPjrt};
-pub use sharding::OpShardingExtension;
+pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
-pub use values::{Constant, Dimension, Reference, Value};
+pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
+pub use values::{ArrayConstant, Constant, Dimension, Reference, Value};
 
 // TODO(eaplatanios): Review this module.
 

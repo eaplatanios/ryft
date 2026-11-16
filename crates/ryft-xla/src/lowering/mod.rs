@@ -47,7 +47,6 @@ use ryft_mlir::{
 };
 
 use crate::domains::runtimes::builtin_requirement;
-use crate::domains::{RuntimeRequirement, normalize_runtime_requirements};
 use crate::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
@@ -62,10 +61,11 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
-use crate::operations::{FlatProgram, Program};
-use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardyTensorSharding};
-use crate::values::ArrayConstant;
-use crate::{CompilationError, Constant, Error, Operation, RaggedDotLoweringStrategy, SessionConstant, ToMlir};
+use crate::sharding::ShardyTensorSharding;
+use crate::{
+    ArrayConstant, CompilationError, Constant, Error, FlatProgram, Operation, Program, RaggedDotLoweringStrategy,
+    RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, SessionConstant, ToMlir, normalize_runtime_requirements,
+};
 
 // TODO(eaplatanios): Review this module.
 

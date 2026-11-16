@@ -28,8 +28,10 @@ use ryft_kernels::{
 use ryft_mlir::ValueRef;
 
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
-use crate::operations::FlatProgram;
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation, Target};
+use crate::{
+    Constant, Error, FlatProgram, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation,
+    Target,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1374,10 +1376,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::operations::ProgramBuilder;
-    use crate::operations::jit_call::JitCallOperation;
-    use crate::values::ArrayConstant;
-    use crate::{Domain, FromPjrt, Options, Session};
+    use crate::{ArrayConstant, Domain, FromPjrt, JitCallOperation, Options, ProgramBuilder, Session};
 
     use super::*;
 

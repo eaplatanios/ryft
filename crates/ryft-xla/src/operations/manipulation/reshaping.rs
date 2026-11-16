@@ -317,9 +317,7 @@ mod tests {
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::tracing::ArrayTracer;
-    use crate::values::ArrayConstant;
-    use crate::{Constant, to_mlir_module_for_program};
+    use crate::{ArrayConstant, ArrayTracer, Constant, to_mlir_module_for_program};
 
     use super::*;
 

@@ -491,15 +491,16 @@ mod tests {
 
     use crate::domains::tests::domain_mesh;
     #[cfg(feature = "cuda-13")]
-    use crate::kernels::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, KernelCompilerBinding, stage_kernel};
-    #[cfg(feature = "cuda-13")]
     use crate::tests::values_from_bytes;
     use crate::tests::{
         assert_send_sync, cpu_client, execution_client, four_device_mesh_x, logical_mesh_2x2, values_to_bytes,
     };
     use crate::{Array, FromPjrt, Reference, Session};
     #[cfg(feature = "cuda-13")]
-    use crate::{Constant, Operation, Options};
+    use crate::{
+        CUDA_KERNEL_CUSTOM_CALL_TARGET, Constant, CudaKernelEmbedding, KernelCompilerBinding, Operation, Options,
+        stage_kernel,
+    };
 
     use super::*;
 

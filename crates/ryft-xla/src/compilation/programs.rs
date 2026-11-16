@@ -18,12 +18,10 @@ use crate::compilation::CompilationError;
 use crate::compilation::analysis::{CompilationAnalysis, OptimizedProgram};
 use crate::compilation::keys::{COMPILER_IDENTITY, canonical_boundary_types};
 use crate::compilation::options::FeedbackDirectedProfile;
-use crate::domains::RuntimeRequirement;
-use crate::domains::targets::Target;
 use crate::execution::ExecutionPlan;
 use crate::lowering::LoweredModule;
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Error, SessionConstant};
+use crate::{Error, RuntimeRequirement, SessionConstant, Target};
 
 // TODO(eaplatanios): Review this module.
 

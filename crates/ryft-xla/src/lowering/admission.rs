@@ -13,8 +13,7 @@ use ryft_core::{
     ScatterMode, ScatterReductionKind, SortDirection, Type, Typed,
 };
 
-use crate::operations::FlatProgram;
-use crate::{Error, Operation};
+use crate::{Error, FlatProgram, Operation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -405,9 +404,8 @@ mod tests {
 
     use crate::domains::Tracer;
     use crate::domains::tests::{domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type};
-    use crate::operations::{FlatProgram, ProgramBuilder};
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
-    use crate::{Array, Constant, Domain, Error, Operation, Options, Session, Value};
+    use crate::{Array, Constant, Domain, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Value};
 
     use super::*;
 

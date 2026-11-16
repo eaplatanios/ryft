@@ -34,14 +34,15 @@ use ryft_core::{
 };
 
 use crate::arrays::ConstantKind;
-use crate::compilation::CompiledProgram;
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::domains::Domain;
 use crate::domains::effects::ensure_effect_dispatch_allowed;
 use crate::domains::sessions::SessionConstant;
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::operations::{FlatProgram, ProgramBuilder};
-use crate::{Array, ArrayError, Constant, Dimension, Error, FromPjrt, LowerableOperation, Operation, Options, Value};
+use crate::{
+    Array, ArrayError, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LowerableOperation,
+    Operation, Options, ProgramBuilder, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -716,10 +717,9 @@ mod tests {
         read_booleans, read_f32s, read_f64s, read_i64s, replicated_scalar_type, replicated_vector_type,
     };
     use crate::lowering::tests::test_manual_mesh;
-    use crate::operations::jit_call::JitCallOperation;
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{CompileTracer, CompiledFunctionDispatcher, Reference, jit};
+    use crate::{CompileTracer, CompiledFunctionDispatcher, JitCallOperation, Reference, jit};
 
     use super::*;
 

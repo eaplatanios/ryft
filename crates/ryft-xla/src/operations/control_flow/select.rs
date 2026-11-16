@@ -171,8 +171,7 @@ mod tests {
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Session, to_mlir_module_for_program};
+    use crate::{ArrayConstant, Session, to_mlir_module_for_program};
 
     use super::*;
 

@@ -182,13 +182,11 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_manual_mesh, test_spmd_compilation_options};
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::tracing::{ArrayTracer, TracedProgram, trace};
-    use crate::{Array, FromPjrt, Session};
+    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
     use super::*;
 

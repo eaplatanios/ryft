@@ -13,8 +13,7 @@ use sha2::{Digest, Sha256};
 
 use ryft_core::{DeviceMesh, Parameterized, Sharding};
 
-use crate::kernels::KernelCompilerBinding;
-use crate::{Error, RaggedDotLoweringStrategy};
+use crate::{Error, KernelCompilerBinding, RaggedDotLoweringStrategy};
 
 // TODO(eaplatanios): Review this module.
 

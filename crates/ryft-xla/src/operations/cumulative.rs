@@ -359,8 +359,7 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Array, CompiledFunction, Domain, Options, Session, Value, compile};
+    use crate::{Array, ArrayConstant, CompiledFunction, Domain, Options, Session, Value, compile};
 
     use super::*;
 

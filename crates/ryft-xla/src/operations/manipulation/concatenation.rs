@@ -240,8 +240,10 @@ mod tests {
     use crate::lowering::types::physical_bound_type;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
-    use crate::values::ArrayConstant;
-    use crate::{Array, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, compile, to_mlir_module_for_program};
+    use crate::{
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, compile,
+        to_mlir_module_for_program,
+    };
 
     use super::*;
 

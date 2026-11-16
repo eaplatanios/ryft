@@ -21,14 +21,16 @@ use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::domains::effects::EffectCallbackGuard;
 use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
-use crate::domains::{RuntimeExtension, RuntimeProvider, RuntimeRequirement};
 use crate::lowering::types::{
     lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
 };
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
-use crate::{Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Target};
+use crate::{
+    Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
+    RuntimeProvider, RuntimeRequirement, Target,
+};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;

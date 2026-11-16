@@ -949,11 +949,10 @@ mod tests {
     };
     use ryft_pjrt::Client;
 
-    use crate::operations::ProgramBuilder;
     use crate::tests::{
         cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type,
     };
-    use crate::{Array, ArrayError, FromPjrt, Operation, Session};
+    use crate::{Array, ArrayError, FromPjrt, Operation, ProgramBuilder, Session};
 
     use super::*;
 

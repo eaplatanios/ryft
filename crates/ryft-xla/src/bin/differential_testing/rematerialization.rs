@@ -22,8 +22,7 @@ use ryft_core::{
     TracingContext, Typed, ValueProjection, ZeroLike, composite, differentiate_at, rematerialize, saved_residuals,
     scan,
 };
-use ryft_xla::Domain;
-use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
+use ryft_xla::{ArrayTracer, Domain, TracedProgram, trace};
 
 use super::{DifferentialObservation, SCHEMA};
 

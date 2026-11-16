@@ -20,13 +20,13 @@ use ryft_mlir::{Attribute, ElementsAttribute, Operation as MlirOperation, Region
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-use crate::Domain;
 use crate::lowering::LoweringError;
 use crate::operations::assertions::ensure_assertion_handler_registered;
-use crate::operations::jit_call::JitCallOperation;
-use crate::operations::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
 use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-use crate::tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
+use crate::{
+    ArrayTracer, Domain, FlatProgram, JitCallOperation, ProgramBuilder as ArrayIrProgramBuilder, TracedProgram, trace,
+    trace_with_context,
+};
 
 use super::*;
 

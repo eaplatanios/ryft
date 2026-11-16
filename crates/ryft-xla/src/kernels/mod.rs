@@ -52,7 +52,7 @@ use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::domains::RuntimeProvider;
+use crate::RuntimeProvider;
 
 mod aot;
 mod cuda;
@@ -447,8 +447,7 @@ pub(crate) mod tests {
     };
 
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::operations::ProgramBuilder;
-    use crate::{Constant, Operation};
+    use crate::{Constant, Operation, ProgramBuilder};
 
     use super::*;
 
