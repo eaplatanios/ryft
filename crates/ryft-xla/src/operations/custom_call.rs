@@ -570,8 +570,8 @@ mod tests {
         values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, Domain, ExecutionArguments, FromPjrt, KernelEmbeddingError,
-        RuntimeError, RuntimeRequirement, Session, TracedProgram, Value, to_mlir_module_for_program, trace,
+        Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError, RuntimeError,
+        RuntimeRequirement, Session, TracedProgram, Value, to_mlir_module_for_program, trace,
         with_runtime_requirements,
     };
 
@@ -1529,13 +1529,13 @@ mod tests {
     fn test_custom_call_operation_lower_executes_registered_ffi_handler() {
         let client = cpu_client(1);
         ensure_add_one_handler_registered(&client).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Eager dispatch compiles a single `stablehlo.custom_call` that resolves to the registered handler at
         // execution time.
         let input =
-            replicated_array(&domain, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[1.5f32, 2.5, 3.5, 4.5]));
+            replicated_array(&session, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[1.5f32, 2.5, 3.5, 4.5]));
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2, 2])]);
         let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![4f32, 5.0, 6.0, 7.0]);
 
         // An aliased ordered I/O call keeps the handler ABI with only arrays while its lowering threads a hidden token.
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2])])
             .with_input_output_alias(0, 0)
             .unwrap()
@@ -1631,9 +1631,9 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.0]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.0]));
         let operation = CustomCallOperation::new(TARGET, Vec::new())
             .with_attribute("boolean", true)
             .with_attribute("bytes", CustomCallAttribute::Bytes(vec![0x00, 0xff, 0x80]))
@@ -1666,7 +1666,7 @@ mod tests {
         assert!(matches!(CustomCall::custom_call(&operation, [&input]), Ok(outputs) if outputs.is_empty()));
 
         // The call has effects but no outputs, so its completion is only observable through the effects barrier.
-        domain.effects_barrier().unwrap();
+        session.effects_barrier().unwrap();
         assert_eq!(
             *OBSERVED_ATTRIBUTES.lock().unwrap(),
             vec![
@@ -1721,13 +1721,13 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let values = values_to_bytes(&[1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
-        let row_major_input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values);
+        let row_major_input = replicated_array(&session, &mesh, DataType::F32, &[2, 3], &values);
         let column_major_input = Array::from_host_buffer(
-            &domain,
+            &session,
             replicated_f32_type(&mesh, &[2, 3]).with_layout(column_major.clone()),
             mesh.clone(),
             values.as_slice(),
@@ -1807,13 +1807,13 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
-        // A call without array inputs binds directly in the eager domain and runs a source kernel that only fills its
+        // A call without array inputs binds directly in the eager session and runs a source kernel that only fills its
         // output.
         let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[4])]);
-        let outputs = operation.call(&domain, &[]).unwrap();
+        let outputs = operation.call(&session, &[]).unwrap();
         let [Value::Array(output)] = outputs.as_slice() else {
             panic!("expected one array output but got {} outputs", outputs.len());
         };
@@ -1824,11 +1824,11 @@ mod tests {
     fn test_custom_call_operation_lower_executes_batched_ffi_handler() {
         let client = cpu_client(1);
         ensure_add_one_handler_registered(&client).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let row_type = replicated_f32_type(&mesh, &[2]);
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::F32,
             &[3, 2],
@@ -1879,7 +1879,7 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_inside_manual_region_executes_on_cpu() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         ensure_add_one_handler_registered(&client).unwrap();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -1957,7 +1957,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
             input_buffers,
@@ -2000,16 +2000,16 @@ mod tests {
     fn test_custom_call_operation_lower_executes_under_composite_differentiation() {
         let client = cpu_client(1);
         ensure_add_one_handler_registered(&client).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
 
         // The bare operation rejects differentiation, so a composite supplies its rules. The primal and the forward
-        // rule execute the kernel through the projection of the eager domain onto arrays, and the backward rule passes
+        // rule execute the kernel through the projection of the eager session onto arrays, and the backward rule passes
         // the cotangent through because d(x + 1)/dx is the identity.
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2])]);
         let function = Composite::from_custom_call(operation.clone()).with_vjp(
-            move |inputs: Vec<DomainTracer<ProjectedContext<Domain<'_>, ArrayType>>>| {
+            move |inputs: Vec<DomainTracer<ProjectedContext<Session<'_>, ArrayType>>>| {
                 Ok((CustomCall::custom_call(&operation, &inputs)?, ()))
             },
             |(), cotangents| Ok(cotangents),

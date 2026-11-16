@@ -646,12 +646,12 @@ mod tests {
     #[test]
     fn test_atan2_operation_lower_complex_differentiation() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let y = Complex::new(0.7f32, -0.2);
         let x = Complex::new(-0.3f32, 0.4);
-        let y_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[y]));
-        let x_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[x]));
+        let y_array = replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[y]));
+        let x_array = replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[x]));
 
         // Complex `atan2(y, x)` uses the principal value and its two holomorphic partial derivatives away from
         // singularities and branch cuts. XLA's complex arithmetic may associate differently than the host's.
@@ -689,11 +689,11 @@ mod tests {
     #[test]
     fn test_tanh_operation_lower_complex_large_real() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         // Real parts large enough to overflow the intermediate exponentials saturate to `±1 + 0i` without NaN.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[3],
@@ -712,14 +712,14 @@ mod tests {
     #[test]
     fn test_lower_complex_sine_or_cosine_large_imaginary() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Hyperbolic factors need not overflow with their exponential intermediates, and a small real factor can keep
         // one component finite beyond the range of the hyperbolic factor itself. The finite components near overflow
         // depend on the backend's exponential approximation, so they are compared within a few ulps.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[3],
@@ -745,7 +745,7 @@ mod tests {
         // In single precision, the hyperbolic factor of the first input is finite and that of the second overflows.
         // Both keep their exact zero component, where a naive `0 * inf` decomposition would produce NaN.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[2],

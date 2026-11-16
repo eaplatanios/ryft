@@ -238,7 +238,7 @@ pub(crate) mod tests {
         shards: [Vec<u8>; 4],
     ) -> Vec<Vec<u8>> {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -275,7 +275,7 @@ pub(crate) mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(data_type, &[4 * shard_size], sharding),
             device_mesh,
             buffers,
@@ -301,7 +301,7 @@ pub(crate) mod tests {
     #[test]
     fn test_parallel_reduce_operation_lower() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -377,7 +377,7 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -499,7 +499,7 @@ pub(crate) mod tests {
     #[test]
     fn test_parallel_reduce_operation_lower_executes_log_sum_exp_gradient_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -568,7 +568,7 @@ pub(crate) mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
             buffers,

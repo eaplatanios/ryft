@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use ryft_core::{
-    ArrayIrType, ArrayType, CompilationCacheDomain, CompilationContext, CompilationDomain, CustomCall,
-    CustomCallOperation, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
-    StagedFunction as CoreStagedFunction,
+    ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain, CustomCall, CustomCallOperation, DataType,
+    Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction,
 };
 use ryft_pjrt::extensions::ffi::{
     FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
@@ -15,8 +14,8 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
-    Domain, Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension, RuntimeExtensions,
-    RuntimeProvider, RuntimeRequirement, Session, Target, Value, named_ffi_type_id, with_runtime_requirements,
+    Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
+    RuntimeRequirement, Session, Target, Value, named_ffi_type_id, with_runtime_requirements,
 };
 
 /// Native target that consumes both independently installed states.
@@ -205,7 +204,7 @@ fn providers<'c>(left: &Arc<Statistics>, right: &Arc<Statistics>, duplicate_bind
 fn staged<'c>(
     mesh: DeviceMesh,
     requirements: Vec<RuntimeRequirement>,
-) -> CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType> {
+) -> CoreStagedFunction<Session<'c>, ArrayIrType, ArrayIrType> {
     let r#type = ArrayType::scalar(DataType::I32);
     let operation =
         with_runtime_requirements(CustomCallOperation::new(TARGET, vec![r#type.clone()]), requirements).unwrap();
@@ -236,21 +235,20 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     let left = Arc::new(Statistics::default());
     let right = Arc::new(Statistics::default());
     let configuration = providers(&left, &right, false);
-    let first = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration.clone());
-    let domain = first.domain();
-    let lowered = staged(mesh.clone(), requirements()).lower(&domain).unwrap();
+    let first = Session::builder().client(&client).runtime_extensions(configuration.clone()).build().unwrap();
+    let lowered = staged(mesh.clone(), requirements()).lower(&first).unwrap();
     assert_eq!(lowered.lowered_program().runtime_requirements(), requirements());
     assert_eq!(left.initialized.load(Ordering::SeqCst), 0);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 0);
-    let compiled = lowered.compile(&domain).unwrap();
+    let compiled = lowered.compile(&first).unwrap();
     assert_eq!(compiled.compiled_program().runtime_requirements(), requirements());
     assert_eq!(left.initialized.load(Ordering::SeqCst), 1);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 1);
 
     let input = first.array(ArrayType::scalar(DataType::I32), mesh.clone(), 7i32.to_ne_bytes()).unwrap();
-    let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+    let output = compiled.executable().execute(&first, Value::Array(input.clone())).unwrap();
     assert_eq!(scalar(&output), 30);
-    let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+    let output = compiled.executable().execute(&first, Value::Array(input)).unwrap();
     assert_eq!(scalar(&output), 30);
     assert_eq!(left.initialized.load(Ordering::SeqCst), 1);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 1);
@@ -259,24 +257,23 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     assert_eq!(left.called.load(Ordering::SeqCst), 2);
     assert_eq!(right.called.load(Ordering::SeqCst), 2);
 
-    let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
-    let second = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
-    let restored_domain = second.domain();
+    let bytes = first.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+    let second = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
     assert_eq!(left.initialized.load(Ordering::SeqCst), 1);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 1);
-    let restored = restored_domain.deserialize_program(&bytes).unwrap().unwrap();
+    let restored = second.deserialize_program(&bytes).unwrap().unwrap();
     assert_eq!(restored.runtime_requirements(), requirements());
     // Loading resolves the receiving session's providers before its first invocation.
     assert_eq!(left.initialized.load(Ordering::SeqCst), 2);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 2);
     let input = second.array(ArrayType::scalar(DataType::I32), mesh, 7i32.to_ne_bytes()).unwrap();
-    let output = restored_domain.execute(&restored, vec![Value::Array(input)]).unwrap().remove(0);
+    let output = second.execute(&restored, vec![Value::Array(input)]).unwrap().remove(0);
     assert_eq!(scalar(&output), 53);
     assert_eq!(left.called.load(Ordering::SeqCst), 3);
     assert_eq!(right.called.load(Ordering::SeqCst), 3);
 
-    let missing = Session::with_runtime_extensions(&client, CompilationContext::new(), RuntimeExtensions::empty());
-    assert!(matches!(missing.domain().deserialize_program(&bytes),
+    let missing = Session::builder().client(&client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+    assert!(matches!(missing.deserialize_program(&bytes),
         Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == LEFT));
 }
 
@@ -285,18 +282,20 @@ fn test_runtime_extensions_reject_missing_provider_before_compilation_and_cached
     let (client, mesh) = client_and_mesh();
     let left = Arc::new(Statistics::default());
     let right = Arc::new(Statistics::default());
-    let first = Session::with_runtime_extensions(&client, CompilationContext::new(), providers(&left, &right, false));
-    let domain = first.domain();
-    let lowered = staged(mesh.clone(), requirements()).lower(&domain).unwrap();
-    let missing = Session::with_runtime_extensions(&client, CompilationContext::new(), RuntimeExtensions::empty());
-    let missing_domain = missing.domain();
-    assert!(matches!(lowered.compile(&missing_domain),
+    let first = Session::builder()
+        .client(&client)
+        .runtime_extensions(providers(&left, &right, false))
+        .build()
+        .unwrap();
+    let lowered = staged(mesh.clone(), requirements()).lower(&first).unwrap();
+    let missing = Session::builder().client(&client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+    assert!(matches!(lowered.compile(&missing),
         Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == LEFT));
     assert_eq!(left.initialized.load(Ordering::SeqCst), 0);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 0);
-    let compiled = lowered.compile(&domain).unwrap();
+    let compiled = lowered.compile(&first).unwrap();
     let input = missing.array(ArrayType::scalar(DataType::I32), mesh, 7i32.to_ne_bytes()).unwrap();
-    assert!(matches!(missing_domain.execute(compiled.compiled_program(), vec![Value::Array(input)]),
+    assert!(matches!(missing.execute(compiled.compiled_program(), vec![Value::Array(input)]),
         Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == LEFT));
     assert_eq!(left.called.load(Ordering::SeqCst), 0);
     assert_eq!(right.called.load(Ordering::SeqCst), 0);
@@ -307,12 +306,15 @@ fn test_runtime_extensions_reject_duplicate_native_binding_before_submission() {
     let (client, mesh) = client_and_mesh();
     let left = Arc::new(Statistics::default());
     let right = Arc::new(Statistics::default());
-    let session = Session::with_runtime_extensions(&client, CompilationContext::new(), providers(&left, &right, true));
-    let domain = session.domain();
-    let compiled = staged(mesh.clone(), requirements()).lower(&domain).unwrap().compile(&domain).unwrap();
+    let session = Session::builder()
+        .client(&client)
+        .runtime_extensions(providers(&left, &right, true))
+        .build()
+        .unwrap();
+    let compiled = staged(mesh.clone(), requirements()).lower(&session).unwrap().compile(&session).unwrap();
     let input = session.array(ArrayType::scalar(DataType::I32), mesh, 7i32.to_ne_bytes()).unwrap();
     let type_id = named_ffi_type_id(LEFT);
-    assert!(matches!(compiled.executable().execute(&domain, Value::Array(input)),
+    assert!(matches!(compiled.executable().execute(&session, Value::Array(input)),
         Err(Error::Runtime(RuntimeError::DuplicateUserData { type_id: actual })) if actual == i64::from(type_id)));
     assert_eq!(left.called.load(Ordering::SeqCst), 0);
     assert_eq!(right.called.load(Ordering::SeqCst), 0);
@@ -344,10 +346,9 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
 
     let (client, mesh) = client_and_mesh();
     let configuration = RuntimeExtensions::empty().with_provider(Arc::new(FailingProvider)).unwrap();
-    let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
-    let domain = session.domain();
+    let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
     let requirement = RuntimeRequirement::new("ryft.test.runtime_extensions.failure", 1, Vec::new()).unwrap();
-    let error = staged(mesh, vec![requirement]).lower(&domain).unwrap().compile(&domain).err().unwrap();
+    let error = staged(mesh, vec![requirement]).lower(&session).unwrap().compile(&session).err().unwrap();
     assert_eq!(error.downcast_custom::<ProviderFailure>(), Some(&ProviderFailure));
     assert_eq!(error.to_string(), "downstream provider is unavailable");
 }

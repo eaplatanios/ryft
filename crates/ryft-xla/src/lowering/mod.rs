@@ -1402,7 +1402,7 @@ where
 /// aliases between inputs and outputs, which are non-semantic hints that the buffers may alias and that merely permit
 /// backend buffer reuse. The runtime never donates reference state inputs, so an alias never authorizes in-place
 /// mutation of the state buffer of the caller. Read-only state may be finite and bounded dynamic because it has no
-/// hidden alias. The validation here owns the physical alias contract, and the XLA domain additionally enforces the
+/// hidden alias. The validation here owns the physical alias contract, and the XLA session additionally enforces the
 /// supported memory, sharding, and dynamic shape classes before calling it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<

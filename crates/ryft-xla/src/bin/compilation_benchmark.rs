@@ -38,8 +38,8 @@ use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 use ryft_xla::{
-    Array, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Domain, FromPjrt, Operation, Options, Session,
-    Value, compile, jit,
+    Array, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, FromPjrt, Operation, Options, Session, Value,
+    compile, jit,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -60,10 +60,10 @@ const ATTENTION_DIMENSIONS: [usize; 4] = [4, 2048, 32, 128];
 const SMOKE_ATTENTION_DIMENSIONS: [usize; 4] = [1, 16, 2, 8];
 
 /// Staged benchmark workload.
-type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkStagedFunction<'c> = CoreStagedFunction<Session<'c>, ArrayIrType, ArrayIrType>;
 
 /// Compiled benchmark workload.
-type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Session<'c>, ArrayIrType, ArrayIrType>;
 
 /// Benchmark scenario that `--scenario` selects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -224,9 +224,9 @@ fn dispatcher_statistics(statistics: DispatcherStatistics) -> JsonValue {
     })
 }
 
-/// Returns the counters and durations of the compilation context of `domain` as JSON.
-fn compilation_statistics(domain: &Domain<'_>) -> JsonValue {
-    let statistics = domain.compilation_context().statistics();
+/// Returns the counters and durations of the compilation context of `session` as JSON.
+fn compilation_statistics(session: &Session<'_>) -> JsonValue {
+    let statistics = session.compilation_context().statistics();
     json!({
         "memory_hits": statistics.memory_hits,
         "persistent_hits": statistics.persistent_hits,
@@ -255,7 +255,7 @@ fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::
 
 /// Uploads a deterministic input array of type `r#type` with `size` elements to `mesh`.
 fn input_array<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: &DeviceMesh,
     r#type: ArrayType,
     size: usize,
@@ -264,16 +264,16 @@ fn input_array<'c>(
     for index in 0..size {
         bytes.extend_from_slice(&((index % 1024) as f32 / 1024.0).to_ne_bytes());
     }
-    Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
+    Ok(Array::from_host_buffer(session, r#type, mesh.clone(), bytes.as_slice())?)
 }
 
 /// Stages the workload `sin(x * x + x)` for inputs of type `r#type` over `mesh`.
 fn stage_workload<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: &DeviceMesh,
     r#type: ArrayType,
 ) -> Result<BenchmarkStagedFunction<'c>, Box<dyn std::error::Error>> {
-    Ok(domain.stage(
+    Ok(session.stage(
         |input| {
             let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
             (input.clone() * input.clone() + input).sin().unwrap().into_value()
@@ -285,11 +285,11 @@ fn stage_workload<'c>(
 
 /// Executes the compiled workload at `input` and returns its output array.
 fn call_workload<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     compiled: &BenchmarkCompiledFunction<'c>,
     input: Array<'c>,
 ) -> Result<Array<'c>, Box<dyn std::error::Error>> {
-    match compiled.executable().execute(domain, Value::Array(input))? {
+    match compiled.executable().execute(session, Value::Array(input))? {
         Value::Array(output) => Ok(output),
         Value::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
         Value::Reference(_) => Err("compilation benchmark produced a reference".into()),
@@ -305,14 +305,13 @@ fn persistent_restore(
     r#type: &ArrayType,
     directory: &Path,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
-    let producer =
-        Session::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0)).domain();
+    let disk_cache = || Ok::<_, std::io::Error>(DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0));
+    let producer = Session::builder().client(client).disk_cache(disk_cache()?).build()?;
     let producer_staged = stage_workload(&producer, mesh, r#type.clone())?;
     let producer_lowered = producer_staged.lower(&producer)?;
     producer_lowered.compile(&producer)?;
 
-    let restored =
-        Session::with_disk_cache(client, DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0)).domain();
+    let restored = Session::builder().client(client).disk_cache(disk_cache()?).build()?;
     let restored_staged = stage_workload(&restored, mesh, r#type.clone())?;
     let restored_lowered = restored_staged.lower(&restored)?;
     let start = Instant::now();
@@ -335,14 +334,14 @@ fn replicated_f32_type(mesh: &DeviceMesh, shape: &[usize]) -> Result<ArrayType, 
 }
 
 /// Returns the cold duration of `construct`, the warm durations of `iterations` further calls, and the counters and
-/// durations of the compilation context of `domain` across them as JSON. The constructed values are dropped outside
+/// durations of the compilation context of `session` across them as JSON. The constructed values are dropped outside
 /// the timed region.
 fn repeated_construction<T>(
-    domain: &Domain<'_>,
+    session: &Session<'_>,
     iterations: usize,
     mut construct: impl FnMut() -> Result<T, ryft_xla::Error>,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
-    domain.compilation_context().clear_statistics();
+    session.compilation_context().clear_statistics();
     let start = Instant::now();
     let constructed = construct()?;
     let cold_nanoseconds = duration_nanoseconds(start);
@@ -357,8 +356,8 @@ fn repeated_construction<T>(
     Ok(json!({
         "cold_ns": cold_nanoseconds,
         "warm": distribution(&warm_samples),
-        "compilation_cache": compilation_statistics(domain),
-        "retained_programs": domain.program_count(),
+        "compilation_cache": compilation_statistics(session),
+        "retained_programs": session.program_count(),
     }))
 }
 
@@ -372,17 +371,17 @@ fn jit_eager_gradient(
     iterations: usize,
     smoke: bool,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
-    let domain = Session::new(client).domain();
+    let session = Session::with_client(client);
     let r#type = replicated_f32_type(mesh, &[])?;
     let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
         |_, input: CompileTracer<'_>| {
             Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
         },
-        &domain,
+        &session,
         mesh.clone(),
     );
-    domain.compilation_context().clear_statistics();
-    let input = |value: f32| Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), value.to_ne_bytes());
+    session.compilation_context().clear_statistics();
+    let input = |value: f32| Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), value.to_ne_bytes());
 
     let mut samples = Vec::with_capacity(iterations + 1);
     let mut cold_statistics = None;
@@ -412,8 +411,8 @@ fn jit_eager_gradient(
             "after_cold_call": dispatcher_statistics(cold_statistics.unwrap()),
             "after_warm_calls": dispatcher_statistics(statistics),
         },
-        "compilation_cache": compilation_statistics(&domain),
-        "retained_programs": domain.program_count(),
+        "compilation_cache": compilation_statistics(&session),
+        "retained_programs": session.program_count(),
     }))
 }
 
@@ -432,7 +431,7 @@ fn jit_eager_gradient(
 /// frontend time. The derived programs of distinct outer functions are distinct compilations that no frontend cache
 /// can remove.
 fn shared_callee_transforms<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: &DeviceMesh,
     callee_operations: usize,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
@@ -446,7 +445,7 @@ fn shared_callee_transforms<'c>(
             value
         },
         r#type.clone(),
-        domain,
+        session,
         mesh.clone(),
     )?;
 
@@ -462,7 +461,7 @@ fn shared_callee_transforms<'c>(
                 value
             },
             r#type.clone(),
-            domain,
+            session,
             mesh.clone(),
         )?;
 
@@ -483,7 +482,7 @@ fn shared_callee_transforms<'c>(
         outers.push(outer);
     }
 
-    let compilation_duration = || domain.compilation_context().statistics().compilation_duration;
+    let compilation_duration = || session.compilation_context().statistics().compilation_duration;
     let mut constructions = serde_json::Map::new();
     let mut mean_frontend_nanoseconds = serde_json::Map::new();
     for transform in ["jvp", "gradient"] {
@@ -493,8 +492,8 @@ fn shared_callee_transforms<'c>(
             let before = compilation_duration();
             let start = Instant::now();
             match transform {
-                "jvp" => drop(outer.jvp(domain)?),
-                _ => drop(outer.gradient(domain)?),
+                "jvp" => drop(outer.jvp(session)?),
+                _ => drop(outer.gradient(session)?),
             }
             let total = duration_nanoseconds(start);
             let backend = nanoseconds(compilation_duration() - before);
@@ -522,29 +521,29 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let jit_eager_gradient = jit_eager_gradient(&client, &mesh, arguments.iterations, arguments.smoke)?;
 
     // Repeated reverse mode construction of the gradient of `sum(sin(x))` over an `f32[4, 4]` input.
-    let domain = Session::new(&client).domain();
+    let session = Session::with_client(&client);
     let r#type = replicated_f32_type(&mesh, &[4, 4])?;
     let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
         |x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(),
         r#type.clone(),
-        &domain,
+        &session,
         mesh.clone(),
     )?;
-    let gradient_construction = repeated_construction(&domain, arguments.iterations, || compiled.gradient(&domain))?;
+    let gradient_construction = repeated_construction(&session, arguments.iterations, || compiled.gradient(&session))?;
 
     // Repeated forward mode construction of the JVP of `cos(sin(x))` over an `f32[4, 4]` input.
-    let domain = Session::new(&client).domain();
+    let session = Session::with_client(&client);
     let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-        compile(|x| x.sin().unwrap().cos().unwrap(), r#type, &domain, mesh.clone())?;
-    let jvp_construction = repeated_construction(&domain, arguments.iterations, || compiled.jvp(&domain))?;
+        compile(|x| x.sin().unwrap().cos().unwrap(), r#type, &session, mesh.clone())?;
+    let jvp_construction = repeated_construction(&session, arguments.iterations, || compiled.jvp(&session))?;
 
     // Transformations of a short and a long shared callee, whose difference isolates the frontend cost that grows with
     // the callee.
-    let domain = Session::new(&client).domain();
+    let session = Session::with_client(&client);
     let callee_operation_counts = if arguments.smoke { SMOKE_CALLEE_OPERATION_COUNTS } else { CALLEE_OPERATION_COUNTS };
     let callees = callee_operation_counts
         .into_iter()
-        .map(|callee_operations| shared_callee_transforms(&domain, &mesh, callee_operations))
+        .map(|callee_operations| shared_callee_transforms(&session, &mesh, callee_operations))
         .collect::<Result<Vec<_>, _>>()?;
     let added_operations = (callee_operation_counts[1] - callee_operation_counts[0]) as f64;
     let growth = |transform: &str| {
@@ -574,8 +573,8 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
         "shared_callee_transforms": {
             "callees": callees,
             "frontend_growth": { "jvp": growth("jvp"), "gradient": growth("gradient") },
-            "compilation_cache": compilation_statistics(&domain),
-            "retained_programs": domain.program_count(),
+            "compilation_cache": compilation_statistics(&session),
+            "retained_programs": session.program_count(),
         },
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -608,18 +607,18 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let (client, cuda) = platform_client()?;
     let client = Box::leak(Box::new(client));
     let mesh = mesh(client)?;
-    let domain = Session::new(client).domain();
+    let session = Session::with_client(client);
     let dimensions @ [batch, sequence, heads, head_dimension] =
         if arguments.smoke { SMOKE_ATTENTION_DIMENSIONS } else { ATTENTION_DIMENSIONS };
     let r#type = ArrayType::new_static(DataType::BF16, dimensions)
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-    let attention = dot_product_attention::<Domain<'static>>(
+    let attention = dot_product_attention::<Session<'static>>(
         AttentionConfiguration::new().with_scale(1.0 / (head_dimension as f64).sqrt()),
     );
 
     let start = Instant::now();
-    let staged: CoreStagedFunction<Domain<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> = domain.stage(
-        |inputs: Vec<CompilationTracer<Domain<'static>>>| {
+    let staged: CoreStagedFunction<Session<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> = session.stage(
+        |inputs: Vec<CompilationTracer<Session<'static>>>| {
             let inputs = AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone());
             vec![attention.call(inputs).unwrap()]
         },
@@ -628,25 +627,25 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let staging_nanoseconds = duration_nanoseconds(start);
     let start = Instant::now();
-    let lowered = staged.lower(&domain)?;
+    let lowered = staged.lower(&session)?;
     let lowering_nanoseconds = duration_nanoseconds(start);
     let fused = lowered.lowered_program().stable_hlo().contains("__cudnn$fmhaSoftmax");
     if cuda {
         assert!(fused, "attention must lower to cuDNN's fused attention kernel on CUDA");
     }
     let start = Instant::now();
-    let compiled: CoreCompiledFunction<Domain<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> =
-        lowered.compile(&domain)?;
+    let compiled: CoreCompiledFunction<Session<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> =
+        lowered.compile(&session)?;
     let compilation_nanoseconds = duration_nanoseconds(start);
 
     // Every input element is the bf16 encoding of one.
     let element_count = dimensions.iter().product::<usize>();
     let bytes = 0x3f80u16.to_ne_bytes().repeat(element_count);
-    let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice())?;
+    let input = Array::from_host_buffer(&session, r#type, mesh, bytes.as_slice())?;
     input.block_until_ready()?;
     let inputs = vec![Value::Array(input); 3];
     let execute = || -> Result<(), Box<dyn std::error::Error>> {
-        match compiled.executable().execute(&domain, inputs.clone())?.remove(0) {
+        match compiled.executable().execute(&session, inputs.clone())?.remove(0) {
             Value::Array(output) => Ok(output.block_until_ready()?),
             _ => Err("attention benchmark produced a value that is not an array".into()),
         }
@@ -718,29 +717,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let mesh = mesh(&client)?;
     let r#type = input_type(&mesh, arguments.size)?;
-    let domain = Session::new(&client).domain();
-    let input = input_array(&domain, &mesh, r#type.clone(), arguments.size)?;
+    let session = Session::with_client(&client);
+    let input = input_array(&session, &mesh, r#type.clone(), arguments.size)?;
     input.block_until_ready()?;
     let start = Instant::now();
-    let staged = stage_workload(&domain, &mesh, r#type.clone())?;
+    let staged = stage_workload(&session, &mesh, r#type.clone())?;
     let cold_staging_nanoseconds = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let lowered = staged.lower(&domain)?;
+    let lowered = staged.lower(&session)?;
     let cold_lowering_nanoseconds = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'_> = lowered.compile(&domain)?;
+    let compiled: BenchmarkCompiledFunction<'_> = lowered.compile(&session)?;
     let cold_compilation_nanoseconds = duration_nanoseconds(start);
 
-    let warmup = call_workload(&domain, &compiled, input.clone())?;
+    let warmup = call_workload(&session, &compiled, input.clone())?;
     warmup.block_until_ready()?;
 
     let mut enqueue_samples = Vec::with_capacity(arguments.iterations);
     let mut pending_outputs = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        pending_outputs.push(call_workload(&domain, &compiled, input.clone())?);
+        pending_outputs.push(call_workload(&session, &compiled, input.clone())?);
         enqueue_samples.push(duration_nanoseconds(start));
     }
     for output in pending_outputs {
@@ -750,12 +749,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut synchronized_samples = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        call_workload(&domain, &compiled, input.clone())?.block_until_ready()?;
+        call_workload(&session, &compiled, input.clone())?.block_until_ready()?;
         synchronized_samples.push(duration_nanoseconds(start));
     }
 
     let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-        jit(|(), input: CompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?), &domain, mesh.clone());
+        jit(|(), input: CompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?), &session, mesh.clone());
     dispatcher.execute((), input.clone())?.block_until_ready()?;
     let cold_dispatch_statistics = dispatcher.statistics();
     let mut warm_dispatch_samples = Vec::with_capacity(arguments.iterations);
@@ -831,7 +830,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "counters": {
             "after_cold_dispatch": dispatcher_statistics(cold_dispatch_statistics),
             "after_warm_dispatch": dispatcher_statistics(warm_dispatch_statistics),
-            "compilation_cache": compilation_statistics(&domain),
+            "compilation_cache": compilation_statistics(&session),
         },
     });
     println!("{}", serde_json::to_string_pretty(&report)?);

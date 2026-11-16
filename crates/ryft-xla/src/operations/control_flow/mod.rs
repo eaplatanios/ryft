@@ -586,7 +586,7 @@ mod tests {
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &test_spmd_compilation_options(2))
             .unwrap();
-        let domain = Session::new(client).domain();
+        let session = Session::with_client(client);
         let device_ids = executable
             .addressable_devices()
             .unwrap()
@@ -599,9 +599,9 @@ mod tests {
                 let (r#type, mesh, bytes) = ((*r#type).clone(), mesh.clone(), values_to_bytes(values));
                 match sharding {
                     Some(sharding) => {
-                        Array::from_host_buffer_with_sharding(&domain, r#type, (*sharding).clone(), mesh, bytes)
+                        Array::from_host_buffer_with_sharding(&session, r#type, (*sharding).clone(), mesh, bytes)
                     }
-                    None => Array::from_host_buffer(&domain, r#type, mesh, bytes),
+                    None => Array::from_host_buffer(&session, r#type, mesh, bytes),
                 }
                 .unwrap()
             })

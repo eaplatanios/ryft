@@ -707,10 +707,10 @@ mod tests {
     #[test]
     fn test_gather_operation_lower_fill_differentiation() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[10f32, 20.0, 30.0]));
-        let indices = replicated_array(&domain, &mesh, DataType::I32, &[4, 1], &values_to_bytes(&[-1i32, 1, 1, 3]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[10f32, 20.0, 30.0]));
+        let indices = replicated_array(&session, &mesh, DataType::I32, &[4, 1], &values_to_bytes(&[-1i32, 1, 1, 3]));
         let options = GatherOptions::default()
             .with_mode(GatherMode::Fill { value: Some(Box::new(CoreArray::scalar(7f32).unwrap())) });
 
@@ -735,12 +735,12 @@ mod tests {
         // A diagonal is a slice of its two axes followed by one gather over iota indices, which lowers and executes
         // like the reference backend, including for offsets, axes with different extents, and empty diagonals.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let values = (0..18).map(|value| value as f32).collect::<Vec<_>>();
         let reference =
             CoreArray::from_elements(ArrayType::new_static(DataType::F32, [3, 2, 3]), values.as_slice()).unwrap();
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[3, 2, 3], &values_to_bytes(&values));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[3, 2, 3], &values_to_bytes(&values));
         for (offset, axis1, axis2) in [(0, 0, 2), (0, 2, 0), (1, 0, 2), (-1, 0, 2), (1, 1, 2), (-2, 2, 1), (3, 0, 2)] {
             let diagonal = input.diagonal(offset, axis1, axis2).unwrap();
             let reference_diagonal = reference.diagonal(offset, axis1, axis2).unwrap();
@@ -829,7 +829,7 @@ mod tests {
         // pullback.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, CoreDimension::Static(1)]));
@@ -916,7 +916,7 @@ mod tests {
                         .collect()
                 },
                 input_types.clone(),
-                &domain,
+                &session,
                 mesh.clone(),
             )
             .unwrap_or_else(|error| panic!("n={size} compilation: {error}"));
@@ -924,9 +924,9 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
-            let outputs = compiled.executable().execute(&domain, inputs).unwrap();
+            let outputs = compiled.executable().execute(&session, inputs).unwrap();
             assert_eq!(outputs.len(), 2);
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);

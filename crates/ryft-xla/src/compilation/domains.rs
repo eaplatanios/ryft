@@ -1,10 +1,10 @@
-//! Compilation lifecycle of the XLA [`Domain`], which implements [`CompilationDomain`] and [`CompilationCacheDomain`].
+//! Compilation lifecycle of the XLA [`Session`], which implements [`CompilationDomain`] and [`CompilationCacheDomain`].
 //!
-//! `Domain::lower_staged_program` validates the boundary of a staged program against the sharding overrides of its
-//! [`Options`]. `Domain::lower_program` then selects kernels, discharges references, places every executable argument
-//! and result, and emits the StableHLO module together with its invocation contract. `Domain::compile_program` compiles
-//! that module through the PJRT client of the domain and derives the reusable execution plan. [`with_input_shardings`]
-//! applies input sharding overrides to input types before staging.
+//! `Session::lower_staged_program` validates the boundary of a staged program against the sharding overrides of its
+//! [`Options`]. `Session::lower_program` then selects kernels, discharges references, places every executable argument
+//! and result, and emits the StableHLO module together with its invocation contract. `Session::compile_program`
+//! compiles that module through the PJRT client of the session and derives the reusable execution plan.
+//! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,11 +24,11 @@ use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredP
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::{collect_session_constants, contains_unresolved_references, contains_unresolved_state};
-use crate::{Constant, Domain, Error, ExecutionError, FlatProgram, OpShardingExtension, Operation, Value};
+use crate::{Constant, Error, ExecutionError, FlatProgram, OpShardingExtension, Operation, Session, Value};
 
 // TODO(eaplatanios): Review this module.
 
-impl<'c> CompilationDomain for Domain<'c> {
+impl<'c> CompilationDomain for Session<'c> {
     type DispatchKey = DispatchKey;
     type LoweredProgram = LoweredProgram;
     type CompiledProgram = CompiledProgram<'c>;
@@ -47,12 +47,12 @@ impl<'c> CompilationDomain for Domain<'c> {
     }
 
     // The cached executable depends only on the types of the session constants of `program`, so their arrays are
-    // resolved through this domain's session for every request, including cache hits, as `SessionConstant` explains.
+    // resolved through this session's session for every request, including cache hits, as `SessionConstant` explains.
     fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram<'c>>, Vec<Value<'c>>), Self::Error> {
         let session_arrays = program
             .session_constants()
             .iter()
-            .map(|constant| Ok(Value::Array(self.session().constant(self, constant)?)))
+            .map(|constant| Ok(Value::Array(self.retained_constant(constant)?)))
             .collect::<Result<Vec<_>, Error>>()?;
         let compiled = self.compilation_context().compile(self, program)?;
 
@@ -69,7 +69,7 @@ impl<'c> CompilationDomain for Domain<'c> {
     }
 }
 
-impl<'c> Domain<'c> {
+impl<'c> Session<'c> {
     /// Lowers a staged program after validating that its boundary types carry the sharding overrides of its options and
     /// that no reference crosses its output boundary. This function implements
     /// [`CompilationDomain::lower`].
@@ -118,7 +118,7 @@ impl<'c> Domain<'c> {
     }
 
     /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
-    /// domain.
+    /// session.
     pub(crate) fn lower_program(
         &self,
         program: &FlatProgram,
@@ -340,7 +340,7 @@ impl<'c> Domain<'c> {
                     options.capture_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 } else if index < lowered_capture_count {
                     let constant = &session_constants[index - source_capture_count];
-                    Some(self.session().constant(self, constant)?.sharding().clone())
+                    Some(self.retained_constant(constant)?.sharding().clone())
                 } else {
                     let index = index - lowered_capture_count;
                     options.input_shardings().and_then(|shardings| shardings.get(index).cloned()).or_else(|| {
@@ -444,7 +444,7 @@ impl<'c> Domain<'c> {
             }));
         }
         let compilation_options = jit_compilation_options(
-            self.compilation_options(),
+            options.compilation_options().unwrap_or_else(|| self.default_compilation_options()),
             options.mesh().devices().len(),
             use_shardy_partitioner,
             options.feedback_directed_profile(),
@@ -542,7 +542,7 @@ impl<'c> Domain<'c> {
         )
     }
 
-    /// Compiles a lowering through this domain's client after resolving its runtime requirements, then derives the
+    /// Compiles a lowering through this session's client after resolving its runtime requirements, then derives the
     /// reusable execution plan.
     pub(crate) fn compile_program(&self, program: &LoweredProgram) -> Result<CompiledProgram<'c>, Error> {
         self.ensure_runtime_requirements(program.runtime_requirements())?;
@@ -576,7 +576,7 @@ impl<'c> Domain<'c> {
     }
 }
 
-impl<'c> CompilationCacheDomain for Domain<'c> {
+impl<'c> CompilationCacheDomain for Session<'c> {
     type CacheKey = CompilationKey;
 
     #[inline]
@@ -752,7 +752,7 @@ fn validate_output_shardings(output_types: &[ArrayIrType], options: &Options) ->
 /// allocation from the forwarded external reference. References returned by nested calls inside a program never cross
 /// that ABI, so only the outputs of the lowered program itself are checked.
 fn validate_reference_outputs(
-    program: &CoreFlatProgram<Domain<'_>>,
+    program: &CoreFlatProgram<Session<'_>>,
     capture_count: usize,
     output_types: &[ArrayIrType],
 ) -> Result<(), Error> {
@@ -939,10 +939,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_domain_compilation_domain_pipeline() {
+    fn test_session_compilation_domain_pipeline() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain().with_mesh(mesh.clone());
+        let engine = Session::with_client(&client).with_mesh(mesh.clone());
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -951,7 +951,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
         // Round-trip a small input through the `CompilationDomain` pipeline.
@@ -994,7 +994,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let _: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            let _: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
                 staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
@@ -1005,10 +1005,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_staged_program_rejects_reference_boundary_shardings() {
+    fn test_session_lower_staged_program_rejects_reference_boundary_shardings() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
@@ -1017,18 +1017,18 @@ mod tests {
         // rejects the overrides for staged functions whose input types did not receive them.
         fn forward<'c>(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Domain<'c>>>,
-            input: CompilationTracer<Domain<'c>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            _: Vec<CompilationTracer<Session<'c>>>,
+            input: CompilationTracer<Session<'c>>,
+        ) -> Result<CompilationTracer<Session<'c>>, Error> {
             Ok(input)
         }
         assert!(matches!(
-            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
+            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type.clone(),
                 Options::new(mesh.clone()).with_input_shardings(vec![scalar_sharding.clone()]),
             )
-            .and_then(|staged| staged.lower(&domain))
+            .and_then(|staged| staged.lower(&session))
             .map(|_| ()),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "external reference inputs do not support explicit input shardings",
@@ -1038,18 +1038,18 @@ mod tests {
         // of the ABI for reference outputs rather than by the output override, which never runs on a reference type.
         fn allocate<'c>(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Domain<'c>>>,
-            input: CompilationTracer<Domain<'c>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            _: Vec<CompilationTracer<Session<'c>>>,
+            input: CompilationTracer<Session<'c>>,
+        ) -> Result<CompilationTracer<Session<'c>>, Error> {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
-            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(allocate,
+            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(allocate,
                 Vec::new(),
                 ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
                 Options::new(mesh.clone()).with_output_shardings(vec![scalar_sharding]),
             )
-            .and_then(|staged| staged.lower(&domain))
+            .and_then(|staged| staged.lower(&session))
             .map(|_| ()),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
@@ -1060,12 +1060,12 @@ mod tests {
         // Forwarding an external reference through an output is rejected by the same contract when lowered, because
         // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
-            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(forward,
+            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type,
                 Options::new(mesh.clone()),
             )
-            .and_then(|staged| staged.lower(&domain))
+            .and_then(|staged| staged.lower(&session))
             .map(|_| ()),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
@@ -1074,10 +1074,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_staged_program_rejects_reference_outputs() {
+    fn test_session_lower_staged_program_rejects_reference_outputs() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
 
         fn allocate_reference<'c>(
@@ -1090,14 +1090,14 @@ mod tests {
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type),
             Options::new(mesh),
         )
         .unwrap();
-        let error = staged.lower(&domain).err().unwrap();
+        let error = staged.lower(&session).err().unwrap();
         assert!(matches!(
             error,
             Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason })
@@ -1107,25 +1107,25 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_staged_program_requires_input_shardings() {
+    fn test_session_lower_staged_program_requires_input_shardings() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let options = Options::new(mesh.clone())
             .with_input_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
 
         fn forward<'c>(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Domain<'c>>>,
-            input: CompilationTracer<Domain<'c>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            _: Vec<CompilationTracer<Session<'c>>>,
+            input: CompilationTracer<Session<'c>>,
+        ) -> Result<CompilationTracer<Session<'c>>, Error> {
             Ok(input)
         }
 
         // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
         // did not receive the requested input shardings before staging.
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             scalar_type.clone(),
@@ -1133,27 +1133,27 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            staged.lower(&domain).map(|_| ()),
+            staged.lower(&session).map(|_| ()),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "staged input types do not carry the shardings requested by `input_shardings`; apply them \
                               to the input types before staging (e.g., with `with_input_shardings`)",
         ));
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             input_types,
             options,
         )
         .unwrap();
-        staged.lower(&domain).unwrap();
+        staged.lower(&session).unwrap();
     }
 
     #[test]
-    fn test_domain_lower_staged_program_requires_output_shardings() {
+    fn test_session_lower_staged_program_requires_output_shardings() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = |axis_type| {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let devices = client
@@ -1175,17 +1175,17 @@ mod tests {
 
         fn forward<'c>(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Domain<'c>>>,
-            input: CompilationTracer<Domain<'c>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            _: Vec<CompilationTracer<Session<'c>>>,
+            input: CompilationTracer<Session<'c>>,
+        ) -> Result<CompilationTracer<Session<'c>>, Error> {
             Ok(input)
         }
 
         fn reshard<'c>(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Domain<'c>>>,
-            input: CompilationTracer<Domain<'c>>,
-        ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+            _: Vec<CompilationTracer<Session<'c>>>,
+            input: CompilationTracer<Session<'c>>,
+        ) -> Result<CompilationTracer<Session<'c>>, Error> {
             let mesh = <&ArrayType>::try_from(input.r#type().as_ref()).unwrap().sharding().unwrap().mesh().clone();
             Ok(input.reshard(&Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())?)
         }
@@ -1193,7 +1193,7 @@ mod tests {
         // Lowering checks rather than overwrites the placement that staged types track, so that calls of a staged
         // function return the output types of its executions.
         let mesh_explicit = mesh(MeshAxisType::Explicit);
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1201,32 +1201,32 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            staged.lower(&domain).map(|_| ()),
+            staged.lower(&session).map(|_| ()),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "staged output 0 has type `f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}]`, which does \
                               not carry the sharding `{mesh<['x'=2:explicit]>, [{'x'}]}` requested by \
                               `output_shardings`; reshard the outputs to their overrides before staging them",
         ));
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             reshard,
             Vec::new(),
             input_type(&mesh_explicit),
             options(&mesh_explicit),
         )
         .unwrap();
-        staged.lower(&domain).unwrap();
+        staged.lower(&session).unwrap();
 
         // Staged types cannot record placement over auto mesh axes, so lowering applies it to the executable outputs,
         // whose types keep the staged placement while their runtime placements carry the override.
         let mesh_auto = mesh(MeshAxisType::Auto);
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_auto),
             options(&mesh_auto),
         )
         .unwrap();
-        let lowered = staged.lower(&domain).unwrap();
+        let lowered = staged.lower(&session).unwrap();
         assert_eq!(
             lowered.lowered_program().output_types()[0].sharding().unwrap().to_string(),
             "{mesh<['x'=2:auto]>, [{}]}",
@@ -1235,10 +1235,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_dynamic_dimension_arithmetic_broadcast_and_reshape() {
+    fn test_session_lower_program_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1290,7 +1290,7 @@ mod tests {
         };
 
         let dynamic_program = build_program(&vector_type, 1);
-        let dynamic_lowering = domain.lower_program(&dynamic_program, 0, &Options::new(mesh.clone())).unwrap();
+        let dynamic_lowering = session.lower_program(&dynamic_program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(
             dynamic_lowering.stable_hlo(),
             indoc! {r#"
@@ -1329,39 +1329,39 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let renamed_program = build_program(&renamed_type, 1);
-        let renamed_lowering = domain.lower_program(&renamed_program, 0, &Options::new(mesh.clone())).unwrap();
+        let renamed_lowering = session.lower_program(&renamed_program, 0, &Options::new(mesh.clone())).unwrap();
         let different_program = build_program(&vector_type, 2);
-        let different_lowering = domain.lower_program(&different_program, 0, &Options::new(mesh.clone())).unwrap();
-        let dynamic_key = domain.compilation_key(&dynamic_lowering).unwrap();
-        assert_eq!(dynamic_key, domain.compilation_key(&renamed_lowering).unwrap());
-        assert_ne!(dynamic_key, domain.compilation_key(&different_lowering).unwrap());
+        let different_lowering = session.lower_program(&different_program, 0, &Options::new(mesh.clone())).unwrap();
+        let dynamic_key = session.compilation_key(&dynamic_lowering).unwrap();
+        assert_eq!(dynamic_key, session.compilation_key(&renamed_lowering).unwrap());
+        assert_ne!(dynamic_key, session.compilation_key(&different_lowering).unwrap());
 
         // CPU PJRT does not provide the `PadToStatic` custom call for bounded inputs. Execute the same first-class
         // dimension graph with a static input axis. This changes only the dimension size lowering from a runtime read
         // to its exact scalar constant and still exercises dimension SSA arithmetic and both mixed shape operations.
         let static_vector_type = replicated_vector_type(&mesh, 3);
         let static_program = build_program(&static_vector_type, 1);
-        let static_lowering = domain.lower_program(&static_program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&static_lowering).unwrap();
+        let static_lowering = session.lower_program(&static_program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&static_lowering).unwrap();
         let vector = Array::from_host_buffer(
-            &domain,
+            &session,
             static_vector_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
         )
         .unwrap();
-        let scalar = f32_scalar(&domain, &mesh, 7.0);
-        let outputs = domain.execute_program(&compiled, vec![vector, scalar]).unwrap();
+        let scalar = f32_scalar(&session, &mesh, 7.0);
+        let outputs = session.execute_program(&compiled, vec![vector, scalar]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape().as_slice(), &[4]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0; 4]);
     }
 
     #[test]
-    fn test_domain_lower_program_rejects_shard_maps_in_bounded_dynamic_programs() {
+    fn test_session_lower_program_rejects_shard_maps_in_bounded_dynamic_programs() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -1408,7 +1408,7 @@ mod tests {
             )
             .unwrap();
 
-        let Err(error) = domain.lower_program(&program, 0, &Options::new(mesh)) else {
+        let Err(error) = session.lower_program(&program, 0, &Options::new(mesh)) else {
             panic!("bounded-dynamic program containing a shard_map unexpectedly lowered");
         };
         assert!(matches!(&error,
@@ -1422,10 +1422,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_uses_the_replica_path_for_internal_dynamic_tensors() {
+    fn test_session_lower_program_uses_the_replica_path_for_internal_dynamic_tensors() {
         let client = cpu_client(4);
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -1448,7 +1448,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let executable_options = lowered.compilation_options().executable_build_options.as_ref().unwrap();
         assert_eq!(executable_options.replica_count, 4);
         assert_eq!(executable_options.partition_count, 1);
@@ -1456,17 +1456,17 @@ mod tests {
         assert!(!executable_options.use_shardy_partitioner);
         assert!(!lowered.stable_hlo().contains("sdy."), "{}", lowered.stable_hlo());
 
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let size =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 3i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), 3i64.to_ne_bytes().as_slice()).unwrap();
         let value = Array::from_host_buffer(
-            &domain,
+            &session,
             value_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![size, value]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![size, value]).unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![6.0]);
 
         // The replica path is a hard requirement rather than a preference, because annotating the very same program
@@ -1487,25 +1487,25 @@ mod tests {
         let shardy_lowered = lowered
             .clone()
             .with_stable_hlo(annotated.into_parts().0)
-            .with_compilation_options(jit_compilation_options(domain.compilation_options(), 4, true, None));
-        let Err(error) = domain.compile_program(&shardy_lowered) else {
+            .with_compilation_options(jit_compilation_options(session.default_compilation_options(), 4, true, None));
+        let Err(error) = session.compile_program(&shardy_lowered) else {
             panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
         };
         assert!(error.to_string().contains("only supports ranked tensors with a static shape"), "{error}");
     }
 
     #[test]
-    fn test_domain_lower_program_rejects_unsupported_external_reference_storage_classes() {
+    fn test_session_lower_program_rejects_unsupported_external_reference_storage_classes() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(replicated(1))
             .unwrap();
         assert!(matches!(
-            domain.lower_program(
+            session.lower_program(
                 &external_reference_read_program(zero_type),
                 0,
                 &Options::new(mesh.clone()),
@@ -1520,7 +1520,7 @@ mod tests {
             .unwrap()
             .with_memory(Memory::Host { pinned: true });
         assert!(matches!(
-            domain.lower_program(
+            session.lower_program(
                 &external_reference_read_program(host_type),
                 0,
                 &Options::new(mesh.clone()),
@@ -1534,7 +1534,7 @@ mod tests {
             .with_sharding(replicated(1))
             .unwrap();
         assert!(matches!(
-            domain.lower_program(
+            session.lower_program(
                 &external_reference_read_program(unbounded_type),
                 0,
                 &Options::new(mesh.clone()),
@@ -1552,7 +1552,7 @@ mod tests {
             .with_sharding(Sharding::new(explicit_logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&external_reference_read_program(sharded_type), 0, &Options::new(explicit_mesh)),
+            session.lower_program(&external_reference_read_program(sharded_type), 0, &Options::new(explicit_mesh)),
             Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
                 if reason == "bounded-dynamic external state input 0 must use replicated sharding",
         ));
@@ -1563,7 +1563,7 @@ mod tests {
             .with_sharding(Sharding::replicated(foreign_logical_mesh.clone(), 0))
             .unwrap();
         assert!(matches!(
-            domain.lower_program(
+            session.lower_program(
                 &external_reference_read_program(foreign_sharding_type),
                 0,
                 &Options::new(mesh.clone()),
@@ -1585,7 +1585,7 @@ mod tests {
             .with_sharding(Sharding::replicated(foreign_mesh.logical_mesh().clone(), 0))
             .unwrap();
         assert!(matches!(
-            domain.lower_program(
+            session.lower_program(
                 &external_reference_read_program(scalar_type),
                 0,
                 &Options::new(foreign_mesh),
@@ -1604,7 +1604,7 @@ mod tests {
             .with_sharding(Sharding::replicated(non_addressable_mesh.logical_mesh().clone(), 0))
             .unwrap();
         assert!(matches!(
-            domain.lower_program(
+            session.lower_program(
                 &external_reference_read_program(scalar_type),
                 0,
                 &Options::new(non_addressable_mesh),
@@ -1616,10 +1616,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_reference_state() {
+    fn test_session_lower_program_discharges_local_reference_state() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = ProgramBuilder::new();
@@ -1645,7 +1645,7 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
         let expected_signature = concat!(
             "  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
@@ -1664,9 +1664,9 @@ mod tests {
         "#}
         .replace("@SIGNATURE@", expected_signature);
         assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain
-            .execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 3.0), f32_scalar(&domain, &mesh, 5.0)])
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
+            .execute_program(&compiled, vec![f32_scalar(&session, &mesh, 3.0), f32_scalar(&session, &mesh, 5.0)])
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![8.0]);
@@ -1683,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_pinned_host_reference_state_in_shard_maps() {
+    fn test_session_lower_program_discharges_pinned_host_reference_state_in_shard_maps() {
         // A pinned host allocation that a `shard_map` mutates through a sharded reference input discharges to a manual
         // computation over its state. Every device updates its own shard, the final state keeps the pinned host
         // placement of the allocation, and the mapped output stays in device memory.
@@ -1696,7 +1696,7 @@ mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
@@ -1744,23 +1744,23 @@ mod tests {
                 .unwrap()
         };
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let initial = Array::from_host_buffer(
-            &domain,
+            &session,
             host_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let update = Array::from_host_buffer(
-            &domain,
+            &session,
             device_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![initial, update]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![initial, update]).unwrap();
         let shards = |array: &Array<'_>| {
             array
                 .addressable_shards()
@@ -1784,10 +1784,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_accumulates_slice_cotangents_into_existing_state() {
+    fn test_session_lower_program_accumulates_slice_cotangents_into_existing_state() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(replicated_vector_type(&mesh, 4).into());
         let output = builder
@@ -1804,7 +1804,7 @@ mod tests {
 
         // Discharge reads only the selected buffer entries, adds the seed, and writes that slice back. The lowered
         // graph contains no zero gradient of full size or dense addition before the indexed update.
-        let lowered = domain.lower_program(&pullback, 0, &Options::new(mesh)).unwrap();
+        let lowered = session.lower_program(&pullback, 0, &Options::new(mesh)).unwrap();
         let operations = lowered
             .stable_hlo()
             .lines()
@@ -1815,10 +1815,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_index_and_slice_reference_transforms() {
+    fn test_session_lower_program_discharges_local_index_and_slice_reference_transforms() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
         let mut builder = ProgramBuilder::new();
@@ -1868,7 +1868,7 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let expected_signature = concat!(
             "  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
             "%arg1: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
@@ -1915,14 +1915,14 @@ mod tests {
             .replace("@UPDATE2@", &expected_update("9", "6", "8", "c_1", 3, 2))
             .replace("@UPDATE3@", &expected_update("10", "5", "9", "c_2", 4, 3)),
         );
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
             .execute_program(
                 &compiled,
                 vec![
-                    f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]),
-                    f32_vector(&domain, &mesh, &[10.0, 20.0]),
-                    f32_vector(&domain, &mesh, &[1.0, 2.0]),
+                    f32_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0]),
+                    f32_vector(&session, &mesh, &[10.0, 20.0]),
+                    f32_vector(&session, &mesh, &[1.0, 2.0]),
                 ],
             )
             .unwrap();
@@ -1932,10 +1932,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_writes_through_reference_views() {
+    fn test_session_lower_program_discharges_writes_through_reference_views() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
         let mut builder = ProgramBuilder::new();
@@ -1958,22 +1958,22 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
             .execute_program(
                 &compiled,
-                vec![f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]), f32_vector(&domain, &mesh, &[10.0, 20.0])],
+                vec![f32_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0]), f32_vector(&session, &mesh, &[10.0, 20.0])],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 10.0, 20.0, 4.0]);
     }
 
     #[test]
-    fn test_domain_lower_program_indexed_reference_mutation() {
+    fn test_session_lower_program_indexed_reference_mutation() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::new();
@@ -2010,7 +2010,7 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let expected_signature = concat!(
             "  func.func @main(%arg0: tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
             "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
@@ -2049,14 +2049,14 @@ mod tests {
             .replace("@UPDATE0@", &expected_update("3", "arg0", "2", "c"))
             .replace("@UPDATE1@", &expected_update("8", "3", "7", "c_0")),
         );
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
             .execute_program(
                 &compiled,
                 vec![
-                    f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]),
-                    f32_scalar(&domain, &mesh, 10.0),
-                    f32_scalar(&domain, &mesh, 3.0),
+                    f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]),
+                    f32_scalar(&session, &mesh, 10.0),
+                    f32_scalar(&session, &mesh, 3.0),
                 ],
             )
             .unwrap();
@@ -2065,10 +2065,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_preserves_capture_scope_inside_condition_regions() {
+    fn test_session_lower_program_preserves_capture_scope_inside_condition_regions() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
 
@@ -2092,19 +2092,19 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain
-            .execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 7.0), boolean_scalar(&domain, &mesh, true)])
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
+            .execute_program(&compiled, vec![f32_scalar(&session, &mesh, 7.0), boolean_scalar(&session, &mesh, true)])
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0]);
     }
 
     #[test]
-    fn test_domain_lower_program_validates_capture_count() {
+    fn test_session_lower_program_validates_capture_count() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar_type.into());
@@ -2113,7 +2113,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            domain.lower_program(&program, 2, &Options::new(mesh)),
+            session.lower_program(&program, 2, &Options::new(mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidArgument { message })
@@ -2123,10 +2123,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_reference_state_through_condition() {
+    fn test_session_lower_program_discharges_local_reference_state_through_condition() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2178,7 +2178,7 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
         let expected_signature = concat!(
             "  func.func @main(%arg0: tensor<i1> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
@@ -2202,28 +2202,28 @@ mod tests {
         "#}
         .replace("@SIGNATURE@", expected_signature);
         assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
 
-        let true_outputs = domain
+        let true_outputs = session
             .execute_program(
                 &compiled,
                 vec![
-                    boolean_scalar(&domain, &mesh, true),
-                    f32_scalar(&domain, &mesh, 10.0),
-                    f32_scalar(&domain, &mesh, 7.0),
+                    boolean_scalar(&session, &mesh, true),
+                    f32_scalar(&session, &mesh, 10.0),
+                    f32_scalar(&session, &mesh, 7.0),
                 ],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, &true_outputs[0]), vec![10.0]);
         assert_eq!(read_f32s(&client, &true_outputs[1]), vec![7.0]);
 
-        let false_outputs = domain
+        let false_outputs = session
             .execute_program(
                 &compiled,
                 vec![
-                    boolean_scalar(&domain, &mesh, false),
-                    f32_scalar(&domain, &mesh, 10.0),
-                    f32_scalar(&domain, &mesh, 7.0),
+                    boolean_scalar(&session, &mesh, false),
+                    f32_scalar(&session, &mesh, 10.0),
+                    f32_scalar(&session, &mesh, 7.0),
                 ],
             )
             .unwrap();
@@ -2232,10 +2232,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_reference_state_through_while() {
+    fn test_session_lower_program_discharges_local_reference_state_through_while() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2279,20 +2279,20 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session.execute_program(&compiled, vec![f32_scalar(&session, &mesh, 2.0)]).unwrap();
 
         // Three bounded iterations accumulate the constant `1.0` into the initial `2.0` state.
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_reference_state_through_static_scan() {
+    fn test_session_lower_program_discharges_local_reference_state_through_static_scan() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2337,10 +2337,10 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session.execute_program(&compiled, vec![f32_scalar(&session, &mesh, 2.0)]).unwrap();
 
         // Three scan iterations accumulate the constant `1.0` into the initial `2.0` state, and the body's second
         // output stacks the state observed after each iteration.
@@ -2349,10 +2349,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_reference_state_through_dynamic_scan() {
+    fn test_session_lower_program_discharges_local_reference_state_through_dynamic_scan() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
         let length_variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
@@ -2408,10 +2408,10 @@ mod tests {
             program.entry_region_ref().atoms()[runtime_length.index()].as_constant(),
             Some(&Constant::Dimension(length)),
         );
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session.execute_program(&compiled, vec![f32_scalar(&session, &mesh, 2.0)]).unwrap();
 
         // The runtime length is three, so the scan accumulates the constant `1.0` into the initial `2.0` state three
         // times.
@@ -2419,10 +2419,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_discharges_local_reference_state_through_nested_jit_call() {
+    fn test_session_lower_program_discharges_local_reference_state_through_nested_jit_call() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2457,11 +2457,11 @@ mod tests {
             program.entry_region_ref().instructions()[1].operation(),
             Operation::JitCall(operation) if operation.capture_count() == 0,
         ));
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.add").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain
-            .execute_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0), f32_scalar(&domain, &mesh, 4.0)])
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
+            .execute_program(&compiled, vec![f32_scalar(&session, &mesh, 2.0), f32_scalar(&session, &mesh, 4.0)])
             .unwrap();
 
         let immutable_oracle = 2.0f32 + 4.0;
@@ -2469,10 +2469,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_carries_external_reference_state_metadata() {
+    fn test_session_lower_program_carries_external_reference_state_metadata() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
 
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
@@ -2480,7 +2480,7 @@ mod tests {
         let program: FlatProgram = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
         assert_eq!(lowered.output_count(), 1);
         assert_eq!(lowered.reference_states().len(), 1);
         assert_eq!(lowered.reference_states()[0].source().flat_input_index(lowered.capture_count()).unwrap(), 0);
@@ -2499,10 +2499,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_preserves_provenance_locations() {
+    fn test_session_lower_program_preserves_provenance_locations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::F64);
 
         // Builds `-(x * x)` with the multiplication carrying the provided provenance.
@@ -2528,7 +2528,7 @@ mod tests {
         );
         let scoped = build_program(&input_type, coordinate_basis);
         let options = Options::new(mesh.clone());
-        let lowered = domain.lower_program(&scoped, 0, &options).unwrap();
+        let lowered = session.lower_program(&scoped, 0, &options).unwrap();
 
         // The nested framework scopes survive lowering as a chain of nested name locations that is visible in the
         // serialized module and therefore in dumped MLIR and HLO metadata, while the negation with unknown provenance
@@ -2552,10 +2552,11 @@ mod tests {
         );
 
         // Provenance does not affect numeric results.
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let value = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3.0f64.to_ne_bytes().as_slice())
-            .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![value]).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let value =
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 3.0f64.to_ne_bytes().as_slice())
+                .unwrap();
+        let outputs = session.execute_program(&compiled, vec![value]).unwrap();
         assert_eq!(read_f64s(&client, &outputs[0]), vec![-9.0]);
 
         // Two semantically equal programs with different scope names serialize differently and therefore key
@@ -2563,10 +2564,10 @@ mod tests {
         // the serialization without locations, and hence the cache key that it had before provenance existed.
         let relabeled =
             build_program(&input_type, Provenance::scope(ProvenanceScope::new("other_label"), Provenance::unknown()));
-        let relabeled = domain.lower_program(&relabeled, 0, &options).unwrap();
+        let relabeled = session.lower_program(&relabeled, 0, &options).unwrap();
         assert_ne!(lowered.compilation_key().unwrap(), relabeled.compilation_key().unwrap(),);
         let unlabeled = build_program(&input_type, Provenance::unknown());
-        let unlabeled = domain.lower_program(&unlabeled, 0, &options).unwrap();
+        let unlabeled = session.lower_program(&unlabeled, 0, &options).unwrap();
         assert_eq!(
             unlabeled.stable_hlo(),
             indoc! {r#"
@@ -2583,10 +2584,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_lower_program_recreates_reference_views_inside_condition_branches() {
+    fn test_session_lower_program_recreates_reference_views_inside_condition_branches() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(vector_type.clone());
@@ -2639,7 +2640,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let expected_signature = concat!(
             "  func.func @main(%arg0: tensor<i1> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
             "%arg1: tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> ",
@@ -2675,12 +2676,12 @@ mod tests {
             .replace("@SIGNATURE@", expected_signature)
             .replace("@UPDATE@", expected_update),
         );
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         for (predicate, expected) in [(true, vec![1.0, 3.0, 3.0]), (false, vec![1.0, 2.0, 3.0])] {
-            let outputs = domain
+            let outputs = session
                 .execute_program(
                     &compiled,
-                    vec![boolean_scalar(&domain, &mesh, predicate), f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0])],
+                    vec![boolean_scalar(&session, &mesh, predicate), f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])],
                 )
                 .unwrap();
             assert_eq!(read_f32s(&client, &outputs[0]), expected);
@@ -2688,7 +2689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_validate_cached_program_rejects_foreign_invocation_contracts() {
+    fn test_session_validate_cached_program_rejects_foreign_invocation_contracts() {
         // Exchange on the follower side that answers every key with one fixed artifact. This is the reachable
         // stand-in for a colliding or corrupted persistent entry, because the disk tier keys entries by the digest of
         // the canonical key bytes and re-validates that digest inside the stored envelope, so a planted disk entry
@@ -2730,7 +2731,7 @@ mod tests {
 
         // The foreign executable keeps the requesting lowering's boundary types so that it loads and passes every
         // output type check in the core crate, and differs only in the donation contract the runtime call path trusts.
-        let producer = Session::new(&client).domain();
+        let producer = Session::with_client(&client);
         let staged = crate::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
@@ -2738,18 +2739,18 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let foreign: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+        let foreign: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 
         let consumer = |policy| {
             let exchange: Arc<dyn CompilationArtifactExchange> =
                 Arc::new(CollidingArtifactExchange { artifact: artifact.clone() });
-            Session::with_compilation_context(
-                &client,
-                CompilationContext::new().with_artifact_exchange(exchange, policy),
-            )
-            .domain()
+            Session::builder()
+                .client(&client)
+                .compilation_context(CompilationContext::new().with_artifact_exchange(exchange, policy))
+                .build()
+                .unwrap()
         };
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()

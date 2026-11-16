@@ -81,7 +81,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let devices = devices.iter().take(2).map(|device| Device::from_pjrt(device).unwrap()).collect();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-    let domain = Session::new(&client).domain();
+    let session = Session::with_client(&client);
     let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let item_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
     let boundary =
@@ -126,7 +126,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
             )?)
         },
         (ArrayIrType::Reference(ReferenceType::new(batched_type.clone())), ArrayIrType::Array(batched_type.clone())),
-        &domain,
+        &session,
         Options::new(mesh.clone()),
     )
     .unwrap();
@@ -138,13 +138,13 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         (0..3).flat_map(|item| (1..=4).map(move |column| (10 * item + column) as f32)).collect::<Vec<_>>();
     let update_values = (0..3).flat_map(|item| [(100 * (item + 1)) as f32; 4]).collect::<Vec<_>>();
     let reference = ArrayReference::new(
-        Array::from_host_buffer(&domain, batched_type.clone(), mesh.clone(), to_bytes(&reference_values)).unwrap(),
+        Array::from_host_buffer(&session, batched_type.clone(), mesh.clone(), to_bytes(&reference_values)).unwrap(),
     );
-    let update = Array::from_host_buffer(&domain, batched_type, mesh, to_bytes(&update_values)).unwrap();
+    let update = Array::from_host_buffer(&session, batched_type, mesh, to_bytes(&update_values)).unwrap();
     let Value::Array(output) = compiled
         .execute_statefully_and_wait(
-            &domain,
-            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+            &session,
+            (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
         )
         .unwrap()
     else {

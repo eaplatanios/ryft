@@ -571,7 +571,7 @@ impl LowerableOperation for KernelOperation {
 /// Binds an unselected kernel with its real body attached to the surrounding XLA program.
 ///
 /// Portable instructions and enabled typed extensions remain visible to ordinary region, effect, and reference
-/// traversal. Compiler selection belongs to the enclosing XLA domain's immutable compilation options. Staging itself
+/// traversal. Compiler selection belongs to the enclosing XLA session's immutable compilation options. Staging itself
 /// neither invokes an adapter nor acquires native runtime resources. Bind concrete scalar-prefetch values with
 /// [`KernelDefinition::specialize_prefetch`] before staging when they are intended as compile-time parameters. XLA
 /// capture references cannot be materialized as host scalars by partial evaluation without an explicit transfer.
@@ -1376,7 +1376,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::{ArrayConstant, Domain, FromPjrt, JitCallOperation, Options, ProgramBuilder, Session};
+    use crate::{ArrayConstant, FromPjrt, JitCallOperation, Options, ProgramBuilder, Session};
 
     use super::*;
 
@@ -1507,13 +1507,13 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// Compiles scalar derivative programs through the existing XLA domain and waits for concrete results.
+    /// Compiles scalar derivative programs through the existing XLA session and waits for concrete results.
     fn execute_derivative(program: &FlatProgram, inputs: &[f32]) -> Vec<f32> {
         /// Keeps the traced input and output value lifetimes tied to the same execution client.
         fn replay<'c>(
             program: &FlatProgram,
-            inputs: Vec<CompilationTracer<Domain<'c>>>,
-        ) -> Result<Vec<CompilationTracer<Domain<'c>>>, crate::Error> {
+            inputs: Vec<CompilationTracer<Session<'c>>>,
+        ) -> Result<Vec<CompilationTracer<Session<'c>>>, crate::Error> {
             let context = inputs[0].context().clone();
             Ok(program.interpret_in_context(&context, inputs)?)
         }
@@ -1524,28 +1524,28 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
             program.input_types().into_owned(),
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
         let inputs = inputs
             .iter()
             .zip(program.input_types().into_owned())
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
                 crate::Value::Array(
-                    crate::Array::from_host_buffer(&domain, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
+                    crate::Array::from_host_buffer(&session, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
         compiled
             .executable()
-            .execute(&domain, inputs)
+            .execute(&session, inputs)
             .unwrap()
             .into_iter()
             .map(|value| {

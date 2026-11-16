@@ -86,7 +86,7 @@ impl CudaKernelParameterBinding {
 /// operands, writable arrays use results, and read-write arrays retain their canonical alias between an operand and a
 /// result. Static scalars expand a compiler-owned ABI without adding logical array parameters or a second launch path.
 ///
-/// Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] to use the native handler owned by the session. The XLA domain
+/// Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] to use the native handler owned by the session. The XLA session
 /// initializes its launcher during compilation and reload, supplies execution context user data at submission, and
 /// retains fences over whole executions through session cleanup. Other target names select explicitly registered
 /// handlers with the same payload contract. Artifact construction and embedding alone do not establish the safety of

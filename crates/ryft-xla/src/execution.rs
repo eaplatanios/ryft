@@ -4,7 +4,7 @@
 //! The plan records the physical input types, the default donation requests, the addressable devices, and, when every
 //! output has a static type and a fixed placement, the output layouts, so that each execution only reads it.
 //!
-//! Programs without external reference state execute through `Domain::execute_compiled_async`, which validates the
+//! Programs without external reference state execute through `Session::execute_compiled_async`, which validates the
 //! inputs, materializes their physical form (i.e., pads bounded dynamic inputs, allocates carriers for inputs of the
 //! zero data type, reshards them, and converts their layouts), submits them to PJRT, and reconstructs the logical
 //! outputs from the returned buffers. Programs with external reference state execute through
@@ -25,7 +25,6 @@ use ryft_core::{
     ShardingDimension, StatefulCompilationDomain, StatefulExecution, Type, TypeRefinements, Typed, TypedProgram,
     ValueProjection, validate_reference_boundary,
 };
-use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Execution, ExecutionDeviceInputs, ExecutionFence, ExecutionInput,
     LoadedExecutable,
@@ -40,7 +39,7 @@ use crate::domains::tests::{
 };
 use crate::lowering::signature::ExecutableSignature;
 use crate::{
-    Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Domain, Error, FromPjrt, RuntimeRequirement,
+    Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, FromPjrt, RuntimeRequirement, Session,
     ToPjrt, Value,
 };
 
@@ -374,16 +373,16 @@ impl std::fmt::Debug for ExecutionArguments<'_> {
     }
 }
 
-impl<'c> Domain<'c> {
+impl<'c> Session<'c> {
     /// Initializes required extensions on the invoking session before compilation or native loading.
     pub(super) fn ensure_runtime_requirements(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
         if requirements.is_empty() {
             return Ok(());
         }
-        self.session().runtimes().ensure(requirements, self.target()?)
+        self.runtimes().ensure(requirements, self.target()?)
     }
 
-    /// Validates that this domain's PJRT client owns `program`.
+    /// Validates that this session's PJRT client owns `program`.
     pub(super) fn validate_program_owner(&self, program: &CompiledProgram<'c>) -> Result<(), Error> {
         if program.executable().is_owned_by(self.client()) {
             Ok(())
@@ -597,11 +596,7 @@ impl<'c> Domain<'c> {
             let expected = physical_type.layout().unwrap();
             if let Some(actual) = input.layout() {
                 if actual != expected {
-                    // A representation adapter owns its small compilation signature, so do not inherit a caller's
-                    // low-level overrides of parameter and result shapes. Keep the same session, mesh, and effect
-                    // scope.
-                    let conversion_domain = self.with_compilation_options(CompilationOptions::default());
-                    let source = input.clone().associate(&conversion_domain)?;
+                    let source = input.clone().associate(self)?;
                     *input = source.cast(source.r#type().into_owned().with_layout(expected.clone()), &[])?;
                 }
             } else {
@@ -1145,8 +1140,7 @@ impl<'c> Domain<'c> {
                 "injected failure before execution submission".to_string(),
             )));
         }
-        let resources =
-            self.session().runtimes().prepare(program.runtime_requirements(), self.target()?, program.mesh())?;
+        let resources = self.runtimes().prepare(program.runtime_requirements(), self.target()?, program.mesh())?;
         let (context, retained_resources) = resources.into_parts();
         // These leases stay in this stack frame on every error path. PJRT destroys the context before returning an
         // error, and if submission succeeded it first waits for every device, so the leases outlive all native use.
@@ -1156,7 +1150,7 @@ impl<'c> Domain<'c> {
             .into_parts();
         // The fence releases the context before it reports readiness, and the session releases these leases only after
         // that, so pointees of the context's user data outlive native context destruction.
-        self.session().runtimes().retain(&fence, retained_resources);
+        self.runtimes().retain(&fence, retained_resources);
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(&fence);
         let output_count = program.signature().physical_output_count();
@@ -1396,7 +1390,7 @@ impl<'c> Domain<'c> {
     }
 }
 
-impl<'c> StatefulCompilationDomain for Domain<'c> {
+impl<'c> StatefulCompilationDomain for Session<'c> {
     fn execute_statefully(
         &self,
         program: &CompiledProgram<'c>,
@@ -1633,7 +1627,7 @@ mod tests {
     fn test_execution_plan_new_rejects_compilation_options_with_conflicting_layouts() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let mut builder = ProgramBuilder::new();
@@ -1653,7 +1647,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let row_major = BufferSpecification::new(BufferType::F64, [2, 3]).proto().unwrap();
         // Explicit argument layouts bypass the MLIR layout attributes in PJRT. A conflicting result override must
         // fail before its buffers can be wrapped in types that claim another layout.
@@ -1661,7 +1655,7 @@ mod tests {
         compilation_options.argument_layouts = vec![row_major.clone()];
         compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(row_major);
         let lowered = lowered.with_compilation_options(compilation_options.clone());
-        let Err(error) = domain.compile_program(&lowered) else {
+        let Err(error) = session.compile_program(&lowered) else {
             panic!("conflicting executable layout unexpectedly accepted");
         };
         assert!(matches!(&error, Error::Compilation(CompilationError::IncompatibleExecutable { .. })));
@@ -1675,30 +1669,29 @@ mod tests {
             .unwrap();
         compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(column_major.clone());
         let lowered = lowered.with_compilation_options(compilation_options.clone());
-        domain.compile_program(&lowered).unwrap();
+        session.compile_program(&lowered).unwrap();
         compilation_options.argument_layouts = vec![column_major];
         let lowered = lowered.with_compilation_options(compilation_options);
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let values = vec![1f64, 2., 3., 4., 5., 6.];
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             ArrayType::new_static(DataType::F64, [2, 3]),
             mesh,
             values_to_bytes(&values),
         )
         .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
         assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
-        let configured = domain.with_compilation_options(lowered.compilation_options().clone());
         let input = Array::from_host_buffer(
-            &configured,
+            &session,
             ArrayType::new_static(DataType::F64, [2, 3])
                 .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]))),
             compiled.mesh().clone(),
             values_to_bytes(&values),
         )
         .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
         assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
     }
 
@@ -1706,7 +1699,7 @@ mod tests {
     fn test_execution_plan_new_plans_static_output_layouts_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
@@ -1719,15 +1712,15 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), Some(1));
 
         // Outputs are built from the program's planned layouts, which place every shard like the validating
         // constructors do and are shared by the outputs of every execution.
         let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
         let input = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             input_type,
             sharding.clone(),
             mesh.clone(),
@@ -1735,7 +1728,7 @@ mod tests {
         )
         .unwrap();
         let call = || {
-            let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+            let output = compiled.executable().execute(&session, Value::Array(input.clone())).unwrap();
             let Value::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -1771,7 +1764,7 @@ mod tests {
     fn test_execution_plan_new_plans_no_output_layouts_without_declared_placement() {
         let client = cpu_client(4);
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let unconstrained_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
         let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
@@ -1790,14 +1783,14 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-                staged.lower(&domain).unwrap().compile(&domain).unwrap();
+            let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+                staged.lower(&session).unwrap().compile(&session).unwrap();
             assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
 
             // Without planned layouts, the outputs are built from the returned buffers by the validating constructor.
             let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
-            let input = f32_vector(&domain, &mesh, values.as_slice());
-            let Value::Array(output) = compiled.executable().execute(&domain, Value::Array(input)).unwrap() else {
+            let input = f32_vector(&session, &mesh, values.as_slice());
+            let Value::Array(output) = compiled.executable().execute(&session, Value::Array(input)).unwrap() else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
             assert_eq!(output.mesh(), &mesh);
@@ -1812,7 +1805,7 @@ mod tests {
     fn test_execution_arguments_from_arrays() {
         // Use the same 8-device CPU setup as `ryft_pjrt` tests.
         let client = cpu_client(8);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
@@ -1871,7 +1864,7 @@ mod tests {
         let right_array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)]));
         let left_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
+            &session,
             left_array_type,
             left_sharding,
             mesh.clone(),
@@ -1879,7 +1872,7 @@ mod tests {
         )
         .unwrap();
         let right_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
+            &session,
             right_array_type,
             right_sharding,
             mesh.clone(),
@@ -1994,7 +1987,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -2068,7 +2061,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -2118,10 +2111,10 @@ mod tests {
     fn test_execution_arguments_from_arrays_with_donation_respects_buffer_ownership() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
 
-        let unique = ArrayReference::new(f32_scalar(&domain, &mesh, 1.0));
+        let unique = ArrayReference::new(f32_scalar(&session, &mesh, 1.0));
         let unique_guard = unique.lock_storage().unwrap();
         let mut inputs = vec![unique_guard.observe().unwrap().snapshot().clone()];
         drop(ExecutionArguments::from_arrays_with_donation(inputs.clone(), [device_id].into(), &[true]).unwrap());
@@ -2131,7 +2124,7 @@ mod tests {
         assert!(arguments.inputs_by_device()[0][0].donatable);
         unique_taken.poison("test transaction consumed unique input");
 
-        let shared_value = f32_scalar(&domain, &mesh, 2.0);
+        let shared_value = f32_scalar(&session, &mesh, 2.0);
         let retained = shared_value.clone();
         let shared = ArrayReference::new(shared_value);
         let shared_guard = shared.lock_storage().unwrap();
@@ -2165,10 +2158,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_stateless_zero_identity_preserves_logical_type_and_canonical_value() {
+    fn test_session_execute_stateless_zero_identity_preserves_logical_type_and_canonical_value() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2176,11 +2169,11 @@ mod tests {
             crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
-        let donated_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+        let donated_staged: CoreStagedFunction<Session<'_>, ArrayIrType, ArrayIrType> =
             crate::stage::<_, ArrayType, ArrayType>(
                 |input| input,
                 input_type.clone(),
@@ -2188,28 +2181,28 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-        let donated_lowered = donated_staged.lower(&domain).unwrap();
+        let donated_lowered = donated_staged.lower(&session).unwrap();
         assert_eq!(donated_lowered.lowered_program().donation_flags(), &[false]);
         assert_eq!(
-            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
-            domain.compilation_key(donated_lowered.lowered_program()).unwrap(),
+            session.compilation_key(compiled.lowered().lowered_program()).unwrap(),
+            session.compilation_key(donated_lowered.lowered_program()).unwrap(),
         );
 
         // Boolean values retain physical `i1` arguments and results while the identity over the zero data type has an
         // empty physical signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
-        let boolean_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+        let boolean_staged: CoreStagedFunction<Session<'_>, ArrayIrType, ArrayIrType> =
             crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
-        let boolean_lowered = boolean_staged.lower(&domain).unwrap();
+        let boolean_lowered = boolean_staged.lower(&session).unwrap();
         assert_ne!(
-            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
-            domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
+            session.compilation_key(compiled.lowered().lowered_program()).unwrap(),
+            session.compilation_key(boolean_lowered.lowered_program()).unwrap(),
         );
 
-        let input = Array::from_host_buffer(&domain, input_type, mesh, []).unwrap();
-        let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh, []).unwrap();
+        let output = compiled.executable().execute(&session, Value::Array(input)).unwrap();
         let Value::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -2218,10 +2211,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_stateless_projects_and_reconstructs_mixed_zero_signatures() {
+    fn test_session_execute_stateless_projects_and_reconstructs_mixed_zero_signatures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]))
             .with_sharding(sharding.clone())
@@ -2237,24 +2230,24 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let lowered = staged.lower(&domain).unwrap();
+        let lowered = staged.lower(&session).unwrap();
         assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
         let compiled: ryft_core::compilation::CompiledFunction<
-            Domain<'_>,
+            Session<'_>,
             (ArrayIrType, ArrayIrType),
             (ArrayIrType, ArrayIrType),
-        > = lowered.compile(&domain).unwrap();
+        > = lowered.compile(&session).unwrap();
         let value = Array::from_host_buffer(
-            &domain,
+            &session,
             value_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
         )
         .unwrap();
-        let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh, []).unwrap();
 
         let (zero_output, value_output) =
-            compiled.executable().execute(&domain, (Value::Array(value), Value::Array(zero))).unwrap();
+            compiled.executable().execute(&session, (Value::Array(value), Value::Array(zero))).unwrap();
         let Value::Array(zero_output) = zero_output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
@@ -2279,10 +2272,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_program_bounded_dynamic_program_on_multiple_cpu_devices() {
+    fn test_session_execute_program_bounded_dynamic_program_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
@@ -2305,8 +2298,8 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
         let executable_options =
             compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
         assert_eq!(executable_options.replica_count, 4);
@@ -2322,13 +2315,13 @@ mod tests {
                     .unwrap();
             let values = (0..shape.iter().product()).map(|value| value as f32).collect::<Vec<_>>();
             let input = Array::from_host_buffer(
-                &domain,
+                &session,
                 actual_type,
                 mesh.clone(),
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+            let output = compiled.executable().execute(&session, Value::Array(input)).unwrap();
             let Value::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
@@ -2337,7 +2330,7 @@ mod tests {
             assert_eq!(output.shape().as_slice(), shape.as_slice());
             assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
         }
-        assert_eq!(domain.program_count(), 1);
+        assert_eq!(session.program_count(), 1);
 
         // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
         // requested placement to replication. Types record no placement over auto mesh axes, so that placement is an
@@ -2357,7 +2350,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let Err(error) = staged.lower(&domain) else {
+        let Err(error) = staged.lower(&session) else {
             panic!("bounded-dynamic sharded program unexpectedly lowered");
         };
         assert_eq!(
@@ -2368,10 +2361,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_program_data_derived_prefix_slice_at_multiple_extents() {
+    fn test_session_execute_program_data_derived_prefix_slice_at_multiple_extents() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(input_sharding.clone())
@@ -2413,11 +2406,11 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let values = || f32_vector(&session, &mesh, &[10.0, 20.0, 30.0, 40.0]);
         let execute = |mask: &[bool]| {
-            domain.execute_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
+            session.execute_program(&compiled, vec![boolean_vector(&session, &mesh, mask), values()]).unwrap()
         };
 
         let two = execute(&[true, false, true, false]);
@@ -2429,10 +2422,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_program_data_derived_prefix_slice_with_duplicate_and_equal_outputs() {
+    fn test_session_execute_program_data_derived_prefix_slice_with_duplicate_and_equal_outputs() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(input_sharding.clone())
@@ -2484,11 +2477,11 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let values = || f32_vector(&session, &mesh, &[10.0, 20.0, 30.0, 40.0]);
         let execute = |mask: &[bool]| {
-            domain.execute_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
+            session.execute_program(&compiled, vec![boolean_vector(&session, &mesh, mask), values()]).unwrap()
         };
 
         let two = execute(&[true, false, true, false]);
@@ -2506,27 +2499,27 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_prepare_compiled_execution_validates_kernel_participants() {
+    fn test_session_prepare_compiled_execution_validates_kernel_participants() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "device", 1);
-        let domain = Session::new(&client).domain();
-        let input = f32_vector(&domain, &mesh, &[2.0, 5.0]);
+        let session = Session::with_client(&client);
+        let input = f32_vector(&session, &mesh, &[2.0, 5.0]);
         let mut builder = ProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         let source = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let program = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
+        let program = session.compile_program(&lowered).unwrap();
         // Attach the same validated marker carried by executables with native kernels. The identity program isolates
         // submission admission from any backend-specific kernel compiler or custom-call handler.
         let program = program.with_kernel_execution_facts(Some(
-            crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh)
+            crate::kernels::KernelExecutionFacts::from_target(session.target().unwrap(), &mesh)
                 .unwrap()
                 .configuration_key()
                 .unwrap(),
         ));
-        let execution = domain.execute_compiled_async(&program, vec![input.clone()]).unwrap();
+        let execution = session.execute_compiled_async(&program, vec![input.clone()]).unwrap();
         execution.fence().block_until_ready().unwrap();
         assert_eq!(read_f32s(&client, &execution.output()[0]), vec![2.0, 5.0]);
         let program = program.with_mesh(
@@ -2539,7 +2532,7 @@ mod tests {
         // A topology change cannot reach resharding, donation, or PJRT execution, and the retained input stays
         // readable.
         assert!(matches!(
-            domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
+            session.prepare_compiled_execution(&program, vec![input.clone()], &[]),
             Err(error)
                 if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
                     Some(crate::kernels::KernelEmbeddingError::Invalid { message })
@@ -2550,10 +2543,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_prepare_compiled_execution_preserves_erased_input_producer_completion() {
+    fn test_session_prepare_compiled_execution_preserves_erased_input_producer_completion() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let zero_type = ArrayType::new_static(DataType::Zero, [2]);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         // Exercise both the ordinary input projection and the branch that materializes bounded inputs. The failed
@@ -2571,23 +2564,23 @@ mod tests {
                     vec![Placeholder; 2],
                 )
                 .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             assert_eq!(lowered.signature().input_mapping(), &[None, Some(0)]);
-            let compiled = domain.compile_program(&lowered).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
-            let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), [])
+            let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), [])
                 .unwrap()
                 .with_execution_fence(ExecutionFence::new(vec![event]));
             let value = Array::from_host_buffer(
-                &domain,
+                &session,
                 ArrayType::new_static(DataType::F32, [2]),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0]),
             )
             .unwrap();
             assert!(matches!(
-                domain.execute_compiled_async(&compiled, vec![zero, value]),
+                session.execute_compiled_async(&compiled, vec![zero, value]),
                 Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
                     if message == "erased producer failed",
             ));
@@ -2595,10 +2588,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_reshard_inputs_if_needed() {
+    fn test_session_reshard_inputs_if_needed() {
         let client = cpu_client(4);
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_values = |array: &Array<'_>| {
@@ -2613,8 +2606,8 @@ mod tests {
         };
 
         // An input that already has the expected sharding passes through.
-        let input = f32_vector(&domain, &mesh, &[1., 2., 3., 4.]);
-        let inputs = domain
+        let input = f32_vector(&session, &mesh, &[1., 2., 3., 4.]);
+        let inputs = session
             .reshard_inputs_if_needed(&mesh, std::slice::from_ref(&replicated), vec![input.clone()])
             .unwrap();
         assert_eq!(inputs, vec![input.clone()]);
@@ -2625,8 +2618,8 @@ mod tests {
             vec![mesh.devices()[0]],
         )
         .unwrap();
-        let single_device_input = f32_vector(&domain, &single_device_mesh, &[1., 2., 3., 4.]);
-        let inputs = domain
+        let single_device_input = f32_vector(&session, &single_device_mesh, &[1., 2., 3., 4.]);
+        let inputs = session
             .reshard_inputs_if_needed(
                 &mesh,
                 &[replicated.clone(), replicated],
@@ -2641,20 +2634,20 @@ mod tests {
             single_device_input.shards()[0].buffer().unwrap(),
         ));
         assert_eq!(device_values(&inputs[1]), vec![vec![1., 2., 3., 4.]; 4]);
-        assert_eq!(domain.program_count(), 0);
+        assert_eq!(session.program_count(), 0);
 
         // An input whose shards have to be sliced goes through a compiled reshard.
-        let inputs = domain.reshard_inputs_if_needed(&mesh, std::slice::from_ref(&sharded), vec![input]).unwrap();
+        let inputs = session.reshard_inputs_if_needed(&mesh, std::slice::from_ref(&sharded), vec![input]).unwrap();
         assert_eq!(inputs[0].sharding(), &sharded);
         assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(domain.program_count(), 1);
+        assert_eq!(session.program_count(), 1);
 
         // An input with the expected sharding on a mesh that lists the devices in another order holds each slice on
         // another device, so its shards are moved to the devices that the program expects them on.
         let reversed_mesh =
             DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().copied().collect()).unwrap();
         let reversed_input = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             ArrayType::new_static(DataType::F32, [4]),
             sharded.clone(),
             reversed_mesh.clone(),
@@ -2662,19 +2655,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reversed_input.sharding(), &sharded);
-        let inputs = domain
+        let inputs = session
             .reshard_inputs_if_needed(&mesh, std::slice::from_ref(&sharded), vec![reversed_input])
             .unwrap();
         assert_eq!(inputs[0].mesh(), &mesh);
         assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(domain.program_count(), 1);
+        assert_eq!(session.program_count(), 1);
     }
 
     #[test]
-    fn test_domain_materialize_zero_space_carriers() {
+    fn test_session_materialize_zero_space_carriers() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // The compiled module declares the `[3]` argument at its bounds, so a `[2]` runtime value below those bounds
         // must still produce a `[3]` carrier. The hidden extent scalar transports the logical size.
@@ -2684,9 +2677,9 @@ mod tests {
         let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&domain, runtime_zero_type, mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, runtime_zero_type, mesh, []).unwrap();
 
-        let carriers = domain.materialize_zero_space_carriers(&[physical_zero_type], vec![zero]).unwrap();
+        let carriers = session.materialize_zero_space_carriers(&[physical_zero_type], vec![zero]).unwrap();
 
         assert_eq!(carriers.len(), 1);
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
@@ -2705,10 +2698,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_materialize_zero_space_carriers_for_inputs_below_their_bounds() {
+    fn test_session_materialize_zero_space_carriers_for_inputs_below_their_bounds() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let declared_type = ArrayType::new(
             DataType::Zero,
@@ -2720,13 +2713,13 @@ mod tests {
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&domain, actual_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, []).unwrap();
 
         // The input of the zero data type below its bounds must bypass the retained cache and byte padding tiers,
         // because its dense host copy is empty, and rely on the carrier materialization to synthesize the predicate
         // argument at its bounds.
         let materialized = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&actual_type),
@@ -2737,17 +2730,17 @@ mod tests {
         assert_eq!(inputs.len(), 2);
 
         let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));
-        let carriers = domain.materialize_zero_space_carriers(&physical_types, inputs).unwrap();
+        let carriers = session.materialize_zero_space_carriers(&physical_types, inputs).unwrap();
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
         assert_eq!(carriers[0].shape().as_slice(), &[3]);
         assert_eq!(carriers[1].data_type(), DataType::I32);
     }
 
     #[test]
-    fn test_domain_execute_statefully_uses_compiled_input_types() {
+    fn test_session_execute_statefully_uses_compiled_input_types() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::new();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
@@ -2760,15 +2753,15 @@ mod tests {
         let program: FlatProgram = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let bytes = compiled.serialize().unwrap().unwrap();
-        let restored = domain.deserialize_compiled_program(&bytes).unwrap().unwrap();
+        let restored = session.deserialize_compiled_program(&bytes).unwrap().unwrap();
 
         for program in [&compiled, &restored] {
-            let holder = ArrayReference::new(f32_scalar(&domain, &mesh, 1.0));
-            let reference = Value::Reference(crate::Reference::new(holder.clone(), domain.clone()));
-            let update = Value::Array(f32_scalar(&domain, &mesh, 2.0));
+            let holder = ArrayReference::new(f32_scalar(&session, &mesh, 1.0));
+            let reference = Value::Reference(crate::Reference::new(holder.clone(), session.clone()));
+            let update = Value::Array(f32_scalar(&session, &mesh, 2.0));
 
             // Kind checks use the stored binding positions, including captures, before acquiring mutable state.
             let expected = format!(
@@ -2777,7 +2770,7 @@ mod tests {
                 reference.r#type(),
             );
             assert!(matches!(
-                domain.execute_statefully(program, vec![update.clone(), update.clone()]).r#await(),
+                session.execute_statefully(program, vec![update.clone(), update.clone()]).r#await(),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::InvalidArgument { message })
@@ -2790,7 +2783,7 @@ mod tests {
                 update.r#type(),
             );
             assert!(matches!(
-                domain.execute_statefully(program, vec![reference.clone(), reference.clone()]).r#await(),
+                session.execute_statefully(program, vec![reference.clone(), reference.clone()]).r#await(),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::InvalidArgument { message })
@@ -2798,7 +2791,7 @@ mod tests {
                 ),
             ));
             assert!(matches!(
-                domain.execute_statefully(program, Vec::new()).r#await(),
+                session.execute_statefully(program, Vec::new()).r#await(),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -2806,35 +2799,35 @@ mod tests {
             ));
             assert_eq!(read_f32s(&client, &holder.read().unwrap()), vec![1.0]);
 
-            let outputs = domain.execute_statefully(program, vec![reference, update]).r#await().unwrap();
+            let outputs = session.execute_statefully(program, vec![reference, update]).r#await().unwrap();
             assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
             assert_eq!(read_f32s(&client, &holder.read().unwrap()), vec![3.0]);
         }
     }
 
     #[test]
-    fn test_domain_execute_statefully_rejects_non_root_views() {
+    fn test_session_execute_statefully_rejects_non_root_views() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 2);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(scalar_type)),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let root = ArrayReference::new(
-            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
+            Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
         );
         let view = root
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) })
             .unwrap();
         assert!(matches!(
-            compiled.execute_statefully_and_wait(&domain, Value::Reference(Reference::new(view, domain.clone()))),
+            compiled.execute_statefully_and_wait(&session, Value::Reference(Reference::new(view, session.clone()))),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
@@ -2847,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_validates_holder_sharding() {
+    fn test_session_execute_statefully_validates_holder_sharding() {
         let client = execution_client();
         // Types record placement over explicit mesh axes only, so the alternate static sharding uses an explicit axis.
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -2856,7 +2849,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let replicated_type = ArrayType::new(DataType::F32, shape.clone())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -2867,13 +2860,13 @@ mod tests {
         let sharded = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &domain,
+                &session,
                 alternate_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(),
@@ -2881,7 +2874,7 @@ mod tests {
             .unwrap(),
         );
         let Value::Array(output) = sharded
-            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .execute_statefully_and_wait(&session, Value::Reference(Reference::new(reference.clone(), session.clone())))
             .unwrap()
         else {
             panic!("stateful read output must be an array")
@@ -2896,12 +2889,12 @@ mod tests {
                 ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
                 ArrayIrType::Array(replicated_type.clone()),
             ),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let update = Array::from_host_buffer(
-            &domain,
+            &session,
             replicated_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[3.0, 4.0]).as_slice(),
@@ -2909,8 +2902,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                &session,
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
@@ -2925,11 +2918,11 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_updates_sharded_holder() {
+    fn test_session_execute_statefully_updates_sharded_holder() {
         let client = cpu_client(2);
         // Types record placement over explicit mesh axes only, so the statically sharded state uses an explicit axis.
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(sharding)
@@ -2940,13 +2933,13 @@ mod tests {
                 reference.read().map_err(Into::into)
             },
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &domain,
+                &session,
                 array_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -2954,7 +2947,7 @@ mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &domain,
+            &session,
             array_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -2963,8 +2956,8 @@ mod tests {
 
         let Value::Array(output) = compiled
             .execute_statefully_and_wait(
-                &domain,
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                &session,
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
             )
             .unwrap()
         else {
@@ -2978,7 +2971,7 @@ mod tests {
             DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().cloned().collect()).unwrap();
         let reversed_reference = ArrayReference::new(
             Array::from_host_buffer(
-                &domain,
+                &session,
                 array_type.clone(),
                 reversed_mesh,
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -2986,7 +2979,7 @@ mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &domain,
+            &session,
             array_type,
             mesh,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -2994,9 +2987,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(reversed_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(reversed_reference.clone(), session.clone())),
                     Value::Array(update),
                 ),
             ),
@@ -3010,14 +3003,14 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_rejects_capture_aliasing_input() {
+    fn test_session_execute_statefully_rejects_capture_aliasing_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, public_reference| {
@@ -3025,14 +3018,14 @@ mod tests {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
-            vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+            vec![Value::Reference(Reference::new(reference.clone(), session.clone()))],
             reference_type.clone(),
-            &domain,
+            &session,
             Options::new(mesh),
         )
         .unwrap();
         let error = compiled
-            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .execute_statefully_and_wait(&session, Value::Reference(Reference::new(reference.clone(), session.clone())))
             .err();
         assert!(
             matches!(
@@ -3049,10 +3042,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_commits_references_in_reverse_identity_order() {
+    fn test_session_execute_statefully_commits_references_in_reverse_identity_order() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), (ArrayIrType, ArrayIrType)>(
@@ -3062,28 +3055,28 @@ mod tests {
                 Ok((first.read()?, second.read()?))
             },
             (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let (higher_output, lower_output) = compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(higher_reference.clone(), domain.clone())),
-                    Value::Reference(Reference::new(lower_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(higher_reference.clone(), session.clone())),
+                    Value::Reference(Reference::new(lower_reference.clone(), session.clone())),
                     Value::Array(update),
                 ),
             )
@@ -3099,10 +3092,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_locks_shared_holders_in_identity_order() {
+    fn test_session_execute_statefully_locks_shared_holders_in_identity_order() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ()>(
@@ -3111,25 +3104,25 @@ mod tests {
                 second.add_update(&update).map_err(Into::into)
             },
             (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
         let higher_first_update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let lower_first_update =
-            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         // The two calls present the same holders in opposite argument order and start together. Both must finish,
         // because internal identity ordering serializes their retained guard windows without creating a lock cycle.
@@ -3143,15 +3136,15 @@ mod tests {
                 let start = Arc::clone(&start);
                 let finished = finished.clone();
                 let compiled = &compiled;
-                let domain = &domain;
+                let session = &session;
                 scope.spawn(move || {
                     start.wait();
                     finished
                         .send(compiled.execute_statefully_and_wait(
-                            domain,
+                            session,
                             (
-                                Value::Reference(Reference::new(first, domain.clone())),
-                                Value::Reference(Reference::new(second, domain.clone())),
+                                Value::Reference(Reference::new(first, session.clone())),
+                                Value::Reference(Reference::new(second, session.clone())),
                                 Value::Array(update),
                             ),
                         ))
@@ -3169,10 +3162,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_failure_boundaries() {
+    fn test_session_execute_statefully_failure_boundaries() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -3183,13 +3176,13 @@ mod tests {
                 Ok(output)
             },
             (reference_type.clone(), reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference_new = |value: f32| {
             ArrayReference::new(
-                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap(),
             )
         };
@@ -3200,7 +3193,8 @@ mod tests {
         let pre_handoff_read_only = reference_new(20.0);
         let wrong_update_type = replicated_scalar_type(&mesh, DataType::F64);
         let wrong_update =
-            Array::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice())
+                .unwrap();
         let declared_update_type = <&ArrayType>::try_from(&compiled.executable().input_types()[3]).unwrap();
         let expected_error = format!(
             "runtime input type `{}` does not refine declared type `{declared_update_type}`",
@@ -3208,11 +3202,11 @@ mod tests {
         );
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(pre_handoff_first.clone(), domain.clone())),
-                    Value::Reference(Reference::new(pre_handoff_second.clone(), domain.clone())),
-                    Value::Reference(Reference::new(pre_handoff_read_only.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_handoff_first.clone(), session.clone())),
+                    Value::Reference(Reference::new(pre_handoff_second.clone(), session.clone())),
+                    Value::Reference(Reference::new(pre_handoff_read_only.clone(), session.clone())),
                     Value::Array(wrong_update),
                 ),
             ),
@@ -3231,16 +3225,16 @@ mod tests {
         let pre_submission_second = reference_new(10.0);
         let pre_submission_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(pre_submission_first.clone(), domain.clone())),
-                    Value::Reference(Reference::new(pre_submission_second.clone(), domain.clone())),
-                    Value::Reference(Reference::new(pre_submission_read_only.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_submission_first.clone(), session.clone())),
+                    Value::Reference(Reference::new(pre_submission_second.clone(), session.clone())),
+                    Value::Reference(Reference::new(pre_submission_read_only.clone(), session.clone())),
                     Value::Array(update),
                 ),
             ),
@@ -3257,16 +3251,16 @@ mod tests {
         let post_handoff_second = reference_new(10.0);
         let post_handoff_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(post_handoff_first.clone(), domain.clone())),
-                    Value::Reference(Reference::new(post_handoff_second.clone(), domain.clone())),
-                    Value::Reference(Reference::new(post_handoff_read_only.clone(), domain.clone())),
+                    Value::Reference(Reference::new(post_handoff_first.clone(), session.clone())),
+                    Value::Reference(Reference::new(post_handoff_second.clone(), session.clone())),
+                    Value::Reference(Reference::new(post_handoff_read_only.clone(), session.clone())),
                     Value::Array(update),
                 ),
             ),
@@ -3291,16 +3285,16 @@ mod tests {
         let pre_commit_second = reference_new(10.0);
         let pre_commit_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(pre_commit_first.clone(), domain.clone())),
-                    Value::Reference(Reference::new(pre_commit_second.clone(), domain.clone())),
-                    Value::Reference(Reference::new(pre_commit_read_only.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_commit_first.clone(), session.clone())),
+                    Value::Reference(Reference::new(pre_commit_second.clone(), session.clone())),
+                    Value::Reference(Reference::new(pre_commit_read_only.clone(), session.clone())),
                     Value::Array(update),
                 ),
             ),
@@ -3322,15 +3316,15 @@ mod tests {
         let committed_first = reference_new(1.0);
         let committed_second = reference_new(10.0);
         let committed_read_only = reference_new(20.0);
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(committed_first.clone(), domain.clone())),
-                    Value::Reference(Reference::new(committed_second.clone(), domain.clone())),
-                    Value::Reference(Reference::new(committed_read_only.clone(), domain.clone())),
+                    Value::Reference(Reference::new(committed_first.clone(), session.clone())),
+                    Value::Reference(Reference::new(committed_second.clone(), session.clone())),
+                    Value::Reference(Reference::new(committed_read_only.clone(), session.clone())),
                     Value::Array(update),
                 ),
             ),
@@ -3343,10 +3337,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_validation_failure_leaves_peer_unchanged() {
+    fn test_session_execute_statefully_validation_failure_leaves_peer_unchanged() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -3356,26 +3350,26 @@ mod tests {
                 first.read().map_err(Into::into)
             },
             (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let frozen = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         frozen.freeze().unwrap();
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             compiled.execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(first.clone(), domain.clone())),
-                    Value::Reference(Reference::new(frozen, domain.clone())),
+                    Value::Reference(Reference::new(first.clone(), session.clone())),
+                    Value::Reference(Reference::new(frozen, session.clone())),
                     Value::Array(update),
                 ),
             ),
@@ -3388,28 +3382,28 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_read_leases_overlap_and_block_mutation() {
+    fn test_session_execute_statefully_read_leases_overlap_and_block_mutation() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             reference_type.clone(),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let mutate = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
@@ -3418,24 +3412,24 @@ mod tests {
         let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
         inject_stateful_completion(CoreReferenceCompletion::new(first_gate.clone()));
         let first_read =
-            read.execute_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
+            read.execute_statefully(&session, Value::Reference(Reference::new(reference.clone(), session.clone())));
         let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
         inject_stateful_completion(CoreReferenceCompletion::new(second_gate.clone()));
         let second_read =
-            read.execute_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
+            read.execute_statefully(&session, Value::Reference(Reference::new(reference.clone(), session.clone())));
 
         std::thread::scope(|scope| {
             let (mutation_finished, mutation_result) = mpsc::channel();
             let mutation_reference = reference.clone();
-            let domain = &domain;
+            let session = &session;
             let mutate = &mutate;
             scope.spawn(move || {
                 let update =
-                    Array::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                    Array::from_host_buffer(session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
                 mutation_finished
                     .send(mutate.execute_statefully_and_wait(
-                        domain,
-                        (Value::Reference(Reference::new(mutation_reference, domain.clone())), Value::Array(update)),
+                        session,
+                        (Value::Reference(Reference::new(mutation_reference, session.clone())), Value::Array(update)),
                     ))
                     .unwrap();
             });
@@ -3454,27 +3448,27 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_without_public_outputs_waits_for_commit() {
+    fn test_session_execute_statefully_without_public_outputs_waits_for_commit() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
             .execute_statefully(
-                &domain,
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                &session,
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
             )
             .r#await()
             .unwrap();
@@ -3482,36 +3476,36 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_chains_unawaited_mutations_and_preserves_prior_failure() {
+    fn test_session_execute_statefully_chains_unawaited_mutations_and_preserves_prior_failure() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let predecessor = ControlledReferenceCompletion::new();
         inject_stateful_completion(CoreReferenceCompletion::new(predecessor.clone()));
         let first_update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let first = compiled.execute_statefully(
-            &domain,
-            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(first_update)),
+            &session,
+            (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(first_update)),
         );
         let second_update =
-            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let second = compiled.execute_statefully(
-            &domain,
-            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(second_update)),
+            &session,
+            (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(second_update)),
         );
 
         predecessor.complete(Err(Arc::from("injected predecessor failure")));
@@ -3530,28 +3524,28 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_execute_statefully_drop_reconciles_pending_holder_on_access() {
+    fn test_session_execute_statefully_drop_reconciles_pending_holder_on_access() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let completion = ControlledReferenceCompletion::new();
         inject_stateful_completion(CoreReferenceCompletion::new(completion.clone()));
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         drop(compiled.execute_statefully(
-            &domain,
-            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+            &session,
+            (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
         ));
 
         completion.complete(Ok(()));

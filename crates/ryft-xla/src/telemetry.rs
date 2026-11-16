@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn test_constructed_array_count_and_dropped_array_count() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
@@ -90,7 +90,7 @@ mod tests {
         let constructed_baseline = constructed_array_count();
         let arrays: Vec<Array<'_>> = (0..200)
             .map(|_| {
-                Array::from_addressable_buffers(&domain, array_type.clone(), device_mesh.clone(), Vec::new()).unwrap()
+                Array::from_addressable_buffers(&session, array_type.clone(), device_mesh.clone(), Vec::new()).unwrap()
             })
             .collect();
         let after_construct = constructed_array_count();

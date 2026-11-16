@@ -669,19 +669,19 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
             |(first, second)| first.concatenate_with([&second], 0).unwrap(),
             (input_type.clone(), input_type.clone()),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
         let first =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1i64, 2, 3, 4]))
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), values_to_bytes(&[1i64, 2, 3, 4]))
                 .unwrap();
-        let second = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5i64, 6, 7, 8])).unwrap();
-        let output = compiled.executable().execute(&domain, (first, second)).unwrap();
+        let second = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[5i64, 6, 7, 8])).unwrap();
+        let output = compiled.executable().execute(&session, (first, second)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&sharding));
         for (index, device) in devices.iter().enumerate() {
             let bytes = output

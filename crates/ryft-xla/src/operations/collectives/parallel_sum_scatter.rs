@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn test_parallel_sum_scatter_operation_lower() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -245,7 +245,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn test_parallel_sum_scatter_operation_lower_untiled_removes_rank() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -371,7 +371,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[6, 2], input_sharding),
             device_mesh,
             input_buffers,

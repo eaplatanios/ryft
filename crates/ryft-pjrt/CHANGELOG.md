@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added the asynchronous `ExecutionFence::ready` for awaiting the joined execution result without parking the calling
   thread, in contrast to `ExecutionFence::block_until_ready`. A pending fence suspends the task and wakes it from
   the thread that completes the last participating event.
+- Added `Plugin::initialize` for initializing a plugin explicitly and observing an initialization failure as an `Error`.
+  The other `Plugin` functions still initialize the plugin on first use and panic if that fails, so call this function
+  first to handle the failure (e.g., to fall back to another plugin).
+- Added `PartialEq` and `Eq` implementations for `Plugin`, under which two plugins are equal when they refer to the same
+  PJRT API (e.g., when they were loaded from the same shared library).
 - Added support for the new `PJRT_Buffer_Bitcast` C API function.
 - Added support for the new `PJRT_Device_ClearMemoryStats` C API function.
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust

@@ -629,7 +629,7 @@ mod tests {
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, Domain, Options, Session, ToPjrt, TracedProgram,
+        Array, ArrayConstant, ArrayTracer, Constant, Options, Session, ToPjrt, TracedProgram,
         to_mlir_module_for_program, trace,
     };
 
@@ -849,7 +849,7 @@ mod tests {
         // The operands stay `f8e4m3fn` on device and the contraction accumulates at `f32`. Every value is exactly
         // representable in `f8e4m3fn` and every product and sum is exact in `f32`, so both backends are exact.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let operand_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let reference_left = CoreArray::from_elements(
@@ -862,8 +862,8 @@ mod tests {
             &[1f64, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        let left = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2, 2], &reference_left.logical_bytes());
-        let right = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2, 2], &reference_right.logical_bytes());
+        let left = replicated_array(&session, &mesh, DataType::F8E4M3FN, &[2, 2], &reference_left.logical_bytes());
+        let right = replicated_array(&session, &mesh, DataType::F8E4M3FN, &[2, 2], &reference_right.logical_bytes());
 
         let product = left.dot_with_accumulation_type(&right, &DotDimensionNumbers::matmul(), DataType::F32).unwrap();
         let reference_product = reference_left
@@ -882,7 +882,7 @@ mod tests {
     #[test]
     fn test_dot_operation_lower_with_narrower_accumulation_type_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The three terms `2⁻¹²` sum to three quarters of the distance from `1` to the next `f16` value, so a sum
@@ -890,8 +890,8 @@ mod tests {
         let reference_left =
             CoreArray::vector(vec![1.0f32, 0.000_244_140_63, 0.000_244_140_63, 0.000_244_140_63]).unwrap();
         let reference_right = CoreArray::vector(vec![1.0f32; 4]).unwrap();
-        let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &reference_left.logical_bytes());
-        let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &reference_right.logical_bytes());
+        let left = replicated_array(&session, &mesh, DataType::F32, &[4], &reference_left.logical_bytes());
+        let right = replicated_array(&session, &mesh, DataType::F32, &[4], &reference_right.logical_bytes());
         let dimensions = DotDimensionNumbers::inner_product();
         let product = left.dot_with_accumulation_type(&right, &dimensions, DataType::F16).unwrap();
         let reference_product =
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn test_dot_operation_lower_with_distinct_f8_inputs_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Two distinct 8-bit input types stay as they are on device and the contraction accumulates at the requested
@@ -918,8 +918,8 @@ mod tests {
             &[2.0f64, 4.0].map(|value| f8e5m2::from_f64(value).unwrap()),
         )
         .unwrap();
-        let left = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2], &reference_left.logical_bytes());
-        let right = replicated_array(&domain, &mesh, DataType::F8E5M2, &[2], &reference_right.logical_bytes());
+        let left = replicated_array(&session, &mesh, DataType::F8E4M3FN, &[2], &reference_left.logical_bytes());
+        let right = replicated_array(&session, &mesh, DataType::F8E5M2, &[2], &reference_right.logical_bytes());
         let dimensions = DotDimensionNumbers::inner_product();
         let product = left.dot_with_accumulation_type(&right, &dimensions, DataType::BF16).unwrap();
         let reference_product =
@@ -1074,15 +1074,15 @@ mod tests {
     #[test]
     fn test_dot_operation_lower_with_precision_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The `bf16` preset rounds its `f64` inputs to `bf16`, where `1 + 2⁻¹⁰` becomes `1`, accumulates at `f32`,
         // and converts the result to the `f64` output type. Every remaining value is exact, so both backends are.
         let reference_left = CoreArray::vector(vec![1.0009765625f64, 2.0]).unwrap();
         let reference_right = CoreArray::vector(vec![1.0f64, 1.0]).unwrap();
-        let left = replicated_array(&domain, &mesh, DataType::F64, &[2], &reference_left.logical_bytes());
-        let right = replicated_array(&domain, &mesh, DataType::F64, &[2], &reference_right.logical_bytes());
+        let left = replicated_array(&session, &mesh, DataType::F64, &[2], &reference_left.logical_bytes());
+        let right = replicated_array(&session, &mesh, DataType::F64, &[2], &reference_right.logical_bytes());
         let dimensions = DotDimensionNumbers::inner_product();
         let product = left.dot_with_precision(&right, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into()).unwrap();
         let reference_product = reference_left
@@ -1096,8 +1096,8 @@ mod tests {
         // over more than one pair of elements, so a single pair is contracted here.
         let reference_stored = CoreArray::vector(vec![33685504.0f32]).unwrap();
         let reference_unit = CoreArray::vector(vec![1.0f32]).unwrap();
-        let stored = replicated_array(&domain, &mesh, DataType::F32, &[1], &reference_stored.logical_bytes());
-        let unit = replicated_array(&domain, &mesh, DataType::F32, &[1], &reference_unit.logical_bytes());
+        let stored = replicated_array(&session, &mesh, DataType::F32, &[1], &reference_stored.logical_bytes());
+        let unit = replicated_array(&session, &mesh, DataType::F32, &[1], &reference_unit.logical_bytes());
         let product = stored.dot_with_precision(&unit, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into()).unwrap();
         let reference_product = reference_stored
             .dot_with_precision(&reference_unit, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into())
@@ -1446,7 +1446,7 @@ mod tests {
     fn test_ragged_dot_operation_lower_strategy() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let left_type = ArrayType::new_static(DataType::F32, [5, 2]);
         let right_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
         let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
@@ -1468,8 +1468,8 @@ mod tests {
         let decomposition_options = Options::new(mesh.clone());
         let instruction_options =
             Options::new(mesh).with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
-        let decomposition = domain.lower_program(&program, 0, &decomposition_options).unwrap();
-        let instruction = domain.lower_program(&program, 0, &instruction_options).unwrap();
+        let decomposition = session.lower_program(&program, 0, &decomposition_options).unwrap();
+        let instruction = session.lower_program(&program, 0, &instruction_options).unwrap();
 
         assert!(decomposition.stable_hlo().contains("stablehlo.dot_general"));
         assert!(!decomposition.stable_hlo().contains("chlo.ragged_dot"));
@@ -2040,7 +2040,7 @@ mod tests {
         // are compared as values, because a dot without contracting dimensions keeps the sign of a zero product on
         // XLA, while the reference kernel adds every product to a positive zero.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let cases: &[(&str, &[&[usize]])] = &[
             ("ij,jk->ik", &[&[2, 3], &[3, 4]]),
@@ -2063,7 +2063,7 @@ mod tests {
                 reference_inputs.push(
                     CoreArray::from_elements(ArrayType::new_static(DataType::F32, shape.to_vec()), &values).unwrap(),
                 );
-                inputs.push(replicated_array(&domain, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
+                inputs.push(replicated_array(&session, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
             }
             let output = Einsum::einsum(subscripts, inputs.iter()).unwrap();
             let reference_output = CoreArray::einsum(subscripts, reference_inputs.iter()).unwrap();
@@ -2077,7 +2077,7 @@ mod tests {
 
         // An einsum of one input that ends with no sum reshards its output to a requested sharding.
         let values = (0..6).map(|value| value as f32).collect::<Vec<_>>();
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&values));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&values));
         let output_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let options = EinsumOptions::new().with_output_sharding(output_sharding.clone());
         let output = Einsum::einsum_with_options(&"ij->ji".parse().unwrap(), [&input], &options).unwrap();
@@ -2087,7 +2087,7 @@ mod tests {
         // The options select the path, the precision, and the accumulation type of the staged contractions.
         let values = [3.0f32, 0.5, 2.0, 4.0].map(bf16::from_f32);
         let reference = CoreArray::matrix(2, 2, values.to_vec()).unwrap();
-        let input = replicated_array(&domain, &mesh, DataType::BF16, &[2, 2], &reference.logical_bytes());
+        let input = replicated_array(&session, &mesh, DataType::BF16, &[2, 2], &reference.logical_bytes());
         let specification = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
         let options = EinsumOptions::new()
             .with_path_strategy(EinsumPathStrategy::Unoptimized)
@@ -2149,8 +2149,8 @@ mod tests {
             ),
         ];
         // Inputs of different element types are promoted before they are contracted.
-        let lhs = replicated_array(&domain, &mesh, DataType::U8, &[2, 2], &integers.logical_bytes());
-        let rhs = replicated_array(&domain, &mesh, DataType::F32, &[2, 2], &fractions.logical_bytes());
+        let lhs = replicated_array(&session, &mesh, DataType::U8, &[2, 2], &integers.logical_bytes());
+        let rhs = replicated_array(&session, &mesh, DataType::F32, &[2, 2], &fractions.logical_bytes());
         let output = Einsum::einsum("ij,jk->ik", [&lhs, &rhs]).unwrap();
         let reference_output = CoreArray::einsum("ij,jk->ik", [&integers, &fractions]).unwrap();
         assert_eq!(reference_output.r#type().data_type(), DataType::F32);
@@ -2161,8 +2161,8 @@ mod tests {
         // the accumulation type first would produce zero. JAX computes one as well.
         let wide = CoreArray::vector(vec![2049i16, -2048]).unwrap();
         let ones = CoreArray::vector(vec![1i16, 1]).unwrap();
-        let lhs = replicated_array(&domain, &mesh, DataType::I16, &[2], &wide.logical_bytes());
-        let rhs = replicated_array(&domain, &mesh, DataType::I16, &[2], &ones.logical_bytes());
+        let lhs = replicated_array(&session, &mesh, DataType::I16, &[2], &wide.logical_bytes());
+        let rhs = replicated_array(&session, &mesh, DataType::I16, &[2], &ones.logical_bytes());
         let specification = "i,i->".parse::<EinsumSpecification>().unwrap();
         let expected = [
             CoreArray::scalar(f16::from_f32(1.0)).unwrap(),
@@ -2186,8 +2186,8 @@ mod tests {
         // `33685504`.
         let wide = CoreArray::vector(vec![33685505i32]).unwrap();
         let unit = CoreArray::vector(vec![1.0f32]).unwrap();
-        let lhs = replicated_array(&domain, &mesh, DataType::I32, &[1], &wide.logical_bytes());
-        let rhs = replicated_array(&domain, &mesh, DataType::F32, &[1], &unit.logical_bytes());
+        let lhs = replicated_array(&session, &mesh, DataType::I32, &[1], &wide.logical_bytes());
+        let rhs = replicated_array(&session, &mesh, DataType::F32, &[1], &unit.logical_bytes());
         let options = EinsumOptions::new()
             .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
             .with_accumulation_type(DataType::F32);
@@ -2200,7 +2200,7 @@ mod tests {
 
         for (subscripts, reference, options) in cases {
             let input =
-                replicated_array(&domain, &mesh, reference.r#type().data_type(), &[2, 2], &reference.logical_bytes());
+                replicated_array(&session, &mesh, reference.r#type().data_type(), &[2, 2], &reference.logical_bytes());
             let specification = subscripts.parse::<EinsumSpecification>().unwrap();
             let count = specification.inputs().len();
             let output = Einsum::einsum_with_options(&specification, vec![&input; count], &options).unwrap();
@@ -2217,7 +2217,7 @@ mod tests {
         // axes to auto axes, like in JAX. The contracted axes of the first two inputs below are sharded alike over
         // two devices, which explicit placement of their contraction rejects as ambiguous.
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
         let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.logical_mesh().clone(), dimensions);
         let shardings = [
@@ -2232,7 +2232,7 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [4, 4]);
             reference_inputs.push(CoreArray::from_elements(r#type.clone(), &values).unwrap());
             let r#type = r#type.with_sharding(sharding.clone()).unwrap();
-            inputs.push(Array::from_host_buffer(&domain, r#type, mesh.clone(), &values_to_bytes(&values)).unwrap());
+            inputs.push(Array::from_host_buffer(&session, r#type, mesh.clone(), &values_to_bytes(&values)).unwrap());
         }
         let specification = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
         let options = EinsumOptions::new()
@@ -2252,7 +2252,7 @@ mod tests {
         // An einsum function with multiple steps executes each call as one eager dispatch of its whole body, where
         // the capability dispatches every step separately. Both agree with the reference backend.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let shapes: [&[usize]; 3] = [&[2, 3], &[3, 4], &[4, 2]];
         let mut inputs = Vec::new();
@@ -2262,12 +2262,12 @@ mod tests {
             let values = (0..count).map(|value| ((value * (index + 2)) % 7) as f32 - 3.0).collect::<Vec<_>>();
             reference_inputs
                 .push(CoreArray::from_elements(ArrayType::new_static(DataType::F32, shape.to_vec()), &values).unwrap());
-            inputs.push(replicated_array(&domain, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
+            inputs.push(replicated_array(&session, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
         }
-        let function = einsum::<ProjectedContext<Domain<'_>, ArrayType>>("ij,jk,kl->il").unwrap();
+        let function = einsum::<ProjectedContext<Session<'_>, ArrayType>>("ij,jk,kl->il").unwrap();
         let reference_output = CoreArray::einsum("ij,jk,kl->il", reference_inputs.iter()).unwrap();
         let dispatches = || {
-            let statistics = domain.eager_dispatch_statistics();
+            let statistics = session.eager_dispatch_statistics();
             (statistics.misses, statistics.hits)
         };
 
@@ -2308,7 +2308,7 @@ mod tests {
     fn test_einsum_composite_lowering_shares_one_function() {
         // Calls of one einsum function with equal input types lower to calls of one shared function, which holds the
         // decomposition once.
-        let function = einsum::<ProjectedContext<Domain<'static>, ArrayType>>("ij,jk,kl->il").unwrap();
+        let function = einsum::<ProjectedContext<Session<'static>, ArrayType>>("ij,jk,kl->il").unwrap();
         let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
             move |inputs: Vec<ArrayTracer>| {
                 let first = function.call(inputs.clone()).unwrap();

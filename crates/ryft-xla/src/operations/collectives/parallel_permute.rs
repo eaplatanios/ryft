@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn test_parallel_permute_operation_lower() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -161,7 +161,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], sharding.clone()),
             device_mesh.clone(),
             input_buffers,

@@ -1626,9 +1626,9 @@ mod tests {
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let value = |dimensions: &[usize], values: &[f32]| {
-            Value::Array(replicated_array(&domain, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
+            Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
         let read = |value: Value<'_>| {
             let array = program_array(&value);

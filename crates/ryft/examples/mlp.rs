@@ -292,16 +292,10 @@ fn run_core_ir() -> ExampleResult<Training> {
 
 #[cfg(feature = "xla")]
 mod xla_backend {
-    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    use ryft::pjrt::{ClientOptions, CpuClientOptions, Error as PjrtError, Plugin, load_cpu_plugin};
-    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-    use ryft::pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
-    use ryft::xla::{Array, Domain, FromPjrt, Session, Value};
+    use ryft::xla::{Array, Session, Value};
     use ryft::{
-        ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Parameterized,
-        ProjectedContext, Shape, Sharding,
+        ArrayType, DataType, DeviceMesh, Dimension, MeshAxis, MeshAxisType, Parameterized, ProjectedContext, Shape,
+        Sharding,
     };
 
     use super::{ExampleResult, Linear, Mlp, Training, initial_layer_values, input_values, target_values};
@@ -313,7 +307,7 @@ mod xla_backend {
 
     /// Constructs a replicated `f32` array on the selected XLA device.
     fn array<'c>(
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         mesh: &DeviceMesh,
         dimensions: &[usize],
         values: &[f32],
@@ -321,7 +315,7 @@ mod xla_backend {
         let shape = Shape::new(dimensions.iter().copied().map(Dimension::Static).collect());
         let r#type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-        Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(values))?)
+        Ok(Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes(values))?)
     }
 
     /// Copies a replicated `f32` XLA array back to the host.
@@ -339,94 +333,34 @@ mod xla_backend {
             .collect())
     }
 
-    /// Attempts to load and initialize one CUDA plugin candidate. Plugin initialization can panic inside the PJRT
-    /// wrapper, so this optional-probe boundary converts that failure into the same CPU fallback used for ordinary
-    /// loading and client-creation errors.
-    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-    fn try_cuda_plugin<L>(label: &str, load: L) -> Option<(Plugin, ClientOptions)>
-    where
-        L: FnOnce() -> Result<Plugin, PjrtError>,
-    {
-        let options = ClientOptions::GPU(GpuClientOptions {
-            platform: Some(GpuPlatform::CUDA),
-            allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-            ..GpuClientOptions::default()
-        });
-        let candidate = catch_unwind(AssertUnwindSafe(|| -> Result<_, PjrtError> {
-            let plugin = load()?;
-            if plugin.client(options.clone())?.addressable_devices()?.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some((plugin, options)))
-            }
-        }));
-        match candidate {
-            Ok(Ok(Some(candidate))) => Some(candidate),
-            Ok(Ok(None)) => {
-                eprintln!("{label} plugin has no addressable GPU; trying the next XLA platform");
-                None
-            }
-            Ok(Err(error)) => {
-                eprintln!("{label} plugin loading or initialization failed ({error}); trying the next XLA platform");
-                None
-            }
-            Err(_) => {
-                eprintln!("{label} plugin initialization panicked; trying the next XLA platform");
-                None
-            }
-        }
-    }
-
-    /// Chooses a usable CUDA plugin when enabled and otherwise returns the built-in CPU plugin.
-    fn load_xla_plugin() -> Result<(Plugin, ClientOptions), PjrtError> {
-        #[cfg(feature = "cuda-13")]
-        if let Some(candidate) = try_cuda_plugin("CUDA 13", ryft::pjrt::load_cuda_13_plugin) {
-            return Ok(candidate);
-        }
-
-        #[cfg(feature = "cuda-12")]
-        if let Some(candidate) = try_cuda_plugin("CUDA 12", ryft::pjrt::load_cuda_12_plugin) {
-            return Ok(candidate);
-        }
-
-        Ok((load_cpu_plugin()?, ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
-    }
-
     /// Runs MLP training through XLA on the selected PJRT platform, over XLA arrays or, if `array_ir` is set, over
     /// array IR values with XLA array members.
     pub(super) fn run(array_ir: bool) -> ExampleResult<Training> {
-        let (plugin, client_options) = load_xla_plugin()?;
-        let client = plugin.client(client_options)?;
-        println!("XLA platform: {}", client.platform_name()?);
-        let device = client
-            .addressable_devices()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "xla client has no addressable device".to_string())?;
-        let device = Device::from_pjrt(device)?;
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
-        let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
-        let domain = Session::new(&client).domain();
+        // The session creates its own client on the best available platform, which is a CUDA GPU when a CUDA feature
+        // is enabled and a GPU is present, and the CPU otherwise.
+        let session = Session::new()?;
+        println!("XLA platform: {}", session.target()?.platform_name());
+        let mesh = session.new_mesh([MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
 
         let model = Mlp {
             layers: initial_layer_values()
                 .into_iter()
                 .map(|(input_size, output_size, weights, bias)| -> ExampleResult<_> {
                     Ok(Linear::new(
-                        array(&domain, &mesh, &[input_size, output_size], &weights)?,
-                        bias.map(|bias| array(&domain, &mesh, &[output_size], &bias)).transpose()?,
+                        array(&session, &mesh, &[input_size, output_size], &weights)?,
+                        bias.map(|bias| array(&session, &mesh, &[output_size], &bias)).transpose()?,
                     ))
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let inputs = array(&domain, &mesh, &[4, 2], &input_values())?;
-        let targets = array(&domain, &mesh, &[4, 1], &target_values())?;
-        let learning_rate = array(&domain, &mesh, &[], &[0.1])?;
-        let mean_scale = array(&domain, &mesh, &[], &[0.25])?;
+        let inputs = array(&session, &mesh, &[4, 2], &input_values())?;
+        let targets = array(&session, &mesh, &[4, 1], &target_values())?;
+        let learning_rate = array(&session, &mesh, &[], &[0.1])?;
+        let mean_scale = array(&session, &mesh, &[], &[0.25])?;
         if !array_ir {
             return super::train(
                 "xla",
-                &ProjectedContext::new(domain.clone()),
+                &ProjectedContext::new(session.clone()),
                 model,
                 inputs,
                 targets,
@@ -436,10 +370,10 @@ mod xla_backend {
             );
         }
 
-        // Array IR values over XLA arrays train in the session-backed array IR domain itself.
+        // Array IR values over XLA arrays train in the session-backed array IR session itself.
         super::train(
             "xla-ir",
-            &domain,
+            &session,
             model.map_parameters(Value::Array)?,
             Value::Array(inputs),
             Value::Array(targets),

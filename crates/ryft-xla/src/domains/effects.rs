@@ -1,4 +1,4 @@
-//! Ordering and completion tracking for the effects of executions submitted through a [`Domain`](crate::Domain).
+//! Ordering and completion tracking for the effects of executions submitted through a [`Session`](crate::Session).
 //!
 //! Every execution with effects reserves a position in an `EffectScope` before dispatch. Ordered executions form a
 //! chain in which each submission consumes the token carrier that its predecessor publishes, so ordered I/O observes
@@ -7,9 +7,9 @@
 //! its own predecessor without waiting on the host.
 //!
 //! PJRT callbacks retain only an `EffectCompletion`, which borrows no client resources and never acquires the scope
-//! mutex. [`Domain::effects_barrier`](crate::Domain::effects_barrier) waits for a fixed snapshot of earlier
+//! mutex. [`Session::effects_barrier`](crate::Session::effects_barrier) waits for a fixed snapshot of earlier
 //! submissions and reports their failures in submission order, and
-//! [`Domain::acknowledge_effect_errors`](crate::Domain::acknowledge_effect_errors) clears observed failures once the
+//! [`Session::acknowledge_effect_errors`](crate::Session::acknowledge_effect_errors) clears observed failures once the
 //! affected work has completed. `EffectCallbackGuard` marks managed callbacks, and `ensure_effect_dispatch_allowed`
 //! rejects dispatch and barriers that would reenter from inside one.
 
@@ -56,10 +56,10 @@ impl EffectCompletion {
     }
 }
 
-/// Ordering and completion scope that a session owns by default and that forked domains own independently, separate
-/// from numerical values and compilation artifacts.
+/// Ordering and completion scope that every handle of a session selects, separate from numerical values and
+/// compilation artifacts.
 ///
-/// Cloned domains share their selected scope, while forking a domain starts an independent sequence. Submissions
+/// Cloned sessions share their selected scope, while forking a session starts an independent sequence. Submissions
 /// reserve positions before dispatch so ordered work observes its predecessors even when launches complete
 /// asynchronously. [`Self::barrier`] waits for earlier reservations and reports failures in submission order.
 /// [`Self::acknowledge`] permits recovery only after affected work has completed and its failures have been observed.
@@ -407,7 +407,7 @@ mod tests {
     /// is recorded, so there the chain is proven through submission order and barrier completion alone.
     fn assert_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
         let mesh = domain_mesh(client, "x", 1);
-        let session = Session::new(client);
+        let session = Session::with_client(client);
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
         let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
         let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
@@ -419,24 +419,14 @@ mod tests {
                     client.addressable_devices().unwrap()[0].default_memory().unwrap(),
                 )
                 .unwrap();
-            let mut predecessor = session.default_effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+            let mut predecessor = session.effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
             predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
             predecessor.submission.completion.complete(Ok(()));
             predecessor.published = true;
             manager
         });
         let tail_pending = || {
-            !session
-                .default_effect_scope()
-                .state
-                .lock()
-                .unwrap()
-                .tail
-                .as_ref()
-                .unwrap()
-                .carrier()
-                .unwrap()
-                .unwrap()[0]
+            !session.effect_scope().state.lock().unwrap().tail.as_ref().unwrap().carrier().unwrap().unwrap()[0]
                 .ready()
                 .unwrap()
                 .ready()
@@ -468,25 +458,24 @@ mod tests {
     /// [`assert_session_array_ordered_effects`] for why that fixture only works on CPU.
     fn assert_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
         let mesh = domain_mesh(client, "x", 1);
-        let session = Session::new(client);
-        let domain = session.domain();
+        let session = Session::with_client(client);
         ensure_print_handler_registered(client).unwrap();
-        let input = f64_vector(&domain, &mesh, &[3.0]);
+        let input = f64_vector(&session, &mesh, &[3.0]);
         let mut builder = ProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
             .unwrap();
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         assert!(compiled.signature().has_ordered_io());
         let serialized = compiled.serialize().unwrap().unwrap();
-        let restored = domain.deserialize_compiled_program(&serialized).unwrap().unwrap();
+        let restored = session.deserialize_compiled_program(&serialized).unwrap().unwrap();
         assert_eq!(restored.signature(), compiled.signature());
         let corrupted = corrupt_ordered_io_metadata(&serialized);
         assert!(matches!(
-            domain.deserialize_compiled_program(&corrupted),
+            session.deserialize_compiled_program(&corrupted),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "effect signature does not match executable physical outputs",
         ));
@@ -501,8 +490,8 @@ mod tests {
             )
             .unwrap();
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let unordered = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
+        let unordered = session.compile_program(&lowered).unwrap();
         assert!(unordered.signature().has_unordered_io());
         assert!(!unordered.signature().has_ordered_io());
         let manager = hold_predecessor.then(|| {
@@ -512,21 +501,21 @@ mod tests {
                     client.addressable_devices().unwrap()[0].default_memory().unwrap(),
                 )
                 .unwrap();
-            let mut predecessor = session.default_effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+            let mut predecessor = session.effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
             predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
             predecessor.submission.completion.complete(Ok(()));
             predecessor.published = true;
             manager
         });
         let ((), lines) = with_captured_prints(|| {
-            assert!(domain.execute_program(&compiled, vec![input.clone()]).unwrap().is_empty());
-            assert!(domain.execute_program(&restored, vec![input.clone()]).unwrap().is_empty());
-            let independent = domain.execute_compiled_async(&unordered, vec![input]).unwrap();
+            assert!(session.execute_program(&compiled, vec![input.clone()]).unwrap().is_empty());
+            assert!(session.execute_program(&restored, vec![input.clone()]).unwrap().is_empty());
+            let independent = session.execute_compiled_async(&unordered, vec![input]).unwrap();
             if let Some(manager) = &manager {
                 manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
             }
             independent.fence().block_until_ready().unwrap();
-            domain.effects_barrier().unwrap();
+            session.effects_barrier().unwrap();
         });
         assert_eq!(lines.iter().filter(|line| line.as_str() == "ordered: [3.0]").count(), 2);
         assert_eq!(lines.iter().filter(|line| line.as_str() == "unordered: [3.0]").count(), 1);
@@ -717,7 +706,7 @@ mod tests {
     #[test]
     fn test_ensure_effect_dispatch_allowed_rejects_managed_callback_reentrancy() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scope = EffectScope::default();
         let guard = EffectCallbackGuard::enter();
         let reason = "execution and effect barriers cannot be entered from a managed callback";
@@ -725,7 +714,7 @@ mod tests {
         assert!(matches!(scope.barrier(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
         assert!(matches!(
-            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            session.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
             Err(ProgramError::InvalidArgument { message })
                 if message == reason,
         ));
@@ -781,14 +770,14 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_effect_metadata_reload_and_unordered_completion() {
+    fn test_session_effect_metadata_reload_and_unordered_completion() {
         let client = cpu_client(1);
         assert_domain_effect_metadata_reload_and_unordered_completion(&client, true);
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_domain_effect_metadata_reload_and_unordered_completion_on_cuda() {
+    fn test_session_effect_metadata_reload_and_unordered_completion_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::GPU(GpuClientOptions {
@@ -801,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_device_ordered_effects_preserve_per_device_dependencies() {
+    fn test_session_device_ordered_effects_preserve_per_device_dependencies() {
         let client = cpu_client(2);
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
@@ -813,7 +802,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         ensure_print_handler_registered(&client).unwrap();
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![2])))
             .with_sharding(
@@ -822,9 +811,9 @@ mod tests {
             )
             .unwrap();
         let first =
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
         let second =
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
         let boundary = ShardMapBoundary::new(
             mesh.logical_mesh().clone(),
             vec![r#type.sharding().unwrap().clone()],
@@ -854,8 +843,8 @@ mod tests {
             .add_instruction(Operation::ShardMap(Box::new(operation)), vec![body], vec![input], None)
             .unwrap();
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh)).unwrap();
-        let program = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&source, 0, &Options::new(mesh)).unwrap();
+        let program = session.compile_program(&lowered).unwrap();
         assert!(program.signature().has_device_ordered_io());
         let devices = program.executable().addressable_devices().unwrap();
         let managers = devices
@@ -869,7 +858,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let scope = domain.effect_scope.as_ref();
+        let scope = session.effect_scope();
         let mut predecessor = scope
             .reserve(Some(devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect()))
             .unwrap();
@@ -880,7 +869,7 @@ mod tests {
         predecessor.published = true;
         managers[1].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
         let (independent, lines) = with_captured_prints(|| {
-            domain.execute_program(&program, vec![first]).unwrap();
+            session.execute_program(&program, vec![first]).unwrap();
             let tokens = scope.state.lock().unwrap().tail.as_ref().unwrap().carrier().unwrap().unwrap();
             let independent = std::thread::scope(|threads| {
                 let (sender, receiver) = std::sync::mpsc::channel();
@@ -888,11 +877,11 @@ mod tests {
                 let independent = receiver.recv_timeout(Duration::from_secs(2));
                 // CPU itself serializes multi-device launches. Submit the next invocation without adding a Ryft
                 // join, but observe the readiness of each device on the first invocation rather than promising overlap.
-                domain.execute_program(&program, vec![second]).unwrap();
+                session.execute_program(&program, vec![second]).unwrap();
                 managers[0].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
                 independent
             });
-            domain.effects_barrier().unwrap();
+            session.effects_barrier().unwrap();
             independent
         });
         assert!(matches!(independent, Ok(Ok(()))));

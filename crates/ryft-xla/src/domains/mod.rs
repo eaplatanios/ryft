@@ -1,304 +1,92 @@
-//! XLA execution domains and the shared resources used to stage, compile, and execute array programs. A [`Domain`]
-//! implements [`ryft_core::Domain`] over [`ArrayIrType`], with [`Value`]s that hold device arrays, checked dimensions,
-//! or mutable references. Values retain their domain, so eager operations and transforms recover the execution context
-//! from their inputs. [`Constant`] and [`Operation`] provide the corresponding families of stored constants and
-//! operations for traced programs.
+//! XLA sessions and the shared resources used to stage, compile, and execute array programs. A [`Session`] implements
+//! [`ryft_core::Domain`] over [`ArrayIrType`](ryft_core::ArrayIrType), with [`Value`](crate::Value)s that hold device
+//! arrays, checked dimensions, or mutable references. Values retain their session, so eager operations and transforms
+//! recover the execution context from their inputs. [`Constant`](crate::Constant) and [`Operation`](crate::Operation)
+//! provide the corresponding families of stored constants and operations for traced programs.
 //!
-//! # Sessions and Domains
+//! # Sessions
 //!
-//! A [`Session`] borrows one PJRT [`Client`] and owns its compilation cache, default effect scope, and runtime
-//! extension resources. Create a session with [`Session::new`] or one of its constructors that configure the cache,
-//! then obtain a domain through [`Session::domain`]. Domains derived from the same session share those resources.
-//! Creating another session gives an independent cache and effect scope, even when it borrows the same client.
-//! Configure built-in or downstream providers through [`RuntimeExtensions`] and [`Session::with_runtime_extensions`].
-//! Each session initializes its own runtime instances lazily when an executable requires them.
+//! A [`Session`] executes on one PJRT [`Client`](ryft_pjrt::Client) and is a cheap handle to the resources that it
+//! creates for that client, which are its compilation cache, runtime extension resources, and default compilation
+//! options. [`Session::new`] creates a session on a client that it creates for the best available [`Platform`], and
+//! [`Session::builder`] configures everything else. [`SessionBuilder::client`] or its shorthand
+//! [`Session::with_client`] borrows a client that the caller owns instead. Clone a session wherever another handle is
+//! needed. Clones share its resources, while creating another session gives an independent cache and effect scope,
+//! even on the same client. Configure built-in or downstream providers through [`RuntimeExtensions`] and
+//! [`SessionBuilder::runtime_extensions`]. Each session initializes its own runtime instances lazily when an
+//! executable requires them.
 //!
-//! [`Options`](crate::Options) supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend
-//! compilation policies for a staged function. The domain's [`CompilationOptions`] supplies the underlying PJRT
-//! compiler settings. [`Target`] describes the client's platform and devices without retaining live device handles.
+//! [`Options`](crate::Options) supplies the execution [`DeviceMesh`](ryft_core::DeviceMesh), sharding overrides,
+//! donation flags, and backend compilation policies for a staged function. The session's default
+//! [`CompilationOptions`](ryft_pjrt::protos::CompilationOptions) supply the underlying PJRT compiler settings.
+//! [`Target`] describes the client's platform and devices without retaining live device handles.
 //!
 //! # Compilation and Execution
 //!
-//! The [`crate::compilation`] module implements compilation for a domain and [`crate::execution`] implements execution.
-//! Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained dispatcher that
-//! specializes on its runtime inputs. The backend also implements the generic lifecycle in [`ryft_core::compilation`].
-//! When staging directly through [`ryft_core::StagedFunction::stage`], apply
-//! [`with_input_shardings`](crate::with_input_shardings) to the input types
-//! first if the options specify input sharding overrides.
+//! The [`crate::compilation`] module implements compilation for a session and [`crate::execution`] implements
+//! execution. Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained dispatcher
+//! that specializes on its runtime inputs. The backend also implements the generic lifecycle in
+//! [`ryft_core::compilation`]. When staging directly through [`ryft_core::StagedFunction::stage`], apply
+//! [`with_input_shardings`](crate::with_input_shardings) to the input types first if the options specify input sharding
+//! overrides.
 //!
 //! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
 //! [`CompiledProgram`](crate::CompiledProgram) contains the loaded executable and its invocation contract. These flat
 //! artifacts are distinct from the typed function handles in [`crate::compilation::functions`], which also retain input
-//! and output container structures. The session's [`CompilationContext`] coordinates artifact reuse, and
-//! [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation configuration.
-//! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
+//! and output container structures. The session's [`CompilationContext`](ryft_core::CompilationContext) coordinates
+//! artifact reuse, and [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation
+//! configuration. [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
 //! expose compiler diagnostics for a compiled program.
 //!
 //! # Effects and Completion
 //!
-//! Cloned domains share effect ordering. [`Domain::fork_effect_scope`] starts an independent sequence while retaining
-//! the session and its cache. Cached programs contain no session or effect scope, so execution uses the invoking
-//! domain's scope. Mutable references also retain their own coordination across calls, based on their identities.
+//! Cloned sessions share effect ordering. [`Session::fork_effect_scope`] starts an independent sequence while retaining
+//! the shared resources of the session. Cached programs contain no session or effect scope, so execution uses the
+//! invoking session's scope. Mutable references also retain their own coordination across calls, based on their
+//! identities.
 //!
-//! Array readiness observes completion of the work that produced that array. [`Domain::effects_barrier`] observes
+//! Array readiness observes completion of the work that produced that array. [`Session::effects_barrier`] observes
 //! previously submitted effects, including work whose outputs were discarded. Call it before dropping the client when
-//! those effects must be observed. Sessions, domains, and their values borrow the client and cannot outlive it.
+//! those effects must be observed. Sessions and their values borrow the client and cannot outlive it. Clients that
+//! `ryft-xla` creates for sessions live for the rest of the process.
 
-use std::sync::{Arc, LazyLock};
-
-use ryft_core::{
-    ArrayIrType, CompilationContext, DeviceMesh, Domain as CoreDomain, DomainTracer, SpecializationCacheStatistics,
-};
-use ryft_pjrt::Client;
-use ryft_pjrt::protos::CompilationOptions;
-
-use crate::domains::effects::EffectScope;
-use crate::{ArrayError, Constant, Error, Operation, Value};
+use ryft_core::DomainTracer;
 
 pub mod eager;
 pub mod effects;
+pub mod platforms;
 pub mod runtimes;
 pub mod sessions;
 pub mod targets;
 
+pub use platforms::Platform;
 pub use runtimes::{
     ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension,
     RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id, normalize_runtime_requirements,
     runtime_requirements, with_runtime_requirements,
 };
-pub use sessions::{Session, SessionConstant, ThroughSession};
+pub use sessions::{Session, SessionBuilder, SessionConstant, SessionError, ThroughSession};
 pub use targets::{Target, TargetDevice};
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
-/// [`Client`].
-///
-/// Domains retain a [`Session`] for the client and compilation cache, a selected effect scope, an optional
-/// [`DeviceMesh`], and shared default [`CompilationOptions`]. Clones share their scope, while
-/// [`Self::fork_effect_scope`] starts an independent sequence and retains the cache and configuration. Cached programs
-/// retain no session, so execution always uses the invoking domain's scope, including for cache hits and retained
-/// compiled functions.
-///
-/// Ordered I/O dependencies gate the successor computation's entire launch, including its pure work. The backend
-/// may execute inline or asynchronously. Use unordered printing when debugging code whose throughput matters and
-/// whose ordering does not. [`Self::effects_barrier`] also observes unordered I/O and local assertion failures, so it
-/// is broader than flushing prints. Call it before dropping the client when its effects must be observed.
-///
-/// Custom calls and prints declaring [`EffectClass::DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) may
-/// execute separately on each device inside manual computation regions on CPU, while occurrences of
-/// [`EffectClass::OrderedIo`](ryft_core::EffectClass::OrderedIo) keep the program on one device. Tokens retain the
-/// dependencies of each device without a device rendezvous across Ryft. The backend can impose additional scheduling
-/// dependencies, including serialization of multi-device launches. Opaque registered handlers must not reenter
-/// dispatch or barriers. Managed print and assertion handlers reject such reentrancy before acquiring scope locks.
-///
-/// The same domain type covers both staging and concrete execution. Every domain belongs to a [`Session`] and is
-/// therefore backed by a live PJRT client. Tracing only uses the domain as a type witness and never needs an instance
-/// without a client, while compiling ahead of time without devices requires an abstraction of compilation targets
-/// rather than an execution domain without a client.
-///
-/// The concrete values of this domain are [`Value`]s, every member of which carries the domain that it belongs to.
-/// Array IR values therefore dispatch their capabilities through this domain eagerly, free transform entry points
-/// recover it from their inputs, and first-class dimensions can produce arrays (e.g., when compared or converted to
-/// scalars) without an explicit context.
-pub struct Domain<'c> {
-    /// Session that borrows the client of this domain and owns its compilation cache, default effect scope, and kernel
-    /// runtimes.
-    session: Arc<Session<'c>>,
-
-    /// Concrete device mesh that eager binds prefer when deriving their execution mesh and that the constant
-    /// materialization fast path requires.
-    mesh: Option<DeviceMesh>,
-
-    /// Default compilation options forwarded to [`Client::compile`]. Shared because the template is immutable and
-    /// [`Domain`] values are cloned into every transform tracer that executes through this domain.
-    compilation_options: Arc<CompilationOptions>,
-
-    /// Selected ordering scope, which may be a fork of the session default.
-    effect_scope: Arc<EffectScope<'c>>,
-}
-
 /// Tracer shape used while staging XLA programs directly from types.
-pub(crate) type Tracer<'c> = DomainTracer<Domain<'c>>;
-
-impl<'c> Clone for Domain<'c> {
-    fn clone(&self) -> Self {
-        Self {
-            session: Arc::clone(&self.session),
-            mesh: self.mesh.clone(),
-            compilation_options: Arc::clone(&self.compilation_options),
-            effect_scope: Arc::clone(&self.effect_scope),
-        }
-    }
-}
-
-impl<'c> Domain<'c> {
-    /// Creates a domain over `session` using the session's default effect scope and the supplied execution
-    /// configuration.
-    fn from_session_configuration(
-        session: Arc<Session<'c>>,
-        mesh: Option<DeviceMesh>,
-        compilation_options: Arc<CompilationOptions>,
-    ) -> Self {
-        Self { effect_scope: Arc::clone(session.default_effect_scope()), session, mesh, compilation_options }
-    }
-
-    /// Returns a sibling of this domain that shares its session, effect scope, and mesh but forwards
-    /// `compilation_options` to the compile path. Arrays produced through the returned domain inherit it.
-    pub fn with_compilation_options(&self, compilation_options: CompilationOptions) -> Self {
-        Self { compilation_options: Arc::new(compilation_options), ..self.clone() }
-    }
-
-    /// Returns a sibling of this domain that places eager outputs on `mesh` when they would otherwise have no mesh.
-    /// Used to keep arrays derived from a first-class dimension on the mesh of the array that the dimension was read
-    /// from, and by unit tests of this crate that exercise the [`Self::constant`] materialization helper.
-    pub(crate) fn with_mesh(&self, mesh: DeviceMesh) -> Self {
-        Self { mesh: Some(mesh), ..self.clone() }
-    }
-
-    /// Forks ordering and completion state while retaining the session, compilation cache, and configuration.
-    /// Use forks at independent task boundaries. References retain their own coordination, based on their identities.
-    pub fn fork_effect_scope(&self) -> Self {
-        Self { effect_scope: Arc::new(EffectScope::default()), ..self.clone() }
-    }
-
-    /// Returns the PJRT [`Client`] of this domain's session.
-    #[inline]
-    pub fn client(&self) -> &'c Client<'c> {
-        self.session.client()
-    }
-
-    /// Returns the session shared by this domain.
-    #[inline]
-    pub fn session(&self) -> &Arc<Session<'c>> {
-        &self.session
-    }
-
-    /// Returns the [`Target`] of this domain's session. Refer to the documentation of [`Session::target`] for
-    /// more information.
-    #[inline]
-    pub fn target(&self) -> Result<&Target, Error> {
-        self.session.target()
-    }
-
-    /// Returns the [`DeviceMesh`] this domain resolves shard placement against, or [`ArrayError::MissingMesh`] when the
-    /// domain was constructed without a mesh. Eager binds derive their mesh from the inputs in that case.
-    #[inline]
-    pub fn mesh(&self) -> Result<&DeviceMesh, Error> {
-        self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
-    }
-
-    /// Returns the base [`CompilationOptions`] template that the compile path forwards to PJRT.
-    #[inline]
-    pub fn compilation_options(&self) -> &CompilationOptions {
-        self.compilation_options.as_ref()
-    }
-
-    /// Returns the effect ordering scope that executions through this domain reserve their submissions in.
-    #[inline]
-    pub(crate) fn effect_scope(&self) -> &EffectScope<'c> {
-        &self.effect_scope
-    }
-
-    /// Returns the number of compiled programs currently cached in the in-memory tier.
-    #[inline]
-    pub fn program_count(&self) -> usize {
-        self.compilation_context().program_count()
-    }
-
-    /// Returns this domain's shared compilation context, which is owned by its session.
-    #[inline]
-    pub fn compilation_context(&self) -> &CompilationContext<'c, Self> {
-        self.session.compilation_context()
-    }
-
-    /// Returns a snapshot of the activity of the session's eager dispatch cache, which maps eager operation
-    /// applications directly to compiled programs, ahead of program construction and lowering.
-    #[inline]
-    pub fn eager_dispatch_statistics(&self) -> SpecializationCacheStatistics {
-        self.session.eager_dispatch_cache().statistics()
-    }
-
-    /// Removes every entry from the in-memory compilation cache and the eager dispatch cache of this domain's session.
-    /// Mirrors JAX's `clear_caches()`, which also clears the eager dispatch cache of each primitive.
-    ///
-    /// Eager dispatch cache hits do not re-read the `XLA_FLAGS` environment variable, although the miss path still
-    /// records it in the compilation key, so call this function after changing it if the change must apply to eager
-    /// operations that already ran. XLA itself reads the variable when it initializes its debug options.
-    #[inline]
-    pub fn clear_cache(&self) {
-        self.compilation_context().clear_cache();
-        self.session.eager_dispatch_cache().clear();
-    }
-
-    /// Waits for this scope's previously reserved effects, including unordered I/O and local assertions. The backend
-    /// may execute work inline, and this function waits only for work that is still pending. Later reservations and
-    /// other scopes are excluded. Call it before client destruction to ensure that effects are observed.
-    pub fn effects_barrier(&self) -> Result<(), Error> {
-        self.effect_scope.barrier()
-    }
-
-    /// Acknowledges failures that a barrier reported after the affected work has completed, without waiting or
-    /// repairing references. If work is pending or unreported, call [`Self::effects_barrier`] and retry this function.
-    pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
-        self.effect_scope.acknowledge()
-    }
-
-    /// Returns the shared default [`CompilationOptions`] template.
-    #[inline]
-    fn default_compilation_options() -> Arc<CompilationOptions> {
-        static DEFAULT: LazyLock<Arc<CompilationOptions>> = LazyLock::new(|| Arc::new(CompilationOptions::default()));
-        Arc::clone(&DEFAULT)
-    }
-}
-
-impl<'c> CoreDomain for Domain<'c> {
-    type Type = ArrayIrType;
-    type Value = Value<'c>;
-    type Constant = Constant;
-    type Operation = Operation;
-}
-
-impl ryft_core::NamedAxes for Domain<'_> {
-    fn named_axis(&self, name: &str) -> Option<ryft_core::NamedAxis> {
-        let _ = name;
-        None
-    }
-
-    fn named_axes(&self) -> Vec<(String, ryft_core::NamedAxis)> {
-        Vec::new()
-    }
-}
-
-impl ryft_core::MeshContext for Domain<'_> {
-    fn default_mesh(&self) -> Option<ryft_core::LogicalMesh> {
-        // A domain that was given a device mesh through `Domain::with_mesh` owns the logical view of that mesh as its
-        // default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), as under JAX's
-        // `jax.set_mesh`. A domain without a mesh has no default.
-        self.mesh.as_ref().map(|mesh| mesh.logical_mesh().clone())
-    }
-}
+pub(crate) type Tracer<'c> = DomainTracer<Session<'c>>;
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::RefCell;
-    use std::sync::Arc;
 
-    use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, ArrayType, Context, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh,
-        MeshAxis, MeshAxisType, NegOperation, Placeholder, ProjectedContext,
-        ReferenceCompletion as CoreReferenceCompletion, ReferenceReadOperation, ReferenceType, Shape, Sharding,
-        ShardingDimension,
+        ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis,
+        MeshAxisType, Placeholder, ProjectedContext, ReferenceCompletion as CoreReferenceCompletion,
+        ReferenceReadOperation, ReferenceType, Shape, Sharding,
     };
     use ryft_pjrt::Client;
-    use ryft_pjrt::protos::CompilationOptions;
 
     use crate::domains::sessions::Session;
-    use crate::tests::{cpu_client, execution_client, four_device_mesh_x, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, ExecutionError, FlatProgram, FromPjrt, Operation, ProgramBuilder, Value};
-
-    use super::*;
+    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::{Array, Constant, FlatProgram, FromPjrt, ProgramBuilder, Value};
 
     /// Deterministic failure point of stateful execution, used by regression tests of its transaction protocol.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -390,9 +178,9 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// Creates an independent session and projects its domain to ordinary array values.
-    pub(crate) fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<Domain<'c>, ArrayType> {
-        ProjectedContext::new(Session::new(client).domain())
+    /// Creates an independent session and projects it to ordinary array values.
+    pub(crate) fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<Session<'c>, ArrayType> {
+        ProjectedContext::new(Session::with_client(client))
     }
 
     /// Borrows the array carried by a test value, requiring the array variant.
@@ -418,38 +206,38 @@ pub(crate) mod tests {
     }
 
     /// Uploads a replicated rank-1 `f32` test array.
-    pub(crate) fn f32_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
+    pub(crate) fn f32_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
         let r#type = replicated_vector_type(mesh, values.len());
-        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
     /// Uploads a replicated `f32` test scalar.
-    pub(crate) fn f32_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
+    pub(crate) fn f32_scalar<'c>(session: &Session<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::F32);
-        Array::from_host_buffer(domain, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
     }
 
     /// Uploads a replicated rank-1 `f64` test array.
-    pub(crate) fn f64_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
+    pub(crate) fn f64_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
     }
 
     /// Uploads a replicated rank-1 Boolean test array using one byte per element.
-    pub(crate) fn boolean_vector<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+    pub(crate) fn boolean_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
         let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
-        Array::from_host_buffer(domain, r#type, mesh.clone(), values.as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), values.as_slice()).unwrap()
     }
 
     /// Uploads a replicated Boolean test scalar using one byte per element.
-    pub(crate) fn boolean_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
+    pub(crate) fn boolean_scalar<'c>(session: &Session<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
-        Array::from_host_buffer(domain, r#type, mesh.clone(), [u8::from(value)]).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), [u8::from(value)]).unwrap()
     }
 
     /// Reads the first addressable shard as native-endian `f32` values.
@@ -545,98 +333,5 @@ pub(crate) mod tests {
             .into_iter()
             .map(|value| value != 0)
             .collect()
-    }
-
-    #[test]
-    fn test_domain_with_compilation_options() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let compilation_options = CompilationOptions { compile_portable_executable: true, ..Default::default() };
-        let sibling = domain.with_compilation_options(compilation_options.clone());
-        assert!(Arc::ptr_eq(domain.session(), sibling.session()));
-        assert!(Arc::ptr_eq(&domain.effect_scope, &sibling.effect_scope));
-        assert_eq!(sibling.compilation_options(), &compilation_options);
-        assert_eq!(domain.compilation_options(), &CompilationOptions::default());
-    }
-
-    #[test]
-    fn test_domain_accessors_return_constructor_arguments() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let cloned = domain.clone();
-
-        assert_eq!(domain.mesh().unwrap(), &mesh);
-        assert_eq!(domain.compilation_options(), &CompilationOptions::default());
-        assert!(Arc::ptr_eq(&domain.compilation_options, &cloned.compilation_options));
-        assert!(size_of::<Domain<'_>>() < size_of::<CompilationOptions>());
-
-        // A domain without a mesh reports the missing mesh.
-        assert!(matches!(
-            Session::new(&client).domain().mesh(),
-            Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh),
-        ));
-    }
-
-    #[test]
-    fn test_domain_clear_cache_clears_the_eager_dispatch_cache() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let inputs = [Value::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]))];
-        domain.bind(Operation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
-        assert_eq!((domain.session().eager_dispatch_cache().len(), domain.program_count()), (1, 1));
-        domain.clear_cache();
-        assert_eq!((domain.session().eager_dispatch_cache().len(), domain.program_count()), (0, 0));
-        domain.bind(Operation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
-        assert_eq!(domain.eager_dispatch_statistics().misses, 2);
-    }
-
-    #[test]
-    fn test_domain_clear_cache_clears_the_compilation_cache() {
-        let client = cpu_client(4);
-        let engine = Session::new(&client).domain();
-        let mesh = four_device_mesh_x(&client);
-
-        let values = [80.0f32, 81.0, 82.0, 83.0];
-        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
-            .with_sharding(replicated_sharding)
-            .unwrap();
-        let source_array =
-            Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
-        let target_sharding =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        let _ = source_array
-            .to_placement(&engine, crate::arrays::DevicePutTarget::Placement { mesh, sharding: target_sharding })
-            .unwrap();
-        assert_eq!(engine.program_count(), 1);
-        engine.clear_cache();
-        assert_eq!(engine.program_count(), 0);
-    }
-
-    #[test]
-    fn test_domain_acknowledge_effect_errors() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mut reservation = domain.effect_scope().reserve(None).unwrap();
-        let completion = reservation.publish(Ok(None));
-        reservation.commit();
-        completion.complete(Err(Arc::from("effect failed")));
-
-        // Failures can only be acknowledged after a barrier has reported them.
-        assert!(matches!(
-            domain.acknowledge_effect_errors(),
-            Err(Error::Execution(ExecutionError::PrematureAcknowledgment)),
-        ));
-        assert!(matches!(
-            domain.effects_barrier(),
-            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
-                if failures == vec![(0, Arc::from("effect failed"))],
-        ));
-        domain.acknowledge_effect_errors().unwrap();
-        domain.effects_barrier().unwrap();
     }
 }

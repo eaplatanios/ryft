@@ -1,8 +1,9 @@
-//! Compilation options of the XLA [`Domain`](crate::Domain).
+//! Compilation options of the XLA [`Session`](crate::Session).
 //!
 //! [`Options`] configures one compilation. It carries the device mesh, sharding overrides, donation flags, backend
-//! lowering choices, and policies of retained dispatch, and it is retained by staged functions for their later lowering
-//! and compilation. [`FeedbackDirectedProfile`] holds an opaque XLA profile for profile-guided recompilation, and
+//! lowering choices, policies of retained dispatch, and optional PJRT compilation options that replace the template of
+//! the session, and it is retained by staged functions for their later lowering and compilation.
+//! [`FeedbackDirectedProfile`] holds an opaque XLA profile for profile-guided recompilation, and
 //! [`InputBoundBucketing`] groups concrete input extents into bounded specializations of retained JIT dispatchers.
 
 use std::hash::{Hash, Hasher};
@@ -12,7 +13,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use ryft_core::{DeviceMesh, Parameterized, Sharding};
+use ryft_pjrt::protos::CompilationOptions;
 
+use crate::compilation::keys::canonical_compilation_options_bytes;
 use crate::{Error, KernelCompilerBinding, RaggedDotLoweringStrategy};
 
 // TODO(eaplatanios): Review this module.
@@ -85,13 +88,51 @@ pub enum InputBoundBucketing {
     PowerOfTwo,
 }
 
+/// PJRT compilation options that one compilation starts from in place of the template of its session. The Protobuf
+/// message contains maps and floating-point values, and so it implements neither [`Eq`] nor [`Hash`], which [`Options`]
+/// needs for its dispatch and cache identity. These options are therefore compared and hashed through their canonical
+/// encoding, which is computed once.
+#[derive(Clone, Debug)]
+struct CompilationOptionsOverride {
+    /// Options that the compilation starts from.
+    options: CompilationOptions,
+
+    /// Canonical encoding of [`Self::options`], which determines equality and hashing.
+    canonical_bytes: Arc<[u8]>,
+}
+
+impl CompilationOptionsOverride {
+    /// Creates an override that carries `options` together with their canonical encoding.
+    fn new(options: CompilationOptions) -> Self {
+        let canonical_bytes = canonical_compilation_options_bytes(&options).into();
+        Self { options, canonical_bytes }
+    }
+}
+
+impl PartialEq for CompilationOptionsOverride {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_bytes == other.canonical_bytes
+    }
+}
+
+impl Eq for CompilationOptionsOverride {}
+
+impl Hash for CompilationOptionsOverride {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_bytes.hash(state);
+    }
+}
+
 /// Backend options of one compilation for the [`CompilationDomain`](ryft_core::CompilationDomain) implementation on
-/// [`Domain`](crate::Domain). Carries the device mesh, optional sharding overrides for inputs and outputs, optional
+/// [`Session`](crate::Session). Carries the device mesh, optional sharding overrides for inputs and outputs, optional
 /// donation flags for each input, backend lowering choices, and policies of retained dispatch.
 ///
-/// These settings supplement the PJRT options configured through
-/// [`Domain::compilation_options`](crate::Domain::compilation_options). Settings that affect compilation participate
-/// in its cache identity.
+/// These settings supplement the PJRT options that the session supplies through
+/// [`Session::default_compilation_options`](crate::Session::default_compilation_options), which
+/// [`Self::with_compilation_options`] replaces for one compilation. Settings that affect compilation participate in
+/// its cache identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Explicit compiler and typed embedding used to select retained portable kernel calls.
@@ -134,6 +175,9 @@ pub struct Options {
 
     /// Backend representation used to lower ragged dots. Defaults to [`RaggedDotLoweringStrategy::Decomposition`].
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
+
+    /// Optional PJRT compilation options that this compilation starts from in place of the template of its session.
+    compilation_options: Option<CompilationOptionsOverride>,
 }
 
 impl Options {
@@ -152,6 +196,7 @@ impl Options {
             feedback_directed_profile: None,
             input_bound_bucketing: None,
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
+            compilation_options: None,
         }
     }
 
@@ -230,6 +275,22 @@ impl Options {
     #[inline]
     pub fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         self.ragged_dot_lowering_strategy = strategy;
+        self
+    }
+
+    /// Supplies the PJRT [`CompilationOptions`] that this compilation starts from, in place of the template of its
+    /// session (i.e., [`Session::default_compilation_options`](crate::Session::default_compilation_options)). This
+    /// plays the role of the `compiler_options` argument of `jax.jit`.
+    ///
+    /// The supplied options replace the template of the session as a whole and are not merged with it. Lowering still
+    /// overlays the settings that it derives for the program (i.e., the replica and partition counts, the partitioner
+    /// selection, and the profile of [`Self::with_feedback_directed_profile`]). Use this function for settings of one
+    /// program signature (e.g., argument layouts and the result layout) and for compiler settings of one function
+    /// (e.g., environment option overrides). The options are part of every cache key of the compilation, and two
+    /// [`Options`] are equal only if their compilation options have the same canonical encoding.
+    #[inline]
+    pub fn with_compilation_options(mut self, compilation_options: CompilationOptions) -> Self {
+        self.compilation_options = Some(CompilationOptionsOverride::new(compilation_options));
         self
     }
 
@@ -319,6 +380,13 @@ impl Options {
     pub fn ragged_dot_lowering_strategy(&self) -> RaggedDotLoweringStrategy {
         self.ragged_dot_lowering_strategy
     }
+
+    /// Returns the optional PJRT compilation options that this compilation starts from in place of the template of its
+    /// session.
+    #[inline]
+    pub fn compilation_options(&self) -> Option<&CompilationOptions> {
+        self.compilation_options.as_ref().map(|compilation_options| &compilation_options.options)
+    }
 }
 
 impl Hash for Options {
@@ -336,6 +404,7 @@ impl Hash for Options {
         self.input_bound_bucketing.hash(state);
         self.ragged_dot_lowering_strategy.hash(state);
         self.kernel_compiler.hash(state);
+        self.compilation_options.hash(state);
     }
 }
 
@@ -345,7 +414,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::ShardingDimension;
-    use ryft_pjrt::protos::CompilationOptions;
+    use ryft_pjrt::protos::{OptionOverride, Precision};
 
     use crate::compilation::domains::jit_compilation_options;
     use crate::tests::{device_mesh_2x2, hash_of};
@@ -407,6 +476,7 @@ mod tests {
         assert_eq!(options.feedback_directed_profile(), None);
         assert_eq!(options.input_bound_bucketing(), None);
         assert_eq!(options.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Decomposition);
+        assert_eq!(options.compilation_options(), None);
     }
 
     #[test]
@@ -451,6 +521,35 @@ mod tests {
         let options =
             Options::new(device_mesh_2x2()).with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
         assert_eq!(options.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Instruction);
+    }
+
+    #[test]
+    fn test_options_with_compilation_options() {
+        let compilation_options =
+            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
+        let options = Options::new(device_mesh_2x2());
+        let configured = options.clone().with_compilation_options(compilation_options.clone());
+        assert_eq!(configured.compilation_options(), Some(&compilation_options));
+        assert_ne!(configured, options);
+        assert_ne!(hash_of(&configured), hash_of(&options));
+
+        // Default options that are supplied explicitly still differ from the absence of an override, because the
+        // template of the session then no longer applies.
+        assert_ne!(options.clone().with_compilation_options(CompilationOptions::default()), options);
+
+        // Options compare and hash through their canonical encoding, which does not depend on the order in which the
+        // entries of their maps were inserted.
+        let with_overrides = |names: [&str; 2]| {
+            let mut compilation_options = CompilationOptions::default();
+            for name in names {
+                compilation_options.environment_option_overrides.insert(name.to_string(), OptionOverride::default());
+            }
+            options.clone().with_compilation_options(compilation_options)
+        };
+        assert_eq!(with_overrides(["first", "second"]), with_overrides(["second", "first"]));
+        assert_eq!(hash_of(&with_overrides(["first", "second"])), hash_of(&with_overrides(["second", "first"])));
+        assert_ne!(with_overrides(["first", "second"]), with_overrides(["first", "third"]));
+        assert_ne!(with_overrides(["first", "second"]), configured);
     }
 
     #[test]

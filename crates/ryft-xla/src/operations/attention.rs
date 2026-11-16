@@ -1000,7 +1000,7 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, Session, to_mlir_module_for_program};
+    use crate::{Array, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1008,7 +1008,7 @@ mod tests {
     type StagedProgram = (FlatProgram, Vec<ArrayType>, Vec<ArrayType>);
 
     /// Context whose values are eager XLA [`Array`]s.
-    type ArrayContext<'c> = ProjectedContext<Domain<'c>, ArrayType>;
+    type ArrayContext<'c> = ProjectedContext<Session<'c>, ArrayType>;
 
     /// Context whose values are reference backend arrays.
     type ReferenceContext = EagerContext<CoreArray, ArrayOperation<CoreArray>>;
@@ -1039,8 +1039,8 @@ mod tests {
         input_types: Vec<ArrayType>,
         calls: usize,
     ) -> StagedProgram {
-        let attention = dot_product_attention::<Domain<'static>>(configuration);
-        let (output_types, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let attention = dot_product_attention::<Session<'static>>(configuration);
+        let (output_types, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let mut inputs = AttentionInputs::from_parameters(input_structure, inputs)?;
                 let mut outputs = Vec::new();
@@ -1070,9 +1070,9 @@ mod tests {
         input_structure: AttentionInputs<Placeholder>,
         input_types: Vec<ArrayType>,
     ) -> StagedProgram {
-        let attention = differentiable_dot_product_attention::<Domain<'static>>(configuration);
+        let attention = differentiable_dot_product_attention::<Session<'static>>(configuration);
         let input_types = input_types.iter().cloned().chain([input_types[0].clone()]).collect::<Vec<_>>();
-        let (output_types, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (output_types, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let (output_cotangent, inputs) = inputs.split_last().unwrap();
                 let inputs = AttentionInputs::from_parameters(input_structure, inputs.iter().cloned())?;
@@ -1493,11 +1493,11 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let halves = |dimensions: &[usize], values: &[f32]| {
             let values = values.iter().copied().map(half::f16::from_f32).collect::<Vec<_>>();
-            replicated_array(&domain, &mesh, DataType::F16, dimensions, values_to_bytes(values.as_slice()).as_slice())
+            replicated_array(&session, &mesh, DataType::F16, dimensions, values_to_bytes(values.as_slice()).as_slice())
         };
         let values = (0..16).map(|index| if index < 8 { 1.0 } else { 2.0 }).collect::<Vec<_>>();
         for implementation in [AttentionImplementation::Fused, AttentionImplementation::Portable] {
@@ -1506,7 +1506,7 @@ mod tests {
             );
             let inputs = AttentionInputs {
                 bias: Some(replicated_array(
-                    &domain,
+                    &session,
                     &mesh,
                     DataType::F32,
                     &[1, 1, 1, 2],
@@ -1539,7 +1539,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let function = dot_product_attention::<ArrayContext<'_>>(AttentionConfiguration::new());
         for (query_dimensions, key_value_dimensions, expected_residual) in [
@@ -1548,7 +1548,7 @@ mod tests {
         ] {
             let device = |dimensions: &[usize]| {
                 let bytes = vec![0u8; 2 * dimensions.iter().product::<usize>()];
-                replicated_array(&domain, &mesh, DataType::BF16, dimensions, bytes.as_slice())
+                replicated_array(&session, &mesh, DataType::BF16, dimensions, bytes.as_slice())
             };
             let (output, residual) = function
                 .call_with_residual(AttentionInputs::new(
@@ -1622,7 +1622,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let reference = |dimensions: &[usize], elements: &[f32]| {
             let elements = elements.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
@@ -1632,7 +1632,7 @@ mod tests {
         let device = |value: &CoreArray| {
             let r#type = value.r#type();
             let dimensions = r#type.static_shape().unwrap().dimensions().to_vec();
-            replicated_array(&domain, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
+            replicated_array(&session, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
         };
         let query = reference(&[1, 1, 1, 8], &[125.0; 8]);
         let key = reference(&[1, 2, 1, 8], &[1.0; 16]);
@@ -1751,13 +1751,13 @@ mod tests {
     #[test]
     fn test_portable_attention_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
         let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();
         let device = |values: &[f32]| {
-            replicated_array(&domain, &mesh, DataType::F32, &[1, 3, 2, 2], values_to_bytes(values).as_slice())
+            replicated_array(&session, &mesh, DataType::F32, &[1, 3, 2, 2], values_to_bytes(values).as_slice())
         };
         let reference = |values: &[f32]| {
             CoreArray::from_elements(ArrayType::new_static(DataType::F32, [1, 3, 2, 2]), values).unwrap()
@@ -1772,7 +1772,7 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [1, 3, 2, 2])
                 .with_sharding(Sharding::new(explicit_mesh.clone(), placements).unwrap())
                 .unwrap();
-            Array::from_host_buffer(&domain, r#type, explicit_device_mesh.clone(), values_to_bytes(values)).unwrap()
+            Array::from_host_buffer(&session, r#type, explicit_device_mesh.clone(), values_to_bytes(values)).unwrap()
         };
         for configuration in [
             AttentionConfiguration::new().with_scale(0.5),
@@ -1804,13 +1804,13 @@ mod tests {
     fn test_portable_attention_backward_matches_reference_backend() {
         // Distinct query, key, and value inputs make a mix-up between their cotangents visible.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let query_values = [0.25f32, -0.5, 0.75, 1.0];
         let key_values = [-0.75f32, 0.5, 1.25, -0.25];
         let value_values = [1.5f32, -1.0, 0.5, 2.0];
         let device = |values: &[f32]| {
-            replicated_array(&domain, &mesh, DataType::F32, &[1, 2, 1, 2], values_to_bytes(values).as_slice())
+            replicated_array(&session, &mesh, DataType::F32, &[1, 2, 1, 2], values_to_bytes(values).as_slice())
         };
         let reference = |values: &[f32]| {
             CoreArray::from_elements(ArrayType::new_static(DataType::F32, [1, 2, 1, 2]), values).unwrap()
@@ -1853,7 +1853,7 @@ mod tests {
         // the reference backend over inputs without a sharding. A key that is sharded along its sequence shards the
         // scores along the dimension over which the softmax reduces its maximum.
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(&client, "x", 2).devices().to_vec()).unwrap();
         let values = |start: f32, count: usize| (0..count).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
@@ -1866,7 +1866,7 @@ mod tests {
                 .with_sharding(Sharding::new(logical_mesh.clone(), placements).unwrap())
                 .unwrap();
             let bytes = values_to_bytes(values(start, dimensions.iter().product()).as_slice());
-            Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap()
         };
         let reference = |dimensions: &[usize], start: f32| {
             CoreArray::from_elements(
@@ -2057,7 +2057,7 @@ mod tests {
         // A broadcast rank-0 bias, an arbitrary mask, independent length vectors, the default scale, an asymmetric
         // window, and the residual all agree with the reference backend.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
@@ -2086,7 +2086,7 @@ mod tests {
         let device = |value: &CoreArray| {
             let r#type = value.r#type();
             let dimensions = r#type.static_shape().unwrap().dimensions().to_vec();
-            replicated_array(&domain, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
+            replicated_array(&session, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
         };
         let device_inputs = AttentionInputs {
             query: device(&reference_inputs.query),

@@ -1,5 +1,5 @@
 //! General XLA program tracing. The [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a fresh
-//! root tracing context of [`Domain`], and its [`TracedProgram`] result reports the statistics of the
+//! root tracing context of [`Session`], and its [`TracedProgram`] result reports the statistics of the
 //! staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`](crate::lowering) module.
 //! [`Error`] reports the failures of both tracing and lowering.
 //!
@@ -28,10 +28,10 @@ use ryft_core::{
 };
 
 use crate::domains::Tracer;
-use crate::{Constant, Domain, Error, Program};
+use crate::{Constant, Error, Program, Session};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
-/// [`DomainTracer`](ryft_core::DomainTracer) of [`Domain`] projected onto its array member. The `shard_map` bodies
+/// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies
 /// traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of type [`ArrayTracer`]) receive the same
 /// values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer<'static>>;
@@ -40,7 +40,7 @@ pub type ArrayTracer = ProjectedValue<ArrayType, Tracer<'static>>;
 ///
 /// This is the general XLA tracing entry point used when callers want to compose `shard_map` with differentiation
 /// transforms and then lower the resulting whole program to StableHLO/Shardy MLIR. `function` is traced once, in a
-/// fresh root tracing context of [`Domain`] that binds no named axes, over [`ArrayTracer`]s of
+/// fresh root tracing context of [`Session`] that binds no named axes, over [`ArrayTracer`]s of
 /// `global_input_types`, and the traced program is simplified. Functions that need that context (e.g., to create values
 /// that derive from no input) or that can fail are traced through [`trace_with_context`] instead.
 ///
@@ -64,7 +64,7 @@ where
 }
 
 /// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context
-/// of [`Domain`] together with its inputs. The context lets the function create values that derive from no input
+/// of [`Session`] together with its inputs. The context lets the function create values that derive from no input
 /// (e.g., through [`Context::lift`](ryft_core::Context::lift)) and bind context capabilities directly (e.g., a
 /// `shard_map` without inputs through [`ShardMap`](ryft_core::ShardMap)), and the function must not retain it or its
 /// tracers after returning.
@@ -90,13 +90,13 @@ where
     Output: Parameterized<ArrayType>,
     Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     F: FnOnce(
-        &DomainTracingContext<Domain<'static>>,
+        &DomainTracingContext<Session<'static>>,
         Input::To<ArrayTracer>,
     ) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {
     let input_structure = global_input_types.parameter_structure();
     let output_structure = RefCell::new(None);
-    let (output_types, program) = DomainTracingContext::<Domain<'static>>::trace_with_context_and_named_axes(
+    let (output_types, program) = DomainTracingContext::<Session<'static>>::trace_with_context_and_named_axes(
         |context, inputs: Vec<Tracer<'static>>| {
             let inputs = inputs
                 .into_iter()
@@ -194,7 +194,7 @@ where
     /// arguments and/or results. This is what the XLA SPMD partitioner reads to drive boundary slicing of per-device
     /// output buffers, including for shapes whose dimensions are not divisible by the partition count (e.g., shape
     /// `[5]` on 2 partitions producing `[3]` + `[2]`). A side without explicit shardings carries the sharding of each
-    /// of its global types that has one, as the compilation path of [`Domain`] does. Unlike that path, which places
+    /// of its global types that has one, as the compilation path of [`Session`] does. Unlike that path, which places
     /// a value whose type has no sharding as replicated because it lowers for concrete placed arrays, such a value is
     /// left unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
     /// shardings).

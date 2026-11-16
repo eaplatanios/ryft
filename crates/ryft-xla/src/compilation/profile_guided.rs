@@ -18,7 +18,7 @@ use crate::compilation::CompilationError;
 use crate::compilation::functions::ExecutableFunction;
 use crate::compilation::options::{FeedbackDirectedProfile, Options};
 use crate::compilation::programs::LoweredProgram;
-use crate::{Array, Constant, Domain, Error, Value};
+use crate::{Array, Constant, Error, Session, Value};
 
 /// Namespace of the auxiliary disk cache entries that persist aggregated adaptive profiles.
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
@@ -323,10 +323,10 @@ where
     /// # Errors
     ///
     /// Returns an error when `compilation_options` already carry a feedback-directed profile, when the platform of
-    /// `domain` is neither CUDA nor ROCm, when the client has no profiler extension, or when the persistent key of the
+    /// `session` is neither CUDA nor ROCm, when the client has no profiler extension, or when the persistent key of the
     /// profile cannot be computed.
     pub(crate) fn new(
-        domain: Domain<'c>,
+        session: Session<'c>,
         baseline: ExecutableFunction<'c, In, Out>,
         lowered_program: LoweredProgram,
         compilation_options: Options,
@@ -337,13 +337,13 @@ where
                 reason: "adaptive profile-guided recompilation requires an unprofiled baseline".to_string(),
             }));
         }
-        let client = domain.client();
+        let client = session.client();
         validate_adaptive_profile_guided_platform(client.platform_name()?.as_ref())?;
         client.profiler_extension()?;
-        let profile_sidecar_key = adaptive_profile_sidecar_key(&domain, &lowered_program, options)?;
+        let profile_sidecar_key = adaptive_profile_sidecar_key(&session, &lowered_program, options)?;
         let function = Self {
             inner: Arc::new(AdaptiveProfileGuidedFunctionInner {
-                domain,
+                session,
                 active: RwLock::new(baseline.clone()),
                 baseline,
                 lowered_program,
@@ -413,11 +413,11 @@ where
             }
             AdaptiveDispatch::Baseline => {
                 self.inner.statistics.baseline_executions.fetch_add(1, Ordering::Relaxed);
-                executable.execute(&self.inner.domain, inputs)
+                executable.execute(&self.inner.session, inputs)
             }
             AdaptiveDispatch::Optimized => {
                 self.inner.statistics.optimized_executions.fetch_add(1, Ordering::Relaxed);
-                executable.execute(&self.inner.domain, inputs)
+                executable.execute(&self.inner.session, inputs)
             }
         }
     }
@@ -446,20 +446,20 @@ where
             raise_error_on_start_failure: true,
             ..ProfileOptions::default()
         };
-        let profiler = match self.inner.domain.client().profiler(&profiler_options) {
+        let profiler = match self.inner.session.client().profiler(&profiler_options) {
             Ok(profiler) => profiler,
             Err(error) => {
-                let outputs = executable.execute(&self.inner.domain, inputs)?;
+                let outputs = executable.execute(&self.inner.session, inputs)?;
                 self.record_profile_failure(error.to_string());
                 return Ok(outputs);
             }
         };
         if let Err(error) = profiler.start() {
-            let outputs = executable.execute(&self.inner.domain, inputs)?;
+            let outputs = executable.execute(&self.inner.session, inputs)?;
             self.record_profile_failure(error.to_string());
             return Ok(outputs);
         }
-        let execution = match executable.execute_async(&self.inner.domain, inputs) {
+        let execution = match executable.execute_async(&self.inner.session, inputs) {
             Ok(execution) => execution,
             Err(error) => {
                 let reason = match profiler.stop() {
@@ -517,9 +517,9 @@ where
     fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableFunction<'c, In, Out>, Error> {
         let profile = FeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
-        let domain = &self.inner.domain;
-        let program = domain.compilation_context().compile(domain, &lowered_program)?;
-        domain.replace_executable_program(&self.inner.baseline, program)
+        let session = &self.inner.session;
+        let program = session.compilation_context().compile(session, &lowered_program)?;
+        session.replace_executable_program(&self.inner.baseline, program)
     }
 
     /// Installs an executable compiled with the persisted aggregated profile, if the disk cache holds one. Failures
@@ -528,7 +528,7 @@ where
         let Some(key) = self.inner.profile_sidecar_key.as_deref() else {
             return;
         };
-        let Some(disk_cache) = self.inner.domain.compilation_context().disk_cache() else {
+        let Some(disk_cache) = self.inner.session.compilation_context().disk_cache() else {
             return;
         };
         let profile = match disk_cache.get_auxiliary(ADAPTIVE_PROFILE_CACHE_NAMESPACE, key) {
@@ -573,7 +573,7 @@ where
         let Some(key) = self.inner.profile_sidecar_key.as_deref() else {
             return;
         };
-        let Some(disk_cache) = self.inner.domain.compilation_context().disk_cache() else {
+        let Some(disk_cache) = self.inner.session.compilation_context().disk_cache() else {
             return;
         };
         match disk_cache.put_auxiliary(ADAPTIVE_PROFILE_CACHE_NAMESPACE, key, profile) {
@@ -848,7 +848,7 @@ where
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Domain that executes and recompiles the function.
-    domain: Domain<'c>,
+    session: Session<'c>,
 
     /// Unprofiled baseline executable, which also defines the invocation contract of every replacement.
     baseline: ExecutableFunction<'c, In, Out>,
@@ -888,19 +888,19 @@ fn validate_adaptive_profile_guided_platform(platform_name: &str) -> Result<(), 
 }
 
 /// Returns the key under which the aggregated profile of `lowered_program` is persisted, or `None` when the compilation
-/// context of `domain` has no disk cache or no persistent key for the program. The key combines the persistent key of
+/// context of `session` has no disk cache or no persistent key for the program. The key combines the persistent key of
 /// the baseline program with the sampling and aggregation policy of `options`.
 fn adaptive_profile_sidecar_key<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     lowered_program: &LoweredProgram,
     options: AdaptiveProfileGuidedOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let cache = domain.compilation_context();
+    let cache = session.compilation_context();
     if cache.disk_cache().is_none() {
         return Ok(None);
     }
-    let compilation_key = domain.compilation_key(lowered_program)?;
-    let Some(baseline_key) = domain.persistent_cache_key(&compilation_key) else {
+    let compilation_key = session.compilation_key(lowered_program)?;
+    let Some(baseline_key) = session.persistent_cache_key(&compilation_key) else {
         return Ok(None);
     };
     let baseline_key_length = u64::try_from(baseline_key.len()).map_err(|_| Error::SizeLimitExceeded {

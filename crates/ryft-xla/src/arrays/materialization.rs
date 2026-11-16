@@ -14,7 +14,7 @@ use ryft_core::{ArrayType, DataType, ProgramError, StaticShape};
 use crate::arrays::host::DenseArrayHostCopy;
 use crate::arrays::{Array, ArrayTypeExtension};
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Domain, Error, ToPjrt};
+use crate::{Error, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 
@@ -328,14 +328,14 @@ impl<'c> MaterializedBoundedInputs<'c> {
 /// shard segments, while a ready cache hit performs no allocation or transport for padding. A failed asynchronous
 /// upload stores no cache entry, and a later call retries the ordinary path for cache misses.
 pub(crate) fn materialize_bounded_dynamic_inputs<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     signature: &ExecutableSignature,
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
     inputs: Vec<Array<'c>>,
 ) -> Result<MaterializedBoundedInputs<'c>, Error> {
     materialize_bounded_dynamic_inputs_with_readiness(
-        domain,
+        session,
         signature,
         declared_types,
         actual_types,
@@ -501,7 +501,7 @@ impl BoundedInputPacking {
 
 /// Completes one host copy that was already issued and issues its upload with the bound shape without publishing it.
 fn upload_bounded_input_host_copy<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     input: &Array<'c>,
     pending: PendingBoundedInputHostCopy<'c>,
     report: &mut BoundedInputMaterializationReport,
@@ -516,7 +516,7 @@ fn upload_bounded_input_host_copy<'c>(
         pending.physical_type.data_type(),
     )?;
     report.host_padding_payload_allocations += padding_payload_allocations;
-    let physical = Array::from_host_buffer(domain, pending.physical_type, input.mesh().clone(), padded_bytes)?;
+    let physical = Array::from_host_buffer(session, pending.physical_type, input.mesh().clone(), padded_bytes)?;
     report.host_to_device_shard_uploads += physical.shards().iter().filter(|shard| shard.buffer().is_some()).count();
     Ok(PendingBoundedInputPublication {
         physical_input_index: pending.physical_input_index,
@@ -543,7 +543,7 @@ fn publish_bounded_input_uploads<'c>(
 /// Implements [`materialize_bounded_dynamic_inputs`] with an injectable batch readiness check for deterministic failure
 /// tests.
 fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     signature: &ExecutableSignature,
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
@@ -635,7 +635,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
     let mut pending_publications = Vec::with_capacity(pending_host_copies.len());
     for pending in pending_host_copies {
         let input = &inputs[pending.logical_input_index];
-        pending_publications.push(upload_bounded_input_host_copy(domain, input, pending, &mut report)?);
+        pending_publications.push(upload_bounded_input_host_copy(session, input, pending, &mut report)?);
     }
     publish_bounded_input_uploads(pending_publications, &mut physical_inputs, &mut check_readiness)?;
 
@@ -669,7 +669,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                     host_copy: input.begin_copy_to_host()?,
                     producer,
                 };
-                let publication = upload_bounded_input_host_copy(domain, input, pending, &mut report)?;
+                let publication = upload_bounded_input_host_copy(session, input, pending, &mut report)?;
                 publish_bounded_input_uploads(vec![publication], &mut physical_inputs, &mut check_readiness)?;
             }
         }
@@ -683,7 +683,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
         let extent = i32::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
             message: format!("runtime dimension extent {extent} does not fit in a StableHLO `i32` scalar"),
         })?;
-        let (extent_scalar, uploaded) = input.logical_extent_scalar(domain, extent)?;
+        let (extent_scalar, uploaded) = input.logical_extent_scalar(session, extent)?;
         report.extent_scalar_uploads += usize::from(uploaded);
         physical_inputs.push(extent_scalar);
     }
@@ -816,7 +816,7 @@ mod tests {
     fn test_materialize_bounded_dynamic_inputs() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -829,7 +829,7 @@ mod tests {
         // value is its hidden logical extent scalar.
         let exact_type = replicated_vector_type(&mesh, 8);
         let exact = Array::from_host_buffer(
-            &domain,
+            &session,
             exact_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[0.0; 8]).as_slice(),
@@ -841,7 +841,7 @@ mod tests {
         );
         let exact_storage = exact.clone();
         let at_bound = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&exact_type),
@@ -872,14 +872,14 @@ mod tests {
             BoundedInputPacking::Pad,
         );
         let smaller = Array::from_host_buffer(
-            &domain,
+            &session,
             smaller_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let cold = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&smaller_type),
@@ -906,7 +906,7 @@ mod tests {
                 .unwrap();
         assert!(!donation_arguments.inputs_by_device()[0][0].donatable);
         let warm =
-            materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[smaller_type], vec![smaller])
+            materialize_bounded_dynamic_inputs(&session, &signature, &[declared_type], &[smaller_type], vec![smaller])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained_storage);
         assert_eq!(
@@ -925,7 +925,7 @@ mod tests {
     fn test_materialize_bounded_dynamic_inputs_independent_misses_share_one_issue_phase() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -934,14 +934,14 @@ mod tests {
         .unwrap();
         let actual_type = replicated_vector_type(&mesh, 4);
         let left = Array::from_host_buffer(
-            &domain,
+            &session,
             actual_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &domain,
+            &session,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
@@ -955,7 +955,7 @@ mod tests {
         // before its completion loop awaits either one. The report of each call guards the two independent cache
         // misses and the subsequent cache hits, which do no work, without relying on scheduler timing.
         let cold = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             &declared_types,
             &actual_types,
@@ -978,7 +978,7 @@ mod tests {
         let retained = [cold.inputs[0].clone(), cold.inputs[1].clone()];
 
         let warm =
-            materialize_bounded_dynamic_inputs(&domain, &signature, &declared_types, &actual_types, vec![left, right])
+            materialize_bounded_dynamic_inputs(&session, &signature, &declared_types, &actual_types, vec![left, right])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained[0]);
         assert_eq!(warm.inputs[1], retained[1]);
@@ -1008,7 +1008,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -1020,7 +1020,7 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
         let source = Array::from_host_buffer(
-            &domain,
+            &session,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -1029,7 +1029,7 @@ mod tests {
         let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
 
         let cold = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&actual_type),
@@ -1045,7 +1045,7 @@ mod tests {
         let retained = cold.inputs[0].clone();
 
         let warm =
-            materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[actual_type], vec![source])
+            materialize_bounded_dynamic_inputs(&session, &signature, &[declared_type], &[actual_type], vec![source])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained);
         assert_eq!(warm.report.cache_hits, 1);
@@ -1065,7 +1065,7 @@ mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::replicated(logical_mesh, 1).with_unreduced_axes(["x"]).unwrap();
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -1083,10 +1083,10 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let source = Array::from_addressable_buffers(&domain, actual_type.clone(), mesh, buffers).unwrap();
+        let source = Array::from_addressable_buffers(&session, actual_type.clone(), mesh, buffers).unwrap();
         let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
         let Err(error) =
-            materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[actual_type], vec![source])
+            materialize_bounded_dynamic_inputs(&session, &signature, &[declared_type], &[actual_type], vec![source])
         else {
             panic!("bounded materialization unexpectedly padded an unreduced input");
         };
@@ -1102,7 +1102,7 @@ mod tests {
     fn test_materialize_bounded_dynamic_inputs_concurrent_calls_are_single_flight() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -1111,7 +1111,7 @@ mod tests {
         .unwrap();
         let actual_type = replicated_vector_type(&mesh, 4);
         let source = Array::from_host_buffer(
-            &domain,
+            &session,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -1125,7 +1125,7 @@ mod tests {
             let left_actual_type = actual_type.clone();
             let left = scope.spawn(|| {
                 materialize_bounded_dynamic_inputs(
-                    &domain,
+                    &session,
                     &signature,
                     &[left_declared_type],
                     &[left_actual_type],
@@ -1135,7 +1135,7 @@ mod tests {
             });
             let right = scope.spawn(|| {
                 materialize_bounded_dynamic_inputs(
-                    &domain,
+                    &session,
                     &signature,
                     std::slice::from_ref(&declared_type),
                     std::slice::from_ref(&actual_type),
@@ -1159,7 +1159,7 @@ mod tests {
     fn test_materialize_bounded_dynamic_inputs_skips_padding_for_zero_space_inputs() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let declared_type = ArrayType::new(
             DataType::Zero,
@@ -1171,12 +1171,12 @@ mod tests {
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&domain, actual_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, []).unwrap();
 
         // A zero-space input below its bound has an empty dense host copy, so it takes neither the retained cache
         // nor the padding tier, and only its hidden extent scalar is uploaded.
         let materialized = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&actual_type),
@@ -1194,7 +1194,7 @@ mod tests {
     fn test_materialize_bounded_dynamic_inputs_with_readiness_failed_batch_is_not_published_and_retries() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -1203,14 +1203,14 @@ mod tests {
         .unwrap();
         let actual_type = replicated_vector_type(&mesh, 4);
         let left = Array::from_host_buffer(
-            &domain,
+            &session,
             actual_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &domain,
+            &session,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
@@ -1226,7 +1226,7 @@ mod tests {
         // the error before publication drops both producer reservations, so neither failed result can become a cache
         // hit later.
         let error = match materialize_bounded_dynamic_inputs_with_readiness(
-            &domain,
+            &session,
             &signature,
             &declared_types,
             &actual_types,
@@ -1257,7 +1257,7 @@ mod tests {
         assert_eq!(observed_uploads, 2);
 
         let retry = materialize_bounded_dynamic_inputs(
-            &domain,
+            &session,
             &signature,
             &declared_types,
             &actual_types,
@@ -1271,7 +1271,7 @@ mod tests {
         let retained = [retry.inputs[0].clone(), retry.inputs[1].clone()];
 
         let warm =
-            materialize_bounded_dynamic_inputs(&domain, &signature, &declared_types, &actual_types, vec![left, right])
+            materialize_bounded_dynamic_inputs(&session, &signature, &declared_types, &actual_types, vec![left, right])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained[0]);
         assert_eq!(warm.inputs[1], retained[1]);

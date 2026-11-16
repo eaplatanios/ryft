@@ -145,7 +145,7 @@ mod tests {
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::{FlatProgram, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{Array, CompiledFunction, Constant, Domain, Session, compile, to_mlir_module_for_program};
+    use crate::{Array, CompiledFunction, Constant, Session, compile, to_mlir_module_for_program};
 
     use super::*;
 
@@ -171,7 +171,7 @@ mod tests {
     fn test_stop_gradient_operation_lower_executes_as_the_identity() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -423,7 +423,7 @@ mod tests {
                 Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
             })
             .with_optimization_barrier(optimization_barrier);
-            let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            let (_, program) = DomainTracingContext::<Session<'static>>::trace(
                 |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
                 ArrayIrType::from(scalar_type.clone()),
             )
@@ -502,7 +502,7 @@ mod tests {
             let square = context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
             Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
         });
-        let (_, gradient) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, gradient) = DomainTracingContext::<Session<'static>>::trace(
             |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
@@ -597,7 +597,7 @@ mod tests {
             Ok(context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[sine.clone(), sine])?.remove(0))
         })
         .with_policy(EverythingSavable);
-        let (_, gradient) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, gradient) = DomainTracingContext::<Session<'static>>::trace(
             |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
@@ -638,7 +638,7 @@ mod tests {
         .with_policy(
             SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["sine"], Memory::Host { pinned: true }).unwrap(),
         );
-        let (_, gradient) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, gradient) = DomainTracingContext::<Session<'static>>::trace(
             |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )

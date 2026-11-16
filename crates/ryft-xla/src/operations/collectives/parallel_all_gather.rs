@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -258,7 +258,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
             input_buffers,
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower_untiled_inserts_rank() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -376,7 +376,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], input_sharding),
             device_mesh,
             input_buffers,
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower_executes_invariant_gradient_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -534,7 +534,7 @@ mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
             buffers,

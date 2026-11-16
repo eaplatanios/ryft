@@ -16,11 +16,11 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-use crate::{CompiledFunction, Domain, Error, Options, ToPjrt};
+use crate::{CompiledFunction, Error, Options, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 
-/// Target leaf accepted by [`Domain::device_put`], which models the subset of the `device` and `src` arguments of
+/// Target leaf accepted by [`Session::device_put`], which models the subset of the `device` and `src` arguments of
 /// JAX's `jax.device_put` that `ryft` currently supports. [`Self::Device`] commits one leaf to a single concrete
 /// device, which is represented internally as a mesh of size 1 with fully replicated sharding, and
 /// [`Self::Placement`] commits one leaf to an explicit mesh and sharding.
@@ -100,7 +100,7 @@ impl<'o> Array<'o> {
     ///      shares the buffer of its source shard on the same device, or is filled by a copy between devices or by a
     ///      PJRT cross-host transfer for a source shard on a remote host.
     ///   2. **Compiled Reshard:** An `identity(x) = x` program with input and output sharding constraints is lowered
-    ///      to StableHLO and Shardy, compiled through the compilation cache of `domain`, and executed.
+    ///      to StableHLO and Shardy, compiled through the compilation cache of `session`, and executed.
     ///   3. **Host Fallback:** The global array is copied to the host with [`Array::copy_to_host`] and uploaded again
     ///      with [`Array::from_host_buffer_with_sharding`]. This is used only when the device work fails (e.g., for
     ///      `Manual` mesh axes) and both the source array and the destination mesh are fully addressable from this
@@ -114,14 +114,14 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `domain`: [`Domain`] that provides the PJRT client and the compilation cache.
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: [`DevicePutTarget`] that resolves to the destination [`DeviceMesh`] and [`Sharding`].
-    pub fn to_placement(&self, domain: &Domain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
+    pub fn to_placement(&self, session: &Session<'o>, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
         }
-        self.clone().run_placement_dispatch(domain, target_mesh, target_sharding, false)
+        self.clone().run_placement_dispatch(session, target_mesh, target_sharding, false)
     }
 
     /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the
@@ -137,14 +137,14 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `domain`: [`Domain`] that provides the PJRT client and the compilation cache.
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: [`DevicePutTarget`] that resolves to the destination [`DeviceMesh`] and [`Sharding`].
-    pub fn into_placement(self, domain: &Domain<'o>, target: DevicePutTarget) -> Result<Self, Error> {
+    pub fn into_placement(self, session: &Session<'o>, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
         }
-        self.run_placement_dispatch(domain, target_mesh, target_sharding, true)
+        self.run_placement_dispatch(session, target_mesh, target_sharding, true)
     }
 
     /// Places this array on `mesh` according to `sharding` with device work only (i.e., without copying its contents
@@ -154,24 +154,24 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `domain`: [`Domain`] that provides the PJRT client and the compilation cache.
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `mesh`: Destination [`DeviceMesh`].
     ///   - `sharding`: Destination [`Sharding`].
     ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
     ///     its output. The donation only takes effect when this array is the only handle of its buffers.
     pub(crate) fn reshard_on_devices(
         self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         donate: bool,
     ) -> Result<Self, Error> {
-        self.reshard_on_devices_or_return(domain, mesh, sharding, donate).map_err(|(error, _)| error)
+        self.reshard_on_devices_or_return(session, mesh, sharding, donate).map_err(|(error, _)| error)
     }
 
     /// Returns an array with the type and the placement of this array whose addressable shards are copies of the
     /// shards of this array on the same devices, so that the result shares no buffer with any other array.
-    pub(crate) fn with_copied_shard_buffers(&self, domain: &Domain<'o>) -> Result<Self, Error> {
+    pub(crate) fn with_copied_shard_buffers(&self, session: &Session<'o>) -> Result<Self, Error> {
         let buffers = self
             .addressable_shards()
             .filter_map(ArrayShard::buffer)
@@ -179,10 +179,10 @@ impl<'o> Array<'o> {
             .collect::<Result<Vec<_>, Error>>()?;
         let r#type = self.r#type().into_owned().with_sharding(None)?;
         let output = if self.data_type().is_zero() {
-            Self::from_zero_space(domain, r#type, Some(self.sharding().clone()), self.mesh().clone())?
+            Self::from_zero_space(session, r#type, Some(self.sharding().clone()), self.mesh().clone())?
         } else {
             let (sharding, mesh) = (self.sharding().clone(), self.mesh().clone());
-            Self::from_shared_addressable_buffers(domain, r#type, sharding, mesh, buffers)?
+            Self::from_shared_addressable_buffers(session, r#type, sharding, mesh, buffers)?
         };
         Ok(match self.execution_fence() {
             Some(fence) => output.with_execution_fence(fence.clone()),
@@ -195,7 +195,7 @@ impl<'o> Array<'o> {
     /// because a host round trip cannot reuse device buffers.
     fn run_placement_dispatch(
         self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         target_mesh: DeviceMesh,
         target_sharding: Sharding,
         donate: bool,
@@ -204,7 +204,7 @@ impl<'o> Array<'o> {
 
         // Keep the error of the device work, which is the most informative one if the host fallback fails too.
         let (compiled_error, source) =
-            match self.reshard_on_devices_or_return(domain, &target_mesh, &target_sharding, donate) {
+            match self.reshard_on_devices_or_return(session, &target_mesh, &target_sharding, donate) {
                 Ok(array) => return Ok(array),
                 Err((error, Some(source))) => (error, source),
                 Err((error, None)) => return Err(error),
@@ -214,7 +214,7 @@ impl<'o> Array<'o> {
         // `from_host_buffer_with_sharding`. It only applies when both the source array and the destination mesh are
         // fully addressable from this process, which is the same restriction that the host round trip of JAX has. If
         // any condition fails, the error of the device work is surfaced as the more informative diagnostic.
-        let local_process = domain.client().process_index()?;
+        let local_process = session.client().process_index()?;
         let destination_fully_addressable =
             target_mesh.devices().iter().all(|device| device.process_index() == local_process);
         if !destination_fully_addressable {
@@ -226,7 +226,7 @@ impl<'o> Array<'o> {
         };
         let host_type = ArrayType::new(source.data_type(), source.shape().into());
         match Self::from_host_buffer_with_sharding(
-            domain,
+            session,
             host_type,
             target_sharding.clone(),
             target_mesh,
@@ -245,21 +245,22 @@ impl<'o> Array<'o> {
     /// this process issued, so that the readiness functions of the result surface the errors of those sends.
     fn place_exact_shards(
         &self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<Option<Self>, Error> {
         let output = if self.data_type().is_zero() {
             let r#type = self.r#type().into_owned().with_sharding(None)?;
-            Self::from_zero_space(domain, r#type, Some(sharding.clone()), mesh.clone())?
+            Self::from_zero_space(session, r#type, Some(sharding.clone()), mesh.clone())?
         } else {
             let shape = self.shape();
-            let Some((buffers, send_fence)) = self.exact_shard_buffers(domain.client(), &shape, mesh, sharding)? else {
+            let Some((buffers, send_fence)) = self.exact_shard_buffers(session.client(), &shape, mesh, sharding)?
+            else {
                 return Ok(None);
             };
             let r#type = self.r#type().into_owned().with_shape(shape).with_sharding(None)?;
             let output =
-                Self::from_shared_addressable_buffers(domain, r#type, sharding.clone(), mesh.clone(), buffers)?;
+                Self::from_shared_addressable_buffers(session, r#type, sharding.clone(), mesh.clone(), buffers)?;
             match send_fence {
                 Some(fence) => output.with_send_fence(fence),
                 None => output,
@@ -490,32 +491,32 @@ impl<'o> Array<'o> {
     #[allow(clippy::result_large_err)]
     fn reshard_on_devices_or_return(
         self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         donate: bool,
     ) -> Result<Self, (Error, Option<Self>)> {
-        match self.place_exact_shards(domain, mesh, sharding) {
+        match self.place_exact_shards(session, mesh, sharding) {
             Ok(Some(output)) => return Ok(output),
             Ok(None) => {}
             Err(error) => return Err((error, None)),
         }
-        if let Err(error) = self.validate_compiled_reshard(domain, mesh) {
+        if let Err(error) = self.validate_compiled_reshard(session, mesh) {
             return Err((error, Some(self)));
         }
         if self.mesh() == mesh {
-            match self.compile_reshard_on_same_mesh(domain, mesh, sharding, donate) {
+            match self.compile_reshard_on_same_mesh(session, mesh, sharding, donate) {
                 Ok(reshard) => {
                     let source = (!donate).then(|| self.clone());
-                    reshard.executable().execute(domain, self).map_err(|error| (error, source))
+                    reshard.executable().execute(session, self).map_err(|error| (error, source))
                 }
                 Err(error) => Err((error, Some(self))),
             }
         } else {
             let output = if self.sharding().is_replicated() {
-                self.reshard_replicated_across_meshes(domain, mesh, sharding)
+                self.reshard_replicated_across_meshes(session, mesh, sharding)
             } else {
-                self.reshard_sharded_across_meshes(domain, mesh, sharding)
+                self.reshard_sharded_across_meshes(session, mesh, sharding)
             };
             output.map_err(|error| (error, Some(self)))
         }
@@ -525,7 +526,7 @@ impl<'o> Array<'o> {
     /// [`ArrayError::ManualReshardingAxis`] when the destination mesh has a `Manual` axis, while `Auto` and `Explicit`
     /// axes are supported, and [`ArrayError::MissingShardBuffer`] when a source shard on the current process has no
     /// buffer.
-    fn validate_compiled_reshard(&self, domain: &Domain<'o>, destination_mesh: &DeviceMesh) -> Result<(), Error> {
+    fn validate_compiled_reshard(&self, session: &Session<'o>, destination_mesh: &DeviceMesh) -> Result<(), Error> {
         // `Manual` axes are managed explicitly by the user (e.g., inside `shard_map`) and cannot be planned by the SPMD
         // partitioner from the top level. `Auto` and `Explicit` axes both go through SPMD partitioning, so both are
         // allowed.
@@ -538,7 +539,7 @@ impl<'o> Array<'o> {
         // Source shards on the current process must carry a local buffer, because a missing one indicates a real
         // misconfiguration. Shards on other processes are normal, and the cross-host transfers extension serves them
         // when the compiled reshard needs them.
-        let client_process_index = domain.client().process_index()?;
+        let client_process_index = session.client().process_index()?;
         for shard in self.shards() {
             if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
                 return Err(Error::from(ArrayError::MissingShardBuffer {
@@ -555,13 +556,13 @@ impl<'o> Array<'o> {
     /// which requires the executed array to be the only handle of its buffers.
     fn reshard_on_same_mesh(
         self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         donate: bool,
     ) -> Result<Self, Error> {
-        let reshard = self.compile_reshard_on_same_mesh(domain, mesh, sharding, donate)?;
-        reshard.executable().execute(domain, self)
+        let reshard = self.compile_reshard_on_same_mesh(session, mesh, sharding, donate)?;
+        reshard.executable().execute(session, self)
     }
 
     /// Compiles the identity program that reshards this array, which must already be on `destination_mesh`, to
@@ -572,7 +573,7 @@ impl<'o> Array<'o> {
     /// annotations and PJRT options.
     fn compile_reshard_on_same_mesh(
         &self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         destination_mesh: &DeviceMesh,
         destination_sharding: &Sharding,
         donate: bool,
@@ -593,7 +594,7 @@ impl<'o> Array<'o> {
 
         let staged: crate::StagedFunction<'_, ArrayType, ArrayType> =
             crate::stage(|input| input, bare_input_type, options)?;
-        domain.compile_staged_function(staged)
+        session.compile_staged_function(staged)
     }
 
     /// Copies this fully replicated array onto every device of `destination_mesh`, using copies between the devices of
@@ -603,11 +604,11 @@ impl<'o> Array<'o> {
     /// [`Self::block_until_ready`] surface their errors without this function waiting for them.
     fn reshard_replicated_across_meshes(
         &self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         destination_mesh: &DeviceMesh,
         destination_sharding: &Sharding,
     ) -> Result<Array<'o>, Error> {
-        let client = domain.client();
+        let client = session.client();
         let client_process_index = client.process_index()?;
         let addressable_devices = client.addressable_devices()?;
         let mut destination_device_by_id = HashMap::with_capacity(addressable_devices.len());
@@ -719,11 +720,11 @@ impl<'o> Array<'o> {
         let replicated_on_destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), shape.rank());
         let intermediate_type = ArrayType::new(element_type, shape.into()).with_sharding(replicated_on_destination)?;
         let intermediate =
-            Array::from_addressable_buffers(domain, intermediate_type, destination_mesh.clone(), buffers)?;
+            Array::from_addressable_buffers(session, intermediate_type, destination_mesh.clone(), buffers)?;
 
         // The intermediate is owned exclusively by this function and is never observed by callers.
         // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.
-        let output = intermediate.reshard_on_same_mesh(domain, destination_mesh, destination_sharding, true)?;
+        let output = intermediate.reshard_on_same_mesh(session, destination_mesh, destination_sharding, true)?;
         Ok(match send_fence {
             Some(fence) => output.with_send_fence(fence),
             None => output,
@@ -737,11 +738,11 @@ impl<'o> Array<'o> {
     ///   2. [`Self::reshard_replicated_across_meshes`] then copies that intermediate to `destination_mesh` and
     ///      compiles the final reshard from the replicated sharding on `destination_mesh` to `destination_sharding`.
     ///
-    /// Both compiled programs go through the compilation cache of `domain`, so repeated calls with the same input and
+    /// Both compiled programs go through the compilation cache of `session`, so repeated calls with the same input and
     /// output shardings pay the compilation cost once.
     fn reshard_sharded_across_meshes(
         &self,
-        domain: &Domain<'o>,
+        session: &Session<'o>,
         destination_mesh: &DeviceMesh,
         destination_sharding: &Sharding,
     ) -> Result<Array<'o>, Error> {
@@ -750,8 +751,8 @@ impl<'o> Array<'o> {
         // The source array is owned externally, so it is not donated to the all-gather. The gathered intermediate is
         // owned by this function and is donated to the subsequent reshard inside
         // `Self::reshard_replicated_across_meshes`.
-        let gathered = self.clone().reshard_on_same_mesh(domain, source_mesh, &replicated_on_source, false)?;
-        gathered.reshard_replicated_across_meshes(domain, destination_mesh, destination_sharding)
+        let gathered = self.clone().reshard_on_same_mesh(session, source_mesh, &replicated_on_source, false)?;
+        gathered.reshard_replicated_across_meshes(session, destination_mesh, destination_sharding)
     }
 }
 
@@ -1218,7 +1219,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_reshards_fully_addressable_array() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1236,7 +1237,7 @@ mod tests {
             .with_sharding(source_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
-            &domain,
+            &session,
             source_type,
             source_mesh,
             values_to_bytes::<f32>(source_values.as_slice()).as_slice(),
@@ -1248,7 +1249,7 @@ mod tests {
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let moved_array = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
             .unwrap();
 
         assert_eq!(moved_array.addressable_shards().count(), 2);
@@ -1268,7 +1269,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_copies_matching_local_shards_without_full_source_addressability() {
         let client = cpu_client(1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -1283,7 +1284,7 @@ mod tests {
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let source_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
+            &session,
             source_array_type,
             sharding.clone(),
             mesh.clone(),
@@ -1292,7 +1293,7 @@ mod tests {
         .unwrap();
 
         let copied_array = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding })
             .unwrap();
         let expected_visualization =
             format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
@@ -1307,7 +1308,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_rejects_non_addressable_source_shards() {
         let client = cpu_client(1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![Device::new(0, 0), Device::new(1, 1)],
@@ -1317,7 +1318,7 @@ mod tests {
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let source_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
+            &session,
             source_array_type,
             source_sharding,
             source_mesh,
@@ -1332,7 +1333,7 @@ mod tests {
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
         let error = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding })
             .unwrap_err();
         assert!(matches!(
             &error,
@@ -1349,7 +1350,7 @@ mod tests {
         // dimension. Every destination shard has the slices of a source shard, but a copy of that shard would hold
         // one summand instead of the logical value.
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -1374,9 +1375,9 @@ mod tests {
             })
             .collect();
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(unreduced.clone()).unwrap();
-        let summands = Array::from_addressable_buffers(&domain, r#type, mesh.clone(), buffers).unwrap();
+        let summands = Array::from_addressable_buffers(&session, r#type, mesh.clone(), buffers).unwrap();
         let reduced = summands
-            .to_placement(&domain, DevicePutTarget::placement(mesh.clone(), tiled.clone()).unwrap())
+            .to_placement(&session, DevicePutTarget::placement(mesh.clone(), tiled.clone()).unwrap())
             .unwrap();
         assert_eq!(reduced.sharding(), &tiled);
         assert_eq!(shard_values(&reduced), vec![vec![11., 22.], vec![33., 44.], vec![11., 22.], vec![33., 44.]]);
@@ -1384,9 +1385,9 @@ mod tests {
         // In the other direction, a copy of every shard would hold the logical value once per device along `x`.
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(tiled).unwrap();
         let value =
-            Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+            Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let summands =
-            value.to_placement(&domain, DevicePutTarget::placement(mesh, unreduced.clone()).unwrap()).unwrap();
+            value.to_placement(&session, DevicePutTarget::placement(mesh, unreduced.clone()).unwrap()).unwrap();
         assert_eq!(summands.sharding(), &unreduced);
         assert_eq!(values_from_bytes::<f32>(&summands.copy_to_host().unwrap()), vec![1., 2., 3., 4.]);
     }
@@ -1394,7 +1395,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_zero_space_is_bufferless_and_preserves_type_metadata() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = four_device_mesh_x(&client);
         let source_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
@@ -1403,12 +1404,15 @@ mod tests {
             .with_memory(Memory::Host { pinned: true })
             .with_sharding(source_sharding)
             .unwrap();
-        let source = Array::from_host_buffer(&domain, source_type, mesh.clone(), []).unwrap();
+        let source = Array::from_host_buffer(&session, source_type, mesh.clone(), []).unwrap();
         let target_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let resharded = source
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() })
+            .to_placement(
+                &session,
+                DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
+            )
             .unwrap();
 
         assert_eq!(resharded.sharding(), &target_sharding);
@@ -1421,7 +1425,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_zero_space_preserves_producer_completion() {
         let client = crate::tests::execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let device = client.addressable_devices().unwrap().remove(0);
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1439,13 +1443,13 @@ mod tests {
         for fails in [false, true] {
             let (event, promise) = client.event(()).unwrap();
             let source =
-                Array::from_host_buffer(&domain, ArrayType::new_static(DataType::Zero, [2]), source_mesh.clone(), [])
+                Array::from_host_buffer(&session, ArrayType::new_static(DataType::Zero, [2]), source_mesh.clone(), [])
                     .unwrap()
                     .with_execution_fence(ExecutionFence::new(vec![event]));
             let outputs = [
-                source.to_placement(&domain, target.clone()).unwrap(),
-                source.clone().into_placement(&domain, target.clone()).unwrap(),
-                source.clone().reshard_on_devices(&domain, &target_mesh, &target_sharding, false).unwrap(),
+                source.to_placement(&session, target.clone()).unwrap(),
+                source.clone().into_placement(&session, target.clone()).unwrap(),
+                source.clone().reshard_on_devices(&session, &target_mesh, &target_sharding, false).unwrap(),
             ];
             // A move that only changes the representation must neither wait for nor discard the producer's completion.
             // Complete the event before asserting so that even a failing regression releases its pending native
@@ -1474,7 +1478,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_exact_shards_replicated_cross_mesh_to_replicated_destination() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
 
         // The source is replicated on a 1-device submesh.
@@ -1489,7 +1493,7 @@ mod tests {
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
 
         // The target is replicated on the full 4-device mesh. The exact shard path matches every destination shard to
@@ -1499,19 +1503,19 @@ mod tests {
         let target_mesh = four_device_mesh_x(&client);
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
             .unwrap();
 
         assert_eq!(resharded.addressable_shards().count(), 4);
         assert_eq!(shard_values(&resharded), vec![values.to_vec(); 4]);
         // The exact shard path satisfies this request without compiling any SPMD program.
-        assert_eq!(domain.program_count(), 0);
+        assert_eq!(session.program_count(), 0);
     }
 
     #[test]
     fn test_array_to_placement_compiled_reshard_replicated_to_sharded_on_same_mesh() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = four_device_mesh_x(&client);
 
         let values = [10.0f32, 11.0, 12.0, 13.0];
@@ -1520,13 +1524,13 @@ mod tests {
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
 
         let sharded_target =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target })
             .unwrap();
 
         assert_eq!(resharded.addressable_shards().count(), 4);
@@ -1536,7 +1540,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_sharded_to_replicated_on_same_mesh() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = four_device_mesh_x(&client);
 
         let values = [20.0f32, 21.0, 22.0, 23.0];
@@ -1544,7 +1548,7 @@ mod tests {
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
         let source_array = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             source_type,
             sharded_sharding,
             mesh.clone(),
@@ -1554,7 +1558,7 @@ mod tests {
 
         let replicated_target = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: replicated_target })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: replicated_target })
             .unwrap();
 
         assert_eq!(shard_values(&resharded), vec![values.to_vec(); 4]);
@@ -1563,7 +1567,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -1585,7 +1589,7 @@ mod tests {
         let source_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
         let source_array = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             source_type,
             sharded_along_x,
             mesh.clone(),
@@ -1599,7 +1603,7 @@ mod tests {
         )
         .unwrap();
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y })
             .unwrap();
         assert_eq!(resharded.addressable_shards().count(), 4);
 
@@ -1618,7 +1622,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_with_explicit_mesh_axes() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -1639,7 +1643,7 @@ mod tests {
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
-            &domain,
+            &session,
             source_type,
             explicit_mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
@@ -1649,7 +1653,7 @@ mod tests {
         let sharded_target =
             Sharding::new(explicit_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: explicit_mesh, sharding: sharded_target })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: explicit_mesh, sharding: sharded_target })
             .unwrap();
         assert_eq!(resharded.addressable_shards().count(), 4);
         assert_eq!(shard_values(&resharded), vec![vec![400.0], vec![401.0], vec![402.0], vec![403.0]]);
@@ -1658,7 +1662,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
 
         // The source lives on a 1-device submesh.
@@ -1673,7 +1677,7 @@ mod tests {
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
 
         // Reshard onto the full 4-device mesh, sharded along "x".
@@ -1681,7 +1685,7 @@ mod tests {
         let target_sharding =
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
             .unwrap();
 
         assert_eq!(resharded.addressable_shards().count(), 4);
@@ -1691,7 +1695,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
 
         // The source is sharded along "x" on a 2-device submesh, so devices 0 and 1 each hold half the data.
         let source_mesh = two_device_sub_mesh_x(&client);
@@ -1700,7 +1704,7 @@ mod tests {
         let values = [70.0f32, 71.0, 72.0, 73.0];
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
         let source_array = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             source_type,
             source_sharding,
             source_mesh,
@@ -1714,7 +1718,7 @@ mod tests {
         let target_mesh = four_device_mesh_x(&client);
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
             .unwrap();
 
         assert_eq!(resharded.addressable_shards().count(), 4);
@@ -1724,7 +1728,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
 
         // The source is sharded along "x" on a 2-device submesh.
         let source_mesh = two_device_sub_mesh_x(&client);
@@ -1733,7 +1737,7 @@ mod tests {
         let values = [80.0f32, 81.0, 82.0, 83.0];
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
         let source_array = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             source_type,
             source_sharding,
             source_mesh,
@@ -1747,7 +1751,7 @@ mod tests {
         let target_sharding =
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding })
             .unwrap();
 
         assert_eq!(resharded.addressable_shards().count(), 4);
@@ -1757,7 +1761,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
 
         let source_mesh = two_device_sub_mesh_x(&client);
         let source_sharding =
@@ -1765,7 +1769,7 @@ mod tests {
         let values = [90.0f32, 91.0, 92.0, 93.0];
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
         let source_array = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             source_type,
             source_sharding,
             source_mesh,
@@ -1776,20 +1780,20 @@ mod tests {
         let target_mesh = four_device_mesh_x(&client);
         let target_sharding =
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(domain.program_count(), 0);
+        assert_eq!(session.program_count(), 0);
         let _ = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding })
             .unwrap();
 
         // A sharded source on another mesh compiles two executables, which are an all-gather on the source mesh and a
         // reshard from the replicated sharding to the requested sharding on the destination mesh.
-        assert_eq!(domain.program_count(), 2);
+        assert_eq!(session.program_count(), 2);
     }
 
     #[test]
     fn test_array_to_placement_compiled_reshard_caches_executable_across_calls() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = four_device_mesh_x(&client);
 
         let values = [30.0f32, 31.0, 32.0, 33.0];
@@ -1798,21 +1802,21 @@ mod tests {
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
 
         let sharded_target =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(domain.program_count(), 0);
+        assert_eq!(session.program_count(), 0);
         let first = source_array
             .clone()
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() })
             .unwrap();
-        let after_first = domain.program_count();
+        let after_first = session.program_count();
         let second = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target })
             .unwrap();
-        let after_second = domain.program_count();
+        let after_second = session.program_count();
 
         assert_eq!(first.addressable_shards().count(), 4);
         assert_eq!(second.addressable_shards().count(), 4);
@@ -1828,14 +1832,14 @@ mod tests {
     #[ignore = "timing-sensitive; runs locally to validate the structural cache hit"]
     fn test_array_to_placement_compiled_reshard_cache_hit_avoids_tracing_and_lowering() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = four_device_mesh_x(&client);
         let values = (0..4096).map(|index| index as f32).collect::<Vec<_>>();
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let target_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1843,25 +1847,28 @@ mod tests {
         let cold_start = std::time::Instant::now();
         let _ = source_array
             .clone()
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() })
+            .to_placement(
+                &session,
+                DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
+            )
             .unwrap();
         let cold_elapsed = cold_start.elapsed();
 
         let warm_start = std::time::Instant::now();
         let _ = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding })
+            .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding })
             .unwrap();
         let warm_elapsed = warm_start.elapsed();
 
         eprintln!("cold reshard (trace+lower+compile+execute): {cold_elapsed:?}");
         eprintln!("warm reshard (structural cache hit + execute, no trace/lower): {warm_elapsed:?}");
-        assert_eq!(domain.program_count(), 1);
+        assert_eq!(session.program_count(), 1);
     }
 
     #[test]
     fn test_array_to_placement_preserves_missing_cross_host_extension() {
         let client = cpu_client(1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -1877,7 +1884,7 @@ mod tests {
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
 
         // Sending to the remote destination requires the extension even though local copies are possible.
@@ -1890,7 +1897,7 @@ mod tests {
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
         let result = source_array
-            .to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding });
+            .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding });
         assert!(matches!(
             result,
             Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
@@ -1902,7 +1909,7 @@ mod tests {
     fn test_array_to_placement_preserves_missing_cross_host_extension_for_receiver() {
         let client = cpu_client(1);
         assert!(matches!(client.cross_host_transfers_extension(), Err(PjrtError::Unimplemented { .. })));
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1912,7 +1919,7 @@ mod tests {
         let source_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let source = Array::from_addressable_buffers(&domain, source_type, source_mesh, Vec::new()).unwrap();
+        let source = Array::from_addressable_buffers(&session, source_type, source_mesh, Vec::new()).unwrap();
         assert_eq!(source.addressable_shards().count(), 0);
         let target_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("destination", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1925,7 +1932,7 @@ mod tests {
         // missing extension. Preserve that error instead of searching for a nonexistent remote destination and
         // panicking.
         assert!(matches!(
-            source.to_placement(&domain, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding }),
+            source.to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding }),
             Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                 if message == "the cross-host transfers extension is not provided by the PJRT plugin",
         ));
@@ -1934,7 +1941,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_with_manual_mesh_axes_uses_host_fallback() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -1953,7 +1960,7 @@ mod tests {
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
-            &domain,
+            &session,
             source_type,
             manual_mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
@@ -1967,7 +1974,7 @@ mod tests {
             Sharding::new(manual_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = source_array
             .to_placement(
-                &domain,
+                &session,
                 DevicePutTarget::Placement { mesh: manual_mesh.clone(), sharding: sharded_target.clone() },
             )
             .unwrap();
@@ -1978,13 +1985,13 @@ mod tests {
         assert_eq!(shard_values(&resharded), vec![vec![40.0], vec![41.0], vec![42.0], vec![43.0]]);
 
         // No executable was compiled, because the host fallback bypasses the compilation cache.
-        assert_eq!(domain.program_count(), 0, "host fallback should not populate the executable cache");
+        assert_eq!(session.program_count(), 0, "host fallback should not populate the executable cache");
     }
 
     #[test]
     fn test_array_into_placement_preserves_same_partially_addressable_placement() {
         let client = cpu_client(1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -1999,7 +2006,7 @@ mod tests {
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let source_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
+            &session,
             source_array_type,
             sharding.clone(),
             mesh.clone(),
@@ -2008,7 +2015,7 @@ mod tests {
         .unwrap();
 
         let copied_array = source_array
-            .into_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
+            .into_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
             .unwrap();
         let expected_visualization =
             format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
@@ -2023,7 +2030,7 @@ mod tests {
     #[test]
     fn test_array_into_placement_donates_source_and_returns_independently_readable_output() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = four_device_mesh_x(&client);
 
         let values = [300.0f32, 301.0, 302.0, 303.0];
@@ -2032,7 +2039,7 @@ mod tests {
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array =
-            Array::from_host_buffer(&domain, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
 
         // `Array::into_placement` consumes the source array and donates its buffers to the compiled SPMD reshard. PJRT
@@ -2042,7 +2049,7 @@ mod tests {
         let target_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let moved = source_array
-            .into_placement(&domain, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding })
+            .into_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding })
             .unwrap();
 
         assert_eq!(shard_values(&moved), vec![vec![300.0], vec![301.0], vec![302.0], vec![303.0]]);
@@ -2051,7 +2058,7 @@ mod tests {
     #[test]
     fn test_array_reshard_on_devices() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2077,18 +2084,18 @@ mod tests {
         // completion of the execution that produced the array.
         let (event, promise) = client.event(()).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(tiled.clone()).unwrap();
-        let source = Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
+        let source = Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
             .unwrap()
             .with_execution_fence(ExecutionFence::new(vec![event]));
         let reduced = tiled.clone().with_reduced_axes(["x"]).unwrap();
-        let output = source.clone().reshard_on_devices(&domain, &mesh, &reduced, false).unwrap();
+        let output = source.clone().reshard_on_devices(&session, &mesh, &reduced, false).unwrap();
         let pending = matches!(output.execution_fence().map(ExecutionFence::is_ready), Some(Ok(false)));
         promise.set(None).unwrap();
         assert!(pending);
         assert_eq!(output.sharding(), &reduced);
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(shared_buffers(&source, &output), vec![true; 4]);
-        assert_eq!(domain.program_count(), 0);
+        assert_eq!(session.program_count(), 0);
 
         // On another device mesh, the shard on a device of the source shares its buffer and the others are copies.
         let single_device_mesh = DeviceMesh::new(
@@ -2098,9 +2105,10 @@ mod tests {
         .unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [4]);
         let source =
-            Array::from_host_buffer(&domain, r#type, single_device_mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+            Array::from_host_buffer(&session, r#type, single_device_mesh, values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
-        let output = source.clone().reshard_on_devices(&domain, &mesh, &replicated, false).unwrap();
+        let output = source.clone().reshard_on_devices(&session, &mesh, &replicated, false).unwrap();
         assert_eq!(output.sharding(), &replicated);
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(
@@ -2112,14 +2120,14 @@ mod tests {
             vec![false, true, false, false],
         );
         assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]; 4]);
-        assert_eq!(domain.program_count(), 0);
+        assert_eq!(session.program_count(), 0);
 
         // A sharding with other shards needs a compiled program.
         let sharded = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let resharded = output.clone().reshard_on_devices(&domain, &mesh, &sharded, false).unwrap();
+        let resharded = output.clone().reshard_on_devices(&session, &mesh, &sharded, false).unwrap();
         assert_eq!(resharded.sharding(), &sharded);
         assert_eq!(shard_values(&resharded), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(domain.program_count(), 1);
+        assert_eq!(session.program_count(), 1);
 
         // There is no host fallback, so a destination that a compiled program cannot serve is an error.
         let manual_mesh = DeviceMesh::new(
@@ -2130,7 +2138,7 @@ mod tests {
         let manual =
             Sharding::new(manual_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(
-            output.reshard_on_devices(&domain, &manual_mesh, &manual, false).unwrap_err().to_string(),
+            output.reshard_on_devices(&session, &manual_mesh, &manual, false).unwrap_err().to_string(),
             "compiled reshard does not support `Manual` mesh axis x",
         );
     }
@@ -2138,7 +2146,7 @@ mod tests {
     #[test]
     fn test_array_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_moves() {
         let client = cpu_client(1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -2154,7 +2162,7 @@ mod tests {
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let source_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
+            &session,
             source_array_type,
             source_sharding,
             source_mesh,

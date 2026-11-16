@@ -973,19 +973,19 @@ mod tests {
     #[test]
     fn test_scatter_operation_lower_complex_max() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         // Complex extrema compare `(real, imaginary)` lexicographically, so the update `1 + 9i` replaces `1 + 5i`.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[3],
             &values_to_bytes(&[Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)]),
         );
-        let indices = replicated_array(&domain, &mesh, DataType::I32, &[1, 1], &values_to_bytes(&[0i32]));
+        let indices = replicated_array(&session, &mesh, DataType::I32, &[1, 1], &values_to_bytes(&[0i32]));
         let updates =
-            replicated_array(&domain, &mesh, DataType::C64, &[1], &values_to_bytes(&[Complex::new(1f32, 9.0)]));
+            replicated_array(&session, &mesh, DataType::C64, &[1], &values_to_bytes(&[Complex::new(1f32, 9.0)]));
         let output = input
             .scatter(
                 &indices,
@@ -1011,7 +1011,7 @@ mod tests {
         type DynamicPolicy = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let staged_types = vec![
             ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)])),
@@ -1095,7 +1095,7 @@ mod tests {
                         .collect()
                 },
                 input_types.clone(),
-                &domain,
+                &session,
                 mesh.clone(),
             )
             .unwrap_or_else(|error| panic!("n={size} compilation: {error}"));
@@ -1108,9 +1108,9 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
-            let outputs = compiled.executable().execute(&domain, inputs).unwrap();
+            let outputs = compiled.executable().execute(&session, inputs).unwrap();
             assert_eq!(outputs.len(), 3, "n={size}");
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);
@@ -1237,11 +1237,11 @@ mod tests {
     #[test]
     fn test_scatter_operation_lower_differentiation_duplicate_overwrite() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[2f32, 5.0]));
-        let indices = replicated_array(&domain, &mesh, DataType::I32, &[2, 1], &values_to_bytes(&[0i32, 0]));
-        let updates = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[7f32, 8.0]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[2f32, 5.0]));
+        let indices = replicated_array(&session, &mesh, DataType::I32, &[2, 1], &values_to_bytes(&[0i32, 0]));
+        let updates = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[7f32, 8.0]));
 
         // Duplicate overwrite may select either update. Its primal and pullback must select the same winner, and
         // untouched elements must retain their identity derivative regardless of device scheduling.

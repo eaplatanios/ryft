@@ -720,9 +720,9 @@ mod tests {
     #[test]
     fn test_slice_operation_lower() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
         let output = input.slice(&[1], &[3], &[1]).unwrap();
         assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![2.0, 3.0]);
     }
@@ -1038,10 +1038,10 @@ mod tests {
     #[test]
     fn test_update_slice_operation_lower() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
-        let update = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
+        let update = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
         let output = input.update_slice(&update, &[1]).unwrap();
         assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![1.0, 5.0, 6.0, 4.0]);
     }
@@ -1208,15 +1208,15 @@ mod tests {
     fn test_dynamic_slice_operation_lower_clamps_unsigned_indices_without_narrowing() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let input = Value::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
+        let session = Session::with_client(&client);
+        let input = Value::Array(f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]));
         let index = Value::Array(
-            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
                 .unwrap(),
         );
 
         // An unsigned index larger than `i64::MAX` selects the last valid slice, rather than wrapping negative.
-        let sliced = domain
+        let sliced = session
             .bind(
                 Operation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![1]))),
                 Vec::new(),
@@ -1224,11 +1224,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&sliced[0])), vec![3.0]);
-        let updated = domain
+        let updated = session
             .bind(
                 Operation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
                 Vec::new(),
-                &[input, Value::Array(f32_vector(&domain, &mesh, &[9.0])), index],
+                &[input, Value::Array(f32_vector(&session, &mesh, &[9.0])), index],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&updated[0])), vec![1.0, 2.0, 9.0]);
@@ -1244,7 +1244,7 @@ mod tests {
         // extents, with an in-bounds start and a start that clamps to the last rows.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
@@ -1313,7 +1313,7 @@ mod tests {
                         .collect()
                 },
                 input_types.clone(),
-                &domain,
+                &session,
                 mesh.clone(),
             )
             .unwrap_or_else(|error| panic!("n={size} compilation: {error}"));
@@ -1327,9 +1327,9 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
-            let outputs = compiled.executable().execute(&domain, inputs).unwrap();
+            let outputs = compiled.executable().execute(&session, inputs).unwrap();
             assert_eq!(outputs.len(), 2, "n={size}, row={row}");
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);
@@ -1654,7 +1654,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_with_dimensions() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
@@ -1692,7 +1692,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let lowering = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowering = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(
             lowering.stable_hlo(),
             indoc! {r#"
@@ -1709,11 +1709,15 @@ mod tests {
                 }
             "#},
         );
-        let compiled = domain.compile_program(&lowering).unwrap();
-        let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
-                .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+        let compiled = session.compile_program(&lowering).unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            input_type,
+            mesh,
+            values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+        )
+        .unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape().as_slice(), &[3]);
@@ -1727,7 +1731,7 @@ mod tests {
         // points, including an empty result.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let mut builder = ArrayIrProgramBuilder::new();
@@ -1776,18 +1780,19 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[0f32, 1., 2., 3., 4., 5.]))
+            Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes(&[0f32, 1., 2., 3., 4., 5.]))
                 .unwrap();
-        let size = Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), values_to_bytes(&[2i64])).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input.clone(), size]).unwrap();
+        let size =
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), values_to_bytes(&[2i64])).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input.clone(), size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![3., 5.]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
-        let size = Array::from_host_buffer(&domain, size_type, mesh, values_to_bytes(&[0i64])).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input, size]).unwrap();
+        let size = Array::from_host_buffer(&session, size_type, mesh, values_to_bytes(&[0i64])).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input, size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0f32; 6]);
     }
@@ -1796,7 +1801,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_pullback_with_runtime_input_shape() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
         let scalar_type = ArrayType::scalar(DataType::I64);
         let context = TracingContext::<Constant, Operation>::new();
@@ -1858,8 +1863,8 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let values = [
             0f32,
             1.,
@@ -1882,20 +1887,20 @@ mod tests {
             f32::NAN,
             f32::NAN,
         ];
-        let input = Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
         let rows =
-            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3i64])).unwrap();
+            Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3i64])).unwrap();
         let columns =
-            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4i64])).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
+            Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4i64])).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![0., 2., 10., 12.]);
         assert_eq!(
             read_f32s(&client, &outputs[1]),
             vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
         );
-        let rows = Array::from_host_buffer(&domain, scalar_type, mesh, values_to_bytes(&[0i64])).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input, rows, columns]).unwrap();
+        let rows = Array::from_host_buffer(&session, scalar_type, mesh, values_to_bytes(&[0i64])).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input, rows, columns]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0f32; 20]);
     }
@@ -1904,7 +1909,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_checks_runtime_extents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -1948,11 +1953,11 @@ mod tests {
             )
             .unwrap();
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let scalar =
-            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap();
+            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap();
         let inputs = |input_size: i64, result_size: i64| {
             vec![
                 scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),
@@ -1962,13 +1967,13 @@ mod tests {
         };
 
         let eager = program
-            .interpret_in_context(&domain, inputs(4, 2).into_iter().map(Value::Array).collect::<Vec<_>>())
+            .interpret_in_context(&session, inputs(4, 2).into_iter().map(Value::Array).collect::<Vec<_>>())
             .unwrap();
-        let compiled_valid = domain.execute_program(&compiled, inputs(4, 2)).unwrap();
+        let compiled_valid = session.execute_program(&compiled, inputs(4, 2)).unwrap();
         assert_eq!(read_f32s(&client, program_array(&eager[0])), vec![7.0, 7.0]);
         assert_eq!(read_f32s(&client, &compiled_valid[0]), read_f32s(&client, program_array(&eager[0])));
 
-        let error = match domain.execute_program(&compiled, inputs(2, 4)) {
+        let error = match session.execute_program(&compiled, inputs(2, 4)) {
             Ok(invalid) => invalid[0].block_until_ready().unwrap_err().to_string(),
             Err(error) => error.to_string(),
         };

@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_axis_index_operation_lower() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -233,7 +233,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::U64, &[4], sharding),
             device_mesh,
             input_buffers,

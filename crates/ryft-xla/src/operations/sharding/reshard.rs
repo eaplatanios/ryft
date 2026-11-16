@@ -38,8 +38,8 @@ mod tests {
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Domain, FromPjrt, Options, Session, TracedProgram,
-        compile, compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, Session, TracedProgram, compile,
+        compile_with_options, trace,
     };
 
     /// Returns `logical_mesh` over the addressable devices of `client`.
@@ -152,7 +152,7 @@ mod tests {
         // replicated sharding governs the output buffer.
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_auto_axes_executes_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = explicit_mesh();
         let mesh = device_mesh(&client, logical_mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
@@ -211,7 +211,7 @@ mod tests {
             vec![-3.431_453_7, 0.755_142_2],
         ];
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
@@ -237,11 +237,11 @@ mod tests {
                 }
             },
             input_type,
-            &domain,
+            &session,
             mesh,
         )
         .unwrap();
-        let output = compiled.executable().execute(&domain, input.clone()).unwrap();
+        let output = compiled.executable().execute(&session, input.clone()).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
         assert_eq!(read_device_f32s(&output), expected);
 
@@ -262,14 +262,14 @@ mod tests {
     #[test]
     fn test_explicit_axes_executes_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = explicit_mesh().with_axis_types(["x", "y"], MeshAxisType::Auto).unwrap();
         let mesh = device_mesh(&client, logical_mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(Sharding::replicated(logical_mesh.clone(), 2))
             .unwrap();
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
@@ -297,11 +297,11 @@ mod tests {
                 }
             },
             input_type,
-            &domain,
+            &session,
             mesh,
         )
         .unwrap();
-        let output = compiled.executable().execute(&domain, input.clone()).unwrap();
+        let output = compiled.executable().execute(&session, input.clone()).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
         assert_eq!(read(&output), expected);
         let output =
@@ -316,7 +316,7 @@ mod tests {
         // An eager `shard_map` over the mesh with `x` manual returns its output typed over the explicit mesh of its
         // input, as JAX's `shard_map` types its outputs over its context mesh, so `auto_axes` switches it directly.
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = explicit_mesh();
         let map_mesh = logical_mesh.with_axis_types(["x"], MeshAxisType::Manual).unwrap();
         let mesh = device_mesh(&client, logical_mesh.clone());
@@ -324,14 +324,14 @@ mod tests {
         let map_sharding = sharding(&map_mesh, &[Some("x"), Some("y")]);
         let input_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(input_sharding.clone()).unwrap();
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             input_type.clone(),
             mesh,
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         )
         .unwrap();
         let doubled = shard_map(
-            |input: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(input.clone() + input),
+            |input: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(input.clone() + input),
             input,
             map_mesh,
             map_sharding.clone(),
@@ -364,13 +364,13 @@ mod tests {
         // function takes that placement as an input sharding override. The gradient through `explicit_axes` keeps the
         // input's placement, with the values of the JAX oracle `grad explicit_axes`.
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = explicit_mesh().with_axis_types(["x", "y"], MeshAxisType::Auto).unwrap();
         let mesh = device_mesh(&client, logical_mesh.clone());
         let input_placement = sharding(&logical_mesh, &[Some("x"), Some("y")]);
         let input_type = ArrayType::new_static(DataType::F32, [4, 2]);
         let input = Array::from_host_buffer_with_sharding(
-            &domain,
+            &session,
             input_type.clone(),
             input_placement.clone(),
             mesh.clone(),
@@ -395,11 +395,11 @@ mod tests {
                 ValueProjection::<ArrayType>::into_projected(gradient).unwrap()
             },
             input_type,
-            &domain,
+            &session,
             Options::new(mesh).with_input_shardings(vec![input_placement.clone()]),
         )
         .unwrap();
-        let gradient = compiled.executable().execute(&domain, input.clone()).unwrap();
+        let gradient = compiled.executable().execute(&session, input.clone()).unwrap();
         assert_eq!(gradient.r#type(), input.r#type());
         assert_eq!(gradient.sharding(), &input_placement);
         let gradient = gradient.copy_to_host().unwrap();

@@ -26,7 +26,7 @@ use ryft_core::{
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::{Array, ArrayTracer, Domain, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
+use ryft_xla::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
 // TODO(eaplatanios): Review this module.
 
@@ -277,7 +277,7 @@ fn execute_collective_inputs(
             .collect::<Result<Vec<_>, _>>()?;
         let input_type = ArrayType::new_static(DataType::F32, global_shape.to_vec()).with_sharding(sharding.clone())?;
         arrays.push(Array::from_addressable_buffers(
-            &Session::new(client).domain(),
+            &Session::with_client(client),
             input_type,
             device_mesh.clone(),
             buffers,
@@ -764,7 +764,7 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
             observations.insert(name, values(value));
         }
     }
-    let function = block_scaled_dot::<ProjectedContext<Domain<'static>, ArrayType>>(nvfp4)?;
+    let function = block_scaled_dot::<ProjectedContext<Session<'static>, ArrayType>>(nvfp4)?;
     let traced: TracedProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
         move |(left, right, seed): (ArrayTracer, ArrayTracer, ArrayTracer)| {
             let (output, pullback) = differentiate_at((left, right))
@@ -831,7 +831,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         ("residual", values(residual)),
         ("rank_four_gqa", values(gqa_output)),
     ]);
-    let attention = dot_product_attention::<ProjectedContext<Domain<'static>, ArrayType>>(configuration);
+    let attention = dot_product_attention::<ProjectedContext<Session<'static>, ArrayType>>(configuration);
     let traced: TracedProgram<
         (ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType),
         (ArrayType, ArrayType),

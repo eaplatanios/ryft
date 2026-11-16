@@ -1107,7 +1107,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         if client_devices.len() < 2 {
             return;
@@ -1183,7 +1183,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 Array::from_addressable_buffers(
-                    &domain,
+                    &session,
                     static_sharded_array_type(DataType::I32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
                     buffers,
@@ -1303,7 +1303,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 Array::from_addressable_buffers(
-                    &domain,
+                    &session,
                     static_sharded_array_type(DataType::F32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
                     buffers,
@@ -1335,7 +1335,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::I32, &[4], sharding.clone()),
                 device_mesh.clone(),
                 buffers,

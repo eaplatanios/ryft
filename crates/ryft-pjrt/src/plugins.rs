@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use libloading::Library;
 
@@ -13,17 +13,27 @@ pub struct Plugin {
     /// PJRT [`Api`] for this [`Plugin`].
     api: Api,
 
-    /// Shared [`Once`] used to initialize this [`Plugin`] exactly once, even if it is cloned.
-    initialization: Arc<Once>,
+    /// Shared outcome of initializing this [`Plugin`], which happens exactly once, even if the plugin is cloned.
+    initialization: Arc<OnceLock<Result<(), Error>>>,
 }
 
 impl Plugin {
+    /// Initializes this [`Plugin`] if it has not been initialized yet, and returns the outcome of its initialization.
+    /// Initialization happens at most once, so every later call returns the same outcome. The other functions of a
+    /// plugin initialize it on first use and panic if its initialization fails, so call this function first in order
+    /// to handle such a failure (e.g., to fall back to another plugin when an accelerator runtime is unavailable).
+    pub fn initialize(&self) -> Result<(), Error> {
+        self.initialization
+            .get_or_init(|| {
+                use ffi::PJRT_Plugin_Initialize_Args;
+                invoke_pjrt_api_error_fn!(self.api, PJRT_Plugin_Initialize)
+            })
+            .clone()
+    }
+
     /// Returns the initialized PJRT [`Api`] for this [`Plugin`].
     pub(crate) fn api(&self) -> Api {
-        self.initialization.call_once(|| {
-            use ffi::PJRT_Plugin_Initialize_Args;
-            invoke_pjrt_api_error_fn!(self.api, PJRT_Plugin_Initialize).expect("PJRT plugin initialization failed");
-        });
+        self.initialize().expect("PJRT plugin initialization failed");
         self.api
     }
 
@@ -47,6 +57,17 @@ impl Plugin {
         self.api().client_with_key_value_store(options, key_value_store)
     }
 }
+
+impl PartialEq for Plugin {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Plugins are handles to a PJRT API, so two plugins are equal when they refer to the same API
+        // (e.g., when they were loaded from the same shared library).
+        std::ptr::eq(unsafe { self.api.to_c_api() }, unsafe { other.api.to_c_api() })
+    }
+}
+
+impl Eq for Plugin {}
 
 /// Loaded shared [`Library`] that contains a PJRT [`Plugin`].
 struct PluginLibrary {
@@ -73,7 +94,7 @@ impl PluginLibrary {
                         .map_err(|error| Error::plugin_loading_error(format!("{:?}", self.path), error.to_string()))?
                 };
                 let api = unsafe { Api::from_c_api(get_pjrt_api_function()) }?;
-                Ok(Plugin { api, initialization: Arc::new(Once::new()) })
+                Ok(Plugin { api, initialization: Arc::new(OnceLock::new()) })
             })
             .clone()
     }
@@ -113,7 +134,7 @@ static PLUGIN_MANAGER: LazyLock<PluginManager> =
 static CPU_PLUGIN: LazyLock<Plugin> = LazyLock::new(|| {
     let api = unsafe { Api::from_c_api(ryft_xla_sys::bindings::GetPjrtApi() as *const crate::ffi::PJRT_Api) }
         .expect("failed to load the built-in PJRT CPU API");
-    Plugin { api, initialization: Arc::new(Once::new()) }
+    Plugin { api, initialization: Arc::new(OnceLock::new()) }
 });
 
 /// Loads a PJRT [`Plugin`] from the provided [`Path`] pointing to the shared library for that plugin.
@@ -219,7 +240,21 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::test_for_each_platform;
+    use crate::tests::{test_cpu_plugin, test_for_each_platform};
+
+    #[test]
+    fn test_plugin_initialize() {
+        let plugin = test_cpu_plugin();
+        assert_eq!(plugin.initialize(), Ok(()));
+        assert_eq!(plugin.clone().initialize(), Ok(()));
+    }
+
+    #[test]
+    fn test_plugin_eq() {
+        let plugin = test_cpu_plugin();
+        assert!(plugin == plugin.clone());
+        assert!(plugin == test_cpu_plugin());
+    }
 
     #[test]
     fn test_load_plugins() {

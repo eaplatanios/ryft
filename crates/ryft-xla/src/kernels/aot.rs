@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::staging::{KernelCompilerBinding, KernelExecutionFacts, stage_kernel};
-use crate::{Array, CompilationAnalysis, CompiledProgram, Domain, Error, Options};
+use crate::{Array, CompilationAnalysis, CompiledProgram, Error, Options, Session};
 
 // TODO(eaplatanios): Review this module.
 
@@ -162,7 +162,7 @@ impl KernelAotBundle {
     /// compilation, so adapter compiler deadlines remain active.
     pub fn compile<'c>(
         definition: &KernelDefinition,
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         options: Options,
         maximum_programs: usize,
     ) -> Result<Self, KernelAotError> {
@@ -176,24 +176,24 @@ impl KernelAotBundle {
         }
         let binding = options.kernel_compiler().ok_or_else(|| Self::invalid("a compiler binding is required"))?;
         let configuration = binding.configuration().to_vec();
-        let facts = KernelExecutionFacts::from_target(domain.target()?, options.mesh())?;
+        let facts = KernelExecutionFacts::from_target(session.target()?, options.mesh())?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<CompilationTracer<Domain<'c>>>| {
+        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<CompilationTracer<Session<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
             },
             vec![],
             definition.operation().input_types(),
             options,
         )?;
-        let lowered = staged.lower(domain)?;
+        let lowered = staged.lower(session)?;
         let stable_hlo = lowered.lowered_program().stable_hlo().to_owned();
         let lowering_duration = start.elapsed();
         let start = Instant::now();
-        let compiled = lowered.compile(domain)?;
+        let compiled = lowered.compile(session)?;
         let compilation_duration = start.elapsed();
-        let executable = domain
+        let executable = session
             .serialize_program(compiled.compiled_program())?
             .ok_or_else(|| Self::invalid("the plugin does not support executable serialization"))?;
         let semantic_digest = Self::semantic_digest(definition)?;
@@ -211,7 +211,7 @@ impl KernelAotBundle {
                 .collect(),
             lowering_duration,
             compilation_duration,
-            analysis: domain.analyze(compiled.executable())?,
+            analysis: session.analyze(compiled.executable())?,
         };
         let bundle = Self {
             definition: definition.clone(),
@@ -318,18 +318,18 @@ impl KernelAotBundle {
     /// devices in the same order. XLA additionally validates its build identity, flags, platform, and executable ABI.
     pub fn load<'c>(
         &self,
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         binding: &KernelCompilerBinding,
         mesh: &DeviceMesh,
     ) -> Result<LoadedKernel<'c>, KernelAotError> {
         if binding.configuration() != self.manifest.configuration {
             return Err(Self::invalid("compiler binding configuration mismatch"));
         }
-        let facts = KernelExecutionFacts::from_target(domain.target()?, mesh)?;
+        let facts = KernelExecutionFacts::from_target(session.target()?, mesh)?;
         if facts.configuration_key()? != self.manifest.execution {
             return Err(Self::invalid("live execution compatibility mismatch"));
         }
-        let program = domain
+        let program = session
             .deserialize_program(&self.executable)?
             .ok_or_else(|| Self::invalid("the plugin does not support executable deserialization"))?;
         let inputs = self
@@ -352,7 +352,7 @@ impl KernelAotBundle {
             return Err(Self::invalid("loaded executable boundary differs from the kernel bundle"));
         }
         Ok(LoadedKernel {
-            domain: domain.clone(),
+            session: session.clone(),
             program: Arc::new(program),
             identity: serde_json::to_vec(&(&self.manifest.semantic_digest, &self.manifest.configuration))?,
             execution: self.manifest.execution.clone(),
@@ -371,11 +371,11 @@ impl KernelAotBundle {
     }
 }
 
-/// A kernel loaded ahead of time, using the existing XLA domain and the fence over the whole execution.
+/// A kernel loaded ahead of time, using the existing XLA session and the fence over the whole execution.
 #[derive(Clone)]
 pub struct LoadedKernel<'c> {
     /// Session owning native runtime resources and the ordinary invocation and effect policy.
-    domain: Domain<'c>,
+    session: Session<'c>,
 
     /// Existing PJRT executable and its validated invocation metadata.
     program: Arc<CompiledProgram<'c>>,
@@ -391,9 +391,9 @@ pub struct LoadedKernel<'c> {
 }
 
 impl<'c> LoadedKernel<'c> {
-    /// Borrows the existing domain, canonical boundary, and identities for execution coordinated by the host.
-    pub(crate) fn distributed_parts(&self) -> (&Domain<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
-        (&self.domain, self.program.input_types(), self.program.mesh(), &self.identity, &self.execution)
+    /// Borrows the existing session, canonical boundary, and identities for execution coordinated by the host.
+    pub(crate) fn distributed_parts(&self) -> (&Session<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
+        (&self.session, self.program.input_types(), self.program.mesh(), &self.identity, &self.execution)
     }
 
     /// Rejects external effects which cannot be rolled back by discarding functional outputs.
@@ -412,7 +412,7 @@ impl<'c> LoadedKernel<'c> {
     /// Submits ordinary array inputs and returns the existing execution handle that carries the completion.
     /// Pending uploads, input retention, aliases, and device failures use XLA's canonical invocation path.
     pub fn call(&self, inputs: Vec<Array<'c>>) -> Result<Execution<Vec<Array<'c>>>, KernelAotError> {
-        Ok(self.domain.execute_compiled_async(&self.program, inputs)?)
+        Ok(self.session.execute_compiled_async(&self.program, inputs)?)
     }
 }
 
@@ -495,7 +495,7 @@ pub(crate) mod tests {
     /// Compiles a real ordinary CPU executable to isolate the AOT loader's stateless boundary checks.
     /// This fixture does not claim execution of a mock adapter's custom call.
     pub(crate) fn executable_bundle<'c>(
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         mesh: &DeviceMesh,
         data_type: DataType,
         capture: bool,
@@ -504,13 +504,13 @@ pub(crate) mod tests {
         let r#type = ArrayType::scalar(data_type);
         let captures = if capture {
             vec![crate::Value::Array(
-                Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
+                Array::from_host_buffer(session, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
             )]
         } else {
             vec![]
         };
-        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, captures: Vec<CompilationTracer<Domain<'c>>>, inputs| {
+        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, captures: Vec<CompilationTracer<Session<'c>>>, inputs| {
                 // Returning the capture retains a real capture slot without introducing unrelated operations.
                 Ok(if captures.is_empty() { inputs } else { captures })
             },
@@ -519,11 +519,11 @@ pub(crate) mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let compiled = staged.lower(domain).unwrap().compile(domain).unwrap();
+        let compiled = staged.lower(session).unwrap().compile(session).unwrap();
         let mut bundle = bundle();
         bundle.manifest.configuration = compiler.configuration().to_vec();
-        bundle.executable = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
-        bundle.manifest.execution = KernelExecutionFacts::from_target(domain.target().unwrap(), mesh)
+        bundle.executable = session.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        bundle.manifest.execution = KernelExecutionFacts::from_target(session.target().unwrap(), mesh)
             .unwrap()
             .configuration_key()
             .unwrap();
@@ -563,9 +563,9 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_compile_missing_binding() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         assert!(matches!(
-            KernelAotBundle::compile(&definition(), &domain, Options::new(mesh), 1),
+            KernelAotBundle::compile(&definition(), &session, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message }) if message == "a compiler binding is required",
         ));
     }
@@ -576,9 +576,9 @@ pub(crate) mod tests {
         let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         assert!(matches!(
-            KernelAotBundle::compile(&definition, &domain, Options::new(mesh), 1),
+            KernelAotBundle::compile(&definition, &session, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message })
                 if message == "aot compilation requires at least one ordinary kernel input",
         ));
@@ -705,9 +705,9 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_load_configuration() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         assert!(matches!(
-            bundle().load(&domain, &binding(2), &mesh),
+            bundle().load(&session, &binding(2), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "compiler binding configuration mismatch",
         ));
     }
@@ -716,9 +716,9 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_load_live_facts() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         assert!(matches!(
-            bundle().load(&domain, &binding(1), &mesh),
+            bundle().load(&session, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "live execution compatibility mismatch",
         ));
     }
@@ -727,12 +727,12 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_load_stateless_boundary() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let original = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let original = executable_bundle(&session, &mesh, DataType::I32, false, &binding(1));
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
-        let loaded = decoded.load(&domain, &binding(1), &mesh).unwrap();
+        let loaded = decoded.load(&session, &binding(1), &mesh).unwrap();
         let input =
-            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
                 .unwrap();
         let execution = loaded.call(vec![input]).unwrap();
         execution.fence().block_until_ready().unwrap();
@@ -751,14 +751,14 @@ pub(crate) mod tests {
         assert_eq!(i32::from_ne_bytes(bytes.as_slice().try_into().unwrap()), 23);
 
         let expected = "loaded executable boundary differs from the kernel bundle";
-        let wrong_input = executable_bundle(&domain, &mesh, DataType::F32, false, &binding(1));
+        let wrong_input = executable_bundle(&session, &mesh, DataType::F32, false, &binding(1));
         assert!(matches!(
-            wrong_input.load(&domain, &binding(1), &mesh),
+            wrong_input.load(&session, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == expected,
         ));
-        let captured = executable_bundle(&domain, &mesh, DataType::I32, true, &binding(1));
+        let captured = executable_bundle(&session, &mesh, DataType::I32, true, &binding(1));
         assert!(matches!(
-            captured.load(&domain, &binding(1), &mesh),
+            captured.load(&session, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == expected,
         ));
     }
@@ -767,9 +767,9 @@ pub(crate) mod tests {
     fn test_loaded_kernel_validate_distributed_effects() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let bundle = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
-        let mut loaded = bundle.load(&domain, &binding(1), &mesh).unwrap();
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let bundle = executable_bundle(&session, &mesh, DataType::I32, false, &binding(1));
+        let mut loaded = bundle.load(&session, &binding(1), &mesh).unwrap();
         assert!(loaded.validate_distributed_effects().is_ok());
         for effect in
             [EffectClass::OrderedIo, EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo, EffectClass::OrderedState]

@@ -161,10 +161,10 @@ mod tests {
     #[test]
     fn test_compare_operation_lower() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 5.0, 3.0, 8.0]));
-        let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[4f32, 2.0, 3.0, 9.0]));
+        let left = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 5.0, 3.0, 8.0]));
+        let right = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[4f32, 2.0, 3.0, 9.0]));
         assert_eq!(
             values_from_bytes::<bool>(
                 &left.compare(&right, ComparisonDirection::LessThan).unwrap().copy_to_host().unwrap(),
@@ -176,14 +176,14 @@ mod tests {
     #[test]
     fn test_compare_operation_lower_one_bit_integers() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Every pair of bits is compared in every direction. I1 interprets the set bit as -1, while U1 and Boolean
         // interpret it as +1.
         for data_type in [DataType::Boolean, DataType::I1, DataType::U1] {
-            let left = replicated_array(&domain, &mesh, data_type, &[4], &[0, 0, 1, 1]);
-            let right = replicated_array(&domain, &mesh, data_type, &[4], &[0, 1, 0, 1]);
+            let left = replicated_array(&session, &mesh, data_type, &[4], &[0, 0, 1, 1]);
+            let right = replicated_array(&session, &mesh, data_type, &[4], &[0, 1, 0, 1]);
             let signed = data_type == DataType::I1;
             for (direction, expected) in [
                 (ComparisonDirection::Equal, [true, false, false, true]),
@@ -202,7 +202,7 @@ mod tests {
         }
 
         // Implicit promotion must preserve the signed set bit before comparing against wider numeric inputs.
-        let signed = replicated_array(&domain, &mesh, DataType::I1, &[2], &[1, 0]);
+        let signed = replicated_array(&session, &mesh, DataType::I1, &[2], &[1, 0]);
         for (data_type, bytes) in [
             (DataType::Boolean, vec![0, 0]),
             (DataType::U1, vec![0, 0]),
@@ -210,7 +210,7 @@ mod tests {
             (DataType::I32, values_to_bytes(&[0i32, 0])),
             (DataType::F32, values_to_bytes(&[0f32, 0.0])),
         ] {
-            let zero = replicated_array(&domain, &mesh, data_type, &[2], &bytes);
+            let zero = replicated_array(&session, &mesh, data_type, &[2], &bytes);
             for (direction, expected) in [
                 (ComparisonDirection::Equal, [false, true]),
                 (ComparisonDirection::NotEqual, [true, false]),
@@ -232,9 +232,9 @@ mod tests {
     fn test_compare_operation_lower_executes_per_element() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let values = f32_vector(&domain, &mesh, &[1., -2., 3., -4.]);
-        let limits = f32_vector(&domain, &mesh, &[0., 0., 0., 0.]);
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let values = f32_vector(&session, &mesh, &[1., -2., 3., -4.]);
+        let limits = f32_vector(&session, &mesh, &[0., 0., 0., 0.]);
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].greater_than(&inputs[1]).unwrap()],
             vec![values.r#type().into_owned(), limits.r#type().into_owned()],
@@ -242,10 +242,10 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let lowered = domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         assert!(!compiled.requires_assertion_handler());
-        let outputs = domain.execute_program(&compiled, vec![values, limits]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![values, limits]).unwrap();
         assert_eq!(
             outputs[0]
                 .addressable_shards()

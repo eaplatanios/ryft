@@ -2,7 +2,7 @@
 //!
 //! [`CompilationAnalysis`] normalizes the cost and memory properties that PJRT reports for one [`CompiledProgram`]
 //! into typed fields, retaining every raw property as an [`AnalysisValue`], and [`MemoryAnalysis`] holds the executable
-//! and allocator memory statistics. The [`AnalyzableCompilationDomain`] implementation of [`Domain`] caches each
+//! and allocator memory statistics. The [`AnalyzableCompilationDomain`] implementation of [`Session`] caches each
 //! analysis on its program. [`OptimizedProgram`] holds the optimized program that the backend returns on explicit
 //! inspection.
 
@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::compilation::CompilationError;
 use crate::compilation::programs::CompiledProgram;
-use crate::{Domain, Error};
+use crate::{Error, Session};
 
 // TODO(eaplatanios): Review this module.
 
@@ -200,7 +200,7 @@ impl MemoryAnalysis {
 /// PJRT plugins expose different property sets. Common properties are normalized into optional fields and every raw
 /// property is retained in [`Self::properties`]. Unsupported optional queries remain `None`.
 ///
-/// [`AnalyzableCompilationDomain::analyze`] on a [`Domain`] caches both successful analyses and failures on the
+/// [`AnalyzableCompilationDomain::analyze`] on a [`Session`] caches both successful analyses and failures on the
 /// corresponding [`CompiledProgram`], so repeated inspection does not issue new backend queries. Optimized compiler
 /// representations are inspected separately through [`CompiledProgram::optimized_program`].
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -357,7 +357,7 @@ impl OptimizedProgram {
     }
 }
 
-impl AnalyzableCompilationDomain for Domain<'_> {
+impl AnalyzableCompilationDomain for Session<'_> {
     type Analysis = CompilationAnalysis;
 
     fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
@@ -531,18 +531,18 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_analyze_preserves_cached_errors() {
+    fn test_session_analyze_preserves_cached_errors() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             |_, _, input| Ok(input),
             Vec::new(),
             ArrayType::scalar(DataType::F32).into(),
             Options::new(mesh),
         )
         .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
         compiled
             .compiled_program()
             .analysis()
@@ -552,7 +552,7 @@ mod tests {
         // Repeated access preserves the runtime's category and diagnostic rather than relabeling cached failures
         // as invalid analysis data or adding another display prefix.
         for _ in 0..2 {
-            let error = domain.analyze(compiled.executable()).unwrap_err();
+            let error = session.analyze(compiled.executable()).unwrap_err();
             assert!(matches!(
                 &error,
                 Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }) if message == "analysis query failed",

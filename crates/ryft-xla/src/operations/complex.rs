@@ -230,10 +230,10 @@ mod tests {
     #[test]
     fn test_conjugate_operation_lower_differentiation() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let z = Complex::new(0.7f32, -0.3);
-        let input = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[z]));
+        let input = replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[z]));
 
         // The gradient of the real-valued |z|² = Re(z · conj(z)) is 2 · conj(z). Its pullback lowers `conjugate`
         // together with `real` and `complex`.

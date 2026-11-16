@@ -14,7 +14,7 @@ use ryft_core::{ArrayType, DataType, Layout, ProgramError, StaticShape, Typed, U
 use ryft_pjrt::{DeviceId, Event, ExecutionFence, HostDestination, HostDestinationSlice};
 
 use crate::arrays::{Array, ArrayError, ArrayShard, ArrayTypeExtension, ShardIndex};
-use crate::{Domain, Error, ToPjrt};
+use crate::{Error, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 
@@ -277,11 +277,11 @@ impl<'o> Array<'o> {
     /// array whose sharding has unreduced axes, whose devices hold separate summands of its value. Materializing such
     /// an array densely would add those summands, and uploading the sum would replace them with a canonical
     /// decomposition of it, which an unchecked `shard_map` body could tell apart, because it observes the summands.
-    pub(crate) fn relayout_through_host(&self, domain: &Domain<'o>, layout: &Layout) -> Result<Array<'o>, Error> {
+    pub(crate) fn relayout_through_host(&self, session: &Session<'o>, layout: &Layout) -> Result<Array<'o>, Error> {
         let r#type = self.r#type().into_owned().with_layout(layout.clone());
         let device_layout = layout.to_pjrt()?;
         let buffer_type = Array::physical_buffer_type(self.data_type());
-        let client = domain.client();
+        let client = session.client();
         let mut buffers = Vec::new();
         for shard in self.addressable_shards() {
             let shard_index = shard.index();
@@ -301,7 +301,7 @@ impl<'o> Array<'o> {
             )?);
         }
         Array::from_addressable_buffers_with_sharding(
-            domain,
+            session,
             r#type,
             self.sharding().clone(),
             self.mesh().clone(),
@@ -624,12 +624,12 @@ mod tests {
     #[test]
     fn test_array_begin_copy_to_host_preserves_producer_errors_for_empty_arrays() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for data_type in [DataType::F32, DataType::Zero] {
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
-            let array = Array::from_host_buffer(&domain, ArrayType::new_static(data_type, [0]), mesh.clone(), [])
+            let array = Array::from_host_buffer(&session, ArrayType::new_static(data_type, [0]), mesh.clone(), [])
                 .unwrap()
                 .with_execution_fence(ExecutionFence::new(vec![event]));
             let copy = array.begin_copy_to_host().unwrap();
@@ -645,7 +645,7 @@ mod tests {
         // Sharding its columns makes the tiles non-contiguous, so every shard is copied into its own buffer and merged,
         // and a replicated array needs a single copy.
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -661,7 +661,7 @@ mod tests {
         let materialize = |dimensions: Vec<ShardingDimension>| {
             let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
             let r#type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
-            let array = Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&values)).unwrap();
+            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&values)).unwrap();
             let copy = array.begin_copy_to_host().unwrap();
             let shard_copy_count = copy.shard_copy_count();
             let (bytes, merged) = copy.finish_with_measurements().unwrap();

@@ -131,24 +131,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let device = Device::from_pjrt(&client.addressable_devices()?.remove(0))?;
     let mesh = DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto)?])?, vec![device])?;
-    let domain = Session::new(&client).domain();
+    let session = Session::with_client(&client);
     let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?;
     let bytes = (0..8).flat_map(|index| (index as f32).to_ne_bytes()).collect::<Vec<_>>();
-    let input = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), bytes.as_slice())?;
+    let input = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), bytes.as_slice())?;
     input.block_until_ready()?;
 
     let mut results = HashMap::new();
 
-    // Eager `add` through the receiver-based capability, which dispatches through the array's domain.
+    // Eager `add` through the receiver-based capability, which dispatches through the array's session.
     if arguments.selects("eager_add") {
         results.insert("eager_add", measure(&arguments, || drop(input.add(&input).unwrap())));
     }
 
     // First-class dimension addition through a session-carrying `Dimension`, which binds the operation through its
-    // domain, and through a session-free `DimensionValue`, which adds the extents directly on the host.
+    // session, and through a session-free `DimensionValue`, which adds the extents directly on the host.
     let extent = DimensionValue::constant(8)?;
-    let xla_extent = Dimension::new(extent.clone(), domain.clone());
+    let xla_extent = Dimension::new(extent.clone(), session.clone());
     if arguments.selects("xla_dimension_add") {
         results.insert("xla_dimension_add", measure(&arguments, || drop(xla_extent.add(&xla_extent).unwrap())));
     }
@@ -161,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Reference reads through a session-carrying `Value`, which binds the read through its domain, and through a
+    // Reference reads through a session-carrying `Value`, which binds the read through its session, and through a
     // session-free `ArrayIrValue`, which reads the handle directly.
     let xla_reference = Value::Array(input.clone()).reference_new()?;
     if arguments.selects("xla_reference_read") {
@@ -183,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
     };
     let predicate_type = ArrayType::scalar(DataType::Boolean).replicated(&mesh)?;
-    let predicate = Array::from_host_buffer(&domain, predicate_type, mesh.clone(), [1u8])?;
+    let predicate = Array::from_host_buffer(&session, predicate_type, mesh.clone(), [1u8])?;
     let condition_inputs = [Value::Array(predicate), Value::Array(input.clone())];
     if arguments.selects("eager_condition") {
         results.insert(
@@ -194,14 +194,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     branch(Operation::Array(MulOperation::new().into())),
                 ];
                 let operation = Operation::Condition(ConditionOperation::new());
-                drop(domain.bind(operation, branches, &condition_inputs).unwrap());
+                drop(session.bind(operation, branches, &condition_inputs).unwrap());
             }),
         );
     }
 
     // Warm JIT dispatch of `x + x`.
     let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-        jit(|_, value: CompileTracer<'_>| Ok(value.add(&value)?), &domain, mesh.clone());
+        jit(|_, value: CompileTracer<'_>| Ok(value.add(&value)?), &session, mesh.clone());
     if arguments.selects("jit_add") {
         results.insert("jit_add", measure(&arguments, || drop(function.execute((), input.clone()).unwrap())));
     }

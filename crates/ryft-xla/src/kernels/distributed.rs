@@ -247,8 +247,8 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
             .with_chunk_bytes(options.chunk_bytes)?
             .with_maximum_rounds(options.maximum_rounds)?;
         kernel.validate_distributed_effects()?;
-        let (domain, inputs, mesh, identity, execution) = kernel.distributed_parts();
-        let client = domain.client();
+        let (session, inputs, mesh, identity, execution) = kernel.distributed_parts();
+        let client = session.client();
         validate_kernel_participants(client, mesh)?;
         if mesh.devices().len() != 1 || inputs.is_empty() || inputs.len() > 64 {
             return Err(DistributedKernelError::invalid(
@@ -258,7 +258,7 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
         if identity.len() > 64 * 1024 || execution.len() > 64 * 1024 {
             return Err(DistributedKernelError::invalid("kernel identity exceeds the coordination metadata budget"));
         }
-        let actual = KernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
+        let actual = KernelExecutionFacts::from_target(session.target()?, mesh)?.configuration_key()?;
         if actual != execution {
             return Err(DistributedKernelError::invalid("loaded kernel live execution identity changed"));
         }
@@ -376,7 +376,7 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
         deadline: Instant,
     ) -> Result<Execution<Vec<Array<'c>>>, DistributedKernelError> {
         self.coordination.validate_progress(cancelled, deadline)?;
-        let (domain, types, mesh, identity, execution) = self.kernel.distributed_parts();
+        let (session, types, mesh, identity, execution) = self.kernel.distributed_parts();
         if inputs.len() != types.len()
             || sources.len() != types.len()
             || sources.iter().any(|&source| source >= self.coordination.processes)
@@ -491,7 +491,7 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
             if Sha256::digest(&bytes).as_slice() != manifest.checksum {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
-            let value = Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes)?;
+            let value = Array::from_host_buffer(session, r#type.clone(), mesh.clone(), bytes)?;
             value.block_until_ready()?;
             arguments.push(value);
         }
@@ -775,10 +775,10 @@ mod tests {
     use super::*;
 
     /// Produces a real scalar identity loaded on the CPU through the existing AOT persistence fixture.
-    fn loaded<'c>(domain: &crate::Domain<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
+    fn loaded<'c>(session: &crate::Session<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
-        crate::kernels::aot::tests::executable_bundle(domain, mesh, ryft_core::DataType::I32, false, &compiler)
-            .load(domain, &compiler, mesh)
+        crate::kernels::aot::tests::executable_bundle(session, mesh, ryft_core::DataType::I32, false, &compiler)
+            .load(session, &compiler, mesh)
             .unwrap()
     }
 
@@ -949,14 +949,14 @@ mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = crate::Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = crate::Session::with_client(&client).with_mesh(mesh.clone());
         let compiler_options = if mode == "configuration" { 1 + process as u32 } else { 1 };
-        let kernel = loaded(&domain, &mesh, compiler_options);
+        let kernel = loaded(&session, &mesh, compiler_options);
         let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();
         let mut coordinator = DistributedKernel::new(&runtime, &kernel, options.clone()).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             ryft_core::ArrayType::scalar(ryft_core::DataType::I32),
             mesh.clone(),
             (10 + process as i32).to_ne_bytes(),

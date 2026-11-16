@@ -245,19 +245,19 @@ mod tests {
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, Constant, Domain, Error, LowerableOperation, Lowerer, LoweringError, Session,
+        Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, Session,
         to_mlir_module_for_program,
     };
 
     // Uploads one generator state to the device and builds the same state on the reference backend.
     fn generator_states<'c>(
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         mesh: &DeviceMesh,
         algorithm: RandomAlgorithm,
         state_values: &[u64],
     ) -> (Array<'c>, CoreArray) {
         let bytes = values_to_bytes(state_values);
-        let state = replicated_array(domain, mesh, DataType::U64, &[state_values.len()], bytes.as_slice());
+        let state = replicated_array(session, mesh, DataType::U64, &[state_values.len()], bytes.as_slice());
         (state, CoreArray::from_elements(algorithm.state_type(), state_values).unwrap())
     }
 
@@ -497,7 +497,7 @@ mod tests {
         // first even-sized axis of the output, or else its first largest axis, and advances the counter by the size
         // of the resulting half shape, which the last group covers at several shapes and every narrow width.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for (algorithm, state_values, outputs) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, 7], vec![(DataType::U32, vec![5]), (DataType::U64, vec![3])]),
@@ -517,7 +517,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (state, reference_state) = generator_states(&domain, &mesh, algorithm, &state_values);
+            let (state, reference_state) = generator_states(&session, &mesh, algorithm, &state_values);
             for (data_type, dimensions) in outputs {
                 let output_type = ArrayType::new_static(data_type, dimensions);
                 let (device_advanced_state, device_bits) = state.rng_bit_generator(algorithm, &output_type).unwrap();
@@ -542,14 +542,14 @@ mod tests {
         // Empty outputs preserve the state, and counter advancement wraps at the counter width of the algorithm while
         // the bits stay byte-identical with the reference backend for every output width.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for (algorithm, state_values) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, u64::MAX - 1]),
             (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, 7]),
             (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, u64::MAX]),
         ] {
-            let (state, reference_state) = generator_states(&domain, &mesh, algorithm, &state_values);
+            let (state, reference_state) = generator_states(&session, &mesh, algorithm, &state_values);
             for data_type in [DataType::U8, DataType::U16, DataType::U32, DataType::U64] {
                 for dimensions in [vec![2, 0, 3], vec![5]] {
                     // The empty shape runs no cipher invocations. Five elements run enough invocations to cross the
@@ -589,9 +589,9 @@ mod tests {
     #[test]
     fn test_split_rng_key_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let (device_advanced_state, device_keys) = state.split_rng_key(2).unwrap();
         let (reference_advanced_state, reference_keys) = reference_state.split_rng_key(2).unwrap();
         assert_eq!(device_advanced_state.copy_to_host().unwrap(), reference_advanced_state.logical_bytes());
@@ -606,9 +606,9 @@ mod tests {
         // Every step of the composition is exact arithmetic over byte-identical ThreeFry bits, so the samples keep
         // their exact encodings on both backends, including the narrow floating-point types.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for data_type in [DataType::F32, DataType::BF16, DataType::F16] {
             let sample_type = ArrayType::new_static(data_type, [8]);
             let (device_advanced_state, device_samples) = state.random_uniform(&sample_type).unwrap();
@@ -628,9 +628,9 @@ mod tests {
         // The Box-Muller transform goes through transcendental functions, whose last bits may differ between the
         // backends. Complex samples consist of two independently drawn components.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for (data_type, component_count, tolerance) in
             [(DataType::F32, 8, 1e-5f64), (DataType::C64, 16, 1e-5), (DataType::C128, 16, 1e-12)]
         {
@@ -670,11 +670,11 @@ mod tests {
     #[test]
     fn test_random_categorical_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let logit_values = [0f32, 10.0, -3.0, 2.0];
-        let logits = replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&logit_values).as_slice());
+        let logits = replicated_array(&session, &mesh, DataType::F32, &[4], values_to_bytes(&logit_values).as_slice());
         let reference_logits =
             CoreArray::from_elements(ArrayType::new_static(DataType::F32, [4]), &logit_values).unwrap();
         let (device_advanced_state, device_samples) = state.random_categorical(&logits, 0).unwrap();
@@ -690,12 +690,12 @@ mod tests {
         // High-precision sampling never selects a category masked with `-inf` and advances the same state on both
         // backends.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for (algorithm, state_values) in
             [(RandomAlgorithm::ThreeFry, vec![11u64, 3]), (RandomAlgorithm::Philox, vec![11u64, 3, 0])]
         {
-            let (state, reference_state) = generator_states(&domain, &mesh, algorithm, &state_values);
+            let (state, reference_state) = generator_states(&session, &mesh, algorithm, &state_values);
             for data_type in [DataType::F32, DataType::F64] {
                 let reference_logits =
                     CoreArray::matrix(2, 3, vec![f64::NEG_INFINITY, 2000.0, 0.0, f64::NEG_INFINITY, 0.0, 2000.0])
@@ -703,7 +703,7 @@ mod tests {
                         .convert_element_type(data_type)
                         .unwrap();
                 let logits =
-                    replicated_array(&domain, &mesh, data_type, &[2, 3], reference_logits.logical_bytes().as_slice());
+                    replicated_array(&session, &mesh, data_type, &[2, 3], reference_logits.logical_bytes().as_slice());
                 let (device_advanced_state, device_samples) =
                     state.random_categorical_with_mode(&logits, -1, CategoricalSamplingMode::HighPrecision).unwrap();
                 let (reference_advanced_state, _) = reference_state
@@ -723,8 +723,8 @@ mod tests {
         }
 
         // A zero first uniform exercises the rare tail where an ordinary `log(1 - x)` loses the distinction from zero.
-        let (state, _) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[0u64, 0x1badd8a64e5859ae]);
-        let logits = replicated_array(&domain, &mesh, DataType::F32, &[2], values_to_bytes(&[-16f32, 0.0]).as_slice());
+        let (state, _) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[0u64, 0x1badd8a64e5859ae]);
+        let logits = replicated_array(&session, &mesh, DataType::F32, &[2], values_to_bytes(&[-16f32, 0.0]).as_slice());
         for (mode, expected) in
             [(CategoricalSamplingMode::LowPrecision, 1i32), (CategoricalSamplingMode::HighPrecision, 0)]
         {

@@ -47,7 +47,7 @@ mod tests {
         // Compiled basic and broadcast advanced reads and repeated indexed updates.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_types = vec![
             ArrayType::new_static(DataType::F64, [3, 4]),
             ArrayType::new_static(DataType::I64, [2, 1]),
@@ -65,7 +65,7 @@ mod tests {
                 ]
             },
             input_types.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
@@ -78,9 +78,9 @@ mod tests {
         let inputs = input_types
             .into_iter()
             .zip(bytes)
-            .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+            .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
             .collect::<Vec<_>>();
-        let outputs = compiled.executable().execute(&domain, inputs).unwrap();
+        let outputs = compiled.executable().execute(&session, inputs).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[3, 2]);
         assert_eq!(read_f64s(&client, &outputs[0]), vec![9., 11., 5., 7., 1., 3.]);
         assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
@@ -97,7 +97,7 @@ mod tests {
         // One symbolic indexing graph replays at distinct concrete extents.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
@@ -145,7 +145,7 @@ mod tests {
                         .collect()
                 },
                 input_types.clone(),
-                &domain,
+                &session,
                 mesh.clone(),
             )
             .unwrap();
@@ -159,11 +159,11 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
                 .collect::<Vec<_>>();
             compiled
                 .executable()
-                .execute(&domain, inputs)
+                .execute(&session, inputs)
                 .unwrap()
                 .iter()
                 .map(|output| read_f64s(&client, output))
@@ -180,7 +180,7 @@ mod tests {
     fn test_compiled_symbolic_manipulation_primal_and_pullback() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in the
         // pinned JAX oracle, plus empty rows for the conveniences that admit them. Keep dimension residuals internal to
         // a fused primal and pullback. This verifies retained graph specialization, without asserting reuse of one
@@ -535,7 +535,7 @@ mod tests {
                             .collect()
                     },
                     input_types.clone(),
-                    &domain,
+                    &session,
                     mesh.clone(),
                 )
                 .unwrap_or_else(|error| panic!("{name}, n={size} compilation: {error}"));
@@ -554,9 +554,9 @@ mod tests {
                 let inputs = input_types
                     .into_iter()
                     .zip(bytes)
-                    .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+                    .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
                     .collect();
-                let outputs = compiled.executable().execute(&domain, inputs).unwrap();
+                let outputs = compiled.executable().execute(&session, inputs).unwrap();
                 assert_eq!(outputs.len(), 2);
                 for output in &outputs {
                     assert_eq!(output.data_type(), DataType::F64);

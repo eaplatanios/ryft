@@ -7,7 +7,7 @@
 //! effects, runtime requirements, shardings, the device mesh and assignment, and the identity of the target and the
 //! compiler) in stable explicit encodings rather than Rust enum discriminants.
 //!
-//! `Domain::deserialize_compiled_program` validates that metadata against the loading domain before it loads the
+//! `Session::deserialize_compiled_program` validates that metadata against the loading session before it loads the
 //! native bytes. Envelopes from other schemas, targets, compilers, or device assignments load as `None` so that
 //! callers can recompile, while malformed metadata of a supported schema is an error. Persistent cache directories
 //! must be trusted sources of executable code.
@@ -33,7 +33,7 @@ use crate::compilation::programs::CompiledProgram;
 use crate::domains::runtimes::builtin_requirement;
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Domain, Error, RuntimeRequirement, normalize_runtime_requirements};
+use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
 
@@ -552,9 +552,9 @@ impl CompiledProgram<'_> {
     }
 }
 
-impl<'c> Domain<'c> {
-    /// Validates and loads a versioned executable envelope for this domain. Unsupported schemas, target configurations,
-    /// or PJRT loading return `None`. Malformed supported metadata returns an error.
+impl<'c> Session<'c> {
+    /// Validates and loads a versioned executable envelope for this session. Unsupported schemas, target
+    /// configurations, or PJRT loading return `None`. Malformed supported metadata returns an error.
     ///
     /// The envelope, target, runtime contracts, and signature mapping logical values to physical executable slots are
     /// validated before loading the native PJRT executable bytes. Persistent cache directories must be trusted sources
@@ -1567,12 +1567,12 @@ mod tests {
     fn test_compiled_program_serialize() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let capture = Array::from_host_buffer(
-            &domain,
+            &session,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -1580,28 +1580,28 @@ mod tests {
         .unwrap();
         fn add_capture<'c>(
             _: Vec<Constant>,
-            captures: Vec<ryft_core::compilation::CompilationTracer<Domain<'c>>>,
-            input: ryft_core::compilation::CompilationTracer<Domain<'c>>,
-        ) -> Result<ryft_core::compilation::CompilationTracer<Domain<'c>>, Error> {
+            captures: Vec<ryft_core::compilation::CompilationTracer<Session<'c>>>,
+            input: ryft_core::compilation::CompilationTracer<Session<'c>>,
+        ) -> Result<ryft_core::compilation::CompilationTracer<Session<'c>>, Error> {
             let capture = ValueProjection::<ArrayType>::into_projected(captures.into_iter().next().unwrap())
                 .map_err(ProgramError::from)?;
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
-        let staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged: CoreStagedFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
                 add_capture,
                 vec![Value::Array(capture.clone())],
                 ArrayIrType::Array(input_type.clone()),
                 Options::new(mesh.clone()).with_donate(true),
             )
             .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let compiled_analysis = domain.analyze(compiled.executable()).unwrap();
-        assert_eq!(domain.analyze(compiled.executable()).unwrap(), compiled_analysis);
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
+        let compiled_analysis = session.analyze(compiled.executable()).unwrap();
+        assert_eq!(session.analyze(compiled.executable()).unwrap(), compiled_analysis);
 
-        let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
-        let restored = domain.deserialize_program(bytes.as_slice()).unwrap().unwrap();
+        let bytes = session.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        let restored = session.deserialize_program(bytes.as_slice()).unwrap().unwrap();
         assert_eq!(restored.input_types(), compiled.compiled_program().input_types());
         assert_eq!(restored.all_output_types(), compiled.compiled_program().all_output_types());
         assert_eq!(restored.signature(), compiled.compiled_program().signature());
@@ -1616,9 +1616,9 @@ mod tests {
         let encode = |metadata: PersistentExecutableMetadata| encode_envelope(&metadata, executable);
         let mut matching = decode_envelope(&bytes).0;
         assert_eq!(matching.kernel_execution_facts, None);
-        let facts = crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh).unwrap();
+        let facts = crate::kernels::KernelExecutionFacts::from_target(session.target().unwrap(), &mesh).unwrap();
         matching.kernel_execution_facts = Some(facts.configuration_key().unwrap());
-        let matching = domain.deserialize_program(&encode(matching)).unwrap().unwrap();
+        let matching = session.deserialize_program(&encode(matching)).unwrap().unwrap();
         assert_eq!(matching.kernel_execution_facts(), Some(facts.configuration_key().unwrap().as_slice()));
         let mut mismatch = decode_envelope(&bytes).0;
         // The key is a JSON array whose fifth element is the minor version of the PJRT C API, so incrementing that
@@ -1626,23 +1626,23 @@ mod tests {
         let mut changed_key: serde_json::Value = serde_json::from_slice(&facts.configuration_key().unwrap()).unwrap();
         changed_key[4] = serde_json::json!(facts.pjrt_version().minor + 1);
         mismatch.kernel_execution_facts = Some(serde_json::to_vec(&changed_key).unwrap());
-        assert!(domain.deserialize_program(&encode(mismatch)).unwrap().is_none());
+        assert!(session.deserialize_program(&encode(mismatch)).unwrap().is_none());
         let mut corrupt = decode_envelope(&bytes).0;
         corrupt.kernel_execution_facts = Some(vec![255]);
-        assert!(domain.deserialize_program(&encode(corrupt)).unwrap().is_none());
+        assert!(session.deserialize_program(&encode(corrupt)).unwrap().is_none());
         let baseline = serde_json::to_value(decode_envelope(&bytes).0).unwrap();
         assert_eq!(baseline["runtime_requirements"], serde_json::json!([]));
         let mut missing: PersistentExecutableMetadata = serde_json::from_value(baseline).unwrap();
         missing.runtime_requirements = vec![crate::domains::runtimes::builtin_requirement("test.missing-runtime")];
         assert!(matches!(
-            domain.deserialize_program(&encode(missing)),
+            session.deserialize_program(&encode(missing)),
             Err(Error::Runtime(crate::domains::runtimes::RuntimeError::MissingProvider { identifier }))
                 if identifier == "test.missing-runtime"
         ));
         let mut explicit = decode_envelope(&bytes).0;
         explicit.runtime_requirements =
             vec![builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")];
-        let explicit = domain.deserialize_program(&encode(explicit)).unwrap().unwrap();
+        let explicit = session.deserialize_program(&encode(explicit)).unwrap().unwrap();
         assert_eq!(
             explicit.runtime_requirements(),
             &[builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")],
@@ -1653,17 +1653,17 @@ mod tests {
         let mut invalid_signature_metadata = decode_envelope(&bytes).0;
         invalid_signature_metadata.input_mapping[0] = None;
         assert!(matches!(
-            domain.deserialize_program(&encode(invalid_signature_metadata)),
+            session.deserialize_program(&encode(invalid_signature_metadata)),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "executable signature does not match logical input and output types",
         ));
 
         let mut incompatible_metadata = decode_envelope(&bytes).0;
         incompatible_metadata.platform_version.push_str("-incompatible");
-        assert!(domain.deserialize_program(&encode(incompatible_metadata)).unwrap().is_none());
+        assert!(session.deserialize_program(&encode(incompatible_metadata)).unwrap().is_none());
 
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -1671,13 +1671,13 @@ mod tests {
         .unwrap();
         // A restored program owns the complete declaration contract, including the hidden capture prefix.
         assert!(matches!(
-            domain.execute(&restored, vec![Value::Array(capture.clone())]),
+            session.execute(&restored, vec![Value::Array(capture.clone())]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
             ),
         ));
-        let wrong_type = f64_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let wrong_type = f64_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         for index in 0..2 {
             let expected = format!(
                 "runtime input type `{}` does not refine declared type `{}`",
@@ -1687,7 +1687,7 @@ mod tests {
             let mut inputs = vec![Value::Array(capture.clone()), Value::Array(input.clone())];
             inputs[index] = Value::Array(wrong_type.clone());
             assert!(matches!(
-                domain.execute(&restored, inputs),
+                session.execute(&restored, inputs),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::InvalidArgument { message })
@@ -1695,7 +1695,7 @@ mod tests {
                 ),
             ));
         }
-        let outputs = domain.execute(&restored, vec![Value::Array(capture), Value::Array(input)]).unwrap();
+        let outputs = session.execute(&restored, vec![Value::Array(capture), Value::Array(input)]).unwrap();
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![11.0, 22.0, 33.0, 44.0]);
 
         let analysis = restored.analyze().unwrap();
@@ -1714,7 +1714,7 @@ mod tests {
             vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = ProgramBuilder::new();
@@ -1733,10 +1733,10 @@ mod tests {
         let program: FlatProgram = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let bytes = compiled.serialize().unwrap().unwrap();
-        let restored = domain.deserialize_compiled_program(bytes.as_slice()).unwrap().unwrap();
+        let restored = session.deserialize_compiled_program(bytes.as_slice()).unwrap().unwrap();
         assert_eq!(compiled.output_count(), 1);
         assert_eq!(compiled.reference_states().len(), 2);
         assert_eq!(compiled.reference_states()[0].source(), ReferenceSource::Capture { index: 0 });
@@ -1747,8 +1747,8 @@ mod tests {
         assert_eq!(compiled.reference_states()[1].output_index(), None);
         assert_eq!(restored.output_count(), compiled.output_count());
         assert_eq!(restored.reference_states(), compiled.reference_states());
-        let outputs = domain
-            .execute_program(&restored, vec![f32_scalar(&domain, &mesh, 1.0), f32_scalar(&domain, &mesh, 2.0)])
+        let outputs = session
+            .execute_program(&restored, vec![f32_scalar(&session, &mesh, 1.0), f32_scalar(&session, &mesh, 2.0)])
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![3.0]);
@@ -1763,7 +1763,7 @@ mod tests {
         metadata.reference_states[0].logical_input_index = 1;
         let corrupted = corrupt(metadata);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state source does not match its logical input",
         ));
@@ -1772,7 +1772,7 @@ mod tests {
         metadata.reference_states[0].source = PersistentReferenceSource::PublicInput { index: 1 };
         let corrupted = corrupt(metadata);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state source does not match its logical input",
         ));
@@ -1782,7 +1782,7 @@ mod tests {
         invalid_outputs.output_count = 3;
         let corrupted = corrupt(invalid_outputs);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state metadata has an invalid output count",
         ));
@@ -1794,7 +1794,7 @@ mod tests {
         truncated_expected_shardings.expected_argument_shardings.pop();
         let corrupted = corrupt(truncated_expected_shardings);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "expected argument shardings do not match the physical input count",
         ));
@@ -1803,7 +1803,7 @@ mod tests {
         reordered.reference_states.swap(0, 1);
         let corrupted = corrupt(reordered);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference states are not in canonical logical input order",
         ));
@@ -1812,7 +1812,7 @@ mod tests {
         foreign_process_mesh.mesh.devices[0].process_index += 1;
         let corrupted = corrupt(foreign_process_mesh);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state mesh does not include an addressable device of this process",
         ));
@@ -1821,7 +1821,7 @@ mod tests {
         mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
@@ -1842,7 +1842,7 @@ mod tests {
         mismatched_input.output_shardings[1].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_input);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
@@ -1857,7 +1857,7 @@ mod tests {
         mismatched_output.output_shardings[1].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_output);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
@@ -1867,7 +1867,7 @@ mod tests {
         mismatched_output_sharding.output_shardings[1].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_output_sharding);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "output shardings do not match the output types or the executable mesh",
         ));
@@ -1876,7 +1876,7 @@ mod tests {
         zero_space.signature.input_types[0].data_type = encode_data_type(DataType::Zero);
         let corrupted = corrupt(zero_space);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state input has a zero-space type",
         ));
@@ -1885,7 +1885,7 @@ mod tests {
         host_memory.signature.input_types[0].memory = PersistentMemory::Host(true);
         let corrupted = corrupt(host_memory);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state input is not in device memory",
         ));
@@ -1901,7 +1901,7 @@ mod tests {
             vec![PersistentShardingDimension::Replicated];
         let corrupted = corrupt(unbounded_dynamic);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
@@ -1917,7 +1917,7 @@ mod tests {
             vec![PersistentShardingDimension::Replicated];
         let corrupted = corrupt(mutated_dynamic);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "mutated bounded-dynamic reference-state input 0 is unsupported because backend alias \
                               compatibility has not been verified",
@@ -1934,7 +1934,7 @@ mod tests {
             vec![PersistentShardingDimension::Sharded(vec!["x".to_string()])];
         let corrupted = corrupt(sharded_dynamic);
         assert!(matches!(
-            domain.deserialize_compiled_program(corrupted.as_slice()),
+            session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "bounded-dynamic reference-state input 1 logical sharding is not replicated",
         ));
@@ -1944,17 +1944,17 @@ mod tests {
     fn test_compiled_program_serialize_round_trips_bounded_dynamic_read_only_reference_state() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let lowered = domain
+        let lowered = session
             .lower_program(&external_reference_read_program(state_type.clone()), 0, &Options::new(mesh.clone()))
             .unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let bytes = compiled.serialize().unwrap().unwrap();
-        let restored = domain.deserialize_compiled_program(bytes.as_slice()).unwrap().unwrap();
+        let restored = session.deserialize_compiled_program(bytes.as_slice()).unwrap().unwrap();
 
         assert_eq!(restored.input_types()[0].data_type(), state_type.data_type());
         assert_eq!(restored.input_types()[0].shape().to_string(), state_type.shape().to_string());
@@ -1968,15 +1968,15 @@ mod tests {
 
         // Runtime holders have exact extents. The restored declarations retain the bounds against which they refine.
         let array = Array::from_host_buffer(
-            &domain,
+            &session,
             replicated_vector_type(&mesh, 3),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice(),
         )
         .unwrap();
         let holder = ArrayReference::new(array);
-        let reference = Value::Reference(crate::Reference::new(holder, domain.clone()));
-        let outputs = domain.execute_statefully(&restored, vec![reference]).r#await().unwrap();
+        let reference = Value::Reference(crate::Reference::new(holder, session.clone()));
+        let outputs = session.execute_statefully(&restored, vec![reference]).r#await().unwrap();
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![1.0, 2.0, 3.0]);
     }
 
@@ -1994,7 +1994,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
@@ -2011,8 +2011,8 @@ mod tests {
         let program: FlatProgram = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         assert_eq!(compiled.input_types(), &[state_type.clone(), state_type.clone()]);
         assert_eq!(compiled.all_output_types(), &[state_type.clone(), state_type.clone()]);
         assert_eq!(compiled.expected_argument_shardings(), &[state_sharding.clone(), state_sharding]);
@@ -2023,7 +2023,7 @@ mod tests {
         );
         match compiled.serialize().unwrap() {
             Some(bytes) => {
-                let restored = domain.deserialize_compiled_program(bytes.as_slice()).unwrap().unwrap();
+                let restored = session.deserialize_compiled_program(bytes.as_slice()).unwrap().unwrap();
                 assert_eq!(restored.input_types(), compiled.input_types());
                 assert_eq!(restored.all_output_types(), compiled.all_output_types());
                 assert_eq!(restored.reference_states(), compiled.reference_states());
@@ -2044,10 +2044,10 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_deserialize_compiled_program_requires_runtime_contracts_for_effect_metadata() {
+    fn test_session_deserialize_compiled_program_requires_runtime_contracts_for_effect_metadata() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let mut builder = ProgramBuilder::new();
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
@@ -2060,13 +2060,13 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh)).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let bytes = domain.serialize_program(&compiled).unwrap().unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let bytes = session.serialize_program(&compiled).unwrap().unwrap();
         let (baseline, executable) = decode_envelope(&bytes);
         assert!(baseline.requires_assertion_handler);
         assert!(baseline.ordered_io);
-        assert!(domain.deserialize_program(&bytes).unwrap().is_some());
+        assert!(session.deserialize_program(&bytes).unwrap().is_some());
 
         for identifier in ["ryft.assert", "ryft.ordered-io"] {
             for replacement in [None, Some((2, Vec::new())), Some((1, vec![1]))] {
@@ -2078,7 +2078,7 @@ mod tests {
                         .push(RuntimeRequirement::new(identifier, version, configuration).unwrap());
                 }
                 assert!(matches!(
-                    domain.deserialize_program(&encode_envelope(&metadata, executable)),
+                    session.deserialize_program(&encode_envelope(&metadata, executable)),
                     Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                         if reason == format!(
                             "effect metadata requires runtime extension `{identifier}` with ABI version 1 and empty \
@@ -2090,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_deserialize_compiled_program_restores_into_a_fresh_compilation_context() {
+    fn test_session_deserialize_compiled_program_restores_into_a_fresh_compilation_context() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
@@ -2098,11 +2098,8 @@ mod tests {
             .unwrap();
         let directory = tempdir().unwrap();
 
-        let first_domain = Session::with_disk_cache(
-            &client,
-            DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
-        )
-        .domain();
+        let disk_cache = || DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+        let first_session = Session::builder().client(&client).disk_cache(disk_cache()).build().unwrap();
         let staged = crate::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
@@ -2110,40 +2107,36 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let first: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&first_domain).unwrap().compile(&first_domain).unwrap();
-        assert_eq!(first_domain.compilation_context().statistics().compilations, 1);
+        let first: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&first_session).unwrap().compile(&first_session).unwrap();
+        assert_eq!(first_session.compilation_context().statistics().compilations, 1);
         drop(first);
-        drop(first_domain);
+        drop(first_session);
 
-        let second_domain = Session::with_disk_cache(
-            &client,
-            DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
-        )
-        .domain();
+        let second_session = Session::builder().client(&client).disk_cache(disk_cache()).build().unwrap();
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let _restored: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&second_domain).unwrap().compile(&second_domain).unwrap();
-        let statistics = second_domain.compilation_context().statistics();
+        let _restored: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&second_session).unwrap().compile(&second_session).unwrap();
+        let statistics = second_session.compilation_context().statistics();
         assert_eq!(statistics.persistent_hits, 1);
         assert_eq!(statistics.compilations, 0, "restoration must not invoke backend compilation");
     }
 
     #[test]
-    fn test_domain_deserialize_compiled_program_rejects_malformed_and_incompatible_metadata() {
+    fn test_session_deserialize_compiled_program_rejects_malformed_and_incompatible_metadata() {
         let client = cpu_client(1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
 
         assert!(matches!(
-            domain.deserialize_program(b"truncated"),
+            session.deserialize_program(b"truncated"),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                 if reason == "missing persistent executable header",
         ));
         let mut legacy = b"RYFTXLA8".to_vec();
         legacy.extend_from_slice(&0u64.to_le_bytes());
-        assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
+        assert!(session.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
         let metadata = PersistentExecutableMetadata {
             schema_version: PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
@@ -2181,7 +2174,7 @@ mod tests {
             xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default(),
             compilation_duration_nanoseconds: None,
         };
-        assert!(domain.deserialize_program(&encode_envelope(&metadata, &[])).unwrap().is_none());
+        assert!(session.deserialize_program(&encode_envelope(&metadata, &[])).unwrap().is_none());
     }
 
     #[test]

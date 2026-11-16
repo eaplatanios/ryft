@@ -20,7 +20,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
-    Array, CompileTracer, CompiledFunction, Domain, FromPjrt, Operation, Session, StatefulCompileTracer, Value, compile,
+    Array, CompileTracer, CompiledFunction, FromPjrt, Operation, Session, StatefulCompileTracer, Value, compile,
 };
 
 /// Shape and sampling hyperparameters of the tiny decode loop demo model.
@@ -295,7 +295,7 @@ fn build_decode_loop<'c>(
     // The `While` condition and body region programs are staged in the XLA domain universe. Their tracers are
     // `StatefulCompileTracer`s, whose `ArrayType` projections are `CompileTracer`s, so the shared `decode_step`
     // model runs unchanged inside the staged regions and in the eager reference loop.
-    let (_, condition) = DomainTracingContext::<Domain<'c>, Value<'c>>::trace(
+    let (_, condition) = DomainTracingContext::<Session<'c>, Value<'c>>::trace(
         |state: Vec<StatefulCompileTracer<'c>>| {
             let state = state
                 .into_iter()
@@ -308,7 +308,7 @@ fn build_decode_loop<'c>(
         carry_types.clone(),
     )
     .unwrap();
-    let (_, body) = DomainTracingContext::<Domain<'c>, Value<'c>>::trace(
+    let (_, body) = DomainTracingContext::<Session<'c>, Value<'c>>::trace(
         |state: Vec<StatefulCompileTracer<'c>>| {
             let state = state
                 .into_iter()
@@ -491,7 +491,7 @@ fn read_i32_array(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
 fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
     let client = cpu_client(1);
     let mesh = domain_mesh(&client, "x", 1);
-    let engine = Session::new(&client).domain();
+    let engine = Session::with_client(&client);
     if attention == DecodeAttention::CustomCall {
         ensure_decode_attention_handler_registered(&client).unwrap();
     }

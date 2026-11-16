@@ -2,7 +2,7 @@
 //!
 //! Every workload is the gradient of the sum of the outputs of a multilayer perceptron whose layers compute
 //! `h ↦ tanh(h · w₁) · w₂` with respect to its parameters, staged, lowered, compiled, and executed through the XLA
-//! domain on the CPU, or on a CUDA GPU with the `cuda-13` feature and `RYFT_BENCHMARK_PLATFORM=cuda-13`. The
+//! session on the CPU, or on a CUDA GPU with the `cuda-13` feature and `RYFT_BENCHMARK_PLATFORM=cuda-13`. The
 //! benchmark reports:
 //!
 //!   - **Staging cost:** the staging, lowering, and compilation times and the number of StableHLO operations of the
@@ -38,7 +38,7 @@ use ryft_core::{
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
-use ryft_xla::{Array, Domain, FromPjrt, Operation, Options, Session, Value};
+use ryft_xla::{Array, FromPjrt, Operation, Options, Session, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -49,7 +49,7 @@ const UP_PROJECTION_NAME: &str = "up_projection";
 const DOWN_PROJECTION_NAME: &str = "down_projection";
 
 /// Tracer over which the benchmarked functions are staged.
-type Tracer<'c> = DomainTracer<Domain<'c>>;
+type Tracer<'c> = DomainTracer<Session<'c>>;
 
 /// Input types of a benchmarked gradient, which are the hidden state and the two parameter matrices.
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
@@ -58,10 +58,10 @@ type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
 type BenchmarkOutput = (ArrayIrType, ArrayIrType);
 
 /// Staged gradient of a benchmarked function.
-type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkStagedFunction<'c> = CoreStagedFunction<Session<'c>, BenchmarkInput, BenchmarkOutput>;
 
 /// Compiled gradient of a benchmarked function.
-type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Session<'c>, BenchmarkInput, BenchmarkOutput>;
 
 /// Rematerialization of a layer.
 #[derive(Copy, Clone, Debug)]
@@ -240,7 +240,7 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
 /// Returns an array replicated over `mesh` with deterministic centered values of variance `1 / fan_in`.
 /// Distinct seeds separate inputs and parameter matrices, and the generator continues across stacked layers so that
 /// their weights differ. Reusing the same seed and shape reproduces identical inputs across benchmark variants.
-fn array<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> Array<'c> {
+fn array<'c>(session: &Session<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> Array<'c> {
     let size = shape.iter().product::<usize>();
     let scale = (3.0 / fan_in as f32).sqrt();
     let bytes = (0..size)
@@ -255,7 +255,7 @@ fn array<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: us
             ((2.0 * unit - 1.0) * scale).to_ne_bytes()
         })
         .collect::<Vec<_>>();
-    Array::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
+    Array::from_host_buffer(session, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
 }
 
 /// Returns the values of `array`.
@@ -268,7 +268,7 @@ fn values(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
 /// Stages the gradient of the sum of the outputs of `apply` with respect to the parameters `(w₁, w₂)` of shapes
 /// `up_shape` and `down_shape`, at a hidden state of `model`.
 fn stage_gradient<'c, F>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: &DeviceMesh,
     model: Model,
     up_shape: &[usize],
@@ -279,14 +279,14 @@ where
     F: Fn(Tracer<'c>, Tracer<'c>, Tracer<'c>) -> Result<Tracer<'c>, ProgramError>,
 {
     let hidden_type = array_type(&[model.batch_size, model.width]);
-    domain
+    session
         .stage(
             |(hidden, up, down)| {
                 // The hidden state is differentiated too, so that every input belongs to the differentiated function,
                 // and its gradient is discarded.
                 let (_, up, down) = differentiate_at((hidden, up, down))
                     .gradient(|(hidden, up, down)| {
-                        let (_, apply) = DomainTracingContext::<Domain<'c>>::trace(
+                        let (_, apply) = DomainTracingContext::<Session<'c>>::trace(
                             |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| apply(hidden, up, down),
                             (
                                 ArrayIrType::from(hidden_type.clone()),
@@ -317,7 +317,7 @@ where
 /// rematerialization. Rematerialized layers disable their optimization barriers, because the scan already separates
 /// their recomputations from the forward computation.
 fn stage_scanned_gradient<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: &DeviceMesh,
     model: Model,
     checkpointing: Checkpointing,
@@ -326,13 +326,13 @@ fn stage_scanned_gradient<'c>(
     let layer_up_type = array_type(&[model.width, model.expanded_width]);
     let layer_down_type = array_type(&[model.expanded_width, model.width]);
     stage_gradient(
-        domain,
+        session,
         mesh,
         model,
         &[model.layer_count, model.width, model.expanded_width],
         &[model.layer_count, model.expanded_width, model.width],
         move |hidden, up, down| {
-            let (_, body) = DomainTracingContext::<Domain<'c>>::trace(
+            let (_, body) = DomainTracingContext::<Session<'c>>::trace(
                 |(_index, hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>, Tracer<'c>)| {
                     checkpointed_layer(checkpointing, false, hidden, up, down)
                 },
@@ -352,24 +352,24 @@ fn stage_scanned_gradient<'c>(
 
 /// Lowers, compiles, analyzes, and executes `staged` at `inputs`, whose staging took `staging`.
 fn measure<'c>(
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     staged: BenchmarkStagedFunction<'c>,
     staging: Duration,
     inputs: (Array<'c>, Array<'c>, Array<'c>),
     execution_count: usize,
 ) -> Measurement<'c> {
     let start = Instant::now();
-    let lowered = staged.lower(domain).unwrap();
+    let lowered = staged.lower(session).unwrap();
     let lower = start.elapsed();
     let operation_count = lowered.lowered_program().stable_hlo().matches(" = stablehlo.").count();
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(domain).unwrap();
+    let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(session).unwrap();
     let compile = start.elapsed();
-    let analysis = domain.analyze(compiled.executable()).unwrap();
+    let analysis = session.analyze(compiled.executable()).unwrap();
     let memory = analysis.memory();
     let inputs = (Value::Array(inputs.0), Value::Array(inputs.1), Value::Array(inputs.2));
     let execute = || {
-        let (up, down) = compiled.executable().execute(domain, inputs.clone()).unwrap();
+        let (up, down) = compiled.executable().execute(session, inputs.clone()).unwrap();
         let gradients = [up, down].map(|gradient| ValueProjection::<ArrayType>::into_projected(gradient).unwrap());
         gradients.iter().for_each(|gradient| gradient.block_until_ready().unwrap());
         gradients
@@ -579,15 +579,15 @@ fn main() -> Result<(), ProgramError> {
     let device = Device::from_pjrt(&client.addressable_devices().unwrap().remove(0)).unwrap();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
-    let domain = Session::new(client).domain();
+    let session = Session::with_client(client);
     println!("platform: {}", client.platform_name().unwrap());
 
     // Runtime of a model that scans over its layers.
     let inputs = || {
         (
-            array(&domain, &mesh, &[model.batch_size, model.width], 1, 1),
-            array(&domain, &mesh, &[model.layer_count, model.width, model.expanded_width], model.width, 2),
-            array(&domain, &mesh, &[model.layer_count, model.expanded_width, model.width], model.expanded_width, 3),
+            array(&session, &mesh, &[model.batch_size, model.width], 1, 1),
+            array(&session, &mesh, &[model.layer_count, model.width, model.expanded_width], model.width, 2),
+            array(&session, &mesh, &[model.layer_count, model.expanded_width, model.width], model.expanded_width, 3),
         )
     };
     print_header(&format!("Scan over layers ({model:?})"));
@@ -600,8 +600,8 @@ fn main() -> Result<(), ProgramError> {
         Checkpointing::OffloadNames,
     ] {
         let start = Instant::now();
-        let staged = stage_scanned_gradient(&domain, &mesh, model, checkpointing);
-        let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
+        let staged = stage_scanned_gradient(&session, &mesh, model, checkpointing);
+        let measurement = measure(&session, staged, start.elapsed(), inputs(), execution_count);
         report(
             client,
             checkpointing.name(),
@@ -617,9 +617,9 @@ fn main() -> Result<(), ProgramError> {
     let down_shape = [model.expanded_width, model.width];
     let inputs = || {
         (
-            array(&domain, &mesh, &[model.batch_size, model.width], 1, 1),
-            array(&domain, &mesh, &up_shape, model.width, 2),
-            array(&domain, &mesh, &down_shape, model.expanded_width, 3),
+            array(&session, &mesh, &[model.batch_size, model.width], 1, 1),
+            array(&session, &mesh, &up_shape, model.width, 2),
+            array(&session, &mesh, &down_shape, model.expanded_width, 3),
         )
     };
     print_header(&format!("Repeated calls ({model:?})"));
@@ -633,12 +633,12 @@ fn main() -> Result<(), ProgramError> {
         (Checkpointing::OffloadNames, true),
     ] {
         let start = Instant::now();
-        let staged = stage_gradient(&domain, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
+        let staged = stage_gradient(&session, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
             (0..model.layer_count).try_fold(hidden, |hidden, _| {
                 checkpointed_layer(checkpointing, optimization_barrier, hidden, up.clone(), down.clone())
             })
         });
-        let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
+        let measurement = measure(&session, staged, start.elapsed(), inputs(), execution_count);
         let name = match (checkpointing, optimization_barrier) {
             (Checkpointing::None, _) | (_, true) => checkpointing.name().to_owned(),
             (_, false) => format!("{} without an optimization barrier", checkpointing.name()),
@@ -652,10 +652,10 @@ fn main() -> Result<(), ProgramError> {
     let mut reference = None;
     for depth in 0..=3 {
         let start = Instant::now();
-        let staged = stage_gradient(&domain, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
+        let staged = stage_gradient(&session, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
             nested_layer(depth, hidden, up, down)
         });
-        let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
+        let measurement = measure(&session, staged, start.elapsed(), inputs(), execution_count);
         report(client, &format!("depth {depth}"), &measurement, reference.as_ref().unwrap_or(&measurement), 1)?;
         reference.get_or_insert(measurement);
     }

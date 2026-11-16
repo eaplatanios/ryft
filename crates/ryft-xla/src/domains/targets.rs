@@ -293,9 +293,9 @@ mod tests {
     #[test]
     fn test_target_from_client() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
-        let target = domain.target().unwrap();
-        assert!(std::ptr::eq(target, domain.session().target().unwrap()));
+        let session = Session::with_client(&client);
+        let target = session.target().unwrap();
+        assert!(std::ptr::eq(target, session.clone().target().unwrap()));
         assert_eq!(target.platform_name(), client.platform_name().unwrap());
         assert_eq!(target.platform_version(), client.platform_version().unwrap());
         assert_eq!(target.pjrt_version(), client.version());
@@ -323,7 +323,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program: FlatProgram = builder.build(output, vec![Placeholder], vec![Placeholder]).unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
         assert_eq!(lowered.platform_name(), target.platform_name());
         assert_eq!(lowered.platform_version(), target.platform_version());
         let device_kinds = devices.iter().map(|device| device.kind().unwrap().into_owned()).collect::<Vec<_>>();

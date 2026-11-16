@@ -236,7 +236,7 @@ mod tests {
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
         let device_id = device.id().unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = ArrayType::new_static(DataType::I64, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();

@@ -329,11 +329,11 @@ mod tests {
     #[test]
     fn test_select_operation_lower_promotes_signed_one_bit_branches() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let condition = replicated_array(&domain, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
-        let signed = replicated_array(&domain, &mesh, DataType::I1, &[4], &[1, 1, 0, 0]);
-        let wide = replicated_array(&domain, &mesh, DataType::I32, &[4], &values_to_bytes(&[2i32, 3, 4, 5]));
+        let condition = replicated_array(&session, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
+        let signed = replicated_array(&session, &mesh, DataType::I1, &[4], &[1, 1, 0, 0]);
+        let wide = replicated_array(&session, &mesh, DataType::I32, &[4], &values_to_bytes(&[2i32, 3, 4, 5]));
 
         // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Both branch positions
         // are exercised so that recovering the sign cannot depend on the selected side.

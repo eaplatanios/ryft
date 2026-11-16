@@ -1,10 +1,11 @@
 //! XLA backend of `ryft`, which stages `ryft-core` programs, lowers them to StableHLO and Shardy MLIR, and compiles
 //! and executes them through PJRT.
 //!
-//! A [`Session`] borrows one PJRT client and owns its compilation cache, effect scope, and runtime extensions, and a
-//! [`Domain`] obtained from it implements [`ryft_core::Domain`] for the XLA backend. Device data lives in [`Array`]s,
-//! and the [`Value`]s of a domain (i.e., arrays, first-class [`Dimension`]s, and array [`Reference`]s) carry the
-//! domain that they belong to, so eager operations and transforms recover their execution context from their inputs.
+//! A [`Session`] executes on one PJRT client, which a [`SessionBuilder`] creates for a [`Platform`] or borrows from the
+//! caller. It is a cheap handle to the compilation cache and runtime extensions that it creates for that client, and
+//! it implements [`ryft_core::Domain`] for the XLA backend. Device data lives in [`Array`]s,
+//! and the [`Value`]s of a session (i.e., arrays, first-class [`Dimension`]s, and array [`Reference`]s) carry the
+//! session that they belong to, so eager operations and transforms recover their execution context from their inputs.
 //!
 //! The entry points of the compilation lifecycle are [`stage`], which stages a function into a program without
 //! compiling it, [`compile`], which compiles one explicit abstract signature of a function, and [`jit`], which returns
@@ -50,10 +51,10 @@ pub use compilation::{
 };
 pub use distributed::DistributedRuntime;
 pub use domains::{
-    Domain, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError,
-    RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, SessionConstant, Target,
-    TargetDevice, ThroughSession, named_ffi_type_id, normalize_runtime_requirements, runtime_requirements,
-    with_runtime_requirements,
+    ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, Platform, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError,
+    RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, SessionBuilder, SessionConstant,
+    SessionError, Target, TargetDevice, ThroughSession, named_ffi_type_id, normalize_runtime_requirements,
+    runtime_requirements, with_runtime_requirements,
 };
 pub use errors::Error;
 pub use execution::{ExecutionArguments, ExecutionError};
@@ -110,7 +111,7 @@ pub(crate) mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::{Array, Domain, FromPjrt};
+    use crate::{Array, FromPjrt, Session};
 
     /// Creates a CPU client with `device_count` addressable devices, for tests that need a fixed device count or that
     /// exercise CPU-only behavior. Tests that only need some single device use [`execution_client`] instead.
@@ -199,7 +200,7 @@ pub(crate) mod tests {
     /// Uploads `bytes` as an [`Array`] of element type `data_type` and shape `dimensions` that is replicated over
     /// `mesh`. Read it back with [`Array::copy_to_host`] and [`values_from_bytes`].
     pub(crate) fn replicated_array<'c>(
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         mesh: &DeviceMesh,
         data_type: DataType,
         dimensions: &[usize],
@@ -208,7 +209,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::new(data_type, StaticShape::new(dimensions.to_vec()).into())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
             .unwrap();
-        Array::from_host_buffer(domain, r#type, mesh.clone(), bytes).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), bytes).unwrap()
     }
 
     /// Returns the native-endian bytes of `values`, in order.

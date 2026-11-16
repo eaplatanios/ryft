@@ -852,7 +852,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -917,8 +917,8 @@ mod tests {
         let client = cpu_client(1);
         ensure_print_handler_registered(&client).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input = f64_vector(&domain, &mesh, &[1.5, 2.5]);
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let input = f64_vector(&session, &mesh, &[1.5, 2.5]);
 
         // Eager batching binds one print of the whole batch through the `@ryft.print` host callback.
         let (output, lines) = with_captured_prints(|| {
@@ -940,10 +940,10 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let lowered = domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh)).unwrap();
+        let lowered = session.lower_program(staged.source_program().program(), 0, &Options::new(mesh)).unwrap();
         assert!(lowered.stable_hlo().contains("@ryft.print"), "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let (outputs, lines) = with_captured_prints(|| domain.execute_program(&compiled, vec![input]).unwrap());
+        let compiled = session.compile_program(&lowered).unwrap();
+        let (outputs, lines) = with_captured_prints(|| session.execute_program(&compiled, vec![input]).unwrap());
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f64s(&client, &outputs[0]), vec![1.5, 2.5]);

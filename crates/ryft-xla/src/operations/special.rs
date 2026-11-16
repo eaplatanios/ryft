@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn test_erf_operation_lower_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The grid covers every approximation regime of the reference implementation on both signs (i.e., the series
@@ -100,7 +100,7 @@ mod tests {
             -6.5f32, -4.0, -3.0, -2.0, -1.5, -1.0, -0.9, -0.5, -0.1, -1e-3, -1e-10, 0.0, 1e-10, 1e-3, 0.1, 0.5, 0.9,
             1.0, 1.2, 1.25, 2.0, 2.9, 3.0, 4.0, 6.5,
         ];
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
         let device_values = values_from_bytes::<f32>(&input.erf().unwrap().copy_to_host().unwrap());
         let reference_values = CoreArray::vector(values.to_vec()).unwrap().erf().unwrap().to_f64s();
         assert_eq!(device_values.len(), reference_values.len());
@@ -126,13 +126,13 @@ mod tests {
     #[test]
     fn test_erf_operation_lower_f8e8m0fnu_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Cover every encoding of the format with only exponent bits, including the smallest input that the lowering
         // raises and NaN.
         let bytes = (0..=255u8).collect::<Vec<_>>();
-        let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[256], &bytes);
+        let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[256], &bytes);
         let output = input.erf().unwrap().copy_to_host().unwrap();
         assert_eq!(&output[..3], &[1, 1, 2]);
         let reference =

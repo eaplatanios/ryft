@@ -22,7 +22,7 @@ use ryft_core::{
     TracingContext, Typed, ValueProjection, ZeroLike, composite, differentiate_at, rematerialize, saved_residuals,
     scan,
 };
-use ryft_xla::{ArrayTracer, Domain, TracedProgram, trace};
+use ryft_xla::{ArrayTracer, Session, TracedProgram, trace};
 
 use super::{DifferentialObservation, SCHEMA};
 
@@ -32,7 +32,7 @@ use super::{DifferentialObservation, SCHEMA};
 type CoreTracer = Tracer<TracingContext<CoreArray, ArrayOperation<CoreArray>>>;
 
 /// Tracer over which the bodies of the rematerialized functions staged for XLA are traced.
-type XlaTracer = DomainTracer<Domain<'static>>;
+type XlaTracer = DomainTracer<Session<'static>>;
 
 /// Stable identifiers and emitters of the rematerialization cases, in registry order.
 pub(super) const CASES: [(&str, fn() -> Result<DifferentialObservation, Box<dyn Error>>); 20] = [

@@ -415,10 +415,10 @@ fn execute_aot_case<'c>(
         vec![Device::from_pjrt(&device).unwrap()],
     )
     .unwrap();
-    let producer = Session::new(client);
+    let producer = Session::with_client(client);
     let bundle = KernelAotBundle::compile(
         &definition,
-        &producer.domain(),
+        &producer,
         Options::new(mesh.clone()).with_kernel_compiler(binding.clone()),
         1024,
     )
@@ -430,8 +430,8 @@ fn execute_aot_case<'c>(
     drop(bundle);
     drop(producer);
     let restored = KernelAotBundle::from_bytes(&bytes, 1024).unwrap();
-    let runtime = Session::new(client);
-    let loaded = restored.load(&runtime.domain(), &deployment_binding, &mesh).unwrap();
+    let runtime = Session::with_client(client);
+    let loaded = restored.load(&runtime, &deployment_binding, &mesh).unwrap();
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
         .map(|value| runtime.array(r#type.clone(), mesh.clone(), value.to_ne_bytes().repeat(64)).unwrap())
@@ -687,8 +687,7 @@ mod gpu {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = Session::new(client);
-        let domain = session.domain();
+        let session = Session::with_client(client);
         let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
             |inputs: Vec<CompileTracer<'_>>| {
                 let values = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
@@ -704,7 +703,7 @@ mod gpu {
                     .collect()
             },
             input_types.clone(),
-            &domain,
+            &session,
             Options::new(mesh.clone()).with_kernel_compiler(binding),
         )
         .unwrap();
@@ -720,7 +719,7 @@ mod gpu {
             if iteration == warmup {
                 start = Instant::now();
             }
-            let outputs = compiled.executable().execute(&domain, inputs.clone())?;
+            let outputs = compiled.executable().execute(&session, inputs.clone())?;
             assert_eq!(outputs.len(), 1);
             bytes = outputs[0]
                 .device_shard(device.id().unwrap())
@@ -1275,7 +1274,7 @@ mod cutile {
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options as CuTileOptions, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{CuTileEmbedding, KernelCompilerBinding, stage_kernel};
-    use ryft_xla::{Domain, Error, FromPjrt, Session, Value};
+    use ryft_xla::{Error, FromPjrt, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1378,10 +1377,9 @@ mod cutile {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = Session::new(client);
-        let domain = producer.domain();
-        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<ryft_core::CompilationTracer<Domain<'c>>>| {
+        let producer = Session::with_client(client);
+        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<ryft_core::CompilationTracer<Session<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
             vec![],
@@ -1389,15 +1387,15 @@ mod cutile {
             ryft_xla::Options::new(mesh.clone()).with_kernel_compiler(binding),
         )
         .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let executable_bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        let compiled = staged.lower(&producer).unwrap().compile(&producer).unwrap();
+        let executable_bytes = producer.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
         let restored_output =
             CompiledKernel::from_manifest(&verified, output.manifest(), output.artifact().bytes().to_vec()).unwrap();
         assert_eq!(restored_output.artifact().bytes(), output.artifact().bytes());
         assert_eq!(restored_output.arguments(), output.arguments());
-        let runtime_session = Session::new(client);
-        let runtime = runtime_session.domain();
+        let runtime_session = Session::with_client(client);
+        let runtime = runtime_session.clone();
         let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
         let executable = compiled.executable().with_compiled_program(Arc::new(restored));
         let mut arrays = case
@@ -1576,8 +1574,7 @@ mod cutile {
                     Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
                 let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
                 let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
-                let session = Session::new(&client);
-                let domain = session.domain();
+                let session = Session::with_client(&client);
                 let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
                     |input: CompileTracer<'_>| {
                         shard_map(
@@ -1608,7 +1605,7 @@ mod cutile {
                         .unwrap()
                     },
                     r#type.clone(),
-                    &domain,
+                    &session,
                     Options::new(mesh.clone()).with_kernel_compiler(binding),
                 )
                 .unwrap();
@@ -1616,7 +1613,7 @@ mod cutile {
                 let input = session
                     .array(r#type, mesh, expected.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                     .unwrap();
-                let output = compiled.executable().execute(&domain, input).unwrap();
+                let output = compiled.executable().execute(&session, input).unwrap();
                 let bytes = output
                     .device_shard(device.id().unwrap())
                     .unwrap()
@@ -1722,7 +1719,7 @@ mod tuning {
         KernelCompilerBinding, KernelExecutionFacts, KernelOutputEmbedding, KernelTarget, KernelTuner,
         KernelTuningBudget, KernelTuningError, KernelTuningRequest, KernelTuningRunner, stage_kernel,
     };
-    use ryft_xla::{Domain, FromPjrt, Options, Session, Value};
+    use ryft_xla::{FromPjrt, Options, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1730,8 +1727,8 @@ mod tuning {
 
     /// One immutable workload with ordinary compiled-function ownership; no alternate execution engine is introduced.
     struct Runner<'c> {
-        /// Existing XLA execution domain and session owner.
-        domain: Domain<'c>,
+        /// Existing XLA session.
+        session: Session<'c>,
 
         /// Fixed independent oracle and canonical input signature.
         case: KernelCase,
@@ -1743,7 +1740,7 @@ mod tuning {
         bindings: Vec<(KernelSchedule, KernelCompilerBinding)>,
 
         /// Prepared ordinary executable, replaced only between candidates.
-        executable: Option<CoreExecutableFunction<Domain<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
+        executable: Option<CoreExecutableFunction<Session<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
 
         /// Fixed functional inputs reused across all samples.
         inputs: Vec<Value<'c>>,
@@ -1758,8 +1755,8 @@ mod tuning {
                 input.block_until_ready().map_err(error)?;
             }
             let binding = self.bindings.iter().find(|(candidate, _)| candidate == schedule).unwrap().1.clone();
-            let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-                |_, _, inputs: Vec<CompilationTracer<Domain<'c>>>| {
+            let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+                |_, _, inputs: Vec<CompilationTracer<Session<'c>>>| {
                     Ok(stage_kernel(inputs[0].context(), &self.case.definition, &inputs)?)
                 },
                 vec![],
@@ -1768,7 +1765,7 @@ mod tuning {
             )
             .map_err(error)?;
             // The existing lower/compile path performs real adapter admission before artifact lookup.
-            let compiled = staged.lower(&self.domain).map_err(error)?.compile(&self.domain).map_err(error)?;
+            let compiled = staged.lower(&self.session).map_err(error)?.compile(&self.session).map_err(error)?;
             self.executable = Some(compiled.executable().clone());
             Ok(())
         }
@@ -1779,7 +1776,7 @@ mod tuning {
                     .executable
                     .as_ref()
                     .unwrap()
-                    .execute_statefully_and_wait(&self.domain, self.inputs.clone())
+                    .execute_statefully_and_wait(&self.session, self.inputs.clone())
                     .map_err(error)?;
                 let Value::Array(output) = &outputs[0] else {
                     return Err(KernelTuningError::Invalid { message: "expected an ordinary array output".into() });
@@ -1835,7 +1832,7 @@ mod tuning {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = Session::new(client);
+        let session = Session::with_client(client);
         let facts = KernelExecutionFacts::from_target(session.target().unwrap(), &mesh).unwrap();
         let candidates = vec![
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(1).unwrap()),
@@ -1892,7 +1889,7 @@ mod tuning {
                 )
             })
             .collect();
-        let mut runner = Runner { domain: session.domain(), case, mesh, bindings, executable: None, inputs };
+        let mut runner = Runner { session: session.clone(), case, mesh, bindings, executable: None, inputs };
         let result = KernelTuner::new(None).run(&request, &mut runner, cancellation).unwrap();
         assert_eq!(result.samples().iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
         assert!(result.best_candidate() < request.candidates().len());
@@ -2272,7 +2269,7 @@ mod triton {
     use ryft_kernels::{KernelCompiler, KernelSchedule};
     use ryft_triton::kernels::{Compiler, Options as TritonOptions, Target};
     use ryft_xla::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
-    use ryft_xla::{Domain, FromPjrt, Options, Session, Value};
+    use ryft_xla::{FromPjrt, Options, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -2309,10 +2306,9 @@ mod triton {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = Session::new(client);
-        let domain = producer.domain();
-        let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<ryft_core::CompilationTracer<Domain<'c>>>| {
+        let producer = Session::with_client(client);
+        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<ryft_core::CompilationTracer<Session<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
             vec![],
@@ -2320,11 +2316,11 @@ mod triton {
             Options::new(mesh.clone()).with_kernel_compiler(binding),
         )
         .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        let compiled = staged.lower(&producer).unwrap().compile(&producer).unwrap();
+        let bytes = producer.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
-        let session = Session::new(client);
-        let runtime = session.domain();
+        let session = Session::with_client(client);
+        let runtime = session.clone();
         let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
         let executable = compiled.executable().with_compiled_program(Arc::new(restored));
         let inputs = case

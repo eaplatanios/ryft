@@ -1,8 +1,8 @@
-//! Compilation of staged programs for the XLA [`Domain`](crate::Domain).
+//! Compilation of staged programs for the XLA [`Session`](crate::Session).
 //!
 //! This module mirrors [`ryft_core::compilation`]. [`functions`] holds the typed entry points (i.e., [`stage`],
 //! [`compile`], and [`jit`]) and the function handles that they return. [`domains`] implements the lifecycle of
-//! [`ryft_core::CompilationDomain`] for the domain, which lowers a staged program into a [`LoweredProgram`] and
+//! [`ryft_core::CompilationDomain`] for the session, which lowers a staged program into a [`LoweredProgram`] and
 //! compiles it into a [`CompiledProgram`]. [`options`] configures a compilation, [`keys`] identifies retained
 //! specializations and cached artifacts, [`persistence`] serializes compiled programs, [`analysis`] exposes compiler
 //! diagnostics, and [`profile_guided`] recompiles a function from execution profiles.

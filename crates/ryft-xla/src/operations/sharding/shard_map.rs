@@ -418,8 +418,8 @@ pub(crate) mod tests {
     };
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Domain, ExecutionArguments, FromPjrt, Options, Reference, Session,
-        TracedProgram, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
+        Array, ArrayConstant, ArrayTracer, ExecutionArguments, FromPjrt, Options, Reference, Session, TracedProgram,
+        Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
     };
 
     use super::*;
@@ -450,7 +450,7 @@ pub(crate) mod tests {
     fn bind_doubling_shard_map(x: ArrayTracer, boundary: ShardMapBoundary) -> Result<ArrayTracer, ProgramError> {
         let global_type = boundary.global_input_type(0, &x.r#type())?;
         let local_type = boundary.local_input_type(0, &global_type)?;
-        let (_, body) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, body) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let y = ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
                 Ok(vec![(y.clone() + y).into_value()])
@@ -920,15 +920,15 @@ pub(crate) mod tests {
         let devices = client.addressable_devices().unwrap();
         let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
         let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
-        let domain = Session::new(client).domain();
+        let session = Session::with_client(client);
         let inputs = input_types
             .into_iter()
             .zip(input_bytes)
-            .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+            .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
             .collect();
-        let lowered = domain.lower_program(&xla_program, 0, &Options::new(mesh)).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let outputs = domain.execute_program(&compiled, inputs).unwrap();
+        let lowered = session.lower_program(&xla_program, 0, &Options::new(mesh)).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session.execute_program(&compiled, inputs).unwrap();
         let outputs = outputs
             .iter()
             .map(|output| {
@@ -995,18 +995,18 @@ pub(crate) mod tests {
         let devices = client.addressable_devices().unwrap();
         let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
         let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
-        let domain = Session::new(client).domain();
+        let session = Session::with_client(client);
         let xla_values = |types: &[ArrayType], bytes: &[Vec<u8>]| {
             types
                 .iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), bytes).unwrap())
                 .collect::<Vec<_>>()
         };
         let execute = |program: &FlatProgram, inputs: Vec<_>| {
-            let lowered = domain.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            domain.execute_program(&compiled, inputs).unwrap()
+            let lowered = session.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
+            session.execute_program(&compiled, inputs).unwrap()
         };
         let mut primal_outputs = execute(xla.primal(), xla_values(&input_types, &input_bytes));
         let residuals = primal_outputs.split_off(primal_outputs.len() - xla.residual_count());
@@ -1457,7 +1457,7 @@ pub(crate) mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -1500,7 +1500,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
 
         let input_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -1630,7 +1630,7 @@ pub(crate) mod tests {
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         let global_input_type =
             ArrayType::new_static(DataType::F32, [8]).with_sharding(input_sharding.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
@@ -1739,7 +1739,7 @@ pub(crate) mod tests {
         let mesh = test_manual_mesh("x", 4);
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let global_type = ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
@@ -2257,7 +2257,7 @@ pub(crate) mod tests {
         let mesh = test_manual_mesh("x", 2);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
@@ -2510,7 +2510,7 @@ pub(crate) mod tests {
         let mesh = test_manual_mesh("x", 2);
         let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [1]).with_sharding(reduced.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
@@ -2679,7 +2679,7 @@ pub(crate) mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
             .expect("failed to create 8-device CPU client");
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
@@ -2766,14 +2766,14 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
 
         let left_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[8, 4], left_sharding.clone()),
             device_mesh.clone(),
             left_buffers,
         )
         .unwrap();
         let right_array = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4, 2], right_sharding),
             device_mesh,
             right_buffers,
@@ -2837,7 +2837,7 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let replicated = Sharding::replicated(logical_mesh.clone(), 0);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
@@ -2858,7 +2858,7 @@ pub(crate) mod tests {
                 Ok((r, (cosine * cotangent * state).into_value()))
             },
         );
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let (value, gradient) = inputs[0]
                     .domain()
@@ -2890,12 +2890,12 @@ pub(crate) mod tests {
             vec![ArrayIrType::Array(input_type.clone())],
         )
         .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let inputs = [0.25f32, 0.5, 1.0, 2.0];
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&inputs).as_slice()).unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&inputs).as_slice()).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
         let shards = |array: &Array<'_>| {
             array
                 .addressable_shards()
@@ -2935,11 +2935,11 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let along_x_and_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
         let caller_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x_and_y).unwrap();
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let input =
                     ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
@@ -2958,8 +2958,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
-        let lowered = domain.lower_program(&pullback, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&pullback, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
 
         // The serialized optimized HLO module names the opcode of every instruction (e.g., of its `parameter`), so it
         // names no collective opcode.
@@ -2973,13 +2973,13 @@ pub(crate) mod tests {
 
         let cotangent_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x).unwrap();
         let cotangent = Array::from_host_buffer(
-            &domain,
+            &session,
             cotangent_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![cotangent]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![cotangent]).unwrap();
         assert_eq!(outputs[0].r#type().as_ref(), &caller_type);
         let shards = outputs[0]
             .addressable_shards()
@@ -3007,7 +3007,7 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let input_sharding = Sharding::new(
             logical_mesh.clone(),
@@ -3015,7 +3015,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(input_sharding).unwrap();
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let output = batch(
                     |item| {
@@ -3040,7 +3040,7 @@ pub(crate) mod tests {
             vec![ArrayIrType::Array(input_type.clone())],
         )
         .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(
             lowered.stable_hlo(),
             indoc! {"
@@ -3058,15 +3058,15 @@ pub(crate) mod tests {
                 }
             "},
         );
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let input = Array::from_host_buffer(
-            &domain,
+            &session,
             input_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
         let items = outputs[0]
             .addressable_shards()
             .map(|shard| {
@@ -3121,30 +3121,30 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
         let inputs = program.input_types().into_owned();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
             |inputs| program.interpret_in_context(inputs[0].context(), inputs.clone()).map_err(Into::into),
             inputs,
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
         let tangent_reference = ArrayReference::new(array(&[23.0, 29.0, 31.0, 37.0]));
         let outputs = compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 vec![
-                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(reference.clone(), session.clone())),
                     Value::Array(array(&[11.0, 13.0, 17.0, 19.0])),
-                    Value::Reference(Reference::new(tangent_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(tangent_reference.clone(), session.clone())),
                     Value::Array(array(&[41.0, 43.0, 47.0, 53.0])),
                 ],
             )
@@ -3166,7 +3166,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
         let mut input_types = program.input_types().into_owned();
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
@@ -3190,22 +3190,22 @@ pub(crate) mod tests {
                 Ok(vec![output, cotangents.remove(1)])
             },
             input_types,
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
         };
         let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
         let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
         let outputs = compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 vec![
-                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(reference.clone(), session.clone())),
                     Value::Array(array(&array_type, &[11.0, 13.0, 17.0, 19.0])),
-                    Value::Reference(Reference::new(destination.clone(), domain.clone())),
+                    Value::Reference(Reference::new(destination.clone(), session.clone())),
                     Value::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0])),
                 ],
             )
@@ -3229,7 +3229,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharding = Sharding::replicated(logical_mesh.clone(), 1);
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
@@ -3268,21 +3268,21 @@ pub(crate) mod tests {
                 Ok(vec![context.bind(ReferenceReadOperation::new(), Vec::new(), &outputs)?.remove(0)])
             },
             vec![ArrayIrType::Array(array_type.clone()), reference_type.clone()],
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let destination = ArrayReference::new(array(&[5.0, 7.0]));
         compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 vec![
                     Value::Array(array(&[1.0, 2.0])),
-                    Value::Reference(Reference::new(destination.clone(), domain.clone())),
+                    Value::Reference(Reference::new(destination.clone(), session.clone())),
                 ],
             )
             .unwrap();
@@ -3295,7 +3295,7 @@ pub(crate) mod tests {
         // devices hold `[2, 4]` afterwards.
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
@@ -3305,17 +3305,17 @@ pub(crate) mod tests {
                 Ok(Vec::new())
             },
             vec![reference_type],
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
+            Array::from_host_buffer(&session, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
         );
         compiled
             .execute_statefully_and_wait(
-                &domain,
-                vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+                &session,
+                vec![Value::Reference(Reference::new(reference.clone(), session.clone()))],
             )
             .unwrap();
         assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), vec![2.0, 4.0, 2.0, 4.0]);
@@ -3328,7 +3328,7 @@ pub(crate) mod tests {
         // logical destination `[5, 7]`, uploaded as the summands `[5, 7]` and `[0, 0]`, becomes `[10, 14]`.
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let cotangent_type =
@@ -3341,17 +3341,17 @@ pub(crate) mod tests {
                 Ok(Vec::new())
             },
             vec![cotangent_reference_type],
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let destination = ArrayReference::new(
-            Array::from_host_buffer(&domain, cotangent_type, mesh, values_to_bytes(&[5f32, 7.0]).as_slice()).unwrap(),
+            Array::from_host_buffer(&session, cotangent_type, mesh, values_to_bytes(&[5f32, 7.0]).as_slice()).unwrap(),
         );
         compiled
             .execute_statefully_and_wait(
-                &domain,
-                vec![Value::Reference(Reference::new(destination.clone(), domain.clone()))],
+                &session,
+                vec![Value::Reference(Reference::new(destination.clone(), session.clone()))],
             )
             .unwrap();
         let destination = destination.read().unwrap();
@@ -3367,7 +3367,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
@@ -3416,14 +3416,14 @@ pub(crate) mod tests {
                 ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
                 ArrayIrType::Array(sharded_type.clone()),
             ),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
 
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &domain,
+                &session,
                 sharded_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -3431,7 +3431,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &domain,
+            &session,
             sharded_type,
             mesh,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -3439,8 +3439,8 @@ pub(crate) mod tests {
         .unwrap();
         let Value::Array(output) = compiled
             .execute_statefully_and_wait(
-                &domain,
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                &session,
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
             )
             .unwrap()
         else {
@@ -3464,7 +3464,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
@@ -3519,14 +3519,14 @@ pub(crate) mod tests {
                 ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
                 ArrayIrType::Array(sharded_type.clone()),
             ),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
 
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &domain,
+                &session,
                 replicated_type,
                 mesh.clone(),
                 values_to_bytes::<f32>(&[100.0, 200.0]).as_slice(),
@@ -3534,7 +3534,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &domain,
+            &session,
             sharded_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -3542,8 +3542,8 @@ pub(crate) mod tests {
         .unwrap();
         let Value::Array(output) = compiled
             .execute_statefully_and_wait(
-                &domain,
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                &session,
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
             )
             .unwrap()
         else {
@@ -3573,7 +3573,7 @@ pub(crate) mod tests {
                     Ok(context
                         .shard_map(
                             |context: &ProjectedContext<
-                                DomainTracingContext<DomainTracingContext<Domain<'static>>>,
+                                DomainTracingContext<DomainTracingContext<Session<'static>>>,
                                 ArrayType,
                             >,
                              ()| { context.axis_index("x")?.reshape([1]) },
@@ -3641,7 +3641,7 @@ pub(crate) mod tests {
     fn test_shard_map_operation_lower_executes_checked_variation_gradients_on_cpu() {
         for device_count in [1, 2] {
             let client = cpu_client(device_count);
-            let domain = Session::new(&client).domain();
+            let session = Session::with_client(&client);
             let client_devices = client.addressable_devices().unwrap();
             assert_eq!(client_devices.len(), device_count);
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3880,14 +3880,14 @@ pub(crate) mod tests {
                 .collect();
             let inputs = vec![
                 Array::from_addressable_buffers(
-                    &domain,
+                    &session,
                     static_sharded_array_type(DataType::F32, &[], replicated),
                     device_mesh.clone(),
                     shared_buffers,
                 )
                 .unwrap(),
                 Array::from_addressable_buffers(
-                    &domain,
+                    &session,
                     static_sharded_array_type(DataType::F32, &[device_count], sharded),
                     device_mesh,
                     weight_buffers,
@@ -3957,7 +3957,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_nested_variation_gradients_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -4047,14 +4047,14 @@ pub(crate) mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[], replicated),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[4], global),
                 device_mesh,
                 weight_buffers,
@@ -4092,7 +4092,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_mixed_variation_gradients_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -4179,14 +4179,14 @@ pub(crate) mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[2], shared_sharding),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[2, 2], global),
                 device_mesh,
                 weight_buffers,
@@ -4227,7 +4227,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_gather_gradient_with_varying_indices_on_cpu() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4339,21 +4339,21 @@ pub(crate) mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[3], replicated),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[4], sharded),
                 device_mesh,
                 seed_buffers,
@@ -4395,7 +4395,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_sort_jvp_with_varying_keys_on_cpu() {
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4491,21 +4491,21 @@ pub(crate) mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[2], replicated.clone()),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &domain,
+                &session,
                 static_sharded_array_type(DataType::F32, &[2], replicated),
                 device_mesh,
                 seed_buffers,
@@ -4551,7 +4551,7 @@ pub(crate) mod tests {
         type AttentionDomain = EagerContext<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4637,11 +4637,12 @@ pub(crate) mod tests {
             .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let inputs = vec![
-            Array::from_host_buffer(&domain, query_type, device_mesh.clone(), values_to_bytes(&[0.0f32])).unwrap(),
-            Array::from_host_buffer(&domain, key_type, device_mesh.clone(), values_to_bytes(&[0.0f32, 1.0, 0.0, 3.0]))
+            Array::from_host_buffer(&session, query_type, device_mesh.clone(), values_to_bytes(&[0.0f32])).unwrap(),
+            Array::from_host_buffer(&session, key_type, device_mesh.clone(), values_to_bytes(&[0.0f32, 1.0, 0.0, 3.0]))
                 .unwrap(),
-            Array::from_host_buffer(&domain, value_type, device_mesh.clone(), values_to_bytes(&[2.0f32, 6.0])).unwrap(),
-            Array::from_host_buffer(&domain, seed_type, device_mesh, values_to_bytes(&[2.0f32, 5.0])).unwrap(),
+            Array::from_host_buffer(&session, value_type, device_mesh.clone(), values_to_bytes(&[2.0f32, 6.0]))
+                .unwrap(),
+            Array::from_host_buffer(&session, seed_type, device_mesh, values_to_bytes(&[2.0f32, 5.0])).unwrap(),
         ];
         let device_ids = executable
             .addressable_devices()
@@ -4671,7 +4672,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_varying_while_predicate_gradient_on_cpu() {
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4795,7 +4796,7 @@ pub(crate) mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
             buffers,
@@ -4839,10 +4840,10 @@ pub(crate) mod tests {
         // shard.
         type BatchedShardMapTracer = ProjectedValue<
             ArrayType,
-            DomainTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>,
+            DomainTracer<BatchingContext<DomainTracingContext<Session<'static>>, ArrayIrBatchingPolicy>>,
         >;
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4924,7 +4925,7 @@ pub(crate) mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[3, 8], batched_sharding),
             device_mesh,
             buffers,
@@ -4975,10 +4976,10 @@ pub(crate) mod tests {
         // coordinate along `y`, and the result for every item is what the unbatched `shard_map` yields for that item.
         type BatchedShardMapTracer = ProjectedValue<
             ArrayType,
-            DomainTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>,
+            DomainTracer<BatchingContext<DomainTracingContext<Session<'static>>, ArrayIrBatchingPolicy>>,
         >;
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -5075,7 +5076,7 @@ pub(crate) mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &domain,
+            &session,
             static_sharded_array_type(DataType::F32, &[4, 8], batched_sharding),
             device_mesh,
             buffers,
@@ -5374,7 +5375,7 @@ pub(crate) mod tests {
         // and the second map squares each summand of that unreduced input. The devices return `[1]` and `[4]`, whose
         // sum `5` host materialization recovers.
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = test_manual_mesh("x", 2);
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
@@ -5386,10 +5387,10 @@ pub(crate) mod tests {
         let unreduced = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let options = ShardMapOptions::new().with_check_manual_variation(false);
         let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap();
-        let input = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
         let summands = shard_map(Ok, input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
         let squares = shard_map(
-            |summand: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(summand.clone() * summand),
+            |summand: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(summand.clone() * summand),
             summands,
             logical_mesh,
             unreduced.clone(),
@@ -5419,7 +5420,7 @@ pub(crate) mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let replicated = Sharding::replicated(map_mesh.clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(
@@ -5455,10 +5456,10 @@ pub(crate) mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.])).unwrap();
-        let Value::Array(output) = compiled.executable().execute(&domain, Value::Array(input)).unwrap() else {
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.])).unwrap();
+        let Value::Array(output) = compiled.executable().execute(&session, Value::Array(input)).unwrap() else {
             panic!("the compiled function returned a dimension");
         };
         let items = output
@@ -5487,7 +5488,7 @@ pub(crate) mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let replicated = Sharding::replicated(map_mesh.clone(), 0);
         let input_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -5523,9 +5524,9 @@ pub(crate) mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let input = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
-        let Value::Array(output) = compiled.executable().execute(&domain, Value::Array(input)).unwrap() else {
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let Value::Array(output) = compiled.executable().execute(&session, Value::Array(input)).unwrap() else {
             panic!("the compiled function returned a dimension");
         };
         let blocks = output
@@ -5544,7 +5545,7 @@ pub(crate) mod tests {
         // declares one mesh, which assigns device ids to coordinates, while `axis_index` computes coordinates from the
         // axis order of the mesh of its own map, so maps over meshes with other axis orders must not share a module.
         let client = cpu_client(4);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = test_logical_mesh_2x2();
         let reordered_mesh = LogicalMesh::new(vec![
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -5599,7 +5600,7 @@ pub(crate) mod tests {
                     (replicate(first), replicate(second))
                 },
                 input_type.clone(),
-                &domain,
+                &session,
                 device_mesh,
             )
         };
@@ -5607,8 +5608,8 @@ pub(crate) mod tests {
         // Maps over meshes with the same axis order agree on the coordinates of every device.
         let compiled = compile_maps(&mesh, device_mesh(&mesh)).unwrap();
         let input =
-            Array::from_host_buffer(&domain, input_type.clone(), device_mesh(&mesh), 0f32.to_ne_bytes()).unwrap();
-        let (first, second) = compiled.executable().execute(&domain, input).unwrap();
+            Array::from_host_buffer(&session, input_type.clone(), device_mesh(&mesh), 0f32.to_ne_bytes()).unwrap();
+        let (first, second) = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(values_from_bytes::<u64>(&first.copy_to_host().unwrap()), vec![0, 1]);
         assert_eq!(values_from_bytes::<u64>(&second.copy_to_host().unwrap()), vec![0, 1]);
 
@@ -5638,7 +5639,7 @@ pub(crate) mod tests {
         // result tiled like the output of the map, and every device returns one element instead of both. The first
         // output has no placement and the second one is replicated explicitly.
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh = || {
             let devices = client.addressable_devices().unwrap();
@@ -5676,12 +5677,12 @@ pub(crate) mod tests {
                 (broadcast(unplaced_type), broadcast(replicated_type))
             },
             input_type.clone(),
-            &domain,
+            &session,
             device_mesh(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&domain, input_type, device_mesh(), 0f32.to_ne_bytes()).unwrap();
-        let (unplaced, replicated) = compiled.executable().execute(&domain, input).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, device_mesh(), 0f32.to_ne_bytes()).unwrap();
+        let (unplaced, replicated) = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(values_from_bytes::<u64>(&unplaced.copy_to_host().unwrap()), vec![0, 1]);
         assert_eq!(values_from_bytes::<u64>(&replicated.copy_to_host().unwrap()), vec![0, 1]);
     }

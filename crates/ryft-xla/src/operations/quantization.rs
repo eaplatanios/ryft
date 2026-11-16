@@ -21,7 +21,7 @@ use crate::lowering::types::{
     lower_tensor_type, physical_bound_type,
 };
 use crate::operations::FlatProgram;
-use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session};
 
 /// Traces the canonical scaled dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
@@ -29,7 +29,7 @@ pub(crate) fn trace_scaled_dot_composition(
     input_types: &[ArrayType],
 ) -> Result<FlatProgram, Error> {
     let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
-    let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+    let (_, program) = DomainTracingContext::<Session<'static>>::trace(
         |inputs: Vec<Tracer<'static>>| {
             let [left, right, left_scale, right_scale] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() });
@@ -553,7 +553,7 @@ mod tests {
     use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Domain, FromPjrt, LoweringError, Session, compile,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, Session, compile,
         to_mlir_module_for_program,
     };
 
@@ -708,7 +708,7 @@ mod tests {
         // `f32` product on both backends. Every element, scale, product, and sum is exact, so the comparison is exact
         // whether XLA runs the portable decomposition of the `xla.scaled_dot` composite or a native kernel.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let element_candidates = [0f64, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
         let elements = |seed: usize| {
@@ -725,8 +725,8 @@ mod tests {
         let reference_right = BlockQuantizedValue::new(elements(3), scales([2.0, 0.5]));
         let device = |value: &BlockQuantizedValue<CoreArray>| {
             BlockQuantizedValue::new(
-                replicated_array(&domain, &mesh, DataType::F4E2M1FN, &[2, 16], &value.elements.logical_bytes()),
-                replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2, 1], &value.scales.logical_bytes()),
+                replicated_array(&session, &mesh, DataType::F4E2M1FN, &[2, 16], &value.elements.logical_bytes()),
+                replicated_array(&session, &mesh, DataType::F8E4M3FN, &[2, 1], &value.scales.logical_bytes()),
             )
         };
 
@@ -1145,7 +1145,7 @@ mod tests {
         {
             let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent)]));
-            let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+            let (_, program) = DomainTracingContext::<Session<'static>>::trace(
                 |inputs: Vec<Tracer<'static>>| {
                     let BlockQuantizedValue { elements, scales, .. } =
                         inputs[0].block_quantize(4, element_type, scale_type)?;
@@ -1189,7 +1189,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let placed = |data_type: DataType, shape: &[usize]| {
             ArrayType::new_static(data_type, shape.to_vec())
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))
@@ -1197,7 +1197,7 @@ mod tests {
         };
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         let configuration = BlockScaledDotConfiguration::nvfp4_training(dimensions);
-        let function = block_scaled_dot::<ProjectedContext<Domain<'_>, ArrayType>>(configuration.clone()).unwrap();
+        let function = block_scaled_dot::<ProjectedContext<Session<'_>, ArrayType>>(configuration.clone()).unwrap();
         let compiled: CompiledFunction<
             '_,
             (ArrayType, ArrayType, ArrayType, ArrayType),
@@ -1217,7 +1217,7 @@ mod tests {
                 placed(DataType::F32, &[32, 16]),
                 placed(DataType::U64, &[2]),
             ),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
@@ -1226,12 +1226,12 @@ mod tests {
         };
         let (left, right, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
         let device = |data_type: DataType, shape: &[usize], bytes: Vec<u8>| {
-            Array::from_host_buffer(&domain, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
+            Array::from_host_buffer(&session, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
         };
         let outputs = compiled
             .executable()
             .execute(
-                &domain,
+                &session,
                 (
                     device(DataType::F32, &[32, 32], values_to_bytes(&left)),
                     device(DataType::F32, &[16, 32], values_to_bytes(&right)),

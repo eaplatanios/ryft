@@ -24,7 +24,7 @@ use crate::lowering::LoweringError;
 use crate::operations::assertions::ensure_assertion_handler_registered;
 use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
 use crate::{
-    ArrayTracer, Domain, FlatProgram, JitCallOperation, ProgramBuilder as ArrayIrProgramBuilder, TracedProgram, trace,
+    ArrayTracer, FlatProgram, JitCallOperation, ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram, trace,
     trace_with_context,
 };
 
@@ -90,7 +90,7 @@ where
     Output: Parameterized<ArrayType>,
     Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
     F: FnOnce(
-        &ProjectedContext<DomainTracingContext<Domain<'static>>, ArrayType>,
+        &ProjectedContext<DomainTracingContext<Session<'static>>, ArrayType>,
         Input::To<ArrayTracer>,
     ) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {

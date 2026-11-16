@@ -37,7 +37,7 @@ use crate::lowering::{CollectiveLoweringState, EffectTokens, collect_session_con
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::{FlatProgram, Operation, Program};
-use crate::{Constant, Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Value};
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Value};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -677,10 +677,10 @@ where
 // callee saves interior values asks this operation to split the call on residual demand (refer to
 // `PartiallyEvaluatableOperation::split_on_residual_demand`). That split binds a known call that also returns those
 // values and a replay call that recomputes the demanded outputs from them, as JAX's `_pjit_partial_eval_custom` does.
-// Whether the mixed call's known inputs are concrete values of an eager known-side context or tracers into a live
-// outer trace does not matter, as in JAX's call partial evaluation rules, which always bind the known call. The known
-// side is bound through the default fold-or-residualize policy, which compiles and executes it under an eager context
-// (e.g., [`Domain`](crate::Domain)) and stages it into the outer program under a staging context. The `shard_map` rule
+// Whether the mixed call's known inputs are concrete values of an eager known-side context or tracers into a live outer
+// trace does not matter, as in JAX's call partial evaluation rules, which always bind the known call. The known side is
+// bound through the default fold-or-residualize policy, which compiles and executes it under an eager context (e.g.,
+// [`Session`](crate::Session)) and stages it into the outer program under a staging context. The `shard_map` rule
 // follows the same policy.
 //
 // When a split fires, the callee is split through the shared
@@ -823,7 +823,7 @@ where
 
 // Batching rule for [`JitCallOperation`]. The callee region is rebatched over the mapped input axes through
 // [`BatchingDriver::batch_program`], and the batched call is bound through `context.parent()` with the batched callee
-// attached again. An eager client-backed parent (e.g., [`Domain`](crate::Domain)) compiles and executes the batched
+// attached again. An eager client-backed parent (e.g., [`Session`](crate::Session)) compiles and executes the batched
 // call immediately, a staging parent stages it into the enclosing program, and a differentiation parent dispatches it
 // through its own `jit_call` JVP rule, which is what serves `vmap` nested inside `gradient` and `linearize` closures.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
@@ -943,7 +943,7 @@ where
 // as JAX's `_pjit_jvp` does. An enclosing partial evaluation then splits that call with its own residual policy.
 // Otherwise, it binds a primal `jit_call` and a tangent `jit_call` as ordinary XLA [`Operation`] values through the
 // active context. A staging context stages both calls over its shared builder, while an eager context (e.g., a
-// client-backed [`Domain`](crate::Domain)) compiles and executes them immediately.
+// client-backed [`Session`](crate::Session)) compiles and executes them immediately.
 //
 // Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`. Rather than capturing the primal inputs as residual
 // factors and staging a linear `jit_call`, the separate form keeps the compilation boundary and threads every residual
@@ -1349,15 +1349,15 @@ where
 // Eager interpretation of a staged `jit_call` operation over concrete [`Array`](crate::Array)s. Top-level flat programs
 // containing `jit_call` instructions (e.g., the pullbacks produced by eager `vjp` and `grad`) replay through
 // [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
-// region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
+// region to [`Context::bind`] so the call is compiled whole through this session's dispatch cache and executed on its
 // PJRT client. This mirrors JAX dispatching a `jit`-compiled function called from eager code straight to the compiled
 // executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
 // entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
-// through this same domain.
-impl<'c> InterpretableOperation<Domain<'c>> for JitCallOperation<ArrayIrType> {
-    fn interpret<D: InterpretationDriver<Domain<'c>>>(
+// through this same session.
+impl<'c> InterpretableOperation<Session<'c>> for JitCallOperation<ArrayIrType> {
+    fn interpret<D: InterpretationDriver<Session<'c>>>(
         &self,
-        context: &Domain<'c>,
+        context: &Session<'c>,
         driver: &D,
         inputs: &[Value<'c>],
     ) -> Result<Vec<Value<'c>>, ProgramError> {
@@ -3731,7 +3731,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
         let value_type = value_type.unwrap();
         let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
@@ -3813,17 +3813,17 @@ mod tests {
                     (outputs.next().unwrap(), outputs.next().unwrap(), outputs.next().unwrap())
                 },
                 (value_type.clone(), value_type.clone(), extent_type.clone()),
-                &domain,
+                &session,
                 mesh.clone(),
             )
             .unwrap();
         let array = |r#type: &ArrayType, bytes: Vec<u8>| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), bytes).unwrap()
         };
         let (previous, extent, state) = compiled
             .executable()
             .execute(
-                &domain,
+                &session,
                 (
                     array(&value_type, values_to_bytes(&[3f32])),
                     array(&value_type, values_to_bytes(&[4f32])),
@@ -4136,14 +4136,14 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_splits_concrete_known_inputs() {
-        // Partial evaluation splits a mixed `jit_call` whose known inputs are concrete arrays of the eager XLA domain
+        // Partial evaluation splits a mixed `jit_call` whose known inputs are concrete arrays of the eager XLA session
         // exactly as it splits one whose known inputs are symbolic. The known-side call compiles and executes
         // immediately, so the output `a + a` is known and concrete, and the residual call keeps only `(a + a) * x`,
         // fed by that known output (JAX's `out_fwd`).
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
         let r#type = ArrayIrType::Array(array_type.clone());
 
@@ -4176,7 +4176,7 @@ mod tests {
 
         let array = |values: &[f64]| {
             let bytes = values_to_bytes::<f64>(values);
-            Value::Array(Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes).unwrap())
+            Value::Array(Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), bytes).unwrap())
         };
         let read = |value: &Value<'_>| {
             let Value::Array(array) = value else {
@@ -4187,7 +4187,7 @@ mod tests {
         };
         let evaluation = program
             .partially_evaluate_in_context(
-                &domain,
+                &session,
                 &[PartialValue::Known(array(&[1.0, 2.0, 3.0, 4.0])), PartialValue::Unknown(r#type.clone())],
             )
             .unwrap();
@@ -4213,7 +4213,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        let outputs = evaluation.interpret(&domain, &[array(&[5.0, 6.0, 7.0, 8.0])]).unwrap();
+        let outputs = evaluation.interpret(&session, &[array(&[5.0, 6.0, 7.0, 8.0])]).unwrap();
         assert_eq!(
             outputs.iter().map(read).collect::<Vec<_>>(),
             vec![vec![2.0, 4.0, 6.0, 8.0], vec![10.0, 24.0, 42.0, 64.0]],
@@ -6539,7 +6539,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();

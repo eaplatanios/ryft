@@ -1882,9 +1882,9 @@ mod tests {
         // extent that array IR batching threads through the batched branches.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let value = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
-            Value::Array(replicated_array(&domain, &mesh, data_type, dimensions, bytes))
+            Value::Array(replicated_array(&session, &mesh, data_type, dimensions, bytes))
         };
         let read = |value: Value<'_>| {
             let array = program_array(&value);

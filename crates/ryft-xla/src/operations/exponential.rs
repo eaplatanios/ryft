@@ -875,11 +875,11 @@ mod tests {
     #[test]
     fn test_log_operation_lower_f8e8m0fnu() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The logarithm of one in a format with only exponent bits is an unrepresentable zero and converts to NaN.
-        let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
+        let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
         assert_eq!(input.log().unwrap().copy_to_host().unwrap(), vec![255]);
     }
 
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn test_logistic_operation_lower_saturated() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The derivative `logistic(x) · logistic(-x)` evaluates both sign branches of the lowering, so neither
@@ -1010,8 +1010,8 @@ mod tests {
         // tolerances.
         let expected = (-700f64).exp();
         let input =
-            replicated_array(&domain, &mesh, DataType::F64, &[2], values_to_bytes(&[-700f64, 700.0]).as_slice());
-        let tangent = replicated_array(&domain, &mesh, DataType::F64, &[2], values_to_bytes(&[1f64, 1.0]).as_slice());
+            replicated_array(&session, &mesh, DataType::F64, &[2], values_to_bytes(&[-700f64, 700.0]).as_slice());
+        let tangent = replicated_array(&session, &mesh, DataType::F64, &[2], values_to_bytes(&[1f64, 1.0]).as_slice());
         let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
         let output = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         let derivative = values_from_bytes::<f64>(&derivative.copy_to_host().unwrap());
@@ -1022,14 +1022,14 @@ mod tests {
 
         // Complex inputs select the branch by their real component and keep exact zero imaginary components.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[2],
             values_to_bytes(&[Complex::new(-700f64, 0.0), Complex::new(700.0, 0.0)]).as_slice(),
         );
         let tangent = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[2],
@@ -1048,23 +1048,23 @@ mod tests {
     #[test]
     fn test_lower_log_add_exp_to_mlir() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Narrow formats evaluate the whole composition in `f32` and round only the final output, here for an
         // format with only exponent bits and for a half precision format.
-        let left = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
-        let right = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[1], &[126]);
+        let left = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
+        let right = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[126]);
         assert_eq!(left.log_add_exp(&right).unwrap().copy_to_host().unwrap(), vec![127]);
         let left = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::F16,
             &[2],
             values_to_bytes(&[f16::from_f32(0.5), f16::from_f32(-5.0)]).as_slice(),
         );
         let right = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::F16,
             &[2],
@@ -1078,14 +1078,14 @@ mod tests {
         // Infinities of the same sign and NaN operands take the plain `a + b` arm, so `+∞` absorbs, `-∞` is the
         // identity, and NaN propagates.
         let left = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::F32,
             &[4],
             values_to_bytes(&[f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NAN]).as_slice(),
         );
         let right = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::F32,
             &[4],
@@ -1100,10 +1100,10 @@ mod tests {
     #[test]
     fn test_lower_log_add_exp_to_mlir_complex() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let c128_vector = |value: Complex<f64>| {
-            replicated_array(&domain, &mesh, DataType::C128, &[1], values_to_bytes(&[value]).as_slice())
+            replicated_array(&session, &mesh, DataType::C128, &[1], values_to_bytes(&[value]).as_slice())
         };
 
         // Complex outputs wrap the phase onto the principal logarithm branch. The phase rotation rounds in the last
@@ -1115,7 +1115,7 @@ mod tests {
 
         // A tiny phase that is already principal is kept rather than lost by adding and subtracting π.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[1],
@@ -1151,13 +1151,13 @@ mod tests {
     #[test]
     fn test_lower_complex_exp_m1_to_mlir() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Tiny arguments keep both tiny components, and the real component keeps the `cos - 1` cancellation through
         // `-2 sin²(imaginary / 2)`. The imaginary component keeps its tail after the real component has rounded to -1.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[3],
@@ -1174,12 +1174,12 @@ mod tests {
     #[test]
     fn test_lower_complex_ln_1p_to_mlir() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // An input near zero keeps both tiny components, and inputs on the negative real branch cut keep their side.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[5],

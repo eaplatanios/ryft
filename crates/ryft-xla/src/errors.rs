@@ -11,7 +11,7 @@ use ryft_core::{
 use ryft_mlir::Error as MlirError;
 use ryft_pjrt::Error as PjrtError;
 
-use crate::{ArrayError, CompilationError, ExecutionError, LoweringError, RuntimeError};
+use crate::{ArrayError, CompilationError, ExecutionError, LoweringError, RuntimeError, SessionError};
 
 /// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. Conditions
 /// owned by XLA are grouped by their owning contracts, while foreign errors keep their canonical carriers. Public entry
@@ -44,6 +44,9 @@ pub enum Error {
 
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+
+    #[error(transparent)]
+    Session(#[from] SessionError),
 
     #[error(transparent)]
     Io(Arc<std::io::Error>),

@@ -405,7 +405,7 @@ mod tests {
     use crate::domains::Tracer;
     use crate::domains::tests::{domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
-    use crate::{Array, Constant, Domain, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Value};
+    use crate::{Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Value};
 
     use super::*;
 
@@ -635,10 +635,10 @@ mod tests {
                 CoreDimension::Static(8),
             ]),
         );
-        let attention = differentiable_dot_product_attention::<Domain<'static>>(
+        let attention = differentiable_dot_product_attention::<Session<'static>>(
             AttentionConfiguration::new().with_scale(1.0).with_implementation(attention_implementation),
         );
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let size = &inputs[0];
                 let dimension =
@@ -706,7 +706,7 @@ mod tests {
     fn test_validate_data_dependent_compilation() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
 
         let mut builder = ProgramBuilder::new();
@@ -720,7 +720,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidArgument { message })
@@ -751,7 +751,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
@@ -777,7 +777,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
@@ -805,7 +805,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
@@ -838,7 +838,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())),
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
@@ -884,7 +884,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            domain.lower_program(&program, 0, &Options::new(mesh)),
+            session.lower_program(&program, 0, &Options::new(mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
@@ -1016,19 +1016,19 @@ mod tests {
     fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
 
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
-                .interpret_in_context(&domain, vec![Value::Array(input.clone())])
+                .interpret_in_context(&session, vec![Value::Array(input.clone())])
                 .unwrap()
                 .into_iter()
                 .map(|value| match value {
@@ -1037,7 +1037,7 @@ mod tests {
                     Value::Reference(_) => panic!("padding fixture returned a reference"),
                 })
                 .collect::<Vec<_>>();
-            let compiled = domain.execute_program(&compiled, vec![input]).unwrap();
+            let compiled = session.execute_program(&compiled, vec![input]).unwrap();
             assert_eq!(compiled.len(), eager.len());
             for (compiled, eager) in compiled.iter().zip(&eager) {
                 assert_eq!(compiled.shape(), eager.shape());
@@ -1143,7 +1143,7 @@ mod tests {
     fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_scaled_dot_attention_fixture(
@@ -1153,16 +1153,16 @@ mod tests {
             DataType::F32,
             AttentionImplementation::Automatic,
         );
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
         assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
-                .interpret_in_context(&domain, vec![Value::Array(input.clone())])
+                .interpret_in_context(&session, vec![Value::Array(input.clone())])
                 .unwrap()
                 .into_iter()
                 .map(|value| match value {
@@ -1171,7 +1171,7 @@ mod tests {
                     Value::Reference(_) => panic!("attention fixture returned a reference"),
                 })
                 .collect::<Vec<_>>();
-            let compiled = domain.execute_program(&compiled, vec![input]).unwrap();
+            let compiled = session.execute_program(&compiled, vec![input]).unwrap();
             assert_eq!(compiled.len(), eager.len());
             for (compiled, eager) in compiled.iter().zip(&eager) {
                 assert_eq!(compiled.shape(), eager.shape());
@@ -1235,8 +1235,8 @@ mod tests {
         );
 
         let zero =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
-        let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
+        let error = session.execute_program(&compiled, vec![zero]).unwrap_err();
         assert!(
             error.to_string().contains(
                 "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
@@ -1255,8 +1255,8 @@ mod tests {
             DataType::F32,
             AttentionImplementation::Fused,
         );
-        let input = Array::from_host_buffer(&domain, size_type, mesh, 2i64.to_ne_bytes().as_slice()).unwrap();
-        let error = fused.interpret_in_context(&domain, vec![Value::Array(input)]).unwrap_err();
+        let input = Array::from_host_buffer(&session, size_type, mesh, 2i64.to_ne_bytes().as_slice()).unwrap();
+        let error = fused.interpret_in_context(&session, vec![Value::Array(input)]).unwrap_err();
         assert!(matches!(
             error,
             ProgramError::UnsupportedOperation { message }
@@ -1277,17 +1277,17 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
-            domain.execute_program(&compiled, vec![input]).unwrap()
+            session.execute_program(&compiled, vec![input]).unwrap()
         };
 
         let small = execute(2);
@@ -1337,7 +1337,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [
             (DataType::F4E2M1FN, DataType::F8E4M3FN),
             (DataType::F8E4M3FN, DataType::F8E8M0FNU),
@@ -1356,7 +1356,7 @@ mod tests {
                 scaled_scale_type,
                 AttentionImplementation::Fused,
             );
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             // cuDNN accepts the NVFP4 and `f8e4m3fn` MXFP8 pairs, which lower to the block-scaled-dot custom call, but
             // not `f8e5m2` on both sides, which keeps the composite.
             let uses_custom_call = scaled_element_type != DataType::F8E5M2;
@@ -1364,12 +1364,12 @@ mod tests {
             assert_eq!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""), !uses_custom_call);
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
-            let compiled = domain.compile_program(&lowered).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
             let execute = |size: i64| {
                 let input =
-                    Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                         .unwrap();
-                domain.execute_program(&compiled, vec![input]).unwrap()
+                session.execute_program(&compiled, vec![input]).unwrap()
             };
 
             let small = execute(2);
@@ -1409,8 +1409,8 @@ mod tests {
             });
 
             let zero =
-                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
-            let error = domain.execute_program(&compiled, vec![zero]).unwrap_err();
+                Array::from_host_buffer(&session, size_type, mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
+            let error = session.execute_program(&compiled, vec![zero]).unwrap_err();
             assert!(
                 error.to_string().contains(
                     "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"

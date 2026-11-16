@@ -489,7 +489,7 @@ mod tests {
     fn test_dimension_from_scalar_operation_lower_reports_bounds_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
 
@@ -502,25 +502,25 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         assert!(compiled.requires_assertion_handler());
         // Some PJRT plugins do not serialize executables containing host callbacks. When serialization is available,
         // exercise the path of cache hits and prove that its metadata about runtime features survives restoration.
-        let compiled = match domain.serialize_program(&compiled).unwrap() {
-            Some(bytes) => domain.deserialize_program(bytes.as_slice()).unwrap().unwrap(),
+        let compiled = match session.serialize_program(&compiled).unwrap() {
+            Some(bytes) => session.deserialize_program(bytes.as_slice()).unwrap().unwrap(),
             None => compiled,
         };
         assert!(compiled.requires_assertion_handler());
 
         let valid =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
-        let valid = domain.execute_program(&compiled, vec![valid]).unwrap();
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
+        let valid = session.execute_program(&compiled, vec![valid]).unwrap();
         assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
 
-        let invalid = Array::from_host_buffer(&domain, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
-        let error = domain.execute_program(&compiled, vec![invalid]).unwrap_err();
+        let invalid = Array::from_host_buffer(&session, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
+        let error = session.execute_program(&compiled, vec![invalid]).unwrap_err();
         assert_eq!(
             error.to_string(),
             "`dimension_from_scalar` failed: input dimension `extent` = 9 is outside its declared bounds [1, 9)",
@@ -850,7 +850,7 @@ mod tests {
     fn test_lower_dimension_arithmetic_preserves_checked_diagnostics() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -885,18 +885,18 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
-            let compiled = domain.compile_program(&lowered).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
             let input = |value: i64| {
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap()
             };
 
             let output =
-                domain.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
+                session.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
             assert_eq!(read_i64s(&client, &output[0]), vec![expected_output]);
-            let error = domain
+            let error = session
                 .execute_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
                 .unwrap_err();
             assert_eq!(error.to_string(), expected_error);

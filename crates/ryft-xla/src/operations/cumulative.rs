@@ -359,7 +359,7 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, CompiledFunction, Domain, Options, Session, Value, compile};
+    use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Value, compile};
 
     use super::*;
 
@@ -470,7 +470,7 @@ mod tests {
     fn test_cumulative_operation_lower_sum_executes_with_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let values = [1.0f32, 2.0, 3.0, 4.0];
@@ -645,7 +645,7 @@ mod tests {
     fn test_cumulative_operation_lower_log_sum_exp_executes() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let source = |values: [f32; 4]| {
@@ -805,17 +805,22 @@ mod tests {
     #[test]
     fn test_lower_cumulative_executes() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let increasing = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::F32,
             &[4],
             values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]).as_slice(),
         );
-        let alternating =
-            replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&[4f32, 0.25, -1.5, 2.5]).as_slice());
+        let alternating = replicated_array(
+            &session,
+            &mesh,
+            DataType::F32,
+            &[4],
+            values_to_bytes(&[4f32, 0.25, -1.5, 2.5]).as_slice(),
+        );
         let read = |array: Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
 
         // Dyadic inputs keep every sum and product exact, whatever tree the scan combines them in.
@@ -852,12 +857,12 @@ mod tests {
         // `f32` prefix sum exact, so every form must agree with a sequential scan bit for bit, including along a
         // scanned axis longer than one thousand elements, which spans several levels of the parallel scan.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let (rows, columns) = (3, 1025);
         let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
         let input =
-            replicated_array(&domain, &mesh, DataType::F32, &[rows, columns], values_to_bytes(&values).as_slice());
+            replicated_array(&session, &mesh, DataType::F32, &[rows, columns], values_to_bytes(&values).as_slice());
         let mut forward = values.clone();
         for row in forward.chunks_mut(columns) {
             (1..columns).for_each(|column| row[column] += row[column - 1]);
@@ -873,8 +878,13 @@ mod tests {
         );
 
         // Integer sums take the same path as real sums, here along the leading axis.
-        let integers =
-            replicated_array(&domain, &mesh, DataType::I32, &[4, 2], &values_to_bytes(&[1i32, -2, 3, 4, -5, 6, 7, -8]));
+        let integers = replicated_array(
+            &session,
+            &mesh,
+            DataType::I32,
+            &[4, 2],
+            &values_to_bytes(&[1i32, -2, 3, 4, -5, 6, 7, -8]),
+        );
         assert_eq!(
             values_from_bytes::<i32>(&integers.cumulative_sum(0).unwrap().copy_to_host().unwrap()),
             vec![1, -2, 4, 2, -1, 8, 6, 0],
@@ -931,11 +941,11 @@ mod tests {
     #[test]
     fn test_lower_cumulative_one_bit_integers_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let bits = [1, 1, 0, 1];
         for data_type in [DataType::I1, DataType::U1] {
-            let input = replicated_array(&domain, &mesh, data_type, &[4], &bits);
+            let input = replicated_array(&session, &mesh, data_type, &[4], &bits);
             let reference = CoreArray::from_logical_bytes(ArrayType::new_static(data_type, [4]), &bits).unwrap();
             // Sum must wrap modulo two rather than behave like Boolean OR. Signed extrema reverse the predicate
             // carrier's order, while unsigned extrema and multiplication use its ordinary order.
@@ -1043,7 +1053,7 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for (data_type, lowest) in [
             (DataType::F4E2M1FN, vec![0x0f]),
@@ -1053,7 +1063,7 @@ mod tests {
             (DataType::F32, f32::MIN.to_ne_bytes().to_vec()),
         ] {
             let bytes = lowest.repeat(3001);
-            let input = replicated_array(&domain, &mesh, data_type, &[3001], &bytes);
+            let input = replicated_array(&session, &mesh, data_type, &[3001], &bytes);
             assert_eq!(input.cumulative_log_sum_exp(0).unwrap().copy_to_host().unwrap(), bytes, "{data_type}");
         }
     }
@@ -1061,7 +1071,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_log_sum_exp_complex() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Every window is padded with `-∞ + 0i` initial values, and an operand whose real component is negative
@@ -1072,7 +1082,7 @@ mod tests {
         let negative_infinity = Complex::new(f32::NEG_INFINITY, 0.0);
         let rotated_negative_infinity = Complex::new(f32::NEG_INFINITY, 3.0);
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[4],
@@ -1098,7 +1108,7 @@ mod tests {
         // A prefix that no combination produced is still brought onto the principal branch, and so is one whose phase
         // is huge.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[2],
@@ -1113,7 +1123,7 @@ mod tests {
             assert!((prefix.im - wrapped).abs() <= 1e-13 * wrapped.abs(), "{} vs {wrapped}", prefix.im);
         }
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C128,
             &[1],
@@ -1134,7 +1144,7 @@ mod tests {
         // count, exactly like the reference backend's cumulative maximum.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =
@@ -1148,18 +1158,18 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
         for rows in [2usize, 4] {
             let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();
             let input = Array::from_host_buffer(
-                &domain,
+                &session,
                 ArrayType::new_static(DataType::F32, [rows, 5]).with_sharding(sharding.clone()).unwrap(),
                 mesh.clone(),
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+            let output = compiled.executable().execute(&session, Value::Array(input)).unwrap();
             let Value::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };

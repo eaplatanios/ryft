@@ -1,4 +1,4 @@
-//! Dispatch and cache keys of the XLA [`Domain`](crate::Domain).
+//! Dispatch and cache keys of the XLA [`Session`](crate::Session).
 //!
 //! Three keys identify work at different levels. A [`DispatchKey`] selects a retained specialization of a dispatcher
 //! from the types and placements of its inputs. A [`CompilationKey`] is the complete canonical compilation contract
@@ -43,7 +43,7 @@ pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// Opaque key of a retained `jit` specialization, derived by [`Domain`](crate::Domain).
+/// Opaque key of a retained `jit` specialization, derived by [`Session`](crate::Session).
 ///
 /// Exact dispatch preserves nominal [`DimensionVariable`] identity and shares its type slice with the effective staged
 /// signature, so keying a call costs no deep type clone. Dispatch with [`InputBoundBucketing`] instead uses a
@@ -143,18 +143,18 @@ impl LoweredProgram {
 ///
 /// The key must capture everything that the eager lowering reads besides the session itself, whose client, and thus
 /// [`Target`](crate::Target), is fixed. That is the operation including all of its attributes, the contents of every
-/// attached region (e.g., of `condition`, `while`, `scan`, `jit_call`, or `shard_map` operations), the physical type
-/// of every array input including its sharding, the extent of every dimension input, because eager binding bakes
-/// dimension inputs into the traced program as constants, the device mesh that the lowering compiles against, and the
-/// domain's compilation options. Attached regions are keyed by their contents, as [`RegionKey`] describes, so
-/// applications whose closures are traced afresh on every call still hit the cache when they trace to the same
-/// regions. Instruction provenance is not
-/// part of a [`RegionKey`], so applications that differ only in provenance share one compiled program, whose debug
-/// locations are those of the first application.
+/// attached region (e.g., of `condition`, `while`, `scan`, `jit_call`, or `shard_map` operations), the physical type of
+/// every array input including its sharding, the extent of every dimension input, because eager binding bakes dimension
+/// inputs into the traced program as constants, and the device mesh that the lowering compiles against. The default
+/// compilation options of the session are immutable, so they are not part of the key. Attached regions are keyed by
+/// their contents, as [`RegionKey`] describes, so applications whose closures are traced afresh on every call still hit
+/// the cache when they trace to the same regions. Instruction provenance is not part of a [`RegionKey`], so
+/// applications that differ only in provenance share one compiled program, whose debug locations are those of the first
+/// application.
 ///
 /// Keys are compared and hashed through [`EagerDispatchKeyView`], which they share with the borrowed
 /// [`EagerDispatchQuery`] that eager dispatch uses to look up hits. Cache hits skip tracing and lowering while
-/// execution still uses the invoking domain's effect scope and runtime resources.
+/// execution still uses the invoking session's effect scope and runtime resources.
 #[derive(Clone)]
 pub(crate) struct EagerDispatchKey {
     /// Applied operation, compared and hashed with all of its attributes.
@@ -166,18 +166,11 @@ pub(crate) struct EagerDispatchKey {
     /// Inputs of the application, in order.
     inputs: Arc<[EagerDispatchInput]>,
 
-    /// Mesh that eager lowering compiles against when it is not derived from the operation alone. It is the domain
-    /// mesh if the domain has one, and otherwise the mesh of the first array input. It is [`None`] only for an
-    /// operation without inputs in a domain without a mesh, whose mesh is then determined by the operation and the
+    /// Mesh that eager lowering compiles against when it is not derived from the operation alone. It is the session
+    /// mesh if the session has one, and otherwise the mesh of the first array input. It is [`None`] only for an
+    /// operation without inputs in a session without a mesh, whose mesh is then determined by the operation and the
     /// session's client.
     mesh: Option<DeviceMesh>,
-
-    /// Compilation options of the dispatching domain, compared and hashed by the address of their shared allocation.
-    /// Domains created through [`Session::domain`](crate::Session::domain) share one default allocation, so they
-    /// share eager dispatch cache entries, while each
-    /// [`Domain::with_compilation_options`](crate::Domain::with_compilation_options) call creates a distinct identity.
-    /// Options that are equal but separately allocated therefore only miss each other's entries.
-    compilation_options: Arc<CompilationOptions>,
 }
 
 impl EagerDispatchKey {
@@ -187,9 +180,8 @@ impl EagerDispatchKey {
         regions: Arc<[RegionKey<Constant, Operation>]>,
         inputs: Arc<[EagerDispatchInput]>,
         mesh: Option<DeviceMesh>,
-        compilation_options: Arc<CompilationOptions>,
     ) -> Self {
-        Self { operation, regions, inputs, mesh, compilation_options }
+        Self { operation, regions, inputs, mesh }
     }
 }
 
@@ -242,9 +234,6 @@ pub(crate) trait EagerDispatchKeyView {
 
     /// Returns the mesh that the eager lowering compiles against, if it is not derived from the operation alone.
     fn mesh(&self) -> Option<&DeviceMesh>;
-
-    /// Returns the compilation options of the dispatching domain, which are compared by identity.
-    fn compilation_options(&self) -> &Arc<CompilationOptions>;
 }
 
 impl EagerDispatchKeyView for EagerDispatchKey {
@@ -272,10 +261,6 @@ impl EagerDispatchKeyView for EagerDispatchKey {
     fn mesh(&self) -> Option<&DeviceMesh> {
         self.mesh.as_ref()
     }
-
-    fn compilation_options(&self) -> &Arc<CompilationOptions> {
-        &self.compilation_options
-    }
 }
 
 impl PartialEq for dyn EagerDispatchKeyView + '_ {
@@ -285,7 +270,6 @@ impl PartialEq for dyn EagerDispatchKeyView + '_ {
             && self.input_count() == other.input_count()
             && (0..self.input_count()).all(|index| self.input(index) == other.input(index))
             && self.mesh() == other.mesh()
-            && Arc::ptr_eq(self.compilation_options(), other.compilation_options())
     }
 }
 
@@ -298,7 +282,6 @@ impl Hash for dyn EagerDispatchKeyView + '_ {
         self.input_count().hash(state);
         (0..self.input_count()).for_each(|index| self.input(index).hash(state));
         self.mesh().hash(state);
-        Arc::as_ptr(self.compilation_options()).hash(state);
     }
 }
 
@@ -336,9 +319,6 @@ pub(crate) struct EagerDispatchQuery<'o, 'c> {
 
     /// Mesh that the eager lowering compiles against, as documented on [`EagerDispatchKey`].
     mesh: Option<&'o DeviceMesh>,
-
-    /// Compilation options of the dispatching domain.
-    compilation_options: &'o Arc<CompilationOptions>,
 }
 
 impl<'o, 'c> EagerDispatchQuery<'o, 'c> {
@@ -348,9 +328,8 @@ impl<'o, 'c> EagerDispatchQuery<'o, 'c> {
         regions: &'o [RegionKey<Constant, Operation>],
         inputs: &'o [Value<'c>],
         mesh: Option<&'o DeviceMesh>,
-        compilation_options: &'o Arc<CompilationOptions>,
     ) -> Self {
-        Self { operation, regions, inputs, mesh, compilation_options }
+        Self { operation, regions, inputs, mesh }
     }
 }
 
@@ -378,16 +357,12 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_, '_> {
     fn mesh(&self) -> Option<&DeviceMesh> {
         self.mesh
     }
-
-    fn compilation_options(&self) -> &Arc<CompilationOptions> {
-        self.compilation_options
-    }
 }
 
 /// Derives the retained dispatch key, the effective staged input types, and any options specialized on input
 /// placements for one dispatch request. This function implements
-/// [`CompilationDomain::dispatch_signature`](ryft_core::CompilationDomain::dispatch_signature) for
-/// [`Domain`](crate::Domain).
+/// [`CompilationSession::dispatch_signature`](ryft_core::CompilationSession::dispatch_signature) for
+/// [`Session`](crate::Session).
 pub(super) fn dispatch_signature<'c>(
     inputs: DispatchInputs<'_, '_, Value<'c>>,
     options: &Options,
@@ -608,7 +583,7 @@ struct PersistentKey<'o> {
 /// Encodes compilation options deterministically even though Prost represents protobuf maps as randomly seeded
 /// `HashMap`s. Map entries are removed from a clone before normal protobuf encoding and appended as records that are
 /// delimited by lengths, qualified by paths, and sorted by their encoded keys and values.
-fn canonical_compilation_options_bytes(options: &CompilationOptions) -> Vec<u8> {
+pub(crate) fn canonical_compilation_options_bytes(options: &CompilationOptions) -> Vec<u8> {
     /// Appends one sorted protobuf map record with an explicit path and length delimiters.
     fn append_record(output: &mut Vec<u8>, path: &[u8], mut entries: Vec<(Vec<u8>, Vec<u8>)>) {
         entries.sort_unstable();
@@ -814,7 +789,7 @@ mod tests {
     };
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
-        Array, Constant, Dimension, Domain, Error, Operation, ProgramBuilder, RuntimeRequirement, Session, Value,
+        Array, Constant, Dimension, Error, Operation, ProgramBuilder, RuntimeRequirement, Session, Value,
         with_runtime_requirements,
     };
 
@@ -824,8 +799,8 @@ mod tests {
     /// `[size, value]`.
     fn trace_data_derived<'c>(
         extent: DimensionVariable,
-        inputs: Vec<CompilationTracer<Domain<'c>>>,
-    ) -> Result<CompilationTracer<Domain<'c>>, Error> {
+        inputs: Vec<CompilationTracer<Session<'c>>>,
+    ) -> Result<CompilationTracer<Session<'c>>, Error> {
         let [size, value] = inputs.as_slice() else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };
@@ -844,21 +819,21 @@ mod tests {
     fn test_lowered_program_compilation_key() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
-        let independent_domain = Session::new(&client).domain();
-        let repeated = independent_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
+        let key = session.compilation_key(compiled.lowered().lowered_program()).unwrap();
+        let independent_session = Session::with_client(&client);
+        let repeated = independent_session.compilation_key(compiled.lowered().lowered_program()).unwrap();
 
         assert_eq!(key, repeated);
-        assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
+        assert_eq!(session.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
         let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
         assert_eq!(decoded["schema_version"], PERSISTENT_KEY_SCHEMA_VERSION);
         assert_eq!(decoded["runtime_requirements"], serde_json::json!([]));
@@ -874,7 +849,7 @@ mod tests {
     fn test_lowered_program_compilation_key_includes_runtime_abi_and_configuration() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let array_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -890,7 +865,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap()
+            session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap()
         };
         let requirement =
             |version, configuration| RuntimeRequirement::new("test.runtime", version, configuration).unwrap();
@@ -901,34 +876,26 @@ mod tests {
 
         assert_eq!(first.stable_hlo(), changed_abi.stable_hlo());
         assert_eq!(first.stable_hlo(), changed_configuration.stable_hlo());
-        assert_eq!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&duplicate).unwrap());
-        assert_ne!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&changed_abi).unwrap());
-        assert_ne!(domain.compilation_key(&first).unwrap(), domain.compilation_key(&changed_configuration).unwrap());
+        assert_eq!(session.compilation_key(&first).unwrap(), session.compilation_key(&duplicate).unwrap());
+        assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_abi).unwrap());
+        assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_configuration).unwrap());
     }
 
     #[test]
     fn test_eager_dispatch_query_compares_and_hashes_like_its_key() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let operation = Operation::Array(AddOperation::new().into());
         let inputs = [
-            Value::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
-            Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), domain.clone())),
+            Value::Array(f32_vector(&session, &mesh, &[1.0, 2.0])),
+            Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), session.clone())),
         ];
-        let compilation_options = Arc::new(domain.compilation_options().clone());
-        let query = EagerDispatchQuery {
-            operation: &operation,
-            regions: &[],
-            inputs: &inputs,
-            mesh: Some(&mesh),
-            compilation_options: &compilation_options,
-        };
+        let query = EagerDispatchQuery { operation: &operation, regions: &[], inputs: &inputs, mesh: Some(&mesh) };
         let key = EagerDispatchKey {
             operation: operation.clone(),
             inputs: (0..inputs.len()).map(|index| query.input(index).into_owned()).collect(),
             mesh: Some(mesh.clone()),
-            compilation_options: Arc::clone(&compilation_options),
             regions: Arc::new([]),
         };
         let query_hash = hash_of(&query as &dyn EagerDispatchKeyView);
@@ -939,13 +906,11 @@ mod tests {
         assert_eq!(hash_of(borrowed_key), query_hash);
         assert_eq!(hash_of(&key), query_hash);
 
-        // Compilation options are compared by identity, and every other component by value, with dimensions compared
-        // by extent.
-        let other_options = Arc::new(domain.compilation_options().clone());
-        let other_options_query = EagerDispatchQuery { compilation_options: &other_options, ..query };
-        assert!(borrowed_key != &other_options_query as &dyn EagerDispatchKeyView);
-        let other_inputs =
-            [inputs[0].clone(), Value::Dimension(Dimension::new(DimensionValue::constant(3).unwrap(), domain.clone()))];
+        // Every component is compared by value, with dimensions compared by extent.
+        let other_inputs = [
+            inputs[0].clone(),
+            Value::Dimension(Dimension::new(DimensionValue::constant(3).unwrap(), session.clone())),
+        ];
         let other_inputs_query = EagerDispatchQuery { inputs: &other_inputs, ..query };
         assert!(borrowed_key != &other_inputs_query as &dyn EagerDispatchKeyView);
         let meshless_query = EagerDispatchQuery { mesh: None, ..query };
@@ -953,13 +918,13 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_dispatch_signature() {
+    fn test_session_dispatch_signature() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input = Value::Array(
             Array::from_host_buffer(
-                &domain,
+                &session,
                 ArrayType::new_static(DataType::F32, [3]),
                 mesh.clone(),
                 values_to_bytes(&[1f32, 2.0, 3.0]),
@@ -970,12 +935,12 @@ mod tests {
         let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
 
         let (key, staged_types, specialized_options) =
-            Domain::dispatch_signature(DispatchInputs::Types(input_types.clone()), &options).unwrap();
+            Session::dispatch_signature(DispatchInputs::Types(input_types.clone()), &options).unwrap();
         assert_eq!(key, DispatchKey::new(DispatchKeyKind::Exact(input_types.clone().into())));
         assert_eq!(staged_types.as_ref(), input_types.as_slice());
         assert_eq!(specialized_options, None);
 
-        let (key, executable_types, specialized_options) = Domain::dispatch_signature(
+        let (key, executable_types, specialized_options) = Session::dispatch_signature(
             DispatchInputs::Values { values: &mut std::iter::once(&input), types: input_types.clone() },
             &options,
         )
@@ -996,15 +961,15 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_dispatch_signature_runtime_placement() {
+    fn test_session_dispatch_signature_runtime_placement() {
         let client = cpu_client(2);
         let mesh = domain_mesh(&client, "x", 2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let tiled = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated_input = Value::Array(
             Array::from_host_buffer_with_sharding(
-                &domain,
+                &session,
                 ArrayType::new_static(DataType::F32, [4]),
                 replicated.clone(),
                 mesh.clone(),
@@ -1014,7 +979,7 @@ mod tests {
         );
         let tiled_input = Value::Array(
             Array::from_host_buffer_with_sharding(
-                &domain,
+                &session,
                 ArrayType::new_static(DataType::F32, [4]),
                 tiled.clone(),
                 mesh.clone(),
@@ -1025,12 +990,12 @@ mod tests {
         assert_eq!(replicated_input.r#type(), tiled_input.r#type());
         let input_types = vec![replicated_input.r#type().into_owned()];
         let options = Options::new(mesh);
-        let (replicated_key, replicated_types, replicated_options) = Domain::dispatch_signature(
+        let (replicated_key, replicated_types, replicated_options) = Session::dispatch_signature(
             DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
             &options,
         )
         .unwrap();
-        let (tiled_key, tiled_types, tiled_options) = Domain::dispatch_signature(
+        let (tiled_key, tiled_types, tiled_options) = Session::dispatch_signature(
             DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types.clone() },
             &options,
         )
@@ -1042,12 +1007,12 @@ mod tests {
 
         // A declared sharding determines placement instead of the actual placement of either input.
         let options = options.with_input_shardings(vec![replicated]);
-        let replicated_signature = Domain::dispatch_signature(
+        let replicated_signature = Session::dispatch_signature(
             DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
             &options,
         )
         .unwrap();
-        let tiled_signature = Domain::dispatch_signature(
+        let tiled_signature = Session::dispatch_signature(
             DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types },
             &options,
         )
@@ -1058,22 +1023,22 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_dispatch_signature_reuses_one_specialization_for_data_derived_extents() {
+    fn test_session_dispatch_signature_reuses_one_specialization_for_data_derived_extents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let function: CompiledFunctionDispatcher<Domain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
+        let function: CompiledFunctionDispatcher<Session<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
 
         let call = |size: i64| {
             let size =
-                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)]).unwrap()
         };
@@ -1087,12 +1052,12 @@ mod tests {
         assert_eq!(statistics.lowerings, 1);
         assert_eq!(statistics.compilation_requests, 1);
         assert_eq!(function.executable_specialization_count(), 1);
-        assert_eq!(domain.program_count(), 1);
+        assert_eq!(session.program_count(), 1);
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_domain_dispatch_signature_reuses_one_specialization_for_bounded_dynamic_programs_on_cuda() {
+    fn test_session_dispatch_signature_reuses_one_specialization_for_bounded_dynamic_programs_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::GPU(GpuClientOptions {
@@ -1102,7 +1067,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1114,15 +1079,15 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert_eq!(domain.program_count(), 1);
+        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
+        assert_eq!(session.program_count(), 1);
 
         for size in [4usize, 7] {
             let input_type = replicated_vector_type(&mesh, size);
             let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
             let input = Array::from_host_buffer(
-                &domain,
+                &session,
                 input_type,
                 mesh.clone(),
                 values_to_bytes(values.as_slice()).as_slice(),
@@ -1131,14 +1096,14 @@ mod tests {
             for _ in 0..2 {
                 // Both launches use the same bounded executable. The second also proves that replay does not
                 // accidentally specialize or recompile the program for the concrete logical size.
-                let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+                let output = compiled.executable().execute(&session, Value::Array(input.clone())).unwrap();
                 let Value::Array(output) = output else {
                     panic!("array-only compiled function returned a first-class dimension");
                 };
                 output.block_until_ready().unwrap();
                 assert_eq!(output.shape().as_slice(), &[size]);
                 assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
-                assert_eq!(domain.program_count(), 1, "executing a loaded executable must not trigger recompilation");
+                assert_eq!(session.program_count(), 1, "executing a loaded executable must not trigger recompilation");
             }
         }
 
@@ -1148,14 +1113,14 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: CompiledFunctionDispatcher<Domain<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = domain
+        let function: CompiledFunctionDispatcher<Session<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
         let call = |size: i64| {
             let size =
-                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)])
         };
@@ -1229,21 +1194,21 @@ mod tests {
 
     #[test]
     fn test_normalize_dispatch_signature_reuses_power_of_two_specializations() {
-        fn trace<'c>(input: CompilationTracer<Domain<'c>>) -> Result<CompilationTracer<Domain<'c>>, Error> {
+        fn trace<'c>(input: CompilationTracer<Session<'c>>) -> Result<CompilationTracer<Session<'c>>, Error> {
             let context = input.context().clone();
             Ok(context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input])?.remove(0))
         }
 
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<Domain<'_>, (), ArrayIrType, ArrayIrType, _> = domain
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let function: CompiledFunctionDispatcher<Session<'_>, (), ArrayIrType, ArrayIrType, _> = session
             .jit_with_options(
                 |(), input| trace(input),
                 Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
             );
         let call = |values: &[f32]| {
-            let input = f32_vector(&domain, &mesh, values);
+            let input = f32_vector(&session, &mesh, values);
             function.execute((), Value::Array(input)).unwrap()
         };
 
@@ -1264,14 +1229,14 @@ mod tests {
         assert_eq!(statistics.lowerings, 2);
         assert_eq!(statistics.compilation_requests, 2);
         assert_eq!(function.executable_specialization_count(), 2);
-        assert_eq!(domain.program_count(), 2);
+        assert_eq!(session.program_count(), 2);
     }
 
     #[test]
     fn test_normalize_dispatch_signature_rejects_unsupported_signatures() {
         let single_device_client = cpu_client(1);
         let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
-        let single_device_domain = Session::new(&single_device_client).domain().with_mesh(single_device_mesh.clone());
+        let single_device_session = Session::with_client(&single_device_client).with_mesh(single_device_mesh.clone());
         let bucketing = Some(InputBoundBucketing::PowerOfTwo);
         let bucketed_options =
             Options::new(single_device_mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
@@ -1307,7 +1272,7 @@ mod tests {
                 if reason == "external reference input 0 does not support input-bound bucketing",
         ));
         assert!(matches!(
-            single_device_domain.lower_program(
+            single_device_session.lower_program(
                 &external_reference_read_program(ArrayType::scalar(DataType::F32)),
                 1,
                 &Options::new(single_device_mesh.clone())
@@ -1374,7 +1339,7 @@ mod tests {
 
         // Signatures requested for staging preserve the caller's types without executable dispatch bucketing.
         let (_, staged_types, _) =
-            Domain::dispatch_signature(DispatchInputs::Types(vec![vector_type(CoreDimension::Static(3))]), &options)
+            Session::dispatch_signature(DispatchInputs::Types(vec![vector_type(CoreDimension::Static(3))]), &options)
                 .unwrap();
         assert_eq!(staged_types.as_ref(), &[vector_type(CoreDimension::Static(3))]);
 

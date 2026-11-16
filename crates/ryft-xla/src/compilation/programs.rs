@@ -1,4 +1,4 @@
-//! Lowered and compiled program artifacts of the XLA [`Domain`](crate::domains::Domain).
+//! Lowered and compiled program artifacts of the XLA [`Session`](crate::domains::Session).
 //!
 //! Lowering a staged program produces a [`LoweredProgram`], which holds the StableHLO module, the effective PJRT
 //! compilation options, and the invocation contract that maps logical values to physical executable slots. Compiling
@@ -27,7 +27,7 @@ use crate::{Error, RuntimeRequirement, SessionConstant, Target};
 
 /// StableHLO lowering and metadata of the call boundary produced before PJRT compilation.
 ///
-/// A [`Domain`](crate::domains::Domain) lowers a staged program into this artifact with its effective compilation
+/// A [`Session`](crate::domains::Session) lowers a staged program into this artifact with its effective compilation
 /// options and the mapping between logical values and physical executable slots. PJRT compilation produces a
 /// [`CompiledProgram`] retaining the same invocation contract.
 ///
@@ -388,7 +388,7 @@ impl TypedProgram for LoweredProgram {
 /// [`functions`](crate::compilation::functions) retain the Rust container structures separately. Reused and
 /// replacement executables must preserve the complete invocation contract before execution.
 ///
-/// The invoking [`Domain`](crate::domains::Domain) validates inputs, resolves placement and runtime resources,
+/// The invoking [`Session`](crate::domains::Session) validates inputs, resolves placement and runtime resources,
 /// materializes bounded dynamic arguments, and reconstructs logical outputs. Ordinary calls carry completion through
 /// their outputs. Stateful calls coordinate external references through [`ryft_core::StatefulExecution`], publishing
 /// mutations only after submission and tracking completion of the whole invocation.
@@ -958,7 +958,7 @@ mod tests {
     use crate::domains::tests::domain_mesh;
     use crate::lowering::signature::ExecutableSignature;
     use crate::tests::{device_mesh_2x2, execution_client};
-    use crate::{Domain, Error, Options, Session};
+    use crate::{Error, Options, Session};
 
     use super::*;
 
@@ -966,7 +966,7 @@ mod tests {
     fn test_compiled_program_matches_stateless_signature() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let compile = |upper: usize| {
             let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(upper)).unwrap());
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
@@ -976,8 +976,8 @@ mod tests {
                 stage::<_, ArrayType, ArrayType>(|input| input.clone() + input, input_type, Options::new(mesh.clone()))
                     .unwrap()
                     .into_inner();
-            let compiled: CoreCompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-                staged.lower(&domain).unwrap().compile(&domain).unwrap();
+            let compiled: CoreCompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+                staged.lower(&session).unwrap().compile(&session).unwrap();
             compiled
         };
 
@@ -985,7 +985,7 @@ mod tests {
         // that is later loaded for it, and their boundaries still match. A boundary with another bound does not. The
         // second compilation reuses the executable of the first and keeps its own boundary types.
         let (first, second, other) = (compile(8), compile(8), compile(9));
-        assert_eq!(domain.program_count(), 2);
+        assert_eq!(session.program_count(), 2);
         let (first, second, other) = (first.compiled_program(), second.compiled_program(), other.compiled_program());
         assert_ne!(first.input_types(), second.input_types());
         assert!(first.matches_stateless_signature(first.input_types(), first.output_types()));

@@ -959,7 +959,7 @@ mod tests {
     };
     use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, CompiledFunction, Domain, Session, compile, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, CompiledFunction, Session, compile, to_mlir_module_for_program};
 
     use super::*;
 
@@ -970,10 +970,10 @@ mod tests {
         // imaginary component as `0 · ∞ = NaN`, and a lone signed zero is returned exactly. Reductions and scans share
         // the combiner.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let vector = |values: &[Complex<f64>]| {
-            replicated_array(&domain, &mesh, DataType::C128, &[values.len()], values_to_bytes(values).as_slice())
+            replicated_array(&session, &mesh, DataType::C128, &[values.len()], values_to_bytes(values).as_slice())
         };
         let read = |array: Array<'_>| values_from_bytes::<Complex<f64>>(&array.copy_to_host().unwrap());
 
@@ -1048,11 +1048,12 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Dyadic inputs keep every floating-point result exact, including the division by the count of `Mean`.
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
+        let input =
+            replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
         let read =
             |kind: ReductionKind| values_from_bytes::<f32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap());
         assert_eq!(read(ReductionKind::Sum), vec![7.5]);
@@ -1061,7 +1062,7 @@ mod tests {
         assert_eq!(read(ReductionKind::Min), vec![0.5]);
 
         // Integer `Mean` divides with truncation.
-        let input = replicated_array(&domain, &mesh, DataType::I32, &[4], &values_to_bytes(&[5i32, -2, 7, 0]));
+        let input = replicated_array(&session, &mesh, DataType::I32, &[4], &values_to_bytes(&[5i32, -2, 7, 0]));
         let read =
             |kind: ReductionKind| values_from_bytes::<i32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap());
         assert_eq!(read(ReductionKind::Sum), vec![10]);
@@ -1160,7 +1161,7 @@ mod tests {
     fn test_reduce_operation_lower_product_with_zero_factors() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 3);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -1185,7 +1186,7 @@ mod tests {
     fn test_reduce_operation_lower_product_sharded_gradient() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -1279,7 +1280,7 @@ mod tests {
     fn test_reduce_operation_lower_empty_mean() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 0);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |value| value.reduce(&[0], ReductionKind::Mean).unwrap(),
@@ -1297,7 +1298,7 @@ mod tests {
     fn test_reduce_operation_lower_narrow_floating_point_accumulation() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         // Product retains the small growth of each factor, and the larger mean also needs a widened divisor.
         for (kind, count, input, expected) in [
@@ -1334,20 +1335,20 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower_extrema() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Boolean extrema use the `false` and `true` identities, including when the reduced axis is empty.
-        let empty_booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[0], &[]);
+        let empty_booleans = replicated_array(&session, &mesh, DataType::Boolean, &[0], &[]);
         assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0]);
         assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), vec![1]);
 
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
-        let nan = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, f32::NAN]));
+        let nan = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, f32::NAN]));
         let maximum = values_from_bytes::<f32>(&nan.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap());
         assert_eq!(maximum.len(), 1);
         assert!(maximum[0].is_nan(), "{maximum:?}");
-        let zeros = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[-0f32, 0.0]));
+        let zeros = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[-0f32, 0.0]));
         assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), 0f32.to_ne_bytes());
         assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), (-0f32).to_ne_bytes());
 
@@ -1355,14 +1356,14 @@ mod tests {
         for (zeros, maximum, minimum) in
             [([0f32, -0.0], 0f32, -0f32), ([-0.0, -0.0], -0.0, -0.0), ([0.0, 0.0], 0.0, 0.0)]
         {
-            let zeros = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&zeros));
+            let zeros = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&zeros));
             assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), maximum.to_ne_bytes());
             assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), minimum.to_ne_bytes());
         }
 
         // Narrower floating-point types order their signed zeros in the same way.
         let zeros =
-            replicated_array(&domain, &mesh, DataType::BF16, &[2], &values_to_bytes(&[bf16::NEG_ZERO, bf16::ZERO]));
+            replicated_array(&session, &mesh, DataType::BF16, &[2], &values_to_bytes(&[bf16::NEG_ZERO, bf16::ZERO]));
         assert_eq!(
             zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
             bf16::ZERO.to_bits().to_ne_bytes(),
@@ -1372,7 +1373,7 @@ mod tests {
             bf16::NEG_ZERO.to_bits().to_ne_bytes(),
         );
         let zeros =
-            replicated_array(&domain, &mesh, DataType::F16, &[2], &values_to_bytes(&[f16::NEG_ZERO, f16::ZERO]));
+            replicated_array(&session, &mesh, DataType::F16, &[2], &values_to_bytes(&[f16::NEG_ZERO, f16::ZERO]));
         assert_eq!(
             zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
             f16::ZERO.to_bits().to_ne_bytes(),
@@ -1389,7 +1390,7 @@ mod tests {
         let sharded = |data_type: DataType, bytes: Vec<u8>| {
             let sharding = Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
             let r#type = ArrayType::new_static(data_type, [4]).with_sharding(sharding).unwrap();
-            Array::from_host_buffer(&domain, r#type, device_mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type, device_mesh.clone(), bytes).unwrap()
         };
         let reduce = |input: &Array<'_>, kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap();
         let floats = sharded(DataType::F32, values_to_bytes(&[-0f32, -1.0, 0.0, -2.0]));
@@ -1411,14 +1412,14 @@ mod tests {
         assert!((total[0] - 16f32.ln()).abs() < 1e-6, "{total:?}");
 
         // The sign of an `f8e4m3fn` zero is its most significant bit.
-        let zeros = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2], &[0x80, 0x00]);
+        let zeros = replicated_array(&session, &mesh, DataType::F8E4M3FN, &[2], &[0x80, 0x00]);
         assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0x00]);
         assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), vec![0x80]);
 
         // Complex extrema compare `(real, imaginary)` lexicographically, and their identity has negative infinite
         // components.
         let complex = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[3],
@@ -1427,7 +1428,7 @@ mod tests {
         let read = |array: Array<'_>| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Max).unwrap()), vec![Complex::new(2.0, 4.0)]);
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Min).unwrap()), vec![Complex::new(1.0, 5.0)]);
-        let empty_complex = replicated_array(&domain, &mesh, DataType::C64, &[0], &[]);
+        let empty_complex = replicated_array(&session, &mesh, DataType::C64, &[0], &[]);
         assert_eq!(
             read(empty_complex.reduce(&[0], ReductionKind::Max).unwrap()),
             vec![Complex::new(f32::NEG_INFINITY, f32::NEG_INFINITY)],
@@ -1737,7 +1738,7 @@ mod tests {
     fn test_reduce_operation_lower_complex_executes() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
         // to compare the imaginary component against the identity rather than deciding on the real component.
         for (kind, components, expected) in [
@@ -1844,17 +1845,17 @@ mod tests {
         // without them. The composite stages the softmax as one program, which the eager operations of the other
         // tests never do, and its rows are the softmax of the logarithms of `1`, `2`, and `5` in two orders.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let softmax =
-            composite(|input: DomainTracer<ProjectedContext<Domain<'_>, ArrayType>>| -> Result<_, ProgramError> {
+            composite(|input: DomainTracer<ProjectedContext<Session<'_>, ArrayType>>| -> Result<_, ProgramError> {
                 let maxima = input.reduce(&[1], ReductionKind::Max)?.broadcast_like(&input, &[0])?;
                 let exponentials = input.sub(&maxima)?.exp()?;
                 let sums = exponentials.reduce(&[1], ReductionKind::Sum)?.broadcast_like(&exponentials, &[0])?;
                 exponentials.div(&sums)
             });
         let logits = [1f32.ln(), 2f32.ln(), 5f32.ln(), 5f32.ln(), 1f32.ln(), 2f32.ln()];
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&logits));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&logits));
 
         // A dimension that an explicit mesh axis shards reduces total order keys for every target, so that XLA can
         // distribute the reduction. The mesh of this input has one device, which is enough to select the keys on
@@ -1866,7 +1867,7 @@ mod tests {
         )
         .unwrap();
         let sharded_input = Array::from_host_buffer(
-            &domain,
+            &session,
             ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding).unwrap(),
             DeviceMesh::new(explicit_mesh, mesh.devices().to_vec()).unwrap(),
             values_to_bytes(&logits),
@@ -1890,7 +1891,7 @@ mod tests {
         // they recognize. Floating-point extrema over two devices still propagate NaNs and order negative zero below
         // positive zero, wherever the shards hold them.
         let client = cpu_client(2);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(&client, "x", 2).devices().to_vec()).unwrap();
         let sharded = |data_type: DataType, dimensions: &[usize], axis: usize, bytes: Vec<u8>| {
@@ -1899,7 +1900,7 @@ mod tests {
             let r#type = ArrayType::new_static(data_type, dimensions.to_vec())
                 .with_sharding(Sharding::new(logical_mesh.clone(), placements).unwrap())
                 .unwrap();
-            Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap()
         };
         let reduce = |values: [f32; 4], kind: ReductionKind| {
             let input = sharded(DataType::F32, &[4], 0, values_to_bytes(&values));
@@ -1994,7 +1995,7 @@ mod tests {
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let placed = |data_type: DataType, bytes: Vec<u8>| {
             Array::from_host_buffer_with_sharding(
-                &domain,
+                &session,
                 ArrayType::new_static(data_type, [4]),
                 Sharding::new(auto_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
                 DeviceMesh::new(auto_mesh.clone(), mesh.devices().to_vec()).unwrap(),
@@ -2332,7 +2333,7 @@ mod tests {
     fn test_reduce_operation_lower_log_sum_exp_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2360,7 +2361,7 @@ mod tests {
     fn test_reduce_operation_lower_log_sum_exp_narrow_jvp() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = ArrayType::new_static(DataType::F16, [65536])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2542,7 +2543,7 @@ mod tests {
     #[test]
     fn test_lower_log_sum_exp_to_mlir_complex() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
@@ -2551,7 +2552,7 @@ mod tests {
         let second = Complex::new(3f32, -2.0);
         let shift = Complex::new(3f32, 0.0);
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[3],
@@ -2565,7 +2566,7 @@ mod tests {
 
         // Even without reduced axes, the principal logarithm wraps phases outside its branch.
         let input = replicated_array(
-            &domain,
+            &session,
             &mesh,
             DataType::C64,
             &[2],
@@ -2588,7 +2589,7 @@ mod tests {
         // Narrow floating-point inputs compare in `f32`, signed one-bit inputs compare in a signed byte carrier, and
         // the expected indices are the ones that JAX's `lax.argmax` and `lax.argmin` return.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let cases = [
             (
@@ -2641,7 +2642,7 @@ mod tests {
             ),
         ];
         for (data_type, bytes, axis, index_data_type, expected_argmax, expected_argmin) in cases {
-            let input = replicated_array(&domain, &mesh, data_type, &[2, 3], &bytes);
+            let input = replicated_array(&session, &mesh, data_type, &[2, 3], &bytes);
             assert_eq!(
                 input.argmax_with_index_data_type(axis, index_data_type).unwrap().copy_to_host().unwrap(),
                 expected_argmax,
@@ -2660,7 +2661,7 @@ mod tests {
         // An axis that contains a NaN of either sign reports its first NaN, and ties between signed zeros select the
         // lowest index, as `jnp.argmax` and `jnp.argmin` do.
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for (values, expected_argmax, expected_argmin) in [
             (vec![1f32, f32::NAN, 3.0], 1i32, 1i32),
@@ -2669,7 +2670,7 @@ mod tests {
             (vec![0f32, -0.0, -5.0], 0, 2),
             (vec![-0f32, 0.0], 0, 0),
         ] {
-            let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+            let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
             assert_eq!(
                 values_from_bytes::<i32>(&input.argmax(0).unwrap().copy_to_host().unwrap()),
                 vec![expected_argmax],

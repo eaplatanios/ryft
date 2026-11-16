@@ -867,7 +867,7 @@ mod tests {
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type};
-    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Domain, Session, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1385,7 +1385,8 @@ mod tests {
         })
         .with_policy(NothingSavable);
         let (_, program) =
-            DomainTracingContext::<Domain<'static>>::trace(|x: Tracer<'static>| function.call(x), scalar_type).unwrap();
+            DomainTracingContext::<Session<'static>>::trace(|x: Tracer<'static>| function.call(x), scalar_type)
+                .unwrap();
         let linearization = program.into_flat_program().linearize().unwrap();
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
@@ -1446,7 +1447,7 @@ mod tests {
             let mut outputs = context.bind(AddOperation::new(), Vec::new(), &[x, captured])?;
             Ok(outputs.remove(0))
         });
-        let root = DomainTracingContext::<Domain<'static>>::new();
+        let root = DomainTracingContext::<Session<'static>>::new();
         let input = root.input(scalar_type);
         let result = function.call(input);
         assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
@@ -1808,12 +1809,12 @@ mod tests {
     #[test]
     fn test_elementwise_lowering_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let left_values = [0.5f32, 1.25, 2.0, 3.75];
         let right_values = [4.0f32, 0.25, -1.5, 2.5];
-        let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&left_values));
-        let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&right_values));
+        let left = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&left_values));
+        let right = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&right_values));
         let reference_left = CoreArray::vector(left_values.to_vec()).unwrap();
         let reference_right = CoreArray::vector(right_values.to_vec()).unwrap();
 
@@ -1901,10 +1902,10 @@ mod tests {
     #[test]
     fn test_lower_accuracy_matches_reference_backend() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let values = [0.5f32, -1.0, 2.0];
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
         let reference = CoreArray::vector(values.to_vec()).unwrap();
         let expected_sine = reference.sin().unwrap().elements::<f32>().unwrap();
         let expected_tanh = reference.tanh().unwrap().elements::<f32>().unwrap();

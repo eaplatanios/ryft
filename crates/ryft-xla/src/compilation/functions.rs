@@ -4,7 +4,7 @@
 //! creates a [`CompiledFunctionDispatcher`] that selects specializations from runtime inputs. Its first execution of a
 //! specialization stages, lowers, and requests compilation, while warm executions reuse the retained executable.
 //! [`compile`] stages and obtains a [`CompiledFunction`] for one explicit abstract signature immediately. Both paths
-//! share the domain's [`CompilationContext`](ryft_core::CompilationContext) cache.
+//! share the session's [`CompilationContext`](ryft_core::CompilationContext) cache.
 //!
 //! [`stage`] returns a [`StagedFunction`] for functions that are composed into larger programs before compilation.
 //! Staged functions register runtime captures in their retained capture table instead of embedding runtime arrays in
@@ -25,10 +25,10 @@
 //! # Calling Compiled Functions
 //!
 //! [`StagedFunction::call`], [`CompiledFunction::call`], and [`CompiledFunctionDispatcher::call`] bind a `jit_call`
-//! operation, which carries the retained source program of the called function, in the context that their inputs
-//! belong to. These inputs and outputs are the `ArrayType` leaves of a [`ProjectedContext`] over an array IR context,
-//! which the call recovers from the first input. They are [`Array`]s under the eager [`Domain`] and [`ProjectedValue`]s
-//! of tracers under a trace or a transform (e.g., the [`CompileTracer`]s of an enclosing compilation). The
+//! operation, which carries the retained source program of the called function, in the context that their inputs belong
+//! to. These inputs and outputs are the `ArrayType` leaves of a [`ProjectedContext`] over an array IR context, which
+//! the call recovers from the first input. They are [`Array`]s under the eager [`Session`] and [`ProjectedValue`]s of
+//! tracers under a trace or a transform (e.g., the [`CompileTracer`]s of an enclosing compilation). The
 //! `call_in_context` variants take the array IR context explicitly, which also serves nullary functions. Every parent
 //! context is supported:
 //!
@@ -59,9 +59,9 @@
 //! Some bodies are traced over constants alone (i.e., in a `TracingContext<Constant, Operation>`), such as the bodies
 //! of [`rematerialize`](ryft_core::rematerialize) and [`composite`](ryft_core::composite), the custom rules of
 //! composites, and the regions nested in them. Their capture tables cannot hold runtime arrays, so calls in them
-//! import captures through [`ThroughSession`](crate::ThroughSession) instead. The [`Session`](crate::Session) of each
-//! such array retains it for as long as a handle to it exists, and the body stages a
-//! [`SessionConstant`](crate::SessionConstant) handle to it, which has no lifetime and keeps the callee closed. An
+//! import captures through [`ThroughSession`](crate::ThroughSession) instead. The [`Session`] of each such array
+//! retains it for as long as a handle to it exists, and the body stages a [`SessionConstant`](crate::SessionConstant)
+//! handle to it, which has no lifetime and keeps the callee closed. An
 //! eager parent resolves the handle when it lifts it, and lowering passes every distinct handle of a program as a
 //! hidden argument of the entry function after its captures, so the executable depends only on the types of these
 //! arrays. Composite bodies and rules must be `'static`, so they can only call compiled functions of a `'static`
@@ -206,14 +206,14 @@ use crate::compilation::options::Options;
 use crate::compilation::profile_guided::{AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions};
 use crate::compilation::programs::CompiledProgram;
 use crate::execution::{validate_input_type, validate_runtime_outputs};
-use crate::{Array, Constant, Domain, Error, ExecutionError, Operation, Value};
+use crate::{Array, Constant, Error, ExecutionError, Operation, Session, Value};
 
 /// Array IR tracer retained by the experimental stateful XLA program.
 ///
 /// # Stability
 ///
 /// This alias is experimental while the external reference ABI is evolving.
-pub type StatefulCompileTracer<'c> = CoreTracer<DomainTracingContext<Domain<'c>, Value<'c>>>;
+pub type StatefulCompileTracer<'c> = CoreTracer<DomainTracingContext<Session<'c>, Value<'c>>>;
 
 /// Tracer leaf exposed by the public XLA compilation facade over arrays.
 pub type CompileTracer<'c> = ProjectedValue<ArrayType, StatefulCompileTracer<'c>>;
@@ -252,7 +252,7 @@ pub struct CompiledFunctionDispatcher<
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Array IR domain dispatcher hidden behind the public array projection boundary.
-    function: CoreCompiledFunctionDispatcher<Domain<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
+    function: CoreCompiledFunctionDispatcher<Session<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
 }
 
 impl<'c, F, Static, In, Out> Clone for CompiledFunctionDispatcher<'c, F, Static, In, Out>
@@ -263,7 +263,7 @@ where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    CoreCompiledFunctionDispatcher<Domain<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>: Clone,
+    CoreCompiledFunctionDispatcher<Session<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -314,7 +314,7 @@ where
     /// a `jit_call` operation in the array IR context recovered from `inputs`. Unlike [`Self::execute`], it works under
     /// any context, including eager, staging, and transform contexts, so this dispatcher's closure composes with
     /// enclosing transforms and compilations. Inputs and outputs are `ArrayType` values of a [`ProjectedContext`] over
-    /// that context (e.g., [`Array`]s under the eager [`Domain`] and [`ProjectedValue`]s under traces and transforms),
+    /// that context (e.g., [`Array`]s under the eager [`Session`] and [`ProjectedValue`]s under traces and transforms),
     /// as for [`StagedFunction::call`]. The closure is traced with the named axes and default mesh of that context, so
     /// it can read named batch and mesh axes of its caller. Refer to
     /// [`CoreCompiledFunctionDispatcher::call_in_context`] for how staged specializations are traced and retained.
@@ -333,7 +333,7 @@ where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
-            + ImportingContext<Domain<'c>, Path>
+            + ImportingContext<Session<'c>, Path>
             + NamedAxes
             + MeshContext,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
@@ -353,7 +353,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when the domain rejects the staged input types, when tracing the closure fails, when the same
+    /// Returns an error when the session rejects the staged input types, when tracing the closure fails, when the same
     /// thread recursively requests a staged specialization that it is still producing, or when importing a capture,
     /// binding the call, or reassembling the structured outputs fails.
     #[inline]
@@ -369,7 +369,7 @@ where
             ProgramParameterValues<In, StatefulCompileTracer<'c>>,
         ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
-            + ImportingContext<Domain<'c>, Path>
+            + ImportingContext<Session<'c>, Path>
             + NamedAxes
             + MeshContext,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
@@ -423,7 +423,7 @@ where
 /// outputs wrapped in [`Ok`].
 pub fn jit_with_options<'c, F, Static, In, Out>(
     function: F,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     options: Options,
 ) -> CompiledFunctionDispatcher<
     'c,
@@ -456,7 +456,7 @@ where
         let outputs = function(static_parameters, project_values::<In, StatefulCompileTracer<'c>>(inputs)?)?;
         place_outputs(lift_values::<Out, StatefulCompileTracer<'c>>(outputs)?, output_shardings.as_deref())
     };
-    CompiledFunctionDispatcher { function: domain.jit_with_options(function, options) }
+    CompiledFunctionDispatcher { function: session.jit_with_options(function, options) }
 }
 
 /// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options. Refer to
@@ -467,7 +467,7 @@ where
 #[inline]
 pub fn jit<'c, F, Static, In, Out>(
     function: F,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: DeviceMesh,
 ) -> CompiledFunctionDispatcher<
     'c,
@@ -494,7 +494,7 @@ where
         + ParameterizedFamily<StatefulCompileTracer<'c>>
         + ParameterizedFamily<CompileTracer<'c>>,
 {
-    jit_with_options(function, domain, Options::new(mesh))
+    jit_with_options(function, session, Options::new(mesh))
 }
 
 /// Retained heterogeneous XLA JIT dispatcher whose calls may bind external references.
@@ -523,7 +523,7 @@ pub struct StatefulCompiledFunctionDispatcher<
     Out::Family: ParameterizedFamily<Constant>,
 {
     /// Backend-neutral dispatcher retaining heterogeneous runtime values and compiled specializations.
-    function: CoreCompiledFunctionDispatcher<Domain<'c>, Static, In, Out, F>,
+    function: CoreCompiledFunctionDispatcher<Session<'c>, Static, In, Out, F>,
 }
 
 impl<'c, F, Static, In, Out> Clone for StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
@@ -534,7 +534,7 @@ where
     In::Family: ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayIrType>,
     Out::Family: ParameterizedFamily<Constant>,
-    CoreCompiledFunctionDispatcher<Domain<'c>, Static, In, Out, F>: Clone,
+    CoreCompiledFunctionDispatcher<Session<'c>, Static, In, Out, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -628,7 +628,7 @@ where
 /// This external state entry point is experimental.
 pub fn jit_statefully_with_options<'c, F, Static, In, Out>(
     function: F,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     options: Options,
 ) -> StatefulCompiledFunctionDispatcher<
     'c,
@@ -654,7 +654,7 @@ where
     let function = move |static_parameters, inputs| {
         place_outputs(function(static_parameters, inputs)?, output_shardings.as_deref())
     };
-    StatefulCompiledFunctionDispatcher { function: domain.jit_with_options(function, options) }
+    StatefulCompiledFunctionDispatcher { function: session.jit_with_options(function, options) }
 }
 
 /// Constructs a retained stateful dispatcher for a heterogeneous XLA `function` on `mesh` with otherwise default
@@ -669,7 +669,7 @@ where
 #[inline]
 pub fn jit_statefully<'c, F, Static, In, Out>(
     function: F,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: DeviceMesh,
 ) -> StatefulCompiledFunctionDispatcher<
     'c,
@@ -691,7 +691,7 @@ where
             Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
         >,
 {
-    jit_statefully_with_options(function, domain, Options::new(mesh))
+    jit_statefully_with_options(function, session, Options::new(mesh))
 }
 
 /// Compiled heterogeneous XLA function whose invocation may bind external references.
@@ -712,7 +712,7 @@ where
     Out::Family: ParameterizedFamily<Constant>,
 {
     /// Backend-neutral compiled function retaining the array IR runtime boundary.
-    function: CoreCompiledFunction<Domain<'c>, In, Out>,
+    function: CoreCompiledFunction<Session<'c>, In, Out>,
 }
 
 impl<'c, In, Out> StatefulCompiledFunction<'c, In, Out>
@@ -727,7 +727,7 @@ where
 {
     /// Returns the executable handle, which retains only the runtime state of this function.
     #[inline]
-    pub fn executable(&self) -> &CoreExecutableFunction<Domain<'c>, In, Out> {
+    pub fn executable(&self) -> &CoreExecutableFunction<Session<'c>, In, Out> {
         self.function.executable()
     }
 
@@ -745,10 +745,10 @@ where
     /// [`StatefulCompiledFunctionDispatcher::execute_statefully_and_wait`] for the complete transaction contract.
     pub fn execute_statefully_and_wait(
         &self,
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         inputs: In::To<StatefulValue<'c>>,
     ) -> Result<Out::To<StatefulValue<'c>>, Error> {
-        self.function.executable().execute_statefully_and_wait(domain, inputs)
+        self.function.executable().execute_statefully_and_wait(session, inputs)
     }
 
     /// Submits a stateful call and returns its result, which carries the completion of the call and never cancels it.
@@ -757,10 +757,10 @@ where
     /// governs completion and the observation of errors.
     pub fn execute_statefully(
         &self,
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         inputs: In::To<StatefulValue<'c>>,
     ) -> StatefulExecution<Out::To<StatefulValue<'c>>, Error> {
-        self.function.executable().execute_statefully(domain, inputs)
+        self.function.executable().execute_statefully(session, inputs)
     }
 }
 
@@ -772,7 +772,7 @@ where
 pub fn compile_statefully<'c, F, In, Out>(
     function: F,
     input_types: In,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     options: Options,
 ) -> Result<StatefulCompiledFunction<'c, In, Out>, Error>
 where
@@ -785,7 +785,7 @@ where
     Out::To<StatefulCompileTracer<'c>>:
         Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
-    compile_statefully_with_captures(move |_, inputs| function(inputs), Vec::new(), input_types, domain, options)
+    compile_statefully_with_captures(move |_, inputs| function(inputs), Vec::new(), input_types, session, options)
 }
 
 /// Compiles one heterogeneous signature with explicit array or reference captures for stateful invocation.
@@ -798,7 +798,7 @@ pub fn compile_statefully_with_captures<'c, F, In, Out>(
     function: F,
     captures: Vec<StatefulValue<'c>>,
     input_types: In,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     options: Options,
 ) -> Result<StatefulCompiledFunction<'c, In, Out>, Error>
 where
@@ -816,14 +816,14 @@ where
 {
     let input_types = with_input_shardings(input_types, &options)?;
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
-    let staged = CoreStagedFunction::<Domain<'_>, In, Out>::stage(
+    let staged = CoreStagedFunction::<Session<'_>, In, Out>::stage(
         |_, capture_tracers, inputs| place_outputs(function(capture_tracers, inputs)?, output_shardings.as_deref()),
         captures,
         input_types,
         options,
     )?;
-    let lowered = staged.lower(domain)?;
-    Ok(StatefulCompiledFunction { function: lowered.compile(domain)? })
+    let lowered = staged.lower(session)?;
+    Ok(StatefulCompiledFunction { function: lowered.compile(session)? })
 }
 
 /// Staged XLA function that has not been compiled. Returned by [`stage`] and [`stage_with_captures`].
@@ -832,7 +832,7 @@ where
 /// runtime [`Array`]s and input and output type metadata, without compiling a PJRT executable. This is the right
 /// handle for functions that are only composed into larger programs. [`Self::call`] calls it in any context as a
 /// `jit_call` boundary that carries its source program (refer to the
-/// [module documentation](crate::compilation::functions)), and [`Domain::compile_staged_function`] produces a
+/// [module documentation](crate::compilation::functions)), and [`Session::compile_staged_function`] produces a
 /// [`CompiledFunction`] when an executable is needed. Executable cache identity is derived from the complete lowered
 /// computation and the backend state that affects compilation, so equivalent lowerings can share an executable even
 /// when they were produced at different Rust call sites.
@@ -842,7 +842,7 @@ where
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral staged function carrying the source program, captures, structures, and retained options.
-    function: CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedFunction<'c, In, Out>
@@ -875,7 +875,7 @@ where
     ///
     /// The call binds a boundary that carries this function's retained source program, so enclosing transforms
     /// rewrite it through the ordinary rules of the `jit_call` operation. Inputs and outputs are `ArrayType` values of
-    /// a [`ProjectedContext`] over `C`, which the call recovers from the first input. Under the eager [`Domain`], they
+    /// a [`ProjectedContext`] over `C`, which the call recovers from the first input. Under the eager [`Session`], they
     /// are [`Array`]s and the call executes immediately through eager dispatch. Under a trace or a transform (e.g.,
     /// forward mode differentiation), they are [`ProjectedValue`]s of its tracers and the call is recorded or
     /// rewritten there. The captured runtime arrays of this function enter `C` through [`ImportingContext`], which
@@ -897,7 +897,7 @@ where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
-            + ImportingContext<Domain<'c>, Path>,
+            + ImportingContext<Session<'c>, Path>,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
         In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
         Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
@@ -922,7 +922,8 @@ where
         inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
     ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Domain<'c>, Path>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + ImportingContext<Session<'c>, Path>,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -934,19 +935,19 @@ where
 
     /// Consumes this facade and returns its array IR staged artifact for verification within the crate.
     #[cfg(test)]
-    pub(crate) fn into_inner(self) -> CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>> {
+    pub(crate) fn into_inner(self) -> CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>> {
         self.function
     }
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
-    From<CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>> for StagedFunction<'c, In, Out>
+    From<CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>> for StagedFunction<'c, In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     #[inline]
-    fn from(function: CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>) -> Self {
+    fn from(function: CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>) -> Self {
         Self { function }
     }
 }
@@ -964,7 +965,7 @@ where
 {
     /// Backend-neutral executable function retaining the compiled program, the captured runtime values, and the
     /// runtime signature.
-    function: CoreExecutableFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: CoreExecutableFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableFunction<'c, In, Out>
@@ -995,7 +996,7 @@ where
         self.function.compiled_program().mesh()
     }
 
-    /// Executes this function through `domain` on concrete [`Array`] inputs and reconstructs its structured outputs.
+    /// Executes this function through `session` on concrete [`Array`] inputs and reconstructs its structured outputs.
     /// Returned arrays can still have pending device work. Use [`Self::execute_async`] when a completion handle for
     /// the whole invocation is needed, including for a function with no array outputs.
     ///
@@ -1004,7 +1005,7 @@ where
     /// Returns an error if the executable belongs to another client, input validation or output reconstruction fails,
     /// or execution reports a failure. Deferred device failures can also surface when an output is awaited.
     #[inline]
-    pub fn execute(&self, domain: &Domain<'c>, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
+    pub fn execute(&self, session: &Session<'c>, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
     where
         In: Parameterized<
                 ArrayType,
@@ -1024,10 +1025,10 @@ where
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = lift_values::<In, StatefulValue<'c>>(inputs)?;
-        Ok(project_values::<Out, StatefulValue<'c>>(self.function.execute(domain, inputs)?)?)
+        Ok(project_values::<Out, StatefulValue<'c>>(self.function.execute(session, inputs)?)?)
     }
 
-    /// Submits this function through `domain` and returns its structured outputs together with the completion of the
+    /// Submits this function through `session` and returns its structured outputs together with the completion of the
     /// whole invocation, including for a function with no array outputs. Await the returned [`Execution`] to observe
     /// asynchronous execution failures.
     ///
@@ -1041,7 +1042,7 @@ where
     /// validation, submission, or output reconstruction.
     pub fn execute_async(
         &self,
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         inputs: In::To<Array<'c>>,
     ) -> Result<Execution<Out::To<Array<'c>>>, Error>
     where
@@ -1081,7 +1082,7 @@ where
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let execution = domain.execute_compiled_async(self.function.compiled_program(), inputs)?;
+        let execution = session.execute_compiled_async(self.function.compiled_program(), inputs)?;
         let (flat_outputs, fence) = execution.into_parts();
         validate_runtime_outputs(self.function.compiled_program().output_types(), flat_outputs.as_slice())?;
         let outputs = ProgramParameterValues::<Out, Value<'c>>::from_parameters(
@@ -1093,7 +1094,7 @@ where
     }
 }
 
-impl<'c> Domain<'c> {
+impl<'c> Session<'c> {
     /// Lowers and compiles a staged XLA function using the options that it retained when it was staged.
     pub fn compile_staged_function<In, Out>(
         &self,
@@ -1128,7 +1129,7 @@ impl<'c> Domain<'c> {
     /// Wraps a compiled function in an adaptive profile-guided dispatcher.
     ///
     /// The returned handle retains only runtime state. It samples a bounded number of baseline executions, recompiles
-    /// the already lowered StableHLO through this domain's ordinary compilation cache with the aggregated XLA profile,
+    /// the already lowered StableHLO through this session's ordinary compilation cache with the aggregated XLA profile,
     /// and then atomically directs subsequent calls to the compatible optimized executable.
     pub fn adaptive_profile_guided_recompilation<In, Out>(
         &self,
@@ -1152,7 +1153,7 @@ impl<'c> Domain<'c> {
 }
 
 /// Compiled XLA function for one explicit abstract signature. Returned by [`compile`], [`compile_with_captures`],
-/// [`compile_with_options`], and [`Domain::compile_staged_function`].
+/// [`compile_with_options`], and [`Session::compile_staged_function`].
 ///
 /// Holds the cached [`CompiledProgram`], which a PJRT executable backs, together with the [`StagedFunction`] it was
 /// compiled from, whose input and output type metadata marshals a [`Parameterized`] tree of [`Array`]s into the
@@ -1172,7 +1173,7 @@ where
 {
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
-    function: CoreCompiledFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: CoreCompiledFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
 
     /// Derived transformed functions retained by [`Self::gradient`] and [`Self::jvp`]. Shared across clones so a
     /// wrapper's clones reuse one retained derivative per transform.
@@ -1231,7 +1232,7 @@ where
     }
 
     /// Calls this compiled function as a `jit_call` operation in the array IR context recovered from `inputs`, exactly
-    /// as [`StagedFunction::call`] calls its retained staged function. Under the eager [`Domain`], the call executes
+    /// as [`StagedFunction::call`] calls its retained staged function. Under the eager [`Session`], the call executes
     /// through eager dispatch rather than through the retained executable, so use [`ExecutableFunction::execute`] to
     /// run that executable directly on concrete arrays.
     ///
@@ -1242,7 +1243,7 @@ where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
-            + ImportingContext<Domain<'c>, Path>,
+            + ImportingContext<Session<'c>, Path>,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
         In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
         Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
@@ -1264,7 +1265,8 @@ where
         inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
     ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Domain<'c>, Path>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+            + ImportingContext<Session<'c>, Path>,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -1334,15 +1336,15 @@ where
     /// enter the new trace through [`ImportingContext`] and become captures of the derived function.
     ///
     /// The derived function is retained on this wrapper and shared across its clones. Repeated calls with an
-    /// interchangeable `domain` return the retained compiled function without repeating differentiation, staging, or
-    /// lowering, while a call with a different domain identity produces a fresh derivative and replaces the retained
+    /// interchangeable `session` return the retained compiled function without repeating differentiation, staging, or
+    /// lowering, while a call with a different session identity produces a fresh derivative and replaces the retained
     /// one. The retained artifact is a compiled program whose residuals are runtime values, so reuse across calls with
     /// different runtime inputs is sound by construction. Retention is not single-flight. Concurrent cold calls may
     /// each derive a gradient, and because those derivations are interchangeable, the inserts are idempotent and the
     /// last one wins, while the shared [`CompilationContext`](ryft_core::compilation::CompilationContext) still
     /// deduplicates their backend compilation.
     #[track_caller]
-    pub fn gradient(&self, domain: &Domain<'c>) -> Result<CompiledFunction<'c, In, In>, Error>
+    pub fn gradient(&self, session: &Session<'c>) -> Result<CompiledFunction<'c, In, In>, Error>
     where
         In::Family: ParameterizedFamily<CompileTracer<'c>, To = In::To<CompileTracer<'c>>>,
         In::To<CompileTracer<'c>>: Parameterized<
@@ -1361,7 +1363,7 @@ where
         {
             let slot = self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned");
             if let Some((witness, artifact)) = slot.as_ref()
-                && witness.matches(domain)
+                && witness.matches(session)
             {
                 return Ok(CompiledFunction {
                     function: artifact.clone(),
@@ -1411,11 +1413,11 @@ where
             },
             Vec::new(),
             input_signature,
-            domain,
+            session,
             self.derived_options(),
         )?;
         *self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned") =
-            Some((DomainWitness::new(domain), compiled.function.clone()));
+            Some((SessionWitness::new(session), compiled.function.clone()));
         Ok(compiled)
     }
 }
@@ -1448,13 +1450,13 @@ where
     /// derived function.
     ///
     /// The derived function is retained on this wrapper and shared across its clones. Repeated calls with an
-    /// interchangeable `domain` return the retained compiled function without repeating differentiation, staging, or
-    /// lowering, while a call with a different domain identity produces a fresh derivative and replaces the retained
+    /// interchangeable `session` return the retained compiled function without repeating differentiation, staging, or
+    /// lowering, while a call with a different session identity produces a fresh derivative and replaces the retained
     /// one. Retention is not single-flight. Concurrent cold calls may each derive a JVP, and because those derivations
     /// are interchangeable, the inserts are idempotent and the last one wins, while the shared
     /// [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates their backend compilation.
     #[track_caller]
-    pub fn jvp(&self, domain: &Domain<'c>) -> Result<CompiledFunction<'c, (In, In), (Out, Out)>, Error>
+    pub fn jvp(&self, session: &Session<'c>) -> Result<CompiledFunction<'c, (In, In), (Out, Out)>, Error>
     where
         In::Family: ParameterizedFamily<CompileTracer<'c>, To = In::To<CompileTracer<'c>>>,
         In::To<CompileTracer<'c>>:
@@ -1476,7 +1478,7 @@ where
         {
             let slot = self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned");
             if let Some((witness, artifact)) = slot.as_ref()
-                && witness.matches(domain)
+                && witness.matches(session)
             {
                 return Ok(CompiledFunction {
                     function: artifact.clone(),
@@ -1528,11 +1530,11 @@ where
             },
             Vec::new(),
             (input_signature, tangent_signature),
-            domain,
+            session,
             self.derived_options(),
         )?;
         *self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned") =
-            Some((DomainWitness::new(domain), compiled.function.clone()));
+            Some((SessionWitness::new(session), compiled.function.clone()));
         Ok(compiled)
     }
 }
@@ -1588,7 +1590,7 @@ where
     #[track_caller]
     pub fn batch<InputBatchAxes: Parameterized<BatchAxis>, OutputBatchAxes: Parameterized<BatchAxis>>(
         &self,
-        domain: &Domain<'c>,
+        session: &Session<'c>,
         input_batch_axes: InputBatchAxes,
         output_batch_axes: OutputBatchAxes,
         batch_axis: BatchAxisSpecification<usize>,
@@ -1677,7 +1679,7 @@ where
             },
             Vec::new(),
             batched_input_types,
-            domain,
+            session,
             self.derived_options(),
         )
     }
@@ -1691,13 +1693,13 @@ where
 ///
 /// The function is traced into a fresh XLA program, in which compiled functions that it calls register their runtime
 /// captures as captures of the new program (refer to [`StagedFunction::call`]). The resulting program is then
-/// compiled and executed against `domain`. Its [`CompilationContext`](ryft_core::compilation::CompilationContext)
+/// compiled and executed against `session`. Its [`CompilationContext`](ryft_core::compilation::CompilationContext)
 /// structurally shares equivalent lowerings even when they originate at different Rust call sites.
 #[track_caller]
 pub fn compile<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: DeviceMesh,
 ) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
@@ -1720,7 +1722,7 @@ where
             To<Constant> = ProgramConstants<Out>,
         >,
 {
-    compile_with_options(function, input_types, domain, Options::new(mesh))
+    compile_with_options(function, input_types, session, Options::new(mesh))
 }
 
 /// Same as [`compile`] but makes runtime arrays explicit captures of the compiled program.
@@ -1733,7 +1735,7 @@ pub fn compile_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameter
     function: F,
     captures: Vec<Array<'c>>,
     input_types: In,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     mesh: DeviceMesh,
 ) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
@@ -1760,7 +1762,7 @@ where
         |_, capture_tracers, inputs| Ok(function(capture_tracers, inputs)),
         captures,
         input_types,
-        domain,
+        session,
         Options::new(mesh),
     )
 }
@@ -1770,7 +1772,7 @@ where
 pub fn compile_with_options<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     options: Options,
 ) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
@@ -1793,7 +1795,7 @@ where
             To<Constant> = ProgramConstants<Out>,
         >,
 {
-    compile_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, domain, options)
+    compile_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, session, options)
 }
 
 /// Traces `function` into a staged program and returns a [`StagedFunction`] handle, without compiling a PJRT
@@ -1801,7 +1803,7 @@ where
 ///
 /// This is the counterpart of [`compile`] that only stages. Use it for functions that are composed into larger programs
 /// or transforms through [`StagedFunction::call`] rather than executed directly, so that no executable is built for
-/// them. Compile the staged handle later with [`Domain::compile_staged_function`] when direct execution is needed.
+/// them. Compile the staged handle later with [`Session::compile_staged_function`] when direct execution is needed.
 /// `options` are applied to the abstract input signature before tracing and retained for subsequent lowering and
 /// compilation.
 #[track_caller]
@@ -1899,7 +1901,7 @@ where
         input_structure,
         input_types.into_parameters().map(ArrayIrType::from),
     )?;
-    let output_types = DomainTracingContext::<Domain<'static>, StatefulValue<'static>>::infer_output_type(
+    let output_types = DomainTracingContext::<Session<'static>, StatefulValue<'static>>::infer_output_type(
         |tracers| {
             let input_structure = tracers.parameter_structure();
             let input_parameters = tracers
@@ -1938,16 +1940,16 @@ type ProgramConstants<P> = ProgramParameterValues<P, Constant>;
 /// forward mode JVP compiled around a call of its retained source program).
 type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
     'c,
-    CoreCompiledFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<In>>,
-    CoreCompiledFunction<Domain<'c>, ProgramParameters<(In, In)>, ProgramParameters<(Out, Out)>>,
+    CoreCompiledFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<In>>,
+    CoreCompiledFunction<Session<'c>, ProgramParameters<(In, In)>, ProgramParameters<(Out, Out)>>,
 >;
 
 /// Retention slots, each holding one entry, for functions derived from a [`CompiledFunction`].
 ///
 /// [`CompiledFunction::gradient`] and [`CompiledFunction::jvp`] take no transform configuration per call, so each
-/// derived function has exactly one valid form per domain identity. The slot retains the most recently produced
-/// artifact together with a witness of the domain that produced it. A later call with a matching domain reuses the
-/// retained artifact and skips differentiation, staging, and lowering entirely, while a call with a different domain
+/// derived function has exactly one valid form per session identity. The slot retains the most recently produced
+/// artifact together with a witness of the session that produced it. A later call with a matching session reuses the
+/// retained artifact and skips differentiation, staging, and lowering entirely, while a call with a different session
 /// identity produces a fresh artifact and replaces the slot. Failed productions are never stored, so they retry
 /// naturally.
 ///
@@ -1958,10 +1960,10 @@ type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
 /// deduplicates the backend compilation those duplicate derivations request.
 struct DerivedFunctionSlots<'c, Gradient, Jvp> {
     /// Retained reverse mode gradient function, if any.
-    gradient: Mutex<Option<(DomainWitness<'c>, Gradient)>>,
+    gradient: Mutex<Option<(SessionWitness<'c>, Gradient)>>,
 
     /// Retained forward mode JVP function, if any.
-    jvp: Mutex<Option<(DomainWitness<'c>, Jvp)>>,
+    jvp: Mutex<Option<(SessionWitness<'c>, Jvp)>>,
 }
 
 impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
@@ -1971,34 +1973,32 @@ impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
     }
 }
 
-/// Identity of the [`Domain`] that produced a retained derived function.
+/// Identity of the [`Session`] that produced a retained derived function.
 ///
-/// [`Domain`] handles are cheap clones of shared state, so two handles denote interchangeable compilation
-/// pipelines exactly when they share one compilation context, one client, equal compilation option templates, and an
-/// equal mesh. The witness stores a full domain clone, which both provides those comparisons and keeps the shared
-/// compilation context alive so its address can never be reused by a later allocation.
-struct DomainWitness<'c> {
-    /// Domain handle captured when the retained artifact was produced.
-    domain: Domain<'c>,
+/// [`Session`] handles are cheap clones of shared state, so two handles denote interchangeable compilation
+/// pipelines exactly when they are handles of the same session, and therefore share one client, one compilation
+/// context, and one template of compilation options, and have an equal mesh. The witness stores a full session clone,
+/// which both provides those comparisons and keeps the shared state alive so its address can never be reused by a
+/// later allocation.
+struct SessionWitness<'c> {
+    /// Session handle captured when the retained artifact was produced.
+    session: Session<'c>,
 }
 
-impl<'c> DomainWitness<'c> {
-    /// Captures the identity of `domain`.
-    fn new(domain: &Domain<'c>) -> Self {
-        Self { domain: domain.clone() }
+impl<'c> SessionWitness<'c> {
+    /// Captures the identity of `session`.
+    fn new(session: &Session<'c>) -> Self {
+        Self { session: session.clone() }
     }
 
-    /// Returns whether `domain` is interchangeable with the domain that produced the retained artifact.
-    fn matches(&self, domain: &Domain<'c>) -> bool {
-        std::ptr::eq(self.domain.compilation_context(), domain.compilation_context())
-            && std::ptr::eq(self.domain.client(), domain.client())
-            && self.domain.compilation_options() == domain.compilation_options()
-            && self.domain.mesh().ok() == domain.mesh().ok()
+    /// Returns whether `session` is interchangeable with the session that produced the retained artifact.
+    fn matches(&self, session: &Session<'c>) -> bool {
+        self.session.is_same_session(session) && self.session.mesh().ok() == session.mesh().ok()
     }
 }
 
 /// Batched tracer of one array IR batching level directly inside an XLA compilation trace.
-type CompileBatchTracer<'c> = BatchingTracer<DomainTracingContext<Domain<'c>, Value<'c>>, ArrayIrBatchingPolicy>;
+type CompileBatchTracer<'c> = BatchingTracer<DomainTracingContext<Session<'c>, Value<'c>>, ArrayIrBatchingPolicy>;
 
 /// Projects one tree of array IR values of any context (e.g., runtime [`Value`]s or [`StatefulCompileTracer`]s) to the
 /// tree of their `ArrayType` projections.
@@ -2147,7 +2147,7 @@ where
 /// [`CompiledFunction::call_in_context`]. Inputs whose type differs from the input type of `function` only in its
 /// sharding are first brought to that type in `context` (refer to `place_inputs`).
 fn call_staged_in_context<'c, In, Out, C, Path>(
-    function: &CoreStagedFunction<Domain<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: &CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
     context: &C,
     inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
 ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
@@ -2162,7 +2162,7 @@ where
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<C::Value>
         + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Domain<'c>, Path>,
+    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session<'c>, Path>,
     C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
 {
     let input_structure = inputs.parameter_structure();
@@ -2174,7 +2174,7 @@ where
     project_values::<Out, C::Value>(function.call_in_context(context, inputs)?)
 }
 
-/// Stages `function` through [`stage_with_flat_captures`] and compiles the result against `domain`. This is the shared
+/// Stages `function` through [`stage_with_flat_captures`] and compiles the result against `session`. This is the shared
 /// implementation of [`compile`], [`compile_with_captures`], [`compile_with_options`], and the transforms of
 /// [`CompiledFunction`].
 ///
@@ -2184,14 +2184,14 @@ where
 ///     structured input tracers.
 ///   - `captures`: Runtime arrays to register in the capture table of the source program.
 ///   - `input_types`: Structured abstract input signature, to which the input sharding overrides of `options` apply.
-///   - `domain`: Domain that lowers and compiles the staged program.
+///   - `session`: Domain that lowers and compiles the staged program.
 ///   - `options`: Options retained for lowering and compilation.
 #[track_caller]
 fn compile_with_flat_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<Array<'c>>,
     input_types: In,
-    domain: &Domain<'c>,
+    session: &Session<'c>,
     options: Options,
 ) -> Result<CompiledFunction<'c, In, Out>, Error>
 where
@@ -2219,7 +2219,7 @@ where
         >,
 {
     let staged = stage_with_flat_captures::<F, In, Out>(function, captures, input_types, options)?;
-    domain.compile_staged_function(staged)
+    session.compile_staged_function(staged)
 }
 
 /// Traces `function` into a [`StagedFunction`] over the internal array IR type family. The closure sees public
@@ -2284,7 +2284,7 @@ where
         place_outputs(outputs, output_shardings.as_deref())
     };
     let input_types = with_input_shardings(input_types, &options)?;
-    let function = CoreStagedFunction::<Domain<'_>, ProgramParameters<In>, ProgramParameters<Out>>::stage(
+    let function = CoreStagedFunction::<Session<'_>, ProgramParameters<In>, ProgramParameters<Out>>::stage(
         function,
         captures,
         input_types,
@@ -2328,8 +2328,8 @@ mod tests {
     };
     use crate::tests::{assert_send_sync, cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Domain, Error, ExecutionError, JitCallOperation, Operation, RaggedDotLoweringStrategy,
-        Reference, Session, ThroughSession, Value,
+        Array, Constant, Error, ExecutionError, JitCallOperation, Operation, RaggedDotLoweringStrategy, Reference,
+        Session, ThroughSession, Value,
     };
 
     use super::*;
@@ -2341,8 +2341,8 @@ mod tests {
         reference_type: &ArrayIrType,
         array_type: &ArrayType,
     ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
-        let (_, program) = <Domain<'_>>::trace(
-            |(reference, update): (DomainTracer<Domain<'_>>, DomainTracer<Domain<'_>>)| {
+        let (_, program) = <Session<'_>>::trace(
+            |(reference, update): (DomainTracer<Session<'_>>, DomainTracer<Session<'_>>)| {
                 reference.add_update(&update)?;
                 reference.read()
             },
@@ -2356,16 +2356,16 @@ mod tests {
     fn test_compiled_function_dispatcher_execute() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let function: CompiledFunctionDispatcher<'_, _, bool, ArrayType, ArrayType> = jit(
             |apply_sine, input: CompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
-            &domain,
+            &session,
             mesh.clone(),
         );
 
         let input_type = replicated_vector_type(&mesh, 1);
         let source =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let sine = function.execute(true, source.clone()).unwrap();
         let warm_sine = function.execute(true, source.clone()).unwrap();
@@ -2386,7 +2386,7 @@ mod tests {
     fn test_compiled_function_dispatcher_execute_specializes_on_input_placement_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]);
@@ -2427,7 +2427,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
             jit(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, mesh.clone());
@@ -2459,7 +2459,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call_reads_axis_index_inside_jvp() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let xs = Array::from_host_buffer(
             &engine,
@@ -2514,7 +2514,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call_with_named_axes() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
@@ -2589,29 +2589,29 @@ mod tests {
     fn test_stateful_compiled_function_dispatcher_execute_statefully_and_wait() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let function = jit_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
             },
-            &domain,
+            &session,
             mesh.clone(),
         );
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
 
         for expected in [3.0f32, 5.0] {
             let update =
-                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = function
                 .execute_statefully_and_wait(
                     (),
-                    (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                    (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
                 )
                 .unwrap();
             let Value::Array(output) = output else { panic!("stateful public output must be an array") };
@@ -2626,25 +2626,25 @@ mod tests {
     fn test_stateful_compiled_function_dispatcher_execute_statefully() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let function = jit_statefully_with_options::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
             },
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         );
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let output = function
             .execute_statefully(
                 (),
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
             )
             .r#await()
             .unwrap();
@@ -2658,7 +2658,7 @@ mod tests {
         // The public output types exclude the hidden final state output that the mutated reference appends.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -2667,7 +2667,7 @@ mod tests {
                 reference.read().map_err(Into::into)
             },
             (reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh),
         )
         .unwrap();
@@ -2679,7 +2679,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -2688,23 +2688,23 @@ mod tests {
                 reference.read().map_err(Into::into)
             },
             (reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let initial =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert_eq!(initial.r#type().as_ref(), &replicated_scalar_type(&mesh, DataType::F32));
         let reference = ArrayReference::new(initial);
         let retained_snapshot = reference.read().unwrap();
         let rejected_update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
             compiled.executable().execute(
-                &domain,
-                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(rejected_update),)
+                &session,
+                (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(rejected_update),)
             ),
             Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
         ));
@@ -2712,12 +2712,12 @@ mod tests {
 
         for expected in [3.0f32, 5.0] {
             let update =
-                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = compiled
                 .execute_statefully_and_wait(
-                    &domain,
-                    (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+                    &session,
+                    (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),
                 )
                 .unwrap();
             let Value::Array(output) = output else { panic!("stateful public output must be an array") };
@@ -2731,7 +2731,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_commits_tangent_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2762,7 +2762,7 @@ mod tests {
                     reference_type,
                     ArrayIrType::Array(array_type.clone()),
                 ),
-                &domain,
+                &session,
                 Options::new(mesh.clone()),
             )
             .unwrap();
@@ -2770,17 +2770,17 @@ mod tests {
         // Both references are committed after the call. The primal holder accumulates the update, the tangent holder
         // accumulates the tangent update, and the outputs read the committed states.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
         let reference = ArrayReference::new(scalar(1.0));
         let tangent_reference = ArrayReference::new(scalar(10.0));
         let (primal, tangent) = compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(reference.clone(), session.clone())),
                     Value::Array(scalar(3.0)),
-                    Value::Reference(Reference::new(tangent_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(tangent_reference.clone(), session.clone())),
                     Value::Array(scalar(100.0)),
                 ),
             )
@@ -2797,7 +2797,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_commits_cotangent_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2824,7 +2824,7 @@ mod tests {
                 Ok(outputs.remove(1))
             },
             (reference_type, ArrayIrType::Array(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
@@ -2832,14 +2832,14 @@ mod tests {
         // The read accumulates `ȳ` into the destination and the accumulation hands the accumulated cotangent to `x̄`
         // while leaving the destination unchanged, so both end at `5 + 2`.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
         let cotangent_reference = ArrayReference::new(scalar(5.0));
         let input_cotangent = compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(cotangent_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(cotangent_reference.clone(), session.clone())),
                     Value::Array(scalar(2.0)),
                 ),
             )
@@ -2855,7 +2855,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_without_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |input| {
@@ -2863,13 +2863,13 @@ mod tests {
                 Ok((input.clone() + input).into_value())
             },
             ArrayIrType::Array(array_type.clone()),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.execute_statefully_and_wait(&domain, Value::Array(input)).unwrap();
+        let output = compiled.execute_statefully_and_wait(&session, Value::Array(input)).unwrap();
         let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32s(&client, &output), vec![6.0]);
     }
@@ -2878,23 +2878,23 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_keeps_read_only_holder_ready() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         for _ in 0..2 {
             let output = compiled
                 .execute_statefully_and_wait(
-                    &domain,
-                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    &session,
+                    Value::Reference(Reference::new(reference.clone(), session.clone())),
                 )
                 .unwrap();
             let Value::Array(output) = output else { panic!("stateful public output must be an array") };
@@ -2910,7 +2910,7 @@ mod tests {
         // carrying the execution fence rather than an already completed result.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |input| {
@@ -2918,13 +2918,13 @@ mod tests {
                 Ok((input.clone() + input).into_value())
             },
             ArrayIrType::Array(array_type.clone()),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.execute_statefully(&domain, Value::Array(input)).r#await().unwrap();
+        let output = compiled.execute_statefully(&session, Value::Array(input)).r#await().unwrap();
         let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32s(&client, &output), vec![6.0]);
     }
@@ -2933,15 +2933,15 @@ mod tests {
     fn test_compile_statefully_reference_transforms_match_uncompiled_transforms() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
                 .unwrap()
         };
-        let bind = |reference: &ArrayReference<_>| Value::Reference(Reference::new(reference.clone(), domain.clone()));
+        let bind = |reference: &ArrayReference<_>| Value::Reference(Reference::new(reference.clone(), session.clone()));
         let read = |value: Value<'_>| {
             let Value::Array(array) = value else { panic!("expected an array output") };
             read_f32s(&client, &array)
@@ -2970,13 +2970,13 @@ mod tests {
                     .map_err(ProgramError::from)?)
             },
             reference_type.clone(),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let compiled_reference = ArrayReference::new(array(&scalar_type, &[3.0]));
         let (compiled_value, compiled_gradient) =
-            compiled.execute_statefully_and_wait(&domain, bind(&compiled_reference)).unwrap();
+            compiled.execute_statefully_and_wait(&session, bind(&compiled_reference)).unwrap();
         assert_eq!((read(value), read(gradient)), (vec![36.0], vec![24.0]));
         assert_eq!((read(compiled_value), read(compiled_gradient)), (vec![36.0], vec![24.0]));
         assert_eq!(read_f32s(&client, &eager_reference.read().unwrap()), vec![6.0]);
@@ -3010,7 +3010,7 @@ mod tests {
                 .map_err(ProgramError::from)?)
             },
             (reference_type, ArrayIrType::Array(vector_type)),
-            &domain,
+            &session,
             Options::new(mesh),
         )
         .err()
@@ -3026,12 +3026,12 @@ mod tests {
     fn test_compile_statefully_commits_accumulating_custom_backward_buffers() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = ArrayType::new_static(DataType::F32, [4]);
 
         // `x ↦ x[1]`, whose accumulating backward rule adds its seed to only the affected entry of the caller buffer.
         // The compiled pullback therefore updates the buffer in place, without a cotangent temporary of full size.
-        type ProgramTracer<'c> = DomainTracer<Domain<'c>>;
+        type ProgramTracer<'c> = DomainTracer<Session<'c>>;
         let element = |x: &ProgramTracer<'_>| -> Result<ProgramTracer<'_>, ProgramError> {
             Ok(ValueProjection::<ArrayType>::into_projected(x.clone())?.slice(&[1], &[2usize], &[1])?.into_value())
         };
@@ -3050,10 +3050,10 @@ mod tests {
             },
         );
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
         };
         let input = Value::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
-        let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
+        let (_, pullback) = session.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert!(pullback.residuals().is_empty());
         let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap().into_program();
         let [seed_type, buffer_type] = <[ArrayIrType; 2]>::try_from(pullback.input_types().into_owned()).unwrap();
@@ -3075,16 +3075,16 @@ mod tests {
                 Ok(())
             },
             (buffer_type, seed_type),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let buffer = ArrayReference::new(array(&array_type, &[1.0, 1.0, 1.0, 1.0]));
         compiled
             .execute_statefully_and_wait(
-                &domain,
+                &session,
                 (
-                    Value::Reference(Reference::new(buffer.clone(), domain.clone())),
+                    Value::Reference(Reference::new(buffer.clone(), session.clone())),
                     Value::Array(array(&ArrayType::new_static(DataType::F32, [1]), &[5.0])),
                 ),
             )
@@ -3096,14 +3096,14 @@ mod tests {
     fn test_compile_statefully_rejects_escaping_reference_outputs() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
 
         // A reference allocated inside the program has no host identity the ABI could hand back.
         let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |input| input.reference_new().map_err(Into::into),
             ArrayIrType::Array(array_type.clone()),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .err()
@@ -3120,7 +3120,7 @@ mod tests {
         let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             Ok,
             ArrayIrType::Reference(ReferenceType::new(array_type)),
-            &domain,
+            &session,
             Options::new(mesh),
         )
         .err()
@@ -3137,7 +3137,7 @@ mod tests {
     fn test_compile_statefully_forwards_references_through_nested_calls() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -3151,7 +3151,7 @@ mod tests {
 
         // A nested call may return the external reference that it receives, because that reference never crosses the
         // ABI as an output of the enclosing program.
-        let inner = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             reference_type.clone(),
@@ -3161,15 +3161,15 @@ mod tests {
         let outer = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             move |reference| inner.call(reference)?.read().map_err(Into::into),
             reference_type,
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let output = outer
-            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .execute_statefully_and_wait(&session, Value::Reference(Reference::new(reference.clone(), session.clone())))
             .unwrap();
         let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32s(&client, &output), vec![7.0]);
@@ -3180,7 +3180,7 @@ mod tests {
     fn test_compile_statefully_rejects_nested_calls_that_return_allocated_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
 
         fn allocate_reference<'c>(
@@ -3193,7 +3193,7 @@ mod tests {
 
         // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
         // call is rejected with a diagnostic that names the offending output.
-        let inner = CoreStagedFunction::<Domain<'_>, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type.clone()),
@@ -3203,7 +3203,7 @@ mod tests {
         let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             move |input| inner.call(input)?.freeze().map_err(Into::into),
             ArrayIrType::Array(array_type),
-            &domain,
+            &session,
             Options::new(mesh),
         )
         .err()
@@ -3224,7 +3224,7 @@ mod tests {
     fn test_compile_statefully_reads_bounded_dynamic_state_and_rejects_mutation() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -3232,14 +3232,14 @@ mod tests {
         let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(declared_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let mutation = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
             (ArrayIrType::Reference(ReferenceType::new(declared_type.clone())), ArrayIrType::Array(declared_type)),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         );
         assert!(matches!(
@@ -3255,7 +3255,7 @@ mod tests {
                 .unwrap();
             let reference = ArrayReference::new(
                 Array::from_host_buffer(
-                    &domain,
+                    &session,
                     actual_type,
                     mesh.clone(),
                     values_to_bytes(expected.as_slice()).as_slice(),
@@ -3264,8 +3264,8 @@ mod tests {
             );
             let Value::Array(output) = read
                 .execute_statefully_and_wait(
-                    &domain,
-                    Value::Reference(Reference::new(reference.clone(), domain.clone())),
+                    &session,
+                    Value::Reference(Reference::new(reference.clone(), session.clone())),
                 )
                 .unwrap()
             else {
@@ -3280,10 +3280,10 @@ mod tests {
     fn test_compile_statefully_with_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -3291,14 +3291,14 @@ mod tests {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
-            vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+            vec![Value::Reference(Reference::new(reference.clone(), session.clone()))],
             ArrayIrType::Array(array_type.clone()),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        let output = compiled.execute_statefully_and_wait(&domain, Value::Array(update)).unwrap();
+        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let output = compiled.execute_statefully_and_wait(&session, Value::Array(update)).unwrap();
         let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32s(&client, &output), vec![3.0]);
         assert_eq!(read_f32s(&client, &reference.read().unwrap()), vec![3.0]);
@@ -3308,20 +3308,20 @@ mod tests {
     fn test_compile_statefully_with_captures_rejects_duplicate_reference_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, _| captures[0].read().map_err(Into::into),
             vec![
-                Value::Reference(Reference::new(reference.clone(), domain.clone())),
-                Value::Reference(Reference::new(reference, domain.clone())),
+                Value::Reference(Reference::new(reference.clone(), session.clone())),
+                Value::Reference(Reference::new(reference, session.clone())),
             ],
             ArrayIrType::Array(array_type),
-            &domain,
+            &session,
             Options::new(mesh),
         );
         assert!(matches!(
@@ -3340,7 +3340,7 @@ mod tests {
         // which threads its captures into the outer compiled function. Only the outer program is compiled.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -3386,7 +3386,7 @@ mod tests {
         // `g(x) = sin(x) + sin(x) = 2 sin(x)`.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -3420,12 +3420,12 @@ mod tests {
     fn test_staged_function_call_in_context_without_input_leaves() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let capture = Value::Array(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice()).unwrap(),
         );
-        let inner = CoreStagedFunction::<Domain<'_>, (), ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session<'_>, (), ArrayIrType>::stage(
             |_, mut captures, ()| Ok(captures.remove(0)),
             vec![capture],
             (),
@@ -3439,7 +3439,7 @@ mod tests {
                 in (%0)"},
         );
 
-        let outer = CoreStagedFunction::<Domain<'_>, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
+        let outer = CoreStagedFunction::<Session<'_>, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
             |_, _, input| {
                 // No input leaf can recover the enclosing trace when the callee has no public inputs.
                 assert!(matches!(
@@ -3456,10 +3456,10 @@ mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let compiled = outer.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled = outer.lower(&session).unwrap().compile(&session).unwrap();
         let input =
-            Value::Array(Array::from_host_buffer(&domain, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap());
-        let (Value::Array(typed), Value::Array(flat)) = compiled.executable().execute(&domain, input).unwrap() else {
+            Value::Array(Array::from_host_buffer(&session, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap());
+        let (Value::Array(typed), Value::Array(flat)) = compiled.executable().execute(&session, input).unwrap() else {
             panic!("capture-only calls must return arrays");
         };
         assert_eq!(read_f32s(&client, &typed), vec![7.0]);
@@ -3470,10 +3470,10 @@ mod tests {
     fn test_executable_function_mesh() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type, &domain, mesh.clone()).unwrap();
+            compile(|input| input.sin().unwrap(), input_type, &session, mesh.clone()).unwrap();
         assert_eq!(compiled.executable().mesh(), &mesh);
     }
 
@@ -3481,18 +3481,18 @@ mod tests {
     fn test_executable_function_execute() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 1);
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
+            compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
         let input =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
+            Array::from_host_buffer(&session, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
                 .unwrap();
 
-        let output = executable.execute(&domain, input).unwrap();
+        let output = executable.execute(&session, input).unwrap();
 
         assert_eq!(executable.output_types(), &[input_type]);
         assert!((read_f32s(&client, &output)[0] - 0.5f32.sin()).abs() < 1e-5);
@@ -3504,38 +3504,38 @@ mod tests {
         let other_client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let other_mesh = domain_mesh(&other_client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let other_domain = Session::new(&other_client).domain();
+        let session = Session::with_client(&client);
+        let other_session = Session::with_client(&other_client);
         let input_type = replicated_vector_type(&mesh, 1);
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
+            compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
         let other_input_type = replicated_vector_type(&other_mesh, 1);
         let other_executable: ExecutableFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), other_input_type, &other_domain, other_mesh)
+            compile(|input| input.sin().unwrap(), other_input_type, &other_session, other_mesh)
                 .unwrap()
                 .into_executable();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         assert!(matches!(
-            executable.execute(&other_domain, input.clone()),
+            executable.execute(&other_session, input.clone()),
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
-            executable.execute_async(&other_domain, input),
+            executable.execute_async(&other_session, input),
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
-            domain.validate_replacement(
+            session.validate_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
             Err(Error::Execution(ExecutionError::ClientMismatch)),
         ));
         assert!(matches!(
-            other_domain.validate_replacement(
+            other_session.validate_replacement(
                 executable.function.compiled_program(),
                 other_executable.function.compiled_program(),
             ),
@@ -3549,17 +3549,17 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 1);
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
+            compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let output =
-            std::thread::scope(|scope| scope.spawn(move || executable.execute(&domain, input)).join().unwrap())
+            std::thread::scope(|scope| scope.spawn(move || executable.execute(&session, input)).join().unwrap())
                 .unwrap();
         assert!((read_f32s(&client, &output)[0] - 0.5f32.sin()).abs() < 1e-5);
     }
@@ -3568,7 +3568,7 @@ mod tests {
     fn test_executable_function_execute_reshards_mismatched_inputs() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         // The executable expects an input sharded along `x` across both devices, but the caller passes a fully
         // replicated array, which `ExecutableFunction::execute` silently reshards before executing.
@@ -3616,12 +3616,12 @@ mod tests {
     fn test_executable_function_execute_async_rejects_stateful_executables() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
             ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
@@ -3631,9 +3631,9 @@ mod tests {
         // than enqueueing an execution whose hidden final state outputs nothing would publish.
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             ExecutableFunction { function: compiled.executable().clone() };
-        let input = Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
-            executable.execute_async(&domain, input),
+            executable.execute_async(&session, input),
             Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
         ));
     }
@@ -3642,7 +3642,7 @@ mod tests {
     fn test_executable_function_execute_async_retains_zero_output_completion() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 1);
         let compiled: CompiledFunction<'_, ArrayType, ()> =
@@ -3663,12 +3663,12 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_compile_staged_function() {
+    fn test_session_compile_staged_function() {
         // Staging alone must not build a PJRT executable, and compiling the staged handle afterwards must match a
         // direct `compile` of the same closure numerically.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -3700,16 +3700,16 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_adaptive_profile_guided_recompilation_rejects_cpu() {
+    fn test_session_adaptive_profile_guided_recompilation_rejects_cpu() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 1);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type, &domain, mesh).unwrap();
+            compile(|input| input.sin().unwrap(), input_type, &session, mesh).unwrap();
 
         assert!(matches!(
-            domain.adaptive_profile_guided_recompilation(&compiled, AdaptiveProfileGuidedOptions::default()),
+            session.adaptive_profile_guided_recompilation(&compiled, AdaptiveProfileGuidedOptions::default()),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "adaptive profile-guided recompilation requires a CUDA or ROCm PJRT platform, \
                               but found `cpu`",
@@ -3717,17 +3717,17 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_differentiate_at_with_captures() {
+    fn test_session_differentiate_at_with_captures() {
         // Array IR tracers dispatch `add` and `dot` through the array IR capability universe without projecting to
         // arrays first, and the captured gradient of `f(x; c) = (x + c) · c` is `c`.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_vector_type(&mesh, 2);
         let vector = |values: &[f32]| {
             Value::Array(
                 Array::from_host_buffer(
-                    &domain,
+                    &session,
                     array_type.clone(),
                     mesh.clone(),
                     values_to_bytes::<f32>(values).as_slice(),
@@ -3736,7 +3736,7 @@ mod tests {
             )
         };
         let read = |value: Value<'_>| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
-        let (value, gradient) = domain
+        let (value, gradient) = session
             .differentiate_at(vector(&[1.0, 2.0]))
             .with_captures(vector(&[3.0, 4.0]))
             .value_and_gradient(|x, c| x.add(&c)?.dot(&c, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])))
@@ -3746,33 +3746,33 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_differentiate_at_rematerialized_function() {
-        // `x ↦ sin(tag(x · x, "dot"))` executes its value and gradient on the XLA domain under a policy that saves the
-        // dot product and under one that offloads it to pinned host memory, and both match `sin(x · x)` and
-        // `2 cos(x · x) x`, which the residual placement must not change.
+    fn test_session_differentiate_at_rematerialized_function() {
+        // `x ↦ sin(tag(x · x, "dot"))` executes its value and gradient on the XLA session under a policy that saves the
+        // dot product and under one that offloads it to pinned host memory, and both match `sin(x · x)` and `2 cos(x ·
+        // x) x`, which the residual placement must not change.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let array_type = replicated_vector_type(&mesh, 3);
         let values = [0.1f32, 0.2, 0.3];
         let dot = values.iter().map(|value| value * value).sum::<f32>();
-        type ProgramTracer<'c> = DomainTracer<Domain<'c>>;
+        type ProgramTracer<'c> = DomainTracer<Session<'c>>;
         fn sine_of_dot(x: ProgramTracer<'_>) -> Result<ProgramTracer<'_>, ProgramError> {
             let x = ValueProjection::<ArrayType>::into_projected(x)?;
             let dot = x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.tag("dot")?;
             Ok(dot.sin()?.into_value())
         }
         fn value_and_gradient<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
-            domain: &Domain<'c>,
+            session: &Session<'c>,
             input: Array<'c>,
             policy: P,
         ) -> (Value<'c>, Value<'c>) {
             let function = rematerialize(sine_of_dot).with_policy(policy);
-            domain.differentiate_at(Value::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
+            session.differentiate_at(Value::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
         }
         let input = || {
             Array::from_host_buffer(
-                &domain,
+                &session,
                 array_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&values).as_slice(),
@@ -3780,9 +3780,10 @@ mod tests {
             .unwrap()
         };
         let offload = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["dot"], Memory::Host { pinned: true });
-        for (value, gradient) in
-            [value_and_gradient(&domain, input(), DotsSavable), value_and_gradient(&domain, input(), offload.unwrap())]
-        {
+        for (value, gradient) in [
+            value_and_gradient(&session, input(), DotsSavable),
+            value_and_gradient(&session, input(), offload.unwrap()),
+        ] {
             // XLA's elementary functions may differ from the host ones in the last bit.
             let assert_close = |actual: Value<'_>, expected: Vec<f32>| {
                 let actual = read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(actual).unwrap());
@@ -3800,7 +3801,7 @@ mod tests {
         // printing the IR) and transform composition through `CompiledFunction::call` build on.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -3819,10 +3820,10 @@ mod tests {
     fn test_compiled_function_mesh() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type, &domain, mesh.clone()).unwrap();
+            compile(|input| input.sin().unwrap(), input_type, &session, mesh.clone()).unwrap();
         assert_eq!(compiled.mesh(), &mesh);
     }
 
@@ -3835,7 +3836,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
 
@@ -3884,7 +3885,7 @@ mod tests {
     fn test_compiled_function_call_imports_captures_into_compile() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let bias = Array::from_host_buffer(
@@ -3925,7 +3926,7 @@ mod tests {
     fn test_compiled_function_call_imports_captures_of_multiple_functions_into_compile() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let left_bias = Array::from_host_buffer(
@@ -3986,7 +3987,7 @@ mod tests {
     fn test_compiled_function_call_constrains_inputs_to_input_sharding_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(1)).unwrap();
@@ -4076,7 +4077,7 @@ mod tests {
     fn test_compiled_function_call_returns_output_sharding_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = replicated_vector_type(&mesh, 4);
         let input = Array::from_host_buffer(
@@ -4118,7 +4119,7 @@ mod tests {
     fn test_compiled_function_call_agrees_with_execution_for_auto_axis_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
@@ -4204,7 +4205,7 @@ mod tests {
     fn test_compiled_function_call_under_eager_parents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -4257,7 +4258,7 @@ mod tests {
         // Composite rules must be `'static`, and so the compiled function that they call must outlive every borrow.
         let client = Box::leak(Box::new(execution_client()));
         let mesh = domain_mesh(client, "x", 1);
-        let engine = Session::new(client).domain();
+        let engine = Session::with_client(client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -4326,7 +4327,7 @@ mod tests {
         type Body = Tracer<TracingContext<Constant, Operation>>;
         let client = Box::leak(Box::new(execution_client()));
         let mesh = domain_mesh(client, "x", 1);
-        let engine = Session::new(client).domain();
+        let engine = Session::with_client(client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -4403,7 +4404,7 @@ mod tests {
     fn test_compiled_function_call_inside_batch_in_parent() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -4456,7 +4457,7 @@ mod tests {
     fn test_compiled_function_call_inside_differentiate_in_parent_at() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -4556,7 +4557,7 @@ mod tests {
     fn test_compiled_function_derived_functions_keep_lowering_options() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let strategy = RaggedDotLoweringStrategy::Instruction;
         let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
@@ -4582,7 +4583,7 @@ mod tests {
     fn test_compiled_function_gradient_materializes_disconnected_symbolic_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4613,7 +4614,7 @@ mod tests {
     fn test_compiled_function_gradient_materializes_disconnected_condition_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4707,7 +4708,7 @@ mod tests {
     fn test_compiled_function_gradient_materializes_disconnected_scanned_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let slice_type = scalar_type.clone();
@@ -4811,7 +4812,7 @@ mod tests {
         // differentiate through that transposed call again.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4901,7 +4902,7 @@ mod tests {
     fn test_compiled_function_gradient_preserves_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -4932,13 +4933,13 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_gradient_retains_derived_function_per_domain() {
-        // For `f = |x| x * x`, repeated `f.gradient(&domain)` calls with one domain must reuse the retained derived
+    fn test_compiled_function_gradient_retains_derived_function_per_session() {
+        // For `f = |x| x * x`, repeated `f.gradient(&session)` calls with one session must reuse the retained derived
         // function without deriving it again or querying the compilation context, while different runtime inputs to
         // the shared derived function must still produce their own correct gradients, which depend on those inputs.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -4967,8 +4968,8 @@ mod tests {
             assert_eq!(read_f32s(&client, &output), vec![2.0 * point]);
         }
 
-        // A different domain identity misses, produces a fresh derivative, and replaces the retained slot.
-        let other_engine = Session::new(&client).domain();
+        // A different session identity misses, produces a fresh derivative, and replaces the retained slot.
+        let other_engine = Session::with_client(&client);
         let third = compiled.gradient(&other_engine).unwrap();
         assert!(!std::ptr::eq(first.function.compiled_program(), third.function.compiled_program()));
         let other_statistics = other_engine.compilation_context().statistics();
@@ -4981,15 +4982,15 @@ mod tests {
     fn test_compiled_function_gradient_rejects_non_scalar_output() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|input| input.sin().unwrap(), input_type, &domain, mesh).unwrap();
+            compile(|input| input.sin().unwrap(), input_type, &session, mesh).unwrap();
         let expected = DifferentiationError::NonScalarGradientOutput {
             output_type: "f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]".to_string(),
         };
         assert!(matches!(
-            compiled.gradient(&domain),
+            compiled.gradient(&session),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(error) if error.downcast_custom::<DifferentiationError>() == Some(&expected),
@@ -5003,7 +5004,7 @@ mod tests {
         // it at `(primal, tangent)` returns `(sin(primal), cos(primal) * tangent)` within `1e-5`.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5087,7 +5088,7 @@ mod tests {
     fn test_compiled_function_jvp_preserves_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5137,7 +5138,7 @@ mod tests {
         const CALLEE_OPERATIONS: usize = 600;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5183,12 +5184,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_function_jvp_retains_derived_function_per_domain() {
+    fn test_compiled_function_jvp_retains_derived_function_per_session() {
         // Mirrors `test_compiled_function_gradient_retains_derived_function_per_domain` for the forward mode
         // `CompiledFunction::jvp` path.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5222,7 +5223,7 @@ mod tests {
     fn test_compiled_function_jvp_executes_zero_space_boundaries() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5250,7 +5251,7 @@ mod tests {
     fn test_compiled_function_batch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
         let vector_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated(1)).unwrap();
         let array = |r#type: ArrayType, values: &[f32]| {
@@ -5313,7 +5314,7 @@ mod tests {
     fn test_compiled_function_batch_places_batch_dimension() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_sharding = Sharding::new(
             mesh.logical_mesh().clone(),
@@ -5360,7 +5361,7 @@ mod tests {
     fn test_compiled_function_batch_requires_static_extent() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let function: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), scalar_type, &engine, mesh).unwrap();
@@ -5378,7 +5379,7 @@ mod tests {
     fn test_compile() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -5400,7 +5401,7 @@ mod tests {
     fn test_compile_broadcast_capture() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -5432,7 +5433,7 @@ mod tests {
     fn test_compile_discharges_local_reference_state_without_changing_the_array_abi() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
@@ -5443,7 +5444,7 @@ mod tests {
                 ValueProjection::<ArrayType>::into_projected(reference.freeze().unwrap()).unwrap()
             },
             input_type.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
@@ -5452,8 +5453,8 @@ mod tests {
         assert_eq!(executable.output_types(), std::slice::from_ref(&input_type));
 
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let output = executable.execute(&domain, input).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let output = executable.execute(&session, input).unwrap();
         assert_eq!(read_f32s(&client, &output), vec![6.0]);
     }
 
@@ -5461,7 +5462,7 @@ mod tests {
     fn test_compile_local_reference_value_and_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
         // The inner gradient differentiates reference contents at entry, while the outer compiled function returns
@@ -5485,7 +5486,7 @@ mod tests {
                 )
             },
             input_type.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
@@ -5499,13 +5500,13 @@ mod tests {
             [(3.0f32, 36.0, 6.0, 24.0), (5.0, 100.0, 10.0, 40.0), (3.0, 36.0, 6.0, 24.0)]
         {
             let input = Array::from_host_buffer(
-                &domain,
+                &session,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[initial]).as_slice(),
             )
             .unwrap();
-            let (value, state, gradient) = executable.execute(&domain, input).unwrap();
+            let (value, state, gradient) = executable.execute(&session, input).unwrap();
             assert_eq!(read_f32s(&client, &value), vec![expected_value]);
             assert_eq!(read_f32s(&client, &state), vec![expected_state]);
             assert_eq!(read_f32s(&client, &gradient), vec![expected_gradient]);
@@ -5516,7 +5517,7 @@ mod tests {
     fn test_compile_scan_indexes_its_captured_reference_root_in_nested_call() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]));
             let reference_type = ArrayIrType::Reference(ReferenceType::new(input_type.clone()));
@@ -5651,7 +5652,7 @@ mod tests {
                     )
                 },
                 input_type.clone(),
-                &domain,
+                &session,
                 mesh.clone(),
             )
             .unwrap();
@@ -5659,9 +5660,9 @@ mod tests {
             let values = (1..=length).map(|value| value as f32).collect::<Vec<_>>();
             let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
             let input =
-                Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                     .unwrap();
-            let (outputs, frozen) = compiled.executable().execute(&domain, input).unwrap();
+            let (outputs, frozen) = compiled.executable().execute(&session, input).unwrap();
             assert_eq!(read_f32s(&client, &outputs), expected);
             assert_eq!(read_f32s(&client, &frozen), expected);
         }
@@ -5727,7 +5728,7 @@ mod tests {
         type Body = Tracer<TracingContext<Constant, Operation>>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 8);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -5781,7 +5782,7 @@ mod tests {
     fn test_compile_dense_differentiation_of_array_ir_values() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 2);
 
         // The dense builders run directly on array IR values, rather than on their array projections, whose packed
@@ -5835,40 +5836,40 @@ mod tests {
     fn test_compile_dense_differentiation_as_part_of_the_enclosing_program() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let forward: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_forward(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
         let reverse: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_reverse(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
         let second: CompiledFunction<'_, ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).hessian(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
 
-        assert_eq!(domain.program_count(), 2);
+        assert_eq!(session.program_count(), 2);
         let _: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_forward(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
-        assert_eq!(domain.program_count(), 2, "an equivalent dense transform should reuse its enclosing compilation");
+        assert_eq!(session.program_count(), 2, "an equivalent dense transform should reuse its enclosing compilation");
 
         assert_eq!(
             forward.source_program().program().to_string(),
@@ -5940,21 +5941,21 @@ mod tests {
 
         for (compiled, expected) in [(forward, 6.0), (reverse, 6.0)] {
             let input = Array::from_host_buffer(
-                &domain,
+                &session,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[3.0]).as_slice(),
             )
             .unwrap();
             let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
-                compiled.executable().execute(&domain, input).unwrap();
+                compiled.executable().execute(&session, input).unwrap();
             assert_eq!(read_f32s(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
         }
 
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
-            second.executable().execute(&domain, input).unwrap();
+            second.executable().execute(&session, input).unwrap();
         assert_eq!(read_f32s(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
 
@@ -5962,7 +5963,7 @@ mod tests {
     fn test_compile_dense_differentiation_of_promoted_broadcast() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -5982,19 +5983,19 @@ mod tests {
                     .unwrap()
             },
             (scalar_type.clone(), vector_type.clone()),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
 
         let scalar =
-            Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
+            Array::from_host_buffer(&session, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
                 .unwrap();
         let vector =
-            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
+            Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
         let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
-            forward.executable().execute(&domain, (scalar, vector)).unwrap();
+            forward.executable().execute(&session, (scalar, vector)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         for (actual, expected) in read_f64s(&client, blocks[0].value()).into_iter().zip([0.2, 0.2]) {
@@ -6009,10 +6010,10 @@ mod tests {
     fn test_compile_stable_cross_entropy_gradients() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
-        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<Domain<'_>, ArrayType>>(-1);
+        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<Session<'_>, ArrayType>>(-1);
         // Compile each complete stabilized derivative so optimizer rewrites cannot hide behind eager operation
         // boundaries. Integer labels and teacher logits parameterize their respective losses without differentiation.
         let compiled: CompiledFunction<
@@ -6032,22 +6033,26 @@ mod tests {
                 (loss, hard_gradient, soft_gradient)
             },
             (vector_type.clone(), label_type.clone(), vector_type.clone(), vector_type.clone()),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
         let student_values = [2.0f32 - 1e-7, 1.0f32 + 1e-7, 0.0];
-        let logits =
-            Array::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), values_to_bytes(&[9.0f32, -9.0, -9.0]))
-                .unwrap();
-        let labels = Array::from_host_buffer(&domain, label_type, mesh.clone(), values_to_bytes(&[0i32])).unwrap();
+        let logits = Array::from_host_buffer(
+            &session,
+            vector_type.clone(),
+            mesh.clone(),
+            values_to_bytes(&[9.0f32, -9.0, -9.0]),
+        )
+        .unwrap();
+        let labels = Array::from_host_buffer(&session, label_type, mesh.clone(), values_to_bytes(&[0i32])).unwrap();
         let student =
-            Array::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), values_to_bytes(&student_values))
+            Array::from_host_buffer(&session, vector_type.clone(), mesh.clone(), values_to_bytes(&student_values))
                 .unwrap();
         let teacher =
-            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
+            Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
         let (loss, hard_gradient, soft_gradient) =
-            compiled.executable().execute(&domain, (logits, labels, student, teacher)).unwrap();
+            compiled.executable().execute(&session, (logits, labels, student, teacher)).unwrap();
 
         let tail = (-18.0f64).exp();
         let loss = read_f32s(&client, &loss)[0] as f64;
@@ -6077,7 +6082,7 @@ mod tests {
         // a replicated integer label match the unsharded arithmetic.
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let logits_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
@@ -6138,7 +6143,7 @@ mod tests {
         // runtime extents the lowered program reads.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
+        let session = Session::with_client(&client);
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let classes = DimensionVariable::new("classes", DimensionBounds::new(1, Some(5)).unwrap());
         let replicated = |r#type: ArrayType| {
@@ -6155,7 +6160,7 @@ mod tests {
                 (log_probabilities, loss)
             },
             (logits_type, labels_type),
-            &domain,
+            &session,
             mesh.clone(),
         )
         .unwrap();
@@ -6163,20 +6168,20 @@ mod tests {
             let values = (0..rows * columns).map(|index| 3.0 * (0.75 * index as f32).sin()).collect::<Vec<_>>();
             let label_values = (0..rows).map(|row| (row % columns) as i32).collect::<Vec<_>>();
             let logits = Array::from_host_buffer(
-                &domain,
+                &session,
                 replicated(ArrayType::new_static(DataType::F32, [rows, columns])),
                 mesh.clone(),
                 values_to_bytes(&values),
             )
             .unwrap();
             let labels = Array::from_host_buffer(
-                &domain,
+                &session,
                 replicated(ArrayType::new_static(DataType::I32, [rows])),
                 mesh.clone(),
                 values_to_bytes(&label_values),
             )
             .unwrap();
-            let (log_probabilities, loss) = compiled.executable().execute(&domain, (logits, labels)).unwrap();
+            let (log_probabilities, loss) = compiled.executable().execute(&session, (logits, labels)).unwrap();
 
             // The reference arrays compute the same functions at the static runtime shape.
             let expected_logits = CoreArray::matrix(rows, columns, values).unwrap();
@@ -6204,7 +6209,7 @@ mod tests {
     fn test_compile_stages_jvp_of_compiled_function_call_with_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6272,7 +6277,7 @@ mod tests {
     fn test_compile_binary_function_with_tuple_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let shape = Shape::new(vec![CoreDimension::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -6302,7 +6307,7 @@ mod tests {
     fn test_compile_reuses_cached_lowering_on_repeated_call_site() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 4);
 
         assert_eq!(engine.program_count(), 0);
@@ -6318,7 +6323,7 @@ mod tests {
     fn test_compile_shares_cache_across_call_sites_for_equivalent_lowerings() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 4);
 
         assert_eq!(engine.program_count(), 0);
@@ -6344,7 +6349,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let array_type = replicated_vector_type(&mesh, 4);
 
         for batch_size in [32usize, 64usize] {
@@ -6360,7 +6365,7 @@ mod tests {
         type Body = Tracer<TracingContext<Constant, Operation>>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let array = |r#type: &ArrayType, values: &[f32]| {
@@ -6386,13 +6391,14 @@ mod tests {
         let gradient = w.iter().map(|w| dot.cos() * w).collect::<Vec<_>>();
         let weights = array(&vector_type, &w);
         let function = rematerialize(|x: Body| {
-            let w = ImportingContext::<Domain<'_>, ThroughSession>::import(x.context(), Value::Array(weights.clone()))?;
+            let w =
+                ImportingContext::<Session<'_>, ThroughSession>::import(x.context(), Value::Array(weights.clone()))?;
             let x = ValueProjection::<ArrayType>::into_projected(x)?;
             let w = ValueProjection::<ArrayType>::into_projected(w)?;
             Ok(x.dot(&w, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?.into_value())
         });
 
-        // Eager calls and eager differentiation resolve the session constant on the eager domain.
+        // Eager calls and eager differentiation resolve the session constant on the eager session.
         assert_close(read(function.call(Value::Array(array(&vector_type, &x))).unwrap()), vec![dot.sin()]);
         let (value, eager_gradient) = engine
             .differentiate_at(Value::Array(array(&vector_type, &x)))
@@ -6430,7 +6436,7 @@ mod tests {
     fn test_compile_applies_trace_local_pushforward_under_batch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 2);
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -6495,7 +6501,7 @@ mod tests {
     fn test_compile_with_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let bias = Array::from_host_buffer(
@@ -6540,7 +6546,7 @@ mod tests {
     fn test_compile_with_captures_erases_zero_space_capture_argument() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6566,7 +6572,7 @@ mod tests {
     fn test_compile_with_captures_keeps_captured_array_placement_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
@@ -6601,7 +6607,7 @@ mod tests {
     fn test_compile_with_options_donates_argument() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 3);
         let options = Options::new(mesh.clone()).with_donate(true);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -6626,7 +6632,7 @@ mod tests {
     fn test_compile_with_options_rejects_donation_arity_mismatch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         // A tree of three donation flags does not match the one flat input of the function.
         let options = Options::new(mesh.clone()).with_donate((true, false, false));
@@ -6642,7 +6648,7 @@ mod tests {
     fn test_compile_with_options_input_shardings_override_replaces_input_sharding() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         // `input_type` carries the abstract shape and data type but a replicated sharding, which the `input_shardings`
         // override replaces with a sharding along `x` before tracing, so the compiled program shards the input across
@@ -6692,7 +6698,7 @@ mod tests {
     fn test_compile_with_options_rejects_input_shardings_arity_mismatch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input must fail.
@@ -6709,7 +6715,7 @@ mod tests {
     fn test_compile_with_options_output_shardings_override_propagates_to_output_array() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -6756,7 +6762,7 @@ mod tests {
     fn test_compile_with_options_rejects_output_shardings_arity_mismatch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let options = Options::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
@@ -6773,7 +6779,7 @@ mod tests {
         // Input sharding overrides change the input types before tracing begins.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
 
         // The input type declares no sharding, so the sharding of the staged input can only come from the override.
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
@@ -6793,7 +6799,7 @@ mod tests {
     fn test_infer_output_types() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
+        let engine = Session::with_client(&client);
         let input_type = replicated_vector_type(&mesh, 7);
 
         let output_type: ArrayType = infer_output_types(|x| x.sin().unwrap(), input_type.clone()).unwrap();

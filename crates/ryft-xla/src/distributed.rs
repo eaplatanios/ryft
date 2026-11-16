@@ -564,7 +564,7 @@ mod tests {
     use crate::lowering::tests::test_spmd_compilation_options;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayError, Domain, Error, FromPjrt, Options, Reference, Session, Value, compile_statefully};
+    use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Value, compile_statefully};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -618,7 +618,7 @@ mod tests {
             .filter(|(_, device)| device.process_index() == process_index)
             .map(|(position, _)| position)
             .collect::<Vec<_>>();
-        let domain = Session::new(client).domain();
+        let session = Session::with_client(client);
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(manual_mesh.clone(), devices.clone()).unwrap();
         let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -627,7 +627,7 @@ mod tests {
         // Each process uploads only its own tiles of `[1, 2, 3, 4]` and reads them back.
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let tiles = [vec![1.0, 2.0], vec![3.0, 4.0]];
         assert_eq!(
             read_addressable_f32s(&input),
@@ -668,7 +668,7 @@ mod tests {
             .unwrap();
             assert_eq!(candidates.sharding(), &unreduced);
             shard_map(
-                |candidates: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| {
+                |candidates: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| {
                     candidates.parallel_reduce(reduction, "x")
                 },
                 candidates,
@@ -727,11 +727,11 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
         let items =
-            Array::from_host_buffer(&domain, items_type, explicit_mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]))
+            Array::from_host_buffer(&session, items_type, explicit_mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]))
                 .unwrap();
-        let Value::Array(doubled) = compiled.executable().execute(&domain, Value::Array(items)).unwrap() else {
+        let Value::Array(doubled) = compiled.executable().execute(&session, Value::Array(items)).unwrap() else {
             panic!("the compiled function returned a dimension");
         };
         let doubled_items = [vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]];
@@ -752,17 +752,17 @@ mod tests {
                 Ok(Vec::new())
             },
             vec![ArrayIrType::Reference(ReferenceType::new(referent_type.clone()))],
-            &domain,
+            &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
+            Array::from_host_buffer(&session, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
         );
         compiled
             .execute_statefully_and_wait(
-                &domain,
-                vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+                &session,
+                vec![Value::Reference(Reference::new(reference.clone(), session.clone()))],
             )
             .unwrap();
         assert_eq!(read_addressable_f32s(&reference.read().unwrap()), vec![vec![2.0, 4.0]; local_positions.len()]);
@@ -779,7 +779,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     fn probe_cross_host_placements<'c>(
         client: &'c Client<'c>,
-        place: impl Fn(Array<'c>, &Domain<'c>, DevicePutTarget) -> Result<Array<'c>, Error>,
+        place: impl Fn(Array<'c>, &Session<'c>, DevicePutTarget) -> Result<Array<'c>, Error>,
     ) {
         let rank = client.process_index().unwrap();
         match client.cross_host_transfers_extension() {
@@ -793,7 +793,7 @@ mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(devices.iter().map(Device::process_index).collect::<Vec<_>>(), vec![0, 1]);
-        let domain = Session::new(client).domain();
+        let session = Session::with_client(client);
         let mesh = |devices: Vec<Device>| {
             let axis = MeshAxis::new("x", devices.len(), MeshAxisType::Explicit).unwrap();
             DeviceMesh::new(LogicalMesh::new(vec![axis]).unwrap(), devices).unwrap()
@@ -804,7 +804,7 @@ mod tests {
         };
         let array = |mesh: &DeviceMesh, sharding: Sharding, values: [f32; 4]| {
             let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
-            Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&values)).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&values)).unwrap()
         };
         let process_0_mesh = mesh(vec![devices[0]]);
         let forward_mesh = mesh(devices.clone());
@@ -844,7 +844,7 @@ mod tests {
             ),
         ];
         for (name, source, target) in placements {
-            match place(source, &domain, target) {
+            match place(source, &session, target) {
                 Ok(placed) => {
                     let ready = match placed.block_until_ready() {
                         Ok(()) => "ready".to_string(),
@@ -1671,13 +1671,13 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 .iter()
                 .map(|device| Device::from_pjrt(device).unwrap())
                 .collect::<Vec<_>>();
-            let domain = Session::new(client).domain();
+            let session = Session::with_client(client);
             let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
             let mesh = DeviceMesh::new(manual_mesh.clone(), devices).unwrap();
             let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
             let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
             let input = Array::from_host_buffer(
-                &domain,
+                &session,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes(&[1f32, 2., 3., 4.]),
@@ -1706,7 +1706,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                     )
                     .unwrap()
                     .into_inner();
-                    let lowered = staged.lower(&domain).unwrap();
+                    let lowered = staged.lower(&session).unwrap();
                     let targets = lowered
                         .lowered_program()
                         .stable_hlo()
@@ -1714,8 +1714,8 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                         .skip(1)
                         .map(|call| call.split('(').next().unwrap().trim_matches('"').to_string())
                         .collect::<Vec<_>>();
-                    let compiled = lowered.compile(&domain).unwrap();
-                    let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+                    let compiled = lowered.compile(&session).unwrap();
+                    let output = compiled.executable().execute(&session, Value::Array(input.clone())).unwrap();
                     let Value::Array(output) = output else {
                         panic!("the compiled function returned a dimension");
                     };
@@ -1759,9 +1759,9 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             return;
         };
         run_as_cuda_rank(role.parse().unwrap(), |client| {
-            probe_cross_host_placements(client, |source, domain, target| {
+            probe_cross_host_placements(client, |source, session, target| {
                 let source_shards = read_addressable_f32s(&source);
-                let placed = source.to_placement(domain, target)?;
+                let placed = source.to_placement(session, target)?;
                 assert_eq!(read_addressable_f32s(&source), source_shards);
                 Ok(placed)
             })
@@ -1808,7 +1808,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             return;
         };
         run_as_cuda_rank(role.parse().unwrap(), |client| {
-            probe_cross_host_placements(client, |source, domain, target| source.into_placement(domain, target))
+            probe_cross_host_placements(client, |source, session, target| source.into_placement(session, target))
         });
     }
 

@@ -2485,7 +2485,7 @@ mod tests {
         let client = cpu_client(1);
         ensure_print_handler_registered(&client).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2526,18 +2526,18 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         // Only assertions create a local chain. Ordered I/O is seeded from the hidden executable argument.
         assert!(lowered.signature().has_ordered_io());
         assert!(lowered.signature().requires_assertion_handler());
         assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let input = |value: i64| {
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
 
         let (output, lines) = with_captured_prints(|| {
-            let output = domain.execute_program(&compiled, vec![input(3), input(4)]).unwrap();
+            let output = session.execute_program(&compiled, vec![input(3), input(4)]).unwrap();
             assert_eq!(read_i64s(&client, &output[0]), vec![4]);
             output
         });
@@ -2551,7 +2551,7 @@ mod tests {
     fn test_assert_operation_lower_reports_the_first_failure() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let first_type = DimensionType::new("first", bounds);
@@ -2618,14 +2618,14 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 5, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
         let input = |value: i64| {
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
 
-        let error = domain.execute_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
+        let error = session.execute_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
         assert_eq!(error.to_string(), "assertion failed: `first` <= `second`; first=4, second=3");
     }
 
@@ -2633,7 +2633,7 @@ mod tests {
     fn test_assert_operation_lower_preserves_diagnostics() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2739,13 +2739,13 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
             let input = |value: i64| {
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap()
             };
-            let error = domain.execute_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
+            let error = session.execute_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
             let expected = if right_value == 0 {
                 ryft_core::AssertionError::Failed {
                     message: "divisor must be positive".to_owned(),
@@ -2768,10 +2768,10 @@ mod tests {
     fn test_assert_operation_lower_reports_bounded_element_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         for mode in [0, 1, 2] {
-            let predicates = boolean_vector(&domain, &mesh, &[true, false, false, false]);
-            let observations = f32_vector(&domain, &mesh, &[10., 20., 30., 40.]);
+            let predicates = boolean_vector(&session, &mesh, &[true, false, false, false]);
+            let observations = f32_vector(&session, &mesh, &[10., 20., 30., 40.]);
             let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     if mode == 1 {
@@ -2809,9 +2809,9 @@ mod tests {
             .unwrap()
             .into_inner();
             let lowered =
-                domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let error = domain.execute_program(&compiled, vec![predicates, observations.clone()]).unwrap_err();
+                session.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
+            let error = session.execute_program(&compiled, vec![predicates, observations.clone()]).unwrap_err();
             let expected = ryft_core::AssertionError::FailedElements {
                 message: "bounded check".to_owned(),
                 failures: vec![
@@ -2827,8 +2827,8 @@ mod tests {
                 omitted: 1,
             };
             assert_eq!(error.to_string(), expected.to_string());
-            let predicates = boolean_vector(&domain, &mesh, &[true; 4]);
-            assert!(domain.execute_program(&compiled, vec![predicates, observations]).unwrap().is_empty());
+            let predicates = boolean_vector(&session, &mesh, &[true; 4]);
+            assert!(session.execute_program(&compiled, vec![predicates, observations]).unwrap().is_empty());
         }
     }
 
@@ -2836,7 +2836,7 @@ mod tests {
     fn test_assert_operation_lower_reports_bounded_sub_byte_observations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         for (data_type, values) in [
             (DataType::I1, [0., -1., 0., -1.]),
             (DataType::U1, [0., 1., 0., 1.]),
@@ -2845,8 +2845,8 @@ mod tests {
             (DataType::I4, [0., -8., -1., 7.]),
             (DataType::U4, [0., 1., 8., 15.]),
         ] {
-            let predicates = boolean_vector(&domain, &mesh, &[false; 4]);
-            let observations = f32_vector(&domain, &mesh, &values);
+            let predicates = boolean_vector(&session, &mesh, &[false; 4]);
+            let observations = f32_vector(&session, &mesh, &values);
             let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let observation = inputs[1].convert_element_type(data_type).unwrap();
@@ -2865,9 +2865,9 @@ mod tests {
             .unwrap()
             .into_inner();
             let lowered =
-                domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let error = domain.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
+                session.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
+            let error = session.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
             let expected = ryft_core::AssertionError::FailedElements {
                 message: "narrow values".to_owned(),
                 failures: values
@@ -2889,7 +2889,7 @@ mod tests {
     fn test_assert_operation_lower_reports_scalar_observations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
         for observations in [
             vec![],
@@ -2920,16 +2920,17 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; observations.len() + 1], vec![])
                 .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
             for passed in [true, false] {
                 let mut inputs = vec![
-                    Array::from_host_buffer(&domain, predicate_type.clone(), mesh.clone(), [u8::from(passed)]).unwrap(),
+                    Array::from_host_buffer(&session, predicate_type.clone(), mesh.clone(), [u8::from(passed)])
+                        .unwrap(),
                 ];
                 for (_, data_type, bytes, _) in &observations {
                     inputs.push(
                         Array::from_host_buffer(
-                            &domain,
+                            &session,
                             replicated_scalar_type(&mesh, *data_type),
                             mesh.clone(),
                             bytes,
@@ -2937,7 +2938,7 @@ mod tests {
                         .unwrap(),
                     );
                 }
-                let output = domain.execute_program(&compiled, inputs);
+                let output = session.execute_program(&compiled, inputs);
                 if passed {
                     assert!(output.unwrap().is_empty());
                 } else {
@@ -2954,8 +2955,8 @@ mod tests {
             }
         }
 
-        let predicates = boolean_vector(&domain, &mesh, &[true, false, false]);
-        let observations = f32_vector(&domain, &mesh, &[10., 20., 30.]);
+        let predicates = boolean_vector(&session, &mesh, &[true, false, false]);
+        let observations = f32_vector(&session, &mesh, &[10., 20., 30.]);
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 batch(
@@ -2974,9 +2975,9 @@ mod tests {
         .unwrap()
         .into_inner();
         let program = staged.source_program().program();
-        let lowered = domain.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let error = domain.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
+        let lowered = session.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let error = session.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
         let expected = ryft_core::AssertionError::Failed {
             message: "mapped check".to_owned(),
             observations: vec![("value".to_owned(), "20".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
@@ -2988,7 +2989,7 @@ mod tests {
     fn test_assert_operation_lower_reports_dynamically_batched_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
@@ -3038,24 +3039,25 @@ mod tests {
                 .clone()
                 .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; 2], vec![])
                 .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
             for (size, limit) in [(0i64, 0i64), (1, 1), (3, 3)] {
                 let inputs = [size, limit]
                     .into_iter()
                     .map(|value| {
-                        Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes()).unwrap()
+                        Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes())
+                            .unwrap()
                     })
                     .collect::<Vec<_>>();
-                assert!(domain.execute_program(&compiled, inputs).unwrap().is_empty());
+                assert!(session.execute_program(&compiled, inputs).unwrap().is_empty());
             }
             let inputs = [3i64, 1i64]
                 .into_iter()
                 .map(|value| {
-                    Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes()).unwrap()
+                    Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes()).unwrap()
                 })
                 .collect::<Vec<_>>();
-            let error = domain.execute_program(&compiled, inputs).unwrap_err();
+            let error = session.execute_program(&compiled, inputs).unwrap_err();
             let expected = if bounded {
                 ryft_core::AssertionError::FailedElements {
                     message: "dynamic mapped check".to_owned(),
@@ -3088,7 +3090,7 @@ mod tests {
     fn test_assert_operation_lower_reports_dynamically_batched_replicated_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let context = TracingContext::<Constant, Operation>::new();
@@ -3121,13 +3123,14 @@ mod tests {
                 .clone()
                 .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![])
                 .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let empty = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 0i64.to_ne_bytes()).unwrap();
-            assert!(domain.execute_program(&compiled, vec![empty]).unwrap().is_empty());
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
+            let empty =
+                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 0i64.to_ne_bytes()).unwrap();
+            assert!(session.execute_program(&compiled, vec![empty]).unwrap().is_empty());
             let nonempty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3i64.to_ne_bytes()).unwrap();
-            let error = domain.execute_program(&compiled, vec![nonempty]).unwrap_err();
+                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 3i64.to_ne_bytes()).unwrap();
+            let error = session.execute_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
                 ryft_core::AssertionError::FailedElements {
                     message: "dynamic replicated check".to_owned(),
