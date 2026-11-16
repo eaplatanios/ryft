@@ -2241,8 +2241,6 @@ struct EinsumStep {
     result_names: Vec<char>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Execution policy for the primitive array steps of [`EinsumPlan::run`]. The shared decomposition owns label
 /// bookkeeping, singleton broadcasting, repeated-label handling, element type conversions, and output ordering.
 /// It runs with [`ValueSteps`] over array values to execute or stage those steps, or with [`TypeSteps`] over
@@ -2255,15 +2253,9 @@ struct EinsumStep {
 /// supports the custom pairwise contraction of [`EinsumPlan::execute_with`]. The carrier's [`Typed`] bound supplies
 /// its array metadata directly; the seven methods below are the operations that the policy interprets.
 trait EinsumSteps<V: Typed<Type = ArrayType>> {
-    /// Removes the provided axes of `value`, which have extent one.
-    fn squeeze(&self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError>;
-
     /// Sums `value` along the provided axes, optionally requesting an output sharding. The sum of Boolean values is
     /// defined as their disjunction.
     fn reduce_sum(&self, value: &V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>;
-
-    /// Returns the diagonal of `value` along `kept_axis` and `removed_axis`, in place of `kept_axis`.
-    fn diagonal(&self, value: &V, kept_axis: usize, removed_axis: usize) -> Result<V, ProgramError>;
 
     /// Contracts `lhs` and `rhs` with the provided dimension numbers, optionally accumulating at the provided type
     /// and requesting an output sharding.
@@ -2279,6 +2271,12 @@ trait EinsumSteps<V: Typed<Type = ArrayType>> {
     /// Transposes `value` with the provided permutation.
     fn transpose(&self, value: &V, permutation: Vec<usize>) -> Result<V, ProgramError>;
 
+    /// Removes the provided axes of `value`, which have extent one.
+    fn squeeze(&self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError>;
+
+    /// Returns the diagonal of `value` along `kept_axis` and `removed_axis`, in place of `kept_axis`.
+    fn diagonal(&self, value: &V, kept_axis: usize, removed_axis: usize) -> Result<V, ProgramError>;
+
     /// Converts `value` to the provided element type.
     fn convert_element_type(&self, value: &V, data_type: DataType) -> Result<V, ProgramError>;
 
@@ -2286,8 +2284,8 @@ trait EinsumSteps<V: Typed<Type = ArrayType>> {
     fn reshard(&self, value: &V, sharding: &Sharding) -> Result<V, ProgramError>;
 }
 
-/// [`EinsumSteps`] that compute or stage every step on values through their capabilities, with `Contraction` as the
-/// pairwise contraction.
+/// [`EinsumSteps`] that compute or stage every step on values through their capabilities,
+/// with `Contraction` as the pairwise contraction.
 struct ValueSteps<Contraction> {
     /// Pairwise contraction, which may keep state of its own between its calls.
     contraction: RefCell<Contraction>,
@@ -2309,11 +2307,6 @@ where
     Contraction: FnMut(&V, &V, &DotDimensionNumbers, Option<DataType>, Option<&Sharding>) -> Result<V, ProgramError>,
 {
     #[inline]
-    fn squeeze(&self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError> {
-        value.squeeze(axes)
-    }
-
-    #[inline]
     fn reduce_sum(&self, value: &V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError> {
         value.reduce_with_output_sharding(
             axes,
@@ -2323,6 +2316,28 @@ where
             },
             output_sharding.cloned(),
         )
+    }
+
+    #[inline]
+    fn contract(
+        &self,
+        lhs: &V,
+        rhs: &V,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: Option<DataType>,
+        output_sharding: Option<&Sharding>,
+    ) -> Result<V, ProgramError> {
+        self.contraction.borrow_mut()(lhs, rhs, dimensions, accumulation_type, output_sharding)
+    }
+
+    #[inline]
+    fn transpose(&self, value: &V, permutation: Vec<usize>) -> Result<V, ProgramError> {
+        value.transpose(permutation)
+    }
+
+    #[inline]
+    fn squeeze(&self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError> {
+        value.squeeze(axes)
     }
 
     #[inline]
@@ -2341,23 +2356,6 @@ where
             };
             diagonal.reduce(&[removed_axis], kind)
         }
-    }
-
-    #[inline]
-    fn contract(
-        &self,
-        lhs: &V,
-        rhs: &V,
-        dimensions: &DotDimensionNumbers,
-        accumulation_type: Option<DataType>,
-        output_sharding: Option<&Sharding>,
-    ) -> Result<V, ProgramError> {
-        self.contraction.borrow_mut()(lhs, rhs, dimensions, accumulation_type, output_sharding)
-    }
-
-    #[inline]
-    fn transpose(&self, value: &V, permutation: Vec<usize>) -> Result<V, ProgramError> {
-        value.transpose(permutation)
     }
 
     #[inline]
@@ -2390,11 +2388,6 @@ impl TypeSteps {
 }
 
 impl EinsumSteps<ArrayType> for TypeSteps {
-    fn squeeze(&self, value: &ArrayType, axes: Vec<usize>) -> Result<ArrayType, ProgramError> {
-        self.stage(1);
-        value.squeeze(axes)
-    }
-
     fn reduce_sum(
         &self,
         value: &ArrayType,
@@ -2411,37 +2404,6 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         )
         .with_output_sharding(output_sharding.cloned())?;
         Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
-    }
-
-    fn diagonal(&self, value: &ArrayType, kept_axis: usize, removed_axis: usize) -> Result<ArrayType, ProgramError> {
-        // The main diagonal of two axes that share one extent is an iota and a gather for static extents. Otherwise
-        // a masked sum stages two index arrays, their comparison, the zeros, the selection, and the sum.
-        if value.shape().dimensions().iter().all(|dimension| dimension.value().is_some()) {
-            self.stage(2);
-            value.diagonal(0, kept_axis, removed_axis)
-        } else {
-            self.stage(6);
-            let input = std::slice::from_ref(value);
-            let indices = |axis: usize| -> Result<ArrayType, ProgramError> {
-                let operation = IotaLikeOperation::<ArrayType>::new(axis, DataType::I64)?;
-                Ok(operation.infer_output_types(input, &[])?.remove(0))
-            };
-            let mask = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal)
-                .infer_output_types(&[indices(kept_axis)?, indices(removed_axis)?], &[])?
-                .remove(0);
-            let zeros = ZeroLikeOperation::<ArrayType>::new().infer_output_types(input, &[])?.remove(0);
-            let diagonal = SelectOperation::<ArrayType>::new()
-                .infer_output_types(&[mask, value.clone(), zeros], &[])?
-                .remove(0);
-            let operation = ReduceOperation::new(
-                vec![removed_axis],
-                match value.data_type() {
-                    DataType::Boolean => ReductionKind::Any,
-                    _ => ReductionKind::Sum,
-                },
-            );
-            Ok(operation.infer_output_types(&[diagonal], &[])?.remove(0))
-        }
     }
 
     fn contract(
@@ -2486,6 +2448,42 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         value.transpose(permutation)
     }
 
+    fn squeeze(&self, value: &ArrayType, axes: Vec<usize>) -> Result<ArrayType, ProgramError> {
+        self.stage(1);
+        value.squeeze(axes)
+    }
+
+    fn diagonal(&self, value: &ArrayType, kept_axis: usize, removed_axis: usize) -> Result<ArrayType, ProgramError> {
+        // The main diagonal of two axes that share one extent is an iota and a gather for static extents. Otherwise,
+        // a masked sum stages two index arrays, their comparison, the zeros, the selection, and the sum.
+        if value.shape().dimensions().iter().all(|dimension| dimension.value().is_some()) {
+            self.stage(2);
+            value.diagonal(0, kept_axis, removed_axis)
+        } else {
+            self.stage(6);
+            let input = std::slice::from_ref(value);
+            let indices = |axis: usize| -> Result<ArrayType, ProgramError> {
+                let operation = IotaLikeOperation::<ArrayType>::new(axis, DataType::I64)?;
+                Ok(operation.infer_output_types(input, &[])?.remove(0))
+            };
+            let mask = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal)
+                .infer_output_types(&[indices(kept_axis)?, indices(removed_axis)?], &[])?
+                .remove(0);
+            let zeros = ZeroLikeOperation::<ArrayType>::new().infer_output_types(input, &[])?.remove(0);
+            let diagonal = SelectOperation::<ArrayType>::new()
+                .infer_output_types(&[mask, value.clone(), zeros], &[])?
+                .remove(0);
+            let operation = ReduceOperation::new(
+                vec![removed_axis],
+                match value.data_type() {
+                    DataType::Boolean => ReductionKind::Any,
+                    _ => ReductionKind::Sum,
+                },
+            );
+            Ok(operation.infer_output_types(&[diagonal], &[])?.remove(0))
+        }
+    }
+
     fn convert_element_type(&self, value: &ArrayType, data_type: DataType) -> Result<ArrayType, ProgramError> {
         self.stage(1);
         let operation = ConvertElementTypeOperation::<ArrayType>::new(data_type, false);
@@ -2498,6 +2496,8 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// State of one run of [`EinsumPlan::run`], which holds the element type conversions that the steps share.
 struct EinsumExecution<'s, S> {
