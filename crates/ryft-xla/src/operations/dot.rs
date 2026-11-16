@@ -613,12 +613,13 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayIrType, ArrayOperation, Complex, Dimension as CoreDimension, DimensionBounds,
         DimensionVariable, Dot, DotAlgorithm, DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep,
-        EinsumPathStrategy, EinsumSpecification, Operation as CoreOperation, Placeholder, ProjectedContext, RaggedDot,
-        RaggedDotDimensionNumbers, Sharding, Typed, bf16, differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
+        EinsumPathStrategy, EinsumSpecification, MeshAxisType, Operation as CoreOperation, Placeholder,
+        ProjectedContext, RaggedDot, RaggedDotDimensionNumbers, Sharding, ShardingDimension, Typed, bf16,
+        differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::domain_mesh;
+    use crate::domains::tests::{domain_mesh, two_device_mesh};
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
@@ -629,7 +630,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::tracing::{ArrayTracer, TracedProgram, trace};
     use crate::values::ArrayConstant;
-    use crate::{Constant, Domain, Options, Session, ToPjrt, to_mlir_module_for_program};
+    use crate::{Array, Constant, Domain, Options, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1087,6 +1088,20 @@ mod tests {
             .dot_with_precision(&reference_right, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into())
             .unwrap();
         assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[3.0f64]));
+        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+
+        // The same preset also rounds inputs that are stored as `f32`, where the tie `33685504` rounds to `2²⁵` at
+        // `bf16`. XLA does that on GPUs for every contraction. Its CPU backend ignores the algorithm of contractions
+        // over more than one pair of elements, so a single pair is contracted here.
+        let reference_stored = CoreArray::vector(vec![33685504.0f32]).unwrap();
+        let reference_unit = CoreArray::vector(vec![1.0f32]).unwrap();
+        let stored = replicated_array(&domain, &mesh, DataType::F32, &[1], &reference_stored.logical_bytes());
+        let unit = replicated_array(&domain, &mesh, DataType::F32, &[1], &reference_unit.logical_bytes());
+        let product = stored.dot_with_precision(&unit, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into()).unwrap();
+        let reference_product = reference_stored
+            .dot_with_precision(&reference_unit, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into())
+            .unwrap();
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[33554432.0f32]));
         assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
 
         // Per-input precisions are hints that the CPU backend ignores.
@@ -2059,13 +2074,22 @@ mod tests {
             );
         }
 
+        // An einsum of one input that ends with no sum reshards its output to a requested sharding.
+        let values = (0..6).map(|value| value as f32).collect::<Vec<_>>();
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&values));
+        let output_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let options = EinsumOptions::new().with_output_sharding(output_sharding.clone());
+        let output = Einsum::einsum_with_options(&"ij->ji".parse().unwrap(), [&input], &options).unwrap();
+        assert_eq!(output.r#type().sharding(), Some(&output_sharding));
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+
         // The options select the path, the precision, and the accumulation type of the staged contractions.
         let values = [3.0f32, 0.5, 2.0, 4.0].map(bf16::from_f32);
         let reference = CoreArray::matrix(2, 2, values.to_vec()).unwrap();
         let input = replicated_array(&domain, &mesh, DataType::BF16, &[2, 2], &reference.logical_bytes());
         let specification = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
         let options = EinsumOptions::new()
-            .with_path(EinsumPathStrategy::Unoptimized)
+            .with_path_strategy(EinsumPathStrategy::Unoptimized)
             .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
             .with_accumulation_type(DataType::F32);
         let output = Einsum::einsum_with_options(&specification, [&input, &input, &input], &options).unwrap();
@@ -2103,14 +2127,25 @@ mod tests {
             ("ij,jk,kl->il", &fractions, counted.clone()),
             ("ij,jk->ik", &fractions, counted.clone()),
             ("ij,jk,kl->il", &integers, counted),
-            ("ij,jk,kl->il", &fractions, EinsumOptions::new().with_path(EinsumPathStrategy::DynamicProgramming)),
-            ("ij,jk,kl->l", &fractions, EinsumOptions::new().with_path(reduced)),
+            (
+                "ij,jk,kl->il",
+                &fractions,
+                EinsumOptions::new().with_path_strategy(EinsumPathStrategy::DynamicProgramming),
+            ),
+            ("ij,jk,kl->l", &fractions, EinsumOptions::new().with_path_strategy(reduced)),
             ("ij,jk->ik", &complex, EinsumOptions::new().with_accumulation_type(DataType::F32)),
             ("ij,jk->ik", &complex, EinsumOptions::new().with_accumulation_type(DataType::I32)),
             ("ij,jk->ik", &narrow, EinsumOptions::new().with_accumulation_type(DataType::C64)),
             ("ij,jk->ik", &narrow, truncated),
             ("ij,jk->ik", &integers, EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
             ("ij,jk->ik", &booleans, EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
+            (
+                "ij,jk,kl->il",
+                &fractions,
+                EinsumOptions::new()
+                    .with_precision(DotAlgorithmPreset::F32_F32_F32)
+                    .with_accumulation_type(DataType::C64),
+            ),
         ];
         // Inputs of different element types are promoted before they are contracted.
         let lhs = replicated_array(&domain, &mesh, DataType::U8, &[2, 2], &integers.logical_bytes());
@@ -2173,6 +2208,42 @@ mod tests {
             assert_eq!(output.r#type().data_type(), reference_output.r#type().data_type(), "{subscripts}");
             assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes(), "{subscripts} {options:?}");
         }
+    }
+
+    #[test]
+    fn test_einsum_output_sharding_matches_reference_backend() {
+        // An einsum of more than one step with a requested output sharding runs inside a switch of the explicit mesh
+        // axes to auto axes, like in JAX. The contracted axes of the first two inputs below are sharded alike over
+        // two devices, which explicit placement of their contraction rejects as ambiguous.
+        let client = cpu_client(2);
+        let domain = Session::new(&client).domain();
+        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
+        let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.logical_mesh().clone(), dimensions);
+        let shardings = [
+            sharding(vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap(),
+            sharding(vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]).unwrap(),
+            sharding(vec![ShardingDimension::Replicated; 2]).unwrap(),
+        ];
+        let mut inputs = Vec::new();
+        let mut reference_inputs = Vec::new();
+        for (index, sharding) in shardings.iter().enumerate() {
+            let values = (0..16).map(|value| ((value * (index + 2)) % 7) as f32 - 3.0).collect::<Vec<_>>();
+            let r#type = ArrayType::new_static(DataType::F32, [4, 4]);
+            reference_inputs.push(CoreArray::from_elements(r#type.clone(), &values).unwrap());
+            let r#type = r#type.with_sharding(sharding.clone()).unwrap();
+            inputs.push(Array::from_host_buffer(&domain, r#type, mesh.clone(), &values_to_bytes(&values)).unwrap());
+        }
+        let specification = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
+        let options = EinsumOptions::new()
+            .with_path_strategy(EinsumPathStrategy::Unoptimized)
+            .with_output_sharding(shardings[2].clone());
+        let output = Einsum::einsum_with_options(&specification, inputs.iter(), &options).unwrap();
+        let reference_output = CoreArray::einsum("ij,jk,kl->il", reference_inputs.iter()).unwrap();
+        assert_eq!(output.r#type().sharding(), Some(&shardings[2]));
+        assert_eq!(
+            values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+            reference_output.elements::<f32>().unwrap(),
+        );
     }
 
     #[test]

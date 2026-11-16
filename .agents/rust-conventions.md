@@ -37,6 +37,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
 - For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding redundant
   constructor methods unless those constructors add validation or the user explicitly asks for them.
+- Follow enum declaration order in `match` arms, variant-specific helper groups, and variant coverage tables where
+  semantics permit. Keep overlapping cases in their required precedence and explain exceptions. Preserve existing
+  serialization tags when reordering arms.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
 - Define bookkeeping types used only within one function at the beginning of that function.
