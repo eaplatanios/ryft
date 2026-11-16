@@ -19,6 +19,12 @@ pub mod transfers;
 pub mod values;
 pub mod versions;
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+pub mod cuda;
+
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+pub use cuda::*;
+
 pub use buffers::*;
 pub use clients::*;
 pub use devices::*;
