@@ -1705,7 +1705,7 @@ impl EinsumPlan {
                         .filter(|_| ends_with_sum)
                         .map(|output_sharding| (output_sharding, step.result_names.as_slice()));
                     let uniques_output = output.filter(|_| last_repeated.is_none());
-                    let (value, names) = state.sum_uniques(value, names, uniques, uniques_output)?;
+                    let (value, names) = state.sum_unique(value, names, uniques, uniques_output)?;
                     state.sum_repeats(value, names, &counts, &step.result_names, output)?
                 }
                 [lhs_position, rhs_position] => {
@@ -1735,7 +1735,7 @@ impl EinsumPlan {
                                     == 0
                         })
                         .collect();
-                    let (lhs, lhs_names) = state.sum_uniques(lhs, lhs_names, lhs_uniques, None)?;
+                    let (lhs, lhs_names) = state.sum_unique(lhs, lhs_names, lhs_uniques, None)?;
                     let rhs_uniques = step
                         .contracted_names
                         .iter()
@@ -1746,7 +1746,7 @@ impl EinsumPlan {
                                     == 0
                         })
                         .collect();
-                    let (rhs, rhs_names) = state.sum_uniques(rhs, rhs_names, rhs_uniques, None)?;
+                    let (rhs, rhs_names) = state.sum_unique(rhs, rhs_names, rhs_uniques, None)?;
 
                     // Labels that one input repeats are replaced by their diagonal, which is kept when the result
                     // or the other input contains the label and summed otherwise.
@@ -2497,8 +2497,6 @@ impl EinsumSteps<ArrayType> for TypeSteps {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// State of one run of [`EinsumPlan::run`], which holds the element type conversions that the steps share.
 struct EinsumExecution<'s, S> {
     /// Primitive steps that the run computes, stages, or infers.
@@ -2524,12 +2522,12 @@ impl<S> EinsumExecution<'_, S> {
         }
     }
 
-    /// Returns the element type that values of the element type `data_type` have at `accumulation_type` before the
-    /// output is converted to it. That is the accumulation type itself, except that an algorithm never contracts
-    /// complex values (refer to [`DotPrecision::validate`]). With an algorithm, real and Boolean values at a complex
-    /// accumulation type are therefore kept at the type of its components, which represents them equally, where
-    /// JAX makes them complex and discards their zero imaginary components again in the next contraction.
-    fn accumulation_representation(&self, data_type: DataType, accumulation_type: DataType) -> DataType {
+    /// Returns the intermediate element type that values of the element type `data_type` have at `accumulation_type`
+    /// before the output is converted to it. That is the accumulation type itself, except that an algorithm never
+    /// contracts complex values (refer to [`DotPrecision::validate`]). With an algorithm, real and Boolean values at
+    /// a complex accumulation type are therefore kept at the type of its components, which represents them equally,
+    /// where JAX makes them complex and discards their zero imaginary components again in the next contraction.
+    fn accumulation_type(&self, data_type: DataType, accumulation_type: DataType) -> DataType {
         let is_algorithm = !matches!(self.precision, DotPrecision::Inputs { .. });
         match accumulation_type {
             DataType::C64 if is_algorithm && !data_type.is_complex() => DataType::F32,
@@ -2538,11 +2536,11 @@ impl<S> EinsumExecution<'_, S> {
         }
     }
 
-    /// Converts `value` to the accumulation type when one is requested, unless the element type of `value` is the
-    /// type that the two promote to. This is the conversion that JAX applies before it sums, which sums at the
-    /// element type of `value` only when the accumulation type adds nothing to it. Types without a common promotion
-    /// (i.e., the 8-bit floating-point types with any other type) are converted as well. The value is converted to
-    /// the [`Self::accumulation_representation`] of the accumulation type.
+    /// Converts `value` to the accumulation type when one is requested, unless the element type of `value` is the type
+    /// that the two promote to. This is the conversion that JAX applies before it sums, which sums at the element type
+    /// of `value` only when the accumulation type adds nothing to it. Types without a common promotion (i.e., the 8-bit
+    /// floating-point types with any other type) are converted as well. The value uses the intermediate element type
+    /// returned by [`Self::accumulation_type()`].
     fn accumulated<V: Typed<Type = ArrayType>>(&self, value: V) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
@@ -2553,8 +2551,8 @@ impl<S> EinsumExecution<'_, S> {
                 if data_type != accumulation_type
                     && DataType::promoted(&[data_type, accumulation_type]).ok() != Some(data_type) =>
             {
-                let representation = self.accumulation_representation(data_type, accumulation_type);
-                self.convert(value, representation)
+                let accumulation_type = self.accumulation_type(data_type, accumulation_type);
+                self.convert(value, accumulation_type)
             }
             _ => Ok(value),
         }
@@ -2574,10 +2572,10 @@ impl<S> EinsumExecution<'_, S> {
         self.steps.reduce_sum(&value, axes, output_sharding)
     }
 
-    /// Sums the labels `uniques`, each of which names one axis of `value`, with a single reduction. With an
-    /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the reduction
-    /// receives that sharding in the order of its own axes.
-    fn sum_uniques<V: Typed<Type = ArrayType>>(
+    /// Sums the labels `uniques`, each of which names one axis of `value`, with a single reduction. With an `output`,
+    /// which holds a requested output sharding and the labels of the axes that it describes, the reduction receives
+    /// that sharding in the order of its own axes.
+    fn sum_unique<V: Typed<Type = ArrayType>>(
         &self,
         value: V,
         mut names: Vec<char>,
@@ -2602,11 +2600,11 @@ impl<S> EinsumExecution<'_, S> {
         Ok((value, names))
     }
 
-    /// Replaces every label that `counts` records as repeated in `value` by its diagonal, which takes the place of
-    /// the last axis of the label, and sums the diagonals of the labels that `keep_names` does not contain. A diagonal
-    /// that is kept is converted like the input of a sum. With an
-    /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the sum of
-    /// the last repeated label receives that sharding in the order of its own axes.
+    /// Replaces every label that `counts` records as repeated in `value` by its diagonal, which takes the place of the
+    /// last axis of the label, and sums the diagonals of the labels that `keep_names` does not contain. A diagonal that
+    /// is kept is converted like the input of a sum. With an `output`, which holds a requested output sharding and the
+    /// labels of the axes that it describes, the sum of the last repeated label receives that sharding in the order of
+    /// its own axes.
     fn sum_repeats<V: Typed<Type = ArrayType>>(
         &self,
         mut value: V,
@@ -2633,12 +2631,14 @@ impl<S> EinsumExecution<'_, S> {
                     },
                 )?;
             }
+
             loop {
                 let axes = (0..names.len()).filter(|axis| names[*axis] == **repeated_name).collect::<Vec<_>>();
                 let [removed_axis, .., kept_axis] = axes.as_slice() else { break };
                 value = self.steps.diagonal(&value, *kept_axis, *removed_axis)?;
                 names.remove(*removed_axis);
             }
+
             value = self.convert(value, data_type)?;
             if !keep_names.contains(repeated_name) {
                 let axis = names.iter().position(|name| name == *repeated_name).unwrap();
@@ -2654,14 +2654,14 @@ impl<S> EinsumExecution<'_, S> {
                 value = self.accumulated(value)?;
             }
         }
+
         Ok((value, names))
     }
 
-    /// Removes every axis of `value` that provably has extent one while the other input of its step has another
-    /// extent for its label, which broadcasts `value` along that label. Static axes are squeezed away. A dynamic
-    /// axis whose bounds admit only extent one cannot be removed by a reshape, so the axes are then summed away,
-    /// which keeps their single elements. An element type without a zero is converted to `f32` for the sum and
-    /// converted back afterwards.
+    /// Removes every axis of `value` that provably has extent one while the other input of its step has another extent
+    /// for its label, which broadcasts `value` along that label. Static axes are squeezed away. A dynamic axis whose
+    /// bounds admit only extent one cannot be removed by a reshape, so the axes are then summed away, which keeps their
+    /// single elements. An element type without a zero is converted to `f32` for the sum and converted back afterwards.
     fn filter_singleton_axes<V: Typed<Type = ArrayType>>(
         &self,
         value: V,
@@ -2682,9 +2682,11 @@ impl<S> EinsumExecution<'_, S> {
                         .is_some_and(|other_axis| other_type.dimension(other_axis).bounds().extent() != Some(1))
             })
             .collect::<Vec<_>>();
+
         if squeezed_axes.is_empty() {
             return Ok((value, names));
         }
+
         let value = if squeezed_axes.iter().all(|axis| value_type.dimension(*axis) == Dimension::Static(1)) {
             self.steps.squeeze(&value, squeezed_axes.clone())?
         } else {
@@ -2700,9 +2702,11 @@ impl<S> EinsumExecution<'_, S> {
             let value = self.steps.reduce_sum(&value, &squeezed_axes, None)?;
             self.convert(value, data_type)?
         };
+
         for axis in squeezed_axes.into_iter().rev() {
             names.remove(axis);
         }
+
         Ok((value, names))
     }
 
@@ -2716,24 +2720,23 @@ impl<S> EinsumExecution<'_, S> {
     ///   - Floating-point inputs are converted first for a complex accumulation type. For every other kind of
     ///     accumulation type they are contracted at their own type, and the result is converted, so a fractional
     ///     product is truncated once.
-    ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer
-    ///     accumulation type that is at least as wide as their components, they are contracted at their own type
-    ///     and the result is converted, which discards its imaginary component.
-    ///   - Integer and Boolean inputs are converted first when the accumulation type is numeric and at least as
-    ///     wide.
+    ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer accumulation
+    ///     type that is at least as wide as their components, they are contracted at their own type and the result is
+    ///     converted, which discards its imaginary component.
+    ///   - Integer and Boolean inputs are converted first when the accumulation type is numeric and at least as wide.
     ///   - Every other combination is left for the `dot` to reject.
     ///
-    /// An algorithm converts its inputs to the element types that it computes with and accumulates at its own type,
-    /// so its inputs are contracted as they are, like in JAX. Converting them to the accumulation type first would
-    /// round them before the algorithm does (e.g., `i16` inputs at an `f16` accumulation type, which the
-    /// `F32_F32_F32` preset contracts at `f32`). Only inputs of different element types are converted, because a
-    /// `dot` requires one input type. Each is converted to the type that the algorithm computes with for it, and
-    /// when those types still differ, the rounded inputs are converted to their promotion (e.g., an `i32` input of
-    /// the `BF16_BF16_F32` preset is rounded to `bf16` before it meets an `f32` input at `f32`). A floating-point
-    /// accumulation type is then produced by the `dot` itself. Every other one is converted from the type that the
-    /// algorithm accumulates at, which keeps the `dot` differentiable, and a complex one is represented by the type
-    /// of its components until the output (refer to [`Self::accumulation_representation`]). The algorithm is
-    /// validated for the element types of inputs of different element types before they are converted.
+    /// An algorithm converts its inputs to the element types that it computes with and accumulates at its own type, so
+    /// its inputs are contracted as they are, like in JAX. Converting them to the accumulation type first would round
+    /// them before the algorithm does (e.g., `i16` inputs at an `f16` accumulation type, which the `F32_F32_F32` preset
+    /// contracts at `f32`). Only inputs of different element types are converted, because a `dot` requires one input
+    /// type. Each is converted to the type that the algorithm computes with for it, and when those types still differ,
+    /// the rounded inputs are converted to their promotion (e.g., an `i32` input of the `BF16_BF16_F32` preset is
+    /// rounded to `bf16` before it meets an `f32` input at `f32`). A floating-point accumulation type is then produced
+    /// by the `dot` itself. Every other one is converted from the type that the algorithm accumulates at, which keeps
+    /// the `dot` differentiable, and a complex one is represented by the type of its components until the output (refer
+    /// to [`Self::accumulation_type()`]). The algorithm is validated for the element types of inputs of different
+    /// element types before they are converted.
     fn contract<V: Clone + Typed<Type = ArrayType>>(
         &self,
         lhs: &V,
@@ -2747,6 +2750,7 @@ impl<S> EinsumExecution<'_, S> {
         let Some(accumulation_type) = self.accumulation_type else {
             return self.steps.contract(lhs, rhs, dimensions, None, output_sharding);
         };
+
         let lhs_type = lhs.r#type().data_type();
         let rhs_type = rhs.r#type().data_type();
         let is_native_f8_pair = is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type);
@@ -2754,9 +2758,9 @@ impl<S> EinsumExecution<'_, S> {
             let (lhs, rhs, lhs_type, rhs_type) = if lhs_type == rhs_type || is_native_f8_pair {
                 (lhs.clone(), rhs.clone(), lhs_type, rhs_type)
             } else {
-                // The algorithm is validated for the element types that the two inputs have, because the
-                // conversions below would otherwise hide an input that it does not support (e.g., a complex input,
-                // or an input of the `Any_F8` presets that is not an 8-bit floating-point type).
+                // The algorithm is validated for the element types that the two inputs have, because the conversions
+                // below would otherwise hide an input that it does not support (e.g., a complex input, or an input of
+                // the `Any_F8` presets that is not an 8-bit floating-point type).
                 self.precision.validate(EINSUM_NAME, lhs_type, rhs_type)?;
 
                 // Each input is first converted to the type that the algorithm computes with for it, which rounds
@@ -2773,14 +2777,17 @@ impl<S> EinsumExecution<'_, S> {
                     (self.convert(lhs, common_type)?, self.convert(rhs, common_type)?, common_type, common_type)
                 }
             };
+
             if accumulation_type.is_floating_point() {
                 return self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding);
             }
+
             let result_type = self.precision.computation_types(lhs_type, rhs_type, accumulation_type).2;
             let output = self.steps.contract(&lhs, &rhs, dimensions, Some(result_type), output_sharding)?;
-            let representation = self.accumulation_representation(result_type, accumulation_type);
-            return self.convert(output, representation);
+            let accumulation_type = self.accumulation_type(result_type, accumulation_type);
+            return self.convert(output, accumulation_type);
         }
+
         let (converts_inputs, converts_output) = if lhs_type != rhs_type {
             (!is_native_f8_pair, false)
         } else if is_dot_accumulation_type(lhs_type, accumulation_type) {
@@ -2796,6 +2803,7 @@ impl<S> EinsumExecution<'_, S> {
         } else {
             (false, false)
         };
+
         if converts_inputs {
             let lhs = self.convert(lhs.clone(), accumulation_type)?;
             let rhs = self.convert(rhs.clone(), accumulation_type)?;
@@ -2975,10 +2983,12 @@ impl<'o> PathSearch<'o> {
                 break;
             }
         }
+
         candidates.sort_by(|left, right| {
             (left.0, left.1, left.2, left.3, left.4, left.5)
                 .cmp(&(right.0, right.1, right.2, right.3, right.4, right.5))
         });
+
         for (_, _, new_flops, new_size, first, second, result) in
             candidates.into_iter().take(branch_count.unwrap_or(usize::MAX))
         {
@@ -2991,6 +3001,8 @@ impl<'o> PathSearch<'o> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Small deterministic pseudorandom number generator (SplitMix64) for the randomized path searches, which need
 /// reproducible choices and no statistical guarantees beyond rough uniformity.
