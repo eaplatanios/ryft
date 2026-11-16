@@ -76,11 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Comparisons & Logical:** `Compare`, `Not`, `And`, `Or`, and `Xor`.
   - **Complex Numbers:** `Complex`, `Real`, `Imaginary`, and `Conjugate`.
   - **Manipulation:** `Transpose`, `Reverse`, `Reshape`, `Broadcast`, `BroadcastLike`, `Pad`, `Concatenate`, `Slice`,
-    `UpdateSlice`, `DynamicSlice`, `DynamicUpdateSlice`, `Gather`, `Scatter`, `Indexing`, `ConvertElementType`, `Cast`,
-    `ReducePrecision`, and `TransferToMemory`, along with the dynamic-shape `DynamicReshape`, `DynamicBroadcast`,
-    `DynamicPad`, `DynamicConcatenate`, `DynamicSliceWithDimensions`, `DynamicGather`, and `DynamicScatter`.
-  - **Contractions, Reductions, & Sorting:** `Dot`, `RaggedDot`, `Reduce`, `ArgMax`, `ArgMin`, `Cumulative`,
-    `Softmax`, `Sort`, and `TopK`.
+    `UpdateSlice`, `DynamicSlice`, `DynamicUpdateSlice`, `Gather`, `Scatter`, `Diagonal`, `Indexing`,
+    `ConvertElementType`, `Cast`, `ReducePrecision`, and `TransferToMemory`, along with the dynamic-shape
+    `DynamicReshape`, `DynamicBroadcast`, `DynamicPad`, `DynamicConcatenate`, `DynamicSliceWithDimensions`,
+    `DynamicGather`, and `DynamicScatter`.
+  - **Contractions, Reductions, & Sorting:** `Dot`, `RaggedDot`, `Einsum`, `Reduce`, `ArgMax`, `ArgMin`, `Cumulative`,
+    `Softmax`, `Sort`, and `TopK`. Dot products accept a `DotPrecision`, which requests a precision for each input or
+    a specific algorithm (e.g., a `DotAlgorithmPreset`). Einstein summation is decomposed into existing operations
+    along a contraction path that is selected by an `EinsumPathStrategy`, and `einsum` creates functions that plan
+    once for each input type signature and call the contraction as one named composite.
   - **Quantization:** `BlockQuantize`, `BlockDequantize`, and `ScaledDot` for block-scaled (i.e., microscaling) formats
     such as NVFP4 and MXFP8, along with `block_scaled_dot`, which creates a differentiable block-scaled dot product for
     training.
