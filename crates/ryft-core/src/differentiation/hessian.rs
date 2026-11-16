@@ -240,6 +240,7 @@ impl<'o, T: Type, V> Clone for HessianBlock<'o, T, V> {
 ///   - `primal`: Structured input values specifying the differentiation point.
 ///   - `capture`: Structured runtime values held fixed through both derivative levels.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
+#[allow(clippy::type_complexity)]
 pub(crate) fn hessian_in_context<C, Input, Capture, Output, AuxiliaryOutput, F>(
     context: &C,
     function: F,

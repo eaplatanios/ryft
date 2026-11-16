@@ -575,6 +575,6 @@ mod tests {
                 TestOptions::default(),
             )
             .unwrap();
-        staged.lower(&domain).unwrap().compile(&domain).unwrap()
+        staged.lower(domain).unwrap().compile(domain).unwrap()
     }
 }

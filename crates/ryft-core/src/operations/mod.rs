@@ -24,6 +24,7 @@ pub mod debugging;
 pub mod differentiation;
 pub mod dimensions;
 pub mod dot;
+pub mod einsum;
 pub mod exponential;
 pub mod extrema;
 pub mod logical;
@@ -123,8 +124,13 @@ pub use dimensions::{
     DimensionToScalar, DimensionToScalarOperation,
 };
 pub use dot::{
-    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOperations, RAGGED_DOT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
+    DOT_OPERATION_NAME, Dot, DotAlgorithm, DotAlgorithmPreset, DotDimensionNumbers, DotInputPrecision, DotOperation,
+    DotOperations, DotPrecision, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode,
+    RaggedDotOperation,
+};
+pub use einsum::{
+    EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION, Einsum, EinsumComposite, EinsumLabel, EinsumOptions,
+    EinsumPathStep, EinsumPathStrategy, EinsumPlan, EinsumSpecification, einsum, einsum_with_options,
 };
 pub use exponential::{
     EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, Exp, ExpM1, ExpM1Operation, ExpOperation, ExponentialOperations,
@@ -144,17 +150,18 @@ pub use manipulation::{
     BroadcastLikeOperation, BroadcastOperation, CAST_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate, ConcatenateOperation,
     ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-    DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicManipulationOperations,
-    DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceBounds,
-    DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType,
-    GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger,
-    IndexMask, IndexSelector, IndexSlice, Indexed, Indexing, ManipulationOperations, PAD_OPERATION_NAME, Pad,
-    PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME,
-    ReducePrecision, ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation,
-    SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-    ScatterOptions, ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME,
-    TRANSPOSE_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
-    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
+    Diagonal, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicGather,
+    DynamicManipulationOperations, DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice,
+    DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode,
+    GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing,
+    ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
+    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
+    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
+    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
+    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
+    UpdateSliceOperation,
 };
 pub use quantization::{
     BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,
@@ -673,7 +680,10 @@ mod tests {
 
         let operation = TestElementwiseArrayOperation { input_count: 1 };
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        assert_eq!(Operation::infer_output_types(&operation, &[input_type.clone()], &[]), Ok(vec![input_type]));
+        assert_eq!(
+            Operation::infer_output_types(&operation, std::slice::from_ref(&input_type), &[]),
+            Ok(vec![input_type])
+        );
         assert_eq!(
             Operation::infer_output_types(&operation, &[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),

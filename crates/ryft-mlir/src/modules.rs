@@ -260,6 +260,8 @@ mod tests {
         assert_ne!(module_1, module_0);
         assert_eq!(module_1, module_1);
 
+        // The keys hash by the identity of the MLIR object that they refer to, which never changes.
+        #[allow(clippy::mutable_key_type)]
         let mut map = HashMap::new();
         assert_eq!(map.insert(&module_0, "module_0"), None);
         assert_eq!(map.insert(&module_1, "module_1"), None);

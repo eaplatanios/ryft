@@ -392,11 +392,8 @@ mod tests {
                 let mut block = context.block(&[(input_tensor_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let bitcast_convert_op = bitcast_convert(input_value, output_tensor_type, location).unwrap();
-                assert_eq!(
-                    bitcast_convert_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(bitcast_convert_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(bitcast_convert_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(bitcast_convert_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(bitcast_convert_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
                 let bitcast_convert_block = block.append_operation(bitcast_convert_op).unwrap();
                 block
@@ -446,8 +443,8 @@ mod tests {
                 let mut block = context.block(&[(input_tensor_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let convert_op = convert(input_value, output_tensor_type, location).unwrap();
-                assert_eq!(convert_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(convert_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(convert_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(convert_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(convert_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
                 let convert_block = block.append_operation(convert_op).unwrap();
                 block
@@ -497,14 +494,8 @@ mod tests {
                 let mut block = context.block(&[(input_quantized_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let uniform_dequantize_op = uniform_dequantize(input_value, output_tensor_type, location).unwrap();
-                assert_eq!(
-                    uniform_dequantize_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    uniform_dequantize_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(uniform_dequantize_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(uniform_dequantize_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(uniform_dequantize_op.result(0).unwrap().r#type().unwrap(), output_tensor_type,);
                 let uniform_dequantize_block = block.append_operation(uniform_dequantize_op).unwrap();
                 block
@@ -557,14 +548,8 @@ mod tests {
                 let mut block = context.block(&[(input_tensor_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let uniform_quantize_op = uniform_quantize(input_value, output_quantized_type, location).unwrap();
-                assert_eq!(
-                    uniform_quantize_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    uniform_quantize_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(uniform_quantize_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(uniform_quantize_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(uniform_quantize_op.result(0).unwrap().r#type().unwrap(), output_quantized_type);
                 let uniform_quantize_block = block.append_operation(uniform_quantize_op).unwrap();
                 block
@@ -614,14 +599,8 @@ mod tests {
                 let mut block = context.block(&[(input_tensor_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let reduce_precision_op = reduce_precision(input_value, 5, 10, location).unwrap();
-                assert_eq!(
-                    reduce_precision_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    reduce_precision_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(reduce_precision_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(reduce_precision_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(reduce_precision_op.exponent_bits().unwrap(), 5);
                 assert_eq!(reduce_precision_op.mantissa_bits().unwrap(), 10);
                 assert_eq!(reduce_precision_op.exponent_bits().unwrap(), 5);

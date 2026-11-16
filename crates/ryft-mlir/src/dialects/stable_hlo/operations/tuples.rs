@@ -148,8 +148,8 @@ mod tests {
                 let arg_0 = block.argument(0).unwrap();
                 let arg_1 = block.argument(1).unwrap();
                 let tuple_op = tuple(&[arg_0, arg_1], location).unwrap();
-                assert_eq!(tuple_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(tuple_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(tuple_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(tuple_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(tuple_op.result(0).unwrap().r#type().unwrap(), tuple_type);
                 let tuple_block = block.append_operation(tuple_op).unwrap();
                 block
@@ -206,8 +206,8 @@ mod tests {
                 let outer_tuple_result = outer_tuple_block.result(0).unwrap();
                 let get_element_op = get_tuple_element(outer_tuple_result, 0, location).unwrap();
                 assert_eq!(get_element_op.index().unwrap(), 0);
-                assert_eq!(get_element_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(get_element_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(get_element_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(get_element_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let get_element_block = block.append_operation(get_element_op).unwrap();
                 block
                     .append_operation(func::r#return(&[get_element_block.result(0).unwrap()], location).unwrap())

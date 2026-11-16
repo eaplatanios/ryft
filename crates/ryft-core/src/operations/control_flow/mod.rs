@@ -447,14 +447,14 @@ pub(crate) fn validate_control_flow_output_identity_scope<T: Type>(
 }
 
 /// Validates that the `body` of the loop operation named `operation_name` returns every reference carry as the
-/// reference that it entered with, i.e., as its own body input: carry `i` enters `body` at input `carry_inputs.start
-/// + i` and leaves it at output `i`. A loop threads the allocation of a reference carry through every iteration and its
-/// output denotes that same allocation, so a body that returns another reference (e.g., another reference carry, a
-/// reference that it allocates, or a captured reference) gives the loop state no fixed point, and the outputs of a loop
-/// that runs no iteration would disagree with those of every other trip count. The rule is structural: it compares body
-/// positions rather than the allocations that the inputs of one application denote, so every rule (eager
-/// interpretation, reference discharge, and the staged transforms alike) accepts the same bodies. Aliased handles
-/// therefore satisfy it unless the body swaps them.
+/// reference that it entered with, i.e., as its own body input: carry `i` enters `body` at input
+/// `carry_inputs.start + i` and leaves it at output `i`. A loop threads the allocation of a reference carry through
+/// every iteration and its output denotes that same allocation, so a body that returns another reference (e.g., another
+/// reference carry, a reference that it allocates, or a captured reference) gives the loop state no fixed point, and
+/// the outputs of a loop that runs no iteration would disagree with those of every other trip count. The rule is
+/// structural: it compares body positions rather than the allocations that the inputs of one application denote, so
+/// every rule (eager interpretation, reference discharge, and the staged transforms alike) accepts the same bodies.
+/// Aliased handles therefore satisfy it unless the body swaps them.
 ///
 /// # Errors
 ///

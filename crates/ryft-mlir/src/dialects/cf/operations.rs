@@ -408,10 +408,10 @@ mod tests {
                 let op = assert(argument, "bad stuff", location).unwrap();
                 assert_eq!(op.argument().unwrap(), argument);
                 assert_eq!(op.message().unwrap().as_str(), Ok("bad stuff"));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 block.append_operation(op).unwrap();
                 block.append_operation(func::r#return::<ValueRef, _>(&[], location).unwrap()).unwrap();
                 func::func(
@@ -453,10 +453,10 @@ mod tests {
                 let op = br(&target_block, &[argument], location).unwrap();
                 assert_eq!(op.destination().unwrap(), target_block.as_ref());
                 assert_eq!(op.destination_operands().unwrap(), vec![argument]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 entry_block.append_operation(op).unwrap();
                 target_block
                     .append_operation(func::r#return(&[target_block.argument(0).unwrap()], location).unwrap())
@@ -522,10 +522,10 @@ mod tests {
                 assert_eq!(op.on_true_successor_operands().unwrap(), vec![true_value]);
                 assert_eq!(op.on_false_successor_operands().unwrap(), vec![false_value]);
                 assert_eq!(op.branch_weights().unwrap().map(Vec::<i32>::from), Some(vec![13, 21]));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
                 entry_block.append_operation(op).unwrap();
                 true_block
                     .append_operation(func::r#return(&[true_block.argument(0).unwrap()], location).unwrap())
@@ -612,10 +612,10 @@ mod tests {
                 assert_eq!(op.flag().unwrap(), flag);
                 assert_eq!(op.default().unwrap(), default_branch);
                 assert_eq!(op.cases().unwrap(), vec![case_0_branch, case_1_branch]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 4);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.successors().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
                 entry_block.append_operation(op).unwrap();
                 default_block
                     .append_operation(func::r#return(&[default_block.argument(0).unwrap()], location).unwrap())

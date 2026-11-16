@@ -856,9 +856,7 @@ mod tests {
     fn test_jacobian_forward() {
         // A vector identity function packs every input coordinate direction into one replay and reconstructs the
         // complete identity matrix as a single output/input block.
-        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
-            .jacobian_forward(|input| Ok(input))
-            .unwrap();
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()).jacobian_forward(Ok).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(
             block.value().r#type().into_owned(),
@@ -1189,7 +1187,7 @@ mod tests {
 
         let integer = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[2]).unwrap();
         assert_eq!(
-            context.differentiate_at(integer).jacobian_forward(|x| Ok(x)).unwrap_err(),
+            context.differentiate_at(integer).jacobian_forward(Ok).unwrap_err(),
             DifferentiationError::NonDifferentiableParameter {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -1224,9 +1222,7 @@ mod tests {
 
         let complex_output_error = context
             .differentiate_at(Array::scalar(2.0).unwrap())
-            .jacobian_reverse(|input| {
-                Ok(input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)).unwrap())?)
-            })
+            .jacobian_reverse(|input| input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)).unwrap()))
             .unwrap_err();
         assert_eq!(
             complex_output_error,
@@ -1244,7 +1240,7 @@ mod tests {
         );
         let dynamic = Array::new_unchecked(dynamic_type.clone(), Arc::new(1.0f64.to_le_bytes().to_vec()));
         assert_eq!(
-            context.differentiate_at(dynamic).jacobian_forward(|x| Ok(x)).unwrap_err(),
+            context.differentiate_at(dynamic).jacobian_forward(Ok).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -1255,9 +1251,9 @@ mod tests {
         assert_eq!(
             context
                 .differentiate_at(Array::scalar(1.0).unwrap())
-                .jacobian_forward(|input| Ok(input
+                .jacobian_forward(|input| input
                     .context()
-                    .lift(Array::new_unchecked(dynamic_type.clone(), Arc::new(1.0f64.to_le_bytes().to_vec())))?))
+                    .lift(Array::new_unchecked(dynamic_type.clone(), Arc::new(1.0f64.to_le_bytes().to_vec()))))
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianForward,
@@ -1271,7 +1267,7 @@ mod tests {
         assert_eq!(
             context
                 .differentiate_at(dynamic)
-                .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(1.0).unwrap())?))
+                .jacobian_reverse(|input| input.context().lift(Array::scalar(1.0).unwrap()))
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianReverse,

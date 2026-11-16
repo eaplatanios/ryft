@@ -265,7 +265,7 @@ mod tests {
         TestContext::new().jvp(
             |x, ()| {
                 let operation = CompositeOperation::new(definition.reference());
-                x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
+                x.context().bind(operation, vec![cube_program(&r#type)], std::slice::from_ref(&x))
             },
             x,
             tangent,

@@ -220,7 +220,7 @@ impl<C: Context<Type = ArrayType, Operation: From<PrintOperation<ArrayType>>>, P
         // print the parent's input at transformation time and drop the instruction and its effect from the programs
         // that a staging parent produces.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(context.forward_to_parent(self.clone().into(), inputs)?.into())
+        context.forward_to_parent(self.clone().into(), inputs)
     }
 }
 
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn test_print_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")?),
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| input.print("x"),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
@@ -720,7 +720,7 @@ mod tests {
         // The selected class is recorded on the staged instruction and summarized as the program's effect.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                Ok(input.print_with_effect_class("x", EffectClass::UnorderedIo)?)
+                input.print_with_effect_class("x", EffectClass::UnorderedIo)
             },
             ArrayType::scalar(DataType::F64),
         )

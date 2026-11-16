@@ -18,6 +18,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.
+- Keep struct fields private, including from sibling modules of the same crate. Expose construction through
+  constructors and `with_*` builder functions and reads through accessor functions instead of marking fields `pub`,
+  `pub(crate)`, or `pub(super)`. Structs that mirror a C layout in an `ffi` module are the exception.
 - Give trait function arguments descriptive names without a leading underscore. When a default implementation does
   not use them, start its body with `let _ = (...);` to mark the unused arguments explicitly.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
@@ -34,6 +37,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
 - For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding redundant
   constructor methods unless those constructors add validation or the user explicitly asks for them.
+- Follow enum declaration order in `match` arms, variant-specific helper groups, and variant coverage tables where
+  semantics permit. Keep overlapping cases in their required precedence and explain exceptions. Preserve existing
+  serialization tags when reordering arms.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
 - Define bookkeeping types used only within one function at the beginning of that function.
@@ -163,6 +169,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
 - In derive lists that include both `Copy` and `Clone`, list `Copy` before `Clone` and keep those two traits before
   any other derived traits.
+- Place `#[allow(...)]` and `#[expect(...)]` attributes before the other attributes of their item (e.g.,
+  `#[derive(...)]`, `#[cfg(...)]`, `#[inline]`, and `#[test]`), directly below the item's documentation comment.
+  A code comment that explains the attribute stays directly above it.
 - Precede every non-trivial declarative-macro branch with a concise code comment explaining the accepted public form
   or the internal generation role.
 

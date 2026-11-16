@@ -398,9 +398,7 @@ where
         // batched physical shape (because all sort inputs must agree on shape), and the sort axis lifts past the
         // inserted leading batch axis while the key count and ordering carry through unchanged.
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
-            return Ok(self
-                .interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()])?
-                .into());
+            return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()]);
         };
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let batched_inputs = inputs
@@ -417,13 +415,11 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let lifted = SortOperation { axis: self.axis + 1, ..*self };
-        Ok(lifted
-            .interpret_with_batch_axes(
-                context,
-                batched_inputs.as_slice(),
-                &vec![BatchAxis::from_position(0); inputs.len()],
-            )?
-            .into())
+        lifted.interpret_with_batch_axes(
+            context,
+            batched_inputs.as_slice(),
+            &vec![BatchAxis::from_position(0); inputs.len()],
+        )
     }
 }
 

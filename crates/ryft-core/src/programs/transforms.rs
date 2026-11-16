@@ -1429,7 +1429,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             panic_message(panicked),
-            transform_recheck_message(&CollisionKey(8), 9, 8, &[program_rendering.clone()], &[program_rendering],),
+            transform_recheck_message(
+                &CollisionKey(8),
+                9,
+                8,
+                std::slice::from_ref(&program_rendering),
+                std::slice::from_ref(&program_rendering),
+            ),
         );
     }
 

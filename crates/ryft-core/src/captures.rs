@@ -1014,7 +1014,7 @@ mod tests {
     #[test]
     fn test_importing_context_import_projected_context() {
         let parent = ImportArrayIrContext::new();
-        let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let context = ProjectedContext::<_, ArrayType>::new(parent);
         let array = Array::scalar(u64::MAX).unwrap();
         assert_eq!(
             ImportingContext::<ImportArrayIrContext, _>::import(&context, ArrayIrValue::Array(array.clone())),

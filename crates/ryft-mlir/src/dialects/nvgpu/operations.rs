@@ -208,6 +208,7 @@ mlir_op_trait!(MmaSparseSync, ZeroRegions);
 mlir_op_trait!(MmaSparseSync, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`MmaSparseSyncOperation`] at the specified [`Location`].
+#[allow(clippy::too_many_arguments)]
 pub fn mma_sparse_sync<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     matrix_a: ValueRef<'v, 'c, 't>,
     matrix_b: ValueRef<'v, 'c, 't>,

@@ -165,8 +165,8 @@ mod tests {
                 let complex_op = complex(real_value, imag_value, location).unwrap();
                 assert_eq!(complex_op.real().unwrap(), real_value);
                 assert_eq!(complex_op.imag().unwrap(), imag_value);
-                assert_eq!(complex_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(complex_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(complex_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(complex_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(complex_op.result(0).unwrap().r#type().unwrap(), complex_tensor_type);
                 let complex_block = block.append_operation(complex_op).unwrap();
                 block
@@ -217,8 +217,8 @@ mod tests {
                 let imag_op = imag(input_value, location).unwrap();
                 assert_eq!(imag_op.input().unwrap(), input_value);
                 assert_eq!(imag_op.input().unwrap(), input_value);
-                assert_eq!(imag_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(imag_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(imag_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(imag_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let imag_block = block.append_operation(imag_op).unwrap();
                 block.append_operation(func::r#return(&[imag_block.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -266,8 +266,8 @@ mod tests {
                 let real_op = real(input_value, location).unwrap();
                 assert_eq!(real_op.input().unwrap(), input_value);
                 assert_eq!(real_op.input().unwrap(), input_value);
-                assert_eq!(real_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(real_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(real_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(real_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let real_block = block.append_operation(real_op).unwrap();
                 block.append_operation(func::r#return(&[real_block.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

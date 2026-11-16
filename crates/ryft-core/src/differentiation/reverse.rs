@@ -2814,7 +2814,7 @@ where
         ///   - `builder`: Destination pullback builder into which demanded pure producers are replayed.
         ///   - `known_map`: Per-source-atom mapping to an already materialized pullback atom.
         ///   - `materialization_state`: Per-source-instruction traversal state used for memoization
-        ///      and cycle detection.
+        ///     and cycle detection.
         ///   - `known_lifecycles`: Known local reference lifecycles and the slice of them that is replayed.
         ///   - `atom`: ID of the known source atom to materialize in the pullback builder.
         #[allow(clippy::too_many_arguments)]
@@ -5683,7 +5683,7 @@ pub(crate) mod tests {
         assert_eq!(builder.instructions()[0].operation().name(), "add");
         assert_eq!(builder.instructions()[0].inputs(), &[first.atom_id().unwrap(), second.atom_id().unwrap()]);
         drop(builder);
-        assert!(context.take_cotangents(&[accumulator.clone()]).unwrap()[0].is_zero());
+        assert!(context.take_cotangents(std::slice::from_ref(&accumulator)).unwrap()[0].is_zero());
         accumulator.accumulate(&mut context, MaybeZero::Value(first.clone())).unwrap();
         let values = context.take_cotangents(&[accumulator]).unwrap();
         assert_eq!(values[0].as_value().unwrap().atom_id(), first.atom_id());
@@ -9673,7 +9673,7 @@ pub(crate) mod tests {
         // leaves and never constructs a token-valued zero operation.
         let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| {
-                let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(|token| Ok(token))?;
+                let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(Ok)?;
                 let cotangent = pullback.apply_materialized(inputs[1].clone())?;
                 Ok(vec![value, cotangent])
             },
@@ -9684,7 +9684,7 @@ pub(crate) mod tests {
 
         // With no leaf value to recover a context from, the builder's `vjp` terminal reports that differentiation
         // requires at least one input leaf.
-        let error = differentiate_at(Vec::<Array>::new()).vjp(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err();
+        let error = differentiate_at(Vec::<Array>::new()).vjp(Ok).map(|(outputs, _)| outputs).unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
@@ -10367,7 +10367,7 @@ pub(crate) mod tests {
                             .bind(
                                 ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum)),
                                 Vec::new(),
-                                &[value.clone()],
+                                std::slice::from_ref(&value),
                             )?
                             .remove(0),
                     )

@@ -217,7 +217,7 @@ where
         let Some(_) = inputs[0].batch_axis_position() else {
             // Replicated input meaning there is no batch axis to thread through the reshape, so interpret it as given
             // and report the output replicated.
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let Dimension::Static(axis_size) = P::axis_dimension(context)? else {
             return Err(BatchingError::UnsupportedOperation {
@@ -244,9 +244,7 @@ where
             lifted_operation = lifted_operation
                 .with_output_sharding(output_sharding.batched(0, ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
-        Ok(lifted_operation
-            .interpret_with_batch_axes(context, &[moved_input], &[BatchAxis::from_position(0)])?
-            .into())
+        lifted_operation.interpret_with_batch_axes(context, &[moved_input], &[BatchAxis::from_position(0)])
     }
 }
 
@@ -902,12 +900,12 @@ where
         // Recompute the runtime assertion requirement for the lifted signature so proven equal counts stay effect-free.
         let operation = operation
             .with_input_types(&lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
-        Ok(context
+        context
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(0)))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -2079,8 +2077,10 @@ mod tests {
         let target_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(target.clone())]));
         let target_output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(target)]));
-        let instantiated =
-            program.with_instantiated_type_identities(&[target_input_type.clone()]).unwrap().into_owned();
+        let instantiated = program
+            .with_instantiated_type_identities(std::slice::from_ref(&target_input_type))
+            .unwrap()
+            .into_owned();
         assert_eq!(instantiated.output_types(), vec![target_output_type.clone()]);
         assert_eq!(
             instantiated.to_string(),

@@ -3576,7 +3576,7 @@ mod tests {
         assert_relative_eq!(output.im, 6.101757441282702e153, epsilon = 0.0, max_relative = 1e-15);
         let output = FloatingPointArrayElement::sqrt(Complex::new(f32::MAX, f32::MAX)).unwrap();
         assert_relative_eq!(output.re, 2.0267144e19, epsilon = 0.0, max_relative = 1e-6);
-        assert_relative_eq!(output.im, 8.3949256e18, epsilon = 0.0, max_relative = 1e-6);
+        assert_relative_eq!(output.im, 8.394_926e18, epsilon = 0.0, max_relative = 1e-6);
         let output = FloatingPointArrayElement::sqrt(Complex::new(f64::from_bits(1), 0.0)).unwrap();
         assert_eq!(output, Complex::new(2.2227587494850775e-162, 0.0));
         assert_eq!(
@@ -3652,7 +3652,7 @@ mod tests {
         assert_relative_eq!(output.re, 5.143333304259946e307, epsilon = 0.0, max_relative = 2e-15);
         assert_eq!(output.im, f64::INFINITY);
         let output = FloatingPointArrayElement::sin(Complex::new(f64::from_bits(1), 1430.0)).unwrap();
-        assert_relative_eq!(output.re, 2.7155873871042953e297, epsilon = 0.0, max_relative = 2e-13);
+        assert_relative_eq!(output.re, 2.715_587_387_104_295e297, epsilon = 0.0, max_relative = 2e-13);
         assert_eq!(output.im, f64::INFINITY);
     }
 

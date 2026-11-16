@@ -148,8 +148,8 @@ mod tests {
                 let mut block = context.block(&[(input_tensor_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let qcast_op = qcast(input_value, output_quantized_type, location).unwrap();
-                assert_eq!(qcast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(qcast_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(qcast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(qcast_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(qcast_op.result(0).unwrap().r#type().unwrap(), output_quantized_type);
                 let qcast_block = block.append_operation(qcast_op).unwrap();
                 block
@@ -198,8 +198,8 @@ mod tests {
                 let mut block = context.block(&[(input_quantized_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let dcast_op = dcast(input_value, output_tensor_type, location).unwrap();
-                assert_eq!(dcast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(dcast_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(dcast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(dcast_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(dcast_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
                 let dcast_block = block.append_operation(dcast_op).unwrap();
                 block
@@ -248,8 +248,8 @@ mod tests {
                 let mut block = context.block(&[(input_quantized_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let scast_op = scast(input_value, output_tensor_type, location).unwrap();
-                assert_eq!(scast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(scast_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(scast_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(scast_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(scast_op.result(0).unwrap().r#type().unwrap(), output_tensor_type);
                 let scast_block = block.append_operation(scast_op).unwrap();
                 block

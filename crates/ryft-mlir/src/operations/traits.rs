@@ -715,8 +715,8 @@ mod tests {
         assert_eq!(op.output_type().unwrap(), function_type);
     }
 
-    #[test]
     #[allow(deprecated)]
+    #[test]
     fn test_single_block() {
         let context = Context::new();
         let location = context.unknown_location();

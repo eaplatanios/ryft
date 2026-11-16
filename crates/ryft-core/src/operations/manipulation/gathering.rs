@@ -698,7 +698,7 @@ where
         let mapped_input = inputs[0].batch_axis_position().is_some();
         let mapped_indices = inputs[1].batch_axis_position().is_some();
         if !mapped_input && !mapped_indices {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         }
 
         // Put each mapped axis first so all three lifting cases produce one leading mapped output axis. Unlike
@@ -791,7 +791,7 @@ where
                 Some(output_sharding.batched(0, ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
 
-        Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?)
+        operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])
     }
 }
 
@@ -1696,13 +1696,13 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                 TypeError::invalid(format!("`{GATHER_OPERATION_NAME}` output sharding construction failed: {error}"))
             };
             let sharding = Sharding::new(mesh, placement)
-                .map_err(&map_sharding_error)?
+                .map_err(map_sharding_error)?
                 .with_unreduced_axes(unreduced_axes)
-                .map_err(&map_sharding_error)?
+                .map_err(map_sharding_error)?
                 .with_unreduced_kind(unreduced_kind)
-                .map_err(&map_sharding_error)?
+                .map_err(map_sharding_error)?
                 .with_reduced_axes(reduced_axes)
-                .map_err(&map_sharding_error)?
+                .map_err(map_sharding_error)?
                 .with_varying_manual_axes(varying_manual_axes)
                 .map_err(map_sharding_error)?;
             Some(sharding)

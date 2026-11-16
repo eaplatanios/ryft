@@ -133,16 +133,15 @@ impl Sharding {
 
         // Build the visualization cell grid.
         let mut cells = vec![vec![String::new(); column_count]; row_count];
-        for row_index in 0..row_count {
-            for column_index in 0..column_count {
-                let label = devices_by_cell
+        for (row_index, row) in cells.iter_mut().enumerate() {
+            for (column_index, cell) in row.iter_mut().enumerate() {
+                *cell = devices_by_cell
                     .get_mut(&(row_index, column_index))
                     .map(|device_indices| {
                         device_indices.sort_unstable();
                         device_indices.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
                     })
                     .unwrap_or_default();
-                cells[row_index][column_index] = label;
             }
         }
 

@@ -370,15 +370,14 @@ mod tests {
         );
         assert_eq!(
             context.fill(&ArrayType::new_static(DataType::Boolean, [2]), ComplexNumber::new(0.0f32, 2.0)),
-            Array::from_elements(ArrayType::new_static(DataType::Boolean, [2]), &[true; 2]).map_err(Into::into),
+            Array::from_elements(ArrayType::new_static(DataType::Boolean, [2]), &[true; 2]),
         );
 
         // Fill uses the same checked element codecs for low-precision and sub-byte values as direct array creation.
         let low_precision = f6e2m3fn::from_bits(0x08).unwrap();
         assert_eq!(
             context.fill(&ArrayType::new_static(DataType::F6E2M3FN, [2]), low_precision),
-            Array::from_elements(ArrayType::new_static(DataType::F6E2M3FN, [2]), &[low_precision; 2])
-                .map_err(Into::into),
+            Array::from_elements(ArrayType::new_static(DataType::F6E2M3FN, [2]), &[low_precision; 2]),
         );
         assert_eq!(
             context.fill(&ArrayType::new_static(DataType::U4, [2]), 2.5f64).unwrap().elements::<u4>(),
@@ -407,17 +406,11 @@ mod tests {
         let varying_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        assert_eq!(
-            context.fill(&varying_type, 2.5f64),
-            Array::from_elements(varying_type, &[2.5f32; 2]).map_err(Into::into),
-        );
+        assert_eq!(context.fill(&varying_type, 2.5f64), Array::from_elements(varying_type, &[2.5f32; 2]),);
         let reduced_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap())
             .unwrap();
-        assert_eq!(
-            context.fill(&reduced_type, 2.5f64),
-            Array::from_elements(reduced_type, &[2.5f32; 2]).map_err(Into::into),
-        );
+        assert_eq!(context.fill(&reduced_type, 2.5f64), Array::from_elements(reduced_type, &[2.5f32; 2]),);
         let unreduced_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
@@ -658,7 +651,7 @@ mod tests {
         let dimension = context.input(DimensionType::from(size.clone()).into());
         let invalid_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), usize::MAX.into()]));
         if usize::BITS >= 64 {
-            let error = context.dynamic_fill(&invalid_type, 1f32, &[dimension.clone()]).unwrap_err();
+            let error = context.dynamic_fill(&invalid_type, 1f32, std::slice::from_ref(&dimension)).unwrap_err();
             assert_eq!(
                 error.downcast_custom::<DimensionError>(),
                 Some(&DimensionError::ExtentExceedsBackendWidth { value: usize::MAX, maximum: i64::MAX as usize })
@@ -671,7 +664,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 0))
             .unwrap()
             .with_shape(Shape::new(vec![size.clone().into()]));
-        assert!(matches!(context.dynamic_fill(&invalid_type, 1f32, &[dimension.clone()]),
+        assert!(matches!(context.dynamic_fill(&invalid_type, 1f32, std::slice::from_ref(&dimension)),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "sharding rank (0) does not match array rank (1)"));
         assert!(context.builder().borrow().instructions().is_empty());
@@ -715,7 +708,7 @@ mod tests {
         let expected_type = r#type.clone().with_shape(Shape::new(vec![3.into(), 2.into()]));
         let expected = ArrayIrValue::Array(Array::from_elements(expected_type, &[7f32; 6]).unwrap());
         let eager = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        assert_eq!(eager.dynamic_fill(&r#type, 7f32, &[extent.clone()]), Ok(expected.clone()));
+        assert_eq!(eager.dynamic_fill(&r#type, 7f32, std::slice::from_ref(&extent)), Ok(expected.clone()));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dimension = context.input(dimension_type.clone().into());
         let output = context.dynamic_fill(&r#type, 7f32, &[dimension]).unwrap();
@@ -741,7 +734,7 @@ mod tests {
             Array::from_elements(tiled_type.clone().with_shape(Shape::new(vec![3.into(), 2.into()])), &[7f32; 6])
                 .unwrap(),
         );
-        assert_eq!(eager.dynamic_fill(&tiled_type, 7f32, &[extent.clone()]), Ok(expected.clone()));
+        assert_eq!(eager.dynamic_fill(&tiled_type, 7f32, std::slice::from_ref(&extent)), Ok(expected.clone()));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dimension = context.input(dimension_type.clone().into());
         let output = context.dynamic_fill(&tiled_type, 7f32, &[dimension]).unwrap();

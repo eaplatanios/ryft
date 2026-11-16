@@ -207,7 +207,7 @@ impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
             }
             DataType::Zero => Array::new(r#type.clone(), Vec::new()),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                Array::from_fn_elements(r#type.clone(), |_| Ok(Element::zero()?))
+                Array::from_fn_elements(r#type.clone(), |_| Element::zero())
             }),
         }
     }
@@ -540,7 +540,7 @@ mod tests {
         let expected = Array::from_elements(output_type.clone(), &[0.0f32; 6]).unwrap();
         assert_eq!(context.zero(&output_type), Ok(expected.clone()));
         let zero_space_type = ArrayType::new_static(DataType::Zero, [2, 3]);
-        assert_eq!(context.zero(&zero_space_type), Array::new(zero_space_type, Vec::new()).map_err(Into::into));
+        assert_eq!(context.zero(&zero_space_type), Array::new(zero_space_type, Vec::new()));
 
         // Token arrays and dynamically shaped eager arrays cannot be materialized as zeros.
         assert_eq!(
@@ -776,7 +776,7 @@ mod tests {
     fn test_zero_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
-        let input_cotangents = ZeroOperation::new(ArrayType::scalar(DataType::F64))
+        ZeroOperation::new(ArrayType::scalar(DataType::F64))
             .transpose(
                 &mut TranspositionContext::new(context),
                 &EmptyRegionDriver,
@@ -785,7 +785,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(input_cotangents, ());
+        assert_eq!((), ());
     }
 
     #[test]
@@ -1001,7 +1001,7 @@ mod tests {
         for data_type in [DataType::Token, DataType::F8E8M0FNU] {
             let r#type = ArrayType::new(data_type, Shape::new(vec![size.clone().into()]));
             assert_eq!(
-                context.dynamic_zero(&r#type, &[dimension.clone()]).unwrap_err(),
+                context.dynamic_zero(&r#type, std::slice::from_ref(&dimension)).unwrap_err(),
                 ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent zero"))),
             );
             assert!(context.builder().borrow().instructions().is_empty());

@@ -468,15 +468,15 @@ mod tests {
                 let map_op = map(
                     &[block.argument(0).unwrap(), block.argument(1).unwrap()],
                     &[0, 1],
-                    computation_region.into(),
+                    computation_region,
                     location,
                 )
                 .unwrap();
                 assert_eq!(map_op.dimensions().unwrap(), vec![0, 1]);
                 assert_eq!(map_op.computation().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(map_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(map_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(map_op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(map_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(map_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(map_op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let map_op = block.append_operation(map_op).unwrap();
                 block.append_operation(func::r#return(&[map_op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -535,13 +535,13 @@ mod tests {
                 let return_op = stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap();
                 region_block.append_operation(return_op).unwrap();
                 region.append_block(region_block).unwrap();
-                let reduce_op = reduce(&[input], &[initial_value], &[1], region.into(), location).unwrap();
+                let reduce_op = reduce(&[input], &[initial_value], &[1], region, location).unwrap();
                 assert_eq!(reduce_op.inputs().collect::<Result<Vec<_>, _>>().unwrap(), vec![input]);
                 assert_eq!(reduce_op.initial_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![initial_value]);
                 assert_eq!(reduce_op.dimensions().unwrap(), vec![1]);
                 assert_eq!(reduce_op.computation().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(reduce_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(reduce_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(reduce_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(reduce_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let reduce_op = block.append_operation(reduce_op).unwrap();
                 block.append_operation(func::r#return(&[reduce_op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -620,7 +620,7 @@ mod tests {
                     Some(&[1, 1, 1, 1]),
                     Some(&[1, 1, 1, 1]),
                     Some(&[(4, 2), (0, 2), (0, 0), (0, 0)]),
-                    region.into(),
+                    region,
                     location,
                 )
                 .unwrap();
@@ -635,8 +635,8 @@ mod tests {
                 assert_eq!(reduce_window_op.window_dilations().unwrap(), Some(vec![1, 1, 1, 1]));
                 assert_eq!(reduce_window_op.padding().unwrap(), Some(vec![(4, 2), (0, 2), (0, 0), (0, 0)]));
                 assert_eq!(reduce_window_op.computation().unwrap().blocks().unwrap().count(), 1);
-                assert_eq!(reduce_window_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(reduce_window_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(reduce_window_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(reduce_window_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let reduce_window_op = block.append_operation(reduce_window_op).unwrap();
                 block
                     .append_operation(func::r#return(&[reduce_window_op.result(0).unwrap()], location).unwrap())

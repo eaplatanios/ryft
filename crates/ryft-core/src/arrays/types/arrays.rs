@@ -20,6 +20,8 @@ use crate::arrays::types::memories::Memory;
 use crate::axes::Axis;
 use crate::contexts::EagerContext;
 use crate::operations::collectives::PARALLEL_VARY_OPERATION_NAME;
+use crate::operations::manipulation::diagonal::diagonal_layout;
+use crate::operations::{Gather, GatherOptions, Reshape, Slice};
 use crate::parameters::Parameter;
 use crate::programs::types::type_signature_pairs;
 use crate::programs::{
@@ -222,6 +224,33 @@ impl ArrayType {
                     .transpose()?,
             )
             .map_err(|error| TypeError::invalid(format!("scalar type is invalid: {error}")))
+    }
+
+    /// Returns the type of the diagonal of a value of this type along `axis_1` and `axis_2` with the provided `offset`
+    /// (refer to [`Diagonal::diagonal`](crate::Diagonal::diagonal) for the parameters), by inferring the types of the
+    /// slice and the gather that take it. This function takes precedence over the [`Diagonal`](crate::Diagonal)
+    /// capability that an [`ArrayType`] has as a value of itself. Unlike the implementation of that capability for
+    /// homogeneous array values, it accepts the dynamic extents that array IR values support, so compositions can
+    /// infer their types for both.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when either axis is out of range, when the two axes are the same, or when an
+    /// extent that must be static is dynamic.
+    #[inline]
+    pub fn diagonal(&self, offset: isize, axis_1: usize, axis_2: usize) -> Result<Self, ProgramError> {
+        let layout = diagonal_layout(self, offset, axis_1, axis_2)?;
+        let value = match layout.slice() {
+            Some((start_indices, limits)) => self.slice(start_indices, limits, &vec![1; limits.len()])?,
+            None => self.clone(),
+        };
+        match layout.empty_shape() {
+            Some(empty_shape) => value.reshape(empty_shape.clone()),
+            None => {
+                let options = GatherOptions::<Self>::new();
+                value.gather(layout.indices_type(), layout.dimensions(), layout.slice_sizes(), &options)
+            }
+        }
     }
 
     /// Returns the [`DataType`] of the elements stored in the array.
@@ -1265,6 +1294,22 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
                 .unwrap()),
         );
+    }
+
+    #[test]
+    fn test_array_type_diagonal() {
+        // The diagonal of an array type is the type of the diagonal of a value of that type.
+        let r#type = ArrayType::new_static(F64, [2, 3, 4]);
+        assert_eq!(r#type.diagonal(0, 1, 2), Ok(ArrayType::new_static(F64, [2, 3])));
+        assert_eq!(r#type.diagonal(2, 2, 1), Ok(ArrayType::new_static(F64, [2, 1])));
+        assert_eq!(r#type.diagonal(-1, 0, 2), Ok(ArrayType::new_static(F64, [1, 3])));
+
+        // The type of a diagonal is also inferred for the dynamic extents that array IR values support.
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let r#type = ArrayType::new(F64, Shape::new(vec![extent.clone(), 2.into(), 2.into()]));
+        assert_eq!(r#type.diagonal(0, 1, 2), Ok(ArrayType::new(F64, Shape::new(vec![extent.clone(), 2.into()]))));
+        let r#type = ArrayType::new(F64, Shape::new(vec![extent.clone(), 3.into(), extent.clone()]));
+        assert_eq!(r#type.diagonal(0, 2, 0), Ok(ArrayType::new(F64, Shape::new(vec![3.into(), extent]))));
     }
 
     #[test]

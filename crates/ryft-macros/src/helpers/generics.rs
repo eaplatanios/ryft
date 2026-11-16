@@ -436,7 +436,7 @@ mod tests {
                     )),
         ));
         assert!(matches!(
-            generics.params.iter().last().expect("expected one generic parameter"),
+            generics.params.iter().next_back().expect("expected one generic parameter"),
             syn::GenericParam::Lifetime(lifetime_param) if lifetime_param.lifetime == lifetime,
         ));
     }

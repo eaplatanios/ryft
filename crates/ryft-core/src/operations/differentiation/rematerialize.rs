@@ -957,7 +957,7 @@ mod tests {
 
     /// Computes `sin(tag(dot(x, x), "dot"))` for a vector `x`.
     fn tagged_sine_of_dot(x: TestTracer) -> Result<TestTracer, ProgramError> {
-        Ok(x.dot(&x, &vector_dot_dimensions())?.tag("dot")?.sin()?)
+        x.dot(&x, &vector_dot_dimensions())?.tag("dot")?.sin()
     }
 
     /// Differentiates [`tagged_sine_of_dot`] rematerialized with `policy` at `[0.1, 0.2, 0.3]` in reverse mode and
@@ -1777,7 +1777,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[multiplier.clone()]), Ok(expected.clone()));
+        assert_eq!(evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&multiplier)), Ok(expected.clone()));
 
         // Unequal tangent and cotangent seeds pin both output positions independently. For f(a, x) = (sin(a),
         // x sin(a)), Jf(3, 5) = (3 cos(a), 6 cos(a) + 5 sin(a)) and Jfᵀ(7, 11) = (29 cos(a), 11 sin(a)).
@@ -2608,7 +2608,7 @@ mod tests {
         // The body calls a composite whose JVP rule doubles the derivative of `sin` and whose VJP rule triples it.
         // Forward mode through the call uses the JVP rule, while reverse mode uses the VJP rule, because the driver
         // selects the rule with which the body is differentiated.
-        let sine = composite(|x: TestTracer| Ok(x.sin()?))
+        let sine = composite(|x: TestTracer| x.sin())
             .with_jvp(|x, tangent| {
                 let tangent = x.cos()? * tangent;
                 Ok((x.sin()?, tangent.clone() + tangent))
@@ -2632,7 +2632,7 @@ mod tests {
     #[test]
     fn test_rematerialize_differentiation_call_body() {
         // A call with derivatives derived from its primal keeps the same values and derivatives inside a checkpoint.
-        let sine = composite(|x: TestTracer| Ok(x.sin()?)).with_jvp_from_primal();
+        let sine = composite(|x: TestTracer| x.sin()).with_jvp_from_primal();
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<TestTracer>| Ok(vec![sine.call(inputs[0].clone())?]),
             vec![ArrayType::scalar(DataType::F64)],
@@ -2661,7 +2661,7 @@ mod tests {
         // Differentiating only x makes g(w) an all-known call. Its returned scale still follows the enclosing
         // checkpoint's storage decision when it is tagged after the call, even though the callee itself needs no
         // partial-evaluation split.
-        let scale = composite(|weight: TestTracer| Ok(weight.sin()?)).with_jvp_from_primal();
+        let scale = composite(|weight: TestTracer| weight.sin()).with_jvp_from_primal();
         let scalar_type = ArrayType::scalar(DataType::F64);
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?.tag("scale")?]),
@@ -2713,7 +2713,7 @@ mod tests {
         // A tag inside the call is invisible to the policy, which classifies the call itself, as JAX's policies
         // classify `custom_jvp_call`. The policy therefore recomputes the scale, and the differentiated call replays
         // the whole call from `w`, which is saved instead.
-        let scale = composite(|weight: TestTracer| Ok(weight.sin()?.tag("scale")?)).with_jvp_from_primal();
+        let scale = composite(|weight: TestTracer| weight.sin()?.tag("scale")).with_jvp_from_primal();
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?]),
             vec![scalar_type.clone(); 2],
@@ -2768,8 +2768,7 @@ mod tests {
     fn test_rematerialize_differentiation_nested_policies() {
         // The inner checkpoint saves cos(x²), a computed residual that saving nothing would recompute from x.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let inner =
-            rematerialize(|input: TestTracer| Ok((input.clone() * input).sin()?)).with_policy(EverythingSavable);
+        let inner = rematerialize(|input: TestTracer| (input.clone() * input).sin()).with_policy(EverythingSavable);
         let (_, inner_program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input: TestTracer| inner.call(input),
             scalar_type.clone(),
@@ -2956,7 +2955,7 @@ mod tests {
         // The staged gradient of `sin(x²)` keeps the differentiated call that recomputes `cos(x²)`, and so does
         // differentiating that gradient in forward mode (i.e., forward over reverse Hessian-vector products) and in
         // reverse mode (i.e., the gradient of the gradient), as well as the gradient of its forward mode derivative.
-        let function = rematerialize(|x: TestTracer| Ok((x.clone() * x).sin()?));
+        let function = rematerialize(|x: TestTracer| (x.clone() * x).sin());
         let (_, gradient) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |x: TestTracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayType::scalar(DataType::F64),

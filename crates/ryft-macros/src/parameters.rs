@@ -103,8 +103,8 @@ impl ParameterizedCodeGenerator {
     /// As an example, the generated code typically looks something like this:
     ///
     /// ```ignore
+    /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications, clippy::redundant_field_names)]
     /// #[doc(hidden)]
-    /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
     /// const _: () = {
     ///     #[automatically_derived]
     ///     impl<__P: ryft::Parameter> ryft::ParameterizedFamily<__P> for CustomType<ryft::Placeholder> {

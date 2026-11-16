@@ -943,15 +943,17 @@ where
         // it), and the lifted operation inserts start index `0` at that axis so each batch item updates its own block.
         check_count!("input", inputs, 2, ProgramError);
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
         let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
-        Ok(UpdateSliceOperation::new(start_indices)
-            .interpret_with_batch_axes(context, &[input, update], &[BatchAxis::from_position(batch_axis)])?
-            .into())
+        UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
+            context,
+            &[input, update],
+            &[BatchAxis::from_position(batch_axis)],
+        )
     }
 }
 
@@ -1877,7 +1879,7 @@ where
         }
 
         let Some(batch_axis) = batch_axes[0] else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
 
         if self.sizes().is_empty() {
@@ -3492,7 +3494,7 @@ where
         }
 
         let Some(batch_axis) = batch_axes[..2].iter().copied().flatten().next() else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
 
         if inputs.len() == 2 {
@@ -6579,7 +6581,7 @@ mod tests {
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(
             DynamicSliceOperation::new(vec![2])
-                .batch(&context, &EmptyRegionDriver, &[input.clone()])
+                .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
                 .unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
@@ -6596,7 +6598,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         let operation = DynamicSliceOperation::new(vec![]);
         let scalars = ArrayBatch::new(Array::vector(vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[scalars.clone()]).unwrap();
+        let outputs = operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&scalars)).unwrap();
         assert_eq!(outputs, vec![scalars]);
 
         // An empty size list cannot turn a per-item vector into a scalar identity operation.
@@ -8302,7 +8304,7 @@ mod tests {
             Ok(ArrayIrValue::Array(Array::vector(Vec::<i32>::new()).unwrap())),
         );
         assert!(matches!(
-            input.dynamic_slice_with_dimensions(&[end], &[size.clone()], &[1]),
+            input.dynamic_slice_with_dimensions(&[end], std::slice::from_ref(&size), &[1]),
             Err(ProgramError::InvalidArgument { message })
                 if message == format!("`{DYNAMIC_SLICE_OPERATION_NAME}` limit 6 exceeds input axis 0 extent 4"),
         ));
@@ -9450,7 +9452,7 @@ mod tests {
         // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
         // are covered by the reference-discharge macro tests.
         let expected = DynamicUpdateSliceOperation::new();
-        let operation = ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(expected.clone()));
+        let operation = ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(expected));
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
         let inputs = [
@@ -9792,7 +9794,7 @@ mod tests {
             |input, update| {
                 let start = index_constant(&input, 1);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
+                (updated.clone() * updated).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             with = Array::vector(vec![7.0, 8.0]).unwrap(),
@@ -9803,7 +9805,7 @@ mod tests {
             |update, input| {
                 let start = index_constant(&input, 1);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
+                (updated.clone() * updated).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![7.0, 8.0]).unwrap(),
             with = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
@@ -9814,7 +9816,7 @@ mod tests {
             |input, update| {
                 let start = index_constant(&input, 9);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
+                (updated.clone() * updated).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             with = Array::vector(vec![7.0, 8.0]).unwrap(),
@@ -9840,7 +9842,7 @@ mod tests {
             |input, update| {
                 let start = index_constant(&input, -1);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
+                (updated.clone() * updated).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             with = Array::vector(vec![7.0, 8.0]).unwrap(),
@@ -9851,7 +9853,7 @@ mod tests {
             |update, input| {
                 let start = index_constant(&input, 9);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
+                (updated.clone() * updated).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![7.0, 8.0]).unwrap(),
             with = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
@@ -10608,11 +10610,19 @@ mod tests {
             Ok(output.clone()),
         );
         assert_eq!(
-            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[replicated_index.clone()]),
+            infer_dynamic_slice_output_type(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                output.clone(),
+                std::slice::from_ref(&replicated_index)
+            ),
             Ok(output.clone()),
         );
         assert_eq!(
-            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[varying_index.clone()]),
+            infer_dynamic_slice_output_type(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                output.clone(),
+                std::slice::from_ref(&varying_index)
+            ),
             Err(TypeError::invalid(
                 "`dynamic_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
                  that lack an axis, as `align_manual_variation` does",
@@ -10627,7 +10637,7 @@ mod tests {
             infer_dynamic_slice_output_type(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 sharded_output.clone(),
-                &[replicated_index.clone()]
+                std::slice::from_ref(&replicated_index)
             ),
             Ok(sharded_output.clone()),
         );
@@ -10635,7 +10645,7 @@ mod tests {
             infer_dynamic_slice_output_type(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 sharded_output.clone(),
-                &[varying_index.clone()]
+                std::slice::from_ref(&varying_index)
             ),
             Err(TypeError::invalid(
                 "`dynamic_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
@@ -10650,7 +10660,11 @@ mod tests {
             Err(TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must use the same mesh"))
                 .into());
         assert_eq!(
-            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, sharded_output, &[other_index.clone()]),
+            infer_dynamic_slice_output_type(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                sharded_output,
+                std::slice::from_ref(&other_index)
+            ),
             same_mesh_error,
         );
         assert_eq!(

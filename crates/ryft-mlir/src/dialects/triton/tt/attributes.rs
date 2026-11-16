@@ -34,6 +34,7 @@ macro_rules! tt_enum_attribute {
             }
 
             /// Parses the MLIR spelling of this enum value.
+            #[allow(clippy::should_implement_trait)]
             pub fn from_str(value: &str) -> Option<Self> {
                 match value {
                     $($value => Some(Self::$variant),)+

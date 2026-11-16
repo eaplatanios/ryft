@@ -1801,13 +1801,13 @@ where
 
     #[inline]
     fn slice(&self, input: &C::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<C::Value, ProgramError> {
-        self.context.bind_array(SliceOperation::new(starts, limits), &[input.clone()])
+        self.context.bind_array(SliceOperation::new(starts, limits), std::slice::from_ref(input))
     }
 
     #[inline]
     fn reshape(&self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
         let input_shape = self.array_type(input)?.shape().clone();
-        self.context.bind_array(ReshapeOperation::new(input_shape, shape), &[input.clone()])
+        self.context.bind_array(ReshapeOperation::new(input_shape, shape), std::slice::from_ref(input))
     }
 
     fn dynamic_index(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
@@ -2502,6 +2502,8 @@ mod tests {
         assert_eq!(root, alias);
         assert_ne!(root, separate);
         assert_ne!(root, view);
+        // References hash and compare by allocation identity and static path, not by the allocation's mutable state.
+        #[allow(clippy::mutable_key_type)]
         let references = HashMap::from([(root.clone(), "root"), (view.clone(), "view")]);
         assert_eq!(references.get(&alias), Some(&"root"));
         assert_eq!(references.get(&view), Some(&"view"));
@@ -3427,7 +3429,12 @@ mod tests {
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         assert_eq!(
-            ArrayReferenceDischarge::apply_transforms(&context, &alias, &[transform.clone()], &[index.clone()]),
+            ArrayReferenceDischarge::apply_transforms(
+                &context,
+                &alias,
+                std::slice::from_ref(&transform),
+                std::slice::from_ref(&index)
+            ),
             Ok(alias.with_bound_transform(transform, vec![index])),
         );
     }

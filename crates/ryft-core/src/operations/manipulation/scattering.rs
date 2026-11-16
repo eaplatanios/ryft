@@ -950,7 +950,7 @@ impl ScatterOperation {
         // Duplicate overwrites reconstruct the primal from the same winners as the tangent. Do not stage an independent
         // data scatter first as its unspecified winners need not agree and its result would be discarded.
         if !empty && self.kind() == ScatterReductionKind::Overwrite && !self.unique_indices() {
-            return linearize_overwrite(&self, context, inputs, [input_tangent, updates_tangent], primal_to_tangent);
+            return linearize_overwrite(self, context, inputs, [input_tangent, updates_tangent], primal_to_tangent);
         }
 
         let primal = input.scatter(indices, updates, self.dimensions(), self.kind(), self.options())?;
@@ -965,9 +965,9 @@ impl ScatterOperation {
                 self.options(),
             )?
         } else if self.kind() == ScatterReductionKind::Mul {
-            linearize_multiplication(&self, inputs, tangents, primal_to_tangent)?
+            linearize_multiplication(self, inputs, tangents, primal_to_tangent)?
         } else {
-            linearize_extremum(&self, inputs, &primal, [input_tangent, updates_tangent], primal_to_tangent)?
+            linearize_extremum(self, inputs, &primal, [input_tangent, updates_tangent], primal_to_tangent)?
         };
 
         Ok((primal, tangent))
@@ -1076,7 +1076,7 @@ where
         check_count!("input", inputs, 3, ProgramError);
 
         if inputs.iter().all(|input| input.batch_axis_position().is_none()) {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?);
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         }
 
         let axis_dimension = P::axis_dimension(context)?;
@@ -1146,9 +1146,7 @@ where
                     .transpose()?,
             );
 
-        Ok(operation
-            .interpret_with_batch_axes(context, &[input, indices, updates], &[BatchAxis::from_position(0)])?
-            .into())
+        operation.interpret_with_batch_axes(context, &[input, indices, updates], &[BatchAxis::from_position(0)])
     }
 }
 
@@ -1464,6 +1462,10 @@ where
 /// Multiplication also permits unreduced input contributions when the updates are reduced over those axes: applying the
 /// same factors to each contribution commutes with their pending sum. Other nonlinear updates do not support unreduced
 /// inputs. Indices must be replicated and invariant whenever the data carries reduction state.
+///
+/// Each static update window must fit its input window axis: it is at most the static extent of that axis or the
+/// guaranteed minimum extent of a dynamic one, so that the window fits every runtime extent the input admits. Inserted
+/// axes take one-element windows and, like batching axes, may be empty.
 ///
 /// Negative starts are out of bounds and do not wrap from an axis end. [`ScatterMode::Clip`] mode moves the entire
 /// update window inside the input. [`ScatterMode::Drop`] mode discards a whole invalid window. Empty inputs remain
@@ -1792,21 +1794,38 @@ impl Scatter for ArrayType {
         }
 
         // Perform window-size checks. The input window axes (i.e., input axes that are neither inserted nor batching,
-        // in order) pair 1:1 with the sorted update window axes and each update window extent must fit within the input
-        // window extent.
+        // in order) pair 1:1 with the sorted update window axes. Like gather slice sizes, each static update window must
+        // fit every runtime extent of its input window axis, which for a dynamic axis is its guaranteed minimum extent.
+        // A dynamic update window has no static size to compare. Inserted axes are not checked because an empty input
+        // axis has no elements to update, and that is how indexed updates of possibly empty arrays are expressed.
         let input_window_axes = (0..input_rank)
             .filter(|axis| !inserted.contains(axis) && !input_batching.contains(axis))
             .collect::<Vec<_>>();
         for (&input_axis, &update_axis) in input_window_axes.iter().zip(dimensions.update_window_dimensions()) {
-            if let (Dimension::Static(update_extent), Dimension::Static(input_extent)) =
-                (updates.dimension(update_axis), input.dimension(input_axis))
-                && update_extent > input_extent
-            {
-                return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` update window axis {update_axis} extent {update_extent} exceeds \
-                     the input window axis {input_axis} extent {input_extent}"
-                ))
-                .into());
+            let Dimension::Static(update_extent) = updates.dimension(update_axis) else {
+                continue;
+            };
+            match input.dimension(input_axis) {
+                Dimension::Static(input_extent) if update_extent > input_extent => {
+                    return Err(TypeError::invalid(format!(
+                        "`{SCATTER_OPERATION_NAME}` update window axis {update_axis} extent {update_extent} exceeds \
+                         the input window axis {input_axis} extent {input_extent}"
+                    ))
+                    .into());
+                }
+                Dimension::Dynamic(variable) if update_extent > variable.bounds().lower() => {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` update window axis {} extent {} exceeds the guaranteed minimum extent {} of dynamic \
+                         input window axis {}",
+                        SCATTER_OPERATION_NAME,
+                        update_axis,
+                        update_extent,
+                        variable.bounds().lower(),
+                        input_axis,
+                    ))
+                    .into());
+                }
+                _ => {}
             }
         }
 
@@ -2921,6 +2940,85 @@ mod tests {
                 "`{SCATTER_OPERATION_NAME}` updates scatter axis 0 must match indices batch axis 0 in extent",
             ))
             .into()),
+        );
+    }
+
+    #[test]
+    fn test_scatter_type_inference_dynamic_window_extents() {
+        // A static update window must fit the guaranteed minimum extent of a dynamic input window axis in every mode,
+        // like a gather slice size, so that it fits every runtime extent of that axis.
+        let rows = Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(2, Some(6)).unwrap()));
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone()]));
+        let indices = ArrayType::new_static(DataType::I32, [2, 1]);
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![], vec![0]), ScatterReductionKind::Add);
+        for mode in [ScatterMode::PromiseInBounds, ScatterMode::Clip, ScatterMode::Drop] {
+            check_operation_type_inference!(
+                operation = operation.clone().with_mode(mode),
+                cases = [
+                    {
+                        input_types = [input.clone(), indices.clone(), ArrayType::new_static(DataType::F32, [2, 2])],
+                        output_types = [input.clone()],
+                    },
+                    {
+                        input_types = [input.clone(), indices.clone(), ArrayType::new_static(DataType::F32, [2, 3])],
+                        error = format!(
+                            "`{SCATTER_OPERATION_NAME}` update window axis 1 extent 3 exceeds the guaranteed minimum \
+                             extent 2 of dynamic input window axis 0",
+                        ),
+                    },
+                ],
+            );
+        }
+
+        // A possibly empty window axis admits no static window, not even one element, whereas a dynamic update window
+        // with the identity of the input axis always fits it.
+        let empty = Dimension::Dynamic(DimensionVariable::new("empty", DimensionBounds::new(0, Some(6)).unwrap()));
+        let possibly_empty_input = ArrayType::new(DataType::F32, Shape::new(vec![empty.clone()]));
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [
+                        possibly_empty_input.clone(),
+                        indices.clone(),
+                        ArrayType::new_static(DataType::F32, [2, 0]),
+                    ],
+                    output_types = [possibly_empty_input.clone()],
+                },
+                {
+                    input_types = [
+                        possibly_empty_input.clone(),
+                        indices.clone(),
+                        ArrayType::new_static(DataType::F32, [2, 1]),
+                    ],
+                    error = format!(
+                        "`{SCATTER_OPERATION_NAME}` update window axis 1 extent 1 exceeds the guaranteed minimum \
+                         extent 0 of dynamic input window axis 0",
+                    ),
+                },
+                {
+                    input_types = [
+                        possibly_empty_input.clone(),
+                        indices.clone(),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), empty])),
+                    ],
+                    output_types = [possibly_empty_input.clone()],
+                },
+            ],
+        );
+
+        // Inserted axes take one-element windows but are not checked, so indexed updates of possibly empty arrays
+        // remain valid.
+        check_operation_type_inference!(
+            operation = ScatterOperation::new(
+                ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                ScatterReductionKind::Add,
+            ),
+            cases = [{
+                input_types = [possibly_empty_input.clone(), indices, ArrayType::new_static(DataType::F32, [2])],
+                output_types = [possibly_empty_input],
+            }],
         );
     }
 

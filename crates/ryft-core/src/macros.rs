@@ -5773,9 +5773,7 @@ pub mod checks {
 
         // Compare the fused JVP with the central difference (f(x + h*v) - f(x - h*v)) / (2*h). The separated path has
         // already been checked against the same expected tangent values above.
-        for ((actual, plus), minus) in
-            actual_tangents.iter().zip(plus_outputs.into_iter()).zip(minus_outputs.into_iter())
-        {
+        for ((actual, plus), minus) in actual_tangents.iter().zip(plus_outputs).zip(minus_outputs) {
             let estimate = (plus - minus) * (1.0 / (2.0 * step));
             approx::assert_abs_diff_eq!(actual, &estimate, epsilon = epsilon);
         }
@@ -7435,7 +7433,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            operation.discharge_references(&context, &EmptyRegionDriver, &[reference.clone()]),
+            operation.discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&reference)),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge expected a value input 0 of `test_unary` but received {reference}",
             ))),
@@ -7568,7 +7566,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(
@@ -7579,7 +7577,7 @@ mod tests {
             DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32).unwrap())
@@ -7589,7 +7587,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(5.0f32).unwrap())
@@ -7602,7 +7600,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(
@@ -7613,7 +7611,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-5.0f32).unwrap())
@@ -7975,10 +7973,7 @@ mod tests {
         let inputs: [PartialValue<Tracer<TracingContext<Array, TestNullaryOperation<ArrayType>>>>; 0] = [];
         let outputs =
             [MaybeZero::Zero(ArrayType::scalar(DataType::F64)), MaybeZero::Zero(ArrayType::scalar(DataType::F64))];
-        let result = <TestNullaryOperation<ArrayType> as TransposableOperation<
-            Array,
-            TestNullaryOperation<ArrayType>,
-        >>::transpose(
+        <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(
             &operation,
             &mut TranspositionContext::new(context.clone()),
             &EmptyRegionDriver,
@@ -7987,7 +7982,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(result, ());
+        assert_eq!((), ());
         let input = context.input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(

@@ -838,11 +838,11 @@ where
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(carrier, Vec::new(), packed_inputs.as_slice())?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| P::batch(output, axis))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -1522,6 +1522,8 @@ mod tests {
         let other_boundary =
             ArrayCompositeTranspose::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type]);
         assert_ne!(carrier, other_boundary);
+        // Composite transpositions hash and compare by their rule definitions' immutable IDs, not mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let map = HashMap::from([(carrier.clone(), "carrier")]);
         assert_eq!(map.get(&twin), Some(&"carrier"));
         assert_eq!(map.get(&other_boundary), None);
@@ -1616,6 +1618,8 @@ mod tests {
         assert_ne!(carrier, source);
         let attached = ArrayCompositeTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type]);
         assert_ne!(carrier, attached);
+        // Composite transpositions hash and compare by their rule definitions' immutable IDs, not mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let map = HashMap::from([(carrier.clone(), "retained"), (attached.clone(), "attached")]);
         assert_eq!(map.get(&same), Some(&"retained"));
         assert_eq!(map.get(&attached), Some(&"attached"));
@@ -2530,8 +2534,7 @@ mod tests {
                         let Some(buffer) = accumulators[0].reference(context)? else {
                             return Err(ProgramError::InvalidArgument {
                                 message: "expected a caller buffer".to_string(),
-                            }
-                            .into());
+                            });
                         };
                         let operation =
                             ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Slice {

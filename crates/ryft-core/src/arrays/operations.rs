@@ -19,23 +19,24 @@ use crate::operations::{
     DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, Dropout,
     DropoutOperation, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
-    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation,
-    ExpOperation, ExponentialOperations, ExtremaOperations, FillLikeOperation, FloorOperation, GatherOperation,
-    GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
-    Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations,
-    MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
-    OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelBroadcastOperation,
-    ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
-    ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
-    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation,
-    SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub,
-    SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
-    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Einsum, Erf, ErfOperation,
+    ExpM1Operation, ExpOperation, ExponentialOperations, ExtremaOperations, FillLikeOperation, FloorOperation,
+    GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation, LiftedCustomRules,
+    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation,
+    ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
+    OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
+    ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
+    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
+    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation,
+    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
+    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, SaturatingSub,
+    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation,
+    ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
+    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
+    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
+    WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
 
@@ -200,6 +201,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Cumulative<T>
     + Sort<T>
     + DotOperations<T>
+    + Einsum<T>
     + CollectiveOperations<T>
     + Compare<Self, T>
     + Select<T>
@@ -233,6 +235,7 @@ impl<
         + Cumulative<T>
         + Sort<T>
         + DotOperations<T>
+        + Einsum<T>
         + CollectiveOperations<T>
         + Compare<V, T>
         + Select<T>
@@ -822,6 +825,8 @@ mod tests {
         let same_sum = ArrayOperation::<Array>::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum));
         assert_eq!(sum, same_sum);
         assert_eq!(hash_of(&sum), hash_of(&same_sum));
+        // Composite operations hash and compare by their rule definitions' immutable IDs, not their mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let operations = HashMap::from([(sum.clone(), "sum")]);
         assert_eq!(operations.get(&same_sum), Some(&"sum"));
         assert_eq!(operations.get(&add), None);
@@ -1091,6 +1096,8 @@ mod tests {
         assert_eq!(constant(f64::NAN), constant(f64::NAN));
         assert_eq!(hash_of(&constant(f64::NAN)), hash_of(&constant(f64::NAN)));
         assert_ne!(constant(-0.0), constant(0.0));
+        // Composite operations hash and compare by their rule definitions' immutable IDs, not their mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let operations = HashMap::from([(add, "array"), (dimension_add, "dimension"), (condition, "condition")]);
         assert_eq!(operations.get(&same_add), Some(&"array"));
         assert_eq!(operations.get(&same_dimension_add), Some(&"dimension"));
@@ -1430,7 +1437,7 @@ mod tests {
             ),
             CustomCall => (
                 ArrayIrOperation::CustomCall(
-                    CustomCallOperation::new("ryft.test.identity", vec![scalar_type.clone()]).into(),
+                    CustomCallOperation::new("ryft.test.identity", vec![scalar_type.clone()]),
                 ),
                 DimensionMixed,
             ),
@@ -1571,7 +1578,7 @@ mod tests {
         );
         let interfaces = [interface.clone(), interface];
         let payload = ConditionOperation::<ArrayIrType>::new();
-        let operation = ArrayIrOperation::<Array>::Condition(payload.clone());
+        let operation = ArrayIrOperation::<Array>::Condition(payload);
 
         assert_eq!(operation.region_slots(), payload.region_slots());
         assert_eq!(operation.infer_output_types(&input_types, &interfaces), Ok(vec![array.clone()]));
@@ -2735,7 +2742,7 @@ mod tests {
             ArrayIrOperation::Condition(_),
         ));
         let while_operation = WhileOperation::new().with_iteration_bound(7).unwrap();
-        let promoted_while = ArrayIrOperation::<Array>::from(ArrayOperation::While(while_operation.clone()));
+        let promoted_while = ArrayIrOperation::<Array>::from(ArrayOperation::While(while_operation));
         assert!(matches!(
             promoted_while,
             ArrayIrOperation::While(operation)

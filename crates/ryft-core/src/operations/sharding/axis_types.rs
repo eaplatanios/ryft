@@ -43,7 +43,7 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayMemberType, LogicalMesh, MeshAxisType, Sharding, ShardingError};
+use crate::arrays::{ArrayMemberType, ArrayType, LogicalMesh, MeshAxisType, Sharding, ShardingError};
 use crate::axes::MeshContext;
 use crate::operations::sharding::reshard::Reshard;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
@@ -263,17 +263,7 @@ where
         .map(|(input_index, input)| {
             let target = match input.r#type().as_array_type().map_err(ProgramError::from)?.sharding() {
                 None => None,
-                Some(sharding) => {
-                    if let Some(axis_name) = sharding
-                        .unreduced_axes()
-                        .iter()
-                        .chain(sharding.reduced_axes())
-                        .find(|axis_name| switch.axis_names.contains(*axis_name))
-                    {
-                        return Err(AxisTypesError::InputReductionState { input_index, axis_name: axis_name.clone() });
-                    }
-                    Some(reshard_target(sharding, &switch.switched_mesh)?)
-                }
+                Some(sharding) => Some(switch.auto_input_reshard_target(input_index, sharding)?),
             };
             match target {
                 None => Ok(input),
@@ -423,6 +413,38 @@ where
     Ok(Output::from_parameters(structure, outputs)?)
 }
 
+/// Returns the shardings that [`auto_axes`] reshards inputs of the types `input_types` to when it switches `axes` over
+/// the mesh of `output_sharding`, with [`None`] for every input without a sharding, which passes through unchanged.
+/// `axes` must name an axis that is not auto already, so that the switch takes place. An operation that runs its steps
+/// inside such a switch uses this to infer the types that its staged steps have.
+///
+/// # Errors
+///
+/// Returns the errors that [`auto_axes`] reports for its axes and its inputs.
+pub(crate) fn auto_axes_input_shardings(
+    input_types: &[ArrayType],
+    axes: &[&str],
+    output_sharding: &Sharding,
+) -> Result<Vec<Option<Sharding>>, AxisTypesError> {
+    let switch = AxisTypeSwitch::new(std::iter::once(output_sharding), || None, Some(axes), MeshAxisType::Auto)?;
+    input_types
+        .iter()
+        .enumerate()
+        .map(|(input_index, input_type)| match input_type.sharding() {
+            None => Ok(None),
+            Some(sharding) => {
+                switch.validate_mesh(sharding, |expected, actual| AxisTypesError::InputMeshMismatch {
+                    axis_type: MeshAxisType::Auto,
+                    input_index,
+                    expected,
+                    actual,
+                })?;
+                Ok(Some(switch.auto_input_reshard_target(input_index, sharding)?))
+            }
+        })
+        .collect()
+}
+
 /// Mesh axis type switch of [`auto_axes`] or [`explicit_axes`].
 struct AxisTypeSwitch {
     /// Mesh of the shardings that the switch is given, over which the values outside of the switch are typed.
@@ -488,6 +510,21 @@ impl AxisTypeSwitch {
         } else {
             Err(mismatch(self.mesh.clone(), sharding.mesh().clone()))
         }
+    }
+
+    /// Returns the sharding that [`auto_axes`] reshards its input at position `input_index` to, which is placed by
+    /// `sharding`. The input loses its placement along the auto axes of the switched mesh. Reduction state along a
+    /// switched axis is rejected, since an auto axis cannot carry reduction state.
+    fn auto_input_reshard_target(&self, input_index: usize, sharding: &Sharding) -> Result<Sharding, AxisTypesError> {
+        if let Some(axis_name) = sharding
+            .unreduced_axes()
+            .iter()
+            .chain(sharding.reduced_axes())
+            .find(|axis_name| self.axis_names.contains(*axis_name))
+        {
+            return Err(AxisTypesError::InputReductionState { input_index, axis_name: axis_name.clone() });
+        }
+        Ok(reshard_target(sharding, &self.switched_mesh)?)
     }
 
     /// Runs `function` with [`Self::mesh`] retyped to [`Self::switched_mesh`] in `context`, the context of the inputs

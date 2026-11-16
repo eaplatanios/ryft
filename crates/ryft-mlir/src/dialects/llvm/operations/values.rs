@@ -101,8 +101,8 @@ mod tests {
                 let op = freeze(input.result(0).unwrap(), i32_type.as_ref(), location).unwrap();
                 assert_eq!(op.operation_name(), "llvm.freeze");
                 assert_eq!(op.value().unwrap(), input.result(0).unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.output_type().unwrap(), i32_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -144,8 +144,8 @@ mod tests {
                 let op = none(token_type.as_ref(), location).unwrap();
                 assert_eq!(op.operation_name(), "llvm.mlir.none");
                 assert_eq!(op.output_type().unwrap(), token_type);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 // Note that token values cannot cross function boundaries (i.e., `func.return` does not have the
                 // `TokenConsumerTrait`), and so the produced token is not returned from the function.
                 block.append_operation(op).unwrap();

@@ -2864,6 +2864,8 @@ mod tests {
         assert_eq!(member, unavailable);
         assert_ne!(member, other);
         assert_eq!(hash_of(&member), hash_of(&unavailable));
+        // Lifted rules hash and compare by the immutable ID of their definition, not its mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let definitions = HashMap::from([(member, 1), (other, 2)]);
         assert_eq!(definitions.get(&unavailable), Some(&1));
         assert_eq!(definitions.len(), 2);

@@ -571,9 +571,12 @@ fn test_operation() {
             operation.validate_region_interfaces(&[]),
             Err(ProgramError::UnsupportedOperation { message: format!("probe {id} region interfaces") }),
         );
-        assert_eq!(operation.infer_region_input_types(&[r#type.clone()], &[]), Ok(vec![Some(vec![r#type.clone()])]));
-        assert_eq!(operation.infer_output_types(&[r#type.clone()], &[]), Ok(vec![r#type.clone()]));
-        assert_eq!(operation.fold(&[r#type.clone()], &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+        assert_eq!(
+            operation.infer_region_input_types(std::slice::from_ref(&r#type), &[]),
+            Ok(vec![Some(vec![r#type.clone()])])
+        );
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&r#type), &[]), Ok(vec![r#type.clone()]));
+        assert_eq!(operation.fold(std::slice::from_ref(&r#type), &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
         assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 2 });
         assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::Local);
         assert_eq!(
@@ -590,7 +593,10 @@ fn test_operation() {
         assert!(operation.defers_reference_discharge());
         assert_eq!(operation.effects().into_owned(), Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)));
         assert_eq!(operation.to_string(), format!("probe [id={id}, indentation=0]"));
-        let pruning = operation.prune_boundary(&[r#type.clone()], &[true], &mut NoRegionLiveness).unwrap().unwrap();
+        let pruning = operation
+            .prune_boundary(std::slice::from_ref(&r#type), &[true], &mut NoRegionLiveness)
+            .unwrap()
+            .unwrap();
         assert_eq!((pruning.kept_inputs, pruning.kept_outputs), (vec![false], vec![true]));
         match (pruning.operation, operation.rename_type_identities(&renaming).unwrap()) {
             (ProbeFamily::Probe(pruned), ProbeFamily::Probe(renamed)) if id == 0 => {
@@ -673,12 +679,12 @@ fn test_operation_member_variants() {
         operation.validate_region_interfaces(&[interface]),
         Err(ProgramError::UnsupportedOperation { message: "probe 2 region interfaces".to_string() }),
     );
-    assert_eq!(operation.infer_output_types(&[array_type.clone()], &[]), Ok(vec![array_type.clone()]));
+    assert_eq!(operation.infer_output_types(std::slice::from_ref(&array_type), &[]), Ok(vec![array_type.clone()]));
     assert_eq!(
-        operation.infer_region_input_types(&[array_type.clone()], &[]),
+        operation.infer_region_input_types(std::slice::from_ref(&array_type), &[]),
         Ok(vec![Some(vec![array_type.clone()])])
     );
-    assert_eq!(operation.fold(&[array_type.clone()], &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+    assert_eq!(operation.fold(std::slice::from_ref(&array_type), &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
     assert!(matches!(
         operation.infer_output_types(&[dimension_type], &[]),
         Err(TypeError::Invalid { message }) if message == "expected array type but got dimension type",
@@ -799,6 +805,7 @@ fn test_operation_crate_path() {
 fn test_operation_discharge_references() {
     /// Family with a native payload, a projected member, and a bare generic extension, each of which discharges
     /// differently.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, Debug, Operation)]
     #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(ArrayType, structural(DimensionType)))]
     #[ryft(dispatch(discharge))]

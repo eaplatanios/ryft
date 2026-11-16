@@ -955,8 +955,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let all_gather_op = all_gather(input, gathering_axes, tensor_sharding, tensor_type, location).unwrap();
-                assert_eq!(all_gather_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(all_gather_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(all_gather_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(all_gather_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(all_gather_op.input().unwrap(), input);
                 assert_eq!(all_gather_op.gathering_axes().unwrap(), gathering_axes);
                 assert_eq!(all_gather_op.out_sharding().unwrap(), tensor_sharding);
@@ -1033,8 +1033,8 @@ mod tests {
                 let all_reduce_op =
                     all_reduce(input, reduction_axes, ReductionOperation::Sum, out_sharding, tensor_type, location)
                         .unwrap();
-                assert_eq!(all_reduce_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(all_reduce_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(all_reduce_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(all_reduce_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(all_reduce_op.input().unwrap(), input);
                 assert_eq!(all_reduce_op.reduction_axes().unwrap(), reduction_axes);
                 assert_eq!(all_reduce_op.reduction_operation().unwrap(), ReductionOperation::Sum);
@@ -1171,8 +1171,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let all_slice_op = all_slice(input, slicing_axes, tensor_sharding, tensor_type, location).unwrap();
-                assert_eq!(all_slice_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(all_slice_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(all_slice_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(all_slice_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(all_slice_op.input().unwrap(), input);
                 assert_eq!(all_slice_op.slicing_axes().unwrap(), slicing_axes);
                 assert_eq!(all_slice_op.out_sharding().unwrap(), tensor_sharding);
@@ -1268,8 +1268,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let all_to_all_op = all_to_all(input, params, output_sharding, tensor_type, location).unwrap();
-                assert_eq!(all_to_all_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(all_to_all_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(all_to_all_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(all_to_all_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(all_to_all_op.input().unwrap(), input);
                 assert_eq!(all_to_all_op.params().unwrap(), params);
                 assert_eq!(all_to_all_op.out_sharding().unwrap(), output_sharding);
@@ -1326,14 +1326,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let collective_permute_op = collective_permute(input, tensor_sharding, tensor_type, location).unwrap();
-                assert_eq!(
-                    collective_permute_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    collective_permute_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(collective_permute_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(collective_permute_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(collective_permute_op.input().unwrap(), input);
                 assert_eq!(collective_permute_op.out_sharding().unwrap(), tensor_sharding);
                 assert_eq!(collective_permute_op.input().unwrap(), input);
@@ -1404,14 +1398,8 @@ mod tests {
                     location,
                 )
                 .unwrap();
-                assert_eq!(
-                    manual_computation_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    manual_computation_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(manual_computation_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(manual_computation_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(manual_computation_op.in_shardings().unwrap(), tensor_sharding_per_value);
                 assert_eq!(manual_computation_op.out_shardings().unwrap(), tensor_sharding_per_value);
                 assert_eq!(manual_computation_op.manual_axes().unwrap(), manual_axes);
@@ -1462,8 +1450,8 @@ mod tests {
             .unwrap()
             .append_operation({
                 let mesh_op = mesh("mesh", mesh_attribute, location).unwrap();
-                assert_eq!(mesh_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(mesh_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(mesh_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(mesh_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 assert_eq!(mesh_op.symbol_name().unwrap().as_str().unwrap(), "mesh");
                 assert_eq!(mesh_op.mesh().unwrap(), mesh_attribute);
                 mesh_op
@@ -1518,8 +1506,8 @@ mod tests {
                     location,
                 )
                 .unwrap();
-                assert_eq!(reduce_scatter_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(reduce_scatter_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(reduce_scatter_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(reduce_scatter_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(reduce_scatter_op.input().unwrap(), input);
                 assert_eq!(reduce_scatter_op.reduce_scatter_axes().unwrap(), reduce_scatter_axes);
                 assert_eq!(reduce_scatter_op.reduction_operation().unwrap(), ReductionOperation::Sum);
@@ -1681,14 +1669,8 @@ mod tests {
                 let input = block.argument(0).unwrap();
                 let replicated_to_unreduced_op =
                     replicated_to_unreduced(input, axes, output_sharding, tensor_type, location).unwrap();
-                assert_eq!(
-                    replicated_to_unreduced_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    replicated_to_unreduced_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(replicated_to_unreduced_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(replicated_to_unreduced_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(replicated_to_unreduced_op.input().unwrap(), input);
                 assert_eq!(replicated_to_unreduced_op.axes().unwrap(), axes);
                 assert_eq!(replicated_to_unreduced_op.out_sharding().unwrap(), output_sharding);
@@ -1751,8 +1733,8 @@ mod tests {
                 let mut region_block = context.block(&[(local_type, location)]);
                 let region_argument = region_block.argument(0).unwrap();
                 let return_op = r#return(&[region_argument], location).unwrap();
-                assert_eq!(return_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(return_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(return_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(return_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 region_block.append_operation(return_op).unwrap();
                 region.append_block(region_block).unwrap();
                 let manual_computation_op = manual_computation(
@@ -1830,14 +1812,8 @@ mod tests {
                 let input = block.argument(0).unwrap();
                 let sharded_to_unreduced_op =
                     sharded_to_unreduced(input, axes, tensor_sharding, tensor_type, location).unwrap();
-                assert_eq!(
-                    sharded_to_unreduced_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    sharded_to_unreduced_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(sharded_to_unreduced_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(sharded_to_unreduced_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(sharded_to_unreduced_op.input().unwrap(), input);
                 assert_eq!(sharded_to_unreduced_op.axes().unwrap(), axes);
                 assert_eq!(sharded_to_unreduced_op.out_sharding().unwrap(), tensor_sharding);
@@ -1896,14 +1872,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let sharding_constraint_op = sharding_constraint(input, tensor_sharding, location).unwrap();
-                assert_eq!(
-                    sharding_constraint_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
-                assert_eq!(
-                    sharding_constraint_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(),
-                    1
-                );
+                assert_eq!(sharding_constraint_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(sharding_constraint_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(sharding_constraint_op.input().unwrap(), input);
                 assert_eq!(sharding_constraint_op.sharding().unwrap(), tensor_sharding);
                 assert_eq!(sharding_constraint_op.input().unwrap(), input);
@@ -1954,8 +1924,8 @@ mod tests {
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
                 let sharding_group_op = sharding_group(input, 7, location).unwrap();
-                assert_eq!(sharding_group_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(sharding_group_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
+                assert_eq!(sharding_group_op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(sharding_group_op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
                 assert_eq!(sharding_group_op.input().unwrap(), input);
                 assert_eq!(sharding_group_op.group_id().unwrap(), 7);
                 block.append_operation(sharding_group_op).unwrap();

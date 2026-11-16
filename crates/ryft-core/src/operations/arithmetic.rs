@@ -4767,7 +4767,7 @@ mod tests {
         let smallest_positive = f64::from_bits(1);
         let outputs = DivOperation::<ArrayType>::new()
             .jvp(
-                &DifferentiationContext::fused(context.clone()),
+                &DifferentiationContext::fused(context),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(Array::scalar(0.0).unwrap(), Array::scalar(smallest_positive).unwrap())
@@ -4922,7 +4922,7 @@ mod tests {
         assert_eq!(
             differentiate_at((Array::scalar(8f64).unwrap(), Array::scalar(2f32).unwrap())).gradient(|inputs| {
                 let (_, denominator_gradient) =
-                    differentiate_at(inputs).gradient(|(numerator, denominator)| Ok(numerator.div(&denominator)?))?;
+                    differentiate_at(inputs).gradient(|(numerator, denominator)| numerator.div(&denominator))?;
                 Ok(denominator_gradient)
             }),
             Ok((Array::scalar(-0.25f64).unwrap(), Array::scalar(2f32).unwrap())),

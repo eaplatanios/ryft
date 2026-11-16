@@ -70,6 +70,7 @@ pub trait AliasOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Alias);
 
 /// Constructs a new detached `llvm.mlir.alias` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn alias<'c, 't: 'c, L: Location<'c, 't>>(
     alias_type: AttributeRef<'c, 't>,
     sym_name: AttributeRef<'c, 't>,
@@ -485,6 +486,7 @@ pub trait GlobalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Global);
 
 /// Constructs a new detached `llvm.mlir.global` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn global<'c, 't: 'c, L: Location<'c, 't>>(
     global_type: AttributeRef<'c, 't>,
     constant: bool,
@@ -645,6 +647,7 @@ pub trait IfuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 mlir_op!(Ifunc);
 
 /// Constructs a new detached `llvm.mlir.ifunc` operation.
+#[allow(clippy::too_many_arguments)]
 pub fn ifunc<'c, 't: 'c, L: Location<'c, 't>>(
     sym_name: AttributeRef<'c, 't>,
     i_func_type: AttributeRef<'c, 't>,
@@ -957,7 +960,7 @@ mod tests {
                 assert_eq!(op.alias_type().unwrap(), context.type_attribute(pointer_type).as_ref());
                 assert_eq!(op.sym_name().unwrap(), context.string_attribute("target_alias").as_ref());
                 assert_eq!(op.linkage().unwrap(), context.llvm_linkage_attribute(Linkage::Internal).unwrap().as_ref());
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 op
             })
             .unwrap();
@@ -1000,9 +1003,9 @@ mod tests {
                 let op = comdat(context.string_attribute("__llvm_comdat").as_ref(), body, location).unwrap();
                 assert_eq!(op.operation_name(), "llvm.comdat");
                 assert_eq!(op.sym_name().unwrap(), context.string_attribute("__llvm_comdat").as_ref());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 op
             })
             .unwrap();
@@ -1088,8 +1091,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(op.operation_name(), "llvm.dso_local_equivalent");
                 assert_eq!(op.output_type().unwrap(), pointer_type);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(

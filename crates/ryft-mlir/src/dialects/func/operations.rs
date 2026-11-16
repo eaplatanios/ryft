@@ -531,7 +531,7 @@ mod tests {
         func(
             "identity",
             FuncAttributes { arguments: vec![r#type.into()], results: vec![r#type.into()], ..Default::default() },
-            vec![block].try_into_with_context(&context)?,
+            vec![block].try_into_with_context(context)?,
             location,
         )
     }
@@ -711,12 +711,16 @@ mod tests {
             )
             .unwrap();
             assert_ne!(op, dummy_op);
+            // The keys hash by the identity of the MLIR object that they refer to, which never changes.
+            #[allow(clippy::mutable_key_type)]
             let mut map = HashMap::new();
             map.insert(&op, "op");
             map.insert(&dummy_op, "dummy_op");
             assert_eq!(map.len(), 2);
             assert_eq!(map.get(&op), Some(&"op"));
             assert_eq!(map.get(&dummy_op), Some(&"dummy_op"));
+            // The keys hash by the identity of the MLIR object that they refer to, which never changes.
+            #[allow(clippy::mutable_key_type)]
             let mut map = HashMap::new();
             let op_ref = op.as_ref().as_ref();
             let dummy_op_ref = dummy_op.as_ref();
@@ -1035,7 +1039,6 @@ mod tests {
                                 context.string_attribute("dummy").as_ref(),
                             )])),
                         }],
-                        ..Default::default()
                     },
                     location,
                 )

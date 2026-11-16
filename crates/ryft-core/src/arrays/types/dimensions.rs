@@ -2041,7 +2041,7 @@ mod tests {
         let wider = DimensionType::new("wider", DimensionBounds::new(0, Some(129)).unwrap());
         assert!(!declared.is_refined_by(&wider));
         assert_eq!(
-            DimensionType::derive_identity_renaming(&[declared.clone()], &[wider]),
+            DimensionType::derive_identity_renaming(std::slice::from_ref(&declared), &[wider]),
             Err(TypeError::invalid(
                 "dimension type dimension<wider ∈ [0, 129)> cannot instantiate declared type \
                  dimension<declared ∈ [1, 65)>",

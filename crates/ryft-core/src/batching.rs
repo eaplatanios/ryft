@@ -2241,7 +2241,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
     ///
     ///   - `operation`: Region-free operation expressed in the projected member operation family.
     ///   - `inputs`: Packed heterogeneous batches corresponding to the operation's inputs.
-    pub fn batch_projected_operation<T: Type, O: Operation<Type = T>>(
+    pub fn batch_projected_operation<T: Type, O>(
         &self,
         operation: &O,
         inputs: &[P::Batch],
@@ -2249,7 +2249,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
     where
         C: ContextProjection<T>,
         P: BatchingPolicyProjection<C, T>,
-        O: BatchableOperation<ProjectedContext<C, T>, P::Projected>,
+        O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,
     {
         if !operation.region_slots().is_empty() {
             return Err(BatchingError::UnsupportedOperation {

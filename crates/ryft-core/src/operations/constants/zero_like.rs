@@ -180,7 +180,7 @@ impl ZeroLike for Array {
             DataType::Token => Err(TypeError::invalid(format!("data type `{data_type}` cannot represent zero")).into()),
             DataType::Zero => Ok(self.clone()),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(Element::zero()?))
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Element::zero())
             }),
         }
     }
@@ -489,7 +489,7 @@ mod tests {
         // batched exemplar, whose type is static too, is again the nullary zero of that type.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
-        let output = batch(|item| Ok(item.zero_like()?), input, BatchAxis::new(1), BatchAxis::new(0), None).unwrap();
+        let output = batch(|item| item.zero_like(), input, BatchAxis::new(1), BatchAxis::new(0), None).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -516,11 +516,11 @@ mod tests {
         // exemplar-based zero through the array member.
         assert_eq!(vector(vec![2.0, 3.0]).zero_like(), Ok(vector(vec![0.0, 0.0])));
         assert_eq!(
-            batch(|item| Ok(item.zero_like()?), vector(vec![2.0, 3.0]), BatchAxis::new(0), BatchAxis::new(0), None,),
+            batch(|item| item.zero_like(), vector(vec![2.0, 3.0]), BatchAxis::new(0), BatchAxis::new(0), None,),
             Ok(vector(vec![0.0, 0.0])),
         );
         assert_eq!(
-            differentiate_at(vector(vec![2.0, 3.0])).jvp(vector(vec![5.0, 7.0]), |x| Ok(x.add(&x.zero_like()?)?)),
+            differentiate_at(vector(vec![2.0, 3.0])).jvp(vector(vec![5.0, 7.0]), |x| x.add(&x.zero_like()?)),
             Ok((vector(vec![2.0, 3.0]), vector(vec![5.0, 7.0]))),
         );
     }

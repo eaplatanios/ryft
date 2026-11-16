@@ -309,8 +309,8 @@ impl Operation for ParallelAllToAllOperation {
         OperationFormatter::new(formatter, indentation, PARALLEL_ALL_TO_ALL_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
-            operation.field("split_axis", format_args!("{:?}", &self.split_axis))?;
-            operation.field("concatenation_axis", format_args!("{:?}", &self.concatenation_axis))?;
+            operation.field("split_axis", format_args!("{:?}", self.split_axis))?;
+            operation.field("concatenation_axis", format_args!("{:?}", self.concatenation_axis))?;
             operation.field("options", format_args!("{:?}", self.options.mode()))?;
             if let Some(axis_index_groups) = self.options.axis_index_groups() {
                 operation.field("axis_index_groups", format_args!("{axis_index_groups:?}"))?;

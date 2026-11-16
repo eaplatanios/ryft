@@ -2206,8 +2206,8 @@ mod tests {
                 let mut block = context.block(&[(input_type, location)]);
                 let input_value = block.argument(0).unwrap();
                 let op = get_dimension_size(input_value, 1, location).unwrap();
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 assert_eq!(op.dimension().unwrap(), 1);
                 let op = block.append_operation(op).unwrap();
@@ -2311,8 +2311,8 @@ mod tests {
                 let input = block.argument(0).unwrap();
                 let op = transpose(input, &[2, 0, 1], location).unwrap();
                 assert_eq!(op.permutation().unwrap(), vec![2, 0, 1]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2359,8 +2359,8 @@ mod tests {
                 let input = block.argument(0).unwrap();
                 let op = reshape(input, &[2, 3], location).unwrap();
                 assert_eq!(op.shape().unwrap(), vec![Size::Static(2), Size::Static(3)]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2505,8 +2505,8 @@ mod tests {
                 let input = block.argument(0).unwrap();
                 let op = broadcast(input, output_type, &[2, 1], location).unwrap();
                 assert_eq!(op.dimensions().unwrap(), vec![2, 1]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2561,8 +2561,8 @@ mod tests {
                 assert_eq!(op.dimensions().unwrap(), vec![2, 1]);
                 assert_eq!(op.known_expanding_dimensions().unwrap(), Some(vec![1]));
                 assert_eq!(op.known_non_expanding_dimensions().unwrap(), Some(vec![0]));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2620,8 +2620,8 @@ mod tests {
                 assert_eq!(op.edge_padding_low().unwrap(), vec![-1, 1]);
                 assert_eq!(op.edge_padding_high().unwrap(), vec![2, 1]);
                 assert_eq!(op.interior_padding().unwrap(), vec![1, 0]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2780,8 +2780,8 @@ mod tests {
                 assert_eq!(op.edge_padding_low().unwrap(), edge_padding_low);
                 assert_eq!(op.edge_padding_high().unwrap(), edge_padding_high);
                 assert_eq!(op.interior_padding().unwrap(), interior_padding);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 5);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -2842,8 +2842,8 @@ mod tests {
                 let input1_value = block.argument(1).unwrap();
                 let op = concatenate(&[input0_value, input1_value], 0, location).unwrap();
                 assert_eq!(op.dimension().unwrap(), 0);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2897,8 +2897,8 @@ mod tests {
                 assert_eq!(op.start_indices().unwrap(), vec![0, 1, 0]);
                 assert_eq!(op.limit_indices().unwrap(), vec![2, 3, 5]);
                 assert_eq!(op.strides().unwrap(), vec![1, 1, 2]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2962,8 +2962,8 @@ mod tests {
                 assert_eq!(op.input().unwrap(), input);
                 assert_eq!(op.start_indices().unwrap(), vec![start_index_0, start_index_1, start_index_2]);
                 assert_eq!(op.slice_sizes().unwrap(), vec![1, 2, 3]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 4);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -3112,8 +3112,8 @@ mod tests {
                 assert_eq!(op.input().unwrap(), input);
                 assert_eq!(op.update().unwrap(), update);
                 assert_eq!(op.start_indices().unwrap(), vec![start_index_0, start_index_1, start_index_2]);
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 5);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 5);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -3247,8 +3247,8 @@ mod tests {
                 assert_eq!(op.dimensions().unwrap(), dimension_numbers);
                 assert_eq!(op.slice_sizes().unwrap(), vec![1, 2, 2]);
                 assert!(!op.indices_are_sorted().unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3332,8 +3332,8 @@ mod tests {
                 assert_eq!(op.slice_sizes().unwrap(), slice_sizes);
                 assert_eq!(op.dimensions().unwrap(), dimensions);
                 assert!(op.indices_are_sorted().unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op_block = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op_block.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3475,7 +3475,7 @@ mod tests {
                     block.argument(1).unwrap(),
                     &[block.argument(2).unwrap()],
                     dimensions,
-                    region.into(),
+                    region,
                     false,
                     false,
                     location,
@@ -3487,8 +3487,8 @@ mod tests {
                 assert_eq!(op.dimensions().unwrap(), dimensions);
                 assert!(!op.indices_are_sorted().unwrap());
                 assert!(!op.unique_indices().unwrap());
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
                 func::func(
@@ -3590,8 +3590,8 @@ mod tests {
                     Some(&[2, 3]),
                     Some(&[2, 3]),
                     Some(&[(0, 1), (0, 0)]),
-                    select_region.into(),
-                    scatter_region.into(),
+                    select_region,
+                    scatter_region,
                     location,
                 )
                 .unwrap();
@@ -3601,8 +3601,8 @@ mod tests {
                 assert_eq!(op.window_dimensions().unwrap(), Some(vec![2, 3]));
                 assert_eq!(op.window_strides().unwrap(), Some(vec![2, 3]));
                 assert_eq!(op.padding().unwrap(), Some(vec![(0, 1), (0, 0)]));
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();

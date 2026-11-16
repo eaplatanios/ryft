@@ -113,8 +113,8 @@ impl OperationCodeGenerator {
     /// looks something like this:
     ///
     /// ```ignore
+    /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications, clippy::redundant_field_names)]
     /// #[doc(hidden)]
-    /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
     /// const _: () = {
     ///     #[automatically_derived]
     ///     impl<V: Value<Type = T>> ::std::fmt::Display for CustomOperation<V> where ... {
