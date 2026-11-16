@@ -3002,10 +3002,11 @@ impl<'o> PathSearch<'o> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Small deterministic pseudorandom number generator (SplitMix64) for the randomized path searches, which need
-/// reproducible choices and no statistical guarantees beyond rough uniformity.
+// TODO(eaplatanios): Why is this separate from the rest of the random number generation machinery in `random.rs`?
+/// Small deterministic pseudorandom number generator for the randomized contraction path searches. It uses
+/// [SplitMix64](https://prng.di.unimi.it/splitmix.c), which advances a 64-bit state by a fixed increment and mixes its
+/// bits to produce each sample. A fixed seed reproduces the same sequence of samples. These searches need reproducible
+/// choices and no statistical guarantees beyond rough uniformity.
 struct RandomGenerator {
     /// State of the generator.
     state: u64,
@@ -3060,9 +3061,9 @@ enum ContractionNode {
     Contraction(Vec<usize>),
 }
 
-/// Best contractions found by [`EinsumPathStrategy::dynamic_programming_path`] for subsets of a given size, ordered
-/// by when each subset was first reached, which decides between equally cheap contractions. A subset is a bitmap
-/// of input positions, and it maps to the labels of its result, its scalar operation count, and the position of the
+/// Best contractions found by [`EinsumPathStrategy::dynamic_programming_path`] for subsets of a given size, ordered by
+/// when each subset was first reached, which decides between equally cheap contractions. A subset is a bitmap of input
+/// positions, and it maps to the labels of its result, its scalar operation count, and the position of the
 /// [`ContractionNode`] at the root of its tree.
 #[derive(Default)]
 struct ContractionTable {
@@ -3092,8 +3093,7 @@ impl ContractionTable {
 }
 
 /// Returns the element type that inputs of the provided types are promoted to, or [`None`] if they all have one
-/// element type and need no promotion. The promotion is the one of the elementwise operations (refer to
-/// [`DataType::promoted`]).
+/// element type and need no promotion. The promotion is the one of the elementwise operations.
 fn promoted_type(input_types: &[ArrayType]) -> Result<Option<DataType>, TypeError> {
     let mut data_types = input_types.iter().map(ArrayType::data_type).collect::<Vec<_>>();
     data_types.dedup();
@@ -3105,17 +3105,17 @@ fn promoted_type(input_types: &[ArrayType]) -> Result<Option<DataType>, TypeErro
         data_types.dedup();
         let data_types = data_types.iter().map(|data_type| format!("`{data_type}`")).collect::<Vec<_>>().join(", ");
         TypeError::invalid(format!(
-            "`{EINSUM_NAME}` inputs have the element types {data_types}, which promote to no common type, so they \
-             require an accumulation type",
+            "`{EINSUM_NAME}` inputs have the element types {data_types}, which promote to no common type, \
+             so they require an accumulation type",
         ))
     })
 }
 
-/// Returns the extent of every label of an einsum whose inputs have the provided labels and types, validating that
-/// each label provably has one extent across the inputs that contain it (refer to [`Dimension::has_equal_extents`]).
-/// An input may have extent one where another has a different extent, in which case its axis is removed before the
-/// two are contracted, but the axes of a label that one input repeats must provably have equal extents, because
-/// their diagonal is taken. The extent of a label is the one of its axes that do not have extent one.
+/// Returns the extent of every label of an einsum whose inputs have the provided labels and types, validating that each
+/// label provably has one extent across the inputs that contain it. An input may have extent one where another has a
+/// different extent, in which case its axis is removed before the two are contracted, but the axes of a label that one
+/// input repeats must provably have equal extents, because their diagonal is taken. The extent of a label is the one of
+/// its axes that do not have extent one.
 fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result<BTreeMap<char, Dimension>, TypeError> {
     let mut extents = BTreeMap::<char, Dimension>::new();
     for (index, (names, input_type)) in input_names.iter().zip(input_types).enumerate() {
@@ -3146,8 +3146,8 @@ fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result
     Ok(extents)
 }
 
-/// Returns `sharding`, which describes axes with the labels `output_names`, in the order of the labels `names`, which
-/// are a permutation of `output_names`.
+/// Returns `sharding`, which describes axes with the labels `output_names`, in the order of the labels `names`,
+/// which are a permutation of `output_names`.
 fn sharding_in_order(sharding: &Sharding, names: &[char], output_names: &[char]) -> Result<Sharding, ProgramError> {
     if names == output_names {
         return Ok(sharding.clone());
@@ -3156,7 +3156,7 @@ fn sharding_in_order(sharding: &Sharding, names: &[char], output_names: &[char])
         .iter()
         .map(|name| output_names.iter().position(|other| other == name).unwrap())
         .collect::<Vec<_>>();
-    Ok(sharding.transpose(permutation)?)
+    sharding.transpose(permutation)
 }
 
 /// Returns how often each label appears in `names`, in the order of their first appearances.
@@ -3171,14 +3171,15 @@ fn count_names(names: &[char]) -> Vec<(char, usize)> {
     counts
 }
 
-/// Returns the symbol with the provided index in the sequence of label symbols of `opt_einsum` (i.e., `a` through
-/// `z`, then `A` through `Z`, and then the Unicode characters from `À` on in the order of their code points), or
-/// [`None`] after the last Unicode character. Every index has its own symbol. The sequence skips the surrogate code
-/// points, which are not characters, where `opt_einsum` produces them for the indices from 55,156 to 55,295. The
-/// symbols from there on therefore have other code points than in `opt_einsum`, but the same order.
+/// Returns the symbol with the provided index in the sequence of label symbols of `opt_einsum` (i.e., `a` through `z`,
+/// then `A` through `Z`, and then the Unicode characters from `À` on in the order of their code points), or [`None`]
+/// after the last Unicode character. Every index has its own symbol. The sequence skips the surrogate code points,
+/// which are not characters, where `opt_einsum` produces them for the indices from 55,156 to 55,295. The symbols
+/// from there on therefore have other code points than in `opt_einsum`, but the same order.
 fn einsum_symbol(index: usize) -> Option<char> {
     const BASE: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const SURROGATES: std::ops::Range<u32> = 0xD800..0xE000;
+
     match BASE.get(index) {
         Some(symbol) => Some(*symbol as char),
         None => {
@@ -3189,12 +3190,11 @@ fn einsum_symbol(index: usize) -> Option<char> {
     }
 }
 
-/// Returns the [`CompositeKey`] of the named composite of an einsum with the provided specification and options.
-/// The attributes encode everything that determines its computation for given input types. Labels are encoded by
-/// their code points and an ellipsis by `-1`, the path strategy by a fixed index followed by its parameters (i.e., a
-/// count, or the positions of every step of an explicit path), the precision by its kind followed by its fields, and
-/// a requested output sharding by the code points of its rendering, which distinguishes every pair of different
-/// shardings.
+/// Returns the [`CompositeKey`] of the named composite of an einsum with the provided specification and options. The
+/// attributes encode everything that determines its computation for given input types. Labels are encoded by their code
+/// points and an ellipsis by `-1`, the path strategy by a fixed index followed by its parameters (i.e., a count, or the
+/// positions of every step of an explicit path), the precision by its kind followed by its fields, and a requested
+/// output sharding by the code points of its rendering, which distinguishes every pair of different shardings.
 fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOptions) -> CompositeKey {
     let integer = |value: usize| CompositeAttribute::Integer(value as i128);
     let subscript = |subscript: &[EinsumLabel]| {
@@ -3258,6 +3258,8 @@ fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOpt
         .with_attribute("precision", CompositeAttribute::Sequence(precision))
         .with_attribute("output_sharding", output_sharding)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
