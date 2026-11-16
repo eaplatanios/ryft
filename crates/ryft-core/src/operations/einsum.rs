@@ -1246,7 +1246,14 @@ where
         let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let plan = specification.plan(&input_types, options)?;
-        invoke_in_scope(ProvenanceScope::new(specification.to_string()), &inputs, || plan.execute(&inputs))
+        // Attribute the staged decomposition to its einsum, like JAX's named call. The scope is purely diagnostic
+        // and is a no-op under an eager context.
+        let scope = ProvenanceScope::new(specification.to_string());
+        let execute = || plan.execute(&inputs);
+        match inputs.first() {
+            Some(input) => input.domain().invoke_with_provenance_scope(scope, execute),
+            None => execute(),
+        }
     }
 }
 
@@ -1375,7 +1382,11 @@ where
         let planned = self.plans.planned(&input_types)?;
         if planned.instruction_count <= 1 {
             // One instruction is cheaper to stage or dispatch directly than through a composite boundary.
-            return invoke_in_scope(planned.scope.clone(), &inputs, || planned.plan.execute(&inputs));
+            let execute = || planned.plan.execute(&inputs);
+            return match inputs.first() {
+                Some(input) => input.domain().invoke_with_provenance_scope(planned.scope.clone(), execute),
+                None => execute(),
+            };
         }
         self.composite.call(inputs)
     }
@@ -1474,21 +1485,6 @@ where
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Invokes `execute`, which executes the plan of an einsum on `inputs`, inside the provided [`ProvenanceScope`],
-/// which is named after the specification of the einsum. The scope is purely diagnostic. It attributes every
-/// instruction that the decomposition stages to its einsum, like the named call that JAX wraps its einsum in, and it
-/// is a no-op under an eager context.
-fn invoke_in_scope<V: Value<Domain: Context>, R, F: FnOnce() -> R>(
-    scope: ProvenanceScope,
-    inputs: &[V],
-    execute: F,
-) -> R {
-    match inputs.first() {
-        Some(input) => input.domain().invoke_with_provenance_scope(scope, execute),
-        None => execute(),
-    }
-}
 
 /// Set of labels of an einsum.
 type LabelSet = BTreeSet<char>;
@@ -1914,12 +1910,20 @@ impl<S> EinsumExecution<'_, S> {
     {
         let repeated = counts.iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).collect::<Vec<_>>();
         for (index, repeated_name) in repeated.iter().enumerate() {
+            // The diagonal of a value with a dynamic extent is a masked sum, which needs a zero of its element
+            // type, so it is taken at a type that has one and converted back.
+            let value_type = self.steps.array_type(&value);
+            let data_type = value_type.data_type();
+            if !is_static(&value_type) {
+                value = self.convert(value, summable_type(data_type))?;
+            }
             loop {
                 let axes = (0..names.len()).filter(|axis| names[*axis] == **repeated_name).collect::<Vec<_>>();
                 let [removed_axis, .., kept_axis] = axes.as_slice() else { break };
                 value = self.steps.diagonal(&value, *kept_axis, *removed_axis)?;
                 names.remove(*removed_axis);
             }
+            value = self.convert(value, data_type)?;
             if !keep_names.contains(repeated_name) {
                 let axis = names.iter().position(|name| name == *repeated_name).unwrap();
                 names.remove(axis);
@@ -1940,7 +1944,7 @@ impl<S> EinsumExecution<'_, S> {
     /// Removes every axis of `value` that provably has extent one while the other input of its step has another
     /// extent for its label, which broadcasts `value` along that label. Static axes are squeezed away. A dynamic
     /// axis whose bounds admit only extent one cannot be removed by a reshape, so the axes are then summed away,
-    /// which keeps their single elements.
+    /// which keeps their single elements. The sum is taken at the [`summable_type`] of the element type.
     fn filter_singleton_axes<V>(
         &self,
         value: V,
@@ -1967,7 +1971,11 @@ impl<S> EinsumExecution<'_, S> {
         let value = if squeezed_axes.iter().all(|axis| value_type.dimension(*axis) == Dimension::Static(1)) {
             self.steps.squeeze(&value, squeezed_axes.clone())?
         } else {
-            self.steps.reduce_sum(&value, &squeezed_axes, None)?
+            // The sum needs a zero of the element type, so it is taken at a type that has one and converted back.
+            let data_type = value_type.data_type();
+            let value = self.convert(value, summable_type(data_type))?;
+            let value = self.steps.reduce_sum(&value, &squeezed_axes, None)?;
+            self.convert(value, data_type)?
         };
         for axis in squeezed_axes.into_iter().rev() {
             names.remove(axis);
@@ -3151,6 +3159,17 @@ fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result
 /// dimension whose bounds admit only that extent does as well.
 fn is_singleton(dimension: &Dimension) -> bool {
     dimension.bounds().extent() == Some(1)
+}
+
+/// Returns the element type at which a sum selects elements of the type `data_type`, which is what the masked sum
+/// of a diagonal and the sum over an axis of extent one do. Such a sum adds its one selected element to zeros, so
+/// it needs a zero of its element type. `f8e8m0fnu` has none, so its values are summed at `f32`, which represents
+/// all of them, and every other type is summed as it is.
+fn summable_type(data_type: DataType) -> DataType {
+    match data_type {
+        DataType::F8E8M0FNU => DataType::F32,
+        data_type => data_type,
+    }
 }
 
 /// Returns `true` if every extent of `type` is static.
