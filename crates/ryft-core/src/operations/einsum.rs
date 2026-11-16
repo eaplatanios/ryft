@@ -550,11 +550,15 @@ pub enum EinsumPathStrategy {
     /// labels. Its cost grows factorially with the number of inputs.
     Optimal,
 
-    /// Finds the pairwise contractions with the fewest scalar operations among the orders that take no outer product
-    /// of connected inputs, by combining the best contractions of ever larger subsets of the inputs. Inputs that share
-    /// no summed label are contracted separately and combined last, and labels that only one input contains are summed
-    /// first with an [`EinsumPathStep::Reduction`]. Its cost grows exponentially with the number of connected inputs.
-    /// This is the `"dp"` strategy of `opt_einsum`.
+    /// Finds, for every group of inputs that summed labels connect, the pairwise contractions with the fewest scalar
+    /// operations among the orders that take no outer product within the group, by combining the best contractions
+    /// of ever larger subsets of its inputs. Labels that only one input contains are summed first with an
+    /// [`EinsumPathStep::Reduction`]. The results of the groups are then combined one after the other from
+    /// the smallest one up, which is a heuristic and can cost more than another order of combining them (e.g.,
+    /// `ab,ab,cd,cd->abcd` with extents of 10 has four groups, and combining them in that order takes 20,100
+    /// scalar operations where multiplying each pair of equally labeled inputs first takes 10,200). Its cost
+    /// grows exponentially with the number of connected inputs. This is the `"dp"` strategy of `opt_einsum`,
+    /// which combines the groups in the same way.
     DynamicProgramming,
 
     /// Explores the provided number of most promising contractions at every step, or all of them without a number, and
@@ -687,9 +691,10 @@ impl EinsumPathStrategy {
         search.best_path
     }
 
-    /// Returns the path with the fewest scalar operations for the `inputs` and `output` of an einsum among the orders
-    /// that take no outer product within a group of connected inputs. This is a port of the `DynamicProgramming`
-    /// optimizer of `opt_einsum` with its default options and without a memory limit:
+    /// Returns a path for the `inputs` and `output` of an einsum that contracts every group of connected inputs with
+    /// the fewest scalar operations among the orders that take no outer product within the group, and that combines
+    /// the results of the groups heuristically. This is a port of the `DynamicProgramming` optimizer of `opt_einsum`
+    /// with its default options and without a memory limit:
     ///
     ///   1. Labels that only one input contains are summed first. An input that keeps no label is finished by that,
     ///      and every other input takes part in the search with its remaining labels.
@@ -697,7 +702,8 @@ impl EinsumPathStrategy {
     ///      contraction of every subset of its inputs is built from the best contractions of two smaller disjoint
     ///      subsets that share a summed label. The search only keeps contractions below a cost cap, which starts
     ///      at the size of the output labels of the group and grows until the whole group is contracted.
-    ///   3. The results of the groups are combined from the smallest one up.
+    ///   3. The results of the groups are combined one after the other from the smallest one up. This order is not
+    ///      searched, so another one can take fewer scalar operations.
     ///
     /// Groups and their members are ordered by input identifier. The search always reaches a feasible cost cap,
     /// including for einsums with an empty input (e.g., `a,b,b->` with an empty first input).
@@ -1519,7 +1525,10 @@ impl EinsumPlan {
     ///   - `inputs`: Inputs of the einsum, in the order of its subscripts.
     ///   - `contraction`: Function that contracts its left-hand side and right-hand side inputs with the provided
     ///     [`DotDimensionNumbers`], whose result must have the axes of [`DotOperation`] in the same order. It also
-    ///     receives the requested output [`Sharding`] when it computes the last contraction and one was requested.
+    ///     receives the requested output [`Sharding`] when it computes the last contraction of a plan that gives the
+    ///     request to its last operation. A plan of more than one step over a mesh with explicit axes runs inside
+    ///     an [`auto_axes`] switch instead (refer to [`EinsumOptions::with_output_sharding`]), so `contraction`
+    ///     then receives no sharding for any of its contractions, and the output is resharded to the request.
     ///
     /// # Errors
     ///
@@ -1613,7 +1622,7 @@ impl EinsumPlan {
     /// Runs the steps of this plan on `inputs` through `steps`, which either computes or stages every step on values
     /// or infers its type. This is a port of the `_einsum` function of JAX, except for repeated labels of inputs
     /// with static extents, whose diagonals are taken with [`Diagonal`].
-    fn run<V: Clone, S: EinsumSteps<V>>(
+    fn run<V: Clone + Typed<Type = ArrayType>, S: EinsumSteps<V>>(
         &self,
         inputs: &[V],
         accumulation_type: Option<DataType>,
@@ -1633,7 +1642,7 @@ impl EinsumPlan {
             .into());
         }
 
-        let input_types = inputs.iter().map(|input| steps.array_type(input)).collect::<Vec<_>>();
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         for (index, (input_type, names)) in input_types.iter().zip(&self.input_labels).enumerate() {
             let rank = input_type.rank();
             if rank != names.len() {
@@ -1707,9 +1716,9 @@ impl EinsumPlan {
 
                     // An axis of extent one is squeezed away when the other input has another extent for its label,
                     // which broadcasts the squeezed input along that label.
-                    let rhs_type = state.steps.array_type(&rhs);
+                    let rhs_type = rhs.r#type().into_owned();
                     let (lhs, lhs_names) = state.filter_singleton_axes(lhs, lhs_names, &rhs_type, &rhs_names)?;
-                    let lhs_type = state.steps.array_type(&lhs);
+                    let lhs_type = lhs.r#type().into_owned();
                     let (rhs, rhs_names) = state.filter_singleton_axes(rhs, rhs_names, &lhs_type, &lhs_names)?;
 
                     // Labels that only one input contains, once, and that the result does not need are summed out of
@@ -2234,17 +2243,23 @@ struct EinsumStep {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Primitive steps of an einsum over values of type `V`, which [`EinsumPlan::run`] is generic over, so that one
-/// implementation of the decomposition both computes or stages values and infers types.
-trait EinsumSteps<V> {
-    /// Returns the type of `value`.
-    fn array_type(&self, value: &V) -> ArrayType;
-
+/// Execution policy for the primitive array steps of [`EinsumPlan::run`]. The shared decomposition owns label
+/// bookkeeping, singleton broadcasting, repeated-label handling, element type conversions, and output ordering.
+/// It runs with [`ValueSteps`] over array values to execute or stage those steps, or with [`TypeSteps`] over
+/// [`ArrayType`] descriptors to infer their outputs and count their primitive instructions without tracing or
+/// computing arrays. Sharing the decomposition keeps execution and inference on the same sequence of steps.
+///
+/// Every operation passes through this policy, including shape changes that are simple capability calls for
+/// [`ValueSteps`], because [`TypeSteps`] must also count the instructions they would stage. [`EinsumComposite`]
+/// uses that count to choose between an inline contraction and a named composite call. [`Self::contract`] also
+/// supports the custom pairwise contraction of [`EinsumPlan::execute_with`]. The carrier's [`Typed`] bound supplies
+/// its array metadata directly; the seven methods below are the operations that the policy interprets.
+trait EinsumSteps<V: Typed<Type = ArrayType>> {
     /// Removes the provided axes of `value`, which have extent one.
     fn squeeze(&self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError>;
 
     /// Sums `value` along the provided axes, optionally requesting an output sharding. The sum of Boolean values is
-    /// their disjunction, like in JAX.
+    /// defined as their disjunction.
     fn reduce_sum(&self, value: &V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>;
 
     /// Returns the diagonal of `value` along `kept_axis` and `removed_axis`, in place of `kept_axis`.
@@ -2294,11 +2309,6 @@ where
     Contraction: FnMut(&V, &V, &DotDimensionNumbers, Option<DataType>, Option<&Sharding>) -> Result<V, ProgramError>,
 {
     #[inline]
-    fn array_type(&self, value: &V) -> ArrayType {
-        value.r#type().into_owned()
-    }
-
-    #[inline]
     fn squeeze(&self, value: &V, axes: Vec<usize>) -> Result<V, ProgramError> {
         value.squeeze(axes)
     }
@@ -2342,7 +2352,7 @@ where
         accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<V, ProgramError> {
-        (self.contraction.borrow_mut())(lhs, rhs, dimensions, accumulation_type, output_sharding)
+        self.contraction.borrow_mut()(lhs, rhs, dimensions, accumulation_type, output_sharding)
     }
 
     #[inline]
@@ -2380,11 +2390,6 @@ impl TypeSteps {
 }
 
 impl EinsumSteps<ArrayType> for TypeSteps {
-    #[inline]
-    fn array_type(&self, value: &ArrayType) -> ArrayType {
-        value.clone()
-    }
-
     fn squeeze(&self, value: &ArrayType, axes: Vec<usize>) -> Result<ArrayType, ProgramError> {
         self.stage(1);
         value.squeeze(axes)
@@ -2508,11 +2513,11 @@ struct EinsumExecution<'s, S> {
 
 impl<S> EinsumExecution<'_, S> {
     /// Converts `value` to `data_type`, unless it already has that element type.
-    fn convert<V>(&self, value: V, data_type: DataType) -> Result<V, ProgramError>
+    fn convert<V: Typed<Type = ArrayType>>(&self, value: V, data_type: DataType) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
     {
-        if self.steps.array_type(&value).data_type() == data_type {
+        if value.r#type().data_type() == data_type {
             Ok(value)
         } else {
             self.steps.convert_element_type(&value, data_type)
@@ -2538,11 +2543,11 @@ impl<S> EinsumExecution<'_, S> {
     /// element type of `value` only when the accumulation type adds nothing to it. Types without a common promotion
     /// (i.e., the 8-bit floating-point types with any other type) are converted as well. The value is converted to
     /// the [`Self::accumulation_representation`] of the accumulation type.
-    fn accumulated<V>(&self, value: V) -> Result<V, ProgramError>
+    fn accumulated<V: Typed<Type = ArrayType>>(&self, value: V) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
     {
-        let data_type = self.steps.array_type(&value).data_type();
+        let data_type = value.r#type().data_type();
         match self.accumulation_type {
             Some(accumulation_type)
                 if data_type != accumulation_type
@@ -2556,7 +2561,12 @@ impl<S> EinsumExecution<'_, S> {
     }
 
     /// Sums `value` along `axes` after converting it like [`Self::accumulated`] does.
-    fn sum<V>(&self, value: V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>
+    fn sum<V: Typed<Type = ArrayType>>(
+        &self,
+        value: V,
+        axes: &[usize],
+        output_sharding: Option<&Sharding>,
+    ) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
     {
@@ -2567,7 +2577,7 @@ impl<S> EinsumExecution<'_, S> {
     /// Sums the labels `uniques`, each of which names one axis of `value`, with a single reduction. With an
     /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the reduction
     /// receives that sharding in the order of its own axes.
-    fn sum_uniques<V>(
+    fn sum_uniques<V: Typed<Type = ArrayType>>(
         &self,
         value: V,
         mut names: Vec<char>,
@@ -2597,7 +2607,7 @@ impl<S> EinsumExecution<'_, S> {
     /// that is kept is converted like the input of a sum. With an
     /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the sum of
     /// the last repeated label receives that sharding in the order of its own axes.
-    fn sum_repeats<V>(
+    fn sum_repeats<V: Typed<Type = ArrayType>>(
         &self,
         mut value: V,
         mut names: Vec<char>,
@@ -2612,7 +2622,7 @@ impl<S> EinsumExecution<'_, S> {
         for (index, repeated_name) in repeated.iter().enumerate() {
             // The diagonal of a value with a dynamic extent is a masked sum, which needs a zero of its element
             // type, so it is taken at a type that has one and converted back.
-            let value_type = self.steps.array_type(&value);
+            let value_type = value.r#type().into_owned();
             let data_type = value_type.data_type();
             if !value_type.shape().dimensions().iter().all(|dimension| dimension.value().is_some()) {
                 value = self.convert(
@@ -2652,7 +2662,7 @@ impl<S> EinsumExecution<'_, S> {
     /// axis whose bounds admit only extent one cannot be removed by a reshape, so the axes are then summed away,
     /// which keeps their single elements. An element type without a zero is converted to `f32` for the sum and
     /// converted back afterwards.
-    fn filter_singleton_axes<V>(
+    fn filter_singleton_axes<V: Typed<Type = ArrayType>>(
         &self,
         value: V,
         mut names: Vec<char>,
@@ -2662,7 +2672,7 @@ impl<S> EinsumExecution<'_, S> {
     where
         S: EinsumSteps<V>,
     {
-        let value_type = self.steps.array_type(&value);
+        let value_type = value.r#type().into_owned();
         let squeezed_axes = (0..names.len())
             .filter(|axis| {
                 value_type.dimension(*axis).bounds().extent() == Some(1)
@@ -2724,7 +2734,7 @@ impl<S> EinsumExecution<'_, S> {
     /// algorithm accumulates at, which keeps the `dot` differentiable, and a complex one is represented by the type
     /// of its components until the output (refer to [`Self::accumulation_representation`]). The algorithm is
     /// validated for the element types of inputs of different element types before they are converted.
-    fn contract<V: Clone>(
+    fn contract<V: Clone + Typed<Type = ArrayType>>(
         &self,
         lhs: &V,
         rhs: &V,
@@ -2737,8 +2747,8 @@ impl<S> EinsumExecution<'_, S> {
         let Some(accumulation_type) = self.accumulation_type else {
             return self.steps.contract(lhs, rhs, dimensions, None, output_sharding);
         };
-        let lhs_type = self.steps.array_type(lhs).data_type();
-        let rhs_type = self.steps.array_type(rhs).data_type();
+        let lhs_type = lhs.r#type().data_type();
+        let rhs_type = rhs.r#type().data_type();
         let is_native_f8_pair = is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type);
         if !matches!(self.precision, DotPrecision::Inputs { .. }) {
             let (lhs, rhs, lhs_type, rhs_type) = if lhs_type == rhs_type || is_native_f8_pair {
@@ -3685,6 +3695,18 @@ mod tests {
         let specification = "d,abcd,abcd,abcd,bc->ab".parse::<EinsumSpecification>().unwrap();
         let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Optimal);
         assert_eq!(path_cost(&specification.plan(&input_types, &options).unwrap()).0, 816);
+
+        // The dynamic programming search is exact within a group of connected inputs only. It combines the results
+        // of the groups from the smallest one up, like `opt_einsum`, which can cost more than another order. The
+        // inputs below share no summed label, so each is its own group.
+        let input_types = vec![ArrayType::new_static(DataType::F32, [10, 10]); 4];
+        let specification = "ab,ab,cd,cd->abcd".parse::<EinsumSpecification>().unwrap();
+        let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::DynamicProgramming);
+        let plan = specification.plan(&input_types, &options).unwrap();
+        assert_eq!(plan.path(), steps(&[(0, 1), (0, 2), (0, 1)]));
+        assert_eq!(path_cost(&plan).0, 20_100);
+        let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(0, 1), (0, 1), (0, 1)]));
+        assert_eq!(path_cost(&specification.plan(&input_types, &options).unwrap()).0, 10_200);
     }
 
     #[test]
@@ -5926,6 +5948,29 @@ mod tests {
                 (DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]), None),
             ],
         );
+
+        // The last contraction receives a requested output sharding when the plan gives the request to its last
+        // operation. A plan of more than one step over a mesh with explicit axes runs inside a switch of those axes
+        // to auto axes instead, so no contraction receives a sharding and the output is resharded to the request.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+        let sharding = sharding.unwrap();
+        let options = EinsumOptions::new().with_output_sharding(sharding.clone());
+        for (subscripts, count, received) in
+            [("ij,jk->ik", 2, vec![Some(sharding.clone())]), ("ij,jk,kl->il", 3, vec![None, None])]
+        {
+            let specification = subscripts.parse::<EinsumSpecification>().unwrap();
+            let plan = specification.plan(&input_types[..count], &options).unwrap();
+            let mut shardings = Vec::new();
+            let output = plan
+                .execute_with(&inputs[..count], |lhs: &Array, rhs: &Array, dimensions, output_sharding| {
+                    shardings.push(output_sharding.cloned());
+                    lhs.dot_with_configuration(rhs, dimensions, DotPrecision::default(), None, output_sharding)
+                })
+                .unwrap();
+            assert_eq!(shardings, received, "{subscripts}");
+            assert_eq!(output.r#type().sharding(), Some(&sharding), "{subscripts}");
+        }
 
         // A contraction that quantizes its inputs first changes the result of every pairwise step. Here each input
         // of a contraction is rounded to `bf16`, whose eight significand bits round `257` to `256`.
