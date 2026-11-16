@@ -43,10 +43,9 @@ use std::sync::{Arc, Mutex};
 
 use ryft_macros::capability;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, MeshAxisType, Sharding};
+use crate::arrays::{Array, ArrayIrType, ArrayType, DataType, Dimension, MeshAxisType, Sharding};
 use crate::axes::MeshContext;
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::operations::Capability;
 use crate::operations::collectives::parallel_vary::{
     ManualVariationAlignment, ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
 };
@@ -67,6 +66,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
 use crate::operations::sharding::axis_types::{auto_axes, auto_axes_input_shardings};
 use crate::operations::sharding::reshard::{Reshard, ReshardOperation};
+use crate::operations::{Capability, Random, RandomAlgorithm};
 use crate::programs::{Operation, ProgramError, ProvenanceScope, TypeError, Typed, Value, ValueProjection};
 use crate::tracing::{DomainTracer, DomainTracingContext};
 
@@ -572,8 +572,10 @@ pub enum EinsumPathStrategy {
     /// Runs [`Self::Greedy`] and then the provided number of repetitions less one of a randomized variant of it,
     /// which perturbs the costs of the candidate contractions and chooses among the best ones at random, and keeps
     /// the path with the fewest scalar operations. This is the `"random-greedy"` strategy of `opt_einsum` with 32
-    /// repetitions and its `"random-greedy-128"` strategy with 128. The paths are deterministic here, while the
-    /// choices of `opt_einsum` differ between processes, so they are not the paths that JAX selects.
+    /// repetitions and its `"random-greedy-128"` strategy with 128. Each randomized trial draws samples through
+    /// [`Random`] using [`RandomAlgorithm::ThreeFry`], with its repetition number as the key and a zero counter.
+    /// The paths are deterministic here, while the choices of `opt_einsum` differ between processes, so they are not
+    /// the paths that JAX selects.
     RandomGreedy(usize),
 
     /// Repeatedly contracts the first two of the remaining inputs and appends their result to the remaining inputs,
@@ -629,21 +631,21 @@ impl EinsumPathStrategy {
                 5..=6 => Self::branch_ssa_path(inputs, output, sizes, None),
                 7..=8 => Self::branch_ssa_path(inputs, output, sizes, Some(2)),
                 9..=14 => Self::branch_ssa_path(inputs, output, sizes, Some(1)),
-                _ => Self::greedy_ssa_path(inputs, output, sizes),
+                _ => Self::greedy_ssa_path(inputs, output, sizes)?,
             })),
             Self::AutoHighQuality => match input_count {
                 ..=5 => pairwise(Self::ssa_to_linear(&Self::optimal_ssa_path(inputs, output, sizes))),
                 6..=16 => Self::dynamic_programming_path(inputs, output, sizes)?,
-                _ => pairwise(Self::ssa_to_linear(&Self::random_greedy_ssa_path(inputs, output, sizes, 128))),
+                _ => pairwise(Self::ssa_to_linear(&Self::random_greedy_ssa_path(inputs, output, sizes, 128)?)),
             },
             Self::Optimal => pairwise(Self::ssa_to_linear(&Self::optimal_ssa_path(inputs, output, sizes))),
             Self::DynamicProgramming => Self::dynamic_programming_path(inputs, output, sizes)?,
             Self::Branch(branch_count) => {
                 pairwise(Self::ssa_to_linear(&Self::branch_ssa_path(inputs, output, sizes, *branch_count)))
             }
-            Self::Greedy => pairwise(Self::ssa_to_linear(&Self::greedy_ssa_path(inputs, output, sizes))),
+            Self::Greedy => pairwise(Self::ssa_to_linear(&Self::greedy_ssa_path(inputs, output, sizes)?)),
             Self::RandomGreedy(repetitions) => {
-                pairwise(Self::ssa_to_linear(&Self::random_greedy_ssa_path(inputs, output, sizes, *repetitions)))
+                pairwise(Self::ssa_to_linear(&Self::random_greedy_ssa_path(inputs, output, sizes, *repetitions)?))
             }
             Self::Unoptimized => pairwise(vec![(0, 1); input_count - 1]),
             Self::Explicit(path) => {
@@ -937,7 +939,7 @@ impl EinsumPathStrategy {
         inputs: &[BTreeSet<char>],
         output: &BTreeSet<char>,
         sizes: &BTreeMap<char, u128>,
-    ) -> Vec<(usize, usize)> {
+    ) -> Result<Vec<(usize, usize)>, ProgramError> {
         Self::noisy_greedy_ssa_path(inputs, output, sizes, None)
     }
 
@@ -945,15 +947,27 @@ impl EinsumPathStrategy {
     /// trials of the `RandomGreedy` optimizer of `opt_einsum` are. With `noise`, every candidate cost is perturbed by
     /// a factor drawn from a normal distribution around one, every candidate is kept rather than the best one of each
     /// input, and each contraction is chosen among the eight best candidates with Boltzmann weights of their costs.
+    /// Samples are drawn in batches through the eager [`Random`] capability of the generator state `noise`.
     fn noisy_greedy_ssa_path(
         inputs: &[BTreeSet<char>],
         output: &BTreeSet<char>,
         sizes: &BTreeMap<char, u128>,
-        mut noise: Option<&mut RandomGenerator>,
-    ) -> Vec<(usize, usize)> {
+        mut noise: Option<&mut Array>,
+    ) -> Result<Vec<(usize, usize)>, ProgramError> {
         /// Candidate contraction of two remaining inputs, ordered by its cost and then by the identifiers
         /// of its inputs, which makes the order of the candidates total.
         type Candidate = (i128, usize, usize, BTreeSet<char>, BTreeSet<char>, BTreeSet<char>);
+
+        // Each chosen candidate removes at least one input, so this batch covers every weighted choice in the trial.
+        let mut selection_samples = match noise.as_deref_mut() {
+            Some(state) => {
+                let sample_type = ArrayType::new_static(DataType::F64, [inputs.len().saturating_sub(1)]);
+                let (advanced_state, samples) = state.random_uniform(&sample_type)?;
+                *state = advanced_state;
+                samples.elements::<f64>()?.into_iter()
+            }
+            None => Vec::new().into_iter(),
+        };
 
         // A label that every input contains can only be contracted in the last step, so it is treated like an output
         // label, which avoids comparing all pairs of the inputs that share it.
@@ -1030,14 +1044,29 @@ impl EinsumPathStrategy {
         };
 
         // Without noise only the best candidate of an input is kept. With noise all of them are, with perturbed costs.
-        let push = |queue: &mut BinaryHeap<Reverse<Candidate>>,
-                    candidates: Vec<Candidate>,
-                    noise: &mut Option<&mut RandomGenerator>| match noise {
-            None => queue.extend(candidates.into_iter().min().map(Reverse)),
-            Some(noise) => queue.extend(candidates.into_iter().map(|mut candidate| {
-                candidate.0 = (noise.normal(1.0, 0.01) * candidate.0 as f64).round() as i128;
-                Reverse(candidate)
-            })),
+        let mut normal_samples = Vec::new().into_iter();
+        let mut push = |queue: &mut BinaryHeap<Reverse<Candidate>>,
+                        candidates: Vec<Candidate>,
+                        noise: &mut Option<&mut Array>|
+         -> Result<(), ProgramError> {
+            match noise {
+                None => queue.extend(candidates.into_iter().min().map(Reverse)),
+                Some(state) => {
+                    for mut candidate in candidates {
+                        if normal_samples.len() == 0 {
+                            // Small batches amortize the array operations while bounding unused samples per trial.
+                            let sample_type = ArrayType::new_static(DataType::F64, [64]);
+                            let (advanced_state, samples) = state.random_normal(&sample_type)?;
+                            **state = advanced_state;
+                            normal_samples = samples.elements::<f64>()?.into_iter();
+                        }
+                        let factor = 1.0 + 0.01 * normal_samples.next().unwrap();
+                        candidate.0 = (factor * candidate.0 as f64).round() as i128;
+                        queue.push(Reverse(candidate));
+                    }
+                }
+            }
+            Ok(())
         };
 
         let mut queue = BinaryHeap::new();
@@ -1053,7 +1082,7 @@ impl EinsumPathStrategy {
                     &shared_by_two,
                     &shared_by_three,
                 );
-                push(&mut queue, candidates, &mut noise);
+                push(&mut queue, candidates, &mut noise)?;
             }
         }
 
@@ -1069,7 +1098,7 @@ impl EinsumPathStrategy {
                     Some(_) => continue,
                     None => break,
                 },
-                Some(noise) => {
+                Some(_) => {
                     let mut choices = Vec::new();
                     while choices.len() < 8
                         && let Some(Reverse(candidate)) = queue.pop()
@@ -1085,7 +1114,16 @@ impl EinsumPathStrategy {
                         .iter()
                         .map(|candidate| (-(candidate.0 as f64 - best_cost) / temperature).exp())
                         .collect::<Vec<_>>();
-                    let candidate = choices.remove(noise.choose(&weights));
+                    let target = selection_samples.next().unwrap() * weights.iter().sum::<f64>();
+                    let mut cumulative = 0.0;
+                    let choice = weights
+                        .iter()
+                        .position(|weight| {
+                            cumulative += weight;
+                            target < cumulative
+                        })
+                        .unwrap_or(weights.len() - 1);
+                    let candidate = choices.remove(choice);
                     queue.extend(choices.into_iter().map(Reverse));
                     (candidate.3, candidate.4, candidate.5)
                 }
@@ -1144,7 +1182,7 @@ impl EinsumPathStrategy {
             if !others.is_empty() {
                 let candidates =
                     candidates(&result, &others, &remaining, &footprints, &shared_by_two, &shared_by_three);
-                push(&mut queue, candidates, &mut noise);
+                push(&mut queue, candidates, &mut noise)?;
             }
         }
 
@@ -1173,23 +1211,26 @@ impl EinsumPathStrategy {
             Reverse((_, first_identifier, first)) = queue.pop().unwrap();
         }
 
-        path
+        Ok(path)
     }
 
     /// Returns the pairwise contractions with the fewest scalar operations among those of [`Self::greedy_ssa_path`]
     /// and `repetitions - 1` variants of [`Self::noisy_greedy_ssa_path`], preferring a smaller largest intermediate
-    /// among equally cheap paths. Each variant is seeded with its repetition number, so the selected path is
+    /// among equally cheap paths. Each variant draws samples through [`Random`] from a [`RandomAlgorithm::ThreeFry`]
+    /// state whose key is its repetition number and whose counter starts at zero, so the selected path is
     /// deterministic.
     fn random_greedy_ssa_path(
         inputs: &[BTreeSet<char>],
         output: &BTreeSet<char>,
         sizes: &BTreeMap<char, u128>,
         repetitions: usize,
-    ) -> Vec<(usize, usize)> {
+    ) -> Result<Vec<(usize, usize)>, ProgramError> {
         let mut best = None::<((u128, u128), Vec<(usize, usize)>)>;
         for repetition in 0..repetitions {
-            let mut noise = RandomGenerator::new(repetition as u64);
-            let path = Self::noisy_greedy_ssa_path(inputs, output, sizes, (repetition > 0).then_some(&mut noise));
+            let mut noise = (repetition > 0)
+                .then(|| Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[repetition as u64, 0]))
+                .transpose()?;
+            let path = Self::noisy_greedy_ssa_path(inputs, output, sizes, noise.as_mut())?;
 
             // The cost of a path is its number of scalar operations and then the size of its largest result,
             // which are computed like `ssa_path_compute_cost` computes them.
@@ -1225,7 +1266,7 @@ impl EinsumPathStrategy {
             }
         }
 
-        best.map(|(_, path)| path).unwrap_or_default()
+        Ok(best.map(|(_, path)| path).unwrap_or_default())
     }
 
     /// Converts pairwise contractions in static single assignment form, whose identifiers are never reused, into the
@@ -3063,52 +3104,6 @@ impl<'o> PathSearch<'o> {
             self.inputs.pop();
             self.path.pop();
         }
-    }
-}
-
-// TODO(eaplatanios): Why is this separate from the rest of the random number generation machinery in `random.rs`?
-/// Small deterministic pseudorandom number generator for the randomized contraction path searches. It uses
-/// [SplitMix64](https://prng.di.unimi.it/splitmix.c), which advances a 64-bit state by a fixed increment and mixes its
-/// bits to produce each sample. A fixed seed reproduces the same sequence of samples. These searches need reproducible
-/// choices and no statistical guarantees beyond rough uniformity.
-struct RandomGenerator {
-    /// State of the generator.
-    state: u64,
-}
-
-impl RandomGenerator {
-    /// Creates a generator with the provided seed.
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    /// Returns a number that is uniformly distributed in `[0, 1)`.
-    fn uniform(&mut self) -> f64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((value ^ (value >> 31)) >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// Returns a number that is normally distributed with the provided mean and standard deviation, using the
-    /// Box-Muller transform.
-    fn normal(&mut self, mean: f64, standard_deviation: f64) -> f64 {
-        let radius = (-2.0 * (1.0 - self.uniform()).ln()).sqrt();
-        mean + standard_deviation * radius * (std::f64::consts::TAU * self.uniform()).cos()
-    }
-
-    /// Returns an index of `weights`, which must not be empty, with a probability proportional to its weight.
-    fn choose(&mut self, weights: &[f64]) -> usize {
-        let target = self.uniform() * weights.iter().sum::<f64>();
-        let mut cumulative = 0.0;
-        for (index, weight) in weights.iter().enumerate() {
-            cumulative += weight;
-            if target < cumulative {
-                return index;
-            }
-        }
-        weights.len() - 1
     }
 }
 
@@ -5266,6 +5261,42 @@ mod tests {
     }
 
     #[test]
+    fn test_einsum_path_strategy_noisy_greedy() {
+        // Equal candidate costs make the first choice uniform over the three input pairs. Its result must agree
+        // with the shared random sampler, independently of the normal perturbations and the search's later steps.
+        let inputs = ["ab", "ac", "bc"].map(|labels| labels.chars().collect::<BTreeSet<_>>());
+        let output = BTreeSet::new();
+        let sizes = [('a', 1), ('b', 1), ('c', 1)].into_iter().collect::<BTreeMap<_, _>>();
+        let sample_type = ArrayType::new_static(DataType::F64, [2]);
+        let mut first_steps = BTreeSet::new();
+        for seed in 1u64..=8 {
+            let mut state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[seed, 0]).unwrap();
+            let mut repeated_state = state.clone();
+            let (_, samples) = state.random_uniform(&sample_type).unwrap();
+            let first_sample = samples.elements::<f64>().unwrap()[0];
+            let expected = [(0, 1), (0, 2), (1, 2)][(first_sample * 3.0) as usize];
+            let path = EinsumPathStrategy::noisy_greedy_ssa_path(&inputs, &output, &sizes, Some(&mut state)).unwrap();
+            assert_eq!(path.len(), 2);
+            assert_eq!(path[0], expected);
+            first_steps.insert(path[0]);
+            assert_eq!(
+                EinsumPathStrategy::noisy_greedy_ssa_path(&inputs, &output, &sizes, Some(&mut repeated_state)),
+                Ok(path),
+            );
+            assert_eq!(state, repeated_state);
+        }
+        assert!(first_steps.len() > 1);
+
+        // Sampling errors are returned through planning instead of panicking or silently using another generator.
+        let mut invalid_state = Array::scalar(0u64).unwrap();
+        let expected = invalid_state.random_uniform(&sample_type).unwrap_err();
+        assert_eq!(
+            EinsumPathStrategy::noisy_greedy_ssa_path(&inputs, &output, &sizes, Some(&mut invalid_state)),
+            Err(expected),
+        );
+    }
+
+    #[test]
     fn test_einsum_path_strategy_random_greedy() {
         // The randomized search is deterministic, never worse than the greedy search that it starts from, and its
         // paths compute the einsum.
@@ -5283,7 +5314,10 @@ mod tests {
         let greedy_options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Greedy);
         let greedy_cost = path_cost(&specification.plan(&input_types, &greedy_options).unwrap());
         let random_options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::RandomGreedy(32));
-        assert!(path_cost(&specification.plan(&input_types, &random_options).unwrap()) <= greedy_cost);
+        let random_cost = path_cost(&specification.plan(&input_types, &random_options).unwrap());
+        assert!(random_cost <= greedy_cost);
+        let more_options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::RandomGreedy(128));
+        assert!(path_cost(&specification.plan(&input_types, &more_options).unwrap()) <= random_cost);
         let expected = Array::einsum(subscripts, inputs.iter()).unwrap();
         for strategy in [
             EinsumPathStrategy::AutoHighQuality,
