@@ -1956,8 +1956,8 @@ where
 pub const EINSUM_COMPOSITE_NAME: &str = "ryft.einsum";
 
 /// Version of the [`CompositeKey`]s of the named composites that [`einsum`] creates. It changes whenever the
-/// computation that a key describes changes.
-pub const EINSUM_COMPOSITE_VERSION: u32 = 2;
+/// computation that a released key describes changes.
+pub const EINSUM_COMPOSITE_VERSION: u32 = 1;
 
 /// Einstein summation function created by [`einsum`] and [`einsum_with_options`], which calls the contraction as one
 /// named composite. The function plans its einsum once for each input type signature and keeps the [`EinsumPlan`]s,
@@ -2156,8 +2156,6 @@ where
     Ok(EinsumComposite { plans, composite })
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Plans of one einsum for the input type signatures that an [`EinsumComposite`] was called with, which the output
 /// type rule and the body of its composite and its calls share, so that each signature is planned once.
 struct EinsumPlans {
@@ -2176,9 +2174,9 @@ impl EinsumPlans {
     /// composite keeps its traced bodies.
     const CAPACITY: usize = 16;
 
-    /// Returns the plan for inputs of the provided types, planning the einsum if it has no plan for them yet. The
-    /// lock is not held while planning, whose path search can be expensive, so concurrent calls with new input types
-    /// may each plan them, in which case the first plan is kept.
+    /// Returns the plan for inputs of the provided types, planning the einsum if it has no plan for them yet. The lock
+    /// is not held while planning, whose path search can be expensive, so concurrent calls with new input types may
+    /// each plan them, in which case the first plan is kept.
     fn planned(&self, input_types: &[ArrayType]) -> Result<Arc<PlannedEinsum>, ProgramError> {
         let find = |planned: &VecDeque<(Vec<ArrayType>, Arc<PlannedEinsum>)>| {
             planned.iter().find(|(planned_types, _)| planned_types == input_types).map(|(_, plan)| plan.clone())
@@ -2233,6 +2231,8 @@ struct EinsumStep {
     /// Labels of the axes of the result of this step.
     result_names: Vec<char>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Primitive steps of an einsum over values of type `V`, which [`EinsumPlan::run`] is generic over, so that one
 /// implementation of the decomposition both computes or stages values and infers types.
@@ -7407,7 +7407,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2, 2], %1:f64[2, 2], %2:f64[2, 2] .
                 let %3:f64[2, 2] = composite [
-                    key=\"ryft.einsum.v2 {inputs = [[105, 106], [106, 107], [107, 108]], output = some([105, 108]), \
+                    key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107], [107, 108]], output = some([105, 108]), \
                     path = [0], accumulation_type = none, precision = [0, 0, 0], output_sharding = none}\",
                 ] %0 %1 %2 [
                     primal=^0={
@@ -7422,7 +7422,7 @@ mod tests {
                     },
                 ]
                     %4:f64[2, 2] = composite [
-                        key=\"ryft.einsum.v2 {inputs = [[105, 106], [106, 107], [107, 108]], \
+                        key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107], [107, 108]], \
                         output = some([105, 108]), path = [0], accumulation_type = none, precision = [0, 0, 0], \
                         output_sharding = none}\",
                     ] %3 %1 %2 [
@@ -7467,7 +7467,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2, 3], %1:f64[1, 4] .
                 let %2:f64[2, 4] = composite [
-                    key=\"ryft.einsum.v2 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
+                    key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
                     accumulation_type = none, precision = [0, 0, 0], output_sharding = none}\",
                 ] %0 %1 [
                     primal={
@@ -7526,7 +7526,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2, 2], %1:f64[2, 2], %2:f64[2, 2] .
                 let %3:f64[2, 2] = composite [
-                    key=\"ryft.einsum.v2 {inputs = [[105, 106], [106, 107], [107, 108]], output = some([105, 108]), \
+                    key=\"ryft.einsum.v1 {inputs = [[105, 106], [106, 107], [107, 108]], output = some([105, 108]), \
                     path = [0], accumulation_type = none, precision = [0, 0, 0], output_sharding = none}\",
                 ] %0 %1 %2 [
                     primal={
@@ -7694,7 +7694,7 @@ mod tests {
             |subscripts: &str, options: EinsumOptions| einsum_composite_key(&subscripts.parse().unwrap(), &options);
         assert_eq!(
             key("ij,jk->ik", EinsumOptions::new()).to_string(),
-            "ryft.einsum.v2 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
+            "ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = some([105, 107]), path = [0], \
              accumulation_type = none, precision = [0, 0, 0], output_sharding = none}",
         );
         assert_eq!(
@@ -7706,7 +7706,7 @@ mod tests {
                     .with_precision(DotAlgorithmPreset::BF16_BF16_F32),
             )
             .to_string(),
-            "ryft.einsum.v2 {inputs = [[-1, 105], [105]], output = none, path = [4, [0, 1]], \
+            "ryft.einsum.v1 {inputs = [[-1, 105], [105]], output = none, path = [4, [0, 1]], \
              accumulation_type = some(f32), precision = [2, 7], output_sharding = none}",
         );
         assert_eq!(
@@ -7720,7 +7720,7 @@ mod tests {
                 ),
             )
             .to_string(),
-            "ryft.einsum.v2 {inputs = [[105, 106], [106, 107]], output = none, path = [0], accumulation_type = none, \
+            "ryft.einsum.v1 {inputs = [[105, 106], [106, 107]], output = none, path = [0], accumulation_type = none, \
              precision = [1, bf16, bf16, f32, 1, 2, 3, true], output_sharding = none}",
         );
 
