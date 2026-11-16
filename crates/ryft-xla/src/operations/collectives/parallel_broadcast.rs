@@ -7,11 +7,10 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::domains::Tracer;
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::operations::collectives::collective_replica_groups;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer};
 
 impl LowerableOperation for ParallelBroadcastOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(

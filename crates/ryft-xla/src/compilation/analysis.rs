@@ -455,7 +455,7 @@ mod tests {
     use ryft_core::{ArrayIrType, ArrayType, DataType, StagedFunction as CoreStagedFunction};
 
     use crate::compilation::options::Options;
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::execution_client;
     use crate::{Error, Session};
 

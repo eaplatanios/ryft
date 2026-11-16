@@ -27,8 +27,7 @@ use ryft_core::{
     ProjectedValue, Sharding, ValueProjection,
 };
 
-use crate::domains::Tracer;
-use crate::{Constant, Error, Program, Session};
+use crate::{Constant, Error, Program, Session, Tracer};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies

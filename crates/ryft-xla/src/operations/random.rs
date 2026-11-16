@@ -238,11 +238,11 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, Session,

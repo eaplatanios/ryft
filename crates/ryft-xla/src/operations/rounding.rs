@@ -54,7 +54,7 @@ mod tests {
     use ryft_core::{Ceil, DataType, Floor, Round};
 
     use crate::Session;
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     // Signed zeros, quarters, and ties around zero and one, compared by encoding so that the sign of a zero result and

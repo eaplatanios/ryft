@@ -1146,7 +1146,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionFence};
 
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{
         cpu_client, device_mesh_2x2, four_device_mesh_x, logical_mesh_2x2, values_from_bytes, values_to_bytes,
     };

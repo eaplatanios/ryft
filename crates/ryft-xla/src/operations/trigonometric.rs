@@ -381,9 +381,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayOperation, Atan2, Cos, Placeholder, Sin, Tanh, differentiate_at};
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module};
     use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Session};
 

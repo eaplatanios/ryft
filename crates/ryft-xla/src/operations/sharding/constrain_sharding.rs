@@ -146,10 +146,10 @@ mod tests {
     };
     use ryft_mlir::{Context as MlirContext, Location};
 
-    use crate::domains::tests::two_device_mesh;
     use crate::lowering::CollectiveLoweringState;
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::Operation;
+    use crate::sessions::tests::two_device_mesh;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{Array, CompiledFunction, Options, Session, compile_with_options};
 

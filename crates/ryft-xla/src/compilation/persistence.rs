@@ -30,9 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::compilation::CompilationError;
 use crate::compilation::keys::COMPILER_IDENTITY;
 use crate::compilation::programs::CompiledProgram;
-use crate::domains::runtimes::builtin_requirement;
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::lowering::signature::ExecutableSignature;
+use crate::sessions::runtimes::builtin_requirement;
 use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
@@ -1455,7 +1455,7 @@ mod tests {
 
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
-    use crate::domains::tests::{
+    use crate::sessions::tests::{
         domain_mesh, external_reference_read_program, f32_scalar, f64_vector, program_array, read_f32s,
         replicated_scalar_type, replicated_vector_type,
     };
@@ -1633,10 +1633,10 @@ mod tests {
         let baseline = serde_json::to_value(decode_envelope(&bytes).0).unwrap();
         assert_eq!(baseline["runtime_requirements"], serde_json::json!([]));
         let mut missing: PersistentExecutableMetadata = serde_json::from_value(baseline).unwrap();
-        missing.runtime_requirements = vec![crate::domains::runtimes::builtin_requirement("test.missing-runtime")];
+        missing.runtime_requirements = vec![crate::sessions::runtimes::builtin_requirement("test.missing-runtime")];
         assert!(matches!(
             session.deserialize_program(&encode(missing)),
-            Err(Error::Runtime(crate::domains::runtimes::RuntimeError::MissingProvider { identifier }))
+            Err(Error::Runtime(crate::sessions::runtimes::RuntimeError::MissingProvider { identifier }))
                 if identifier == "test.missing-runtime"
         ));
         let mut explicit = decode_envelope(&bytes).0;

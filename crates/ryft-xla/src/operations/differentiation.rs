@@ -139,13 +139,12 @@ mod tests {
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
-    use crate::domains::Tracer;
-    use crate::domains::tests::{domain_mesh, read_f32s, replicated_vector_type};
     use crate::lowering::tests::test_vector_type;
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::{FlatProgram, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{Array, CompiledFunction, Constant, Session, compile, to_mlir_module_for_program};
+    use crate::{Array, CompiledFunction, Constant, Session, Tracer, compile, to_mlir_module_for_program};
 
     use super::*;
 

@@ -18,7 +18,7 @@ use ryft_pjrt::{
 };
 
 use crate::Error;
-use crate::domains::sessions::SessionError;
+use crate::sessions::SessionError;
 
 /// Platform that a [`Session`](crate::Session) executes on, which selects the PJRT plugin of the client that
 /// `ryft-xla` creates for the session. Every platform other than [`Self::Cpu`] requires the Cargo feature of

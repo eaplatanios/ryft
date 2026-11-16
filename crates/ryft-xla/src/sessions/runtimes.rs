@@ -25,7 +25,7 @@ use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiUserData};
 use ryft_pjrt::{Client, ExecutionContext, ExecutionFence};
 
 use crate::Error;
-use crate::domains::targets::Target;
+use crate::sessions::targets::Target;
 
 // TODO(eaplatanios): Review this module.
 
@@ -295,7 +295,7 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///
 /// use ryft_core::CustomCallOperation;
 /// use ryft_pjrt::Client;
-/// use ryft_xla::domains::{
+/// use ryft_xla::sessions::{
 ///     RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, with_runtime_requirements,
 /// };
 /// use ryft_xla::{Error, RuntimeError, Session, Target};
@@ -356,7 +356,7 @@ pub trait RuntimeProvider<'c>: Send + Sync {
 /// ```compile_fail
 /// use std::sync::Arc;
 /// use ryft_pjrt::Client;
-/// use ryft_xla::domains::RuntimeExtension;
+/// use ryft_xla::sessions::RuntimeExtension;
 ///
 /// struct BorrowedRuntime<'c>(&'c Client<'c>);
 /// impl<'c> RuntimeExtension<'c> for BorrowedRuntime<'c> {}
@@ -829,8 +829,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType};
 
-    use crate::domains::sessions::Session;
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::Session;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::execution_client;
 
     use super::*;

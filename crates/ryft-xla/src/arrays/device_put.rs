@@ -407,7 +407,7 @@ mod tests {
     use ryft_pjrt::BufferType;
 
     use crate::Session;
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
 
     use super::*;

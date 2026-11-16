@@ -398,9 +398,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{CompilationCacheDomain, DimensionBounds, DimensionVariable, Placeholder, Shape};
 
-    use crate::domains::tests::{domain_mesh, read_i64s, replicated_scalar_type};
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::sessions::tests::{domain_mesh, read_i64s, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
     use crate::{Array, Constant, Options, Session, to_mlir_module_for_program};
 

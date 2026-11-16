@@ -925,9 +925,10 @@ mod tests {
         ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation,
         StagedFunction as CoreStagedFunction, WhileOperation,
     };
+    use ryft_pjrt::protos::Precision;
 
     use crate::compilation::functions::StatefulCompileTracer;
-    use crate::domains::tests::{
+    use crate::sessions::tests::{
         boolean_scalar, domain_mesh, external_reference_read_program, f32_scalar, f32_vector, read_f32s, read_f64s,
         replicated_scalar_type, replicated_vector_type,
     };
@@ -1232,6 +1233,33 @@ mod tests {
             "{mesh<['x'=2:auto]>, [{}]}",
         );
         assert_eq!(lowered.lowered_program().output_shardings()[0].to_string(), "{mesh<['x'=2:auto]>, [{'x'}]}");
+    }
+
+    #[test]
+    fn test_session_lower_program_compilation_options() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let default_compilation_options =
+            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
+        let session = Session::builder()
+            .client(&client)
+            .default_compilation_options(default_compilation_options)
+            .build()
+            .unwrap();
+        let program = external_reference_read_program(replicated_vector_type(&mesh, 2));
+
+        // Lowering starts from the template of the session and overlays the settings that it derives for the program.
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.compilation_options().matrix_unit_operand_precision, Precision::Highest as i32);
+        assert_eq!(lowered.compilation_options().executable_build_options.as_ref().unwrap().partition_count, 1);
+
+        // Compilation options that the options of one compilation supply replace the template for that compilation.
+        let options = Options::new(mesh)
+            .with_compilation_options(CompilationOptions { compile_portable_executable: true, ..Default::default() });
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        assert!(lowered.compilation_options().compile_portable_executable);
+        assert_eq!(lowered.compilation_options().matrix_unit_operand_precision, Precision::Default as i32);
+        assert_eq!(lowered.compilation_options().executable_build_options.as_ref().unwrap().partition_count, 1);
     }
 
     #[test]

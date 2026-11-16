@@ -346,9 +346,9 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Client, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, test_spmd_compilation_options};
     use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Session};
 

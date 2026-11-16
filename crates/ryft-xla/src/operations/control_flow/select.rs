@@ -166,10 +166,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{CompareOperation, ComparisonDirection, Placeholder, Select, Shape};
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Session, to_mlir_module_for_program};
 

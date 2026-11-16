@@ -2322,7 +2322,7 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
-    use crate::domains::tests::{
+    use crate::sessions::tests::{
         domain_mesh, read_f32s, read_f64s, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         two_device_mesh,
     };

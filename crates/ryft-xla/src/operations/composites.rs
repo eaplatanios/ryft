@@ -319,10 +319,10 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Constant, Session, to_mlir_module_for_program};
 

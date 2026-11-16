@@ -349,9 +349,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{Clamp, DeviceMesh, Max, Min, Placeholder, Shape};
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Array, Constant, Session};
 

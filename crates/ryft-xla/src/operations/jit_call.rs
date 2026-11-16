@@ -2320,8 +2320,6 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
     use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::runtimes::builtin_requirement;
-    use crate::domains::tests::{domain_mesh, read_f32s};
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, identity_branch,
@@ -2329,6 +2327,8 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::runtimes::builtin_requirement;
+    use crate::sessions::tests::{domain_mesh, read_f32s};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, Options, Session, StagedFunction, ToPjrt, Value, compile,

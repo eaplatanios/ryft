@@ -32,8 +32,8 @@ use ryft_pjrt::{
 
 use crate::arrays::ArrayOutputLayout;
 use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
-use crate::domains::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
 use crate::lowering::signature::ExecutableSignature;
+use crate::sessions::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, FromPjrt, RuntimeRequirement, Session,
     ToPjrt, Value,
@@ -1537,12 +1537,12 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::domains::tests::{
+    use crate::execution::ExecutionArguments;
+    use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
+    use crate::sessions::tests::{
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_f32s, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, two_device_mesh,
     };
-    use crate::execution::ExecutionArguments;
-    use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, Constant, Error, ExecutionError, FlatProgram, Options, ProgramBuilder, Reference, Session, ToMlir,

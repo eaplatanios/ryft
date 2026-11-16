@@ -1126,8 +1126,6 @@ mod tests {
         load_cpu_plugin,
     };
 
-    use crate::domains::Tracer;
-    use crate::domains::tests::{domain_mesh, f32_vector, read_f32s, read_f64s};
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
         test_spmd_compilation_options,
@@ -1136,9 +1134,11 @@ mod tests {
     use crate::operations::debugging::with_captured_prints;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{domain_mesh, f32_vector, read_f32s, read_f64s};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, to_mlir_module_for_program,
+        Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
+        to_mlir_module_for_program,
     };
 
     use super::*;

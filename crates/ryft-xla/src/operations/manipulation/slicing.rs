@@ -696,14 +696,14 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::{
-        domain_mesh, f32_vector, program_array, read_f32s, read_f64s, replicated_scalar_type, replicated_vector_type,
-    };
     use crate::lowering::tests::{
         ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, unproject_plain_program,
     };
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{
+        domain_mesh, f32_vector, program_array, read_f32s, read_f64s, replicated_scalar_type, replicated_vector_type,
+    };
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayConstant, Constant, Options, Session, Value, to_mlir_module_for_program};
 

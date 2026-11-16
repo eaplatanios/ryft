@@ -355,9 +355,9 @@ mod tests {
         Sharding, associative_scan,
     };
 
-    use crate::domains::tests::{domain_mesh, read_f32s, replicated_vector_type};
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
+    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Value, compile};
 

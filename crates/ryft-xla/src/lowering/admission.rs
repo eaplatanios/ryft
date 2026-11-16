@@ -402,10 +402,9 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::domains::Tracer;
-    use crate::domains::tests::{domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type};
+    use crate::sessions::tests::{domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
-    use crate::{Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Value};
+    use crate::{Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Value};
 
     use super::*;
 

@@ -19,14 +19,14 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error as PjrtError};
 
-use crate::domains::effects::EffectCallbackGuard;
-use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::lowering::types::{
     lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
 };
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
+use crate::sessions::effects::EffectCallbackGuard;
+use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
     RuntimeProvider, RuntimeRequirement, Target,
@@ -1656,12 +1656,12 @@ mod tests {
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
-    use crate::domains::tests::{boolean_vector, domain_mesh, f32_vector, read_i64s, replicated_scalar_type};
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{boolean_vector, domain_mesh, f32_vector, read_i64s, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
     use crate::{Array, Constant, Options, RuntimeError, Session, to_mlir_module_for_program};
 

@@ -65,8 +65,8 @@ mod tests {
     use ryft_core::{Array as CoreArray, ArrayOperation, Erf};
 
     use crate::Session;
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::lowered_unary_module;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;

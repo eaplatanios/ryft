@@ -232,8 +232,8 @@ mod tests {
     };
     use ryft_mlir::Location;
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Session, to_mlir_module_for_program};
 

@@ -160,7 +160,6 @@ mod tests {
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::{domain_mesh, program_array, read_f32s};
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch,
         ragged_dot_cpu_compilation_options, unproject_plain_program,
@@ -171,6 +170,7 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{domain_mesh, program_array, read_f32s};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Constant, Session, Value, to_mlir_module_for_program};
 

@@ -252,8 +252,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayIrType, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
 
-    use crate::domains::sessions::Session;
-    use crate::domains::tests::{domain_mesh, replicated_vector_type};
+    use crate::sessions::Session;
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type};
     use crate::tests::cpu_client;
     use crate::{FlatProgram, Operation, Options, ProgramBuilder};
 

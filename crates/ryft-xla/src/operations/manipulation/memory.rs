@@ -110,10 +110,10 @@ mod tests {
         Trace, TransferToMemory, Typed, ZeroOperation,
     };
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{ProgramBuilder, test_vector_type};
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::Operation;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayError, CompiledFunction, Constant, Error, Session, compile,

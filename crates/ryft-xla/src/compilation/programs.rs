@@ -1,4 +1,4 @@
-//! Lowered and compiled program artifacts of the XLA [`Session`](crate::domains::Session).
+//! Lowered and compiled program artifacts of the XLA [`Session`](crate::sessions::Session).
 //!
 //! Lowering a staged program produces a [`LoweredProgram`], which holds the StableHLO module, the effective PJRT
 //! compilation options, and the invocation contract that maps logical values to physical executable slots. Compiling
@@ -27,7 +27,7 @@ use crate::{Error, RuntimeRequirement, SessionConstant, Target};
 
 /// StableHLO lowering and metadata of the call boundary produced before PJRT compilation.
 ///
-/// A [`Session`](crate::domains::Session) lowers a staged program into this artifact with its effective compilation
+/// A [`Session`](crate::sessions::Session) lowers a staged program into this artifact with its effective compilation
 /// options and the mapping between logical values and physical executable slots. PJRT compilation produces a
 /// [`CompiledProgram`] retaining the same invocation contract.
 ///
@@ -388,7 +388,7 @@ impl TypedProgram for LoweredProgram {
 /// [`functions`](crate::compilation::functions) retain the Rust container structures separately. Reused and
 /// replacement executables must preserve the complete invocation contract before execution.
 ///
-/// The invoking [`Session`](crate::domains::Session) validates inputs, resolves placement and runtime resources,
+/// The invoking [`Session`](crate::sessions::Session) validates inputs, resolves placement and runtime resources,
 /// materializes bounded dynamic arguments, and reconstructs logical outputs. Ordinary calls carry completion through
 /// their outputs. Stateful calls coordinate external references through [`ryft_core::StatefulExecution`], publishing
 /// mutations only after submission and tracking completion of the whole invocation.
@@ -954,9 +954,9 @@ mod tests {
     };
 
     use crate::compilation::functions::stage;
-    use crate::domains::runtimes::builtin_requirement;
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::signature::ExecutableSignature;
+    use crate::sessions::runtimes::builtin_requirement;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{device_mesh_2x2, execution_client};
     use crate::{Error, Options, Session};
 

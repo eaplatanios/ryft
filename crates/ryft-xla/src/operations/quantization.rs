@@ -13,7 +13,6 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::domains::Tracer;
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::compositions::{NamedCompositionKey, lower_decomposition_call, named_composition_input_types};
 use crate::lowering::types::{
@@ -21,7 +20,7 @@ use crate::lowering::types::{
     lower_tensor_type, physical_bound_type,
 };
 use crate::operations::FlatProgram;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer};
 
 /// Traces the canonical scaled dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
@@ -545,12 +544,12 @@ mod tests {
         f8e4m3fn,
     };
 
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
     use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, Session, compile,

@@ -783,8 +783,8 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     #[cfg(feature = "cuda-13")]
-    use crate::domains::tests::replicated_vector_type;
-    use crate::domains::tests::{
+    use crate::sessions::tests::replicated_vector_type;
+    use crate::sessions::tests::{
         domain_mesh, external_reference_read_program, f32_vector, program_array, read_f32s, replicated_scalar_type,
     };
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};

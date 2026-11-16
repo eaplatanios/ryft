@@ -861,13 +861,12 @@ mod tests {
         TypedProgram, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation, rematerialize,
     };
 
-    use crate::domains::Tracer;
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{PlainProgram, ProgramBuilder as PlainProgramBuilder, lowered_unary_module};
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::jit_call::JitCallOperation;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type};
-    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, Tracer, to_mlir_module_for_program};
 
     use super::*;
 

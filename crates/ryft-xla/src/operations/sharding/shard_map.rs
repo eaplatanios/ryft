@@ -402,8 +402,6 @@ pub(crate) mod tests {
         Program as PjrtProgram, load_cpu_plugin,
     };
 
-    use crate::domains::Tracer;
-    use crate::domains::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::lowering::tests::{
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_spmd_compilation_options, test_vector_type,
@@ -416,10 +414,11 @@ pub(crate) mod tests {
     use crate::operations::{
         FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
     };
+    use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, ExecutionArguments, FromPjrt, Options, Reference, Session, TracedProgram,
-        Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
+        Tracer, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
     };
 
     use super::*;

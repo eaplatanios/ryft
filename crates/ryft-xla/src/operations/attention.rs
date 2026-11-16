@@ -995,12 +995,11 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::domains::Tracer;
-    use crate::domains::tests::domain_mesh;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Session, to_mlir_module_for_program};
+    use crate::{Array, Session, Tracer, to_mlir_module_for_program};
 
     use super::*;
 

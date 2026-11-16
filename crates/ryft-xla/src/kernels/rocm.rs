@@ -18,10 +18,10 @@ use ryft_rocm::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::kernels::{
     KernelEmbeddingError, KernelOutputEmbedding, ROCM_KERNEL_CUSTOM_CALL_TARGET, dense_memory_layouts,
 };
+use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, Target, ToPjrt,
     named_ffi_type_id, with_runtime_requirements,

@@ -15,9 +15,9 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error as PjrtError};
 
-use crate::domains::effects::EffectCallbackGuard;
-use crate::domains::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::lowering::{EffectTokens, current_or_new_token};
+use crate::sessions::effects::EffectCallbackGuard;
+use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension, RuntimeProvider,
     RuntimeRequirement, Target,
@@ -560,10 +560,10 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::domains::tests::{array_domain, domain_mesh, f64_vector, read_f64s};
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
+    use crate::sessions::tests::{array_domain, domain_mesh, f64_vector, read_f64s};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile,

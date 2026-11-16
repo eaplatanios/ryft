@@ -34,8 +34,8 @@ mod tests {
     };
     use ryft_pjrt::Client;
 
-    use crate::domains::tests::{read_f32s, two_device_mesh};
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
+    use crate::sessions::tests::{read_f32s, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, Session, TracedProgram, compile,

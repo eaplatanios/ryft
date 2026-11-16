@@ -619,7 +619,6 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::{domain_mesh, two_device_mesh};
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
@@ -627,6 +626,7 @@ mod tests {
         lower_mlir_module_for_program, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::sessions::tests::{domain_mesh, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, Options, Session, ToPjrt, TracedProgram,

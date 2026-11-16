@@ -334,8 +334,7 @@ mod tests {
         ShardingDimension,
     };
 
-    use crate::Session;
-    use crate::domains::Tracer;
+    use crate::{Session, Tracer};
 
     use super::*;
 

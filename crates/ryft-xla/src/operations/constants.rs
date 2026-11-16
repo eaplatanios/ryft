@@ -651,7 +651,6 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::{array_domain, read_f32s, read_u64s};
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
         test_vector_type,
@@ -659,6 +658,7 @@ mod tests {
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
+    use crate::sessions::tests::{array_domain, read_f32s, read_u64s};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Constant, to_mlir_module_for_program};
 

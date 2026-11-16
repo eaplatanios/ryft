@@ -37,8 +37,8 @@ mod tests {
         TracingContext, Typed, TypedProgram, ValueProjection, batch, index,
     };
 
-    use crate::domains::tests::{domain_mesh, read_f64s};
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{domain_mesh, read_f64s};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{Array, Constant, Options, Session};
 

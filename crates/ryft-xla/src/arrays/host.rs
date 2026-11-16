@@ -615,7 +615,7 @@ mod tests {
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_pjrt::{Error as PjrtError, ExecutionFence};
 
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{FromPjrt, Session};
 

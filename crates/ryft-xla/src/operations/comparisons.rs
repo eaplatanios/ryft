@@ -136,7 +136,7 @@ mod tests {
     use ryft_core::{Compare, DataTypeError, Error as CoreError, Typed};
     use ryft_mlir::Context as MlirContext;
 
-    use crate::domains::tests::{domain_mesh, f32_vector};
+    use crate::sessions::tests::{domain_mesh, f32_vector};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Options, Session};
 

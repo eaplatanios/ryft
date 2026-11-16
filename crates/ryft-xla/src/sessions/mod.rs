@@ -1,15 +1,56 @@
-//! Sessions, through which `ryft-xla` stages, lowers, compiles, and executes programs on one PJRT client.
+//! XLA sessions and the shared resources used to stage, compile, and execute array programs. A [`Session`] implements
+//! [`Domain`] over [`ArrayIrType`], with [`Value`]s that hold device arrays, checked dimensions, or mutable references.
+//! Values retain their session, so eager operations and transforms recover the execution context from their inputs.
+//! [`Constant`] and [`Operation`] provide the corresponding families of stored constants and operations for traced
+//! programs.
 //!
-//! A [`Session`] is a cheap handle that every [`Array`], dimension, and reference carries. A [`SessionBuilder`] selects
-//! the PJRT client of a session, which is either one that `ryft-xla` creates for a [`Platform`] or one that the caller
-//! owns, and creates the resources that all handles of the session share, which are its compilation cache, its eager
-//! dispatch cache, its runtime extension instances, its table of retained constant arrays, and its default compilation
-//! options. Cloning a session shares all of them, while separate sessions stay independent
-//! even when they borrow the same client.
+//! # Sessions
+//!
+//! A [`Session`] executes on one PJRT [`Client`] and is a cheap handle to the resources that it creates for
+//! that client, which are its compilation cache, runtime extension resources, and default compilation options.
+//! [`Session::new`] creates a session on a client that it creates for the best available [`Platform`], and
+//! [`Session::builder`] allows configuring everything in detail. Clone a session wherever another handle is
+//! needed. Clones share its resources, while creating another session gives an independent cache and effect
+//! scope, even on the same client. Configure built-in or downstream providers through [`RuntimeExtensions`] and
+//! [`SessionBuilder::runtime_extensions`]. Each session initializes its own runtime instances lazily when an executable
+//! requires them.
+//!
+//! [`Options`](crate::Options) supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend
+//! compilation policies for a staged function. The session's default [`CompilationOptions`] supply the underlying PJRT
+//! compiler settings. [`Target`] describes the client's platform and devices without retaining live device handles.
 //!
 //! Traces whose capture tables hold constants rather than runtime values refer to runtime arrays through
 //! [`SessionConstant`] handles. [`ThroughSession`] imports runtime [`Value`]s into such traces by retaining their
 //! arrays in the session, which keeps each array alive for as long as any handle to it exists.
+//!
+//! # Compilation and Execution
+//!
+//! The [`crate::compilation`] module implements compilation for a session and [`crate::execution`] implements
+//! execution. Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained
+//! dispatcher that specializes on its runtime inputs. The backend also implements the generic lifecycle in
+//! [`ryft_core::compilation`]. When staging directly through [`ryft_core::StagedFunction::stage`], apply
+//! [`with_input_shardings`](crate::with_input_shardings) to the input types first if the options specify
+//! input sharding overrides.
+//!
+//! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
+//! [`CompiledProgram`](crate::CompiledProgram) contains the loaded executable and its invocation contract. These flat
+//! artifacts are distinct from the typed function handles in [`crate::compilation::functions`], which also retain input
+//! and output container structures. The session's [`CompilationContext`] coordinates artifact reuse, and
+//! [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation configuration.
+//! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
+//! expose compiler diagnostics for a compiled program.
+//!
+//! # Effects and Completion
+//!
+//! Cloned sessions share effect ordering. [`Session::fork_effect_scope`] starts an independent sequence while retaining
+//! the shared resources of the session. Cached programs contain no session or effect scope, so execution uses the
+//! invoking session's scope. Mutable references also retain their own coordination across calls, based on their
+//! identities.
+//!
+//! Array readiness observes completion of the work that produced that array. [`Session::effects_barrier`] observes
+//! previously submitted effects, including work whose outputs were discarded. Call it before dropping the client when
+//! those effects must be observed. Sessions and their values borrow the client and cannot outlive it. Clients that
+//! `ryft-xla` creates for sessions live for the rest of the process.
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -29,17 +70,30 @@ use ryft_pjrt::{Client, ClientOptions, Plugin};
 
 use crate::arrays::RetainedArray;
 use crate::compilation::keys::EagerDispatchKey;
-use crate::domains::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchProgram};
-use crate::domains::effects::EffectScope;
-use crate::domains::platforms::{Platform, process_client};
-use crate::domains::runtimes::{RuntimeExtensions, RuntimeRegistry};
-use crate::domains::targets::{Target, TargetDevice};
+use crate::sessions::eager::{EAGER_DISPATCH_CACHE_CAPACITY, EagerDispatchProgram};
+use crate::sessions::effects::EffectScope;
+use crate::sessions::platforms::process_client;
+use crate::sessions::runtimes::RuntimeRegistry;
 use crate::{Array, ArrayError, Constant, Error, Operation, Value};
+
+pub mod eager;
+pub mod effects;
+pub mod platforms;
+pub mod runtimes;
+pub mod targets;
+
+pub use platforms::Platform;
+pub use runtimes::{
+    ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension,
+    RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id, normalize_runtime_requirements,
+    runtime_requirements, with_runtime_requirements,
+};
+pub use targets::{Target, TargetDevice};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Source of the identifiers of sessions, which are unique within the process.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
-
-// TODO(eaplatanios): Review this module.
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
 /// [`Client`].
@@ -319,7 +373,7 @@ impl<'c> Session<'c> {
     /// Returns the compiled programs of eager operation applications, keyed ahead of program construction and lowering.
     /// Refer to the documentation of [`EagerDispatchKey`] for information on what the key captures.
     #[inline]
-    pub(super) fn eager_dispatch_cache(&self) -> &SpecializationCache<EagerDispatchKey, EagerDispatchProgram<'c>> {
+    fn eager_dispatch_cache(&self) -> &SpecializationCache<EagerDispatchKey, EagerDispatchProgram<'c>> {
         &self.state.eager_dispatch_cache
     }
 
@@ -523,7 +577,7 @@ enum DiskCacheSource {
 /// [`Platform::Auto`]. [`Self::platform`] requests a specific platform, [`Self::plugin`] uses a PJRT plugin that
 /// `ryft-xla` does not know about, and [`Self::client_options`] configures the client that either of them creates.
 /// These clients live for the rest of the process, and sessions that request the same plugin with equal client
-/// options share one client, as the [`platforms`](crate::domains::platforms) module documents. [`Self::client`]
+/// options share one client, as the [`platforms`] module documents. [`Self::client`]
 /// instead supplies a client that the caller created and owns. Each of [`Self::platform`], [`Self::plugin`], and
 /// [`Self::client`] replaces the selection of the others.
 ///
@@ -844,18 +898,17 @@ fn session_constant(value: Value) -> Result<Constant, ProgramError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::HashMap;
     #[cfg(feature = "cuda-13")]
     use std::convert::Infallible;
 
     use pretty_assertions::assert_eq;
     #[cfg(feature = "cuda-13")]
+    use ryft_core::{Add, EffectClass, OneLike, ProjectedValue, ReferenceRead, ReferenceWrite, Tracer as CoreTracer};
     use ryft_core::{
-        Add, EffectClass, OneLike, ProjectedValue, ReferenceRead, ReferenceWrite, Tracer as CoreTracer, TracingContext,
-    };
-    use ryft_core::{
-        ArrayReference, ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, DiskCache, MeshAxisType,
-        Neg, NegOperation, Shape, Sharding, ShardingDimension,
+        ArrayReference, DataType, Device, Dimension as CoreDimension, DimensionValue, Error as CoreError, MeshAxisType,
+        Neg, Placeholder, ProjectedContext, ReferenceReadOperation, ReferenceType, Shape, Sharding, ShardingError,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_cuda::{
@@ -863,23 +916,210 @@ mod tests {
     };
     #[cfg(feature = "cuda-13")]
     use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelDefinition, KernelSchedule, VerifiedKernel};
-    use ryft_pjrt::protos::{CompilationOptions, Precision};
+    use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::domains::tests::{domain_mesh, external_reference_read_program, f32_vector, replicated_vector_type};
-    use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, four_device_mesh_x, logical_mesh_2x2, values_from_bytes,
-        values_to_bytes,
-    };
-    use crate::{Array, ExecutionError, FromPjrt, Options, Reference, Session};
+    use crate::sessions::runtimes::builtin_requirement;
+    use crate::tests::{assert_send_sync, cpu_client, execution_client, hash_of, values_from_bytes, values_to_bytes};
     #[cfg(feature = "cuda-13")]
-    use crate::{
-        CUDA_KERNEL_CUSTOM_CALL_TARGET, Constant, CudaKernelEmbedding, KernelCompilerBinding, Operation, stage_kernel,
-    };
+    use crate::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, KernelCompilerBinding, Options, stage_kernel};
+    use crate::{Dimension, ExecutionError, FlatProgram, FromPjrt, ProgramBuilder, Reference};
 
     use super::*;
+
+    /// Builds a one-axis mesh from the client's addressable devices for domain tests.
+    pub(crate) fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        DeviceMesh::new(logical_mesh, devices).unwrap()
+    }
+
+    /// Creates a mesh of two devices with the axis interpretation required by the test.
+    pub(crate) fn two_device_mesh(client: &Client<'_>, axis_type: MeshAxisType) -> DeviceMesh {
+        let devices: Vec<Device> = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .take(2)
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect();
+        DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(), devices).unwrap()
+    }
+
+    /// Builds a flat program that reads and returns one externally supplied reference.
+    pub(crate) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram {
+        let mut builder = ProgramBuilder::new();
+        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(referent_type)));
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Creates an independent session and projects it to ordinary array values.
+    pub(crate) fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<Session<'c>, ArrayType> {
+        ProjectedContext::new(Session::with_client(client))
+    }
+
+    /// Borrows the array carried by a test value, requiring the array variant.
+    pub(crate) fn program_array<'o, 'c>(value: &'o Value<'c>) -> &'o Array<'c> {
+        let Value::Array(array) = value else {
+            panic!("expected an array IR value");
+        };
+        array
+    }
+
+    /// Constructs a rank-1 `f32` type replicated over `mesh`.
+    pub(crate) fn replicated_vector_type(mesh: &DeviceMesh, size: usize) -> ArrayType {
+        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap()
+    }
+
+    /// Constructs a scalar of `data_type` replicated over `mesh`.
+    pub(crate) fn replicated_scalar_type(mesh: &DeviceMesh, data_type: DataType) -> ArrayType {
+        ArrayType::scalar(data_type)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap()
+    }
+
+    /// Uploads a replicated rank-1 `f32` test array.
+    pub(crate) fn f32_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
+        let r#type = replicated_vector_type(mesh, values.len());
+        Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+    }
+
+    /// Uploads a replicated `f32` test scalar.
+    pub(crate) fn f32_scalar<'c>(session: &Session<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
+        let r#type = replicated_scalar_type(mesh, DataType::F32);
+        Array::from_host_buffer(session, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+    }
+
+    /// Uploads a replicated rank-1 `f64` test array.
+    pub(crate) fn f64_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
+    }
+
+    /// Uploads a replicated rank-1 Boolean test array using one byte per element.
+    pub(crate) fn boolean_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+        let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(values.len())]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
+        Array::from_host_buffer(session, r#type, mesh.clone(), values.as_slice()).unwrap()
+    }
+
+    /// Uploads a replicated Boolean test scalar using one byte per element.
+    pub(crate) fn boolean_scalar<'c>(session: &Session<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
+        let r#type = replicated_scalar_type(mesh, DataType::Boolean);
+        Array::from_host_buffer(session, r#type, mesh.clone(), [u8::from(value)]).unwrap()
+    }
+
+    /// Reads the first addressable shard as native-endian `f32` values.
+    pub(crate) fn read_f32s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<f32>(bytes.as_slice())
+    }
+
+    /// Reads every device shard of `array` in mesh device order and concatenates their native-endian `f32` values.
+    pub(crate) fn read_sharded_f32_array(array: &Array<'_>) -> Vec<f32> {
+        let mut values = Vec::new();
+        for device in array.mesh().devices() {
+            let shard_bytes = array
+                .device_shard(device.id())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            values.extend(values_from_bytes::<f32>(shard_bytes.as_slice()));
+        }
+        values
+    }
+
+    /// Reads the first addressable shard as native-endian `f64` values.
+    pub(crate) fn read_f64s(client: &Client<'_>, array: &Array<'_>) -> Vec<f64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<f64>(bytes.as_slice())
+    }
+
+    /// Reads the first addressable shard as native-endian unsigned 64-bit integers.
+    pub(crate) fn read_u64s(client: &Client<'_>, array: &Array<'_>) -> Vec<u64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<u64>(bytes.as_slice())
+    }
+
+    /// Reads the first addressable shard as native-endian signed 64-bit integers.
+    pub(crate) fn read_i64s(client: &Client<'_>, array: &Array<'_>) -> Vec<i64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<i64>(bytes.as_slice())
+    }
+
+    /// Reads the first addressable shard, interpreting each nonzero byte as `true`.
+    pub(crate) fn read_booleans(client: &Client<'_>, array: &Array<'_>) -> Vec<bool> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap()
+            .into_iter()
+            .map(|value| value != 0)
+            .collect()
+    }
 
     #[test]
     fn test_session_is_send_and_sync() {
@@ -887,291 +1127,44 @@ mod tests {
     }
 
     #[test]
-    fn test_session_builder_compilation_context_evicts_least_recently_used_entry() {
-        let client = cpu_client(4);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
-        // Capacity = 2 so that the third distinct reshard evicts the first.
-        let engine = Session::builder()
-            .client(&client)
-            .compilation_context(CompilationContext::with_capacity(2))
-            .build()
-            .unwrap();
-
-        // Replicated source on the 2x2 mesh. Three reshards to three different non-replicated shardings all force the
-        // compiled path, because the fast path returns `None` when no destination shard matches a source shard exactly.
-        let values = (0..16).map(|index| index as f32).collect::<Vec<_>>();
-        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
-        let source_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_sharding(replicated_sharding)
-                .unwrap();
-        let make_source = || {
-            Array::from_host_buffer(
-                &engine,
-                source_type.clone(),
-                mesh.clone(),
-                values_to_bytes::<f32>(&values).as_slice(),
-            )
-            .unwrap()
-        };
-        let sharded_along_x = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let sharded_along_y = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
-        )
-        .unwrap();
-        let sharded_along_both = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
-        )
-        .unwrap();
-
-        assert_eq!(engine.program_count(), 0);
-        let _ = make_source()
-            .to_placement(
-                &engine,
-                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_x },
-            )
-            .unwrap();
-        assert_eq!(engine.program_count(), 1);
-        let _ = make_source()
-            .to_placement(
-                &engine,
-                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_y },
-            )
-            .unwrap();
-        assert_eq!(engine.program_count(), 2);
-        let _ = make_source()
-            .to_placement(
-                &engine,
-                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_along_both },
-            )
-            .unwrap();
-        assert_eq!(engine.program_count(), 2, "third distinct reshard should evict the LRU entry");
-    }
-
-    #[test]
-    fn test_session_builder_disk_cache_warm_starts_a_fresh_session() {
-        let client = cpu_client(4);
-        let mesh = four_device_mesh_x(&client);
-        let cache_dir = tempfile::tempdir().unwrap();
-
-        let values = [200.0f32, 201.0, 202.0, 203.0];
-        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
-            .with_sharding(replicated_sharding)
-            .unwrap();
-        let target_sharding =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        // The first context compiles cold, and the disk cache picks up the serialized executable.
-        let disk_cache = || DiskCache::open(cache_dir.path()).unwrap();
-        let engine_one = Session::builder().client(&client).disk_cache(disk_cache()).build().unwrap();
-        let source = Array::from_host_buffer(
-            &engine_one,
-            source_type.clone(),
-            mesh.clone(),
-            values_to_bytes::<f32>(&values).as_slice(),
-        )
-        .unwrap();
-        let _ = source
-            .to_placement(
-                &engine_one,
-                crate::arrays::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() },
-            )
-            .unwrap();
-        assert_eq!(engine_one.program_count(), 1, "first reshard should populate the in-memory cache");
-        drop(source);
-        drop(engine_one);
-
-        // Second context starts with an empty in-memory cache but loads from the disk cache.
-        let engine_two = Session::builder().client(&client).disk_cache(disk_cache()).build().unwrap();
-        assert_eq!(engine_two.program_count(), 0, "fresh context starts empty in-memory");
-        let source_two =
-            Array::from_host_buffer(&engine_two, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
-        let _ = source_two
-            .to_placement(&engine_two, crate::arrays::DevicePutTarget::Placement { mesh, sharding: target_sharding })
-            .unwrap();
-        assert_eq!(
-            engine_two.program_count(),
-            1,
-            "second context should populate its in-memory cache via the disk hit (no recompile expected)",
-        );
-    }
-
-    #[test]
-    fn test_session_builder_default_compilation_options() {
-        let client = cpu_client(1);
+    fn test_session_clone() {
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let compilation_options =
-            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
-        let session = Session::builder()
-            .client(&client)
-            .default_compilation_options(compilation_options.clone())
-            .build()
-            .unwrap();
-        assert_eq!(session.default_compilation_options(), &compilation_options);
-        assert_eq!(session.fork_effect_scope().default_compilation_options(), &compilation_options);
-        assert_eq!(Session::with_client(&client).default_compilation_options(), &CompilationOptions::default());
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let clone = session.clone();
+        assert!(clone.is_same_session(&session));
+        assert!(std::ptr::eq(clone.effect_scope(), session.effect_scope()));
+        assert_eq!(clone.mesh().unwrap(), &mesh);
 
-        // Lowering starts from the template of the session and overlays the settings that it derives for the program.
-        let program = external_reference_read_program(replicated_vector_type(&mesh, 2));
-        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.compilation_options().matrix_unit_operand_precision, Precision::Highest as i32);
-        assert_eq!(lowered.compilation_options().executable_build_options.as_ref().unwrap().partition_count, 1);
-        let lowered = Session::with_client(&client).lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.compilation_options().matrix_unit_operand_precision, Precision::Default as i32);
-
-        // Compilation options that the options of one compilation supply replace the template for that compilation.
-        let options = Options::new(mesh)
-            .with_compilation_options(CompilationOptions { compile_portable_executable: true, ..Default::default() });
-        let lowered = session.lower_program(&program, 0, &options).unwrap();
-        assert!(lowered.compilation_options().compile_portable_executable);
-        assert_eq!(lowered.compilation_options().matrix_unit_operand_precision, Precision::Default as i32);
-        assert_eq!(lowered.compilation_options().executable_build_options.as_ref().unwrap().partition_count, 1);
+        // The shared state of a session lives for as long as any of its handles.
+        let state = Arc::downgrade(&session.state);
+        drop(session);
+        assert!(state.upgrade().is_some());
+        drop(clone);
+        assert!(state.upgrade().is_none());
     }
 
     #[test]
-    fn test_session_builder_platform() {
-        // Sessions that `ryft-xla` creates clients for can be `'static`, and they share the client of their platform
-        // without sharing any session state.
-        let session: Session<'static> = Session::builder().platform(Platform::Cpu).build().unwrap();
-        let other: Session<'static> = Session::builder().platform(Platform::Cpu).build().unwrap();
-        assert!(session.target().unwrap().platform_name().eq_ignore_ascii_case("cpu"));
+    fn test_session_new() {
+        // Sessions that are created with the default configuration run on the process-wide client of the selected
+        // platform, and they share nothing else.
+        let session = Session::new().unwrap();
+        let other = Session::new().unwrap();
+        assert!(!session.target().unwrap().devices().is_empty());
         assert!(std::ptr::eq(session.client(), other.client()));
         assert!(!session.is_same_session(&other));
-
-        // The default platform is selected automatically and always has a device.
-        let session = Session::builder().build().unwrap();
-        assert!(!session.target().unwrap().devices().is_empty());
-        assert!(std::ptr::eq(Session::new().unwrap().client(), session.client()));
-
-        // Sessions execute on the clients that are created for them.
-        let mesh = session.new_mesh([MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 2f32.to_ne_bytes()).unwrap();
-        let negated = Neg::neg(&array).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&negated.copy_to_host().unwrap()), vec![-2f32]);
-    }
-
-    #[cfg(not(feature = "tpu"))]
-    #[test]
-    fn test_session_builder_platform_rejects_platforms_without_their_feature() {
-        assert!(matches!(
-            Session::builder().platform(Platform::Tpu).build(),
-            Err(Error::Session(SessionError::UnavailablePlatform { platform: Platform::Tpu, feature: "tpu" })),
-        ));
+        assert!(!std::ptr::eq(session.effect_scope(), other.effect_scope()));
     }
 
     #[test]
-    fn test_session_builder_plugin() {
-        // A plugin that the caller loaded creates a process-wide client like a platform does, and it shares the
-        // client of its platform when their client options are equal.
-        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() });
-        let session = Session::builder()
-            .plugin(load_cpu_plugin().unwrap())
-            .client_options(options.clone())
-            .build()
-            .unwrap();
-        let other = Session::builder().platform(Platform::Cpu).client_options(options).build().unwrap();
-        assert_eq!(session.target().unwrap().devices().len(), 2);
-        assert!(std::ptr::eq(session.client(), other.client()));
-    }
-
-    #[test]
-    fn test_session_builder_client_options() {
-        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() });
-        let session = Session::builder().platform(Platform::Cpu).client_options(options.clone()).build().unwrap();
-        let default_session = Session::builder().platform(Platform::Cpu).build().unwrap();
-        assert_eq!(session.target().unwrap().devices().len(), 4);
-        assert!(!std::ptr::eq(session.client(), default_session.client()));
-
-        // Client options cannot configure a client that already exists, and they require an explicit platform.
-        let client = cpu_client(1);
-        let Err(error) = Session::builder().client(&client).client_options(options.clone()).build() else {
-            panic!("client options for an existing client were unexpectedly accepted");
-        };
-        assert_eq!(
-            error.to_string(),
-            "invalid client options: client options only configure a client that the session creates, but the \
-             session was given an existing client",
-        );
-        let Err(error) = Session::builder().client_options(options).build() else {
-            panic!("client options for an automatically selected platform were unexpectedly accepted");
-        };
-        assert_eq!(
-            error.to_string(),
-            "invalid client options: client options require an explicit platform or plugin, because the platforms \
-             that `Platform::Auto` selects among take different options",
-        );
-    }
-
-    #[test]
-    fn test_session_builder_client() {
-        // A session over a client of the caller borrows it, and the last source that a builder is given wins.
-        let client = cpu_client(1);
-        let session = Session::builder().platform(Platform::Cpu).client(&client).build().unwrap();
-        assert!(std::ptr::eq(session.client(), &client));
-        let session = Session::builder().client(&client).platform(Platform::Cpu).build().unwrap();
-        assert!(!std::ptr::eq(session.client(), &client));
-        assert!(std::ptr::eq(Session::with_client(&client).client(), &client));
-    }
-
-    #[test]
-    fn test_session_builder_disk_cache() {
-        // An explicit disk cache replaces the one of a supplied compilation context.
-        let client = cpu_client(1);
-        let context_directory = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let session = Session::builder()
-            .client(&client)
-            .disk_cache(DiskCache::open(directory.path()).unwrap())
-            .compilation_context(
-                CompilationContext::new().with_disk_cache(DiskCache::open(context_directory.path()).unwrap()),
-            )
-            .build()
-            .unwrap();
-        let disk_cache = session.compilation_context().disk_cache().unwrap();
-        assert_eq!(disk_cache.directory(), DiskCache::open(directory.path()).unwrap().directory());
-        assert!(Session::with_client(&client).compilation_context().disk_cache().is_none());
-    }
-
-    #[test]
-    fn test_session_new_mesh() {
-        let client = cpu_client(4);
-        let session = Session::with_client(&client);
-        let devices = session.target().unwrap().devices().iter().map(TargetDevice::device).collect::<Vec<_>>();
-        let axis = |name: &str, size: usize| MeshAxis::new(name, size, MeshAxisType::Auto).unwrap();
-
-        // A mesh takes the first devices of the client that its axes require.
-        let mesh = session.new_mesh([axis("x", 2), axis("y", 2)]).unwrap();
-        assert_eq!(mesh.logical_mesh(), &LogicalMesh::new(vec![axis("x", 2), axis("y", 2)]).unwrap());
-        assert_eq!(mesh.devices(), devices.as_slice());
-        let mesh = session.new_mesh([axis("x", 2)]).unwrap();
-        assert_eq!(mesh.devices(), &devices[..2]);
-
-        // Creating a mesh does not make it the mesh of the session.
-        assert!(session.mesh().is_err());
-
-        // Invalid axes and meshes that need more devices than the client has are rejected.
-        assert!(matches!(
-            session.new_mesh([axis("x", 2), axis("x", 2)]),
-            Err(Error::Core(error)) if error.to_string().contains("x"),
-        ));
-        assert!(matches!(
-            session.new_mesh([axis("x", 8)]),
-            Err(Error::Core(error)) if error.to_string().contains("8"),
-        ));
+    fn test_session_builder() {
+        // A builder without any configuration builds what `Session::new` creates.
+        let session: Session<'static> = Session::builder().build().unwrap();
+        assert!(std::ptr::eq(session.client(), Session::new().unwrap().client()));
+        assert_eq!(session.default_compilation_options(), &CompilationOptions::default());
+        assert!(session.compilation_context().disk_cache().is_none());
+        assert_eq!(session.program_count(), 0);
+        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
     }
 
     #[test]
@@ -1181,47 +1174,239 @@ mod tests {
         let session = Session::with_client(&client);
         let meshed = session.with_mesh(mesh.clone());
         assert_eq!(meshed.mesh().unwrap(), &mesh);
-        assert_eq!(meshed.clone().mesh().unwrap(), &mesh);
-        assert_eq!(meshed.fork_effect_scope().mesh().unwrap(), &mesh);
         assert!(meshed.is_same_session(&session));
         assert!(std::ptr::eq(meshed.effect_scope(), session.effect_scope()));
 
-        // A session without a mesh reports the missing mesh.
-        assert!(matches!(
-            session.mesh(),
-            Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh),
-        ));
+        // The handle that the mesh was added to is unaffected.
+        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
     }
 
     #[test]
     fn test_session_fork_effect_scope() {
         let client = execution_client();
-        let session = Session::with_client(&client);
-        let clone = session.clone();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client).with_mesh(mesh.clone());
         let fork = session.fork_effect_scope();
-        assert!(std::ptr::eq(session.client(), &client));
-        assert!(clone.is_same_session(&session));
         assert!(fork.is_same_session(&session));
-        assert!(!Session::with_client(&client).is_same_session(&session));
-        assert!(std::ptr::eq(fork.compilation_context(), session.compilation_context()));
-        assert!(std::ptr::eq(clone.effect_scope(), session.effect_scope()));
         assert!(!std::ptr::eq(fork.effect_scope(), session.effect_scope()));
+        assert_eq!(fork.mesh().unwrap(), &mesh);
+
+        // A barrier of the fork does not wait for effects that are pending in the scope that it was forked from.
         let pending = session.effect_scope().reserve(None).unwrap();
         fork.effects_barrier().unwrap();
         drop(pending);
         session.effects_barrier().unwrap();
-
-        // The shared state of a session lives for as long as any of its handles.
-        let state = Arc::downgrade(&session.state);
-        drop(session);
-        drop(clone);
-        assert!(state.upgrade().is_some());
-        drop(fork);
-        assert!(state.upgrade().is_none());
     }
 
     #[test]
-    fn test_session_constant() {
+    fn test_session_client() {
+        let client = execution_client();
+        let session = Session::with_client(&client);
+        assert!(std::ptr::eq(session.client(), &client));
+        assert!(std::ptr::eq(session.fork_effect_scope().client(), &client));
+    }
+
+    #[test]
+    fn test_session_target() {
+        let client = cpu_client(2);
+        let session = Session::with_client(&client);
+        let target = session.target().unwrap();
+        assert_eq!(target.platform_name(), client.platform_name().unwrap());
+        assert_eq!(target.devices().len(), 2);
+
+        // The target is read once and shared by all handles of the session.
+        assert!(std::ptr::eq(session.fork_effect_scope().target().unwrap(), target));
+    }
+
+    #[test]
+    fn test_session_mesh() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert_eq!(session.with_mesh(mesh.clone()).mesh().unwrap(), &mesh);
+    }
+
+    #[test]
+    fn test_session_default_compilation_options() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let compilation_options =
+            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
+        let session = Session::builder()
+            .client(&client)
+            .default_compilation_options(compilation_options.clone())
+            .build()
+            .unwrap();
+        assert_eq!(Session::with_client(&client).default_compilation_options(), &CompilationOptions::default());
+
+        // Every handle of a session returns the template that the session was built with.
+        assert_eq!(session.default_compilation_options(), &compilation_options);
+        assert_eq!(session.fork_effect_scope().default_compilation_options(), &compilation_options);
+        assert_eq!(session.with_mesh(mesh).default_compilation_options(), &compilation_options);
+    }
+
+    #[test]
+    fn test_session_compilation_context() {
+        let client = execution_client();
+        let session = Session::with_client(&client);
+        assert!(std::ptr::eq(session.clone().compilation_context(), session.compilation_context()));
+        assert!(std::ptr::eq(session.fork_effect_scope().compilation_context(), session.compilation_context()));
+        assert!(!std::ptr::eq(Session::with_client(&client).compilation_context(), session.compilation_context()));
+    }
+
+    #[test]
+    fn test_session_is_same_session() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        assert!(session.is_same_session(&session));
+        assert!(session.is_same_session(&session.clone()));
+        assert!(session.is_same_session(&session.fork_effect_scope()));
+        assert!(session.is_same_session(&session.with_mesh(mesh)));
+        assert!(!session.is_same_session(&Session::with_client(&client)));
+    }
+
+    #[test]
+    fn test_session_program_count() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        assert_eq!(session.program_count(), 0);
+        Neg::neg(&vector).unwrap();
+        assert_eq!(session.program_count(), 1);
+
+        // Repeating an eager operation compiles nothing, while an input of another type compiles another program.
+        Neg::neg(&vector).unwrap();
+        assert_eq!(session.program_count(), 1);
+        Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(session.program_count(), 2);
+    }
+
+    #[test]
+    fn test_session_eager_dispatch_statistics() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        let statistics = session.eager_dispatch_statistics();
+        assert_eq!((statistics.hits, statistics.misses), (0, 0));
+        Neg::neg(&vector).unwrap();
+        Neg::neg(&vector).unwrap();
+        let statistics = session.eager_dispatch_statistics();
+        assert_eq!((statistics.hits, statistics.misses), (1, 1));
+    }
+
+    #[test]
+    fn test_session_clear_cache() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        Neg::neg(&vector).unwrap();
+        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 1));
+
+        // Clearing empties both the eager dispatch cache and the compilation cache, so the same operation misses again.
+        session.clear_cache();
+        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (0, 0));
+        Neg::neg(&vector).unwrap();
+        assert_eq!(session.eager_dispatch_statistics().misses, 2);
+        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 1));
+    }
+
+    #[test]
+    fn test_session_new_mesh() {
+        let client = cpu_client(4);
+        let session = Session::with_client(&client);
+        let devices = session.target().unwrap().devices().iter().map(TargetDevice::device).collect::<Vec<_>>();
+        let x = MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap();
+        let y = MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap();
+
+        // A mesh takes the first devices of the client that its axes require, in the order of the client.
+        let mesh = session.new_mesh([x.clone(), y.clone()]).unwrap();
+        assert_eq!(mesh.logical_mesh(), &LogicalMesh::new(vec![x.clone(), y]).unwrap());
+        assert_eq!(mesh.devices(), devices.as_slice());
+        let mesh = session.new_mesh([x.clone()]).unwrap();
+        assert_eq!(mesh.devices(), &devices[..2]);
+
+        // Creating a mesh does not make it the mesh of the session.
+        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+
+        // Invalid axes and meshes that need more devices than the client has are rejected.
+        assert!(matches!(
+            session.new_mesh([x.clone(), x]),
+            Err(Error::Core(error))
+                if *error == CoreError::Sharding(ShardingError::DuplicateMeshAxisName { name: "x".to_string() }),
+        ));
+        assert!(matches!(
+            session.new_mesh([MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()]),
+            Err(Error::Core(error))
+                if *error == CoreError::Sharding(ShardingError::DeviceCountMismatch { expected: 8, actual: 4 }),
+        ));
+    }
+
+    #[test]
+    fn test_session_array() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let r#type = replicated_vector_type(&mesh, 2);
+        let array = session.array(r#type.clone(), mesh.clone(), values_to_bytes::<f32>(&[1.0, 2.0])).unwrap();
+        assert_eq!(array.r#type().into_owned(), r#type);
+        assert_eq!(array.mesh(), &mesh);
+        assert!(array.session().is_same_session(&session));
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_session_effects_barrier() {
+        let client = execution_client();
+        let session = Session::with_client(&client);
+        session.effects_barrier().unwrap();
+
+        // A barrier reports the failures of earlier submissions, and keeps reporting them until they are acknowledged.
+        let mut reservation = session.effect_scope().reserve(None).unwrap();
+        let completion = reservation.publish(Ok(None));
+        reservation.commit();
+        completion.complete(Err(Arc::from("effect failed")));
+        assert!(matches!(
+            session.effects_barrier(),
+            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                if failures == vec![(0, Arc::from("effect failed"))],
+        ));
+        assert!(matches!(
+            session.effects_barrier(),
+            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                if failures == vec![(0, Arc::from("effect failed"))],
+        ));
+    }
+
+    #[test]
+    fn test_session_acknowledge_effect_errors() {
+        let client = execution_client();
+        let session = Session::with_client(&client);
+        let mut reservation = session.effect_scope().reserve(None).unwrap();
+        let completion = reservation.publish(Ok(None));
+        reservation.commit();
+        completion.complete(Err(Arc::from("effect failed")));
+
+        // Failures can only be acknowledged after a barrier has reported them.
+        assert!(matches!(
+            session.acknowledge_effect_errors(),
+            Err(Error::Execution(ExecutionError::PrematureAcknowledgment)),
+        ));
+        assert!(matches!(
+            session.effects_barrier(),
+            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                if failures == vec![(0, Arc::from("effect failed"))],
+        ));
+        session.acknowledge_effect_errors().unwrap();
+        session.effects_barrier().unwrap();
+    }
+
+    #[test]
+    fn test_session_retained_constant() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = Session::with_client(&client);
@@ -1232,7 +1417,7 @@ mod tests {
         let fork = session.fork_effect_scope();
         let resolved = fork.retained_constant(&handle).unwrap();
         assert_eq!(resolved, array);
-        assert!(resolved.session().is_same_session(&session));
+        assert!(std::ptr::eq(resolved.session().effect_scope(), fork.effect_scope()));
 
         // Handles resolve only through the session that retains their arrays.
         let other_session = Session::with_client(&client);
@@ -1243,6 +1428,15 @@ mod tests {
                 session.state.id, other_session.state.id,
             ))
             .into()),
+        );
+
+        // Handles whose entries were reclaimed and reused by another array no longer resolve.
+        let stale =
+            SessionConstant::new(session.state.id, 0, handle.r#type().into_owned(), Arc::new(SessionConstantOwner));
+        assert_eq!(
+            session.retained_constant(&stale),
+            Err(TypeError::invalid(format!("session constant `{stale}` is not in the constant table of its session"))
+                .into()),
         );
     }
 
@@ -1275,6 +1469,268 @@ mod tests {
     }
 
     #[test]
+    fn test_session_named_axis() {
+        let client = execution_client();
+        assert!(Session::with_client(&client).named_axis("x").is_none());
+    }
+
+    #[test]
+    fn test_session_named_axes() {
+        let client = execution_client();
+        assert!(Session::with_client(&client).named_axes().is_empty());
+    }
+
+    #[test]
+    fn test_session_default_mesh() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        assert_eq!(session.default_mesh(), None);
+        assert_eq!(session.with_mesh(mesh.clone()).default_mesh(), Some(mesh.logical_mesh().clone()));
+    }
+
+    #[test]
+    fn test_session_error_display() {
+        assert_eq!(
+            SessionError::UnavailablePlatform { platform: Platform::Tpu, feature: "tpu" }.to_string(),
+            "platform `tpu` is unavailable because `ryft-xla` was built without its `tpu` feature",
+        );
+        assert_eq!(
+            SessionError::InvalidClientOptions { reason: "reason".to_string() }.to_string(),
+            "invalid client options: reason",
+        );
+    }
+
+    #[test]
+    fn test_session_builder_platform() {
+        // Sessions that `ryft-xla` creates clients for can be `'static`, and they share the client of their platform
+        // without sharing any session state.
+        let session: Session<'static> = Session::builder().platform(Platform::Cpu).build().unwrap();
+        let other: Session<'static> = Session::builder().platform(Platform::Cpu).build().unwrap();
+        assert!(session.target().unwrap().platform_name().eq_ignore_ascii_case("cpu"));
+        assert!(std::ptr::eq(session.client(), other.client()));
+        assert!(!session.is_same_session(&other));
+    }
+
+    #[cfg(not(feature = "tpu"))]
+    #[test]
+    fn test_session_builder_platform_rejects_platforms_without_their_feature() {
+        assert!(matches!(
+            Session::builder().platform(Platform::Tpu).build(),
+            Err(Error::Session(SessionError::UnavailablePlatform { platform: Platform::Tpu, feature: "tpu" })),
+        ));
+    }
+
+    #[test]
+    fn test_session_builder_plugin() {
+        // A plugin that the caller loaded creates a process-wide client like a platform does, and it shares the client
+        // of its platform when their client options are equal.
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() });
+        let session = Session::builder()
+            .plugin(load_cpu_plugin().unwrap())
+            .client_options(options.clone())
+            .build()
+            .unwrap();
+        let other = Session::builder().platform(Platform::Cpu).client_options(options).build().unwrap();
+        assert_eq!(session.target().unwrap().devices().len(), 2);
+        assert!(std::ptr::eq(session.client(), other.client()));
+    }
+
+    #[test]
+    fn test_session_builder_client_options() {
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() });
+        let session = Session::builder().platform(Platform::Cpu).client_options(options.clone()).build().unwrap();
+        let default_session = Session::builder().platform(Platform::Cpu).build().unwrap();
+        assert_eq!(session.target().unwrap().devices().len(), 4);
+        assert!(!std::ptr::eq(session.client(), default_session.client()));
+
+        // Client options cannot configure a client that already exists, and they require an explicit platform.
+        let client = cpu_client(1);
+        assert!(matches!(
+            Session::builder().client(&client).client_options(options.clone()).build(),
+            Err(Error::Session(SessionError::InvalidClientOptions { reason }))
+                if reason == "client options only configure a client that the session creates, but the session was \
+                              given an existing client",
+        ));
+        assert!(matches!(
+            Session::builder().client_options(options).build(),
+            Err(Error::Session(SessionError::InvalidClientOptions { reason }))
+                if reason == "client options require an explicit platform or plugin, because the platforms that \
+                              `Platform::Auto` selects among take different options",
+        ));
+    }
+
+    #[test]
+    fn test_session_builder_client() {
+        // A session over a client of the caller borrows it, and the last source that a builder is given wins.
+        let client = cpu_client(1);
+        let session = Session::builder().platform(Platform::Cpu).client(&client).build().unwrap();
+        assert!(std::ptr::eq(session.client(), &client));
+        let session = Session::builder().client(&client).platform(Platform::Cpu).build().unwrap();
+        assert!(!std::ptr::eq(session.client(), &client));
+    }
+
+    #[test]
+    fn test_session_builder_compilation_context() {
+        // The session compiles through the supplied context, whose in-memory tier here retains a single program.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::builder()
+            .client(&client)
+            .compilation_context(CompilationContext::with_capacity(1))
+            .build()
+            .unwrap();
+        Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0])).unwrap();
+        Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.compilation_context().statistics().compilations, 2);
+    }
+
+    #[test]
+    fn test_session_builder_disk_cache() {
+        let client = execution_client();
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::builder()
+            .client(&client)
+            .disk_cache(DiskCache::open(directory.path()).unwrap())
+            .build()
+            .unwrap();
+        let expected_directory = DiskCache::open(directory.path()).unwrap().directory().to_path_buf();
+        assert_eq!(session.compilation_context().disk_cache().unwrap().directory(), expected_directory);
+
+        // An explicit disk cache replaces the one of a supplied compilation context, irrespective of their order.
+        let context_directory = tempfile::tempdir().unwrap();
+        let session = Session::builder()
+            .client(&client)
+            .disk_cache(DiskCache::open(directory.path()).unwrap())
+            .compilation_context(
+                CompilationContext::new().with_disk_cache(DiskCache::open(context_directory.path()).unwrap()),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(session.compilation_context().disk_cache().unwrap().directory(), expected_directory);
+    }
+
+    #[test]
+    fn test_session_builder_disk_cache_from_env() {
+        // The session adds the disk cache that the environment configures, if any, when it is built. This test does not
+        // modify the environment of the test process, and so it compares against whatever the environment configures.
+        let client = execution_client();
+        let session = Session::builder().client(&client).disk_cache_from_env().build().unwrap();
+        assert_eq!(
+            session.compilation_context().disk_cache().map(|disk_cache| disk_cache.directory().to_path_buf()),
+            DiskCache::from_env().unwrap().map(|disk_cache| disk_cache.directory().to_path_buf()),
+        );
+    }
+
+    #[test]
+    fn test_session_builder_runtime_extensions() {
+        // The supplied configuration replaces the built-in providers, so a session with an empty configuration cannot
+        // satisfy a requirement that the default configuration satisfies.
+        let client = execution_client();
+        let requirement = builtin_requirement("ryft.ordered-io");
+        let session = Session::with_client(&client);
+        session.runtimes().ensure(std::slice::from_ref(&requirement), session.target().unwrap()).unwrap();
+        let session =
+            Session::builder().client(&client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+        assert!(matches!(
+            session.runtimes().ensure(&[requirement], session.target().unwrap()),
+            Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "ryft.ordered-io",
+        ));
+    }
+
+    #[test]
+    fn test_session_builder_default_compilation_options() {
+        let client = execution_client();
+        let compilation_options = CompilationOptions { compile_portable_executable: true, ..Default::default() };
+        let session = Session::builder()
+            .client(&client)
+            .default_compilation_options(compilation_options.clone())
+            .build()
+            .unwrap();
+        assert_eq!(session.default_compilation_options(), &compilation_options);
+    }
+
+    #[test]
+    fn test_session_builder_build() {
+        // Every build creates an independent session with a fresh effect scope and empty caches, even on one client.
+        let client = execution_client();
+        let session = Session::builder().client(&client).build().unwrap();
+        let other = Session::builder().client(&client).build().unwrap();
+        assert!(std::ptr::eq(session.client(), other.client()));
+        assert!(!session.is_same_session(&other));
+        assert!(!std::ptr::eq(session.effect_scope(), other.effect_scope()));
+        assert_eq!((session.program_count(), session.eager_dispatch_cache().len()), (0, 0));
+    }
+
+    #[test]
+    fn test_session_constant_session() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        assert_eq!(session.retain_constant(&array).session(), session.state.id);
+    }
+
+    #[test]
+    fn test_session_constant_index() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let first = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
+        let second = session.array(ArrayType::scalar(DataType::F32), mesh, 2f32.to_ne_bytes()).unwrap();
+        let handles = (session.retain_constant(&first), session.retain_constant(&second));
+        assert_eq!((handles.0.index(), handles.1.index()), (0, 1));
+    }
+
+    #[test]
+    fn test_session_constant_rename_type_identities() {
+        // Renaming keeps the session, the position, and the ownership token of a handle, and only renames its type.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let handle = session.retain_constant(&array);
+        let renamed = handle.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
+        assert_eq!(renamed, handle);
+        assert!(Arc::ptr_eq(renamed.owner(), handle.owner()));
+    }
+
+    #[test]
+    fn test_session_constant_eq() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let other_session = Session::with_client(&client);
+        let first = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
+        let second = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 2f32.to_ne_bytes()).unwrap();
+        let other = other_session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let handle = session.retain_constant(&first);
+
+        // Handles are equal when they refer to the same position of the same session with the same type.
+        assert_eq!(handle, handle.clone());
+        assert_eq!(handle, session.retain_constant(&first));
+        assert_ne!(handle, session.retain_constant(&second));
+        assert_ne!(handle, other_session.retain_constant(&other));
+    }
+
+    #[test]
+    fn test_session_constant_hash() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let first = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
+        let second = session.array(ArrayType::scalar(DataType::F32), mesh, 2f32.to_ne_bytes()).unwrap();
+        let handle = session.retain_constant(&first);
+        let other = session.retain_constant(&second);
+        assert_eq!(hash_of(&handle), hash_of(&session.retain_constant(&first)));
+        assert_ne!(hash_of(&handle), hash_of(&other));
+        let constants = HashMap::from([(handle.clone(), "first"), (other.clone(), "second")]);
+        assert_eq!(constants.get(&session.retain_constant(&first)), Some(&"first"));
+        assert_eq!(constants.get(&other), Some(&"second"));
+    }
+
+    #[test]
     fn test_session_constant_display() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1285,11 +1741,35 @@ mod tests {
     }
 
     #[test]
-    fn test_session_constant_conversion_rejects_references() {
+    fn test_session_constant_type() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::with_client(&client);
+        let array = session
+            .array(replicated_scalar_type(&mesh, DataType::F32), mesh.clone(), 1f32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(session.retain_constant(&array).r#type().into_owned(), replicated_scalar_type(&mesh, DataType::F32));
+    }
+
+    #[test]
+    fn test_session_constant() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = Session::with_client(&client);
         let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+
+        // Arrays are retained by their session and become handles to their retained storage.
+        let Ok(Constant::Session(handle)) = session_constant(Value::Array(array.clone())) else {
+            panic!("an array was not converted into a session constant");
+        };
+        assert_eq!(session.retained_constant(&handle).unwrap(), array);
+
+        // Dimensions become immediate constants, and references are rejected.
+        let extent = DimensionValue::constant(2).unwrap();
+        assert_eq!(
+            session_constant(Value::Dimension(Dimension::new(extent.clone(), session.clone()))),
+            Ok(Constant::Dimension(extent)),
+        );
         assert_eq!(
             session_constant(Value::Reference(Reference::new(ArrayReference::new(array), session))),
             Err(TypeError::invalid("cannot import an xla reference into a trace whose capture table holds constants")
@@ -1469,67 +1949,5 @@ mod tests {
         drop(input);
         drop(restored_session);
         drop(session);
-    }
-
-    #[test]
-    fn test_session_clear_cache_clears_the_eager_dispatch_cache() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
-        let inputs = [Value::Array(f32_vector(&session, &mesh, &[1.0, 2.0]))];
-        session.bind(Operation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
-        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 1));
-        session.clear_cache();
-        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (0, 0));
-        session.bind(Operation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
-        assert_eq!(session.eager_dispatch_statistics().misses, 2);
-    }
-
-    #[test]
-    fn test_session_clear_cache_clears_the_compilation_cache() {
-        let client = cpu_client(4);
-        let engine = Session::with_client(&client);
-        let mesh = four_device_mesh_x(&client);
-
-        let values = [80.0f32, 81.0, 82.0, 83.0];
-        let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
-            .with_sharding(replicated_sharding)
-            .unwrap();
-        let source_array =
-            Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
-        let target_sharding =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        let _ = source_array
-            .to_placement(&engine, crate::arrays::DevicePutTarget::Placement { mesh, sharding: target_sharding })
-            .unwrap();
-        assert_eq!(engine.program_count(), 1);
-        engine.clear_cache();
-        assert_eq!(engine.program_count(), 0);
-    }
-
-    #[test]
-    fn test_session_acknowledge_effect_errors() {
-        let client = execution_client();
-        let session = Session::with_client(&client);
-        let mut reservation = session.effect_scope().reserve(None).unwrap();
-        let completion = reservation.publish(Ok(None));
-        reservation.commit();
-        completion.complete(Err(Arc::from("effect failed")));
-
-        // Failures can only be acknowledged after a barrier has reported them.
-        assert!(matches!(
-            session.acknowledge_effect_errors(),
-            Err(Error::Execution(ExecutionError::PrematureAcknowledgment)),
-        ));
-        assert!(matches!(
-            session.effects_barrier(),
-            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
-                if failures == vec![(0, Arc::from("effect failed"))],
-        ));
-        session.acknowledge_effect_errors().unwrap();
-        session.effects_barrier().unwrap();
     }
 }

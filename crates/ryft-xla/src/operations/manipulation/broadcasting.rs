@@ -361,7 +361,6 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::{domain_mesh, replicated_vector_type};
     use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
         ragged_dot_cpu_compilation_options, shard_map_module, test_manual_mesh, test_spmd_compilation_options,
@@ -369,6 +368,7 @@ mod tests {
     };
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, ExecutionArguments, FromPjrt, Session, compile,

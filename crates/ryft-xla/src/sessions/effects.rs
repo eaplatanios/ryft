@@ -388,8 +388,8 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::domains::sessions::Session;
-    use crate::domains::tests::{domain_mesh, f64_vector};
+    use crate::sessions::Session;
+    use crate::sessions::tests::{domain_mesh, f64_vector};
     use crate::tests::{cpu_client, execution_client, values_to_bytes};
     use crate::{
         Array, CompilationError, Constant, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,

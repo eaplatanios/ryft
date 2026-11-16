@@ -2337,7 +2337,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
-    use crate::domains::tests::domain_mesh;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{
         assert_send_sync, cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, replicated_array,
         values_from_bytes, values_to_bytes,
