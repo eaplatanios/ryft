@@ -277,7 +277,7 @@ fn execute_collective_inputs(
             .collect::<Result<Vec<_>, _>>()?;
         let input_type = ArrayType::new_static(DataType::F32, global_shape.to_vec()).with_sharding(sharding.clone())?;
         arrays.push(Array::from_addressable_buffers(
-            &Session::with_client(client),
+            &Session::builder().client(client).build()?,
             input_type,
             device_mesh.clone(),
             buffers,

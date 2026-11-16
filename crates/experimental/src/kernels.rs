@@ -415,7 +415,7 @@ fn execute_aot_case<'c>(
         vec![Device::from_pjrt(&device).unwrap()],
     )
     .unwrap();
-    let producer = Session::with_client(client);
+    let producer = Session::builder().client(client).build().unwrap();
     let bundle = KernelAotBundle::compile(
         &definition,
         &producer,
@@ -430,7 +430,7 @@ fn execute_aot_case<'c>(
     drop(bundle);
     drop(producer);
     let restored = KernelAotBundle::from_bytes(&bytes, 1024).unwrap();
-    let runtime = Session::with_client(client);
+    let runtime = Session::builder().client(client).build().unwrap();
     let loaded = restored.load(&runtime, &deployment_binding, &mesh).unwrap();
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
@@ -687,7 +687,7 @@ mod gpu {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = Session::with_client(client);
+        let session = Session::builder().client(client).build()?;
         let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
             |inputs: Vec<CompileTracer<'_>>| {
                 let values = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
@@ -1377,7 +1377,7 @@ mod cutile {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = Session::with_client(client);
+        let producer = Session::builder().client(client).build()?;
         let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs: Vec<ryft_core::CompilationTracer<Session<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
@@ -1394,7 +1394,7 @@ mod cutile {
             CompiledKernel::from_manifest(&verified, output.manifest(), output.artifact().bytes().to_vec()).unwrap();
         assert_eq!(restored_output.artifact().bytes(), output.artifact().bytes());
         assert_eq!(restored_output.arguments(), output.arguments());
-        let runtime_session = Session::with_client(client);
+        let runtime_session = Session::builder().client(client).build()?;
         let runtime = runtime_session.clone();
         let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
         let executable = compiled.executable().with_compiled_program(Arc::new(restored));
@@ -1574,7 +1574,7 @@ mod cutile {
                     Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
                 let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
                 let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
-                let session = Session::with_client(&client);
+                let session = Session::builder().client(&client).build().unwrap();
                 let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
                     |input: CompileTracer<'_>| {
                         shard_map(
@@ -1832,7 +1832,7 @@ mod tuning {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = Session::with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let facts = KernelExecutionFacts::from_target(session.target().unwrap(), &mesh).unwrap();
         let candidates = vec![
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(1).unwrap()),
@@ -2306,7 +2306,7 @@ mod triton {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = Session::with_client(client);
+        let producer = Session::builder().client(client).build().unwrap();
         let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs: Vec<ryft_core::CompilationTracer<Session<'c>>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
@@ -2319,7 +2319,7 @@ mod triton {
         let compiled = staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let bytes = producer.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
-        let session = Session::with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let runtime = session.clone();
         let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
         let executable = compiled.executable().with_compiled_program(Arc::new(restored));

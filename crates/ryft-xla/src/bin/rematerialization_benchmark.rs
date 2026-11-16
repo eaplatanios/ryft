@@ -29,16 +29,16 @@ use std::time::{Duration, Instant};
 use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
     ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, Context, DataType, Device, DeviceMesh,
-    Dimension as CoreDimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh,
-    Memory, MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce,
-    ReductionKind, RematerializationOptimizationBarrier, ResidualPolicy, SaveAndOffloadOnlyTheseNames, ScanOperation,
-    Shape, Sharding, StagedFunction as CoreStagedFunction, Tag, Tanh, Typed, Value as CoreValue, ValueProjection,
-    differentiate_at, rematerialize,
+    Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory,
+    MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
+    RematerializationOptimizationBarrier, ResidualPolicy, SaveAndOffloadOnlyTheseNames, ScanOperation, Shape, Sharding,
+    StagedFunction as CoreStagedFunction, Tag, Tanh, Typed, Value as CoreValue, ValueProjection, differentiate_at,
+    rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
-use ryft_xla::{Array, FromPjrt, Operation, Options, Session, Value};
+use ryft_xla::{Array, FromPjrt, Operation, Options, Session, Tracer, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -47,9 +47,6 @@ const UP_PROJECTION_NAME: &str = "up_projection";
 
 /// Name of the tag of the second dot product of a layer, `tanh(h · w₁) · w₂`, under [`Checkpointing::OffloadNames`].
 const DOWN_PROJECTION_NAME: &str = "down_projection";
-
-/// Tracer over which the benchmarked functions are staged.
-type Tracer<'c> = DomainTracer<Session<'c>>;
 
 /// Input types of a benchmarked gradient, which are the hidden state and the two parameter matrices.
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
@@ -579,7 +576,7 @@ fn main() -> Result<(), ProgramError> {
     let device = Device::from_pjrt(&client.addressable_devices().unwrap().remove(0)).unwrap();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
-    let session = Session::with_client(client);
+    let session = Session::builder().client(client).build().unwrap();
     println!("platform: {}", client.platform_name().unwrap());
 
     // Runtime of a model that scans over its layers.

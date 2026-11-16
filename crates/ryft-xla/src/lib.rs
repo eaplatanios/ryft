@@ -53,7 +53,7 @@ pub use distributed::DistributedRuntime;
 pub use domains::{
     ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, Platform, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError,
     RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, SessionBuilder, SessionConstant,
-    SessionError, Target, TargetDevice, ThroughSession, named_ffi_type_id, normalize_runtime_requirements,
+    SessionError, Target, TargetDevice, ThroughSession, Tracer, named_ffi_type_id, normalize_runtime_requirements,
     runtime_requirements, with_runtime_requirements,
 };
 pub use errors::Error;

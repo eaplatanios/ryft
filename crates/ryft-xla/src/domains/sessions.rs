@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, CapturingContext, CompilationContext, Context, DeviceMesh, DiskCache, Domain,
+    ArrayIrType, ArrayType, CapturingContext, CompilationContext, Context, DeviceMesh, DiskCache, Domain, DomainTracer,
     ImportingContext, LogicalMesh, MeshAxis, MeshContext, NamedAxes, NamedAxis, NestedTracingContext, Parameter,
     ProgramError, SpecializationCache, SpecializationCacheStatistics, TracingContext, Type, TypeError,
     TypeIdentityRenaming, Typed,
@@ -64,9 +64,9 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 /// [`SessionBuilder::platform`], [`SessionBuilder::plugin`], and [`SessionBuilder::client_options`] select and
 /// configure the client that the session creates. Clients that are created this way live for the rest of the process
 /// and are shared by the sessions that request the same configuration, so their sessions can be `Session<'static>`.
-/// [`SessionBuilder::client`] and its shorthand [`Self::with_client`] instead take a client that the caller created
-/// and owns, which is the extension point for clients that `ryft-xla` cannot create and for programs that must
-/// destroy their client. [`Self::new_mesh`] creates device meshes over the devices of the client.
+/// [`SessionBuilder::client`] instead takes a client that the caller created and owns, which is the extension point
+/// for clients that `ryft-xla` cannot create and for programs that must destroy their client. [`Self::new_mesh`]
+/// creates device meshes over the devices of the client.
 ///
 /// # Shared and Selected State
 ///
@@ -124,7 +124,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 /// ```compile_fail
 /// use ryft_xla::Session;
 /// fn escaped(client: ryft_pjrt::Client<'_>) {
-///     let session = Session::with_client(&client);
+///     let session = Session::builder().client(&client).build().unwrap();
 ///     drop(client);
 ///     session.effects_barrier().unwrap();
 /// }
@@ -211,9 +211,11 @@ impl<'c> Session<'c> {
     }
 
     /// Creates an independent session over `client`, which the caller owns, with an empty in-memory compilation cache
-    /// and a fresh effect scope. This is a shorthand for a [`SessionBuilder`] that is only given
-    /// [`SessionBuilder::client`], which cannot fail.
-    pub fn with_client(client: &'c Client<'c>) -> Self {
+    /// and a fresh effect scope, for the unit tests of this crate. This is what a [`SessionBuilder`] that is only given
+    /// [`SessionBuilder::client`] builds, without the [`Result`] of [`SessionBuilder::build`], which cannot be an
+    /// error for that configuration.
+    #[cfg(test)]
+    pub(crate) fn with_client(client: &'c Client<'c>) -> Self {
         Self::from_parts(client, CompilationContext::new(), RuntimeExtensions::new(), CompilationOptions::default())
     }
 
@@ -478,6 +480,9 @@ impl MeshContext for Session<'_> {
     }
 }
 
+/// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
+pub type Tracer<'c> = DomainTracer<Session<'c>>;
+
 /// Invalid configuration of a [`SessionBuilder`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionError {
@@ -512,7 +517,7 @@ enum DiskCacheSource {
 }
 
 /// Builder of [`Session`]s, which [`Session::builder`] returns and which is the one interface for configuring their
-/// construction. [`Session::new`] and [`Session::with_client`] are shorthands for its two most common uses.
+/// construction. [`Session::new`] is a shorthand for building a session without any configuration.
 ///
 /// A builder first selects the PJRT client of the session. By default, the session creates its own client for
 /// [`Platform::Auto`]. [`Self::platform`] requests a specific platform, [`Self::plugin`] uses a PJRT plugin that
@@ -827,7 +832,7 @@ struct RetainedConstant<'c> {
 }
 
 /// Converts `value` into the immediate [`Constant`] that a trace capturing constants stages for it.
-fn session_constant<'c>(value: Value<'c>) -> Result<Constant, ProgramError> {
+fn session_constant(value: Value) -> Result<Constant, ProgramError> {
     match value {
         Value::Array(array) => Ok(Constant::Session(array.session().retain_constant(&array))),
         Value::Dimension(dimension) => Ok(Constant::Dimension(dimension.into_value())),

@@ -9,26 +9,25 @@
 //! A [`Session`] executes on one PJRT [`Client`](ryft_pjrt::Client) and is a cheap handle to the resources that it
 //! creates for that client, which are its compilation cache, runtime extension resources, and default compilation
 //! options. [`Session::new`] creates a session on a client that it creates for the best available [`Platform`], and
-//! [`Session::builder`] configures everything else. [`SessionBuilder::client`] or its shorthand
-//! [`Session::with_client`] borrows a client that the caller owns instead. Clone a session wherever another handle is
-//! needed. Clones share its resources, while creating another session gives an independent cache and effect scope,
-//! even on the same client. Configure built-in or downstream providers through [`RuntimeExtensions`] and
-//! [`SessionBuilder::runtime_extensions`]. Each session initializes its own runtime instances lazily when an
-//! executable requires them.
+//! [`Session::builder`] allows configuring everything in detail. Clone a session wherever another handle is needed.
+//! Clones share its resources, while creating another session gives an independent cache and effect scope, even on
+//! the same client. Configure built-in or downstream providers through [`RuntimeExtensions`] and
+//! [`SessionBuilder::runtime_extensions`]. Each session initializes its own runtime instances
+//! lazily when an executable requires them.
 //!
-//! [`Options`](crate::Options) supplies the execution [`DeviceMesh`](ryft_core::DeviceMesh), sharding overrides,
-//! donation flags, and backend compilation policies for a staged function. The session's default
+//! [`Options`](crate::Options) supplies the execution [`DeviceMesh`](ryft_core::DeviceMesh), sharding
+//! overrides, donation flags, and backend compilation policies for a staged function. The session's default
 //! [`CompilationOptions`](ryft_pjrt::protos::CompilationOptions) supply the underlying PJRT compiler settings.
 //! [`Target`] describes the client's platform and devices without retaining live device handles.
 //!
 //! # Compilation and Execution
 //!
 //! The [`crate::compilation`] module implements compilation for a session and [`crate::execution`] implements
-//! execution. Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained dispatcher
-//! that specializes on its runtime inputs. The backend also implements the generic lifecycle in
+//! execution. Use [`compile`](crate::compile) for a compiled function or [`jit`](crate::jit) for a retained
+//! dispatcher that specializes on its runtime inputs. The backend also implements the generic lifecycle in
 //! [`ryft_core::compilation`]. When staging directly through [`ryft_core::StagedFunction::stage`], apply
-//! [`with_input_shardings`](crate::with_input_shardings) to the input types first if the options specify input sharding
-//! overrides.
+//! [`with_input_shardings`](crate::with_input_shardings) to the input types first if the options specify
+//! input sharding overrides.
 //!
 //! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
 //! [`CompiledProgram`](crate::CompiledProgram) contains the loaded executable and its invocation contract. These flat
@@ -50,8 +49,6 @@
 //! those effects must be observed. Sessions and their values borrow the client and cannot outlive it. Clients that
 //! `ryft-xla` creates for sessions live for the rest of the process.
 
-use ryft_core::DomainTracer;
-
 pub mod eager;
 pub mod effects;
 pub mod platforms;
@@ -65,83 +62,20 @@ pub use runtimes::{
     RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id, normalize_runtime_requirements,
     runtime_requirements, with_runtime_requirements,
 };
-pub use sessions::{Session, SessionBuilder, SessionConstant, SessionError, ThroughSession};
+pub use sessions::{Session, SessionBuilder, SessionConstant, SessionError, ThroughSession, Tracer};
 pub use targets::{Target, TargetDevice};
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Tracer shape used while staging XLA programs directly from types.
-pub(crate) type Tracer<'c> = DomainTracer<Session<'c>>;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::RefCell;
-
     use ryft_core::{
         ArrayIrType, ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis,
-        MeshAxisType, Placeholder, ProjectedContext, ReferenceCompletion as CoreReferenceCompletion,
-        ReferenceReadOperation, ReferenceType, Shape, Sharding,
+        MeshAxisType, Placeholder, ProjectedContext, ReferenceReadOperation, ReferenceType, Shape, Sharding,
     };
     use ryft_pjrt::Client;
 
     use crate::domains::sessions::Session;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, Constant, FlatProgram, FromPjrt, ProgramBuilder, Value};
-
-    /// Deterministic failure point of stateful execution, used by regression tests of its transaction protocol.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub(crate) enum StatefulFailureInjection {
-        /// Fails immediately before PJRT submission, after argument preparation but before publication.
-        BeforeSubmission,
-
-        /// Fails after mutable inputs cross the execution handoff boundary.
-        AfterHandoff,
-
-        /// Fails after state publication but before the hidden replacements of final states are reconstructed and
-        /// committed.
-        BeforeHiddenReplacementCommit,
-
-        /// Fails after the hidden replacements of final states are committed but before public outputs are
-        /// reconstructed.
-        BeforePublicReconstruction,
-    }
-
-    std::thread_local! {
-        /// One-shot failure injection scoped to the invoking test thread.
-        static STATEFUL_FAILURE_INJECTION: std::cell::Cell<Option<StatefulFailureInjection>> = const {
-            std::cell::Cell::new(None)
-        };
-
-        /// One-shot dependency, independent of the backend, joined into the next stateful execution on the current
-        /// test thread.
-        static STATEFUL_COMPLETION_INJECTION: RefCell<Option<CoreReferenceCompletion>> = const { RefCell::new(None) };
-    }
-
-    /// Consumes the pending failure only when execution reaches its selected injection point.
-    pub(crate) fn take_stateful_failure_injection(expected: StatefulFailureInjection) -> bool {
-        STATEFUL_FAILURE_INJECTION.with(|injection| {
-            if injection.get() != Some(expected) {
-                return false;
-            }
-            injection.set(None);
-            true
-        })
-    }
-
-    /// Takes the dependency to join into the next stateful execution on the current test thread.
-    pub(crate) fn take_stateful_completion_injection() -> Option<CoreReferenceCompletion> {
-        STATEFUL_COMPLETION_INJECTION.with(|injection| injection.borrow_mut().take())
-    }
-
-    /// Injects one deterministic failure into the next stateful call on the current test thread.
-    pub(crate) fn inject_stateful_failure(failure: StatefulFailureInjection) {
-        STATEFUL_FAILURE_INJECTION.with(|injection| injection.set(Some(failure)));
-    }
-
-    /// Joins one deterministic dependency into the next stateful call on the current test thread.
-    pub(crate) fn inject_stateful_completion(completion: CoreReferenceCompletion) {
-        STATEFUL_COMPLETION_INJECTION.with(|injection| *injection.borrow_mut() = Some(completion));
-    }
 
     /// Builds a one-axis mesh from the client's addressable devices for domain tests.
     pub(crate) fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {

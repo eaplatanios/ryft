@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let device = Device::from_pjrt(&client.addressable_devices()?.remove(0))?;
     let mesh = DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto)?])?, vec![device])?;
-    let session = Session::with_client(&client);
+    let session = Session::builder().client(&client).build()?;
     let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?;
     let bytes = (0..8).flat_map(|index| (index as f32).to_ne_bytes()).collect::<Vec<_>>();

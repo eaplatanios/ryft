@@ -371,7 +371,7 @@ fn jit_eager_gradient(
     iterations: usize,
     smoke: bool,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
-    let session = Session::with_client(client);
+    let session = Session::builder().client(client).build()?;
     let r#type = replicated_f32_type(mesh, &[])?;
     let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
         |_, input: CompileTracer<'_>| {
@@ -521,7 +521,7 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let jit_eager_gradient = jit_eager_gradient(&client, &mesh, arguments.iterations, arguments.smoke)?;
 
     // Repeated reverse mode construction of the gradient of `sum(sin(x))` over an `f32[4, 4]` input.
-    let session = Session::with_client(&client);
+    let session = Session::builder().client(&client).build()?;
     let r#type = replicated_f32_type(&mesh, &[4, 4])?;
     let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
         |x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(),
@@ -532,14 +532,14 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let gradient_construction = repeated_construction(&session, arguments.iterations, || compiled.gradient(&session))?;
 
     // Repeated forward mode construction of the JVP of `cos(sin(x))` over an `f32[4, 4]` input.
-    let session = Session::with_client(&client);
+    let session = Session::builder().client(&client).build()?;
     let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
         compile(|x| x.sin().unwrap().cos().unwrap(), r#type, &session, mesh.clone())?;
     let jvp_construction = repeated_construction(&session, arguments.iterations, || compiled.jvp(&session))?;
 
     // Transformations of a short and a long shared callee, whose difference isolates the frontend cost that grows with
     // the callee.
-    let session = Session::with_client(&client);
+    let session = Session::builder().client(&client).build()?;
     let callee_operation_counts = if arguments.smoke { SMOKE_CALLEE_OPERATION_COUNTS } else { CALLEE_OPERATION_COUNTS };
     let callees = callee_operation_counts
         .into_iter()
@@ -607,7 +607,7 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let (client, cuda) = platform_client()?;
     let client = Box::leak(Box::new(client));
     let mesh = mesh(client)?;
-    let session = Session::with_client(client);
+    let session = Session::builder().client(client).build()?;
     let dimensions @ [batch, sequence, heads, head_dimension] =
         if arguments.smoke { SMOKE_ATTENTION_DIMENSIONS } else { ATTENTION_DIMENSIONS };
     let r#type = ArrayType::new_static(DataType::BF16, dimensions)
@@ -717,7 +717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let mesh = mesh(&client)?;
     let r#type = input_type(&mesh, arguments.size)?;
-    let session = Session::with_client(&client);
+    let session = Session::builder().client(&client).build()?;
     let input = input_array(&session, &mesh, r#type.clone(), arguments.size)?;
     input.block_until_ready()?;
     let start = Instant::now();

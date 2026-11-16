@@ -81,7 +81,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let devices = devices.iter().take(2).map(|device| Device::from_pjrt(device).unwrap()).collect();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-    let session = Session::with_client(&client);
+    let session = Session::builder().client(&client).build().unwrap();
     let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let item_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
     let boundary =

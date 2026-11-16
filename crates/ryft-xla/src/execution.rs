@@ -33,10 +33,6 @@ use ryft_pjrt::{
 use crate::arrays::ArrayOutputLayout;
 use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
 use crate::domains::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
-#[cfg(test)]
-use crate::domains::tests::{
-    StatefulFailureInjection, take_stateful_completion_injection, take_stateful_failure_injection,
-};
 use crate::lowering::signature::ExecutableSignature;
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, FromPjrt, RuntimeRequirement, Session,
@@ -894,7 +890,7 @@ impl<'c> Session<'c> {
                     let mut completions = dependencies.clone();
                     completions.push(CoreReferenceCompletion::new(ReferenceCompletion { fence: fence.clone() }));
                     #[cfg(test)]
-                    if let Some(injected) = take_stateful_completion_injection() {
+                    if let Some(injected) = tests::take_stateful_completion_injection() {
                         completions.push(injected);
                     }
                     let completion = CoreReferenceCompletion::joined(completions);
@@ -944,7 +940,9 @@ impl<'c> Session<'c> {
             debug_assert!(prepared_replacements.is_empty());
             let replacements = (|| -> Result<Vec<_>, Error> {
                 #[cfg(test)]
-                if take_stateful_failure_injection(StatefulFailureInjection::BeforeHiddenReplacementCommit) {
+                if tests::take_stateful_failure_injection(
+                    tests::StatefulFailureInjection::BeforeHiddenReplacementCommit,
+                ) {
                     return Err(Error::Pjrt(ryft_pjrt::Error::internal(
                         "injected failure before hidden state replacement commit".to_string(),
                     )));
@@ -1024,7 +1022,7 @@ impl<'c> Session<'c> {
 
             let public_result = (|| -> Result<_, Error> {
                 #[cfg(test)]
-                if take_stateful_failure_injection(StatefulFailureInjection::BeforePublicReconstruction) {
+                if tests::take_stateful_failure_injection(tests::StatefulFailureInjection::BeforePublicReconstruction) {
                     return Err(Error::Pjrt(ryft_pjrt::Error::internal(
                         "injected failure before public output reconstruction".to_string(),
                     )));
@@ -1135,7 +1133,7 @@ impl<'c> Session<'c> {
                 .all(|inputs| inputs.len() == program.signature().physical_input_count())
         );
         #[cfg(test)]
-        if take_stateful_failure_injection(StatefulFailureInjection::BeforeSubmission) {
+        if tests::take_stateful_failure_injection(tests::StatefulFailureInjection::BeforeSubmission) {
             return Err(Error::Pjrt(ryft_pjrt::Error::internal(
                 "injected failure before execution submission".to_string(),
             )));
@@ -1194,7 +1192,7 @@ impl<'c> Session<'c> {
         }
 
         #[cfg(test)]
-        if take_stateful_failure_injection(StatefulFailureInjection::AfterHandoff) {
+        if tests::take_stateful_failure_injection(tests::StatefulFailureInjection::AfterHandoff) {
             return Err(Error::Pjrt(ryft_pjrt::Error::internal(
                 "injected failure after execution handoff".to_string(),
             )));
@@ -1520,6 +1518,7 @@ fn validate_compiled_output_refinements(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::Duration;
@@ -1539,9 +1538,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use crate::domains::tests::{
-        boolean_vector, domain_mesh, f32_scalar, f32_vector, inject_stateful_completion, inject_stateful_failure,
-        program_array, read_f32s, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
-        two_device_mesh,
+        boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_f32s, read_sharded_f32_array,
+        replicated_scalar_type, replicated_vector_type, two_device_mesh,
     };
     use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
@@ -1552,6 +1550,61 @@ mod tests {
     };
 
     use super::*;
+
+    /// Deterministic failure point of stateful execution, used by regression tests of its transaction protocol.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub(super) enum StatefulFailureInjection {
+        /// Fails immediately before PJRT submission, after argument preparation but before publication.
+        BeforeSubmission,
+
+        /// Fails after mutable inputs cross the execution handoff boundary.
+        AfterHandoff,
+
+        /// Fails after state publication but before the hidden replacements of final states are reconstructed and
+        /// committed.
+        BeforeHiddenReplacementCommit,
+
+        /// Fails after the hidden replacements of final states are committed but before public outputs are
+        /// reconstructed.
+        BeforePublicReconstruction,
+    }
+
+    thread_local! {
+        /// One-shot failure injection scoped to the invoking test thread.
+        static STATEFUL_FAILURE_INJECTION: Cell<Option<StatefulFailureInjection>> = const {
+            Cell::new(None)
+        };
+
+        /// One-shot dependency, independent of the backend, joined into the next stateful execution on the current
+        /// test thread.
+        static STATEFUL_COMPLETION_INJECTION: RefCell<Option<CoreReferenceCompletion>> = const { RefCell::new(None) };
+    }
+
+    /// Consumes the pending failure only when execution reaches its selected injection point.
+    pub(super) fn take_stateful_failure_injection(expected: StatefulFailureInjection) -> bool {
+        STATEFUL_FAILURE_INJECTION.with(|injection| {
+            if injection.get() != Some(expected) {
+                return false;
+            }
+            injection.set(None);
+            true
+        })
+    }
+
+    /// Takes the dependency to join into the next stateful execution on the current test thread.
+    pub(super) fn take_stateful_completion_injection() -> Option<CoreReferenceCompletion> {
+        STATEFUL_COMPLETION_INJECTION.with(|injection| injection.borrow_mut().take())
+    }
+
+    /// Injects one deterministic failure into the next stateful call on the current test thread.
+    fn inject_stateful_failure(failure: StatefulFailureInjection) {
+        STATEFUL_FAILURE_INJECTION.with(|injection| injection.set(Some(failure)));
+    }
+
+    /// Joins one deterministic dependency into the next stateful call on the current test thread.
+    fn inject_stateful_completion(completion: CoreReferenceCompletion) {
+        STATEFUL_COMPLETION_INJECTION.with(|injection| *injection.borrow_mut() = Some(completion));
+    }
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
     #[derive(Clone)]

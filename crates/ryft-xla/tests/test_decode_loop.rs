@@ -491,7 +491,7 @@ fn read_i32_array(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
 fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
     let client = cpu_client(1);
     let mesh = domain_mesh(&client, "x", 1);
-    let engine = Session::with_client(&client);
+    let engine = Session::builder().client(&client).build().unwrap();
     if attention == DecodeAttention::CustomCall {
         ensure_decode_attention_handler_registered(&client).unwrap();
     }
