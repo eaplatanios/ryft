@@ -130,10 +130,11 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// the session that it belongs to, so eager operations and transforms recover their execution context from their
 /// inputs, and first-class dimensions can produce arrays (e.g., when compared or converted to scalars) without an
 /// explicit context. Handles are cheap to clone. Build one session per client and derive every other handle from it
-/// (i.e., through [`Clone`], [`Self::with_mesh`], or [`Self::with_new_effect_scope`]) so that all arrays on that client
-/// share one compilation cache and one set of runtime extensions. Separate sessions remain independent, even on the
-/// same client, so building a second session is an explicit request for an isolated cache and effect ordering. Cached
-/// executables retain neither sessions nor arrays, so the ownership graph has no cycle between caches and sessions.
+/// (i.e., through [`Clone`], [`Self::with_device_mesh`], or [`Self::with_new_effect_scope`]) so that all arrays on
+/// that client share one compilation cache and one set of runtime extensions. Separate sessions remain independent,
+/// even on the same client, so building a second session is an explicit request for an isolated cache and effect
+/// ordering. Cached executables retain neither sessions nor arrays, so the ownership graph has no cycle between
+/// caches and sessions.
 ///
 /// The same type covers both staging and eager execution. Every session is backed by a live PJRT client. Tracing only
 /// uses the session as a type witness and never needs an instance without a client, while compiling ahead of time
@@ -148,7 +149,7 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// request the same configuration. [`SessionBuilder::client`] instead takes a client that the caller created, which
 /// is the extension point for clients that Ryft's XLA backend cannot directly create. Every client of a session lives
 /// for the rest of the process and is never destroyed, which is why sessions and their values carry no lifetime for
-/// their underlying clients. [`Self::new_mesh`] creates device meshes over the devices of the client.
+/// their underlying clients. [`Self::mesh`] creates device meshes over the devices of the client.
 ///
 /// # Shared and Selected State
 ///
@@ -325,7 +326,7 @@ impl Session {
 
     /// Returns the default [`DeviceMesh`] of this [`Session`], or [`ArrayError::MissingMesh`] if this session has no
     /// default mesh. Eager binds execute on the mesh of their array inputs and only use this mesh when they have none.
-    /// Refer to [`Self::with_mesh`] for more information.
+    /// Refer to [`Self::with_device_mesh`] for more information.
     #[inline]
     pub fn device_mesh(&self) -> Result<&DeviceMesh, Error> {
         self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
@@ -374,7 +375,7 @@ impl Session {
     /// [`ShardingError`](ryft_core::ShardingError) if `axes` do not form a valid mesh or require more devices than
     /// the client has.
     #[inline]
-    pub fn new_mesh<A: IntoIterator<Item = MeshAxis>>(&self, axes: A) -> Result<DeviceMesh, Error> {
+    pub fn mesh<A: IntoIterator<Item = MeshAxis>>(&self, axes: A) -> Result<DeviceMesh, Error> {
         let logical_mesh = LogicalMesh::new(axes.into_iter().collect())?;
         let devices = self
             .target()?
@@ -391,11 +392,11 @@ impl Session {
     /// distributed over the devices.
     ///
     /// The array is placed like every other eager value that is created from no array inputs (e.g., constants and
-    /// zeros). It lives on the mesh of this handle, if the handle has one, so `session.with_mesh(mesh).array(..)`
-    /// uploads to a specific mesh. Otherwise, a sharding of `r#type` supplies a logical mesh that is laid over the
-    /// addressable devices of the client, in the order in which the client reports them. A type without a sharding
-    /// is placed on the first addressable device alone, on a mesh with the single axis `x`. In all cases, a type
-    /// without a sharding is replicated over the resulting mesh.
+    /// zeros). It lives on the mesh of this handle, if the handle has one, so
+    /// `session.with_device_mesh(mesh).array(..)` uploads to a specific mesh. Otherwise, a sharding of `r#type`
+    /// supplies a logical mesh that is laid over the addressable devices of the client, in the order in which the
+    /// client reports them. A type without a sharding is placed on the first addressable device alone, on a mesh with
+    /// the single axis `x`. In all cases, a type without a sharding is replicated over the resulting mesh.
     ///
     /// # Errors
     ///
@@ -966,9 +967,9 @@ impl NamedAxes for Session {
 
 impl MeshContext for Session {
     fn default_mesh(&self) -> Option<LogicalMesh> {
-        // A session handle that was given a device mesh through `Session::with_mesh` owns the logical view of that
-        // mesh as its default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), as under
-        // JAX's `jax.set_mesh`. A handle without a mesh has no default.
+        // A session handle that was given a device mesh through `Session::with_device_mesh` owns the logical view of
+        // that mesh as its default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), as
+        // under JAX's `jax.set_mesh`. A handle without a mesh has no default.
         self.mesh.as_ref().map(|mesh| mesh.logical_mesh().clone())
     }
 }
@@ -1791,7 +1792,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_with_mesh() {
+    fn test_session_with_device_mesh() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
@@ -1842,7 +1843,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_mesh() {
+    fn test_session_device_mesh() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
@@ -1936,7 +1937,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_new_mesh() {
+    fn test_session_mesh() {
         let client = cpu_client(4);
         let session = session_with_client(client);
         let devices = session.target().unwrap().devices().iter().map(TargetDevice::device).collect::<Vec<_>>();
@@ -1944,10 +1945,10 @@ pub(crate) mod tests {
         let y = MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap();
 
         // A mesh takes the first devices of the client that its axes require, in the order of the client.
-        let mesh = session.new_mesh([x.clone(), y.clone()]).unwrap();
+        let mesh = session.mesh([x.clone(), y.clone()]).unwrap();
         assert_eq!(mesh.logical_mesh(), &LogicalMesh::new(vec![x.clone(), y]).unwrap());
         assert_eq!(mesh.devices(), devices.as_slice());
-        let mesh = session.new_mesh([x.clone()]).unwrap();
+        let mesh = session.mesh([x.clone()]).unwrap();
         assert_eq!(mesh.devices(), &devices[..2]);
 
         // Creating a mesh does not make it the mesh of the session.
@@ -1955,12 +1956,12 @@ pub(crate) mod tests {
 
         // Invalid axes and meshes that need more devices than the client has are rejected.
         assert!(matches!(
-            session.new_mesh([x.clone(), x]),
+            session.mesh([x.clone(), x]),
             Err(Error::Core(error))
                 if *error == CoreError::Sharding(ShardingError::DuplicateMeshAxisName { name: "x".to_string() }),
         ));
         assert!(matches!(
-            session.new_mesh([MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()]),
+            session.mesh([MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()]),
             Err(Error::Core(error))
                 if *error == CoreError::Sharding(ShardingError::DeviceCountMismatch { expected: 8, actual: 4 }),
         ));

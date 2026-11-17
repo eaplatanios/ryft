@@ -1567,7 +1567,7 @@ mod tests {
     fn test_compiled_program_serialize() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2047,7 +2047,7 @@ mod tests {
     fn test_session_deserialize_compiled_program_requires_runtime_contracts_for_effect_metadata() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let mut builder = ProgramBuilder::new();
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());

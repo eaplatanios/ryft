@@ -1245,7 +1245,7 @@ mod tests {
         // extents, with an in-bounds start and a start that clamps to the last rows.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
@@ -1655,7 +1655,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_with_dimensions() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
@@ -1732,7 +1732,7 @@ mod tests {
         // points, including an empty result.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let mut builder = ArrayIrProgramBuilder::new();
@@ -1802,7 +1802,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_pullback_with_runtime_input_shape() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
         let scalar_type = ArrayType::scalar(DataType::I64);
         let context = TracingContext::<Constant, Operation>::new();
@@ -1910,7 +1910,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_checks_runtime_extents() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());

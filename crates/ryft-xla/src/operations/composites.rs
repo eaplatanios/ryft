@@ -314,8 +314,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, CompositeJvpRule, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, DimensionValue, DomainTracer, MulOperation, NamedComposite, PrintOperation,
-        Program as CoreProgram, ProjectedContext, batch, composite, differentiate_at,
+        CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Mul, MulOperation, NamedComposite,
+        PrintOperation, Program as CoreProgram, ProjectedContext, Reduce, Softmax, batch, composite, differentiate_at,
+        softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
@@ -951,6 +952,55 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_composite_operation_lower_executes_softmax_as_one_eager_dispatch() {
+        // A held softmax function executes each eager call as one dispatch of its whole body, where the capability
+        // dispatches every operation of the same decomposition separately. Both compute the same probabilities bit for
+        // bit, including the rows with NaN, positive infinity, only excluded classes, ties, and a saturated maximum.
+        let client = execution_client();
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
+        let (nan, infinity) = (f32::NAN, f32::INFINITY);
+        let values = [
+            nan, 0.0, 1.0, infinity, 0.0, 1.0, -infinity, -infinity, -infinity, 0.0, 0.0, 0.0, -infinity, 0.0, 1.0,
+            9.0, -9.0, -9.0,
+        ];
+        let logits = replicated_array(&session, &mesh, DataType::F32, &[6, 3], &values_to_bytes(&values));
+        let function = softmax::<ProjectedContext<Session, ArrayType>>(-1);
+        let dispatches = || {
+            let statistics = session.eager_dispatch_statistics();
+            (statistics.misses, statistics.hits)
+        };
+
+        let first = function.call(logits.clone()).unwrap();
+        assert_eq!(dispatches(), (1, 0));
+        let second = function.call(logits.clone()).unwrap();
+        assert_eq!(dispatches(), (1, 1));
+        // The capability dispatches its 21 operations one by one, and 8 of them reuse the programs that earlier ones of
+        // equal types compiled.
+        let primitive = logits.softmax(-1).unwrap();
+        assert_eq!(dispatches(), (14, 9));
+        let expected = primitive.copy_to_host().unwrap();
+        assert_eq!(first.copy_to_host().unwrap(), expected);
+        assert_eq!(second.copy_to_host().unwrap(), expected);
+        let probabilities = values_from_bytes::<f32>(&expected);
+        assert!(probabilities[..9].iter().all(|probability| probability.is_nan()));
+        assert_eq!(probabilities[15], 0.99999994);
+
+        // The derivatives are those of the capability, because both differentiate the same decomposition.
+        let weights = (0..18).map(|index| index as f32 - 8.0).collect::<Vec<_>>();
+        let weights = replicated_array(&session, &mesh, DataType::F32, &[6, 3], &values_to_bytes(&weights));
+        let gradient = differentiate_at(logits.clone())
+            .with_captures(weights.clone())
+            .gradient(|logits, weights| function.call(logits)?.mul(&weights)?.reduce_sum(&[0, 1], None))
+            .unwrap();
+        let expected = differentiate_at(logits)
+            .with_captures(weights)
+            .gradient(|logits, weights| logits.softmax(-1)?.mul(&weights)?.reduce_sum(&[0, 1], None))
+            .unwrap();
+        assert_eq!(gradient.copy_to_host().unwrap(), expected.copy_to_host().unwrap());
     }
 
     #[test]

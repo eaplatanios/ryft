@@ -562,7 +562,7 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_compile_missing_binding() {
         let client = execution_client();
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         assert!(matches!(
             KernelAotBundle::compile(&definition(), &session, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message }) if message == "a compiler binding is required",
@@ -575,7 +575,7 @@ pub(crate) mod tests {
         let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
         let client = execution_client();
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         assert!(matches!(
             KernelAotBundle::compile(&definition, &session, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message })
@@ -704,7 +704,7 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_load_configuration() {
         let client = execution_client();
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         assert!(matches!(
             bundle().load(&session, &binding(2), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "compiler binding configuration mismatch",
@@ -715,7 +715,7 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_load_live_facts() {
         let client = execution_client();
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         assert!(matches!(
             bundle().load(&session, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "live execution compatibility mismatch",
@@ -726,7 +726,7 @@ pub(crate) mod tests {
     fn test_kernel_aot_bundle_load_stateless_boundary() {
         let client = execution_client();
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let original = executable_bundle(&session, &mesh, DataType::I32, false, &binding(1));
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
         let loaded = decoded.load(&session, &binding(1), &mesh).unwrap();
@@ -766,7 +766,7 @@ pub(crate) mod tests {
     fn test_loaded_kernel_validate_distributed_effects() {
         let client = execution_client();
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let bundle = executable_bundle(&session, &mesh, DataType::I32, false, &binding(1));
         let mut loaded = bundle.load(&session, &binding(1), &mesh).unwrap();
         assert!(loaded.validate_distributed_effects().is_ok());

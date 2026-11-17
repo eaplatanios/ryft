@@ -1526,7 +1526,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
@@ -2430,8 +2430,8 @@ pub(crate) mod tests {
             indoc! {"
                 custom_call [
                     target=ryft.test.aot,
-                    ryft.kernel.schema=2,
-                    ryft.kernel.semantic=\"a13779bf5aa2b6f0aa69c7a71dcdf0702cf41862d7f35b5c0a06ff82d257bc77\",
+                    ryft.kernel.schema=3,
+                    ryft.kernel.semantic=\"4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5\",
                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                     input_output_alias=0->0,
                 ]
@@ -2584,8 +2584,8 @@ pub(crate) mod tests {
                 lambda %0:i32[] .
                 let %1:i32[] = custom_call [
                     target=ryft.test.aot,
-                    ryft.kernel.schema=2,
-                    ryft.kernel.semantic=\"a13779bf5aa2b6f0aa69c7a71dcdf0702cf41862d7f35b5c0a06ff82d257bc77\",
+                    ryft.kernel.schema=3,
+                    ryft.kernel.semantic=\"4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5\",
                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                     input_output_alias=0->0,
                 ] %0
@@ -2650,8 +2650,8 @@ pub(crate) mod tests {
                         lambda %0:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] .
                         let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] = custom_call [
                             target=ryft.test.aot,
-                            ryft.kernel.schema=2,
-                            ryft.kernel.semantic=\"d9f27c94ec67ff5600f0d5ae52fe5f2363f46d532c7ed5a2b825716c037acdd9\",
+                            ryft.kernel.schema=3,
+                            ryft.kernel.semantic=\"5f8db3ac713b4245730a499b5a0802d079efd8994fc7a7be1e3564379253d3e0\",
                             ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                             input_output_alias=0->0,
                         ] %0
@@ -2683,8 +2683,8 @@ pub(crate) mod tests {
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [
                                 target=ryft.test.aot,
-                                ryft.kernel.schema=2,
-                                ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                                ryft.kernel.schema=3,
+                                ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                                 ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                 input_output_alias=0->0,
                             ] %0
@@ -2703,8 +2703,8 @@ pub(crate) mod tests {
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [
                                 target=ryft.test.aot,
-                                ryft.kernel.schema=2,
-                                ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                                ryft.kernel.schema=3,
+                                ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                                 ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                 input_output_alias=0->0,
                             ] %0
@@ -2751,8 +2751,8 @@ pub(crate) mod tests {
                                 lambda %0:f32[] .
                                 let %1:f32[] = custom_call [
                                     target=ryft.test.aot,
-                                    ryft.kernel.schema=2,
-                                    ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                                    ryft.kernel.schema=3,
+                                    ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                     input_output_alias=0->0,
                                 ] %0
@@ -2777,8 +2777,8 @@ pub(crate) mod tests {
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [
                                 target=ryft.test.aot,
-                                ryft.kernel.schema=2,
-                                ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                                ryft.kernel.schema=3,
+                                ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                                 ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                 input_output_alias=0->0,
                             ] %0
@@ -2842,8 +2842,8 @@ pub(crate) mod tests {
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = custom_call [
                             target=ryft.test.aot,
-                            ryft.kernel.schema=2,
-                            ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                            ryft.kernel.schema=3,
+                            ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                             ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                             input_output_alias=0->0,
                         ] %1
@@ -2894,8 +2894,8 @@ pub(crate) mod tests {
                 let %1:f32[] = reference_read %0
                     %2:f32[] = custom_call [
                         target=ryft.test.aot,
-                        ryft.kernel.schema=2,
-                        ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                        ryft.kernel.schema=3,
+                        ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                         ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                         input_output_alias=0->0,
                     ] %1
@@ -2935,8 +2935,8 @@ pub(crate) mod tests {
                 let %1:f32[] = transfer_to_memory [destination=Device] %0
                     %2:f32[] = custom_call [
                         target=ryft.test.aot,
-                        ryft.kernel.schema=2,
-                        ryft.kernel.semantic=\"334848751e8dd2b3df502869f3d7f72b0a9060265f941d865cec4606817a56b3\",
+                        ryft.kernel.schema=3,
+                        ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
                         ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                         input_output_alias=0->0,
                     ] %1
@@ -3024,8 +3024,8 @@ pub(crate) mod tests {
                 lambda %0:i32[] .
                 let %1:i32[] = custom_call [
                     target=ryft.test.aot,
-                    ryft.kernel.schema=2,
-                    ryft.kernel.semantic=\"a13779bf5aa2b6f0aa69c7a71dcdf0702cf41862d7f35b5c0a06ff82d257bc77\",
+                    ryft.kernel.schema=3,
+                    ryft.kernel.semantic=\"4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5\",
                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                     input_output_alias=0->0,
                 ] %0

@@ -34,7 +34,7 @@ mod benchmark {
     use ryft::{
         Add, ArrayMemberType, ArrayOperations, ArrayType, AttentionConfiguration, AttentionInputs, DataType,
         DeviceMesh, Div, DotDimensionNumbers, GatherDimensionNumbers, GatherOptions, MeshAxis, MeshAxisType, Mul,
-        Parameter, Parameterized, ProgramError, ProjectedContext, ReductionKind, Sub, dot_product_attention,
+        Parameter, Parameterized, ProgramError, ProjectedContext, ReductionKind, Sub, dot_product_attention, softmax,
     };
 
     /// Result type of this benchmark.
@@ -43,8 +43,22 @@ mod benchmark {
     /// Execution domain of the `dot_product_attention` composite over eager XLA arrays.
     type AttentionDomain = ProjectedContext<Session, ArrayType>;
 
-    /// Attention function that replaces the primitive score, softmax, and weighted-sum operations, if any.
-    type AttentionFunction<'a, V> = Option<&'a dyn Fn(AttentionInputs<V>) -> Result<V, ProgramError>>;
+    /// Composite functions that replace primitive operations of the attention blocks, if any.
+    struct Functions<'a, V: Parameter> {
+        /// Attention function that replaces the primitive score, softmax, and weighted-sum operations.
+        attention: Option<&'a dyn Fn(AttentionInputs<V>) -> Result<V, ProgramError>>,
+
+        /// Softmax function that replaces the `softmax` call over the attention scores.
+        softmax: Option<&'a dyn Fn(V) -> Result<V, ProgramError>>,
+    }
+
+    impl<V: Parameter> Clone for Functions<'_, V> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<V: Parameter> Copy for Functions<'_, V> {}
 
     /// Number of extra forward passes of each `--profile` measurement.
     const PROFILE_PASSES: usize = 3;
@@ -93,6 +107,7 @@ mod benchmark {
         iterations: usize,
         fused_attention: bool,
         primitive_softmax: bool,
+        composite_softmax: bool,
         jit: bool,
         profile: bool,
         allocator: Option<Allocator>,
@@ -114,6 +129,7 @@ mod benchmark {
                 iterations: 20,
                 fused_attention: false,
                 primitive_softmax: false,
+                composite_softmax: false,
                 jit: false,
                 profile: false,
                 allocator: None,
@@ -154,7 +170,7 @@ mod benchmark {
             format!(
                 "{{\"layers\":{},\"d_model\":{},\"heads\":{},\"d_ff\":{},\"vocab\":{},\"max_seq\":{},\"batch\":{},\
                  \"seq\":{},\"warmup\":{},\"iterations\":{},\"fused_attention\":{},\"primitive_softmax\":{},\
-                 \"jit\":{},\"profile\":{},\"allocator\":{}}}",
+                 \"composite_softmax\":{},\"jit\":{},\"profile\":{},\"allocator\":{}}}",
                 self.layers,
                 self.d_model,
                 self.heads,
@@ -167,6 +183,7 @@ mod benchmark {
                 self.iterations,
                 self.fused_attention,
                 self.primitive_softmax,
+                self.composite_softmax,
                 self.jit,
                 self.profile,
                 self.allocator.map_or("null".to_string(), |allocator| json_string(allocator.name())),
@@ -192,6 +209,7 @@ mod benchmark {
            --small             Use a small configuration for local testing (explicit options still apply)\n\
            --fused-attention   Use the `dot_product_attention` composite in every attention block\n\
            --primitive-softmax Compute softmax as `exp(x - max(x)) / sum(exp(x - max(x)))`\n\
+           --composite-softmax Call Ryft's `softmax` as one held composite instead of its primitives\n\
            --jit               Compile the whole forward pass once with `jit` and time calls of the compiled function\n\
            --allocator NAME    GPU memory allocator of a CUDA build, `cuda-async` or `bfc` (default: that of\n\
                                `Session::new`)\n\
@@ -234,6 +252,7 @@ mod benchmark {
                 "--small" => {}
                 "--fused-attention" => configuration.fused_attention = true,
                 "--primitive-softmax" => configuration.primitive_softmax = true,
+                "--composite-softmax" => configuration.composite_softmax = true,
                 "--jit" => configuration.jit = true,
                 "--profile" => configuration.profile = true,
                 "--allocator" => {
@@ -670,7 +689,7 @@ mod benchmark {
         layer: &Layer<V>,
         inputs: &Inputs<V>,
         plan: &Plan,
-        attention_function: AttentionFunction<'_, V>,
+        attention_function: Functions<'_, V>,
         configuration: &Configuration,
         recorder: &R,
     ) -> Result<V, XlaError>
@@ -690,7 +709,7 @@ mod benchmark {
             recorder.record(Category::Reshape, || part.reshape([b, s, n, e]))
         };
         let (q, k, v) = (split(0)?, split(d)?, split(2 * d)?);
-        let a = match attention_function {
+        let a = match attention_function.attention {
             // The composite takes `[b, s, heads, head_dimension]` inputs and returns its output in the same layout.
             Some(attention_function) => {
                 recorder.record(Category::Attention, || attention_function(AttentionInputs::new(q, k, v)))?
@@ -710,6 +729,8 @@ mod benchmark {
                     let sum = recorder.record(Category::Reduce, || unnormalized.reduce(&[3], ReductionKind::Sum))?;
                     let sum = recorder.record(Category::Reshape, || sum.reshape(keep_dims))?;
                     recorder.record(Category::Div, || Div::div(&unnormalized, &sum))?
+                } else if let Some(softmax_function) = attention_function.softmax {
+                    recorder.record(Category::Softmax, || softmax_function(scores.clone()))?
                 } else {
                     recorder.record(Category::Softmax, || scores.softmax(3))?
                 };
@@ -743,7 +764,7 @@ mod benchmark {
         model: &Model<V>,
         inputs: &Inputs<V>,
         plan: &Plan,
-        attention_function: AttentionFunction<'_, V>,
+        attention_function: Functions<'_, V>,
         configuration: &Configuration,
         recorder: &R,
     ) -> Result<V, XlaError>
@@ -784,7 +805,7 @@ mod benchmark {
         model: &Model<Array>,
         inputs: &Inputs<Array>,
         plan: &Plan,
-        attention_function: AttentionFunction<'_, Array>,
+        attention_function: Functions<'_, Array>,
         configuration: &Configuration,
         recorder: &R,
     ) -> BenchmarkResult<f32> {
@@ -825,7 +846,7 @@ mod benchmark {
         model: &Model<Array>,
         inputs: &Inputs<Array>,
         plan: &Plan,
-        attention_function: AttentionFunction<'_, Array>,
+        attention_function: Functions<'_, Array>,
         configuration: &Configuration,
     ) -> BenchmarkResult<String> {
         let run = |synchronize: bool| -> BenchmarkResult<Profiler> {
@@ -884,7 +905,7 @@ mod benchmark {
         };
         let platform = session.target()?.platform_name().to_string();
         eprintln!("XLA platform: {platform}");
-        let mesh = session.new_mesh([MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
+        let mesh = session.mesh([MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
         let mut uploader = Uploader { session: &session, mesh: mesh.clone(), next_seed: 0 };
 
         let parameter_count = configuration.parameter_count();
@@ -912,8 +933,12 @@ mod benchmark {
         let eager_attention = dot_product_attention
             .as_ref()
             .map(|attention| move |inputs: AttentionInputs<Array>| attention.call(inputs));
-        let eager_attention: AttentionFunction<'_, Array> =
-            eager_attention.as_ref().map(|attention| attention as &dyn Fn(_) -> _);
+        let softmax_composite = configuration.composite_softmax.then(|| softmax::<AttentionDomain>(3));
+        let eager_softmax = softmax_composite.as_ref().map(|softmax| move |scores: Array| softmax.call(scores));
+        let eager_attention: Functions<'_, Array> = Functions {
+            attention: eager_attention.as_ref().map(|attention| attention as &dyn Fn(_) -> _),
+            softmax: eager_softmax.as_ref().map(|softmax| softmax as &dyn Fn(_) -> _),
+        };
 
         // Every pass returns the logit sum on the host together with its timed duration.
         let mut compile_seconds = None;
@@ -923,8 +948,12 @@ mod benchmark {
                     let attention = dot_product_attention
                         .as_ref()
                         .map(|attention| move |inputs: AttentionInputs<CompileTracer>| attention.call(inputs));
-                    let attention: AttentionFunction<'_, CompileTracer> =
-                        attention.as_ref().map(|attention| attention as &dyn Fn(_) -> _);
+                    let softmax =
+                        softmax_composite.as_ref().map(|softmax| move |scores: CompileTracer| softmax.call(scores));
+                    let attention: Functions<'_, CompileTracer> = Functions {
+                        attention: attention.as_ref().map(|attention| attention as &dyn Fn(_) -> _),
+                        softmax: softmax.as_ref().map(|softmax| softmax as &dyn Fn(_) -> _),
+                    };
                     forward(&model, &inputs, &plan, attention, &configuration, &Unrecorded)
                 },
                 &session,

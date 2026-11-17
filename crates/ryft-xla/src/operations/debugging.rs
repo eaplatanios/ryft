@@ -921,7 +921,7 @@ mod tests {
         let client = cpu_client(1);
         ensure_print_handler_registered(client).unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input = f64_vector(&session, &mesh, &[1.5, 2.5]);
 
         // Eager batching binds one print of the whole batch through the `@ryft.print` host callback.

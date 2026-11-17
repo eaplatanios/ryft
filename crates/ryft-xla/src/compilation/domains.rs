@@ -966,7 +966,7 @@ mod tests {
     fn test_session_compilation_domain_pipeline() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let engine = session_with_client(client).with_mesh(mesh.clone());
+        let engine = session_with_client(client).with_device_mesh(mesh.clone());
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1328,7 +1328,7 @@ mod tests {
     fn test_session_lower_program_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1451,7 +1451,7 @@ mod tests {
     fn test_session_lower_program_rejects_shard_maps_in_bounded_dynamic_programs() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -1515,7 +1515,7 @@ mod tests {
     fn test_session_lower_program_uses_the_replica_path_for_internal_dynamic_tensors() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -2591,7 +2591,7 @@ mod tests {
     fn test_session_lower_program_preserves_provenance_locations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::F64);
 
         // Builds `-(x * x)` with the multiplication carrying the provided provenance.

@@ -489,7 +489,7 @@ mod tests {
     fn test_dimension_from_scalar_operation_lower_reports_bounds_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
 
@@ -846,7 +846,7 @@ mod tests {
     fn test_lower_dimension_arithmetic_preserves_checked_diagnostics() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);

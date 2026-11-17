@@ -1146,7 +1146,7 @@ mod tests {
         // count, exactly like the reference backend's cumulative maximum.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =

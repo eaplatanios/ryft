@@ -232,7 +232,7 @@ mod tests {
     fn test_compare_operation_lower_executes_per_element() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let values = f32_vector(&session, &mesh, &[1., -2., 3., -4.]);
         let limits = f32_vector(&session, &mesh, &[0., 0., 0., 0.]);
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(

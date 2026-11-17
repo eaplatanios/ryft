@@ -1749,7 +1749,7 @@ mod tests {
     fn test_execution_plan_new_plans_static_output_layouts_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
@@ -1814,7 +1814,7 @@ mod tests {
     fn test_execution_plan_new_plans_no_output_layouts_without_declared_placement() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let unconstrained_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
         let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
@@ -2213,7 +2213,7 @@ mod tests {
     fn test_session_execute_stateless_zero_identity_preserves_logical_type_and_canonical_value() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2266,7 +2266,7 @@ mod tests {
     fn test_session_execute_stateless_projects_and_reconstructs_mixed_zero_signatures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]))
             .with_sharding(sharding.clone())
@@ -2327,7 +2327,7 @@ mod tests {
     fn test_session_execute_program_bounded_dynamic_program_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
@@ -2416,7 +2416,7 @@ mod tests {
     fn test_session_execute_program_data_derived_prefix_slice_at_multiple_extents() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(input_sharding.clone())
@@ -2477,7 +2477,7 @@ mod tests {
     fn test_session_execute_program_data_derived_prefix_slice_with_duplicate_and_equal_outputs() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(input_sharding.clone())
@@ -2598,7 +2598,7 @@ mod tests {
     fn test_session_prepare_compiled_execution_preserves_erased_input_producer_completion() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let zero_type = ArrayType::new_static(DataType::Zero, [2]);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         // Exercise both the ordinary input projection and the branch that materializes bounded inputs. The failed
@@ -2643,7 +2643,7 @@ mod tests {
     fn test_session_reshard_inputs_if_needed() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_values = |array: &Array| {

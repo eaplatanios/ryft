@@ -705,7 +705,7 @@ mod tests {
     fn test_validate_data_dependent_compilation() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
 
         let mut builder = ProgramBuilder::new();
@@ -1015,7 +1015,7 @@ mod tests {
     fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -1142,7 +1142,7 @@ mod tests {
     fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_scaled_dot_attention_fixture(
@@ -1278,7 +1278,7 @@ mod tests {
         )
         .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -1340,7 +1340,7 @@ mod tests {
         )
         .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_device_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [
             (DataType::F4E2M1FN, DataType::F8E4M3FN),
             (DataType::F8E4M3FN, DataType::F8E8M0FNU),

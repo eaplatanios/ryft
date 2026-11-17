@@ -332,7 +332,7 @@ mod xla_backend {
         // is enabled and a GPU is present, and the CPU otherwise.
         let session = Session::new()?;
         println!("XLA platform: {}", session.target()?.platform_name());
-        let mesh = session.new_mesh([MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
+        let mesh = session.mesh([MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
 
         let model = Mlp {
             layers: initial_layer_values()

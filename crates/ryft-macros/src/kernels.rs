@@ -94,7 +94,7 @@ impl KernelCodeGenerator {
     ///         // ...
     ///         let __kernel_output_type = core::arrays::ArrayType::new_static(
     ///             core::arrays::DataType::F32,
-    ///             [ryft::kernels::static_extent(input, 0usize)?],
+    ///             [ryft::kernels::__private::static_extent(input, 0usize)?],
     ///         );
     ///         let __kernel_operation = { /* Whole-array parameters on a rank-zero grid. */ };
     ///         let __kernel_input_metadata = input;
@@ -486,7 +486,12 @@ impl KernelCodeGenerator {
                     Boundary::InBounds => quote!(#kernels::BoundaryPolicy::InBounds),
                 };
                 Ok(quote!(
-                    #kernels::tiled_call(&[#(#inputs.clone()),*], __kernel_output_type, (#tile).to_vec(), #boundary)?
+                    #kernels::__private::tiled_call(
+                        &[#(#inputs.clone()),*],
+                        __kernel_output_type,
+                        (#tile).to_vec(),
+                        #boundary,
+                    )?
                 ))
             }
             None => Ok(quote!({
@@ -554,7 +559,7 @@ impl KernelCodeGenerator {
             {
                 let extent = self.generate_shape(&call.receiver, traced)?;
                 let divisor = self.generate_shape(&call.args[0], traced)?;
-                Ok(self.generate_shape_result(quote!(#kernels::shape_div_ceil(#extent, #divisor)), traced))
+                Ok(self.generate_shape_result(quote!(#kernels::__private::shape_div_ceil(#extent, #divisor)), traced))
             }
             _ => Err(syn::Error::new_spanned(expression, "unsupported shape metadata expression")),
         }
@@ -587,7 +592,7 @@ impl KernelCodeGenerator {
             ));
         }
         let shape = if traced { format_ident!("__kernel_{}_metadata", name) } else { name };
-        Ok(self.generate_shape_result(quote!(#kernels::static_extent(#shape, #axis)), traced))
+        Ok(self.generate_shape_result(quote!(#kernels::__private::static_extent(#shape, #axis)), traced))
     }
 
     /// Generates the propagation of the error of a fallible shape metadata `call`, converting it into a `ProgramError`
@@ -1438,7 +1443,7 @@ mod tests {
                         }
                         let __kernel_output_type = kernels::__private::core::arrays::ArrayType::new_static(
                             kernels::__private::core::arrays::DataType::F32,
-                            [kernels::static_extent(input, 0usize)?],
+                            [kernels::__private::static_extent(input, 0usize)?],
                         );
                         let __kernel_operation = {
                             let __kernel_parameters = ::std::vec![
@@ -1761,7 +1766,9 @@ mod tests {
                                 ),
                             ));
                         }
-                        if !(kernels::static_extent(left, 0usize)? == kernels::static_extent(indices, 0usize)?) {
+                        if !(kernels::__private::static_extent(left, 0usize)?
+                            == kernels::__private::static_extent(indices, 0usize)?)
+                        {
                             return ::core::result::Result::Err(kernels::KernelError::Type(
                                 kernels::__private::core::programs::TypeError::invalid(
                                     "kernel shape requirement is not satisfied"
@@ -1770,7 +1777,7 @@ mod tests {
                         }
                         let __kernel_output_type = kernels::__private::core::arrays::ArrayType::new_static(
                             kernels::__private::core::arrays::DataType::F32,
-                            [kernels::static_extent(indices, 0usize)?, 32],
+                            [kernels::__private::static_extent(indices, 0usize)?, 32],
                         );
                         let __kernel_operation = #operation;
                         let __kernel_left_metadata = left;
@@ -1798,11 +1805,11 @@ mod tests {
         assert_eq!(
             generator().generate_operation().unwrap().to_string(),
             quote! {
-                kernels::tiled_call(
+                kernels::__private::tiled_call(
                     &[left.clone(), indices.clone()],
                     __kernel_output_type,
                     ([8, 32]).to_vec(),
-                    kernels::BoundaryPolicy::Masked
+                    kernels::BoundaryPolicy::Masked,
                 )?
             }
             .to_string(),
@@ -1838,14 +1845,18 @@ mod tests {
         // metadata bindings, and expressions forwarded through declarative macros are supported.
         assert_eq!(
             shape(parse_quote!([left.shape()[1].div_ceil(32), (8)]), false),
-            Ok(quote!([kernels::shape_div_ceil(kernels::static_extent(left, 1usize)?, 32)?, (8)]).to_string()),
+            Ok(quote!([
+                kernels::__private::shape_div_ceil(kernels::__private::static_extent(left, 1usize)?, 32)?,
+                (8)
+            ])
+            .to_string()),
         );
         assert_eq!(
             shape(parse_quote!(left.shape()[0] == indices.shape()[0] && true), true),
             Ok(quote! {
-                kernels::static_extent(__kernel_left_metadata, 0usize)
+                kernels::__private::static_extent(__kernel_left_metadata, 0usize)
                     .map_err(kernels::__private::core::programs::ProgramError::custom)?
-                    == kernels::static_extent(__kernel_indices_metadata, 0usize)
+                    == kernels::__private::static_extent(__kernel_indices_metadata, 0usize)
                         .map_err(kernels::__private::core::programs::ProgramError::custom)?
                     && true
             }
@@ -2044,7 +2055,7 @@ mod tests {
             quote! {
                 [
                     8,
-                    kernels::static_extent(__kernel_left_metadata, 1usize)
+                    kernels::__private::static_extent(__kernel_left_metadata, 1usize)
                         .map_err(kernels::__private::core::programs::ProgramError::custom)?
                 ]
             }
@@ -2095,8 +2106,8 @@ mod tests {
                 let __kernel_carried = __kernel_context.invoke_with_provenance_scope(#provenance, || {
                     kernels::for_loop(
                         &__kernel_context,
-                        0..kernels::shape_div_ceil(
-                            kernels::static_extent(__kernel_left_metadata, 1usize)
+                        0..kernels::__private::shape_div_ceil(
+                            kernels::__private::static_extent(__kernel_left_metadata, 1usize)
                                 .map_err(kernels::__private::core::programs::ProgramError::custom)?,
                             32
                         )
@@ -2385,7 +2396,7 @@ mod tests {
                     &__kernel_context,
                     [
                         8,
-                        kernels::static_extent(__kernel_indices_metadata, 0usize)
+                        kernels::__private::static_extent(__kernel_indices_metadata, 0usize)
                             .map_err(kernels::__private::core::programs::ProgramError::custom)?
                     ]
                 )?

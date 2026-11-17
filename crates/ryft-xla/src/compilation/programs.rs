@@ -966,7 +966,7 @@ mod tests {
     fn test_compiled_program_matches_stateless_signature() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let compile = |upper: usize| {
             let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(upper)).unwrap());
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))

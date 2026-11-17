@@ -434,7 +434,12 @@ fn execute_aot_case(
     let loaded = restored.load(&runtime, &deployment_binding, &mesh).unwrap();
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
-        .map(|value| runtime.with_mesh(mesh.clone()).array(r#type.clone(), value.to_ne_bytes().repeat(64)).unwrap())
+        .map(|value| {
+            runtime
+                .with_device_mesh(mesh.clone())
+                .array(r#type.clone(), value.to_ne_bytes().repeat(64))
+                .unwrap()
+        })
         .collect();
     let iterations = std::env::var("RYFT_KERNEL_AOT_ITERATIONS")
         .map(|value| value.parse::<usize>().unwrap())
@@ -532,7 +537,12 @@ fn execute_aot_case(
         let mut distributed = DistributedKernel::new(&coordination, &loaded, options).unwrap();
         let inputs = [10.0 + process as f32, 20.0 + process as f32]
             .into_iter()
-            .map(|value| runtime.with_mesh(mesh.clone()).array(r#type.clone(), value.to_ne_bytes().repeat(64)).unwrap())
+            .map(|value| {
+                runtime
+                    .with_device_mesh(mesh.clone())
+                    .array(r#type.clone(), value.to_ne_bytes().repeat(64))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         let cancelled = Arc::new(AtomicBool::new(false));
         // Cross-process and local routes must differ numerically; partial chunks exercise exact reassembly.
@@ -710,7 +720,7 @@ mod gpu {
         let inputs = input_types
             .into_iter()
             .zip(input_bytes)
-            .map(|(r#type, bytes)| session.with_mesh(mesh.clone()).array(r#type, bytes).unwrap())
+            .map(|(r#type, bytes)| session.with_device_mesh(mesh.clone()).array(r#type, bytes).unwrap())
             .collect::<Vec<_>>();
         let warmup = usize::from(iterations > 1);
         let mut start = Instant::now();
@@ -1404,7 +1414,7 @@ mod cutile {
             .zip(&case.inputs)
             .map(|(r#type, values)| {
                 runtime_session
-                    .with_mesh(mesh.clone())
+                    .with_device_mesh(mesh.clone())
                     .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                     .unwrap()
             })
@@ -1608,7 +1618,7 @@ mod cutile {
                 .unwrap();
                 let expected = (0..17).map(|value| value as f32 - 8.0).collect::<Vec<_>>();
                 let input = session
-                    .with_mesh(mesh)
+                    .with_device_mesh(mesh)
                     .array(r#type, expected.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                     .unwrap();
                 let output = compiled.executable().execute(&session, input).unwrap();
@@ -1878,7 +1888,7 @@ mod tuning {
             .map(|(r#type, values)| {
                 Value::Array(
                     session
-                        .with_mesh(mesh.clone())
+                        .with_device_mesh(mesh.clone())
                         .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                         .unwrap(),
                 )
@@ -2324,7 +2334,7 @@ mod triton {
             .zip(&case.inputs)
             .map(|(r#type, values)| {
                 session
-                    .with_mesh(mesh.clone())
+                    .with_device_mesh(mesh.clone())
                     .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                     .unwrap()
             })

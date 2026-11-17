@@ -1432,7 +1432,7 @@ mod tests {
     fn test_convert_element_type_operation_lower_bitcast_preserves_dynamic_prefix_extents() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
@@ -3448,7 +3448,7 @@ mod tests {
     fn test_cast_operation_lower_preserves_layouts() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let values = vec![1f64, 2., 3., 4., 5., 6.];
@@ -3558,7 +3558,7 @@ mod tests {
     fn test_cast_operation_lower_preserves_dynamic_row_major_layout_with_ordered_io() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
@@ -3629,7 +3629,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F64, [4, 3])
             .with_sharding(
                 Sharding::new(

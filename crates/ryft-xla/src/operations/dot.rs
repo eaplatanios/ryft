@@ -1445,7 +1445,7 @@ mod tests {
     fn test_ragged_dot_operation_lower_strategy() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let left_type = ArrayType::new_static(DataType::F32, [5, 2]);
         let right_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
         let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
