@@ -1,13 +1,25 @@
 //! Cooperative lowering of canonical array values and reference effects into a CUDA thread block.
+//!
+//! A reference view records how many of its elements are valid along each axis, together with a predicate for its
+//! indexed away axes, so every element access checks the validity of the window that it reads or writes. Reference
+//! reads, writes, swaps, and add updates, [`TileLoadOperation`](ryft_kernels::TileLoadOperation),
+//! [`MaskedLoadOperation`](ryft_kernels::MaskedLoadOperation),
+//! [`MaskedStoreOperation`](ryft_kernels::MaskedStoreOperation), and
+//! [`MaskedSwapOperation`](ryft_kernels::MaskedSwapOperation) access only the valid elements that their explicit
+//! mask, if any, selects, and a load or swap takes the corresponding element of its `other` input, or zero for an
+//! unmasked read, for every other element. A swap always reads before it writes, even when its old value is dead,
+//! which is equivalent to a store because the read selects only the elements that the swap then overwrites. A
+//! [`WindowMaskOperation`](ryft_kernels::WindowMaskOperation) stores that same validity predicate for every element of
+//! an ordinary memory view without accessing the view.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
-    ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atom, AtomId, ConstantOperation, DataType, InstructionId,
-    Operation as CoreOperation, ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed, ValueId,
-    validated_reference_access_descriptors,
+    ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atom, AtomId, ComparisonDirection, ConstantOperation,
+    DataType, InstructionId, Operation as CoreOperation, ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed,
+    ValueId, validated_reference_access_descriptors,
 };
 use ryft_kernels::{GridExecution, KernelExtension, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_mlir::dialects::{arith, gpu, llvm, memref, nvvm, scf};
@@ -409,6 +421,15 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
             .iter()
             .map(|instruction| instruction.operation()),
     )?;
+    // Block mappings lower through the same dimension arithmetic as kernel bodies, so they are admitted by its rule.
+    for parameter in kernel.definition().operation().parameters() {
+        for instruction in parameter.mapping().program().instructions() {
+            let ArrayIrOperation::Dimension(operation) = instruction.operation() else {
+                unreachable!("BlockMapping construction admits only dimension operations");
+            };
+            dimensions::validate_dimension(operation)?;
+        }
+    }
     for (instruction_id, instruction) in kernel.definition().body().entry_region_ref().instructions_in_closure() {
         let supported = match instruction.operation() {
             KernelOperation::Portable(ArrayIrOperation::Guard(_))
@@ -437,10 +458,35 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
             }
             KernelOperation::Portable(ArrayIrOperation::Array(_)) => true,
             KernelOperation::Portable(ArrayIrOperation::Dimension(operation)) => {
-                operation.effects().is_pure() && !matches!(operation, ryft_core::DimensionOperation::Pow(_))
+                dimensions::validate_dimension(operation)?;
+                true
+            }
+            KernelOperation::Portable(ArrayIrOperation::ReferenceAddUpdate(operation)) => {
+                // The update is added in its own element type, which must be the referent element type because
+                // reference views keep that type. Its shape may broadcast to the view, and admission otherwise follows
+                // the baseline addition.
+                let atoms = kernel.definition().body().regions().get(instruction_id.region()).unwrap().atoms();
+                let reference = atoms[instruction.inputs()[0].index()].r#type();
+                let update = atoms[instruction.inputs()[1].index()].r#type();
+                let (ArrayIrType::Reference(reference), ArrayIrType::Array(update)) =
+                    (reference.as_ref(), update.as_ref())
+                else {
+                    unreachable!()
+                };
+                let unsupported = |reason: String| Error::Unsupported { operation: operation.name(), reason };
+                if update.data_type() != reference.referent().data_type() {
+                    return Err(unsupported("updates require the element type of their reference".to_owned()));
+                }
+                let addition = ArrayOperation::Add(ryft_core::AddOperation::new());
+                arrays::validate(&addition, &[update.clone(), update.clone()], update).map_err(|error| match error {
+                    Error::Unsupported { reason, .. } => unsupported(reason),
+                    error => error,
+                })?;
+                true
             }
             KernelOperation::Portable(
-                ArrayIrOperation::DimensionFromScalar(_)
+                ArrayIrOperation::Compare(_)
+                | ArrayIrOperation::DimensionFromScalar(_)
                 | ArrayIrOperation::DimensionToScalar(_)
                 | ArrayIrOperation::ReferenceRead(_)
                 | ArrayIrOperation::ReferenceFreeze(_)
@@ -480,7 +526,8 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
             | KernelOperation::TileLoad(_)
             | KernelOperation::MaskedLoad(_)
             | KernelOperation::MaskedStore(_)
-            | KernelOperation::MaskedSwap(_) => true,
+            | KernelOperation::MaskedSwap(_)
+            | KernelOperation::WindowMask(_) => true,
             KernelOperation::AsyncCopy(operation) => {
                 // Native copies address whole roots. Reject partial transforms (views that select less than the whole
                 // root) here, before any artifact lookup, instead of leaving them to fail during lowering; full
@@ -505,6 +552,19 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                         });
                     }
                 }
+                // Every copied element is one native 4- or 8-byte transfer. The destination has the same element type,
+                // because copies require exactly matching referent types.
+                if !matches!(atoms[instruction.inputs()[0].index()].r#type().as_ref(),
+                    ArrayIrType::Reference(reference) if matches!(
+                        reference.referent().data_type(),
+                        DataType::I32 | DataType::U32 | DataType::F32 | DataType::I64 | DataType::U64 | DataType::F64
+                    ))
+                {
+                    return Err(Error::Unsupported {
+                        operation: operation.name(),
+                        reason: "native async copies require matching shapes and 4- or 8-byte elements".to_owned(),
+                    });
+                }
                 let entry = kernel.definition().body().entry_region_ref();
                 let source = entry.input_ids().iter().position(|id| id == &instruction.inputs()[0]);
                 let destination = entry
@@ -519,7 +579,6 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                                     .r#type()
                                     .static_shape()
                                     .is_some_and(|shape| shape.dimensions() == parameter.mapping().block_shape())
-                                && parameter.r#type().data_type() != DataType::Boolean
                         })
                     })
                     && destination
@@ -899,6 +958,62 @@ impl<'c, 't> Lowering<'c, 't> {
         self.barrier(block)
     }
 
+    /// Adds `update`, broadcast to the shape of a reference view, into the valid elements of that view. Each
+    /// participant reads, adds into, and writes back only the elements that it owns, which is the read, addition, and
+    /// write of one view that a reference add update stages in program order, so the update is not atomic.
+    fn add_update(
+        &mut self,
+        block: &mut DetachedBlock<'c, 't>,
+        reference: &Reference<'c, 't>,
+        update: &Buffer<'c, 't>,
+    ) -> Result<(), Error> {
+        let update_shape = shape(&update.r#type)?;
+        let data_type = reference.buffer.r#type.data_type();
+        self.distributed(block, reference.shape.iter().product(), |lowering, body, index| {
+            let (offset, valid) = lowering.address(body, reference, index)?;
+            let mut selected = lowering.context.block::<TypeRef<'c, 't>, UnknownLocationRef<'c, 't>>(&[]);
+            // Unit and missing leading update axes broadcast, as they do for the elementwise array operations.
+            let source = if update_shape == reference.shape {
+                index
+            } else {
+                let coordinates = lowering.coordinates(&mut selected, index, &reference.shape)?;
+                let leading = reference.shape.len() - update_shape.len();
+                let mut source_coordinates = Vec::with_capacity(update_shape.len());
+                for (axis, extent) in update_shape.iter().enumerate() {
+                    source_coordinates.push(if *extent == 1 {
+                        lowering.index(&mut selected, 0)?
+                    } else {
+                        coordinates[leading + axis]
+                    });
+                }
+                lowering.flat_index(&mut selected, &source_coordinates, &update_shape)?
+            };
+            let current = lowering.load(&mut selected, &reference.buffer, offset)?;
+            let addend = lowering.load(&mut selected, update, source)?;
+            let sum = lowering.add(&mut selected, data_type, current, addend)?;
+            lowering.store(&mut selected, &reference.buffer, offset, sum)?;
+            selected.append_operation(scf::r#yield(&[], lowering.location)?)?;
+            body.append_operation(scf::r#if(valid, &[], selected.try_into()?, None, lowering.location)?)?;
+            Ok(())
+        })?;
+        self.barrier(block)
+    }
+
+    /// Stores the validity of every element of a reference view, which is the predicate that [`Self::read`] and
+    /// [`Self::write`] check before accessing that element, into a Boolean output, without accessing the view.
+    fn window_mask(
+        &mut self,
+        block: &mut DetachedBlock<'c, 't>,
+        reference: &Reference<'c, 't>,
+        output: &Buffer<'c, 't>,
+    ) -> Result<(), Error> {
+        self.distributed(block, output.r#type.element_count()?.unwrap(), |lowering, body, index| {
+            let (_, valid) = lowering.address(body, reference, index)?;
+            lowering.store(body, output, index, valid)
+        })?;
+        self.barrier(block)
+    }
+
     /// Copies a complete immutable value into an independently allocated destination before publishing it.
     fn copy(
         &mut self,
@@ -1142,7 +1257,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     if data_type == DataType::I32 {
                         value =
                             append(block, arith::extsi(value, self.context.signless_integer_type(64), self.location)?)?;
-                    } else if data_type == DataType::U32 {
+                    } else if matches!(data_type, DataType::U8 | DataType::U32) {
                         value =
                             append(block, arith::extui(value, self.context.signless_integer_type(64), self.location)?)?;
                     }
@@ -1202,6 +1317,28 @@ impl<'c, 't> Lowering<'c, 't> {
                     self.barrier(block)?;
                     vec![Lowered::Array(output().clone())]
                 }
+                KernelOperation::Portable(ArrayIrOperation::Compare(operation)) => {
+                    // Dimensions are nonnegative index values, so they compare as unsigned integers.
+                    let predicate = match operation.direction() {
+                        ComparisonDirection::Equal => arith::IntegerComparisonPredicate::Equal,
+                        ComparisonDirection::NotEqual => arith::IntegerComparisonPredicate::NotEqual,
+                        ComparisonDirection::LessThan => arith::IntegerComparisonPredicate::UnsignedLessThan,
+                        ComparisonDirection::LessThanOrEqual => {
+                            arith::IntegerComparisonPredicate::UnsignedLessThanOrEqual
+                        }
+                        ComparisonDirection::GreaterThan => arith::IntegerComparisonPredicate::UnsignedGreaterThan,
+                        ComparisonDirection::GreaterThanOrEqual => {
+                            arith::IntegerComparisonPredicate::UnsignedGreaterThanOrEqual
+                        }
+                    };
+                    let value = append(
+                        block,
+                        arith::cmpi(inputs[0].dimension(), inputs[1].dimension(), predicate, self.location)?,
+                    )?;
+                    self.distributed(block, 1, |lowering, body, index| lowering.store(body, output(), index, value))?;
+                    self.barrier(block)?;
+                    vec![Lowered::Array(output().clone())]
+                }
                 KernelOperation::Portable(
                     ArrayIrOperation::ReferenceRead(_) | ArrayIrOperation::ReferenceFreeze(_),
                 ) => {
@@ -1216,6 +1353,10 @@ impl<'c, 't> Lowering<'c, 't> {
                     self.read(block, inputs[0].reference(), output(), None, None)?;
                     self.write(block, inputs[0].reference(), inputs[1].array(), None)?;
                     vec![Lowered::Array(output().clone())]
+                }
+                KernelOperation::Portable(ArrayIrOperation::ReferenceAddUpdate(_)) => {
+                    self.add_update(block, inputs[0].reference(), inputs[1].array())?;
+                    vec![]
                 }
                 KernelOperation::Scratch(_) => vec![Lowered::Reference(self.reference(block, output().clone())?)],
                 KernelOperation::AsyncCopy(_) => {
@@ -1263,6 +1404,18 @@ impl<'c, 't> Lowering<'c, 't> {
                         Some(inputs[2].array()),
                     )?;
                     self.write(block, inputs[0].reference(), inputs[1].array(), Some(inputs[2].array()))?;
+                    vec![Lowered::Array(output().clone())]
+                }
+                KernelOperation::WindowMask(_) => {
+                    // The reference input is not a reference access, so it keeps its native representation, and only
+                    // ordinary memory views carry window validity.
+                    let Lowered::Reference(reference) = &inputs[0] else {
+                        return Err(Error::Unsupported {
+                            operation: instruction.operation().name(),
+                            reason: "window masks require an ordinary memory reference".to_owned(),
+                        });
+                    };
+                    self.window_mask(block, reference, output())?;
                     vec![Lowered::Array(output().clone())]
                 }
                 KernelOperation::Portable(ArrayIrOperation::Condition(_)) => {
@@ -1404,7 +1557,10 @@ impl<'c, 't> Lowering<'c, 't> {
                     ArrayReferenceTransformIndex::Dynamic => {
                         let zero = self.index(block, 0)?;
                         let value = self.load(block, inputs[0].array(), zero)?;
-                        let unsigned = matches!(inputs[0].array().r#type.data_type(), DataType::U32 | DataType::U64);
+                        let unsigned = matches!(
+                            inputs[0].array().r#type.data_type(),
+                            DataType::U8 | DataType::U32 | DataType::U64,
+                        );
                         let value = if unsigned {
                             append(block, arith::index_castui(value, self.context.index_type(), self.location)?)?
                         } else {
@@ -1461,12 +1617,14 @@ impl<'c, 't> Lowering<'c, 't> {
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, Condition, Context as CoreContext, Dimension, NestedTracingContext, ReferenceRead,
-        ReferenceWrite, WhileOperation,
+        AddOperation, ArrayIrType, Condition, ConditionOperation, Context as CoreContext, Dimension,
+        NestedTracingContext, Placeholder, ProgramBuilder, ReferenceRead, ReferenceWrite, ReferenceWriteOperation,
+        WhileOperation,
     };
     use ryft_kernels::{
-        AsyncCopyOperation, Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess,
-        MaskedLoadOperation, ScratchOperation, WaitOperation, whole_array_parameter,
+        AsyncCopyOperation, BoundaryPolicy, Grid, GridDimension, KernelCallOperation, KernelDefinition,
+        KernelParameterAccess, MappingExpression, MaskedLoadOperation, ParameterWindow, ScratchOperation, WaitOperation,
+        accumulate, compare_dimension, mapped_call, masked_store, whole_array_parameter, window_mask,
     };
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_version;
     use ryft_mlir::{WalkOrder, WalkResult};
@@ -1646,6 +1804,185 @@ mod tests {
             module(&context, &verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
                 .unwrap();
         assert_eq!(slots, vec![0, 1]);
+        assert_serializes(&module);
+    }
+
+    #[test]
+    fn test_module_window_mask() {
+        // The second window has one valid element, and a store under the window mask initializes the masked output.
+        let operation = mapped_call(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::I32, [3]),
+                KernelParameterAccess::WriteOnly,
+                ParameterWindow::BlockIndices {
+                    block_shape: vec![2],
+                    boundary: BoundaryPolicy::Masked,
+                    indices: vec![MappingExpression::GridCoordinate(0)],
+                },
+            )],
+            vec![],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::vector(vec![5i32, 7])?))?;
+            let mask = window_mask(context, &references[0])?;
+            masked_store(context, &references[0], &value, &mask)
+        })
+        .unwrap();
+        assert_eq!(definition.interpret(vec![], 2), Ok(vec![Array::vector(vec![5i32, 7, 5]).unwrap()]));
+        let verified = VerifiedKernel::new(&definition, 2).unwrap();
+        let context = Context::new();
+        let (module, _, _, _) =
+            module(&context, &verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
+                .unwrap();
+        // The constant value, the window mask, and the predicated masked store are each one distributed loop.
+        assert_eq!(
+            control_snapshot(&module),
+            vec![
+                "gpu.launch",
+                "scf.for",
+                "gpu.barrier",
+                "scf.for",
+                "gpu.barrier",
+                "scf.for",
+                "scf.if",
+                "gpu.barrier",
+                "gpu.terminator",
+            ],
+        );
+        assert_serializes(&module);
+    }
+
+    #[test]
+    fn test_module_dimension_comparison() {
+        // The first step of the sequential axis zeroes the output block, and every step then adds its input block, so
+        // the comparison of the step coordinate with zero becomes the predicate of the native condition.
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Sequential)]).unwrap();
+        let window = |index| ParameterWindow::BlockIndices {
+            block_shape: vec![2],
+            boundary: BoundaryPolicy::InBounds,
+            indices: vec![index],
+        };
+        let operation = mapped_call(
+            grid,
+            vec![
+                (
+                    ArrayType::new_static(DataType::I32, [4]),
+                    KernelParameterAccess::ReadOnly,
+                    window(MappingExpression::GridCoordinate(0)),
+                ),
+                (
+                    ArrayType::new_static(DataType::I32, [2]),
+                    KernelParameterAccess::WriteOnly,
+                    window(MappingExpression::Constant(0)),
+                ),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let branches = [true, false].map(|write| {
+            let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let reference = branch.add_input(operation.parameters()[1].body_type());
+            if write {
+                let zeros = branch.add_constant(ArrayIrValue::Array(Array::vector(vec![0i32; 2]).unwrap()));
+                branch.add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, zeros], None).unwrap();
+            }
+            branch
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
+                .unwrap()
+        });
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, coordinates)| {
+            let context = references[0].context();
+            let first = compare_dimension(context, &coordinates[0], ComparisonDirection::Equal, 0)?;
+            context.bind(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                branches.to_vec(),
+                &[first, references[1].clone()],
+            )?;
+            accumulate(context, &references[1], &references[0].read()?, BoundaryPolicy::InBounds)
+        })
+        .unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1i32, 2, 3, 4]).unwrap()], 2),
+            Ok(vec![Array::vector(vec![4i32, 6]).unwrap()]),
+        );
+        let verified = VerifiedKernel::new(&definition, 2).unwrap();
+        let context = Context::new();
+        let (module, _, _, _) =
+            module(&context, &verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
+                .unwrap();
+        let mut comparisons = Vec::new();
+        module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if operation.name().as_str() == Ok("arith.cmpi")
+                && operation.operand_value(0).unwrap().r#type().unwrap() == context.index_type().as_ref()
+                && operation.operand_value(1).unwrap().r#type().unwrap() == context.index_type().as_ref()
+            {
+                comparisons.push(operation.integer_attribute("predicate").unwrap().signless_value());
+            }
+            WalkResult::Advance
+        });
+        // The step comparison is the first equality, followed by the two element positions of the zero constant and
+        // the unsigned bounds checks of the three window accesses.
+        let equal = arith::IntegerComparisonPredicate::Equal as i64;
+        let less = arith::IntegerComparisonPredicate::UnsignedLessThan as i64;
+        assert_eq!(comparisons, vec![equal, equal, equal, less, less, less]);
+        assert_eq!(
+            control_snapshot(&module),
+            vec![
+                "gpu.launch",
+                "scf.for",
+                "scf.for",
+                "gpu.barrier",
+                "scf.if",
+                "scf.for",
+                "gpu.barrier",
+                "scf.for",
+                "scf.if",
+                "gpu.barrier",
+                "scf.for",
+                "scf.if",
+                "gpu.barrier",
+                "scf.for",
+                "scf.if",
+                "gpu.barrier",
+                "gpu.terminator",
+            ],
+        );
+        assert_serializes(&module);
+    }
+
+    #[test]
+    fn test_module_reference_add_update() {
+        // A rank-0 update broadcasts to every element of the view, which each participant reads, adds into, and writes back.
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::I32, [3]), KernelParameterAccess::ReadWrite)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let update = context.lift(ArrayIrValue::Array(Array::scalar(2i32)?))?;
+            accumulate(context, &references[0], &update, BoundaryPolicy::InBounds)
+        })
+        .unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1i32, 2, 3]).unwrap()], 1),
+            Ok(vec![Array::vector(vec![3i32, 4, 5]).unwrap()]),
+        );
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let context = Context::new();
+        let (module, _, _, _) =
+            module(&context, &verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
+                .unwrap();
+        assert_eq!(
+            control_snapshot(&module),
+            vec!["gpu.launch", "scf.for", "gpu.barrier", "scf.for", "scf.if", "gpu.barrier", "gpu.terminator"],
+        );
         assert_serializes(&module);
     }
 
@@ -1884,6 +2221,86 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_async_copy_element_types() {
+        // Every copied element is one native 4- or 8-byte transfer, so admission rejects 2-byte elements.
+        let r#type = ArrayType::new_static(DataType::F16, [4]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap()],
+        )
+        .unwrap();
+        let scratch = ScratchOperation::new(r#type, 16).unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let destination = context.bind(scratch.clone(), vec![], &[])?.remove(0);
+            let token =
+                context.bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), destination])?.remove(0);
+            context.bind(WaitOperation, vec![], &[token])?;
+            Ok(())
+        })
+        .unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(matches!(
+            validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
+            Err(Error::Unsupported { operation: "async_copy", reason })
+                if reason == "native async copies require matching shapes and 4- or 8-byte elements",
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_mapping_dimension_assertions() {
+        // The bounds of `i - i` cannot prove that the subtraction never underflows, so it carries a runtime assertion,
+        // which admission rejects in a block mapping exactly as lowering does.
+        let coordinate = || Box::new(MappingExpression::GridCoordinate(0));
+        let operation = mapped_call(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::F32, [2]),
+                KernelParameterAccess::ReadOnly,
+                ParameterWindow::BlockIndices {
+                    block_shape: vec![1],
+                    boundary: BoundaryPolicy::InBounds,
+                    indices: vec![MappingExpression::Sub(coordinate(), coordinate())],
+                },
+            )],
+            vec![],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
+        let verified = VerifiedKernel::new(&definition, 2).unwrap();
+        assert!(matches!(
+            validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
+            Err(Error::Unsupported { operation: "dimension_sub", reason })
+                if reason == "runtime dimension assertions require native failure propagation",
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_promoted_reference_add_updates() {
+        // Canonical inference promotes a U8 update to the F32 referent, but updates add in their own element type.
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::ReadWrite)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let update = context.lift(ArrayIrValue::Array(Array::vector(vec![1u8, 2])?))?;
+            accumulate(context, &references[0], &update, BoundaryPolicy::InBounds)
+        })
+        .unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(matches!(
+            validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
+            Err(Error::Unsupported { operation: "reference_add_update", reason })
+                if reason == "updates require the element type of their reference",
+        ));
+    }
+
+    #[test]
     fn test_module_zero_and_sequential_grid() {
         for (extent, expected) in
             [(0, vec!["gpu.launch", "gpu.terminator"]), (2, vec!["gpu.launch", "scf.for", "gpu.terminator"])]
@@ -1915,6 +2332,7 @@ mod tests {
         for (data_type, cast, signed) in [
             (DataType::I32, "arith.index_cast", true),
             (DataType::I64, "arith.index_cast", true),
+            (DataType::U8, "arith.index_castui", false),
             (DataType::U32, "arith.index_castui", false),
             (DataType::U64, "arith.index_castui", false),
         ] {
@@ -2149,6 +2567,12 @@ mod tests {
                 None,
                 arith::IntegerComparisonPredicate::SignedLessThan,
                 arith::IntegerComparisonPredicate::SignedGreaterThan,
+            ),
+            (
+                DataType::U8,
+                Some("arith.extui"),
+                arith::IntegerComparisonPredicate::UnsignedLessThan,
+                arith::IntegerComparisonPredicate::UnsignedGreaterThan,
             ),
             (
                 DataType::U32,

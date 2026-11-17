@@ -47,9 +47,9 @@ enum BackendOperation<V: Value<Type = DataType>> {
 ```
 
 Optional dispatchers can be generated with
-`#[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]`, as described above. Heterogeneous
-operation families whose stored constants belong to a member universe declare their operation and constant types
-explicitly, together with their member universes:
+`#[ryft(dispatch(identity, discharge, partial_evaluation, batching, differentiation, transposition))]`, as described
+above. Heterogeneous operation families whose stored constants belong to a member universe declare their operation and
+constant types explicitly, together with their member universes:
 
 ```rust,ignore
 #[derive(Clone, Debug, Operation)]

@@ -35,3 +35,33 @@ error: tile coordinates require a tiled output
    |
 40 |     let [block] = output.tile_index();
    |                   ^^^^^^^^^^^^^^^^^^^
+
+error: `load` cannot read the padding of the masked window of `input`, so use `load_or(fill)` instead
+  --> tests/kernels/error_bodies.rs:48:24
+   |
+48 |     output.store(input.load());
+   |                        ^^^^
+
+error: use `&` instead of `&&`, because kernel predicates are staged values
+  --> tests/kernels/error_bodies.rs:57:30
+   |
+57 |     output.store(left.load() && right.load());
+   |                              ^^
+
+error: unsupported kernel capability call
+  --> tests/kernels/error_bodies.rs:65:18
+   |
+65 |     output.store(input.load().softplus());
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: kernel capability `load_or` takes 1 argument but received 0
+  --> tests/kernels/error_bodies.rs:73:18
+   |
+73 |     output.store(input.load_or());
+   |                  ^^^^^^^^^^^^^^^
+
+error: kernel slices only support `load`, `store`, `accumulate`, and `atomic_accumulate`
+  --> tests/kernels/error_bodies.rs:81:18
+   |
+81 |     output.store(input.slice([0..1]).window_mask());
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

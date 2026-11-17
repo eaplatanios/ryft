@@ -1,8 +1,9 @@
 //! Direct typed TTIR compilation of verified portable kernels.
 //!
-//! The adapter admits static dense F32 arrays, masked global windows, arithmetic, reductions and bounded control
-//! flow. Floating-point dot uses IEEE input precision. Unsupported effects and memory contracts fail before native
-//! compilation. The linked native bridge compiles without creating a GPU context. Artifact deployment uses the
+//! The adapter admits static dense F32 arrays, masked global windows, arithmetic, reductions, bounded control flow,
+//! sequential grid axes, and in-place and atomic updates whose memory accesses need no ordering between the threads
+//! of one program. Floating-point dot uses IEEE input precision. Unsupported effects and memory contracts fail before
+//! native compilation. The linked native bridge compiles without creating a GPU context. Artifact deployment uses the
 //! corresponding runtime adapter.
 
 use ryft_core::{ArrayType, ProgramError, TypeError};

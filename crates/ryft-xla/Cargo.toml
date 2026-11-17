@@ -1,6 +1,6 @@
 [package]
 name = "ryft-xla"
-version = "0.0.3"
+version = "0.0.1"
 readme = "README.md"
 description = "XLA backend for the Ryft library."
 keywords = ["ryft", "xla", "pjrt", "gpu", "tpu"]

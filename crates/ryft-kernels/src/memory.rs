@@ -1,4 +1,52 @@
-//! Scoped scratch allocation and masked memory access using canonical array types, transforms, and reference lifetimes.
+//! Kernel memory operations for scratch storage, masked access, window validity, and asynchronous copies.
+//!
+//! The canonical reference operations of `ryft-core` read and write whole reference views. Kernels additionally need
+//! private scratch storage, access to selected elements of windows whose edge elements may be padding, and copies that
+//! overlap with computation. This module provides these operations over the same canonical array types, reference
+//! transforms, and reference effects as the portable reference operations, so the existing reference analyses apply to
+//! them. Each operation has a canonical name constant (e.g., [`SCRATCH_OPERATION_NAME`]), and [`KernelMemoryError`]
+//! reports the failures that are specific to kernel memory.
+//!
+//! # Scratch Storage
+//!
+//! [`ScratchOperation`] allocates storage scoped to the enclosing kernel region, with a static and addressable
+//! canonical [`ArrayType`] and a minimum native alignment. The storage starts logically uninitialized, so a read
+//! requires a preceding definite write to every selected element, even when a reference interpreter happens to
+//! initialize it physically. Reference analysis prevents the allocation from escaping its region. Initialized scratch
+//! uses the existing [`ReferenceNewOperation`](ryft_core::operations::ReferenceNewOperation) instead.
+//!
+//! # Masked Access
+//!
+//! [`MaskedLoadOperation`], [`MaskedStoreOperation`], and [`MaskedSwapOperation`] access only the elements of a
+//! reference view that a Boolean mask selects. The mask has exactly the shape of the selected referent, and every other
+//! array input has exactly its type, so broadcasting and padding must be explicit. Inactive elements neither read nor
+//! modify storage. A load or swap returns an array whose inactive elements come from its `other` input. A mask never
+//! authorizes an out-of-bounds reference view, because the reference view itself must be valid. Under kernel
+//! qualification, the interpreter intersects each mask with the validity of the accessed window, so a masked access
+//! never touches the padding elements of a window with
+//! [`BoundaryPolicy::Masked`](crate::mappings::BoundaryPolicy::Masked). An unmasked read of such a window that includes
+//! padding fails with [`KernelMemoryError::UnmaskedWindowAccess`] instead.
+//!
+//! # Window Validity
+//!
+//! [`WindowMaskOperation`] returns which elements of a reference are valid for the current grid point, without
+//! accessing its storage. Its output is the canonical mask of a [`MaskedStoreOperation`] that initializes a whole
+//! masked window.
+//!
+//! # Asynchronous Copies
+//!
+//! [`AsyncCopyOperation`] starts copying one reference view into another and returns a completion token, which is a
+//! scoped resource that only a [`WaitOperation`] in the same region may consume. The copy captures its source when it
+//! is issued, and the wait publishes the destination, which becomes initialized only then. Until that wait, the source
+//! may be read but not changed, and the destination may not be accessed.
+//!
+//! # Qualification
+//!
+//! Scratch storage, window validity, and asynchronous copies depend on the kernel invocation that owns them (i.e., its
+//! region scope, grid point, and pending copies). [`ScratchOperation`], [`WindowMaskOperation`],
+//! [`AsyncCopyOperation`], and [`WaitOperation`] are therefore meaningful only under kernel qualification, and their
+//! ordinary interpretation fails with [`KernelMemoryError::RequiresQualification`]. The masked accesses also have an
+//! ordinary eager interpretation over [`ArrayReference`]s.
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -17,17 +65,26 @@ use thiserror::Error;
 /// Errors encountered when declaring or accessing kernel memory.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelMemoryError {
-    /// An ordinary memory operation selects an invalid lane of a padded kernel window.
-    #[error("kernel operation `{operation}` accesses an invalid window lane without a mask")]
-    UnmaskedWindowAccess { operation: &'static str },
+    /// An ordinary memory operation selects an invalid element of a padded kernel window.
+    #[error("kernel operation `{operation}` accesses an invalid window element without a mask")]
+    UnmaskedWindowAccess {
+        /// Name of the operation that accesses the window.
+        operation: &'static str,
+    },
 
     /// Logical initialization and resource lifetimes must be qualified before this operation can execute.
     #[error("kernel operation `{operation}` requires a qualified invocation")]
-    RequiresQualification { operation: &'static str },
+    RequiresQualification {
+        /// Name of the operation that requires a qualified invocation.
+        operation: &'static str,
+    },
 
     /// The requested alignment is not a positive power of two.
     #[error("scratch alignment `{alignment}` must be a positive power of two")]
-    InvalidAlignment { alignment: usize },
+    InvalidAlignment {
+        /// Requested minimum alignment in bytes.
+        alignment: usize,
+    },
 
     /// The canonical array type cannot describe statically addressable storage.
     #[error(transparent)]
@@ -38,22 +95,26 @@ pub enum KernelMemoryError {
 pub const SCRATCH_OPERATION_NAME: &str = "scratch";
 
 /// Allocates logically uninitialized storage scoped to the enclosing kernel region. Reads require a preceding
-/// definite write to every selected element; physical initialization by a reference interpreter does not establish
-/// logical initialization. Reference analysis enforces the allocation's lifetime and prevents it from escaping.
+/// definite write to every selected element, because physical initialization by a reference interpreter does not
+/// establish logical initialization. Reference analysis enforces the lifetime of the allocation and prevents it from
+/// escaping.
 ///
-/// The referent's canonical [`ArrayType`] carries its shape, layout, and memory placement. Alignment is a minimum byte
-/// alignment required of native storage; the abstract reference interpreter does not expose physical addresses.
-/// Initialized scratch uses the existing [`ReferenceNewOperation`](ryft_core::operations::ReferenceNewOperation).
+/// The canonical [`ArrayType`] of the referent carries its shape, layout, and memory placement. The alignment is a
+/// minimum byte alignment required of native storage, which the abstract reference interpreter does not observe because
+/// it exposes no physical addresses. Initialized scratch uses the existing
+/// [`ReferenceNewOperation`](ryft_core::operations::ReferenceNewOperation).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScratchOperation {
     /// Canonical type of the allocated array.
     referent: ArrayType,
+
     /// Required minimum native allocation alignment in bytes.
     alignment: usize,
 }
 
 impl ScratchOperation {
-    /// Creates a scratch allocation with a static, addressable referent and a positive power-of-two alignment.
+    /// Creates a scratch allocation with a static, addressable referent and an alignment that is a positive power of
+    /// two.
     pub fn new(referent: ArrayType, alignment: usize) -> Result<Self, KernelMemoryError> {
         if !alignment.is_power_of_two() {
             return Err(KernelMemoryError::InvalidAlignment { alignment });
@@ -113,14 +174,52 @@ impl Operation for ScratchOperation {
     }
 }
 
+impl ReferenceAccessOperation for ScratchOperation {
+    type Transform = ArrayReferenceTransform;
+
+    fn base_input_count(&self) -> usize {
+        0
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        None
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        _transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::MalformedProgram(format!(
+            "operation `{}` does not support the requested transforms at input {input_index}",
+            self.name(),
+        )))
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for ScratchOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        Err(ProgramError::custom(KernelMemoryError::RequiresQualification { operation: self.name() }))
+    }
+}
+
 /// Canonical operation name for [`MaskedLoadOperation`].
 pub const MASKED_LOAD_OPERATION_NAME: &str = "masked_load";
 
-/// Loads active reference lanes and returns `other` for inactive lanes.
-/// Base inputs are `(reference, mask, other)`, followed by the transform bindings. The Boolean mask has the selected
-/// referent's exact shape; the remaining array values have its exact type. Broadcasting and padding must be explicit.
-/// The reference itself must be valid: a mask does not authorize an out-of-bounds reference view, and inactive lanes
-/// never access storage.
+/// Loads the active elements of a reference and returns `other` for its inactive elements.
+///
+/// The base inputs are `(reference, mask, other)`, followed by the transform bindings. The Boolean mask has exactly the
+/// shape of the selected referent, and `other` has exactly its type, so broadcasting and padding must be explicit. The
+/// reference view itself must be valid, because a mask does not authorize an out-of-bounds reference view, and inactive
+/// elements never access storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaskedLoadOperation {
     /// Refer to the documentation of [`Self::transforms`].
@@ -128,20 +227,20 @@ pub struct MaskedLoadOperation {
 }
 
 impl MaskedLoadOperation {
-    /// Creates a whole-reference access.
+    /// Creates an access of the whole reference.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Returns the transforms applied to the reference input.
-    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
-        &self.transforms
     }
 
     /// Returns this accessor with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
+    }
+
+    /// Returns the transforms applied to the reference input.
+    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
+        &self.transforms
     }
 }
 
@@ -246,11 +345,12 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
 /// Canonical operation name for [`MaskedStoreOperation`].
 pub const MASKED_STORE_OPERATION_NAME: &str = "masked_store";
 
-/// Writes active reference lanes, preserving every inactive lane.
-/// Base inputs are `(reference, value, mask)`, followed by the transform bindings. The Boolean mask has the selected
-/// referent's exact shape; the remaining array values have its exact type. Broadcasting and padding must be explicit.
-/// The reference itself must be valid: a mask does not authorize an out-of-bounds reference view, and inactive lanes
-/// never access storage.
+/// Writes the active elements of a reference, preserving every inactive element.
+///
+/// The base inputs are `(reference, value, mask)`, followed by the transform bindings. The Boolean mask has exactly the
+/// shape of the selected referent, and `value` has exactly its type, so broadcasting and padding must be explicit. The
+/// reference view itself must be valid, because a mask does not authorize an out-of-bounds reference view, and inactive
+/// elements never access storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaskedStoreOperation {
     /// Refer to the documentation of [`Self::transforms`].
@@ -258,20 +358,20 @@ pub struct MaskedStoreOperation {
 }
 
 impl MaskedStoreOperation {
-    /// Creates a whole-reference access.
+    /// Creates an access of the whole reference.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Returns the transforms applied to the reference input.
-    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
-        &self.transforms
     }
 
     /// Returns this accessor with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
+    }
+
+    /// Returns the transforms applied to the reference input.
+    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
+        &self.transforms
     }
 }
 
@@ -375,11 +475,12 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
 /// Canonical operation name for [`MaskedSwapOperation`].
 pub const MASKED_SWAP_OPERATION_NAME: &str = "masked_swap";
 
-/// Replaces active reference lanes and returns their old values, using `other` for inactive lanes.
-/// Base inputs are `(reference, value, mask, other)`, followed by the transform bindings. The Boolean mask has the
-/// selected referent's exact shape; the remaining array values have its exact type. Broadcasting and padding must be
-/// explicit. The reference itself must be valid: a mask does not authorize an out-of-bounds reference view, and
-/// inactive lanes never access storage.
+/// Replaces the active elements of a reference and returns their old values, using `other` for its inactive elements.
+///
+/// The base inputs are `(reference, value, mask, other)`, followed by the transform bindings. The Boolean mask has
+/// exactly the shape of the selected referent, and `value` and `other` have exactly its type, so broadcasting and
+/// padding must be explicit. The reference view itself must be valid, because a mask does not authorize an
+/// out-of-bounds reference view, and inactive elements never access storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaskedSwapOperation {
     /// Refer to the documentation of [`Self::transforms`].
@@ -387,20 +488,20 @@ pub struct MaskedSwapOperation {
 }
 
 impl MaskedSwapOperation {
-    /// Creates a whole-reference access.
+    /// Creates an access of the whole reference.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Returns the transforms applied to the reference input.
-    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
-        &self.transforms
     }
 
     /// Returns this accessor with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
+    }
+
+    /// Returns the transforms applied to the reference input.
+    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
+        &self.transforms
     }
 }
 
@@ -513,18 +614,114 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
     }
 }
 
+/// Canonical operation name for [`WindowMaskOperation`].
+pub const WINDOW_MASK_OPERATION_NAME: &str = "window_mask";
+
+/// Returns which elements of a reference are valid for the current grid point. The only input is an array reference
+/// with a static referent shape, and the output is a Boolean array with that shape and no layout requirement, which
+/// is true exactly at the valid elements. A parameter window with
+/// [`BoundaryPolicy::Masked`](crate::mappings::BoundaryPolicy::Masked) is a fixed size tile whose elements beyond the
+/// edge of the full array are invalid padding at edge grid points, so its mask is false at those elements. Every
+/// element of every other reference (e.g., an in-bounds parameter window or scratch storage) is valid, so its mask is
+/// true everywhere.
+///
+/// This operation reads and writes no storage, so it declares no reference effects and its reference input is not a
+/// reference access. It is therefore legal before anything is written to a write-only output, it never conflicts with
+/// a pending [`AsyncCopyOperation`], and it is not an unmasked access of a padded window. Its output is the canonical
+/// mask of a [`MaskedStoreOperation`] that initializes a whole masked window, which is the Triton idiom
+/// `tl.store(pointer, value, mask=in_bounds_mask)`. The initialization analysis of
+/// [`validate_kernel_initialization`](crate::initialization::validate_kernel_initialization) credits such a store as a
+/// definite write of the whole reference. Like [`ScratchOperation`], this operation is meaningful only in a qualified
+/// kernel invocation, because window validity depends on the grid point.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WindowMaskOperation;
+
+impl Display for WindowMaskOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(WINDOW_MASK_OPERATION_NAME)
+    }
+}
+
+impl Operation for WindowMaskOperation {
+    type Type = ArrayIrType;
+
+    fn name(&self) -> &'static str {
+        WINDOW_MASK_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let ArrayIrType::Reference(reference) = &input_types[0] else {
+            return Err(TypeError::invalid(format!(
+                "`{WINDOW_MASK_OPERATION_NAME}` input type `{}` must be an array reference",
+                input_types[0],
+            )));
+        };
+        let referent = reference.referent();
+        if referent.static_shape().is_none() {
+            return Err(TypeError::invalid(format!(
+                "`{WINDOW_MASK_OPERATION_NAME}` referent type `{referent}` must have a static shape",
+            )));
+        }
+        Ok(vec![ArrayType::new(DataType::Boolean, referent.shape().clone()).into()])
+    }
+}
+
+impl ReferenceAccessOperation for WindowMaskOperation {
+    type Transform = ArrayReferenceTransform;
+
+    fn base_input_count(&self) -> usize {
+        1
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        // The reference input selects the reference whose validity is returned, but no storage is accessed through it.
+        None
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        _transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::MalformedProgram(format!(
+            "operation `{}` has no reference access at input {input_index}",
+            self.name(),
+        )))
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for WindowMaskOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        Err(ProgramError::custom(KernelMemoryError::RequiresQualification { operation: self.name() }))
+    }
+}
+
 /// Canonical operation name for [`AsyncCopyOperation`].
 pub const ASYNC_COPY_OPERATION_NAME: &str = "async_copy";
 
-/// Starts copying the first reference's selected elements into the second reference. Shapes, element types, and
+/// Starts copying the selected elements of the first reference into the second reference. Shapes, element types, and
 /// sharding must match exactly, while canonical layouts and memory placement may differ. The returned scalar token
-/// reference is a scoped completion resource: only [`WaitOperation`] may consume it, in the same region as this
-/// operation. Source transform bindings trail the two references, followed by destination transform bindings.
+/// reference is a scoped completion resource, which only a [`WaitOperation`] in the same region as this operation may
+/// consume. The source transform bindings trail the two references, followed by the destination transform bindings.
 ///
-/// Until that wait, the source may be read but not changed and the destination may not be accessed. Destination
-/// initialization becomes available only after the wait. Qualification rejects overlapping source and destination
-/// selections, conflicting pending copies, escaped tokens, and exits with outstanding copies. Target adapters decide
-/// which memory placements support asynchronous transfer; the reference interpreter preserves these ordering rules.
+/// Until that wait, the source may be read but not changed, and the destination may not be accessed. The destination
+/// becomes initialized only after the wait. Qualification rejects overlapping source and destination selections,
+/// conflicting pending copies, escaped tokens, and exits with outstanding copies. Target adapters decide which memory
+/// placements support asynchronous transfer, and the reference interpreter preserves these ordering rules.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AsyncCopyOperation {
     /// Ordered selections applied to the source reference.
@@ -540,16 +737,6 @@ impl AsyncCopyOperation {
         Self::default()
     }
 
-    /// Returns the transforms applied to the source reference.
-    pub fn source_transforms(&self) -> &[ArrayReferenceTransform] {
-        &self.source_transforms
-    }
-
-    /// Returns the transforms applied to the destination reference.
-    pub fn destination_transforms(&self) -> &[ArrayReferenceTransform] {
-        &self.destination_transforms
-    }
-
     /// Returns this accessor with the provided transforms applied to the source reference.
     pub fn with_source_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.source_transforms = transforms;
@@ -560,6 +747,16 @@ impl AsyncCopyOperation {
     pub fn with_destination_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.destination_transforms = transforms;
         self
+    }
+
+    /// Returns the transforms applied to the source reference.
+    pub fn source_transforms(&self) -> &[ArrayReferenceTransform] {
+        &self.source_transforms
+    }
+
+    /// Returns the transforms applied to the destination reference.
+    pub fn destination_transforms(&self) -> &[ArrayReferenceTransform] {
+        &self.destination_transforms
     }
 }
 
@@ -601,7 +798,7 @@ impl Operation for AsyncCopyOperation {
             ReferenceAccessMode::Write,
         )?;
         if source.data_type().is_token() {
-            return Err(TypeError::invalid("`async_copy` cannot copy effect tokens"));
+            return Err(TypeError::invalid(format!("`{ASYNC_COPY_OPERATION_NAME}` cannot copy effect tokens")));
         }
         if source.data_type() != destination.data_type()
             || source.shape() != destination.shape()
@@ -609,18 +806,18 @@ impl Operation for AsyncCopyOperation {
         {
             return Err(TypeError::invalid(format!(
                 concat!(
-                    "`async_copy` source type `{}` and destination type `{}` ",
+                    "`{}` source type `{}` and destination type `{}` ",
                     "must have identical shapes, element types, and sharding",
                 ),
-                source, destination,
+                ASYNC_COPY_OPERATION_NAME, source, destination,
             )));
         }
         Ok(vec![ReferenceType::new(ArrayType::scalar(DataType::Token)).into()])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // Like the portable reference accesses, empty paths are omitted so that a whole-reference copy renders as
-        // just its name.
+        // Like the portable reference accesses, empty paths are omitted so that a copy between whole references renders
+        // as just its name.
         let operation = OperationFormatter::new(formatter, indentation, self.name())?;
         if self.source_transforms.is_empty() && self.destination_transforms.is_empty() {
             return Ok(());
@@ -706,9 +903,9 @@ impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for AsyncCopyOpera
 /// Canonical operation name for [`WaitOperation`].
 pub const WAIT_OPERATION_NAME: &str = "wait";
 
-/// Completes an [`AsyncCopyOperation`] and consumes its token reference. The source reservation is released and the
-/// destination's copied elements become initialized. The token must originate from an unmatched copy in this same
-/// region; a token-shaped reference created through ordinary allocation does not establish a pending copy.
+/// Completes an [`AsyncCopyOperation`] and consumes its token reference. The source reservation is released, and the
+/// copied elements of the destination become initialized. The token must originate from an unmatched copy in this same
+/// region, because a reference with the token type that ordinary allocation creates does not establish a pending copy.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WaitOperation;
 
@@ -734,7 +931,10 @@ impl Operation for WaitOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let expected = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
         if input_types[0] != expected {
-            return Err(TypeError::invalid(format!("`wait` input type `{}` must be `{expected}`", input_types[0],)));
+            return Err(TypeError::invalid(format!(
+                "`{WAIT_OPERATION_NAME}` input type `{}` must be `{expected}`",
+                input_types[0],
+            )));
         }
         Ok(vec![])
     }
@@ -751,6 +951,36 @@ impl Operation for WaitOperation {
     }
 }
 
+impl ReferenceAccessOperation for WaitOperation {
+    type Transform = ArrayReferenceTransform;
+
+    fn base_input_count(&self) -> usize {
+        1
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        // The consumed token is accessed as a whole reference, so it has no transforms and no bindings.
+        (input_index == 0).then(|| ReferenceAccessDescriptor::new(&[], 1..1))
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        if input_index != 0 || !transforms.is_empty() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` does not support the requested transforms at input {input_index}",
+                self.name(),
+            )));
+        }
+        Ok(*self)
+    }
+}
+
 impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for WaitOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -762,7 +992,8 @@ impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for WaitOperation 
     }
 }
 
-/// Validates exact referent-shaped masks and values without implicit broadcasting or padding.
+/// Validates that the mask has the exact referent shape and every value the exact referent type, without implicit
+/// broadcasting or padding.
 fn validate_masked_types(
     input_types: &[ArrayIrType],
     region_interfaces: &[RegionInterface<ArrayIrType>],
@@ -799,10 +1030,14 @@ fn validate_masked_types(
     Ok(referent)
 }
 
-/// Replays only active lanes through canonical one-element reference views. Each swap retains the reference
-/// transaction's old-value semantics; inactive lanes neither read nor modify reference storage. A replacement
-/// enables writes; an `other` value requests a result and supplies its inactive lanes. The caller has checked all
-/// input types and supplies at least one of these values, distinguishing load, store, and swap without a new mode.
+/// Interprets a masked load, store, or swap by replaying only its active elements through canonical reference views
+/// of one element each, so inactive elements neither read nor modify reference storage. Each active element of a swap
+/// keeps the old value semantics of a reference swap.
+///
+/// The two optional arrays select the kind of access. A `replacement` makes the access write its elements, and an
+/// `other` value makes the access return a result whose inactive elements come from `other`. A load therefore passes
+/// only `other`, a store passes only `replacement`, and a swap passes both. The caller has validated all input types
+/// and passes at least one of the two arrays.
 fn interpret_masked_memory(
     reference: &ArrayReference<Array>,
     mask: &Array,
@@ -846,18 +1081,38 @@ fn interpret_masked_memory(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{
-        ArrayReferenceTransformIndex, Context, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
-    };
+    use ryft_core::{ArrayReferenceTransformIndex, Context, Dimension, DimensionBounds, Shape};
 
     use crate::operations::KernelOperation;
 
     use super::*;
 
     #[test]
+    fn test_kernel_memory_error_display() {
+        assert_eq!(
+            KernelMemoryError::UnmaskedWindowAccess { operation: MASKED_LOAD_OPERATION_NAME }.to_string(),
+            format!(
+                "kernel operation `{MASKED_LOAD_OPERATION_NAME}` accesses an invalid window element without a mask",
+            ),
+        );
+        assert_eq!(
+            KernelMemoryError::RequiresQualification { operation: SCRATCH_OPERATION_NAME }.to_string(),
+            format!("kernel operation `{SCRATCH_OPERATION_NAME}` requires a qualified invocation"),
+        );
+        assert_eq!(
+            KernelMemoryError::InvalidAlignment { alignment: 3 }.to_string(),
+            "scratch alignment `3` must be a positive power of two",
+        );
+        assert_eq!(
+            KernelMemoryError::Program(ProgramError::MalformedProgram("missing region".to_owned())).to_string(),
+            "encountered malformed program: missing region",
+        );
+    }
+
+    #[test]
     fn test_scratch_operation_new() {
         let referent = ArrayType::new_static(DataType::I32, vec![2, 3]);
-        assert_eq!(ScratchOperation::new(referent.clone(), 16), Ok(ScratchOperation { referent, alignment: 16 }),);
+        assert_eq!(ScratchOperation::new(referent.clone(), 16), Ok(ScratchOperation { referent, alignment: 16 }));
         let empty = ArrayType::new_static(DataType::I32, vec![0]);
         assert_eq!(ScratchOperation::new(empty.clone(), 1), Ok(ScratchOperation { referent: empty, alignment: 1 }));
     }
@@ -867,7 +1122,7 @@ mod tests {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         assert_eq!(
             ScratchOperation::new(referent.clone(), 0),
-            Err(KernelMemoryError::InvalidAlignment { alignment: 0 })
+            Err(KernelMemoryError::InvalidAlignment { alignment: 0 }),
         );
         assert_eq!(ScratchOperation::new(referent, 3), Err(KernelMemoryError::InvalidAlignment { alignment: 3 }));
     }
@@ -900,14 +1155,14 @@ mod tests {
     }
 
     #[test]
-    fn test_scratch_operation_infer_output_types() {
+    fn test_scratch_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let operation = ScratchOperation::new(referent.clone(), 4).unwrap();
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ReferenceType::new(referent).into()]));
     }
 
     #[test]
-    fn test_scratch_operation_infer_output_types_rejects_nonzero_arity() {
+    fn test_scratch_operation_type_inference_rejects_nonzero_arity() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let operation = ScratchOperation::new(referent.clone(), 4).unwrap();
         assert_eq!(
@@ -937,7 +1192,42 @@ mod tests {
         let operation = ScratchOperation::new(ArrayType::new_static(DataType::I32, vec![2]), 4).unwrap();
         assert_eq!(
             operation.effects().as_ref(),
-            &Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }],).unwrap(),
+            &Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_scratch_operation_interpretation_requires_qualification() {
+        let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
+        let error = context
+            .bind(ScratchOperation::new(ArrayType::scalar(DataType::I32), 4).unwrap(), vec![], &[])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelMemoryError>(),
+            Some(&KernelMemoryError::RequiresQualification { operation: SCRATCH_OPERATION_NAME }),
+        );
+    }
+
+    #[test]
+    fn test_scratch_operation_base_input_count() {
+        let operation = ScratchOperation::new(ArrayType::new_static(DataType::I32, vec![2]), 4).unwrap();
+        assert_eq!(operation.base_input_count(), 0);
+    }
+
+    #[test]
+    fn test_scratch_operation_reference_access_descriptor() {
+        let operation = ScratchOperation::new(ArrayType::new_static(DataType::I32, vec![2]), 4).unwrap();
+        assert!(operation.reference_access_descriptor(0).is_none());
+    }
+
+    #[test]
+    fn test_scratch_operation_with_reference_access_transforms() {
+        let operation = ScratchOperation::new(ArrayType::new_static(DataType::I32, vec![2]), 4).unwrap();
+        assert_eq!(
+            operation.with_reference_access_transforms(0, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{SCRATCH_OPERATION_NAME}` does not support the requested transforms at input 0",
+            ))),
         );
     }
 
@@ -951,13 +1241,10 @@ mod tests {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let operation = MaskedLoadOperation::new().with_transforms(transforms.clone());
         assert_eq!(operation.transforms(), transforms);
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
-        assert!(operation.reference_access_descriptor(1).is_none());
-        assert_eq!(operation.with_reference_access_transforms(0, vec![]), Ok(MaskedLoadOperation::new()));
     }
 
     #[test]
-    fn test_masked_load_operation_infer_output_types() {
+    fn test_masked_load_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
         assert_eq!(
@@ -987,24 +1274,24 @@ mod tests {
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
     #[test]
-    fn test_masked_load_operation_interpret() {
+    fn test_masked_load_operation_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = ArrayReference::new(Array::vector(vec![10i32, 20]).unwrap());
         let mask = ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap());
         let other = ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap());
         assert_eq!(
-            context.bind(MaskedLoadOperation::new(), vec![], &[ArrayIrValue::Reference(reference), mask, other,]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10i32, -2]).unwrap())])
+            context.bind(MaskedLoadOperation::new(), vec![], &[ArrayIrValue::Reference(reference), mask, other]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10i32, -2]).unwrap())]),
         );
     }
 
     #[test]
-    fn test_masked_load_operation_interpret_transforms() {
+    fn test_masked_load_operation_interpretation_transforms() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap());
         let operation = MaskedLoadOperation::new().with_transforms(vec![
@@ -1020,14 +1307,14 @@ mod tests {
                     ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap()),
                     ArrayIrValue::Array(Array::scalar(-1i64).unwrap()),
-                ]
+                ],
             ),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![5i32, -2]).unwrap())]),
         );
     }
 
     #[test]
-    fn test_masked_load_operation_interpret_does_not_access_inactive_lanes() {
+    fn test_masked_load_operation_interpretation_does_not_access_inactive_elements() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = ArrayReference::new(Array::vector(vec![10i32, 20]).unwrap());
         reference.freeze().unwrap();
@@ -1040,9 +1327,9 @@ mod tests {
                     ArrayIrValue::Reference(reference.clone()),
                     ArrayIrValue::Array(Array::vector(vec![false, false]).unwrap()),
                     other.clone(),
-                ]
+                ],
             ),
-            Ok(vec![other])
+            Ok(vec![other]),
         );
 
         let expected = reference.read().unwrap_err();
@@ -1054,9 +1341,30 @@ mod tests {
                     ArrayIrValue::Reference(reference),
                     ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap()),
-                ]
+                ],
             ),
             Err(expected),
+        );
+    }
+
+    #[test]
+    fn test_masked_load_operation_reference_access_descriptor() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = MaskedLoadOperation::new().with_transforms(transforms);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
+        assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
+    fn test_masked_load_operation_with_reference_access_transforms() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = MaskedLoadOperation::new().with_transforms(transforms);
+        assert_eq!(operation.with_reference_access_transforms(0, vec![]), Ok(MaskedLoadOperation::new()));
+        assert_eq!(
+            operation.with_reference_access_transforms(1, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{MASKED_LOAD_OPERATION_NAME}` has no reference access at input 1",
+            ))),
         );
     }
 
@@ -1070,19 +1378,16 @@ mod tests {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let operation = MaskedStoreOperation::new().with_transforms(transforms.clone());
         assert_eq!(operation.transforms(), transforms);
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
-        assert!(operation.reference_access_descriptor(1).is_none());
-        assert_eq!(operation.with_reference_access_transforms(0, vec![]), Ok(MaskedStoreOperation::new()));
     }
 
     #[test]
-    fn test_masked_store_operation_infer_output_types() {
+    fn test_masked_store_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
         assert_eq!(
             MaskedStoreOperation::new()
-                .infer_output_types(&[ReferenceType::new(referent.clone()).into(), referent.into(), mask.into(),], &[]),
-            Ok(vec![])
+                .infer_output_types(&[ReferenceType::new(referent.clone()).into(), referent.into(), mask.into()], &[]),
+            Ok(vec![]),
         );
     }
 
@@ -1104,12 +1409,12 @@ mod tests {
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
     #[test]
-    fn test_masked_store_operation_interpret() {
+    fn test_masked_store_operation_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let root = ArrayReference::new(Array::vector(vec![1i32, 2, 3]).unwrap());
         let operation = MaskedStoreOperation::new()
@@ -1122,11 +1427,32 @@ mod tests {
                     ArrayIrValue::Reference(root.clone()),
                     ArrayIrValue::Array(Array::vector(vec![9i32, 8]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap()),
-                ]
+                ],
             ),
-            Ok(vec![])
+            Ok(vec![]),
         );
         assert_eq!(root.read(), Ok(Array::vector(vec![1i32, 2, 8]).unwrap()));
+    }
+
+    #[test]
+    fn test_masked_store_operation_reference_access_descriptor() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = MaskedStoreOperation::new().with_transforms(transforms);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
+        assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
+    fn test_masked_store_operation_with_reference_access_transforms() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = MaskedStoreOperation::new().with_transforms(transforms);
+        assert_eq!(operation.with_reference_access_transforms(0, vec![]), Ok(MaskedStoreOperation::new()));
+        assert_eq!(
+            operation.with_reference_access_transforms(1, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{MASKED_STORE_OPERATION_NAME}` has no reference access at input 1",
+            ))),
+        );
     }
 
     #[test]
@@ -1139,13 +1465,10 @@ mod tests {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let operation = MaskedSwapOperation::new().with_transforms(transforms.clone());
         assert_eq!(operation.transforms(), transforms);
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 4..5);
-        assert!(operation.reference_access_descriptor(1).is_none());
-        assert_eq!(operation.with_reference_access_transforms(0, vec![]), Ok(MaskedSwapOperation::new()));
     }
 
     #[test]
-    fn test_masked_swap_operation_infer_output_types() {
+    fn test_masked_swap_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
         assert_eq!(
@@ -1156,9 +1479,9 @@ mod tests {
                     mask.into(),
                     referent.clone().into(),
                 ],
-                &[]
+                &[],
             ),
-            Ok(vec![referent.into()])
+            Ok(vec![referent.into()]),
         );
     }
 
@@ -1180,12 +1503,12 @@ mod tests {
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
     #[test]
-    fn test_masked_swap_operation_interpret() {
+    fn test_masked_swap_operation_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = ArrayReference::new(Array::vector(vec![10i32, 20]).unwrap());
         assert_eq!(
@@ -1197,15 +1520,15 @@ mod tests {
                     ArrayIrValue::Array(Array::vector(vec![3i32, 4]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap()),
-                ]
+                ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10i32, -2]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10i32, -2]).unwrap())]),
         );
         assert_eq!(reference.read(), Ok(Array::vector(vec![3i32, 20]).unwrap()));
     }
 
     #[test]
-    fn test_masked_swap_operation_interpret_transforms() {
+    fn test_masked_swap_operation_interpretation_transforms() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = ArrayReference::new(Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap());
         let operation = MaskedSwapOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
@@ -1222,11 +1545,107 @@ mod tests {
                     ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap()),
                     ArrayIrValue::Array(Array::scalar(1i64).unwrap()),
-                ]
+                ],
             ),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![-1i32, 4]).unwrap())]),
         );
         assert_eq!(reference.read(), Ok(Array::matrix(2, 2, vec![1i32, 2, 3, 9]).unwrap()));
+    }
+
+    #[test]
+    fn test_masked_swap_operation_reference_access_descriptor() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = MaskedSwapOperation::new().with_transforms(transforms);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 4..5);
+        assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
+    fn test_masked_swap_operation_with_reference_access_transforms() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = MaskedSwapOperation::new().with_transforms(transforms);
+        assert_eq!(operation.with_reference_access_transforms(0, vec![]), Ok(MaskedSwapOperation::new()));
+        assert_eq!(
+            operation.with_reference_access_transforms(1, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{MASKED_SWAP_OPERATION_NAME}` has no reference access at input 1",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_window_mask_operation() {
+        assert_eq!(WindowMaskOperation.name(), WINDOW_MASK_OPERATION_NAME);
+        assert_eq!(WindowMaskOperation.to_string(), "window_mask");
+        assert_eq!(WindowMaskOperation.effects().as_ref(), Effects::empty());
+    }
+
+    #[test]
+    fn test_window_mask_operation_type_inference() {
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![2, 3])));
+        assert_eq!(
+            WindowMaskOperation.infer_output_types(std::slice::from_ref(&reference), &[]),
+            Ok(vec![ArrayType::new_static(DataType::Boolean, vec![2, 3]).into()]),
+        );
+        assert_eq!(
+            WindowMaskOperation.infer_output_types(&[], &[]),
+            Err(TypeError::invalid("expected 1 input but got 0")),
+        );
+        assert_eq!(
+            WindowMaskOperation.infer_output_types(
+                std::slice::from_ref(&reference),
+                &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+        let array = ArrayIrType::Array(ArrayType::new_static(DataType::I32, vec![2]));
+        assert_eq!(
+            WindowMaskOperation.infer_output_types(std::slice::from_ref(&array), &[]),
+            Err(TypeError::invalid(format!(
+                "`{WINDOW_MASK_OPERATION_NAME}` input type `{array}` must be an array reference",
+            ))),
+        );
+        let dimension =
+            Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::non_negative(Some(4)).unwrap()));
+        let referent = ArrayType::new(DataType::I32, Shape::new(vec![dimension]));
+        assert_eq!(
+            WindowMaskOperation.infer_output_types(&[ReferenceType::new(referent.clone()).into()], &[]),
+            Err(TypeError::invalid(format!(
+                "`{WINDOW_MASK_OPERATION_NAME}` referent type `{referent}` must have a static shape",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_window_mask_operation_interpretation_requires_qualification() {
+        let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1i32, 2]).unwrap()));
+        assert_eq!(
+            context.bind(WindowMaskOperation, vec![], &[reference]),
+            Err(ProgramError::custom(KernelMemoryError::RequiresQualification {
+                operation: WINDOW_MASK_OPERATION_NAME,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_window_mask_operation_base_input_count() {
+        assert_eq!(WindowMaskOperation.base_input_count(), 1);
+    }
+
+    #[test]
+    fn test_window_mask_operation_reference_access_descriptor() {
+        assert!(WindowMaskOperation.reference_access_descriptor(0).is_none());
+    }
+
+    #[test]
+    fn test_window_mask_operation_with_reference_access_transforms() {
+        assert_eq!(
+            WindowMaskOperation.with_reference_access_transforms(0, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{WINDOW_MASK_OPERATION_NAME}` has no reference access at input 0",
+            ))),
+        );
     }
 
     #[test]
@@ -1241,46 +1660,42 @@ mod tests {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let operation = AsyncCopyOperation::new().with_source_transforms(transforms.clone());
         assert_eq!(operation.source_transforms(), transforms);
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 2..3);
-        assert_eq!(operation.reference_access_descriptor(1).unwrap().bindings(), 3..3);
     }
 
     #[test]
     fn test_async_copy_operation_with_destination_transforms() {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
-        let operation = AsyncCopyOperation::new()
-            .with_source_transforms(transforms.clone())
-            .with_destination_transforms(transforms.clone());
+        let operation = AsyncCopyOperation::new().with_destination_transforms(transforms.clone());
         assert_eq!(operation.destination_transforms(), transforms);
-        assert_eq!(operation.reference_access_descriptor(1).unwrap().bindings(), 3..4);
-        let replaced = operation.with_reference_access_transforms(0, vec![]).unwrap();
-        assert_eq!(replaced.reference_access_descriptor(1).unwrap().bindings(), 2..3);
     }
 
     #[test]
-    fn test_async_copy_operation_infer_output_types() {
+    fn test_async_copy_operation_type_inference() {
         let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![2])));
         let token = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
         assert_eq!(
             AsyncCopyOperation::new().infer_output_types(&[reference.clone(), reference.clone()], &[]),
-            Ok(vec![token.clone()])
+            Ok(vec![token.clone()]),
         );
         assert_eq!(
             AsyncCopyOperation::new().infer_output_types(&[token.clone(), token], &[]),
-            Err(TypeError::invalid("`async_copy` cannot copy effect tokens")),
+            Err(TypeError::invalid(format!("`{ASYNC_COPY_OPERATION_NAME}` cannot copy effect tokens"))),
         );
         let different = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![3])));
         assert_eq!(
             AsyncCopyOperation::new().infer_output_types(&[reference, different], &[]),
-            Err(TypeError::invalid(concat!(
-                "`async_copy` source type `i32[2]` and destination type `i32[3]` ",
-                "must have identical shapes, element types, and sharding",
-            ),)),
+            Err(TypeError::invalid(format!(
+                concat!(
+                    "`{}` source type `i32[2]` and destination type `i32[3]` ",
+                    "must have identical shapes, element types, and sharding",
+                ),
+                ASYNC_COPY_OPERATION_NAME,
+            ))),
         );
     }
 
     #[test]
-    fn test_async_copy_operation_infer_output_types_transforms() {
+    fn test_async_copy_operation_type_inference_transforms() {
         let operation = AsyncCopyOperation::new()
             .with_source_transforms(vec![ArrayReferenceTransform::Index {
                 axis: 0,
@@ -1296,11 +1711,11 @@ mod tests {
         ];
         assert_eq!(
             operation.infer_output_types(&inputs, &[]),
-            Ok(vec![ReferenceType::new(ArrayType::scalar(DataType::Token)).into(),])
+            Ok(vec![ReferenceType::new(ArrayType::scalar(DataType::Token)).into()]),
         );
         assert_eq!(
             operation.infer_output_types(&inputs[..2], &[]),
-            Err(TypeError::invalid("expected 3 inputs but got 2"))
+            Err(TypeError::invalid("expected 3 inputs but got 2")),
         );
     }
 
@@ -1349,29 +1764,65 @@ mod tests {
                     ReferenceEffect::Allocate { output_index: 0 },
                 ],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
     #[test]
-    fn test_async_copy_operation_interpret_requires_qualification() {
+    fn test_async_copy_operation_interpretation_requires_qualification() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let source = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1i32).unwrap()));
         let destination = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0i32).unwrap()));
         assert_eq!(
             context.bind(AsyncCopyOperation::new(), vec![], &[source, destination]),
-            Err(ProgramError::custom(KernelMemoryError::RequiresQualification { operation: "async_copy" })),
+            Err(ProgramError::custom(KernelMemoryError::RequiresQualification {
+                operation: ASYNC_COPY_OPERATION_NAME,
+            })),
         );
     }
 
     #[test]
-    fn test_wait_operation_infer_output_types() {
+    fn test_async_copy_operation_reference_access_descriptor() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = AsyncCopyOperation::new().with_source_transforms(transforms.clone());
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 2..3);
+        assert_eq!(operation.reference_access_descriptor(1).unwrap().bindings(), 3..3);
+
+        // Destination transform bindings follow the source transform bindings.
+        let operation = operation.with_destination_transforms(transforms);
+        assert_eq!(operation.reference_access_descriptor(1).unwrap().bindings(), 3..4);
+        assert!(operation.reference_access_descriptor(2).is_none());
+    }
+
+    #[test]
+    fn test_async_copy_operation_with_reference_access_transforms() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(transforms.clone())
+            .with_destination_transforms(transforms.clone());
+        let replaced = operation.with_reference_access_transforms(0, vec![]).unwrap();
+        assert_eq!(replaced, AsyncCopyOperation::new().with_destination_transforms(transforms.clone()));
+        assert_eq!(replaced.reference_access_descriptor(1).unwrap().bindings(), 2..3);
+        assert_eq!(
+            operation.with_reference_access_transforms(1, vec![]),
+            Ok(AsyncCopyOperation::new().with_source_transforms(transforms)),
+        );
+        assert_eq!(
+            operation.with_reference_access_transforms(2, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{ASYNC_COPY_OPERATION_NAME}` has no reference access at input 2",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_wait_operation_type_inference() {
         let token = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
         assert_eq!(WaitOperation.infer_output_types(std::slice::from_ref(&token), &[]), Ok(vec![]));
         let invalid = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)));
         assert_eq!(
             WaitOperation.infer_output_types(std::slice::from_ref(&invalid), &[]),
-            Err(TypeError::invalid(format!("`wait` input type `{invalid}` must be `{token}`"))),
+            Err(TypeError::invalid(format!("`{WAIT_OPERATION_NAME}` input type `{invalid}` must be `{token}`"))),
         );
     }
 
@@ -1383,19 +1834,50 @@ mod tests {
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
     #[test]
-    fn test_wait_operation_interpret_requires_qualification() {
+    fn test_wait_operation_interpretation_requires_qualification() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let token = ArrayIrValue::Reference(ArrayReference::new(
             Array::new(ArrayType::scalar(DataType::Token), vec![]).unwrap(),
         ));
         assert_eq!(
             context.bind(WaitOperation, vec![], &[token]),
-            Err(ProgramError::custom(KernelMemoryError::RequiresQualification { operation: "wait" })),
+            Err(ProgramError::custom(KernelMemoryError::RequiresQualification { operation: WAIT_OPERATION_NAME })),
+        );
+    }
+
+    #[test]
+    fn test_wait_operation_base_input_count() {
+        assert_eq!(WaitOperation.base_input_count(), 1);
+    }
+
+    #[test]
+    fn test_wait_operation_reference_access_descriptor() {
+        let descriptor = WaitOperation.reference_access_descriptor(0).unwrap();
+        assert_eq!(descriptor.transforms(), &[]);
+        assert_eq!(descriptor.bindings(), 1..1);
+        assert!(WaitOperation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
+    fn test_wait_operation_with_reference_access_transforms() {
+        assert_eq!(WaitOperation.with_reference_access_transforms(0, vec![]), Ok(WaitOperation));
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) };
+        assert_eq!(
+            WaitOperation.with_reference_access_transforms(0, vec![transform]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{WAIT_OPERATION_NAME}` does not support the requested transforms at input 0",
+            ))),
+        );
+        assert_eq!(
+            WaitOperation.with_reference_access_transforms(1, vec![]),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{WAIT_OPERATION_NAME}` does not support the requested transforms at input 1",
+            ))),
         );
     }
 
@@ -1405,14 +1887,14 @@ mod tests {
         let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
         assert_eq!(
             validate_masked_types(
-                &[ReferenceType::new(referent.clone()).into(), mask.into(), referent.clone().into(),],
+                &[ReferenceType::new(referent.clone()).into(), mask.into(), referent.clone().into()],
                 &[],
                 3,
                 1,
                 &[],
                 ReferenceAccessMode::Read,
             ),
-            Ok(referent)
+            Ok(referent),
         );
     }
 
@@ -1420,13 +1902,13 @@ mod tests {
     fn test_validate_masked_types_rejects_arity_shape_and_value_types() {
         assert_eq!(
             validate_masked_types(&[], &[], 3, 1, &[], ReferenceAccessMode::Read),
-            Err(TypeError::invalid("expected 3 inputs but got 0"))
+            Err(TypeError::invalid("expected 3 inputs but got 0")),
         );
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let mask = ArrayType::new_static(DataType::Boolean, vec![1]);
         assert_eq!(
             validate_masked_types(
-                &[ReferenceType::new(referent.clone()).into(), mask.clone().into(), referent.clone().into(),],
+                &[ReferenceType::new(referent.clone()).into(), mask.clone().into(), referent.clone().into()],
                 &[],
                 3,
                 1,
@@ -1436,13 +1918,13 @@ mod tests {
             Err(TypeError::invalid(format!(
                 "masked memory mask type `{mask}` must be Boolean with referent shape `{}`",
                 referent.shape(),
-            )))
+            ))),
         );
         let value = ArrayType::new_static(DataType::F32, vec![2]);
         let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
         assert_eq!(
             validate_masked_types(
-                &[ReferenceType::new(referent.clone()).into(), value.clone().into(), mask.into(),],
+                &[ReferenceType::new(referent.clone()).into(), value.clone().into(), mask.into()],
                 &[],
                 3,
                 2,
@@ -1451,7 +1933,7 @@ mod tests {
             ),
             Err(TypeError::invalid(format!(
                 "masked memory input `1` type `{value}` must exactly match referent type `{referent}`",
-            )))
+            ))),
         );
     }
 
@@ -1461,13 +1943,13 @@ mod tests {
         let other = Array::scalar(-1i32).unwrap();
         assert_eq!(
             interpret_masked_memory(&reference, &Array::scalar(true).unwrap(), None, Some(&other)),
-            Ok(Some(Array::scalar(9i32).unwrap()))
+            Ok(Some(Array::scalar(9i32).unwrap())),
         );
         let empty = ArrayReference::new(Array::vector(Vec::<i32>::new()).unwrap());
         let other = Array::vector(Vec::<i32>::new()).unwrap();
         assert_eq!(
             interpret_masked_memory(&empty, &Array::vector(Vec::<bool>::new()).unwrap(), None, Some(&other)),
-            Ok(Some(other))
+            Ok(Some(other)),
         );
     }
 }

@@ -471,7 +471,7 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, Placeholder, ProgramBuilder as CoreProgramBuilder,
     };
-    use ryft_kernels::{KernelDefinition, KernelOperation};
+    use ryft_kernels::{KernelDefinition, KernelOperation, kernel};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::sessions::platforms::process_client;
@@ -480,7 +480,7 @@ mod tests {
     use super::*;
 
     /// Uses the same public portable macro and pointer order as the native vector fixture.
-    #[ryft_kernels::kernel(crate = "ryft_kernels")]
+    #[kernel(crate = "ryft_kernels")]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &ryft_core::Array,
         #[input(data_type = F32, rank = 1)] right: &ryft_core::Array,

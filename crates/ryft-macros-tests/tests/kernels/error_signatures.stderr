@@ -1,8 +1,8 @@
-error: unsupported `kernel` argument (expected `crate = "..."` or `requires = ...`)
+error: unsupported `kernel` argument (expected `crate = "..."`, `requires = ...`, or `grid(...)`)
  --> tests/kernels/error_signatures.rs:3:34
   |
-3 | #[kernel(crate = "ryft_kernels", grid = [1])]
-  |                                  ^^^^
+3 | #[kernel(crate = "ryft_kernels", schedule = [1])]
+  |                                  ^^^^^^^^
 
 error: kernel functions must be safe, synchronous, non-generic, and return through output parameters
  --> tests/kernels/error_signatures.rs:7:1
@@ -16,20 +16,56 @@ error: kernel parameters must use the canonical non-generic `Array`
 12 | fn generic_array(#[output(data_type = F32, shape = [])] output: &mut Array<f32>) {}
    |                                                                      ^^^^^^^^^^
 
-error: each kernel parameter requires exactly one `input` or `output` annotation
+error: each kernel parameter requires exactly one `input`, `output`, `inout`, or `prefetch` annotation
   --> tests/kernels/error_signatures.rs:15:16
    |
 15 | fn unannotated(input: &Array, #[output(data_type = F32, shape = [])] output: &mut Array) {}
    |                ^^^^^^^^^^^^^
 
-error: kernel inputs must use `&Array` and kernel outputs must use `&mut Array`
+error: kernel `input` and `prefetch` parameters must use `&Array`, and kernel `output` and `inout` parameters must use `&mut Array`
   --> tests/kernels/error_signatures.rs:19:48
    |
 19 |     #[input(data_type = F32, rank = 1)] input: &mut Array,
    |                                                ^^^^^^^^^^
 
-error: kernels require one `output` parameter
+error: kernels require at least one `output` or `inout` parameter
   --> tests/kernels/error_signatures.rs:25:1
    |
 25 | fn missing_output(#[input(data_type = F32, rank = 1)] input: &Array) {}
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: kernel grid axis names must be unique
+  --> tests/kernels/error_signatures.rs:27:46
+   |
+27 | #[kernel(crate = "ryft_kernels", grid(i = 2, i = 3))]
+   |                                              ^
+
+error: kernel grid axis names cannot collide with parameter names
+  --> tests/kernels/error_signatures.rs:30:39
+   |
+30 | #[kernel(crate = "ryft_kernels", grid(output = 2))]
+   |                                       ^^^^^^
+
+error: `grid` cannot be combined with output `tile` metadata
+  --> tests/kernels/error_signatures.rs:34:64
+   |
+34 | fn grid_and_tile(#[output(data_type = F32, shape = [4], tile = [2], boundary = masked)] output: &mut Array) {}
+   |                                                                ^^^
+
+error: output `tile` metadata requires a single result, whole array inputs, and no `prefetch` parameters
+  --> tests/kernels/error_signatures.rs:39:51
+   |
+39 |     #[output(data_type = F32, shape = [4], tile = [2], boundary = masked)] output: &mut Array,
+   |                                                   ^^^
+
+error: kernel `input` and `prefetch` parameters must use `&Array`, and kernel `output` and `inout` parameters must use `&mut Array`
+  --> tests/kernels/error_signatures.rs:44:63
+   |
+44 | fn immutable_inout(#[inout(data_type = F32, rank = 1)] state: &Array) {}
+   |                                                               ^^^^^^
+
+error: kernel `input` and `prefetch` parameters must use `&Array`, and kernel `output` and `inout` parameters must use `&mut Array`
+  --> tests/kernels/error_signatures.rs:48:42
+   |
+48 |     #[prefetch(data_type = I32)] offset: &mut Array,
+   |                                          ^^^^^^^^^^

@@ -116,7 +116,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, CustomCallAttribute, DataType};
-    use ryft_kernels::{KernelCompiler, KernelSchedule};
+    use ryft_kernels::{KernelCompiler, KernelSchedule, kernel};
     use ryft_triton::kernels::{Compiler, Options};
 
     use crate::kernels::staging::KernelDeviceFacts;
@@ -124,7 +124,7 @@ mod tests {
     use super::*;
 
     /// Exercises the native compiler and embedding contracts without requiring a device runtime.
-    #[ryft_kernels::kernel(crate = "ryft_kernels")]
+    #[kernel(crate = "ryft_kernels")]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &ryft_core::Array,
         #[input(data_type = F32, rank = 1)] right: &ryft_core::Array,

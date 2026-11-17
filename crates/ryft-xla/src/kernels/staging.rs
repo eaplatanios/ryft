@@ -11,14 +11,14 @@ use ryft_core::{
     ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     Domain as CoreDomain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation as CoreOperation, OperationBoundaryPruning, OperationProvider,
-    OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program as CoreProgram, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionDataFlow,
-    RegionInterface, RegionLiveness, RegionSlot, Tracer as CoreTracer, TracingContext, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram,
-    Value as CoreValue,
+    InterpretationDriver, MaybeZero, Operation as CoreOperation, OperationBoundaryPruning, OperationFoldOutput,
+    OperationProvider, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program as CoreProgram,
+    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Tracer as CoreTracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
+    TypedProgram, Value as CoreValue,
 };
 use ryft_kernels::{
     KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension,
@@ -152,6 +152,13 @@ impl CoreOperation for KernelExtension {
         }
     }
 
+    fn defined_type_identities(&self) -> Cow<'_, [<ArrayIrType as Type>::Identity]> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.defined_type_identities(),
+        }
+    }
+
     fn region_slots(&self) -> &'static [RegionSlot] {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -191,6 +198,18 @@ impl CoreOperation for KernelExtension {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => operation.infer_output_types(input_types, region_interfaces),
+        }
+    }
+
+    fn fold(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        let _ = (input_types, region_interfaces);
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.fold(input_types, region_interfaces),
         }
     }
 
@@ -261,6 +280,13 @@ impl CoreOperation for KernelExtension {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => operation.allows_reference_access_through_region_input(region_index, mode),
+        }
+    }
+
+    fn defers_reference_discharge(&self) -> bool {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.defers_reference_discharge(),
         }
     }
 
@@ -339,6 +365,10 @@ impl CoreOperation for KernelOperation {
         self.0.name()
     }
 
+    fn defined_type_identities(&self) -> Cow<'_, [<ArrayIrType as Type>::Identity]> {
+        self.0.defined_type_identities()
+    }
+
     fn region_slots(&self) -> &'static [RegionSlot] {
         self.0.region_slots()
     }
@@ -364,6 +394,14 @@ impl CoreOperation for KernelOperation {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         self.0.infer_output_types(input_types, region_interfaces)
+    }
+
+    fn fold(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        self.0.fold(input_types, region_interfaces)
     }
 
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
@@ -404,6 +442,10 @@ impl CoreOperation for KernelOperation {
 
     fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
         self.0.allows_reference_access_through_region_input(region_index, mode)
+    }
+
+    fn defers_reference_discharge(&self) -> bool {
+        self.0.defers_reference_discharge()
     }
 
     fn effects(&self) -> Cow<'_, Effects> {
@@ -2430,8 +2472,8 @@ pub(crate) mod tests {
             indoc! {"
                 custom_call [
                     target=ryft.test.aot,
-                    ryft.kernel.schema=3,
-                    ryft.kernel.semantic=\"4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5\",
+                    ryft.kernel.schema=1,
+                    ryft.kernel.semantic=\"c0aace572db2a32780947575541c582a8c0e012a86dccb7f08be2cffcc1a97b0\",
                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                     input_output_alias=0->0,
                 ]
@@ -2584,8 +2626,8 @@ pub(crate) mod tests {
                 lambda %0:i32[] .
                 let %1:i32[] = custom_call [
                     target=ryft.test.aot,
-                    ryft.kernel.schema=3,
-                    ryft.kernel.semantic=\"4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5\",
+                    ryft.kernel.schema=1,
+                    ryft.kernel.semantic=\"c0aace572db2a32780947575541c582a8c0e012a86dccb7f08be2cffcc1a97b0\",
                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                     input_output_alias=0->0,
                 ] %0
@@ -2650,8 +2692,8 @@ pub(crate) mod tests {
                         lambda %0:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] .
                         let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] = custom_call [
                             target=ryft.test.aot,
-                            ryft.kernel.schema=3,
-                            ryft.kernel.semantic=\"5f8db3ac713b4245730a499b5a0802d079efd8994fc7a7be1e3564379253d3e0\",
+                            ryft.kernel.schema=1,
+                            ryft.kernel.semantic=\"193d08e41e9ea83ddfd4ebaa8644c04b0f17e9e73fccff9b135537513d969ce9\",
                             ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                             input_output_alias=0->0,
                         ] %0
@@ -2683,8 +2725,8 @@ pub(crate) mod tests {
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [
                                 target=ryft.test.aot,
-                                ryft.kernel.schema=3,
-                                ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                                ryft.kernel.schema=1,
+                                ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                                 ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                 input_output_alias=0->0,
                             ] %0
@@ -2703,8 +2745,8 @@ pub(crate) mod tests {
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [
                                 target=ryft.test.aot,
-                                ryft.kernel.schema=3,
-                                ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                                ryft.kernel.schema=1,
+                                ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                                 ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                 input_output_alias=0->0,
                             ] %0
@@ -2751,8 +2793,8 @@ pub(crate) mod tests {
                                 lambda %0:f32[] .
                                 let %1:f32[] = custom_call [
                                     target=ryft.test.aot,
-                                    ryft.kernel.schema=3,
-                                    ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                                    ryft.kernel.schema=1,
+                                    ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                     input_output_alias=0->0,
                                 ] %0
@@ -2777,8 +2819,8 @@ pub(crate) mod tests {
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [
                                 target=ryft.test.aot,
-                                ryft.kernel.schema=3,
-                                ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                                ryft.kernel.schema=1,
+                                ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                                 ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                                 input_output_alias=0->0,
                             ] %0
@@ -2842,8 +2884,8 @@ pub(crate) mod tests {
                         lambda %0:i64[], %1:f32[] .
                         let %2:f32[] = custom_call [
                             target=ryft.test.aot,
-                            ryft.kernel.schema=3,
-                            ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                            ryft.kernel.schema=1,
+                            ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                             ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                             input_output_alias=0->0,
                         ] %1
@@ -2894,8 +2936,8 @@ pub(crate) mod tests {
                 let %1:f32[] = reference_read %0
                     %2:f32[] = custom_call [
                         target=ryft.test.aot,
-                        ryft.kernel.schema=3,
-                        ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                        ryft.kernel.schema=1,
+                        ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                         ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                         input_output_alias=0->0,
                     ] %1
@@ -2935,8 +2977,8 @@ pub(crate) mod tests {
                 let %1:f32[] = transfer_to_memory [destination=Device] %0
                     %2:f32[] = custom_call [
                         target=ryft.test.aot,
-                        ryft.kernel.schema=3,
-                        ryft.kernel.semantic=\"0338d5e02aa2b8ba5eaab5ae0d1c8b034758b0b95bb9b28645d88d1a7cd5eaed\",
+                        ryft.kernel.schema=1,
+                        ryft.kernel.semantic=\"365635d74d021c307c30e01c2ce48d0c1bfd3d8fe4cf379ceef283f1521ccebd\",
                         ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                         input_output_alias=0->0,
                     ] %1
@@ -3024,8 +3066,8 @@ pub(crate) mod tests {
                 lambda %0:i32[] .
                 let %1:i32[] = custom_call [
                     target=ryft.test.aot,
-                    ryft.kernel.schema=3,
-                    ryft.kernel.semantic=\"4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5\",
+                    ryft.kernel.schema=1,
+                    ryft.kernel.semantic=\"c0aace572db2a32780947575541c582a8c0e012a86dccb7f08be2cffcc1a97b0\",
                     ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                     input_output_alias=0->0,
                 ] %0

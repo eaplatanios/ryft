@@ -365,7 +365,7 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 
     /// Constructs row-major coordinates. Empty dimensions occur only inside loops whose trip count is zero.
-    fn coordinates(
+    pub(super) fn coordinates(
         &self,
         block: &mut DetachedBlock<'c, 't>,
         mut index: KernelValue<'c, 't>,
@@ -382,7 +382,7 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 
     /// Converts logical coordinates into a flat physical element index.
-    fn flat_index(
+    pub(super) fn flat_index(
         &self,
         block: &mut DetachedBlock<'c, 't>,
         coordinates: &[KernelValue<'c, 't>],
@@ -500,7 +500,7 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 
     /// Adds values using the admitted scalar element type.
-    fn add(
+    pub(super) fn add(
         &self,
         block: &mut DetachedBlock<'c, 't>,
         data_type: DataType,

@@ -2,6 +2,7 @@
 
 use pretty_assertions::assert_eq;
 
+use ryft::kernel;
 use ryft_core::{Array, ArrayType, Context, DataType, ReferenceRead, ReferenceWrite};
 use ryft_kernels::{
     AsyncCopyOperation, Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, ScratchOperation,
@@ -9,7 +10,7 @@ use ryft_kernels::{
 };
 
 /// Adds independently loaded tiles, including a partially populated final output tile.
-#[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[0] == right.shape()[0])]
+#[kernel(requires = left.shape()[0] == right.shape()[0])]
 fn vector_add(
     #[input(data_type = F32, rank = 1)] left: &Array,
     #[input(data_type = F32, rank = 1)] right: &Array,
@@ -22,13 +23,13 @@ fn vector_add(
 }
 
 /// Reduces a complete vector to one scalar through the canonical reduction operation.
-#[ryft_kernels::kernel(crate = "ryft_kernels")]
+#[kernel]
 fn sum(#[input(data_type = F32, rank = 1)] input: &Array, #[output(data_type = F32, shape = [])] output: &mut Array) {
     output.store(input.load().sum([0]));
 }
 
 /// Carries tiled dot products through a staged reduction loop with partial tiles on every axis.
-#[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[1] == right.shape()[0])]
+#[kernel(requires = left.shape()[1] == right.shape()[0])]
 fn matmul(
     #[input(data_type = F32, rank = 2)] left: &Array,
     #[input(data_type = F32, rank = 2)] right: &Array,
@@ -45,6 +46,200 @@ fn matmul(
         accumulator += left_tile.dot(right_tile);
     }
     output.store(accumulator);
+}
+
+/// Multiplies two matrices whose extents are multiples of 32 on a grid of blocks. The program `(i, j, k)` adds the
+/// product of the input blocks `(i, k)` and `(k, j)` into the output block `(i, j)`, which it zeroes at the first step
+/// of the sequential axis `k`, so each output block is initialized once and then accumulates the whole contraction.
+#[kernel(
+    grid(
+        i = left.shape()[0].div_ceil(32),
+        j = right.shape()[1].div_ceil(32),
+        k = sequential(left.shape()[1].div_ceil(32)),
+    ),
+    requires = left.shape()[1] == right.shape()[0],
+)]
+fn blocked_matmul(
+    #[input(data_type = F32, rank = 2, block = [32, 32], index = [i, k])] left: &Array,
+    #[input(data_type = F32, rank = 2, block = [32, 32], index = [k, j])] right: &Array,
+    #[output(data_type = F32, shape = [left.shape()[0], right.shape()[1]], block = [32, 32], index = [i, j])]
+    output: &mut Array,
+) {
+    if k == 0 {
+        output.store(zeros::<f32>([32, 32]));
+    }
+    output.accumulate(left.load().dot(right.load()));
+}
+
+/// Multiplies two matrices of any shape like [`blocked_matmul`]. The edge blocks are masked, so their padding is
+/// loaded as zero, contributes nothing to the products, and is never stored.
+#[kernel(
+    grid(
+        i = left.shape()[0].div_ceil(32),
+        j = right.shape()[1].div_ceil(32),
+        k = sequential(left.shape()[1].div_ceil(32)),
+    ),
+    requires = left.shape()[1] == right.shape()[0],
+)]
+fn masked_blocked_matmul(
+    #[input(data_type = F32, rank = 2, block = [32, 32], index = [i, k], boundary = masked)] left: &Array,
+    #[input(data_type = F32, rank = 2, block = [32, 32], index = [k, j], boundary = masked)] right: &Array,
+    #[output(
+        data_type = F32,
+        shape = [left.shape()[0], right.shape()[1]],
+        block = [32, 32],
+        index = [i, j],
+        boundary = masked,
+    )]
+    output: &mut Array,
+) {
+    if k == 0 {
+        output.store(zeros::<f32>([32, 32]));
+    }
+    output.accumulate(left.load_or(0.0).dot(right.load_or(0.0)));
+}
+
+/// Computes the elementwise sum and difference of two vectors whose length is a multiple of 128 in one pass. The
+/// callable returns both results as a tuple in declaration order.
+#[kernel(grid(i = left.shape()[0].div_ceil(128)), requires = left.shape()[0] == right.shape()[0])]
+fn sum_and_difference(
+    #[input(data_type = F32, rank = 1, block = [128], index = [i])] left: &Array,
+    #[input(data_type = F32, rank = 1, block = [128], index = [i])] right: &Array,
+    #[output(data_type = F32, shape = [left.shape()[0]], block = [128], index = [i])] sum: &mut Array,
+    #[output(data_type = F32, shape = [left.shape()[0]], block = [128], index = [i])] difference: &mut Array,
+) {
+    let first = left.load();
+    let second = right.load();
+    sum.store(first + second);
+    difference.store(first - second);
+}
+
+/// Adds a vector whose length is a multiple of 128 into another one in place. The `inout` parameter is read and
+/// written by the same program, and the callable returns its updated value.
+#[kernel(grid(i = input.shape()[0].div_ceil(128)), requires = input.shape()[0] == accumulator.shape()[0])]
+fn add_in_place(
+    #[input(data_type = F32, rank = 1, block = [128], index = [i])] input: &Array,
+    #[inout(data_type = F32, rank = 1, block = [128], index = [i])] accumulator: &mut Array,
+) {
+    accumulator.store(accumulator.load() + input.load());
+}
+
+/// Replaces the negative elements of a vector whose length is a multiple of 128 with zero in place. The store is
+/// masked by a mask that the body computes, so the other elements are never written.
+#[kernel(grid(i = values.shape()[0].div_ceil(128)))]
+fn relu_in_place(#[inout(data_type = F32, rank = 1, block = [128], index = [i])] values: &mut Array) {
+    let value = values.load();
+    values.store_where(zeros::<f32>([128]), value < 0.0f32);
+}
+
+/// Doubles a vector of any length in place. The blocks are masked, and the store is masked by the window mask of the
+/// block, which selects exactly the elements of the last block that lie within the vector.
+#[kernel(grid(i = values.shape()[0].div_ceil(128)))]
+fn double_in_place(
+    #[inout(data_type = F32, rank = 1, block = [128], index = [i], boundary = masked)] values: &mut Array,
+) {
+    let value = values.load_or(0.0);
+    values.store_where(value + value, values.window_mask());
+}
+
+/// Keeps the elements of `values` whose weight is positive and zeroes the others, for vectors whose length is a
+/// multiple of 128. The masked load reads only the selected elements of `values` and fills the rest with zero.
+#[kernel(grid(i = values.shape()[0].div_ceil(128)), requires = values.shape()[0] == weights.shape()[0])]
+fn keep_weighted(
+    #[input(data_type = F32, rank = 1, block = [128], index = [i])] values: &Array,
+    #[input(data_type = F32, rank = 1, block = [128], index = [i])] weights: &Array,
+    #[output(data_type = F32, shape = [values.shape()[0]], block = [128], index = [i])] output: &mut Array,
+) {
+    output.store(values.load_where(weights.load() > 0.0f32, 0.0));
+}
+
+/// Replaces the negative elements of a vector whose length is a multiple of 128 with zero in place, and returns the
+/// replaced elements, with zero at the positions that were kept. The masked swap writes and reads in one access.
+#[kernel(grid(i = values.shape()[0].div_ceil(128)))]
+fn extract_negatives(
+    #[inout(data_type = F32, rank = 1, block = [128], index = [i])] values: &mut Array,
+    #[output(data_type = F32, shape = [values.shape()[0]], block = [128], index = [i])] negatives: &mut Array,
+) {
+    let value = values.load();
+    negatives.store(values.swap_where(zeros::<f32>([128]), value < 0.0f32, 0.0));
+}
+
+/// Copies a vector through uninitialized scratch storage that the kernel writes before it reads.
+#[kernel]
+fn scratch_copy(
+    #[input(data_type = F32, rank = 1)] input: &Array,
+    #[output(data_type = F32, shape = [input.shape()[0]])] output: &mut Array,
+) {
+    let staging = scratch::<f32>([input.shape()[0]]);
+    staging.store(input.load());
+    output.store(staging.load());
+}
+
+/// Copies a vector asynchronously into scratch storage aligned to 16 bytes and waits for the copy to complete before
+/// reading the scratch storage.
+#[kernel]
+fn async_copy(
+    #[input(data_type = F32, rank = 1)] input: &Array,
+    #[output(data_type = F32, shape = [input.shape()[0]])] output: &mut Array,
+) {
+    let staging = scratch_aligned::<f32>([input.shape()[0]], 16);
+    let token = input.copy_to(staging);
+    token.wait();
+    output.store(staging.load());
+}
+
+/// Copies the block of 128 elements of `table` whose block index is the prefetched scalar `block`, which the window
+/// mapping of `table` reads before the kernel runs.
+#[kernel(grid(i = 1))]
+fn gather_block(
+    #[input(data_type = F32, rank = 1, block = [128], index = [block])] table: &Array,
+    #[prefetch(data_type = I32)] block: &Array,
+    #[output(data_type = F32, shape = [128])] output: &mut Array,
+) {
+    output.store(table.load());
+}
+
+/// Reverses the order of the blocks of 128 elements of a vector whose length is a multiple of 128. The input windows
+/// start at element offsets that run backwards, which no separable tiling describes, so the verifier enumerates the
+/// grid to prove that the windows lie within the input.
+#[kernel(grid(i = input.shape()[0].div_ceil(128)))]
+fn reverse_blocks(
+    #[input(data_type = F32, rank = 1, block = [128], start = [input.shape()[0] - 128 - i * 128])] input: &Array,
+    #[output(data_type = F32, shape = [input.shape()[0]], block = [128], index = [i])] output: &mut Array,
+) {
+    output.store(input.load());
+}
+
+/// Sums a vector whose length is a multiple of 128 into `total` on a parallel grid. Every program reduces its own
+/// block and adds the partial sum to `total` atomically, so the programs need no ordering.
+#[kernel(grid(i = input.shape()[0].div_ceil(128)))]
+fn parallel_sum(
+    #[input(data_type = F32, rank = 1, block = [128], index = [i])] input: &Array,
+    #[inout(data_type = F32, rank = 0)] total: &mut Array,
+) {
+    total.atomic_accumulate(input.load().reduce_sum([0]));
+}
+
+/// Copies the first two columns of a matrix through a static slice of its window.
+#[kernel(requires = input.shape()[1] >= 2)]
+fn leading_columns(
+    #[input(data_type = F32, rank = 2)] input: &Array,
+    #[output(data_type = F32, shape = [input.shape()[0], 2])] output: &mut Array,
+) {
+    output.store(input.slice([.., 0..2]).load());
+}
+
+/// Sums the exponentials of the elements of a vector that are not positive, which is the denominator of a softmax
+/// restricted to those elements. A comparison selects the exponential or zero per element, and the selected values are
+/// summed in F64 and rounded back to F32.
+#[kernel]
+fn nonpositive_exp_sum(
+    #[input(data_type = F32, rank = 1)] input: &Array,
+    #[output(data_type = F32, shape = [])] output: &mut Array,
+) {
+    let value = input.load();
+    let exponentials = select(value <= 0.0f32, value.exp(), zeros::<f32>([input.shape()[0]]));
+    output.store((exponentials as f64).reduce_sum([0]) as f32);
 }
 
 /// Stages scaled dot-product attention with a stable row-wise softmax. Half operands request FP32 accumulation and
@@ -379,6 +574,153 @@ fn test_attention_interpretation() {
     check_attention(&outputs[0].elements::<f32>().unwrap(), &case.expected);
 }
 
+/// Returns the operands of a `rows` by `depth` by `columns` matrix multiplication and their product. The elements are
+/// small integers, so every FP32 product and sum is exact regardless of the accumulation order.
+fn matmul_operands(rows: usize, depth: usize, columns: usize) -> (Array, Array, Array) {
+    let left = (0..rows * depth).map(|index| (index % 7) as f32 - 3.0).collect::<Vec<_>>();
+    let right = (0..depth * columns).map(|index| (index % 5) as f32 - 2.0).collect::<Vec<_>>();
+    let mut product = vec![0.0f32; rows * columns];
+    for row in 0..rows {
+        for column in 0..columns {
+            for inner in 0..depth {
+                product[row * columns + column] += left[row * depth + inner] * right[inner * columns + column];
+            }
+        }
+    }
+    (
+        Array::matrix(rows, depth, left).unwrap(),
+        Array::matrix(depth, columns, right).unwrap(),
+        Array::matrix(rows, columns, product).unwrap(),
+    )
+}
+
+#[test]
+fn test_blocked_matmul() {
+    let (left, right, product) = matmul_operands(64, 96, 32);
+    assert_eq!(blocked_matmul(&left, &right), Ok(product));
+}
+
+#[test]
+fn test_masked_blocked_matmul() {
+    // The shapes cover a single partial block, partial edge blocks on every axis, and complete blocks only.
+    for (rows, depth, columns) in [(1, 1, 1), (33, 35, 34), (64, 96, 32)] {
+        let (left, right, product) = matmul_operands(rows, depth, columns);
+        assert_eq!(masked_blocked_matmul(&left, &right), Ok(product));
+    }
+}
+
+#[test]
+fn test_sum_and_difference() {
+    let left = (0..256).map(|index| index as f32 - 100.0).collect::<Vec<_>>();
+    let right = (0..256).map(|index| (index % 7) as f32 - 3.0).collect::<Vec<_>>();
+    let sum = left.iter().zip(&right).map(|(left, right)| left + right).collect::<Vec<_>>();
+    let difference = left.iter().zip(&right).map(|(left, right)| left - right).collect::<Vec<_>>();
+    assert_eq!(
+        sum_and_difference(&Array::vector(left).unwrap(), &Array::vector(right).unwrap()),
+        Ok((Array::vector(sum).unwrap(), Array::vector(difference).unwrap())),
+    );
+}
+
+#[test]
+fn test_add_in_place() {
+    let input = (0..256).map(|index| (index % 11) as f32 - 5.0).collect::<Vec<_>>();
+    let accumulator = (0..256).map(|index| index as f32).collect::<Vec<_>>();
+    let expected = input.iter().zip(&accumulator).map(|(input, accumulator)| input + accumulator).collect::<Vec<_>>();
+    assert_eq!(
+        add_in_place(&Array::vector(input).unwrap(), &Array::vector(accumulator).unwrap()),
+        Ok(Array::vector(expected).unwrap()),
+    );
+}
+
+#[test]
+fn test_relu_in_place() {
+    let values = (0..256).map(|index| (index % 9) as f32 - 4.0).collect::<Vec<_>>();
+    let expected = values.iter().map(|value| value.max(0.0)).collect::<Vec<_>>();
+    assert_eq!(relu_in_place(&Array::vector(values).unwrap()), Ok(Array::vector(expected).unwrap()));
+}
+
+#[test]
+fn test_double_in_place() {
+    // The last of the three blocks has 44 valid elements.
+    let values = (0..300).map(|index| index as f32 - 150.0).collect::<Vec<_>>();
+    let expected = values.iter().map(|value| 2.0 * value).collect::<Vec<_>>();
+    assert_eq!(double_in_place(&Array::vector(values).unwrap()), Ok(Array::vector(expected).unwrap()));
+}
+
+#[test]
+fn test_keep_weighted() {
+    let values = (0..256).map(|index| index as f32 + 1.0).collect::<Vec<_>>();
+    let weights = (0..256).map(|index| (index % 3) as f32 - 1.0).collect::<Vec<_>>();
+    let expected =
+        values.iter().zip(&weights).map(|(value, weight)| if *weight > 0.0 { *value } else { 0.0 }).collect::<Vec<_>>();
+    assert_eq!(
+        keep_weighted(&Array::vector(values).unwrap(), &Array::vector(weights).unwrap()),
+        Ok(Array::vector(expected).unwrap()),
+    );
+}
+
+#[test]
+fn test_extract_negatives() {
+    let values = (0..256).map(|index| (index % 9) as f32 - 4.0).collect::<Vec<_>>();
+    let kept = values.iter().map(|value| value.max(0.0)).collect::<Vec<_>>();
+    let negatives = values.iter().map(|value| value.min(0.0)).collect::<Vec<_>>();
+    assert_eq!(
+        extract_negatives(&Array::vector(values).unwrap()),
+        Ok((Array::vector(kept).unwrap(), Array::vector(negatives).unwrap())),
+    );
+}
+
+#[test]
+fn test_scratch_copy() {
+    let input = Array::vector((0..67).map(|index| index as f32 - 20.0).collect::<Vec<_>>()).unwrap();
+    assert_eq!(scratch_copy(&input), Ok(input));
+}
+
+#[test]
+fn test_async_copy() {
+    let input = Array::vector((0..67).map(|index| index as f32 - 20.0).collect::<Vec<_>>()).unwrap();
+    assert_eq!(async_copy(&input), Ok(input));
+}
+
+#[test]
+fn test_gather_block() {
+    let table = Array::vector((0..512).map(|index| index as f32).collect::<Vec<_>>()).unwrap();
+    assert_eq!(
+        gather_block(&table, &Array::scalar(2i32).unwrap()),
+        Ok(Array::vector((256..384).map(|index| index as f32).collect::<Vec<_>>()).unwrap()),
+    );
+}
+
+#[test]
+fn test_reverse_blocks() {
+    let input = (0..384).map(|index| index as f32).collect::<Vec<_>>();
+    let expected = input.chunks(128).rev().flatten().copied().collect::<Vec<_>>();
+    assert_eq!(reverse_blocks(&Array::vector(input).unwrap()), Ok(Array::vector(expected).unwrap()));
+}
+
+#[test]
+fn test_parallel_sum() {
+    let input = (0..384).map(|index| (index % 13) as f32 - 6.0).collect::<Vec<_>>();
+    let expected = 10.0 + input.iter().sum::<f32>();
+    assert_eq!(
+        parallel_sum(&Array::vector(input).unwrap(), &Array::scalar(10.0f32).unwrap()),
+        Ok(Array::scalar(expected).unwrap()),
+    );
+}
+
+#[test]
+fn test_leading_columns() {
+    let input = Array::matrix(3, 4, (0..12).map(|index| index as f32).collect()).unwrap();
+    assert_eq!(leading_columns(&input), Ok(Array::matrix(3, 2, vec![0.0f32, 1.0, 4.0, 5.0, 8.0, 9.0]).unwrap()));
+}
+
+#[test]
+fn test_nonpositive_exp_sum() {
+    // The exponentials of zero and negative infinity are exact, so the expected sum is exact.
+    let input = Array::vector(vec![0.0f32, 1.5, f32::NEG_INFINITY, -0.0, 2.0]).unwrap();
+    assert_eq!(nonpositive_exp_sum(&input), Ok(Array::scalar(2.0f32).unwrap()));
+}
+
 /// Exports a macro-authored whole-array kernel, reloads it in a fresh session, and awaits its native output.
 #[cfg(any(feature = "mosaic-gpu", feature = "cutile", feature = "triton"))]
 fn execute_aot_case(
@@ -398,7 +740,7 @@ fn execute_aot_case(
     use ryft_xla::{FromPjrt, Options, Session};
 
     /// Uses the portable source codec's whole-array subset with no hidden captures or runtime references.
-    #[ryft_kernels::kernel(crate = "ryft_kernels")]
+    #[kernel]
     fn add(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -2010,7 +2352,7 @@ mod stress {
     // Defines another tile width using the existing portable macro and its canonical valid-lane masking.
     macro_rules! tiled_add {
         ($name:ident, $width:literal) => {
-            #[ryft_kernels::kernel(crate = "ryft_kernels")]
+            #[kernel]
             fn $name(
                 #[input(data_type = F32, rank = 1)] left: &Array,
                 #[input(data_type = F32, rank = 1)] right: &Array,
@@ -2029,7 +2371,7 @@ mod stress {
     tiled_add!(add128, 128);
 
     /// A codec-supported mutation source, independent of tile-load codec eligibility.
-    #[ryft_kernels::kernel(crate = "ryft_kernels")]
+    #[kernel]
     fn codec_add(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -2380,7 +2722,7 @@ mod triton {
             return;
         }
         /// Uses a whole-array contraction without checked loop dimensions or assertion hostcalls.
-        #[ryft_kernels::kernel(crate = "ryft_kernels")]
+        #[kernel]
         fn dot(
             #[input(data_type = F32, rank = 2)] left: &Array,
             #[input(data_type = F32, rank = 2)] right: &Array,
@@ -2481,5 +2823,227 @@ mod triton {
             }
         });
         assert!(executed, "enabled Triton AOT qualification did not execute CUDA");
+    }
+}
+
+/// Records which macro kernels each compiler adapter admits and lowers for a CUDA 12.1 target, as far as this is
+/// possible without a GPU, a native compiler invocation, or the cuTile Python compiler.
+#[cfg(all(feature = "cutile", feature = "mosaic-gpu", feature = "triton"))]
+mod adapters {
+    use std::path::PathBuf;
+
+    use pretty_assertions::assert_eq;
+
+    use ryft_cuda::kernels::cutile::{Compiler as CuTileCompiler, Options as CuTileOptions, Target as CuTileTarget};
+    use ryft_kernels::{
+        KernelCompilationError, KernelCompiler, KernelInitializationError, KernelSchedule, VerifiedKernel,
+    };
+    use ryft_mosaic::kernels::gpu::{Compiler as MosaicCompiler, Options as MosaicOptions, Target as MosaicTarget};
+    use ryft_triton::kernels::{Compiler as TritonCompiler, Options as TritonOptions, Target as TritonTarget};
+
+    use super::*;
+
+    /// Absolute path of a Python executable that does not exist. cuTile admission lowers the kernel to Python source
+    /// before it probes the compiler installation, so failing to launch this executable means that lowering succeeded.
+    const MISSING_PYTHON: &str = "/nonexistent/ryft/python";
+
+    /// Admits a kernel through Mosaic GPU, builds and verifies its MLIR module, and serializes the module into the
+    /// bytes that XLA compiles. Returns `lowers` when every step succeeds and the debug rendering of the first error
+    /// otherwise.
+    fn mosaic(kernel: &VerifiedKernel<'_>) -> String {
+        let target = MosaicTarget::new(12, 1).unwrap();
+        let options = MosaicOptions::default();
+        let schedule = KernelSchedule::default();
+        if let Err(error) = MosaicCompiler.admit(kernel, &target, &options, &schedule) {
+            return format!("{error:?}");
+        }
+        let context = ryft_mlir::Context::new();
+        match MosaicCompiler.module(&context, kernel, &target, &options, &schedule) {
+            Ok(module) => assert_eq!(module.verify(), Ok(true)),
+            Err(error) => return format!("module: {error:?}"),
+        }
+        match MosaicCompiler.compile(kernel, &target, &options, &schedule) {
+            Ok(_) => "lowers".into(),
+            Err(error) => format!("compile: {error:?}"),
+        }
+    }
+
+    /// Admits a kernel through Triton, which lowers it to a verified Triton MLIR module and only then checks that the
+    /// linked native archive includes the CUDA compiler. Returns `lowers` when admission succeeds or fails only because
+    /// that compiler is not linked (e.g., on hosts without CUDA), and the debug rendering of its error otherwise.
+    fn triton(kernel: &VerifiedKernel<'_>) -> String {
+        let target = TritonTarget::Cuda { major: 12, minor: 1 };
+        match TritonCompiler::new().admit(kernel, &target, &TritonOptions::default(), &KernelSchedule::default()) {
+            Ok(()) => "lowers".into(),
+            Err(KernelCompilationError::Unavailable { message })
+                if message == "linked native archive does not include the requested Triton compiler target" =>
+            {
+                "lowers".into()
+            }
+            Err(error) => format!("{error:?}"),
+        }
+    }
+
+    /// Admits a kernel through cuTile with [`MISSING_PYTHON`]. Returns `lowers` when admission fails only because that
+    /// executable cannot be launched, and the debug rendering of its error otherwise.
+    fn cutile(kernel: &VerifiedKernel<'_>) -> String {
+        let target = CuTileTarget::new(12, 1).unwrap();
+        let compiler = CuTileCompiler::new(PathBuf::from(MISSING_PYTHON));
+        match compiler.admit(kernel, &target, &CuTileOptions::default(), &KernelSchedule::default()) {
+            Ok(()) => "lowers".into(),
+            Err(KernelCompilationError::Unavailable { message })
+                if message == format!("`{MISSING_PYTHON}`: No such file or directory (os error 2)") =>
+            {
+                "lowers".into()
+            }
+            Err(error) => format!("{error:?}"),
+        }
+    }
+
+    /// Builds the definition of every macro kernel of this file that is reachable from this module, for small
+    /// argument types that the host interpretation tests also use.
+    fn definitions() -> Vec<(&'static str, KernelDefinition)> {
+        let vector = |extent: usize| ArrayType::new_static(DataType::F32, [extent]);
+        let matrix = |rows: usize, columns: usize| ArrayType::new_static(DataType::F32, [rows, columns]);
+        vec![
+            ("vector_add", vector_add::definition(&vector(1003), &vector(1003)).unwrap()),
+            ("sum", sum::definition(&vector(257)).unwrap()),
+            ("matmul", matmul::definition(&matrix(33, 35), &matrix(35, 34)).unwrap()),
+            ("blocked_matmul", blocked_matmul::definition(&matrix(64, 96), &matrix(96, 32)).unwrap()),
+            ("masked_blocked_matmul", masked_blocked_matmul::definition(&matrix(33, 35), &matrix(35, 34)).unwrap()),
+            ("sum_and_difference", sum_and_difference::definition(&vector(256), &vector(256)).unwrap()),
+            ("add_in_place", add_in_place::definition(&vector(256), &vector(256)).unwrap()),
+            ("relu_in_place", relu_in_place::definition(&vector(256)).unwrap()),
+            ("double_in_place", double_in_place::definition(&vector(300)).unwrap()),
+            ("keep_weighted", keep_weighted::definition(&vector(256), &vector(256)).unwrap()),
+            ("extract_negatives", extract_negatives::definition(&vector(256)).unwrap()),
+            ("scratch_copy", scratch_copy::definition(&vector(67)).unwrap()),
+            ("async_copy", async_copy::definition(&vector(67)).unwrap()),
+            (
+                "gather_block",
+                gather_block::definition(&vector(512), &ArrayType::scalar(DataType::I32))
+                    .unwrap()
+                    .specialize_prefetch(&[Array::scalar(2i32).unwrap()])
+                    .unwrap(),
+            ),
+            ("reverse_blocks", reverse_blocks::definition(&vector(384)).unwrap()),
+            ("parallel_sum", parallel_sum::definition(&vector(384), &ArrayType::scalar(DataType::F32)).unwrap()),
+            ("leading_columns", leading_columns::definition(&matrix(3, 4)).unwrap()),
+            ("nonpositive_exp_sum", nonpositive_exp_sum::definition(&vector(5)).unwrap()),
+        ]
+    }
+
+    #[test]
+    fn test_adapter_admission() {
+        // Verification requires every prefetched scalar to be specialized into a constant first, so no adapter
+        // receives a runtime prefetch, and `definitions` specializes `gather_block` to the block index 2.
+        let definition = gather_block::definition(
+            &ArrayType::new_static(DataType::F32, [512]),
+            &ArrayType::scalar(DataType::I32),
+        )
+        .unwrap();
+        assert!(matches!(
+            VerifiedKernel::new(&definition, 1024),
+            Err(KernelInitializationError::UnsupportedLaunch { boundary: "unspecialized scalar prefetch" }),
+        ));
+
+        // Columns are Mosaic GPU, Triton, and cuTile, and every rejection is the debug rendering of its error.
+        let lowers = || "lowers".to_owned();
+        let mosaic_unsupported = |operation: &str| {
+            format!(
+                "Compiler(Unsupported {{ operation: {operation:?}, reason: \
+                 \"operation has no baseline GPU lowering\" }})",
+            )
+        };
+        let triton_unsupported = |operation: &str, requested: &str| {
+            format!(
+                "Unsupported {{ owner: \"ryft_triton::kernels\", operation: {operation:?}, requested: {requested:?}, \
+                 capability: \"direct Triton lowering\" }}",
+            )
+        };
+        let cutile_unsupported = |operation: &str, requested: &str| {
+            format!(
+                "Unsupported {{ owner: \"ryft_cuda::kernels::cutile\", operation: {operation:?}, \
+                 requested: {requested:?}, capability: \"cuTile source lowering\" }}",
+            )
+        };
+        // Triton orders no global memory access across the threads of one program without a CTA barrier, which
+        // ryft-mlir does not expose, so it rejects every read that follows a write of the same parameter.
+        let read_after_write = triton_unsupported(
+            "kernel_call",
+            "reads after writes of one parameter need a CTA barrier, which ryft-mlir does not expose",
+        );
+        let expected = vec![
+            ("vector_add", [lowers(), lowers(), lowers()]),
+            ("sum", [lowers(), lowers(), lowers()]),
+            ("matmul", [lowers(), lowers(), lowers()]),
+            ("blocked_matmul", [lowers(), read_after_write.clone(), lowers()]),
+            ("masked_blocked_matmul", [lowers(), read_after_write, lowers()]),
+            ("sum_and_difference", [lowers(), lowers(), lowers()]),
+            ("add_in_place", [lowers(), lowers(), lowers()]),
+            ("relu_in_place", [lowers(), lowers(), lowers()]),
+            ("double_in_place", [lowers(), lowers(), lowers()]),
+            ("keep_weighted", [lowers(), lowers(), lowers()]),
+            (
+                "extract_negatives",
+                [
+                    lowers(),
+                    triton_unsupported(
+                        "masked_swap",
+                        "swaps whose old value is used need a CTA barrier, which ryft-mlir does not expose",
+                    ),
+                    lowers(),
+                ],
+            ),
+            (
+                "scratch_copy",
+                [
+                    lowers(),
+                    triton_unsupported("scratch", "operation is outside the portable Triton subset"),
+                    cutile_unsupported("scratch", "operation is outside the portable cuTile subset"),
+                ],
+            ),
+            (
+                "async_copy",
+                [
+                    lowers(),
+                    triton_unsupported("scratch", "operation is outside the portable Triton subset"),
+                    cutile_unsupported("scratch", "operation is outside the portable cuTile subset"),
+                ],
+            ),
+            (
+                "gather_block",
+                [lowers(), triton_unsupported("constant", "unsupported constant element type"), lowers()],
+            ),
+            ("reverse_blocks", [lowers(), lowers(), lowers()]),
+            (
+                "parallel_sum",
+                [
+                    mosaic_unsupported("reference_atomic_add_update"),
+                    lowers(),
+                    cutile_unsupported(
+                        "reference_atomic_add_update",
+                        "operation is outside the portable cuTile subset",
+                    ),
+                ],
+            ),
+            ("leading_columns", [lowers(), lowers(), lowers()]),
+            (
+                "nonpositive_exp_sum",
+                [
+                    lowers(),
+                    triton_unsupported("exp", "array operation or geometry is outside the portable Triton subset"),
+                    lowers(),
+                ],
+            ),
+        ];
+        let actual = definitions()
+            .iter()
+            .map(|(name, definition)| {
+                let kernel = VerifiedKernel::new(definition, 1024).unwrap();
+                (*name, [mosaic(&kernel), triton(&kernel), cutile(&kernel)])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 }

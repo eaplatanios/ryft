@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-cuda"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "hex",
  "indoc",
@@ -1799,6 +1799,7 @@ dependencies = [
  "hex",
  "indoc",
  "pretty_assertions",
+ "ryft",
  "ryft-core",
  "ryft-cuda",
  "ryft-kernels",
@@ -1815,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-kernels"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "indoc",
  "num-complex",
@@ -1865,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-mosaic"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "indoc",
  "pretty_assertions",
@@ -1896,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-rocm"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "libloading 0.9.0",
  "pretty_assertions",
@@ -1906,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-triton"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "indoc",
  "pretty_assertions",
@@ -1923,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-xla"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "half",
  "hex",

@@ -149,7 +149,7 @@ pub use jit_call::{JIT_CALL_OPERATION_NAME, JitCallOperation, transpose_primal_j
     type(ArrayIrType),
     constant(Payload),
     members(ArrayType, structural(DimensionType)),
-    dispatch(identity, discharge, batching, differentiation, transposition)
+    dispatch(identity, discharge, partial_evaluation, batching, differentiation, transposition)
 )]
 pub enum Operation<Payload = Constant>
 where

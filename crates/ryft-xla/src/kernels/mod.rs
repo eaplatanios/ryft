@@ -45,7 +45,7 @@ use ryft_core::{
     MeshAxisType, Operation as CoreOperation, ProgramError, ShardingDimension, TypeError, Typed,
 };
 use ryft_kernels::{
-    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension,
+    KERNEL_KEY_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension,
     KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
@@ -296,7 +296,7 @@ where
             configuration_hash.update(component);
         }
         custom_call = custom_call
-            .with_attribute("ryft.kernel.schema", i64::from(KERNEL_SCHEMA_VERSION))
+            .with_attribute("ryft.kernel.schema", i64::from(KERNEL_KEY_VERSION))
             .with_attribute(
                 "ryft.kernel.semantic",
                 hex::encode(Sha256::digest(kernel.definition().semantic_key()?.as_bytes())),
@@ -664,8 +664,8 @@ pub(crate) mod tests {
                 custom_call [
                     target=ryft.test.deferred_copy,
                     deferred.schema=1,
-                    ryft.kernel.schema=3,
-                    ryft.kernel.semantic="4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5",
+                    ryft.kernel.schema=1,
+                    ryft.kernel.semantic="c0aace572db2a32780947575541c582a8c0e012a86dccb7f08be2cffcc1a97b0",
                     ryft.kernel.configuration="9b504f8715e50a1265774108552c85c4822b04e39355818c680592419a1e0f7d",
                     ryft.kernel.provenance="[\"copy_output\"]",
                     input_output_alias=0->0,
@@ -684,8 +684,8 @@ pub(crate) mod tests {
                 custom_call [
                     target=ryft.test.deferred_copy,
                     deferred.schema=1,
-                    ryft.kernel.schema=3,
-                    ryft.kernel.semantic="4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5",
+                    ryft.kernel.schema=1,
+                    ryft.kernel.semantic="c0aace572db2a32780947575541c582a8c0e012a86dccb7f08be2cffcc1a97b0",
                     ryft.kernel.configuration="9b504f8715e50a1265774108552c85c4822b04e39355818c680592419a1e0f7d",
                     input_output_alias=0->0,
                 ]
@@ -832,8 +832,8 @@ pub(crate) mod tests {
                 let %1:i32[] = custom_call [
                     target=ryft.test.deferred_copy,
                     deferred.schema=1,
-                    ryft.kernel.schema=3,
-                    ryft.kernel.semantic="4cc09d10091393f37ec4916239c2560febf49bccfd6553c6ed4ab9ed8d7598d5",
+                    ryft.kernel.schema=1,
+                    ryft.kernel.semantic="c0aace572db2a32780947575541c582a8c0e012a86dccb7f08be2cffcc1a97b0",
                     ryft.kernel.configuration="9b504f8715e50a1265774108552c85c4822b04e39355818c680592419a1e0f7d",
                     input_output_alias=0->0,
                 ] %0
@@ -891,7 +891,7 @@ pub(crate) mod tests {
             formatdoc! {r#"
             module {{
               func.func @main(%arg0: tensor<i32>) -> tensor<i32> {{
-                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 3 : i64, ryft.kernel.semantic = "{semantic}"}}, operand_layouts = [dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<> : tensor<0xindex>]}} : (tensor<i32>) -> tensor<i32>
+                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 1 : i64, ryft.kernel.semantic = "{semantic}"}}, operand_layouts = [dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<> : tensor<0xindex>]}} : (tensor<i32>) -> tensor<i32>
                 return %0 : tensor<i32>
               }}
             }}

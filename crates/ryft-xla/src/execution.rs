@@ -45,7 +45,7 @@ use crate::{
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ExecutionError {
     /// The executable belongs to a different live PJRT client.
-    #[error("xla executable belongs to a different PJRT client")]
+    #[error("XLA executable belongs to a different PJRT client")]
     ClientMismatch,
 
     /// Runtime donation metadata has a different arity than the invocation inputs.

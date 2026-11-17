@@ -34,15 +34,15 @@ include = [
 [workspace.dependencies]
 ryft = { path = "crates/ryft", version = "0.0.3", default-features = false }
 ryft-core = { path = "crates/ryft-core", version = "0.0.3", default-features = false }
-ryft-cuda = { path = "crates/ryft-cuda", version = "0.0.3", default-features = false }
-ryft-kernels = { path = "crates/ryft-kernels", version = "0.0.3", default-features = false }
+ryft-cuda = { path = "crates/ryft-cuda", version = "0.0.1", default-features = false }
+ryft-kernels = { path = "crates/ryft-kernels", version = "0.0.1", default-features = false }
 ryft-macros = { path = "crates/ryft-macros", version = "0.0.3", default-features = false }
 ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.3", default-features = false }
-ryft-mosaic = { path = "crates/ryft-mosaic", version = "0.0.3", default-features = false }
+ryft-mosaic = { path = "crates/ryft-mosaic", version = "0.0.1", default-features = false }
 ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.3", default-features = false }
-ryft-rocm = { path = "crates/ryft-rocm", version = "0.0.3", default-features = false }
-ryft-triton = { path = "crates/ryft-triton", version = "0.0.3", default-features = false }
-ryft-xla = { path = "crates/ryft-xla", version = "0.0.3", default-features = false }
+ryft-rocm = { path = "crates/ryft-rocm", version = "0.0.1", default-features = false }
+ryft-triton = { path = "crates/ryft-triton", version = "0.0.1", default-features = false }
+ryft-xla = { path = "crates/ryft-xla", version = "0.0.1", default-features = false }
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.3", default-features = false }
 anyhow = "1.0.102"
 approx = "0.5.1"

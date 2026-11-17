@@ -27,3 +27,33 @@ error: unsupported kernel boundary policy (expected `masked` or `in_bounds`)
    |
 28 | fn boundary(#[output(data_type = F32, shape = [4], tile = [2], boundary = clamped)] output: &mut Array) {}
    |                                                                           ^^^^^^^
+
+error: kernel windows take either `index` or `start` metadata
+  --> tests/kernels/error_metadata.rs:32:74
+   |
+32 |     #[input(data_type = F32, rank = 1, block = [2], index = [i], start = [i])] input: &Array,
+   |                                                                          ^^^
+
+error: `index`, `start`, and `boundary` metadata require `block` metadata
+  --> tests/kernels/error_metadata.rs:39:48
+   |
+39 |     #[input(data_type = F32, rank = 1, index = [i])] input: &Array,
+   |                                                ^^^
+
+error: `index`, `start`, and `boundary` metadata require `block` metadata
+  --> tests/kernels/error_metadata.rs:46:5
+   |
+46 |     #[input(data_type = F32, rank = 1, boundary = masked)] input: &Array,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: kernel `index` metadata requires one expression per `block` extent
+  --> tests/kernels/error_metadata.rs:53:64
+   |
+53 |     #[input(data_type = F32, rank = 2, block = [2, 2], index = [i])] input: &Array,
+   |                                                                ^^^
+
+error: unknown grid axis or `prefetch` parameter `j` in kernel mapping expression
+  --> tests/kernels/error_metadata.rs:60:62
+   |
+60 |     #[input(data_type = F32, rank = 1, block = [2], start = [j * 2])] input: &Array,
+   |                                                              ^

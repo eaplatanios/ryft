@@ -313,10 +313,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, CompositeJvpRule, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Mul, MulOperation, NamedComposite,
-        PrintOperation, Program as CoreProgram, ProjectedContext, Reduce, Softmax, batch, composite, differentiate_at,
-        softmax,
+        AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeJvpRule,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Mul, MulOperation,
+        NamedComposite, PrintOperation, Program as CoreProgram, ProjectedContext, Reduce, Softmax, batch, composite,
+        differentiate_at, softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
@@ -959,6 +959,7 @@ mod tests {
         // A held softmax function executes each eager call as one dispatch of its whole body, where the capability
         // dispatches every operation of the same decomposition separately. Both compute the same probabilities bit for
         // bit, including the rows with NaN, positive infinity, only excluded classes, ties, and a saturated maximum.
+        // NaN results are compared as NaN, because their payloads are not part of the contract.
         let client = execution_client();
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 1);
@@ -982,12 +983,23 @@ mod tests {
         // equal types compiled.
         let primitive = logits.softmax(-1).unwrap();
         assert_eq!(dispatches(), (14, 9));
-        let expected = primitive.copy_to_host().unwrap();
-        assert_eq!(first.copy_to_host().unwrap(), expected);
-        assert_eq!(second.copy_to_host().unwrap(), expected);
-        let probabilities = values_from_bytes::<f32>(&expected);
+        let assert_same = |actual: &Array, expected: &[f32]| {
+            let actual = values_from_bytes::<f32>(&actual.copy_to_host().unwrap());
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    (actual.is_nan() && expected.is_nan()) || actual.to_bits() == expected.to_bits(),
+                    "{actual} differs from {expected}",
+                );
+            }
+        };
+        let probabilities = values_from_bytes::<f32>(&primitive.copy_to_host().unwrap());
+        assert_same(&first, &probabilities);
+        assert_same(&second, &probabilities);
         assert!(probabilities[..9].iter().all(|probability| probability.is_nan()));
-        assert_eq!(probabilities[15], 0.99999994);
+        // The saturated maximum rounds to the largest value below one on the CPU and to one on CUDA, whose exponential
+        // is less accurate.
+        assert!((0.99999994..=1.0).contains(&probabilities[15]), "{}", probabilities[15]);
 
         // The derivatives are those of the capability, because both differentiate the same decomposition.
         let weights = (0..18).map(|index| index as f32 - 8.0).collect::<Vec<_>>();
@@ -1000,7 +1012,49 @@ mod tests {
             .with_captures(weights)
             .gradient(|logits, weights| logits.softmax(-1)?.mul(&weights)?.reduce_sum(&[0, 1], None))
             .unwrap();
-        assert_eq!(gradient.copy_to_host().unwrap(), expected.copy_to_host().unwrap());
+        assert_same(&gradient, &values_from_bytes::<f32>(&expected.copy_to_host().unwrap()));
+    }
+
+    #[test]
+    fn test_composite_operation_lower_executes_softmax_non_finite_rows_after_other_programs() {
+        // XLA's CPU backend on aarch64 Linux returned garbage instead of NaN for the non-finite rows of a compiled
+        // softmax once other programs had been compiled on the same client, when the body applied `exp` to a constant
+        // NaN. The softmax now selects the NaN after its exponential. Compiling the one-bit integer comparisons of
+        // `test_compare_operation_lower_one_bit_integers` first was one known trigger.
+        let client = execution_client();
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
+        for data_type in [DataType::Boolean, DataType::I1, DataType::U1] {
+            let left = replicated_array(&session, &mesh, data_type, &[4], &[0, 0, 1, 1]);
+            let right = replicated_array(&session, &mesh, data_type, &[4], &[0, 1, 0, 1]);
+            let signed = data_type == DataType::I1;
+            for (direction, expected) in [
+                (ComparisonDirection::Equal, [true, false, false, true]),
+                (ComparisonDirection::NotEqual, [false, true, true, false]),
+                (ComparisonDirection::LessThan, [false, !signed, signed, false]),
+                (ComparisonDirection::LessThanOrEqual, [true, !signed, signed, true]),
+                (ComparisonDirection::GreaterThan, [false, signed, !signed, false]),
+                (ComparisonDirection::GreaterThanOrEqual, [true, signed, !signed, true]),
+            ] {
+                assert_eq!(
+                    values_from_bytes::<bool>(&left.compare(&right, direction).unwrap().copy_to_host().unwrap()),
+                    expected,
+                    "{data_type} {direction:?}",
+                );
+            }
+        }
+
+        // Rows with NaN, with positive infinity, and with only excluded classes are NaN, and a finite row is not.
+        let (nan, infinity) = (f32::NAN, f32::INFINITY);
+        let values = [nan, 0.0, 1.0, infinity, 0.0, 1.0, -infinity, -infinity, -infinity, 0.0, 0.0, 0.0];
+        let logits = replicated_array(&session, &mesh, DataType::F32, &[4, 3], &values_to_bytes(&values));
+        let function = softmax::<ProjectedContext<Session, ArrayType>>(-1);
+        let probabilities = values_from_bytes::<f32>(&function.call(logits).unwrap().copy_to_host().unwrap());
+        assert!(probabilities[..9].iter().all(|probability| probability.is_nan()), "{probabilities:?}");
+        assert!(
+            probabilities[9..].iter().all(|probability| (probability - 1.0 / 3.0).abs() < 1e-7),
+            "{probabilities:?}",
+        );
     }
 
     #[test]

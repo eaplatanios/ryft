@@ -1,26 +1,85 @@
-//! Host interpretation of qualified kernel calls through canonical references and program replay.
+//! Contains the host interpreter for qualified kernel calls, which executes kernels on host [`Array`]s through
+//! canonical references and program replay.
 //!
-//! Qualification precedes storage creation. Input arrays remain immutable; every invocation owns private reference
-//! roots, and only completed writable roots become results. Masked edge windows use private tiles, explicit load
-//! fallbacks, and publication restricted to valid coordinates. Qualification proves initialization, coverage, and
-//! disjointness before execution; the interpreter never chooses an unresolved dynamic launch extent.
+//! The host interpreter is the reference semantics of a kernel. It qualifies a [`KernelCallOperation`] together with
+//! its attached body, allocates private reference storage, and then replays the verified body once per grid point.
+//! It requires no device and no compiler, so it serves both as the executable specification against which compiled
+//! kernels are checked and as a debugger for kernel bodies.
 //!
-//! Scalar-prefetched values are bound through canonical program specialization before qualification or allocation.
-//! Async copies capture initialized source elements when issued and publish their destination only at the matching
-//! wait. Ordinary reference effects retain their existing semantics; the host traversal chooses one admitted order
-//! for parallel atomic updates, and does not promise bitwise agreement across other valid floating-point orderings.
+//! # Qualification and Storage
 //!
-//! To investigate a failure, retain the trace before propagating the execution result. Optional NaN checks inspect
-//! ordinary operation inputs/results, including complex components and low-precision floating-point formats. They
-//! never read uninitialized scratch merely to inspect its contents. Precision and rounding remain those of the
-//! canonical operations; diagnostics do not substitute a wider-precision execution model.
+//! Scalar prefetch values are bound through canonical program specialization (i.e.,
+//! [`KernelDefinition::specialize_prefetch`]) before qualification or allocation. Grid extents must already be
+//! static, so the interpreter never chooses an unresolved dynamic launch extent. Qualification then proves
+//! initialization, coverage, and disjointness before any storage is created, and it produces the validated reference
+//! summary that replay uses to lower each swap whose old value is never used to a store.
+//!
+//! Input arrays remain immutable. Every invocation owns one private reference root per kernel parameter, which starts
+//! from the input array of a read-only or read-write parameter and from zeros for a write-only parameter. Only the
+//! completed roots of writable parameters become results, and a failure never publishes a partially updated array.
+//!
+//! # Grid Point Replay
+//!
+//! For each grid point, the interpreter evaluates every parameter mapping at the point's coordinates and builds the
+//! window that the body receives for that parameter.
+//!
+//!   - An in-bounds window is a view of the root through the window's valid transform, so it aliases the root and
+//!     every write to it updates the root directly.
+//!   - A masked window is a private zeroed tile whose type is the referent type of the parameter's body type. The tile
+//!     loads the valid region of the root before the body runs and records which of its elements are valid. Unless its
+//!     parameter is read-only, it publishes its valid region back to the root after the body completes, so private
+//!     padding is never published.
+//!
+//! The body then receives these windows followed by the grid point's coordinates. Masked loads, stores, and swaps on
+//! a masked window intersect their explicit mask with the validity of the elements that they select. Any other access
+//! that reads a selection of a masked window containing invalid elements fails with
+//! [`KernelMemoryError::UnmaskedWindowAccess`], except a swap that qualification lowered to a store, which reads
+//! nothing. A [`WindowMaskOperation`](crate::memory::WindowMaskOperation) returns the validity of the elements that
+//! its reference selects without accessing storage, and every element of a window without recorded validity (e.g., an
+//! in-bounds window) is valid. A [`ScratchOperation`](crate::memory::ScratchOperation) allocates fresh zeroed storage
+//! on every binding.
+//!
+//! An [`AsyncCopyOperation`](crate::memory::AsyncCopyOperation) captures the initialized source elements when it is
+//! issued and records a pending copy under a fresh completion token. The matching
+//! [`WaitOperation`](crate::memory::WaitOperation) removes that pending copy and only then writes its destination. A
+//! wait on an unknown or consumed token fails with [`KernelInterpretationError::UnknownCopyToken`], and a grid point
+//! that completes with pending copies fails with [`KernelInterpretationError::PendingCopies`] before any of its
+//! windows are published. Ordinary reference effects retain their existing semantics. The host traversal chooses one
+//! admitted order for parallel atomic updates, and it does not promise bitwise agreement across other valid
+//! floating-point orders. [`KernelDefinition::interpret_interleavings`] explores the other orders of small kernels.
+//!
+//! Replay binds every operation through a private qualified context. That context records a trace entry when tracing,
+//! charges one replay step, applies the optional NaN checks, and handles the kernel memory operations above. It
+//! interprets every other operation through its canonical eager rule, and replays the regions that such a rule enters
+//! through the same context, so nested operations undergo the same checks and every region entry also consumes a
+//! replay step.
+//!
+//! # Entry Points
+//!
+//!   - [`KernelDefinition::interpret`] interprets a definition with no step limit, because kernel bodies admit only
+//!     bounded loops. Its `maximum_programs` argument bounds grid enumeration only for parameter mappings that lack a
+//!     separable tiling proof. Ordinary [`Program::interpret`](ryft_core::Program::interpret) of a `kernel_call` takes
+//!     the same path with [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`].
+//!   - [`KernelDefinition::interpret_with_limits`] caps both the number of grid points and the number of replay steps
+//!     (i.e., operation bindings and region entries) across the whole invocation.
+//!   - [`KernelDefinition::interpret_with_trace`] applies the caps of a [`KernelDebugOptions`], which its
+//!     [`KernelDebugOptions::with_maximum_programs`], [`KernelDebugOptions::with_maximum_steps`], and
+//!     [`KernelDebugOptions::with_nan_checks`] builder functions configure, and it records a [`KernelTraceEntry`] for
+//!     every attempted operation binding, with a [`KernelTraceAccess`] for each of its reference accesses.
+//!
+//! Trace entries precede the effects of their operations, so the trace retains the failing binding of a failed
+//! invocation. To investigate a failure, retain the trace before propagating the execution result. Optional NaN checks
+//! inspect ordinary operation inputs and outputs, including complex components and low precision floating-point
+//! formats. They never read reference storage, so they never read uninitialized scratch merely to inspect its
+//! contents. Precision and rounding remain those of the canonical operations, and diagnostics do not substitute an
+//! execution model with wider precision.
 //!
 //! ```
 //! use ryft_core::{Array, ProgramError};
 //! use ryft_kernels::{KernelDebugOptions, KernelDefinition};
 //!
 //! # fn inspect(definition: &KernelDefinition, inputs: Vec<Array>) -> Result<(), ProgramError> {
-//! let options = KernelDebugOptions { check_nans: true, maximum_steps: 10_000, ..Default::default() };
+//! let options = KernelDebugOptions::default().with_maximum_steps(10_000).with_nan_checks(true);
 //! let mut trace = Vec::new();
 //! let result = definition.interpret_with_trace(inputs, &options, &mut trace);
 //! for entry in trace {
@@ -49,11 +108,14 @@ use thiserror::Error;
 use crate::calls::{KernelCallOperation, KernelDefinition};
 use crate::initialization::{KernelInitializationError, validated_kernel_references};
 use crate::mappings::BoundaryPolicy;
-use crate::memory::{KernelMemoryError, ScratchOperation};
+use crate::memory::{KernelMemoryError, WINDOW_MASK_OPERATION_NAME};
 use crate::operations::{KernelExtension, KernelOperation};
 use crate::validation::{KernelParameterAccess, KernelReferenceOperation, KernelReferenceSummary, KernelSwapLowering};
 
-/// Host debugging limits exceeded while replaying a kernel; these limits do not alter its device semantics.
+/// Failure of the host interpreter while it replays a qualified kernel body. The replay fails when an enabled NaN
+/// check finds a NaN, when the asynchronous copy protocol is violated at runtime, or when a debug entry point exhausts
+/// its replay step limit. Qualification failures are reported separately as [`KernelInitializationError`]s. The
+/// debugging limits and checks never alter the device semantics of the kernel.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelInterpretationError {
     /// Optional numerical checking found a NaN in an ordinary value. Reference storage is never read for this check.
@@ -63,16 +125,22 @@ pub enum KernelInterpretationError {
     Nan {
         /// Canonical operation that produced or consumed the value.
         operation: &'static str,
+
         /// Whether the value is an operation `input` or `output`.
         position: &'static str,
+
         /// Position in that operation's input or output list.
         value: usize,
-        /// Logical row-major element index; either complex component may be NaN.
+
+        /// Logical row-major element index. Either complex component may be NaN.
         element: usize,
+
         /// Original element type, before diagnostic inspection.
         data_type: DataType,
+
         /// Logical grid coordinate at the failing operation.
         coordinate: Vec<usize>,
+
         /// Original source provenance at the failing operation.
         provenance: Provenance,
     },
@@ -89,102 +157,26 @@ pub enum KernelInterpretationError {
     PendingCopies {
         /// Number of incomplete copies in the program instance.
         count: usize,
+
         /// Logical grid coordinate whose output cannot be published.
         coordinate: Vec<usize>,
     },
 
-    /// The invocation exhausted its operation and region-entry budget before successful completion.
+    /// The invocation exhausted its budget of operation bindings and region entries before successful completion.
     #[error("kernel interpretation exceeded {maximum_steps} steps at grid point {coordinate:?} in `{operation}`")]
     StepLimit {
         /// Maximum replay steps requested for the complete invocation.
         maximum_steps: usize,
+
         /// Logical grid coordinate being interpreted when the limit was reached.
         coordinate: Vec<usize>,
+
         /// Canonical operation executing or entering an attached region.
         operation: &'static str,
+
         /// Existing program provenance at the failing step.
         provenance: Provenance,
     },
-}
-
-/// Host-only debugging choices. Mandatory bounds, race, and initialization validation cannot be disabled. Numerical
-/// checking observes ordinary values without changing their dtype, rounding, or accumulator behavior; those remain
-/// properties of canonical operations. These options are excluded from kernel and compiler identity.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct KernelDebugOptions {
-    /// Maximum logical grid size admitted before storage is allocated.
-    pub maximum_programs: usize,
-    /// Maximum operation bindings and region entries across the invocation.
-    pub maximum_steps: usize,
-    /// Rejects NaNs in ordinary floating-point or complex operation inputs/results. Infinity is allowed.
-    pub check_nans: bool,
-}
-
-impl Default for KernelDebugOptions {
-    fn default() -> Self {
-        Self {
-            maximum_programs: DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS,
-            maximum_steps: DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS,
-            check_nans: false,
-        }
-    }
-}
-
-/// One attempted operation binding during host replay. Entries precede effects, so the final entry is retained when
-/// its operation fails. Reference identities are numbered by first observation within this invocation, independent
-/// of process-global allocation IDs. Region-entry budget checks do not create operation entries.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct KernelTraceEntry {
-    /// Logical program coordinate in the declared grid order.
-    pub coordinate: Vec<usize>,
-    /// Canonical operation name.
-    pub operation: &'static str,
-    /// Canonical provenance active at this binding.
-    pub provenance: Provenance,
-    /// Input reference accesses in the operation's declared effect order.
-    pub accesses: Vec<KernelTraceAccess>,
-    /// Invocation-local identities of copies pending before this operation starts.
-    pub pending_copies: Vec<usize>,
-}
-
-/// A reference access in a [`KernelTraceEntry`], with its canonical transform path and invocation-local root identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct KernelTraceAccess {
-    /// Input position of the accessed reference.
-    pub input: usize,
-    /// Exact canonical reference access mode.
-    pub mode: ReferenceAccessMode,
-    /// Allocation number assigned on first observation during this invocation.
-    pub root: usize,
-    /// Canonical transform path from this allocation to the selected elements, rendered as the [`Display`] form of
-    /// each [`ArrayReferenceTransform`] prefixed with `/` (e.g., `/slice(axes=[0:2])`). An empty path selects the
-    /// complete allocation.
-    pub path: String,
-}
-
-impl Display for KernelTraceEntry {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{:?} {}", self.coordinate, self.operation)?;
-        for access in &self.accesses {
-            write!(formatter, " input[{}]={}(root[{}]{})", access.input, access.mode, access.root, access.path)?;
-        }
-        write!(formatter, " pending={:?}", self.pending_copies)?;
-        if !self.provenance.is_unknown() {
-            write!(formatter, " at {}", self.provenance)?;
-        }
-        Ok(())
-    }
-}
-
-/// Mutable collection shared only by nested host replay contexts. It never enters semantic identity or compiled IR.
-#[derive(Default)]
-struct KernelTraceState {
-    /// Attempted bindings collected in execution order.
-    entries: Vec<KernelTraceEntry>,
-    /// Stable local names for observed canonical allocation identities.
-    roots: BTreeMap<ReferenceId, usize>,
-    /// Optional numerical checks applied to bound ordinary values.
-    check_nans: bool,
 }
 
 /// Default host replay budget of [`KernelDebugOptions`], counting operation bindings and region entries across the
@@ -204,6 +196,183 @@ pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS: usize = 1_000_000;
 /// This is a host resource limit, not part of a kernel's semantic identity or a device launch limit.
 pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS: usize = 10_000;
 
+/// Debugging choices that affect only host interpretation through [`KernelDefinition::interpret_with_trace`].
+/// Mandatory bounds, race, and initialization validation cannot be disabled. Numerical checking observes ordinary
+/// values without changing their data type, rounding, or accumulator behavior, which remain properties of canonical
+/// operations. These options are excluded from kernel and compiler identity.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KernelDebugOptions {
+    /// Maximum logical grid size admitted before storage is allocated.
+    maximum_programs: usize,
+
+    /// Maximum operation bindings and region entries across the invocation.
+    maximum_steps: usize,
+
+    /// Rejects NaNs in ordinary floating-point or complex operation inputs and outputs. Infinity is allowed.
+    nan_checks: bool,
+}
+
+impl Default for KernelDebugOptions {
+    fn default() -> Self {
+        Self {
+            maximum_programs: DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS,
+            maximum_steps: DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS,
+            nan_checks: false,
+        }
+    }
+}
+
+impl KernelDebugOptions {
+    /// Returns these options with `maximum_programs` as the maximum logical grid size admitted before storage is
+    /// allocated. A launch with more grid points fails before qualification, even when every parameter mapping has a
+    /// separable tiling proof. The default is [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`].
+    pub fn with_maximum_programs(mut self, maximum_programs: usize) -> Self {
+        self.maximum_programs = maximum_programs;
+        self
+    }
+
+    /// Returns these options with `maximum_steps` as the maximum number of operation bindings and region entries
+    /// across the invocation. Zero permits an empty grid but rejects the first body entry of a nonempty launch. The
+    /// default is [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS`].
+    pub fn with_maximum_steps(mut self, maximum_steps: usize) -> Self {
+        self.maximum_steps = maximum_steps;
+        self
+    }
+
+    /// Returns these options with NaN checking enabled when `nan_checks` is `true` and disabled otherwise. While it is
+    /// enabled, every operation binding inspects its ordinary floating-point and complex array inputs before the
+    /// operation runs and its array outputs after it, and the interpretation fails with
+    /// [`KernelInterpretationError::Nan`] at the first element that is NaN, or whose real or imaginary component is
+    /// NaN. Infinities are allowed. Reference storage is never read for this check, and the check never changes data
+    /// types, rounding, or accumulation. NaN checking is disabled by default.
+    pub fn with_nan_checks(mut self, nan_checks: bool) -> Self {
+        self.nan_checks = nan_checks;
+        self
+    }
+
+    /// Returns the maximum logical grid size admitted before storage is allocated.
+    pub fn maximum_programs(&self) -> usize {
+        self.maximum_programs
+    }
+
+    /// Returns the maximum number of operation bindings and region entries across the invocation.
+    pub fn maximum_steps(&self) -> usize {
+        self.maximum_steps
+    }
+
+    /// Returns whether interpretation rejects NaNs in ordinary floating-point or complex operation inputs and outputs.
+    pub fn nan_checks(&self) -> bool {
+        self.nan_checks
+    }
+}
+
+/// One attempted operation binding during host replay, which [`KernelDefinition::interpret_with_trace`] records.
+/// Entries precede effects, so the final entry is retained when its operation fails. Reference identities are numbered
+/// by first observation within this invocation, independent of the allocation IDs of the process. Budget checks for
+/// region entries do not create operation entries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KernelTraceEntry {
+    /// Logical program coordinate in the declared grid order.
+    coordinate: Vec<usize>,
+
+    /// Canonical operation name.
+    operation: &'static str,
+
+    /// Canonical provenance active at this binding.
+    provenance: Provenance,
+
+    /// Input reference accesses in the operation's declared effect order.
+    accesses: Vec<KernelTraceAccess>,
+
+    /// Identities of the copies pending before this operation starts, numbered within this invocation.
+    pending_copies: Vec<usize>,
+}
+
+impl KernelTraceEntry {
+    /// Returns the logical program coordinate in the declared grid order.
+    pub fn coordinate(&self) -> &[usize] {
+        &self.coordinate
+    }
+
+    /// Returns the canonical operation name.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Returns the canonical provenance active at this binding.
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    /// Returns the input reference accesses in the operation's declared effect order.
+    pub fn accesses(&self) -> &[KernelTraceAccess] {
+        &self.accesses
+    }
+
+    /// Returns the identities of the copies pending before this operation starts, numbered within this invocation
+    /// and in ascending order.
+    pub fn pending_copies(&self) -> &[usize] {
+        &self.pending_copies
+    }
+}
+
+impl Display for KernelTraceEntry {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?} {}", self.coordinate, self.operation)?;
+        for access in &self.accesses {
+            write!(formatter, " input[{}]={}(root[{}]{})", access.input, access.mode, access.root, access.path)?;
+        }
+        write!(formatter, " pending={:?}", self.pending_copies)?;
+        if !self.provenance.is_unknown() {
+            write!(formatter, " at {}", self.provenance)?;
+        }
+        Ok(())
+    }
+}
+
+/// A reference access in a [`KernelTraceEntry`], with its canonical transform path and the identity of its root within
+/// this invocation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KernelTraceAccess {
+    /// Input position of the accessed reference.
+    input: usize,
+
+    /// Exact canonical reference access mode.
+    mode: ReferenceAccessMode,
+
+    /// Allocation number assigned on first observation during this invocation.
+    root: usize,
+
+    /// Canonical transform path from this allocation to the selected elements, rendered as the [`Display`] form of
+    /// each [`ArrayReferenceTransform`] prefixed with `/` (e.g., `/slice(axes=[0:2])`). An empty path selects the
+    /// complete allocation.
+    path: String,
+}
+
+impl KernelTraceAccess {
+    /// Returns the input position of the accessed reference.
+    pub fn input(&self) -> usize {
+        self.input
+    }
+
+    /// Returns the exact canonical reference access mode.
+    pub fn mode(&self) -> ReferenceAccessMode {
+        self.mode
+    }
+
+    /// Returns the allocation number assigned on first observation during this invocation.
+    pub fn root(&self) -> usize {
+        self.root
+    }
+
+    /// Returns the canonical transform path from the allocation to the selected elements, rendered as the
+    /// [`Display`] form of each [`ArrayReferenceTransform`] prefixed with `/` (e.g., `/slice(axes=[0:2])`). An empty
+    /// path selects the complete allocation.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 impl<Extension> KernelDefinition<Extension>
 where
     EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
@@ -215,23 +384,35 @@ where
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     /// Interprets this definition on host arrays after checking initialization, output coverage, and races. The
-    /// inputs and results follow the functional signature: write-only parameters consume no input, and read-only
-    /// parameters produce no result. A failure never publishes a partially updated array or mutates an input. Grid
-    /// points are not capped when every parameter mapping has a separable tiling proof, and replay has no step limit
-    /// because kernel bodies admit only bounded loops. Use [`Self::interpret_with_limits`] to bound both.
+    /// inputs and results follow the functional signature, so [`KernelParameterAccess::WriteOnly`] parameters consume
+    /// no input and [`KernelParameterAccess::ReadOnly`] parameters produce no result. A failure never publishes a
+    /// partially updated array or mutates an input. Grid points are not capped when every parameter mapping has a
+    /// separable tiling proof, and replay has no step limit because kernel bodies admit only bounded loops. Use
+    /// [`Self::interpret_with_limits`] to bound both.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: arrays in the definition's ordinary input order.
     ///   - `maximum_programs`: maximum grid size to enumerate when a parameter mapping lacks a separable tiling proof.
     ///     Qualification rejects such a larger grid before allocating reference storage or replaying a body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the inputs do not match the functional signature, when scalar prefetch
+    /// specialization or qualification fails (e.g., with a [`KernelInitializationError`] for an uninitialized read, a
+    /// dynamic grid extent, or a grid larger than `maximum_programs` that must be enumerated), or when replay fails.
+    /// Replay fails when a canonical operation fails, when an access reads the padding of a masked window (i.e.,
+    /// [`KernelMemoryError::UnmaskedWindowAccess`]), or when the asynchronous copy protocol is violated (i.e.,
+    /// [`KernelInterpretationError::UnknownCopyToken`] or [`KernelInterpretationError::PendingCopies`]). Errors that
+    /// this crate defines are wrapped with [`ProgramError::custom`] and recovered with
+    /// [`ProgramError::downcast_custom`].
     pub fn interpret(&self, inputs: Vec<Array>, maximum_programs: usize) -> Result<Vec<Array>, ProgramError> {
         self.interpret_recorded(inputs, maximum_programs, None, None, None)
     }
 
     /// Interprets this definition with explicit host grid and replay limits. A replay step is an operation binding or
-    /// region entry, so empty loop bodies still consume the budget. All grid points share one counter; nested region
-    /// replay preserves the original instruction provenance. Limit failures discard private output storage.
+    /// region entry, so empty loop bodies still consume the budget. All grid points share one counter, and nested
+    /// region replay preserves the original instruction provenance. Limit failures discard private output storage.
     ///
     /// # Parameters
     ///
@@ -240,6 +421,12 @@ where
     ///     parameter mapping has a separable tiling proof.
     ///   - `maximum_steps`: maximum operation bindings and region entries across the invocation. Zero permits an
     ///     empty grid but rejects the first body entry of a nonempty launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::interpret`], a [`KernelInitializationError::QualificationLimit`] when the grid
+    /// has more than `maximum_programs` points, and a [`KernelInterpretationError::StepLimit`] when replay exceeds
+    /// `maximum_steps`.
     pub fn interpret_with_limits(
         &self,
         inputs: Vec<Array>,
@@ -249,10 +436,22 @@ where
         self.interpret_recorded(inputs, maximum_programs, Some(maximum_steps), None, None)
     }
 
-    /// Interprets with an operation trace retained on success or failure. Existing entries are cleared before
-    /// qualification; a qualification failure therefore leaves an empty trace. The trace records attempted bindings,
+    /// Interprets this definition with an operation trace retained on success or failure. Existing entries are cleared
+    /// before qualification, so a qualification failure leaves an empty trace. The trace records attempted bindings,
     /// exact reference accesses, pending copy tokens, and original source provenance. No array contents are recorded.
     /// Host limits have the same meaning as in [`Self::interpret_with_limits`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: arrays in the definition's ordinary input order.
+    ///   - `options`: host grid and replay limits, and whether NaN checks are enabled.
+    ///   - `trace`: collector that receives a [`KernelTraceEntry`] for every attempted operation binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::interpret_with_limits`] for the limits of `options`, and a
+    /// [`KernelInterpretationError::Nan`] when NaN checks are enabled and an ordinary operation input or output
+    /// contains a NaN.
     pub fn interpret_with_trace(
         &self,
         inputs: Vec<Array>,
@@ -262,8 +461,9 @@ where
         self.interpret_in_order(inputs, options, None, trace)
     }
 
-    /// Shares ordinary replay with bounded scheduler-selected orders. Only the scheduler supplies an explicit order;
-    /// it has already checked flat-region eligibility and generated every instruction occurrence exactly once.
+    /// Shares ordinary replay with the bounded orders that the scheduler selects. Only the scheduler supplies an
+    /// explicit order, and it has already checked that the body is a flat region and generated every instruction
+    /// occurrence exactly once.
     pub(super) fn interpret_in_order(
         &self,
         inputs: Vec<Array>,
@@ -272,7 +472,7 @@ where
         trace: &mut Vec<KernelTraceEntry>,
     ) -> Result<Vec<Array>, ProgramError> {
         trace.clear();
-        let state = Rc::new(RefCell::new(KernelTraceState { check_nans: options.check_nans, ..Default::default() }));
+        let state = Rc::new(RefCell::new(KernelTraceState { nan_checks: options.nan_checks, ..Default::default() }));
         let result = self.interpret_recorded(
             inputs,
             options.maximum_programs,
@@ -284,7 +484,8 @@ where
         result
     }
 
-    /// Runs the ordinary interpreter with optional debug limits and an optional invocation-local trace collector.
+    /// Runs the ordinary interpreter with optional debug limits and an optional trace collector local to the
+    /// invocation.
     fn interpret_recorded(
         &self,
         inputs: Vec<Array>,
@@ -430,13 +631,13 @@ impl KernelCallOperation {
             .iter()
             .map(|parameter| {
                 let array = match parameter.access() {
-                    KernelParameterAccess::WriteOnly => array_context.zero(parameter.r#type().as_ref())?,
                     KernelParameterAccess::ReadOnly | KernelParameterAccess::ReadWrite => {
                         let ArrayIrValue::Array(array) = input_values.next().unwrap() else {
                             unreachable!("the validated functional signature contains only arrays");
                         };
                         array.clone()
                     }
+                    KernelParameterAccess::WriteOnly => array_context.zero(parameter.r#type().as_ref())?,
                 };
                 Ok(ArrayReference::new(array))
             })
@@ -483,20 +684,22 @@ impl KernelCallOperation {
                                 .map(|&extent| ArraySliceAxis::new(0, extent, 1))
                                 .collect(),
                         })?;
-                        if parameter.access() != KernelParameterAccess::WriteOnly {
-                            Self::copy_window(&source, &selected)?;
-                        }
+                        // A carried write-only window holds what the previous step along its carry axis published,
+                        // so every tile loads its valid elements. The root of a write-only parameter starts zeroed, so
+                        // the load is deterministic, and qualification admits no read of any other write-only tile
+                        // before the body writes the elements that it reads.
+                        Self::copy_window(&source, &selected)?;
                         let mask_type = tile_type.clone().with_data_type(DataType::Boolean);
                         let addressing = ArrayAddressing::new(mask_type.clone())?;
                         let mut index = vec![0; tile_type.rank()];
-                        let mut lanes = Vec::with_capacity(addressing.element_count());
+                        let mut elements = Vec::with_capacity(addressing.element_count());
                         for _ in 0..addressing.element_count() {
-                            lanes.push(
+                            elements.push(
                                 index.iter().zip(valid_shape.dimensions()).all(|(&index, &extent)| index < extent),
                             );
                             addressing.advance_index(&mut index);
                         }
-                        validity.insert(tile.id(), ArrayReference::new(Array::from_elements(mask_type, &lanes)?));
+                        validity.insert(tile.id(), ArrayReference::new(Array::from_elements(mask_type, &elements)?));
                         if parameter.access() != KernelParameterAccess::ReadOnly {
                             publications.push((selected, source));
                         }
@@ -536,7 +739,7 @@ impl KernelCallOperation {
                 scheduled.push(Some(RegionInterpreter::new(qualified, body, windows)?));
                 continue;
             }
-            qualified.check_step(self.name())?;
+            qualified.validate_step(self.name())?;
             qualified.replay_region(body, windows)?;
             let pending = qualified.pending_copies.borrow().len();
             if pending != 0 {
@@ -555,7 +758,7 @@ impl KernelCallOperation {
             for &program in order {
                 let state = scheduled[program].take().unwrap();
                 if !started[program] {
-                    state.context().check_step(self.name())?;
+                    state.context().validate_step(self.name())?;
                     started[program] = true;
                 }
                 state.context().instruction.set(Some(InstructionId::new(body.id(), positions[program])));
@@ -565,7 +768,7 @@ impl KernelCallOperation {
             for (program, state) in scheduled.into_iter().enumerate() {
                 let state = state.unwrap();
                 if !started[program] {
-                    state.context().check_step(self.name())?;
+                    state.context().validate_step(self.name())?;
                 }
                 let pending = state.context().pending_copies.borrow().len();
                 if pending != 0 {
@@ -586,7 +789,8 @@ impl KernelCallOperation {
     }
 
     /// Copies only valid selected coordinates between a logical edge tile and the original full array. Physical layout
-    /// may differ because the tile is private; shape, dtype, placement, and distributed dependencies must agree.
+    /// may differ because the tile is private, but shape, data type, placement, and distributed dependencies must
+    /// agree.
     fn copy_window(source: &ArrayReference<Array>, destination: &ArrayReference<Array>) -> Result<(), ProgramError> {
         let value = source.read()?;
         let destination_type = destination.r#type().referent().clone();
@@ -599,55 +803,61 @@ impl KernelCallOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for ScratchOperation {
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        Err(ProgramError::custom(KernelMemoryError::RequiresQualification { operation: self.name() }))
-    }
+/// Mutable collection shared only by nested host replay contexts. It never enters semantic identity or compiled IR.
+#[derive(Default)]
+struct KernelTraceState {
+    /// Attempted bindings collected in execution order.
+    entries: Vec<KernelTraceEntry>,
+
+    /// Stable local names for observed canonical allocation identities.
+    roots: BTreeMap<ReferenceId, usize>,
+
+    /// Optional numerical checks applied to bound ordinary values.
+    nan_checks: bool,
 }
 
 /// Private replay authority created only after the entire attached body passes initialization qualification.
-/// Portable eager rules remain unchanged; their child-region driver retains this authority across recursion.
+/// Portable eager rules remain unchanged, and their child region driver (i.e., [`QualifiedKernelDriver`]) retains
+/// this authority across recursion.
 #[derive(Clone)]
 struct QualifiedKernelContext<Extension: Operation<Type = ArrayIrType>> {
     /// Canonical eager arithmetic and reference semantics.
     eager: EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>,
-    /// Per-tile valid coordinates; private physical padding never counts as readable full array storage.
+
+    /// Valid coordinates of each tile. Private physical padding never counts as readable full array storage.
     validity: BTreeMap<ReferenceId, ArrayReference<Array>>,
+
     /// Validated summary of the attached body, which classifies every swap as a store or an exchange.
     references: Rc<KernelReferenceSummary>,
+
     /// Body instruction whose replay step is in progress. The first swap bound during that step takes it to look up
     /// the validated lowering, so a swap that a rule binds on its own behalf never inherits a store lowering.
     instruction: Rc<Cell<Option<InstructionId>>>,
+
     /// Logical program being replayed for diagnostics.
     coordinate: Vec<usize>,
-    /// Invocation-wide host limit, retained for exact diagnostics.
+
+    /// Host step limit of the whole invocation, retained for exact diagnostics.
     maximum_steps: usize,
-    /// Shared across every grid point and nested region of this invocation.
+
+    /// Remaining replay steps, shared across every grid point and nested region of this invocation.
     remaining_steps: Rc<Cell<usize>>,
-    /// Canonical exception-safe provenance composition during ordinary program replay.
+
+    /// Canonical provenance composition during ordinary program replay, which restores the enclosing provenance even
+    /// when a step fails.
     provenance: Rc<ProvenanceState>,
+
     /// Source snapshots and reserved destinations awaiting their canonical completion tokens.
     pending_copies: Rc<RefCell<BTreeMap<ReferenceId, PendingCopy>>>,
+
     /// Optional observer shared across all points and attached regions.
     trace: Option<Rc<RefCell<KernelTraceState>>>,
 }
 
-/// One deterministic asynchronous copy: its destination remains unchanged until the matching wait succeeds.
-struct PendingCopy {
-    /// Initialized source elements captured when the copy started.
-    source: Array,
-    /// Canonical destination view reserved until completion.
-    destination: ArrayReference<Array>,
-}
-
 impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension> {
-    /// Charges one bounded replay step before any instruction or region entry can perform effects.
-    fn check_step(&self, operation: &'static str) -> Result<(), ProgramError> {
+    /// Charges one bounded replay step before any instruction or region entry can perform effects, and fails with a
+    /// [`KernelInterpretationError::StepLimit`] when the invocation has no steps left.
+    fn validate_step(&self, operation: &'static str) -> Result<(), ProgramError> {
         let remaining = self.remaining_steps.get();
         if remaining == 0 {
             return Err(ProgramError::custom(KernelInterpretationError::StepLimit {
@@ -661,14 +871,15 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
         Ok(())
     }
 
-    /// Inspects ordinary values only; reference initialization and reads retain their explicit operation semantics.
-    fn check_nans(
+    /// Validates that ordinary `values` contain no NaN when NaN checks are enabled. Only ordinary values are
+    /// inspected, so reference initialization and reads retain their explicit operation semantics.
+    fn validate_nans(
         &self,
         operation: &'static str,
         position: &'static str,
         values: &[ArrayIrValue<Array>],
     ) -> Result<(), ProgramError> {
-        if !self.trace.as_ref().is_some_and(|trace| trace.borrow().check_nans) {
+        if !self.trace.as_ref().is_some_and(|trace| trace.borrow().nan_checks) {
             return Ok(());
         }
         for (value, array) in values.iter().enumerate() {
@@ -709,7 +920,7 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
     }
 
     /// Projects a tile's validity through the same canonical transforms as the accessed reference. This includes
-    /// indexed axes and nested slices; the mask has the same shape but owns independent immutable Boolean storage.
+    /// indexed axes and nested slices. The mask has the same shape but owns independent immutable Boolean storage.
     fn window_validity(&self, reference: &ArrayReference<Array>) -> Result<Option<Array>, ProgramError> {
         let Some(validity) = self.validity.get(&reference.id()) else {
             return Ok(None);
@@ -827,8 +1038,8 @@ where
                 pending_copies,
             });
         }
-        self.check_step(operation.name())?;
-        self.check_nans(operation.name(), "input", inputs)?;
+        self.validate_step(operation.name())?;
+        self.validate_nans(operation.name(), "input", inputs)?;
         let outputs = (|| {
             operation.validate_region_interfaces(&regions.region_interfaces())?;
             if let KernelOperation::Scratch(scratch) = &operation {
@@ -838,6 +1049,27 @@ where
                 )?;
                 let storage = EagerContext::<Array, ArrayOperation<Array>>::new().zero(scratch.referent())?;
                 return Ok(vec![ArrayIrValue::Reference(ArrayReference::new(storage))]);
+            }
+            if let KernelOperation::WindowMask(window_mask) = &operation {
+                // The mask is the recorded validity of the tile that the reference views, restricted to that view,
+                // and every element of a reference without recorded validity is valid. No storage is accessed.
+                let output_types = window_mask.infer_output_types(
+                    &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
+                    &[],
+                )?;
+                let (ArrayIrValue::Reference(reference), [ArrayIrType::Array(output_type)]) =
+                    (&inputs[0], output_types.as_slice())
+                else {
+                    unreachable!("`{WINDOW_MASK_OPERATION_NAME}` type inference admits only array references");
+                };
+                let mask = match self.window_validity(reference)? {
+                    Some(validity) => Array::from_logical_bytes(output_type.clone(), &validity.logical_bytes())?,
+                    None => {
+                        let count = ArrayAddressing::new(output_type.clone())?.element_count();
+                        Array::from_elements(output_type.clone(), &vec![true; count])?
+                    }
+                };
+                return Ok(vec![ArrayIrValue::Array(mask)]);
             }
             let mask_index = match &operation {
                 KernelOperation::MaskedLoad(_) => Some(1),
@@ -852,14 +1084,15 @@ where
                 let reference = selected_references.get(&0).unwrap();
                 if let Some(validity) = self.window_validity(reference)? {
                     let ArrayIrValue::Array(mask) = &inputs[mask_index] else { unreachable!() };
-                    let lanes = mask
+                    let elements = mask
                         .elements::<bool>()?
                         .into_iter()
                         .zip(validity.elements::<bool>()?)
                         .map(|(requested, valid)| requested && valid)
                         .collect::<Vec<_>>();
                     let mut inputs = inputs.to_vec();
-                    inputs[mask_index] = ArrayIrValue::Array(Array::from_elements(mask.r#type().into_owned(), &lanes)?);
+                    inputs[mask_index] =
+                        ArrayIrValue::Array(Array::from_elements(mask.r#type().into_owned(), &elements)?);
                     return operation.interpret(
                         &self.eager,
                         &QualifiedKernelDriver { context: self, regions: &regions, operation: operation.name() },
@@ -925,7 +1158,7 @@ where
                 ),
             }
         })()?;
-        self.check_nans(operation.name(), "output", &outputs)?;
+        self.validate_nans(operation.name(), "output", &outputs)?;
         Ok(outputs)
     }
 
@@ -950,12 +1183,23 @@ where
     }
 }
 
+/// One deterministic asynchronous copy, whose destination remains unchanged until the matching wait succeeds.
+struct PendingCopy {
+    /// Initialized source elements captured when the copy started.
+    source: Array,
+
+    /// Canonical destination view reserved until completion.
+    destination: ArrayReference<Array>,
+}
+
 /// Adapts unchanged eager higher-order rules to recursive replay in the private qualified context.
 struct QualifiedKernelDriver<'r, Extension: Operation<Type = ArrayIrType>> {
     /// Qualification authority for this immutable invocation body.
     context: &'r QualifiedKernelContext<Extension>,
+
     /// Actual regions attached to the operation currently being interpreted.
     regions: &'r AttachedRegions<'r, ArrayIrValue<Array>, KernelOperation<Extension>>,
+
     /// Canonical operation whose region entry consumes a replay step.
     operation: &'static str,
 }
@@ -999,7 +1243,7 @@ where
         index: usize,
         inputs: Vec<ArrayIrValue<Array>>,
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
-        self.context.check_step(self.operation)?;
+        self.context.validate_step(self.operation)?;
         self.context.replay_region(self.region(index)?, inputs)
     }
 
@@ -1020,26 +1264,28 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayReferenceTransformIndex, ArrayType, ConditionOperation, Context, DataType,
-        Dimension, DimensionAddOperation, DimensionBounds, DimensionMulOperation, DimensionToScalarOperation,
-        DimensionType, Layout, Memory, Placeholder, ProgramBuilder, ReduceOperation, ReductionKind, ReferenceRead,
-        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, StridedLayout,
-        TracingContext, WhileOperation,
+        AddOperation, ArrayIrOperation, ArrayReferenceTransformIndex, CompareOperation, ComparisonDirection,
+        ConditionOperation, Dimension, DimensionAddOperation, DimensionBounds, DimensionMulOperation,
+        DimensionToScalarOperation, DimensionType, DotOperation, Layout, Memory, NotOperation, Placeholder,
+        ProgramBuilder, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation,
+        StridedLayout, TracingContext, WhileOperation,
     };
 
     use crate::authoring::whole_array_parameter;
     use crate::calls::KernelParameter;
     use crate::grids::{Grid, GridDimension, GridExecution};
-    use crate::mappings::{BlockMapping, BoundaryPolicy};
+    use crate::mappings::BlockMapping;
     use crate::memory::{
-        AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, WaitOperation,
+        AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation,
+        WaitOperation, WindowMaskOperation,
     };
     use crate::operations::NoKernelExtension;
     use crate::operations::tests::TestExtension;
 
     use super::*;
 
-    /// Builds a copy or addition definition with one-element blocks over a scalar or vector.
+    /// Builds a copy or addition definition with blocks of one element over a scalar or vector.
     fn definition(vector: bool, addition: bool) -> KernelDefinition {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let outputs = if vector {
@@ -1146,6 +1392,173 @@ mod tests {
         .unwrap()
     }
 
+    /// Builds a matrix product of `f32[m, k]` and `f32[k, n]` inputs with square tiles of size `block` over the grid
+    /// `(i, j, k)`, where only `k` is sequential. The body zeroes its write-only output tile at `k == 0` and then
+    /// accumulates one tile product into it at every `k`. Masked tiles use masked loads and stores throughout.
+    fn carried_matmul_definition(shape: [usize; 3], block: usize, policy: BoundaryPolicy) -> KernelDefinition {
+        let [m, k, n] = shape;
+        let mapping = |axes: [usize; 2]| {
+            let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let coordinate_types = (0..3)
+                .map(|axis| {
+                    DimensionType::new(format!("coordinate_{axis}"), DimensionBounds::non_negative(None).unwrap())
+                })
+                .collect::<Vec<_>>();
+            let coordinates =
+                coordinate_types.iter().map(|r#type| mapping.add_input(r#type.clone().into())).collect::<Vec<_>>();
+            let size = DimensionValue::constant(block).unwrap();
+            let size_id = mapping.add_constant(ArrayIrValue::Dimension(size.clone()));
+            let starts = axes
+                .iter()
+                .map(|&axis| {
+                    mapping
+                        .add_instruction(
+                            DimensionMulOperation::new(&coordinate_types[axis], size.r#type().as_ref()).unwrap(),
+                            vec![],
+                            vec![coordinates[axis], size_id],
+                            None,
+                        )
+                        .unwrap()[0]
+                })
+                .collect::<Vec<_>>();
+            BlockMapping::new(
+                mapping.build(starts, vec![Placeholder; 3], vec![Placeholder; 2]).unwrap(),
+                vec![block, block],
+                policy,
+            )
+            .unwrap()
+        };
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![
+                GridDimension::new(Dimension::Static(m.div_ceil(block)), GridExecution::Parallel),
+                GridDimension::new(Dimension::Static(n.div_ceil(block)), GridExecution::Parallel),
+                GridDimension::new(Dimension::Static(k.div_ceil(block)), GridExecution::Sequential),
+            ])
+            .unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::F32, [m, k]),
+                    KernelParameterAccess::ReadOnly,
+                    mapping([0, 2]),
+                )
+                .unwrap(),
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::F32, [k, n]),
+                    KernelParameterAccess::ReadOnly,
+                    mapping([2, 1]),
+                )
+                .unwrap(),
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::F32, [m, n]),
+                    KernelParameterAccess::WriteOnly,
+                    mapping([0, 1]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let zeros = Array::matrix(block, block, vec![0f32; block * block]).unwrap();
+        let branches = [true, false].map(|write| {
+            let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let reference = branch.add_input(operation.parameters()[2].body_type());
+            if write {
+                let zeros = branch.add_constant(ArrayIrValue::Array(zeros.clone()));
+                branch
+                    .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, zeros], None)
+                    .unwrap();
+            }
+            branch
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
+                .unwrap()
+        });
+        KernelDefinition::trace(operation, |(references, coordinates)| {
+            let context = references[0].context();
+            let zero = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(0)?))?;
+            let first = context
+                .bind(
+                    ArrayIrOperation::Compare(CompareOperation::new(ComparisonDirection::Equal)),
+                    vec![],
+                    &[coordinates[2].clone(), zero],
+                )?
+                .remove(0);
+            context.bind(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                branches.to_vec(),
+                &[first, references[2].clone()],
+            )?;
+            // Masked tiles read their output tile through a masked load as well, because an ordinary accumulation
+            // would read the padding of edge tiles.
+            let masked = policy == BoundaryPolicy::Masked;
+            let mask = context.lift(ArrayIrValue::Array(Array::matrix(block, block, vec![true; block * block])?))?;
+            let other = context.lift(ArrayIrValue::Array(zeros.clone()))?;
+            let mut tiles = references[..if masked { 3 } else { 2 }]
+                .iter()
+                .map(|reference| {
+                    if masked {
+                        let inputs = [reference.clone(), mask.clone(), other.clone()];
+                        Ok(context.bind(MaskedLoadOperation::new(), vec![], &inputs)?.remove(0))
+                    } else {
+                        reference.read()
+                    }
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let product = context
+                .bind(ArrayIrOperation::from(ArrayOperation::Dot(DotOperation::matmul())), vec![], &tiles[..2])?
+                .remove(0);
+            if masked {
+                let accumulator = tiles.pop().unwrap();
+                let sum = context
+                    .bind(
+                        ArrayIrOperation::from(ArrayOperation::Add(AddOperation::new())),
+                        vec![],
+                        &[accumulator, product],
+                    )?
+                    .remove(0);
+                context.bind(MaskedStoreOperation::new(), vec![], &[references[2].clone(), sum, mask])?;
+            } else {
+                context.bind(ReferenceAddUpdateOperation::new(), vec![], &[references[2].clone(), product])?;
+            }
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_kernel_interpretation_error_display() {
+        assert_eq!(
+            KernelInterpretationError::Nan {
+                operation: "add",
+                position: "input",
+                value: 1,
+                element: 2,
+                data_type: DataType::F32,
+                coordinate: vec![0, 1],
+                provenance: Provenance::unknown(),
+            }
+            .to_string(),
+            "nan in `add` input 1 element 2 of type `f32` at grid point [0, 1]",
+        );
+        let token = ArrayReference::new(Array::scalar(0i32).unwrap()).id();
+        assert_eq!(
+            KernelInterpretationError::UnknownCopyToken { token }.to_string(),
+            "async copy completion token is unknown or already consumed",
+        );
+        assert_eq!(
+            KernelInterpretationError::PendingCopies { count: 2, coordinate: vec![3] }.to_string(),
+            "kernel grid point [3] has 2 copies without a wait",
+        );
+        assert_eq!(
+            KernelInterpretationError::StepLimit {
+                maximum_steps: 5,
+                coordinate: vec![1],
+                operation: "reference_write",
+                provenance: Provenance::unknown(),
+            }
+            .to_string(),
+            "kernel interpretation exceeded 5 steps at grid point [1] in `reference_write`",
+        );
+    }
+
     #[test]
     fn test_kernel_debug_options_default() {
         assert_eq!(
@@ -1153,9 +1566,175 @@ mod tests {
             KernelDebugOptions {
                 maximum_programs: DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS,
                 maximum_steps: DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS,
-                check_nans: false,
+                nan_checks: false,
             },
         );
+    }
+
+    #[test]
+    fn test_kernel_debug_options_with_maximum_programs() {
+        let options = KernelDebugOptions::default().with_maximum_programs(3);
+        assert_eq!(options.maximum_programs(), 3);
+        assert_eq!(options.maximum_steps(), DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS);
+        assert!(!options.nan_checks());
+
+        // A grid with more points than the limit fails before qualification.
+        let definition = definition(true, false);
+        let input = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        let mut trace = Vec::new();
+        let error = definition.interpret_with_trace(vec![input.clone()], &options, &mut trace).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInitializationError>(),
+            Some(&KernelInitializationError::QualificationLimit { programs: 4, maximum: 3 }),
+        );
+        assert_eq!(
+            definition.interpret_with_trace(vec![input.clone()], &options.with_maximum_programs(4), &mut trace),
+            Ok(vec![input]),
+        );
+    }
+
+    #[test]
+    fn test_kernel_debug_options_with_maximum_steps() {
+        let options = KernelDebugOptions::default().with_maximum_steps(2);
+        assert_eq!(options.maximum_programs(), DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS);
+        assert_eq!(options.maximum_steps(), 2);
+        assert!(!options.nan_checks());
+
+        // The body entry and the read consume the two steps, so the write exceeds the limit.
+        let definition = definition(false, false);
+        let input = Array::scalar(17i32).unwrap();
+        let mut trace = Vec::new();
+        let error = definition.interpret_with_trace(vec![input.clone()], &options, &mut trace).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::StepLimit {
+                maximum_steps: 2,
+                coordinate: vec![],
+                operation: "reference_write",
+                provenance: Provenance::unknown(),
+            }),
+        );
+        assert_eq!(
+            definition.interpret_with_trace(vec![input.clone()], &options.with_maximum_steps(3), &mut trace),
+            Ok(vec![input]),
+        );
+    }
+
+    #[test]
+    fn test_kernel_debug_options_with_nan_checks() {
+        let options = KernelDebugOptions::default().with_nan_checks(true);
+        assert_eq!(options.maximum_programs(), DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS);
+        assert_eq!(options.maximum_steps(), DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS);
+        assert!(options.nan_checks());
+        assert_eq!(options.with_nan_checks(false), KernelDebugOptions::default());
+
+        // Enabled checks reject a NaN input that disabled checks pass through unchanged.
+        let definition = value_definition(
+            ArrayOperation::Add(AddOperation::new()),
+            &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)],
+        );
+        let inputs = vec![Array::scalar(f32::NAN).unwrap(), Array::scalar(1f32).unwrap()];
+        let mut trace = Vec::new();
+        let error = definition.interpret_with_trace(inputs.clone(), &options, &mut trace).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::Nan {
+                operation: "reference_read",
+                position: "output",
+                value: 0,
+                element: 0,
+                data_type: DataType::F32,
+                coordinate: vec![],
+                provenance: Provenance::unknown(),
+            }),
+        );
+        let output = definition.interpret_with_trace(inputs, &options.with_nan_checks(false), &mut trace).unwrap();
+        assert!(output[0].elements::<f32>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_kernel_debug_options_maximum_programs() {
+        assert_eq!(KernelDebugOptions::default().maximum_programs(), DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS);
+        assert_eq!(KernelDebugOptions::default().with_maximum_programs(0).maximum_programs(), 0);
+    }
+
+    #[test]
+    fn test_kernel_debug_options_maximum_steps() {
+        assert_eq!(KernelDebugOptions::default().maximum_steps(), DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS);
+        assert_eq!(KernelDebugOptions::default().with_maximum_steps(0).maximum_steps(), 0);
+    }
+
+    #[test]
+    fn test_kernel_debug_options_nan_checks() {
+        assert!(!KernelDebugOptions::default().nan_checks());
+        assert!(KernelDebugOptions::default().with_nan_checks(true).nan_checks());
+    }
+
+    #[test]
+    fn test_kernel_trace_entry_coordinate() {
+        let entry = KernelTraceEntry {
+            coordinate: vec![2, 3],
+            operation: "reference_read",
+            provenance: Provenance::unknown(),
+            accesses: vec![],
+            pending_copies: vec![],
+        };
+        assert_eq!(entry.coordinate(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_kernel_trace_entry_operation() {
+        let entry = KernelTraceEntry {
+            coordinate: vec![],
+            operation: "reference_write",
+            provenance: Provenance::unknown(),
+            accesses: vec![],
+            pending_copies: vec![],
+        };
+        assert_eq!(entry.operation(), "reference_write");
+    }
+
+    #[test]
+    fn test_kernel_trace_entry_provenance() {
+        let provenance = Provenance::scope(ProvenanceScope::new("layer"), Provenance::unknown());
+        let entry = KernelTraceEntry {
+            coordinate: vec![],
+            operation: "reference_read",
+            provenance: provenance.clone(),
+            accesses: vec![],
+            pending_copies: vec![],
+        };
+        assert_eq!(entry.provenance(), &provenance);
+    }
+
+    #[test]
+    fn test_kernel_trace_entry_accesses() {
+        let access = KernelTraceAccess {
+            input: 1,
+            mode: ReferenceAccessMode::Write,
+            root: 0,
+            path: "/slice(axes=[])".to_owned(),
+        };
+        let entry = KernelTraceEntry {
+            coordinate: vec![],
+            operation: "reference_write",
+            provenance: Provenance::unknown(),
+            accesses: vec![access.clone()],
+            pending_copies: vec![],
+        };
+        assert_eq!(entry.accesses(), &[access]);
+    }
+
+    #[test]
+    fn test_kernel_trace_entry_pending_copies() {
+        let entry = KernelTraceEntry {
+            coordinate: vec![],
+            operation: "wait",
+            provenance: Provenance::unknown(),
+            accesses: vec![],
+            pending_copies: vec![2, 5],
+        };
+        assert_eq!(entry.pending_copies(), &[2, 5]);
     }
 
     #[test]
@@ -1176,6 +1755,35 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_trace_access_input() {
+        let access = KernelTraceAccess { input: 3, mode: ReferenceAccessMode::Read, root: 0, path: String::new() };
+        assert_eq!(access.input(), 3);
+    }
+
+    #[test]
+    fn test_kernel_trace_access_mode() {
+        let access = KernelTraceAccess { input: 0, mode: ReferenceAccessMode::Consume, root: 0, path: String::new() };
+        assert_eq!(access.mode(), ReferenceAccessMode::Consume);
+    }
+
+    #[test]
+    fn test_kernel_trace_access_root() {
+        let access = KernelTraceAccess { input: 0, mode: ReferenceAccessMode::Read, root: 4, path: String::new() };
+        assert_eq!(access.root(), 4);
+    }
+
+    #[test]
+    fn test_kernel_trace_access_path() {
+        let access = KernelTraceAccess {
+            input: 0,
+            mode: ReferenceAccessMode::Read,
+            root: 0,
+            path: "/slice(axes=[0:2])".to_owned(),
+        };
+        assert_eq!(access.path(), "/slice(axes=[0:2])");
+    }
+
+    #[test]
     fn test_kernel_definition_interpret() {
         let input = Array::scalar(17i32).unwrap();
         assert_eq!(definition(false, false).interpret(vec![input.clone()], 1), Ok(vec![input.clone()]));
@@ -1190,7 +1798,7 @@ mod tests {
             &[input.r#type().into_owned()],
         );
         assert_eq!(definition.interpret(vec![input], 1), Ok(vec![Array::vector(vec![6i32, 15]).unwrap()]));
-        assert_eq!(definition.simplified().unwrap().operation().output_types(), definition.operation().output_types(),);
+        assert_eq!(definition.simplified().unwrap().operation().output_types(), definition.operation().output_types());
     }
 
     #[test]
@@ -1224,6 +1832,67 @@ mod tests {
             ),
             Ok(vec![Array::vector(vec![6i32, 8, 10, 12]).unwrap()]),
         );
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_parallel_accumulation() {
+        // Every parallel grid point accumulates into its own window of one element.
+        let mapping = definition(true, false).operation().parameters()[0].mapping().clone();
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(4), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::I32, [4]),
+                    KernelParameterAccess::ReadWrite,
+                    mapping,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let update = context.lift(ArrayIrValue::Array(Array::vector(vec![10i32])?))?;
+            context.bind(ReferenceAddUpdateOperation::new(), vec![], &[references[0].clone(), update])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1i32, 2, 3, 4]).unwrap()], 4),
+            Ok(vec![Array::vector(vec![11i32, 12, 13, 14]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_first_step_initialization() {
+        // Every output tile is zeroed at `k == 0` and then accumulates along the sequential axis `k`.
+        let definition = carried_matmul_definition([4, 4, 4], 2, BoundaryPolicy::InBounds);
+        let left = Array::matrix(4, 4, (1..=16).map(|value| value as f32).collect()).unwrap();
+        let right = Array::matrix(4, 4, (1..=16).rev().map(|value| value as f32).collect()).unwrap();
+        let expected = Array::matrix(
+            4,
+            4,
+            vec![80f32, 70., 60., 50., 240., 214., 188., 162., 400., 358., 316., 274., 560., 502., 444., 386.],
+        )
+        .unwrap();
+        assert_eq!(definition.interpret(vec![left, right], 8), Ok(vec![expected]));
+
+        // With a single step along `k`, its coordinate is always zero.
+        let definition = carried_matmul_definition([2, 2, 2], 2, BoundaryPolicy::InBounds);
+        let left = Array::matrix(2, 2, vec![1f32, 2., 3., 4.]).unwrap();
+        let right = Array::matrix(2, 2, vec![5f32, 6., 7., 8.]).unwrap();
+        let expected = Array::matrix(2, 2, vec![19f32, 22., 43., 50.]).unwrap();
+        assert_eq!(definition.interpret(vec![left, right], 1), Ok(vec![expected]));
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_first_step_initialization_masked_edges() {
+        // Every step after the first loads the valid elements that the previous step published into its fresh tile.
+        let definition = carried_matmul_definition([3, 4, 3], 2, BoundaryPolicy::Masked);
+        let left = Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap();
+        let right = Array::matrix(4, 3, (1..=12).map(|value| value as f32).collect()).unwrap();
+        let expected = Array::matrix(3, 3, vec![70f32, 80., 90., 158., 184., 210., 246., 288., 330.]).unwrap();
+        assert_eq!(definition.interpret(vec![left, right], 8), Ok(vec![expected]));
     }
 
     #[test]
@@ -1268,6 +1937,38 @@ mod tests {
         })
         .unwrap();
         assert_eq!(definition.interpret(vec![], 4), Ok(vec![Array::vector(vec![0i64, 1, 2, 3]).unwrap()]));
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_dynamic_index() {
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::I32, [4]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I64), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let index = references[1].read()?;
+            let value = references[0]
+                .context()
+                .bind(
+                    ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Dynamic,
+                    }]),
+                    vec![],
+                    &[references[0].clone(), index],
+                )?
+                .remove(0);
+            references[2].write(&value)
+        })
+        .unwrap();
+        let inputs = vec![Array::vector(vec![10i32, 20, 30, 40]).unwrap(), Array::scalar(2i64).unwrap()];
+        assert_eq!(definition.interpret(inputs, 1), Ok(vec![Array::scalar(30i32).unwrap()]));
     }
 
     #[test]
@@ -1357,6 +2058,33 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_write_only_read_back() {
+        // The first output is written with zeros, accumulated into, and then read back into the second output.
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let zero = context.lift(ArrayIrValue::Array(Array::scalar(0i32)?))?;
+            references[1].write(&zero)?;
+            let input = references[0].read()?;
+            context.bind(ReferenceAddUpdateOperation::new(), vec![], &[references[1].clone(), input])?;
+            references[2].write(&references[1].read()?)
+        })
+        .unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::scalar(7i32).unwrap()], 1),
+            Ok(vec![Array::scalar(7i32).unwrap(), Array::scalar(7i32).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_nested_scratch() {
         let operation = definition(false, false).operation().clone();
         let branch = KernelDefinition::<NoKernelExtension>::trace(operation.clone(), |(references, _coordinates)| {
@@ -1425,12 +2153,64 @@ mod tests {
             definition.interpret_with_trace(vec![input.clone()], &KernelDebugOptions::default(), &mut trace),
             Ok(expected),
         );
-        assert_eq!(trace.iter().map(|entry| entry.operation).collect::<Vec<_>>(), vec!["async_copy", "wait"]);
-        assert_eq!(trace[0].pending_copies, Vec::<usize>::new());
-        assert_eq!(trace[1].pending_copies, vec![2]);
-        assert_eq!(trace[1].accesses[0].mode, ReferenceAccessMode::Consume);
-        assert_eq!(trace[1].accesses[0].root, 2);
+        assert_eq!(trace.iter().map(|entry| entry.operation()).collect::<Vec<_>>(), vec!["async_copy", "wait"]);
+        assert_eq!(trace[0].pending_copies(), Vec::<usize>::new());
+        assert_eq!(trace[1].pending_copies(), vec![2]);
+        assert_eq!(trace[1].accesses()[0].mode(), ReferenceAccessMode::Consume);
+        assert_eq!(trace[1].accesses()[0].root(), 2);
         assert_eq!(input, Array::vector(vec![17i32, 29]).unwrap());
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_async_copy_across_condition() {
+        // Double buffering, where a condition computes on other storage while the copy is pending.
+        let vector = ArrayType::new_static(DataType::I32, [2]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(vector.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(vector, KernelParameterAccess::WriteOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let branches = [5i32, 7].map(|value| {
+            let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let reference = branch.add_input(operation.parameters()[2].body_type());
+            let value = branch.add_constant(ArrayIrValue::Array(Array::scalar(value).unwrap()));
+            branch
+                .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None)
+                .unwrap();
+            branch
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
+                .unwrap()
+        });
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let token = context
+                .bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), references[1].clone()])?
+                .remove(0);
+            let predicate = context.lift(ArrayIrValue::Array(Array::scalar(true)?))?;
+            context.bind(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                branches.to_vec(),
+                &[predicate, references[2].clone()],
+            )?;
+            context.bind(WaitOperation, vec![], &[token])?;
+            Ok(())
+        })
+        .unwrap();
+        let input = Array::vector(vec![17i32, 29]).unwrap();
+        let mut trace = Vec::new();
+        assert_eq!(
+            definition.interpret_with_trace(vec![input.clone()], &KernelDebugOptions::default(), &mut trace),
+            Ok(vec![input, Array::scalar(5i32).unwrap()]),
+        );
+        // The branch replays with the pending copy that the body issued before entering it.
+        assert_eq!(
+            trace.iter().map(|entry| (entry.operation(), entry.pending_copies().to_vec())).collect::<Vec<_>>(),
+            vec![("async_copy", vec![]), ("condition", vec![2]), ("reference_write", vec![2]), ("wait", vec![2])],
+        );
     }
 
     #[test]
@@ -1463,6 +2243,117 @@ mod tests {
         let input = Array::from_elements(r#type, &(0..15i32).collect::<Vec<_>>()).unwrap();
         assert_eq!(definition.interpret(vec![input.clone()], 6), Ok(vec![input.clone()]));
         assert_eq!(input.elements::<i32>().unwrap(), (0..15i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_window_mask() {
+        // The first window is a masked edge window whose second grid point has one valid element, while every element
+        // of the in-bounds output windows is valid. Each output records the mask of one window.
+        let masked = tiled_mapping(vec![2]);
+        let in_bounds = BlockMapping::new(masked.program().clone(), vec![2], BoundaryPolicy::InBounds).unwrap();
+        let output_type = ArrayType::new_static(DataType::Boolean, [4]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::I32, [3]),
+                    KernelParameterAccess::ReadOnly,
+                    masked,
+                )
+                .unwrap(),
+                KernelParameter::new(output_type.clone(), KernelParameterAccess::WriteOnly, in_bounds.clone()).unwrap(),
+                KernelParameter::new(output_type, KernelParameterAccess::WriteOnly, in_bounds).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let masked = context.bind(WindowMaskOperation, vec![], &[references[0].clone()])?.remove(0);
+            references[1].write(&masked)?;
+            let in_bounds = context.bind(WindowMaskOperation, vec![], &[references[2].clone()])?.remove(0);
+            references[2].write(&in_bounds)
+        })
+        .unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1i32, 2, 3]).unwrap()], 2),
+            Ok(vec![
+                Array::vector(vec![true, true, true, false]).unwrap(),
+                Array::vector(vec![true, true, true, true]).unwrap(),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_window_mask_store() {
+        // A store under the validity mask of its own window initializes the write-only output, and only the valid
+        // elements of the edge window are published.
+        let mapping = tiled_mapping(vec![2]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::I32, [3]),
+                    KernelParameterAccess::WriteOnly,
+                    mapping,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::vector(vec![5i32, 7])?))?;
+            let mask = context.bind(WindowMaskOperation, vec![], &[references[0].clone()])?.remove(0);
+            context.bind(MaskedStoreOperation::new(), vec![], &[references[0].clone(), value, mask])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(definition.interpret(vec![], 2), Ok(vec![Array::vector(vec![5i32, 7, 5]).unwrap()]));
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_complementary_masked_stores() {
+        // Stores under a runtime mask and its negation together initialize the write-only output, in either order.
+        let mapping =
+            BlockMapping::new(tiled_mapping(vec![2]).program().clone(), vec![2], BoundaryPolicy::InBounds).unwrap();
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::I32, [4]),
+                    KernelParameterAccess::WriteOnly,
+                    mapping,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for complement_first in [false, true] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let output = builder.add_input(operation.parameters()[0].body_type());
+            builder.add_input(ArrayIrType::Dimension(operation.coordinate_types()[0].clone()));
+            let first = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![1i32, 2]).unwrap()));
+            let second = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![3i32, 4]).unwrap()));
+            let constant = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap()));
+            let not = ArrayIrOperation::Array(ArrayOperation::Not(NotOperation::new()));
+            let mask = builder.add_instruction(not.clone(), vec![], vec![constant], None).unwrap()[0];
+            let complement = builder.add_instruction(not, vec![], vec![mask], None).unwrap()[0];
+            let stores = if complement_first {
+                [(second, complement), (first, mask)]
+            } else {
+                [(first, mask), (second, complement)]
+            };
+            for (value, mask) in stores {
+                builder
+                    .add_instruction(MaskedStoreOperation::new(), vec![], vec![output, value, mask], None)
+                    .unwrap();
+            }
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+                .unwrap();
+            let definition: KernelDefinition = KernelDefinition::new(operation.clone(), body).unwrap();
+            assert_eq!(definition.interpret(vec![], 2), Ok(vec![Array::vector(vec![1i32, 4, 1, 4]).unwrap()]));
+        }
     }
 
     #[test]
@@ -1573,6 +2464,111 @@ mod tests {
                 operation: "reference_swap",
             })),
         );
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_masked_copies() {
+        /// A well-typed masked copy with one repeated element mask and independently initialized destination storage.
+        #[derive(Debug)]
+        struct MaskedCopyCase {
+            /// Immutable source elements.
+            input: Vec<i32>,
+
+            /// Destination elements before the masked stores.
+            initial: Vec<i32>,
+
+            /// Element mask, whose nonzero length is also the logical block width.
+            mask: Vec<bool>,
+        }
+
+        impl MaskedCopyCase {
+            /// Generates a fixed bounded enumeration including empty arrays, partial tiles, and inactive masks.
+            fn generate() -> Vec<Self> {
+                let mut cases = Vec::new();
+                for extent in 0..=5 {
+                    for block in 1..=3 {
+                        for bits in 0..(1usize << block) {
+                            for pattern in 0..2 {
+                                cases.push(Self {
+                                    input: (0..extent).map(|index| (index - 2) * (pattern + 1)).collect(),
+                                    initial: (0..extent).map(|index| 7 - index * (pattern + 1)).collect(),
+                                    mask: (0..block).map(|element| bits & (1 << element) != 0).collect(),
+                                });
+                            }
+                        }
+                    }
+                }
+                cases
+            }
+
+            /// Computes expected immutable values without using kernel mappings, references, or array operations.
+            fn expected(&self) -> Vec<i32> {
+                self.input
+                    .iter()
+                    .zip(&self.initial)
+                    .enumerate()
+                    .map(|(index, (&input, &initial))| if self.mask[index % self.mask.len()] { input } else { initial })
+                    .collect()
+            }
+
+            /// Constructs the same canonical typed kernel shape for each generated case.
+            fn kernel(&self) -> KernelDefinition {
+                let block = self.mask.len();
+                let programs = self.input.len().div_ceil(block);
+                let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                let coordinate_type =
+                    DimensionType::new("coordinate", DimensionBounds::non_negative(Some(programs.max(1))).unwrap());
+                let coordinate = mapping.add_input(coordinate_type.clone().into());
+                let width = DimensionValue::constant(block).unwrap();
+                let width_input = mapping.add_constant(ArrayIrValue::Dimension(width.clone()));
+                let start = mapping
+                    .add_instruction(
+                        DimensionMulOperation::new(&coordinate_type, width.r#type().as_ref()).unwrap(),
+                        vec![],
+                        vec![coordinate, width_input],
+                        None,
+                    )
+                    .unwrap()[0];
+                let mapping = BlockMapping::new(
+                    mapping.build(vec![start], vec![Placeholder], vec![Placeholder]).unwrap(),
+                    vec![block],
+                    BoundaryPolicy::Masked,
+                )
+                .unwrap();
+                let r#type = ArrayType::new_static(DataType::I32, vec![self.input.len()]);
+                let operation = KernelCallOperation::new(
+                    Grid::new(vec![GridDimension::new(Dimension::Static(programs), GridExecution::Parallel)]).unwrap(),
+                    vec![
+                        KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadOnly, mapping.clone()).unwrap(),
+                        KernelParameter::new(r#type, KernelParameterAccess::ReadWrite, mapping).unwrap(),
+                    ],
+                )
+                .unwrap();
+                KernelDefinition::trace(operation, |(references, _coordinates)| {
+                    let context = references[0].context();
+                    let mask = context.lift(ArrayIrValue::Array(Array::vector(self.mask.clone())?))?;
+                    let other = context.lift(ArrayIrValue::Array(Array::vector(vec![0i32; block])?))?;
+                    let value = context
+                        .bind(MaskedLoadOperation::new(), vec![], &[references[0].clone(), mask.clone(), other])?
+                        .remove(0);
+                    context.bind(MaskedStoreOperation::new(), vec![], &[references[1].clone(), value, mask])?;
+                    Ok(())
+                })
+                .unwrap()
+            }
+        }
+
+        for case in MaskedCopyCase::generate() {
+            let input = Array::vector(case.input.clone()).unwrap();
+            let initial = Array::vector(case.initial.clone()).unwrap();
+            assert_eq!(
+                case.kernel().interpret(vec![input.clone(), initial.clone()], 5),
+                Ok(vec![Array::vector(case.expected()).unwrap()]),
+                "{case:?}",
+            );
+            assert_eq!(input.elements::<i32>().unwrap(), case.input, "{case:?}");
+            assert_eq!(initial.elements::<i32>().unwrap(), case.initial, "{case:?}");
+        }
     }
 
     #[test]
@@ -1696,30 +2692,30 @@ mod tests {
         assert_eq!(
             definition.interpret_with_trace(
                 vec![input.clone()],
-                &KernelDebugOptions { maximum_programs: 1, maximum_steps: 3, check_nans: false },
+                &KernelDebugOptions::default().with_maximum_programs(1).with_maximum_steps(3),
                 &mut trace,
             ),
             Ok(vec![input.clone()]),
         );
         assert_eq!(
-            trace.iter().map(|entry| entry.operation).collect::<Vec<_>>(),
+            trace.iter().map(|entry| entry.operation()).collect::<Vec<_>>(),
             vec!["reference_read", "reference_write"],
         );
         assert_eq!(
-            trace.iter().map(|entry| entry.coordinate.clone()).collect::<Vec<_>>(),
+            trace.iter().map(|entry| entry.coordinate().to_vec()).collect::<Vec<_>>(),
             vec![Vec::<usize>::new(), vec![]],
         );
-        assert_eq!(trace[0].accesses[0].mode, ReferenceAccessMode::Read);
-        assert_eq!(trace[0].accesses[0].root, 0);
-        assert_eq!(trace[0].accesses[0].path, "/slice(axes=[])");
-        assert_eq!(trace[1].accesses[0].mode, ReferenceAccessMode::Write);
-        assert_eq!(trace[1].accesses[0].root, 1);
-        assert_eq!(trace[0].pending_copies, Vec::<usize>::new());
+        assert_eq!(trace[0].accesses()[0].mode(), ReferenceAccessMode::Read);
+        assert_eq!(trace[0].accesses()[0].root(), 0);
+        assert_eq!(trace[0].accesses()[0].path(), "/slice(axes=[])");
+        assert_eq!(trace[1].accesses()[0].mode(), ReferenceAccessMode::Write);
+        assert_eq!(trace[1].accesses()[0].root(), 1);
+        assert_eq!(trace[0].pending_copies(), Vec::<usize>::new());
         let first = trace.clone();
         assert_eq!(
             definition.interpret_with_trace(
                 vec![input.clone()],
-                &KernelDebugOptions { maximum_programs: 1, maximum_steps: 3, check_nans: false },
+                &KernelDebugOptions::default().with_maximum_programs(1).with_maximum_steps(3),
                 &mut trace,
             ),
             Ok(vec![input]),
@@ -1735,7 +2731,7 @@ mod tests {
         );
         let inputs = vec![Array::scalar(f32::INFINITY).unwrap(), Array::scalar(f32::NEG_INFINITY).unwrap()];
         let mut trace = Vec::new();
-        let options = KernelDebugOptions { check_nans: true, ..Default::default() };
+        let options = KernelDebugOptions::default().with_nan_checks(true);
         let error = definition.interpret_with_trace(inputs.clone(), &options, &mut trace).unwrap_err();
         assert_eq!(
             error.downcast_custom::<KernelInterpretationError>(),
@@ -1750,66 +2746,10 @@ mod tests {
             }),
         );
         assert_eq!(error.to_string(), "nan in `add` output 0 element 0 of type `f32` at grid point []");
-        assert_eq!(trace.last().unwrap().operation, "add");
+        assert_eq!(trace.last().unwrap().operation(), "add");
         let output = definition.interpret_with_trace(inputs, &KernelDebugOptions::default(), &mut trace).unwrap();
         assert!(output[0].elements::<f32>().unwrap()[0].is_nan());
-        assert_eq!(trace.last().unwrap().operation, "reference_write");
-    }
-
-    #[test]
-    fn test_kernel_definition_interpret_qualifies_operations_bound_by_rules() {
-        // An operation that a rule binds through its interpretation driver is qualified like the instructions of the
-        // body: it is traced, it consumes a replay step, and its outputs undergo the NaN check.
-        let call = KernelCallOperation::new(
-            Grid::new(vec![]).unwrap(),
-            vec![
-                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap(),
-                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::WriteOnly).unwrap(),
-            ],
-        )
-        .unwrap();
-        let definition = KernelDefinition::<TestExtension>::trace(call, |(references, _coordinates)| {
-            let input = references[0].read()?;
-            let output = references[0]
-                .context()
-                .bind(KernelOperation::Extension(TestExtension::Rebinding), vec![], &[input])?
-                .remove(0);
-            references[1].write(&output)
-        })
-        .unwrap();
-        let mut trace = Vec::new();
-        let options = KernelDebugOptions::default();
-        assert_eq!(
-            definition.interpret_with_trace(vec![Array::scalar(3.0f32).unwrap()], &options, &mut trace),
-            Ok(vec![Array::scalar(0.0f32).unwrap()]),
-        );
-        assert_eq!(
-            trace.iter().map(|entry| entry.operation).collect::<Vec<_>>(),
-            vec!["reference_read", "test_rebinding", "sub", "reference_write"],
-        );
-
-        // The body entry and every traced binding consume one replay step each, so a budget of three steps, which
-        // admits the body entry, the read, and the extension, stops at the nested `sub`.
-        let error = definition.interpret_with_limits(vec![Array::scalar(3.0f32).unwrap()], 1, 3).unwrap_err();
-        assert!(
-            matches!(
-                error.downcast_custom::<KernelInterpretationError>(),
-                Some(KernelInterpretationError::StepLimit { operation: "sub", .. }),
-            ),
-            "{error}",
-        );
-
-        // `inf - inf` is NaN, which the NaN check reports at the nested `sub`.
-        let options = KernelDebugOptions { check_nans: true, ..Default::default() };
-        let inputs = vec![Array::scalar(f32::INFINITY).unwrap()];
-        let error = definition.interpret_with_trace(inputs, &options, &mut trace).unwrap_err();
-        assert!(
-            matches!(
-                error.downcast_custom::<KernelInterpretationError>(),
-                Some(KernelInterpretationError::Nan { operation: "sub", position: "output", .. }),
-            ),
-            "{error}",
-        );
+        assert_eq!(trace.last().unwrap().operation(), "reference_write");
     }
 
     #[test]
@@ -1827,7 +2767,7 @@ mod tests {
             let error = definition
                 .interpret_with_trace(
                     vec![input.clone(), input],
-                    &KernelDebugOptions { check_nans: true, ..Default::default() },
+                    &KernelDebugOptions::default().with_nan_checks(true),
                     &mut trace,
                 )
                 .unwrap_err();
@@ -1867,12 +2807,12 @@ mod tests {
         })
         .unwrap();
         let mut trace = Vec::new();
-        let options = KernelDebugOptions { check_nans: true, ..Default::default() };
+        let options = KernelDebugOptions::default().with_nan_checks(true);
         let outputs = definition
             .interpret_with_trace(vec![Array::scalar(f32::NAN).unwrap()], &options, &mut trace)
             .unwrap();
         assert_eq!(outputs[0].elements::<f32>().unwrap()[0].to_bits(), f32::NAN.to_bits());
-        assert_eq!(trace.iter().map(|entry| entry.operation).collect::<Vec<_>>(), vec!["async_copy", "wait"]);
+        assert_eq!(trace.iter().map(|entry| entry.operation()).collect::<Vec<_>>(), vec!["async_copy", "wait"]);
     }
 
     #[test]
@@ -1883,19 +2823,19 @@ mod tests {
         let error = definition
             .interpret_with_trace(
                 vec![input.clone()],
-                &KernelDebugOptions { maximum_programs: 1, maximum_steps: 2, check_nans: false },
+                &KernelDebugOptions::default().with_maximum_programs(1).with_maximum_steps(2),
                 &mut trace,
             )
             .unwrap_err();
         assert_eq!(error.to_string(), "kernel interpretation exceeded 2 steps at grid point [] in `reference_write`");
         assert_eq!(
-            trace.iter().map(|entry| entry.operation).collect::<Vec<_>>(),
+            trace.iter().map(|entry| entry.operation()).collect::<Vec<_>>(),
             vec!["reference_read", "reference_write"],
         );
         let error = definition
             .interpret_with_trace(
                 vec![input],
-                &KernelDebugOptions { maximum_programs: 0, maximum_steps: 2, check_nans: false },
+                &KernelDebugOptions::default().with_maximum_programs(0).with_maximum_steps(2),
                 &mut trace,
             )
             .unwrap_err();
@@ -1904,19 +2844,98 @@ mod tests {
     }
 
     #[test]
-    fn test_scratch_operation_interpret() {
-        let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
-        let error = context
-            .bind(ScratchOperation::new(ArrayType::scalar(DataType::I32), 4).unwrap(), vec![], &[])
-            .unwrap_err();
+    fn test_kernel_definition_interpret_with_trace_qualifies_operations_bound_by_rules() {
+        // An operation that a rule binds through its interpretation driver is qualified like the instructions of the
+        // body, so it is traced, it consumes a replay step, and its outputs undergo the NaN check.
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::<TestExtension>::trace(call, |(references, _coordinates)| {
+            let input = references[0].read()?;
+            let output = references[0]
+                .context()
+                .bind(KernelOperation::Extension(TestExtension::Rebinding), vec![], &[input])?
+                .remove(0);
+            references[1].write(&output)
+        })
+        .unwrap();
+        let mut trace = Vec::new();
+        let options = KernelDebugOptions::default();
         assert_eq!(
-            error.downcast_custom::<KernelMemoryError>(),
-            Some(&KernelMemoryError::RequiresQualification { operation: "scratch" }),
+            definition.interpret_with_trace(vec![Array::scalar(3.0f32).unwrap()], &options, &mut trace),
+            Ok(vec![Array::scalar(0.0f32).unwrap()]),
+        );
+        assert_eq!(
+            trace.iter().map(|entry| entry.operation()).collect::<Vec<_>>(),
+            vec!["reference_read", "test_rebinding", "sub", "reference_write"],
+        );
+
+        // The body entry and every traced binding consume one replay step each, so a budget of three steps, which
+        // admits the body entry, the read, and the extension, stops at the nested `sub`.
+        let error = definition.interpret_with_limits(vec![Array::scalar(3.0f32).unwrap()], 1, 3).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::StepLimit {
+                maximum_steps: 3,
+                coordinate: vec![],
+                operation: "sub",
+                provenance: Provenance::unknown(),
+            }),
+        );
+
+        // `inf - inf` is NaN, which the NaN check reports at the nested `sub`.
+        let options = KernelDebugOptions::default().with_nan_checks(true);
+        let inputs = vec![Array::scalar(f32::INFINITY).unwrap()];
+        let error = definition.interpret_with_trace(inputs, &options, &mut trace).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::Nan {
+                operation: "sub",
+                position: "output",
+                value: 0,
+                element: 0,
+                data_type: DataType::F32,
+                coordinate: vec![],
+                provenance: Provenance::unknown(),
+            }),
         );
     }
 
     #[test]
-    fn test_qualified_kernel_context_async_completion() {
+    fn test_kernel_call_operation_interpret() {
+        let definition = definition(true, true);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                inputs[0].context().bind(definition.operation().clone(), vec![definition.body().clone()], &inputs)
+            },
+            definition.operation().input_types(),
+        )
+        .unwrap();
+        let inputs = vec![
+            ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![5i32, 6, 7, 8]).unwrap()),
+        ];
+        let expected = vec![ArrayIrValue::Array(Array::vector(vec![6i32, 8, 10, 12]).unwrap())];
+        assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
+        let (_, replayed) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context().clone();
+                program.interpret_in_context(&context, inputs)
+            },
+            definition.operation().input_types(),
+        )
+        .unwrap();
+        assert_eq!(replayed.to_string(), program.to_string());
+        assert_eq!(replayed.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_qualified_kernel_context_bind_async_completion() {
         // Construct the private context directly to verify the runtime defense independently of static rejection.
         let context = QualifiedKernelContext::<NoKernelExtension> {
             eager: EagerContext::new(),
@@ -1953,7 +2972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_qualified_kernel_context_async_completion_transforms() {
+    fn test_qualified_kernel_context_bind_async_completion_transforms() {
         let context = QualifiedKernelContext::<NoKernelExtension> {
             eager: EagerContext::new(),
             validity: BTreeMap::new(),
@@ -1996,7 +3015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_qualified_kernel_context_masked_views_project_validity() {
+    fn test_qualified_kernel_context_bind_masked_views_project_validity() {
         let reference = ArrayReference::new(Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap());
         let validity = ArrayReference::new(Array::matrix(2, 2, vec![false, false, true, false]).unwrap());
         let context = QualifiedKernelContext::<NoKernelExtension> {
@@ -2023,37 +3042,9 @@ mod tests {
                     ArrayIrValue::Reference(reference),
                     ArrayIrValue::Array(Array::vector(vec![true, true]).unwrap()),
                     ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap()),
-                ]
+                ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![3i32, -2]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![3i32, -2]).unwrap())]),
         );
-    }
-
-    #[test]
-    fn test_kernel_call_operation_interpret() {
-        let definition = definition(true, true);
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
-            |inputs: Vec<_>| {
-                inputs[0].context().bind(definition.operation().clone(), vec![definition.body().clone()], &inputs)
-            },
-            definition.operation().input_types(),
-        )
-        .unwrap();
-        let inputs = vec![
-            ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap()),
-            ArrayIrValue::Array(Array::vector(vec![5i32, 6, 7, 8]).unwrap()),
-        ];
-        let expected = vec![ArrayIrValue::Array(Array::vector(vec![6i32, 8, 10, 12]).unwrap())];
-        assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
-        let (_, replayed) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
-            |inputs: Vec<_>| {
-                let context = inputs[0].context().clone();
-                program.interpret_in_context(&context, inputs)
-            },
-            definition.operation().input_types(),
-        )
-        .unwrap();
-        assert_eq!(replayed.to_string(), program.to_string());
-        assert_eq!(replayed.interpret(inputs), Ok(expected));
     }
 }

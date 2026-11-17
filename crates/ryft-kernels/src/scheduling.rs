@@ -1,9 +1,45 @@
-//! Bounded exploration of host operation interleavings for qualified straight-line kernels.
+//! Contains the bounded exploration of host operation interleavings for qualified straight-line kernels.
 //!
-//! Each execution uses the canonical resumable interpreter and fresh private storage. Sequential grid dimensions
-//! impose program-completion dependencies; parallel dimensions permit every merge of program instruction orders.
-//! This is an executable concurrency specification for small kernels, not a model of device timing. Nested regions
-//! and masked private windows remain executable by ordinary host interpretation but are outside this explorer.
+//! Ordinary host interpretation (i.e., [`KernelDefinition::interpret`]) replays the grid points of a kernel one after
+//! another, which is only one of the orders that a device may choose. This module replays a small kernel under every
+//! admitted order instead, so that results which depend on the order (e.g., floating-point atomic accumulation) become
+//! observable. It is an executable concurrency specification for small kernels, not a model of device timing.
+//!
+//! # Interleavings
+//!
+//! An interleaving is one complete order of instruction steps across all grid points of a launch. Every grid point
+//! executes the instructions of the kernel body in program order, and an interleaving merges these per point sequences
+//! into one. Parallel grid dimensions permit every merge. Sequential grid dimensions impose completion dependencies, so
+//! a grid point whose coordinate along a sequential axis is nonzero starts only after its immediate predecessor along
+//! that axis has completed every instruction. These immediate predecessors suffice to enforce the complete partial
+//! order of the grid. Each interleaving is replayed with the canonical resumable interpreter, fresh private storage,
+//! and the same qualified context as [`KernelDefinition::interpret_with_trace`].
+//!
+//! # Admission
+//!
+//! [`KernelDefinition::interpret_interleavings`] specializes scalar prefetch values from its inputs and then admits
+//! only kernels whose interleavings are well defined at the granularity of one body instruction.
+//!
+//!   - The body must be a flat region, because the explorer schedules exactly one step per body instruction and plans
+//!     its replay steps from the instruction count of the body, so it cannot interleave the nested steps of an
+//!     attached region with the steps of other grid points.
+//!   - Every parameter mapping must use the [`BoundaryPolicy::InBounds`] policy. A masked window is a private tile
+//!     whose valid region ordinary interpretation publishes back after its grid point completes, and the ordered
+//!     replay of an interleaving has no such publication step.
+//!   - Every atomic update must select at most one element, so that one step represents one indivisible update.
+//!
+//! Grid extents must already be static, and qualification (i.e., [`validate_kernel_initialization`]) rejects races
+//! and uninitialized accesses before exploration. Nested regions and masked windows remain executable by ordinary
+//! host interpretation, and unsupported kernels fail with [`KernelSchedulingError::Unsupported`].
+//!
+//! # Limits and Results
+//!
+//! The [`KernelDebugOptions`] bound the number of grid points and the number of replay steps of each interleaving,
+//! and the `maximum_interleavings` argument bounds the number of interleavings. Exceeding any of these bounds returns
+//! an error before any interleaving executes, so a partial list is never presented as exhaustive. Each returned
+//! [`KernelInterleaving`] holds the functional outputs or the exact execution error of its order, together with the
+//! trace of the operation bindings that it attempted. An execution error stays attached to its interleaving and does
+//! not stop the remaining interleavings from executing.
 
 use ryft_core::{
     Array, ArrayIrType, ArrayIrValue, Domain, EagerContext, InterpretableOperation, Operation, ProgramError,
@@ -18,7 +54,8 @@ use crate::interpretation::{KernelDebugOptions, KernelTraceEntry};
 use crate::mappings::BoundaryPolicy;
 use crate::operations::{KernelExtension, KernelOperation};
 
-/// Admission and resource-limit failures before interleaving execution begins.
+/// Admission and resource limit failures of [`KernelDefinition::interpret_interleavings`], all of which occur before
+/// the execution of any interleaving begins.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelSchedulingError {
     /// A valid kernel requires a continuation or window model not supported by this bounded explorer.
@@ -35,7 +72,7 @@ pub enum KernelSchedulingError {
         maximum: usize,
     },
 
-    /// The total instruction and region-entry count cannot be represented by a host index.
+    /// The total count of instructions and region entries cannot be represented by a host index.
     #[error("kernel interleaving step count exceeds the host index range")]
     StepCountOverflow,
 
@@ -44,19 +81,34 @@ pub enum KernelSchedulingError {
     StepLimit {
         /// Instruction bindings plus one region entry per logical program.
         required: usize,
-        /// Invocation-wide replay-step limit.
+
+        /// Replay step limit of the whole invocation.
         maximum: usize,
     },
 }
 
-/// Outcome and operation trace of one admitted instruction order. Execution errors remain attached to their trace,
-/// and do not stop independent orders from being checked. Allocation identities are normalized within each trace.
+/// Outcome and operation trace of one admitted instruction order, which [`KernelDefinition::interpret_interleavings`]
+/// returns. Execution errors remain attached to their trace and do not stop independent orders from being checked.
+/// Allocation identities are normalized within each trace.
 #[derive(Clone, Debug)]
 pub struct KernelInterleaving {
     /// Functional outputs, or the exact execution diagnostic for this order.
-    pub result: Result<Vec<Array>, ProgramError>,
+    result: Result<Vec<Array>, ProgramError>,
+
     /// Attempted operation bindings in their actual execution order.
-    pub trace: Vec<KernelTraceEntry>,
+    trace: Vec<KernelTraceEntry>,
+}
+
+impl KernelInterleaving {
+    /// Returns the functional outputs, or the exact execution diagnostic for this order.
+    pub fn result(&self) -> &Result<Vec<Array>, ProgramError> {
+        &self.result
+    }
+
+    /// Returns the attempted operation bindings in their actual execution order.
+    pub fn trace(&self) -> &[KernelTraceEntry] {
+        &self.trace
+    }
 }
 
 impl<Extension> KernelDefinition<Extension>
@@ -69,14 +121,29 @@ where
         >,
     Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
-    /// Explores all program-order-preserving instruction interleavings within the supplied bounds. Qualification
-    /// rejects races and uninitialized accesses before exploration. Ordinary floating-point atomic accumulation can
-    /// produce different legal results across orders; each result is retained without selecting a preferred answer.
+    /// Explores all instruction interleavings that preserve the program order of every grid point, within the supplied
+    /// bounds. Qualification rejects races and uninitialized accesses before exploration. Ordinary floating-point
+    /// atomic accumulation can produce different legal results across orders, and each result is retained without
+    /// selecting a preferred answer.
     ///
     /// Atomic updates must select at most one element so an operation step represents one indivisible update.
     /// Nested regions and masked windows are explicitly unsupported here. Scalar prefetch is specialized from the
     /// supplied ordinary array inputs before planning, as in ordinary host interpretation. Dynamic grid extents must
     /// already have been specialized. Exceeding a planning bound returns an error before any execution begins.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: arrays in the definition's ordinary input order, followed by the scalar prefetch values.
+    ///   - `options`: grid point and replay step limits, and whether NaN checks are enabled in each execution.
+    ///   - `maximum_interleavings`: maximum number of complete instruction orders to execute.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the inputs do not match the signature of the definition, when scalar prefetch
+    /// specialization or qualification fails (e.g., with a [`KernelInitializationError`] for a dynamic grid extent or
+    /// a grid with more than [`KernelDebugOptions::maximum_programs`] points), or with a [`KernelSchedulingError`]
+    /// when the kernel is not admitted or a planning bound is exceeded. Failures of individual interleavings are
+    /// returned in their [`KernelInterleaving::result`] instead.
     pub fn interpret_interleavings(
         &self,
         mut inputs: Vec<Array>,
@@ -154,23 +221,23 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let points = self.operation().grid().points(&extents).map_err(ProgramError::custom)?;
-        if points.len() > options.maximum_programs {
+        if points.len() > options.maximum_programs() {
             return Err(ProgramError::custom(KernelInitializationError::QualificationLimit {
                 programs: points.len(),
-                maximum: options.maximum_programs,
+                maximum: options.maximum_programs(),
             }));
         }
-        validate_kernel_initialization(self.body().entry_region_ref(), self.operation(), options.maximum_programs)
+        validate_kernel_initialization(self.body().entry_region_ref(), self.operation(), options.maximum_programs())
             .map_err(ProgramError::custom)?;
         let instructions = self.body().entry_region().instructions().len();
         let required = instructions
             .checked_add(1)
             .and_then(|count| count.checked_mul(points.len()))
             .ok_or_else(|| ProgramError::custom(KernelSchedulingError::StepCountOverflow))?;
-        if required > options.maximum_steps {
+        if required > options.maximum_steps() {
             return Err(ProgramError::custom(KernelSchedulingError::StepLimit {
                 required,
-                maximum: options.maximum_steps,
+                maximum: options.maximum_steps(),
             }));
         }
         let points = points.collect::<Vec<_>>();
@@ -191,8 +258,9 @@ where
 }
 
 impl Grid {
-    /// Enumerates instruction-order merges iteratively, avoiding host recursion proportional to kernel size.
-    /// Immediate predecessors along sequential axes suffice to enforce the grid's complete partial order.
+    /// Enumerates the merges of the instruction orders of all grid points iteratively, avoiding host recursion
+    /// proportional to kernel size. Immediate predecessors along sequential axes suffice to enforce the grid's complete
+    /// partial order.
     fn interleavings(
         &self,
         extents: &[usize],
@@ -320,55 +388,58 @@ mod tests {
     }
 
     #[test]
-    fn test_grid_interleavings() {
-        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
-        let points = grid.points(&[2]).unwrap().collect::<Vec<_>>();
+    fn test_kernel_scheduling_error_display() {
         assert_eq!(
-            grid.interleavings(&[2], &points, 2, 6),
-            Ok(vec![
-                vec![0, 0, 1, 1],
-                vec![0, 1, 0, 1],
-                vec![0, 1, 1, 0],
-                vec![1, 0, 0, 1],
-                vec![1, 0, 1, 0],
-                vec![1, 1, 0, 0],
-            ]),
+            KernelSchedulingError::Unsupported { reason: "masked windows" }.to_string(),
+            "kernel interleaving exploration does not support masked windows",
         );
         assert_eq!(
-            grid.interleavings(&[2], &points, 2, 5),
-            Err(KernelSchedulingError::InterleavingLimit { maximum: 5 }),
+            KernelSchedulingError::InterleavingLimit { maximum: 3 }.to_string(),
+            "kernel interleaving count exceeds the limit 3",
         );
-        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Sequential)]).unwrap();
-        assert_eq!(grid.interleavings(&[2], &points, 2, 1), Ok(vec![vec![0, 0, 1, 1]]));
+        assert_eq!(
+            KernelSchedulingError::StepCountOverflow.to_string(),
+            "kernel interleaving step count exceeds the host index range",
+        );
+        assert_eq!(
+            KernelSchedulingError::StepLimit { required: 10, maximum: 9 }.to_string(),
+            "kernel interleaving requires 10 replay steps, exceeding the limit 9",
+        );
     }
 
     #[test]
-    fn test_grid_interleavings_partial_order() {
-        let grid = Grid::new(vec![
-            GridDimension::new(Dimension::Static(2), GridExecution::Sequential),
-            GridDimension::new(Dimension::Static(2), GridExecution::Sequential),
-        ])
-        .unwrap();
-        let points = grid.points(&[2, 2]).unwrap().collect::<Vec<_>>();
-        assert_eq!(grid.interleavings(&[2, 2], &points, 1, 2), Ok(vec![vec![0, 1, 2, 3], vec![0, 2, 1, 3]]));
-        assert_eq!(grid.interleavings(&[2, 2], &points, 0, 1), Ok(vec![vec![]]));
-        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(0), GridExecution::Parallel)]).unwrap();
-        assert_eq!(grid.interleavings(&[0], &[], 3, 1), Ok(vec![vec![]]));
-        assert_eq!(grid.interleavings(&[0], &[], 3, 0), Err(KernelSchedulingError::InterleavingLimit { maximum: 0 }));
+    fn test_kernel_interleaving_result() {
+        let definition = atomic_definition(GridExecution::Sequential);
+        let executions = definition
+            .interpret_interleavings(vec![Array::scalar(0f32).unwrap()], &KernelDebugOptions::default(), 1)
+            .unwrap();
+        assert_eq!(executions[0].result(), &Ok(vec![Array::scalar(1f32).unwrap()]));
+    }
+
+    #[test]
+    fn test_kernel_interleaving_trace() {
+        // The only order of a sequential grid replays the same bindings as ordinary traced interpretation.
+        let definition = atomic_definition(GridExecution::Sequential);
+        let input = Array::scalar(0f32).unwrap();
+        let options = KernelDebugOptions::default();
+        let executions = definition.interpret_interleavings(vec![input.clone()], &options, 1).unwrap();
+        let mut trace = Vec::new();
+        definition.interpret_with_trace(vec![input], &options, &mut trace).unwrap();
+        assert_eq!(executions[0].trace(), trace.as_slice());
     }
 
     #[test]
     fn test_kernel_definition_interpret_interleavings() {
         let definition = atomic_definition(GridExecution::Parallel);
         let input = Array::scalar(0f32).unwrap();
-        let options = KernelDebugOptions { maximum_programs: 2, maximum_steps: 10, check_nans: false };
+        let options = KernelDebugOptions::default().with_maximum_programs(2).with_maximum_steps(10);
         let executions = definition.interpret_interleavings(vec![input.clone()], &options, 70).unwrap();
         assert_eq!(executions.len(), 70);
         let results = executions
             .iter()
             .map(|execution| {
-                assert_eq!(execution.trace.len(), 8);
-                execution.result.as_ref().unwrap()[0].elements::<f32>().unwrap()[0].to_bits()
+                assert_eq!(execution.trace().len(), 8);
+                execution.result().as_ref().unwrap()[0].elements::<f32>().unwrap()[0].to_bits()
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(results, BTreeSet::from([1f32.to_bits(), 2f32.to_bits()]));
@@ -380,9 +451,7 @@ mod tests {
             Some(&KernelSchedulingError::InterleavingLimit { maximum: 69 }),
         );
         assert_eq!(error.to_string(), "kernel interleaving count exceeds the limit 69");
-        let error = definition
-            .interpret_interleavings(vec![input], &KernelDebugOptions { maximum_steps: 9, ..options }, 70)
-            .unwrap_err();
+        let error = definition.interpret_interleavings(vec![input], &options.with_maximum_steps(9), 70).unwrap_err();
         assert_eq!(
             error.downcast_custom::<KernelSchedulingError>(),
             Some(&KernelSchedulingError::StepLimit { required: 10, maximum: 9 }),
@@ -397,12 +466,13 @@ mod tests {
             .interpret_interleavings(vec![Array::scalar(0f32).unwrap()], &KernelDebugOptions::default(), 1)
             .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].result, Ok(vec![Array::scalar(1f32).unwrap()]));
+        assert_eq!(executions[0].result(), &Ok(vec![Array::scalar(1f32).unwrap()]));
         assert_eq!(
-            executions[0].trace.iter().map(|entry| entry.coordinate.clone()).collect::<Vec<_>>(),
-            vec![vec![0], vec![0], vec![0], vec![0], vec![1], vec![1], vec![1], vec![1],],
+            executions[0].trace().iter().map(|entry| entry.coordinate().to_vec()).collect::<Vec<_>>(),
+            vec![vec![0], vec![0], vec![0], vec![0], vec![1], vec![1], vec![1], vec![1]],
         );
     }
+
     #[test]
     fn test_kernel_definition_interpret_interleavings_rejects_masked_windows() {
         let original = atomic_definition(GridExecution::Parallel);
@@ -529,21 +599,21 @@ mod tests {
         let executions = definition.interpret_interleavings(vec![input], &KernelDebugOptions::default(), 2).unwrap();
         assert_eq!(executions.len(), 2);
         let output = Array::vector(vec![2f32, 0f32]).unwrap();
-        assert_eq!(executions[0].result, Ok(vec![output.clone()]));
+        assert_eq!(executions[0].result(), &Ok(vec![output.clone()]));
         assert_eq!(
             executions[0]
-                .trace
+                .trace()
                 .iter()
-                .map(|entry| (entry.coordinate.clone(), entry.operation))
+                .map(|entry| (entry.coordinate().to_vec(), entry.operation()))
                 .collect::<Vec<_>>(),
             vec![(vec![0], "reference_atomic_add_update"), (vec![1], "reference_atomic_add_update")],
         );
-        assert_eq!(executions[1].result, Ok(vec![output]));
+        assert_eq!(executions[1].result(), &Ok(vec![output]));
         assert_eq!(
             executions[1]
-                .trace
+                .trace()
                 .iter()
-                .map(|entry| (entry.coordinate.clone(), entry.operation))
+                .map(|entry| (entry.coordinate().to_vec(), entry.operation()))
                 .collect::<Vec<_>>(),
             vec![(vec![1], "reference_atomic_add_update"), (vec![0], "reference_atomic_add_update")],
         );
@@ -561,13 +631,13 @@ mod tests {
         let executions = definition
             .interpret_interleavings(
                 vec![input.clone()],
-                &KernelDebugOptions { maximum_programs: 2, maximum_steps: 4, check_nans: true },
+                &KernelDebugOptions::default().with_maximum_programs(2).with_maximum_steps(4).with_nan_checks(true),
                 2,
             )
             .unwrap();
         assert_eq!(executions.len(), 2);
         for (program, execution) in executions.iter().enumerate() {
-            let error = execution.result.as_ref().unwrap_err();
+            let error = execution.result().as_ref().unwrap_err();
             assert_eq!(
                 error.downcast_custom::<KernelInterpretationError>(),
                 Some(&KernelInterpretationError::Nan {
@@ -586,10 +656,48 @@ mod tests {
                     "nan in `reference_atomic_add_update` input 1 element 0 of type `f32` at grid point [{program}]",
                 ),
             );
-            assert_eq!(execution.trace.len(), 1);
-            assert_eq!(execution.trace[0].operation, "reference_atomic_add_update");
-            assert_eq!(execution.trace[0].coordinate, vec![program]);
+            assert_eq!(execution.trace().len(), 1);
+            assert_eq!(execution.trace()[0].operation(), "reference_atomic_add_update");
+            assert_eq!(execution.trace()[0].coordinate(), vec![program]);
         }
         assert_eq!(input, Array::scalar(0f32).unwrap());
+    }
+
+    #[test]
+    fn test_grid_interleavings() {
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
+        let points = grid.points(&[2]).unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            grid.interleavings(&[2], &points, 2, 6),
+            Ok(vec![
+                vec![0, 0, 1, 1],
+                vec![0, 1, 0, 1],
+                vec![0, 1, 1, 0],
+                vec![1, 0, 0, 1],
+                vec![1, 0, 1, 0],
+                vec![1, 1, 0, 0],
+            ]),
+        );
+        assert_eq!(
+            grid.interleavings(&[2], &points, 2, 5),
+            Err(KernelSchedulingError::InterleavingLimit { maximum: 5 }),
+        );
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Sequential)]).unwrap();
+        assert_eq!(grid.interleavings(&[2], &points, 2, 1), Ok(vec![vec![0, 0, 1, 1]]));
+    }
+
+    #[test]
+    fn test_grid_interleavings_partial_order() {
+        let grid = Grid::new(vec![
+            GridDimension::new(Dimension::Static(2), GridExecution::Sequential),
+            GridDimension::new(Dimension::Static(2), GridExecution::Sequential),
+        ])
+        .unwrap();
+        let points = grid.points(&[2, 2]).unwrap().collect::<Vec<_>>();
+        assert_eq!(grid.interleavings(&[2, 2], &points, 1, 2), Ok(vec![vec![0, 1, 2, 3], vec![0, 2, 1, 3]]));
+        assert_eq!(grid.interleavings(&[2, 2], &points, 0, 1), Ok(vec![vec![]]));
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(0), GridExecution::Parallel)]).unwrap();
+        assert_eq!(grid.interleavings(&[0], &[], 3, 1), Ok(vec![vec![]]));
+        assert_eq!(grid.interleavings(&[0], &[], 3, 0), Err(KernelSchedulingError::InterleavingLimit { maximum: 0 }));
     }
 }

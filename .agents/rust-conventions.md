@@ -112,10 +112,10 @@ ownership, and synchronization. These shared rules also apply to test code; deta
     path segments. Both named and glob `pub use` re-exports in module `mod.rs` files count as intentional facades:
     prefer `crate::arrays::ArrayType` and `crate::programs::Typed` to their deeper defining paths, and fall back to
     the defining path only when no facade re-exports the item (e.g.,
-    `crate::programs::types::visit_type_signature_pairs`). The one exclusion is crate-root re-exports: in `ryft-core`,
-    never import through `crate::<Item>` (the `lib.rs` re-exports exist for downstream crates); in crates whose root
-    re-exports are the intentional named public API, such as `ryft-xla`, `use crate::{...}` root imports are the
-    shortest facade and are correct.
+    `crate::programs::types::visit_type_signature_pairs`). The one exclusion is crate-root re-exports: in `ryft-core`
+    and `ryft-kernels`, never import through `crate::<Item>` (their `lib.rs` re-exports exist for downstream crates);
+    in crates whose root re-exports are the intentional named public API, such as `ryft-xla`, `use crate::{...}` root
+    imports are the shortest facade and are correct.
   - Import items owned by the same top-level module through their full accessible defining submodule paths, even when
     an ancestor re-exports them through a shorter facade path. For example, `crate::arrays::addressing` must import
     `ArrayType` from `crate::arrays::types::arrays::ArrayType`, not from `crate::arrays::ArrayType`. Items defined

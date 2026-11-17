@@ -1,6 +1,6 @@
 [package]
 name = "ryft-mosaic"
-version = "0.0.3"
+version = "0.0.1"
 description = "Mosaic compiler adapters for Ryft kernels."
 readme = "README.md"
 authors.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "ryft-kernels"
-version = "0.0.3"
+version = "0.0.1"
 readme = "README.md"
 description = "Portable kernel authoring, verification, and interpretation for Ryft."
 keywords = ["ryft", "kernels", "compiler", "gpu", "machine-learning"]
@@ -32,12 +32,12 @@ ryft-core.workspace = true
 ryft-macros.workspace = true
 num-complex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
 pretty_assertions.workspace = true
-serde_json.workspace = true
 
 [features]
 default = []

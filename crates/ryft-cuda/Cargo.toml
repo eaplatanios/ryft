@@ -1,6 +1,6 @@
 [package]
 name = "ryft-cuda"
-version = "0.0.3"
+version = "0.0.1"
 readme = "README.md"
 description = "CUDA kernel loading & execution support for Ryft."
 keywords = ["ryft", "cuda", "gpu", "kernel", "driver"]

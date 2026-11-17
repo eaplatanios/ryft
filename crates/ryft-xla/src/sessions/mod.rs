@@ -402,6 +402,7 @@ impl Session {
     ///
     /// Returns a [`ProgramError::InvalidArgument`] if the addressable devices of the client cannot be queried or are
     /// fewer than the mesh of `r#type` requires, and the errors of [`Array::from_host_buffer`] otherwise.
+    #[inline]
     pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, buffer: B) -> Result<Array, Error> {
         let mesh = self.eager_mesh(&[], std::slice::from_ref(&r#type))?;
         Array::from_host_buffer(self, r#type, mesh, buffer)
@@ -845,7 +846,7 @@ impl Session {
         for (index, input) in inputs.iter().enumerate() {
             if !std::ptr::eq(input.client(), self.client()) {
                 return Err(invalid_argument(format!(
-                    "received incompatible devices for eager xla execution: input #{index} is owned by a different \
+                    "received incompatible devices for eager XLA execution: input #{index} is owned by a different \
                      PJRT client than this session's client",
                 )));
             }
@@ -860,7 +861,7 @@ impl Session {
                 && !mesh.devices().iter().map(Device::id).eq(first_mesh.devices().iter().map(Device::id))
             {
                 return Err(invalid_argument(format!(
-                    "received incompatible devices for eager xla execution: input #{index} is placed on devices {:?} \
+                    "received incompatible devices for eager XLA execution: input #{index} is placed on devices {:?} \
                      but input #0 is placed on devices {:?}",
                     device_ids(mesh),
                     device_ids(first_mesh),
@@ -870,24 +871,27 @@ impl Session {
         Ok(())
     }
 
-    /// Returns the concrete [`DeviceMesh`] for eager execution, preferring the first input's mesh and then the default
-    /// mesh of this handle, so that an operation executes where its inputs live, as operations on committed arrays do
-    /// under JAX's `jax.set_mesh`. Without either, the first sharded output supplies a logical mesh, which is
-    /// assembled over the client's addressable devices in enumeration order. If no output supplies a mesh, the
-    /// client's first addressable device forms a mesh with a single device.
-    ///
-    /// Deriving placement from output sharding supports operations without inputs on recovered sessions without a mesh,
-    /// including nullary constants synthesized by transforms through [`Zero`], [`One`](ryft_core::One),
-    /// [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota).
+    /// Returns the concrete [`DeviceMesh`] used for eager execution of an operation using the provided input values and
+    /// specified output types, preferring the first input's mesh and then the default mesh of this handle, so that an
+    /// operation executes where its inputs live. Without either, the first sharded output supplies a logical mesh,
+    /// which is assembled over the client's addressable devices in enumeration order. If no output supplies a mesh,
+    /// the client's first addressable device forms a mesh with a single device. Deriving placement from output sharding
+    /// supports operations without inputs on recovered sessions without a mesh, including nullary constants synthesized
+    /// by transforms through [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and
+    /// [`Iota`](ryft_core::Iota).
     fn eager_mesh(&self, inputs: &[Array], output_types: &[ArrayType]) -> Result<DeviceMesh, ProgramError> {
         if let Some(input) = inputs.first() {
             return Ok(input.mesh().clone());
         }
+
         if let Ok(mesh) = self.device_mesh() {
             return Ok(mesh.clone());
         }
-        let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
-        let devices = self.client().addressable_devices().map_err(|error| invalid_argument(error.to_string()))?;
+
+        let devices = self
+            .client()
+            .addressable_devices()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         if let Some(logical_mesh) =
             output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh().clone()))
         {
@@ -895,26 +899,41 @@ impl Session {
             // its declared logical mesh over the client's addressable devices in enumeration order.
             let device_count = logical_mesh.device_count();
             if devices.len() < device_count {
-                return Err(invalid_argument(format!(
-                    "eager xla placement of a value without array inputs over mesh {logical_mesh:?} requires \
-                     {device_count} addressable device(s) but the client only has {}",
-                    devices.len(),
-                )));
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "eager XLA placement of a value without array inputs over mesh {:?} requires \
+                         {} addressable device(s) but the client only has {}",
+                        logical_mesh,
+                        device_count,
+                        devices.len(),
+                    ),
+                });
             }
+
             let devices = devices
                 .iter()
                 .take(device_count)
-                .map(|device| Device::from_pjrt(device).map_err(|error| invalid_argument(error.to_string())))
+                .map(|device| {
+                    Device::from_pjrt(device)
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            return DeviceMesh::new(logical_mesh, devices).map_err(|error| invalid_argument(error.to_string()));
+
+            return DeviceMesh::new(logical_mesh, devices)
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() });
         }
-        let device = devices
-            .first()
-            .ok_or_else(|| invalid_argument("eager xla execution requires at least one addressable device".into()))?;
-        let device = Device::from_pjrt(device).map_err(|error| invalid_argument(error.to_string()))?;
-        let axis = MeshAxis::new("x", 1, MeshAxisType::Auto).map_err(|error| invalid_argument(error.to_string()))?;
-        let logical_mesh = LogicalMesh::new(vec![axis]).map_err(|error| invalid_argument(error.to_string()))?;
-        DeviceMesh::new(logical_mesh, vec![device]).map_err(|error| invalid_argument(error.to_string()))
+
+        let device = devices.first().ok_or_else(|| ProgramError::InvalidArgument {
+            message: "eager XLA execution requires at least one addressable device".to_string(),
+        })?;
+        let device =
+            Device::from_pjrt(device).map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let axis = MeshAxis::new("x", 1, MeshAxisType::Auto)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let logical_mesh = LogicalMesh::new(vec![axis])
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        DeviceMesh::new(logical_mesh, vec![device])
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
     }
 
     /// Materializes a concrete [`Array`] whose addressable shards are filled with the constant that `kind` selects. An
@@ -983,7 +1002,7 @@ impl Context for Session {
     fn lift(&self, constant: Constant) -> Result<Value, ProgramError> {
         match constant {
             Constant::Captured(constant) => Err(TypeError::invalid(format!(
-                "xla captured constant `{constant}` requires a captured program capture table"
+                "XLA captured constant `{constant}` requires a captured program capture table"
             ))
             .into()),
             Constant::Session(constant) => Ok(Value::Array(self.retained_constant(&constant)?)),
@@ -1486,7 +1505,7 @@ fn session_constant(value: Value) -> Result<Constant, ProgramError> {
         Value::Array(array) => Ok(Constant::Session(array.session().retain_constant(&array))),
         Value::Dimension(dimension) => Ok(Constant::Dimension(dimension.into_value())),
         Value::Reference(_) => {
-            Err(TypeError::invalid("cannot import an xla reference into a trace whose capture table holds constants")
+            Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
                 .into())
         }
     }
@@ -2004,7 +2023,7 @@ pub(crate) mod tests {
             Err(Error::Core(error))
                 if *error == CoreError::Program(ProgramError::InvalidArgument {
                     message: format!(
-                        "eager xla placement of a value without array inputs over mesh {logical_mesh:?} requires 2 \
+                        "eager XLA placement of a value without array inputs over mesh {logical_mesh:?} requires 2 \
                          addressable device(s) but the client only has 1",
                     ),
                 }),
@@ -2232,7 +2251,7 @@ pub(crate) mod tests {
         assert_eq!(
             session.lift(Constant::Captured(capture)),
             Err(TypeError::invalid(
-                "xla captured constant `capture#0:f32[]` requires a captured program capture table"
+                "XLA captured constant `capture#0:f32[]` requires a captured program capture table"
             )
             .into()),
         );
@@ -2843,7 +2862,7 @@ pub(crate) mod tests {
         assert_eq!(
             session.bind(operation, Vec::new(), &mixed_inputs),
             Err(ProgramError::InvalidArgument {
-                message: "received incompatible devices for eager xla execution: input #1 is owned by a different \
+                message: "received incompatible devices for eager XLA execution: input #1 is owned by a different \
                           PJRT client than this session's client"
                     .to_owned(),
             }),
@@ -3878,7 +3897,7 @@ pub(crate) mod tests {
         assert!(matches!(
             domain.bind(NegOperation::new(), Vec::new(), std::slice::from_ref(&input)),
             Err(ProgramError::InvalidArgument { message })
-                if message == "received incompatible devices for eager xla execution: input #0 is owned by a \
+                if message == "received incompatible devices for eager XLA execution: input #0 is owned by a \
                     different PJRT client than this session's client",
         ));
         // Casts that produce dimensions execute on the host but still require array witnesses from the selected client.
@@ -3895,7 +3914,7 @@ pub(crate) mod tests {
                 &[dimension, Value::Array(input)],
             ),
             Err(ProgramError::InvalidArgument {
-                message: "received incompatible devices for eager xla execution: input #0 is owned by a different \
+                message: "received incompatible devices for eager XLA execution: input #0 is owned by a different \
                           PJRT client than this session's client"
                     .to_owned(),
             }),
@@ -4478,7 +4497,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             session_constant(Value::Reference(Reference::new(ArrayReference::new(array), session))),
-            Err(TypeError::invalid("cannot import an xla reference into a trace whose capture table holds constants")
+            Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
                 .into()),
         );
     }

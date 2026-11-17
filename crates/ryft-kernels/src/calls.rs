@@ -1,35 +1,76 @@
-//! Functional kernel calls with reference windows confined to an attached body region.
+//! Functional kernel calls whose block references are confined to an attached body region.
 //!
-//! Full array signatures and block mappings belong to the call. The body receives logical block references and
-//! canonical dimension coordinates; read-write and write-only parameters publish ordinary arrays at the outer
-//! boundary. Compiler and launch metadata are intentionally absent. Construction validates types and reference access;
-//! execution additionally requires the initialization, coverage, and race checks performed by the kernel verifier.
+//! A kernel is an ordinary Ryft program, its _body_, that runs once per point of a logical [`Grid`] and that accesses
+//! arrays only through references to block windows of those arrays. The call that applies a kernel owns the full array
+//! signature, and the body sees only the window of each array that belongs to the current grid point. Each
+//! [`KernelParameter`] declares the full array type of one parameter, its [`KernelParameterAccess`], and the
+//! [`BlockMapping`] that selects its window for every grid point, and it derives the logical block reference type
+//! through which the body accesses that window. Compiler, launch, and schedule metadata are intentionally absent, so
+//! one definition serves every compiler adapter and the interpreter.
+//!
+//! # Call Boundary
+//!
+//! [`KernelCallOperation`] is the higher-order [`KERNEL_CALL_OPERATION_NAME`] operation, which has exactly one attached
+//! body region. The body inputs are the block references in parameter order, then one dimension coordinate per grid
+//! axis, and then the scalar prefetched rank-0 integer arrays, whose values the block mappings receive as dimensions
+//! after the grid coordinates. The body returns no values, because its stores produce the results of the call. Outside
+//! the call, every parameter that is not write-only contributes an ordinary array input, the scalar prefetched arrays
+//! follow those inputs, and every parameter that is not read-only contributes an ordinary array result. A read-write
+//! parameter therefore contributes one input and one result that may share storage (refer to
+//! [`KernelCallOperation::aliases`]), and no reference or input mutation is visible outside the call.
+//!
+//! # Definitions and Validation
+//!
+//! [`KernelDefinition`] pairs a call with an immutable body that it validated before retaining either.
+//! [`KernelDefinition::new`] and the tracing constructors [`KernelDefinition::trace`] and
+//! [`KernelDefinition::trace_with_prefetch`] reject a body whose interface does not match the call signature, a body
+//! that contains a `shard_map` anywhere in its attached region closure, and a body whose reference accesses
+//! [`validate_kernel_body`] rejects against the declared parameter accesses. This boundary validation does not grant
+//! execution. [`VerifiedKernel`](crate::compilation::VerifiedKernel) additionally verifies initialization, bounds,
+//! complete output coverage, and the disjointness of mutable windows across grid points before a compiler adapter
+//! admits a definition. Interpretation in [`interpretation`](crate::interpretation) checks initialization, output
+//! coverage, and races as well before it replays a body.
+//!
+//! Dynamic signatures are specialized before or after tracing. [`KernelParameter::from_refined_types`] fixes full array
+//! shapes before a body is traced, while [`KernelDefinition::specialize_grid`] and
+//! [`KernelDefinition::specialize_prefetch`] bind grid extents and scalar prefetched values of an existing definition
+//! without retracing its body. These functions and [`KernelDefinition::simplified`] produce a new definition that is
+//! validated again, so no validation remains attached to changed semantics. Construction and validation failures are
+//! reported as [`KernelError`]s.
+//!
+//! # Semantic Keys
+//!
+//! [`KernelDefinition::semantic_key`] encodes the call and body of a definition into the same wire records as its
+//! portable source document (refer to [`serialization`](crate::serialization)), projects out what is not semantic
+//! (i.e., diagnostic provenance, nominal dimension names, and grid axis names), and serializes the result canonically
+//! after a header that carries [`KERNEL_KEY_VERSION`]. The key numbers nominal dimension identities in occurrence
+//! order, retains exact constant bytes and floating-point bits, and rejects operations whose identity is local to the
+//! process. It covers every valid definition, including features outside the transport schema, which key-only records
+//! encode. Execution integrations combine it with the complete configuration key of a compiler adapter before reusing
+//! compiled work.
 
 use std::borrow::Cow;
-use std::fmt::{Display, Write};
+use std::fmt::Display;
 use std::hash::Hash;
 
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis,
-    ArrayType, ArrayTypeRefinements, Atom, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME,
-    CompositeOperation, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, CustomRuleSource,
-    DifferentiableType, Dimension, DimensionBounds, DimensionFromScalar, DimensionFromScalarOperation, DimensionType,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
+    ArrayTypeRefinements, Dimension, DimensionBounds, DimensionFromScalar, DimensionFromScalarOperation, DimensionType,
     DimensionVariable, EagerContext, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
-    PadOperation, Parameter, Placeholder, ProgramBuilder, ProgramError, REMATERIALIZE_OPERATION_NAME,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot, Tracer,
-    TracingContext, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
+    PadOperation, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot, Tracer, TracingContext, Type,
+    TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
 };
 use thiserror::Error;
 
-use crate::grids::{Grid, GridError, GridExecution};
+use crate::grids::{Grid, GridError};
 use crate::mappings::{BlockMapping, BlockMappingError, BoundaryPolicy};
 use crate::operations::{KernelExtension, KernelOperation, NoKernelExtension};
+use crate::serialization::encode_semantic_key;
 use crate::validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelReferenceSummary, KernelValidationError, validate_kernel_body,
 };
 
-// TODO(eaplatanios): Promote kernel errors to dedicated `ryft_xla::Error` variants after
-// this support leaves experimental status.
 /// Invalid kernel signature or body boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelError {
@@ -45,17 +86,17 @@ pub enum KernelError {
     #[error(transparent)]
     Grid(#[from] GridError),
 
-    /// The canonical mapping verifier rejected a block mapping.
+    /// The canonical mapping verifier rejected a [`BlockMapping`].
     #[error(transparent)]
     Mapping(#[from] BlockMappingError),
 
-    /// Reference access or lifetime validation rejected the body.
+    /// Reference access or lifetime validation by [`validate_kernel_body`] rejected the body.
     #[error(transparent)]
     Validation(#[from] KernelValidationError),
 
-    /// The body applies an operation that kernels do not support anywhere in their attached-region closure. A
-    /// `shard_map` is the only such operation: a kernel body runs once per grid point of one device, so it cannot
-    /// contain a manual SPMD computation over a device mesh.
+    /// The body applies an operation that kernels do not support anywhere in their attached region closure. A
+    /// `shard_map` is the only such operation, because a kernel body runs once per grid point of one device, so it
+    /// cannot contain a manual SPMD computation over a device mesh.
     #[error("kernel body instruction {instruction} applies `{operation}`, which kernel bodies do not support")]
     UnsupportedOperation {
         /// Name of the unsupported operation.
@@ -65,22 +106,28 @@ pub enum KernelError {
         instruction: InstructionId,
     },
 
-    /// Grid ordering does not admit an access performed on a body parameter.
-    #[error("kernel grid does not permit `{mode}` access on parameter {parameter}")]
-    DisallowedGridAccess {
-        /// Parameter whose access requires stronger grid ordering.
-        parameter: usize,
-        /// Exact canonical access mode rejected by the grid region policy.
-        mode: ReferenceAccessMode,
-    },
-
     /// The block and full array have different logical ranks.
     #[error("kernel parameter has array rank {array_rank} but block rank {block_rank}")]
-    ParameterRank { array_rank: usize, block_rank: usize },
+    ParameterRank {
+        /// Rank of the full array type.
+        array_rank: usize,
 
-    /// Mapping arguments must correspond to grid coordinates followed by scalar-prefetched dimensions.
+        /// Rank of the block shape of the parameter mapping.
+        block_rank: usize,
+    },
+
+    /// Mapping arguments must correspond to grid coordinates followed by scalar prefetched dimensions.
     #[error("kernel parameter {parameter} mapping takes {actual} inputs but the call requires {expected}")]
-    MappingInputCount { parameter: usize, expected: usize, actual: usize },
+    MappingInputCount {
+        /// Parameter whose mapping takes the wrong number of inputs.
+        parameter: usize,
+
+        /// Number of grid dimensions plus the number of scalar prefetched arrays.
+        expected: usize,
+
+        /// Number of inputs of the mapping program.
+        actual: usize,
+    },
 
     /// Independent grid axes, or a grid axis and a scalar prefetched dimension, cannot impose equality through a shared
     /// mapping dimension identity.
@@ -91,8 +138,10 @@ pub enum KernelError {
     MappingInputIdentity {
         /// Parameter whose mapping equates independent coordinates.
         parameter: usize,
+
         /// First logical axis using the identity.
         first_axis: usize,
+
         /// Later mapping input using the same identity, which is a logical axis or a scalar prefetched dimension
         /// following the grid coordinates.
         second_axis: usize,
@@ -103,10 +152,13 @@ pub enum KernelError {
     MappingInputBounds {
         /// Parameter whose mapping excludes a coordinate.
         parameter: usize,
+
         /// Logical grid axis supplying the coordinate.
         axis: usize,
+
         /// Coordinate interval required by the declared grid envelope.
         expected: DimensionBounds,
+
         /// Coordinate interval admitted by the mapping input.
         actual: DimensionBounds,
     },
@@ -121,7 +173,7 @@ pub struct KernelParameter {
     /// Access permitted on this parameter's body reference.
     access: KernelParameterAccess,
 
-    /// Pure grid-to-window mapping and explicit boundary policy.
+    /// Pure mapping from grid points to windows, with an explicit boundary policy.
     mapping: BlockMapping,
 
     /// Canonical reference type derived from the full array and logical block by the array slice transform rules.
@@ -130,10 +182,17 @@ pub struct KernelParameter {
 
 impl KernelParameter {
     /// Creates a parameter whose block rank agrees with its full array rank. The reference type is derived by the
-    /// canonical array slice transform rules, preserving whole-window layout and validating partial-window sharding.
-    /// Masked windows have a fixed logical block type derived by slicing the valid origin window and applying the
-    /// canonical padding type rules. Their private tile storage has no required physical layout. Invalid lanes are
-    /// accessible only through masked memory operations with an explicit fallback; padding does not initialize them.
+    /// canonical [`ArrayReferenceTransform::Slice`] type rules, which preserve the layout of a whole window and
+    /// validate the sharding of a partial window. Masked windows have a fixed logical block type derived by slicing the
+    /// valid origin window and applying the canonical padding type rules of [`PadOperation`]. Their private tile
+    /// storage has no required physical layout. Invalid elements are accessible only through masked memory operations
+    /// with an explicit fallback, and padding does not initialize them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::ParameterRank`] when the block rank of `mapping` differs from the rank of `type`, and
+    /// [`KernelError::Type`] when a masked window has a full array type without a static shape or when the slice or
+    /// padding type rules reject the block.
     pub fn new(r#type: ArrayType, access: KernelParameterAccess, mapping: BlockMapping) -> Result<Self, KernelError> {
         if r#type.rank() != mapping.block_shape().len() {
             return Err(KernelError::ParameterRank {
@@ -183,19 +242,24 @@ impl KernelParameter {
     }
 
     /// Specializes declared full array shapes before constructing parameters or tracing a body. Canonical
-    /// [`ArrayTypeRefinements`] checks enforce bounds and agreement of repeated dimension
-    /// identities across all parameters, including outputs. Every supplied actual shape must be static; unresolved
-    /// output dimensions are rejected rather than inferred from unrelated inputs or runtime contents.
+    /// [`ArrayTypeRefinements`] checks enforce bounds and agreement of repeated dimension identities across all
+    /// parameters, including outputs. Every supplied actual shape must be static, and unresolved output dimensions are
+    /// rejected rather than inferred from unrelated inputs or runtime contents.
     ///
-    /// Actual types must refine the declarations, including declared dtype, memory, layout, and sharding constraints.
-    /// Only their shapes are copied: additional actual layout or sharding information does not become a declaration
-    /// or specialization dependency. Canonical slice and padding inference then validates each fixed block type.
-    /// This constructs a concrete signature for subsequent tracing; it does not restage a retained dynamic body.
+    /// Actual types must refine the declarations, including declared data type, memory, layout, and sharding
+    /// constraints. Only their shapes are copied, so additional actual layout or sharding information does not become a
+    /// declaration or specialization dependency. Canonical slice and padding inference then validates each fixed block
+    /// type. This constructs a concrete signature for subsequent tracing and does not restage a retained dynamic body.
     ///
     /// # Parameters
     ///
-    ///   - `parameters`: Full type declaration, access, and mapping for each parameter in body-reference order.
+    ///   - `parameters`: Full type declaration, access, and mapping for each parameter in body reference order.
     ///   - `actual_types`: Explicit concrete types in the same order, including write-only output types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Type`] when the actual types do not refine the declarations or when an actual shape is
+    /// not static, and every error of [`Self::new`] for the specialized parameters.
     pub fn from_refined_types(
         parameters: Vec<(ArrayType, KernelParameterAccess, BlockMapping)>,
         actual_types: &[ArrayType],
@@ -226,9 +290,9 @@ impl KernelParameter {
         &self.mapping
     }
 
-    /// Returns the canonical logical reference type of this parameter inside the body. Whole-array windows retain
-    /// the complete array type; partial windows use the existing slice rules for layout, sharding, and memory.
-    /// Masked windows use a private padded tile with no required physical layout.
+    /// Returns the canonical logical reference type of this parameter inside the body. Windows that cover the whole
+    /// array retain the complete array type, and partial windows use the existing slice rules for layout, sharding, and
+    /// memory. Masked windows use a private padded tile with no required physical layout.
     pub fn body_type(&self) -> ArrayIrType {
         self.body_type.clone()
     }
@@ -242,19 +306,20 @@ impl Typed for KernelParameter {
     }
 }
 
-/// Canonical name for the higher-order kernel call.
+/// Canonical name for the higher-order [`KernelCallOperation`].
 pub const KERNEL_CALL_OPERATION_NAME: &str = "kernel_call";
 
-/// Version of the experimental kernel semantic-key schema. An incompatible change to the encoded semantics
-/// requires a new version; this is independent of adapter artifact and executable persistence versions.
-pub const KERNEL_SCHEMA_VERSION: u32 = 2;
+/// Version of the encoding of kernel semantic keys, which [`KernelDefinition::semantic_key`] writes as the only version
+/// in its header. An incompatible change to the encoded semantics requires a new version. This version is independent
+/// of the version of serialized kernel sources and of adapter artifact and executable persistence versions.
+pub const KERNEL_KEY_VERSION: u32 = 1;
 
-/// Higher-order operation with one attached, reference-preserving kernel body.
+/// Higher-order operation with one attached kernel body that preserves its block references.
 ///
-/// Body reference inputs follow [`Self::parameters`] order. Outer inputs omit write-only parameters; outer results
-/// omit read-only parameters. A read-write parameter therefore contributes one ordinary input and one ordinary
-/// result. This functional alias relationship does not expose a reference-state slot or permit an input mutation
-/// visible outside the call. The body returns no values: its stores produce the declared array results.
+/// Body reference inputs follow the order of [`Self::parameters`]. Outer inputs omit write-only parameters, and outer
+/// results omit read-only parameters. A read-write parameter therefore contributes one ordinary input and one ordinary
+/// result. This functional alias relationship does not expose a reference state slot or permit an input mutation
+/// visible outside the call. The body returns no values, because its stores produce the declared array results.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelCallOperation {
     /// Logical execution grid, independent of native launch dimensions.
@@ -263,25 +328,36 @@ pub struct KernelCallOperation {
     /// Logical array parameters in body input order.
     parameters: Vec<KernelParameter>,
 
-    /// Canonical logical coordinate types, in grid-axis order after the reference inputs.
+    /// Canonical logical coordinate types, in grid axis order after the reference inputs.
     coordinate_types: Vec<DimensionType>,
 
-    /// Rank-zero integer arrays read before mapping evaluation and supplied as private body values.
+    /// Rank-0 integer arrays read before mapping evaluation and supplied as private body values.
     prefetch_types: Vec<ArrayType>,
 }
 
 impl KernelCallOperation {
     /// Creates a call with one mapping coordinate per logical grid dimension. Full body validation belongs to
-    /// [`KernelDefinition::new`]; constructing metadata alone does not make an executable kernel.
+    /// [`KernelDefinition::new`], and constructing metadata alone does not make an executable kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::new_with_prefetch`].
     pub fn new(grid: Grid, parameters: Vec<KernelParameter>) -> Result<Self, KernelError> {
         Self::new_with_prefetch(grid, parameters, vec![])
     }
 
-    /// Creates a call with scalar-prefetched arrays after its ordinary array inputs. Each mapping takes grid
-    /// coordinates followed by checked dimensions converted from these rank-zero integer arrays. Body inputs append
-    /// the original scalar arrays after references and coordinates. Values must be explicitly specialized before
-    /// executable qualification; this preserves the ordinary array ABI at native call boundaries. A prefetched
+    /// Creates a call with scalar prefetched arrays after its ordinary array inputs. Each mapping takes grid
+    /// coordinates followed by checked dimensions converted from these rank-0 integer arrays. Body inputs append the
+    /// original scalar arrays after references and coordinates. Values must be explicitly specialized before
+    /// executable qualification, which preserves the ordinary array ABI at native call boundaries. A prefetched
     /// dimension cannot share its identity with a grid coordinate, because specialization binds it to a constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Type`] when a prefetched type is not a rank-0 integer array type,
+    /// [`KernelError::MappingInputCount`] when a mapping does not take one input per grid dimension and prefetched
+    /// array, [`KernelError::MappingInputIdentity`] when a mapping shares one dimension identity between coordinates
+    /// that may differ, and [`KernelError::MappingInputBounds`] when a mapping input excludes a grid coordinate.
     pub fn new_with_prefetch(
         grid: Grid,
         parameters: Vec<KernelParameter>,
@@ -399,18 +475,19 @@ impl KernelCallOperation {
         &self.parameters
     }
 
-    /// Returns coordinate types in logical grid-axis order. Each identity belongs to this call definition and admits
+    /// Returns coordinate types in logical grid axis order. Each identity belongs to this call definition and admits
     /// indices from zero up to the maximum possible extent. Empty axes use `[0, 1)` because no invocation occurs.
     pub fn coordinate_types(&self) -> &[DimensionType] {
         &self.coordinate_types
     }
 
-    /// Returns the rank-zero integer array types in scalar-prefetch order.
+    /// Returns the rank-0 integer array types in scalar prefetch order.
     pub fn prefetch_types(&self) -> &[ArrayType] {
         &self.prefetch_types
     }
 
-    /// Returns the body signature: block references, dimension coordinates, then scalar-prefetched arrays.
+    /// Returns the body signature, which consists of the block references, then the dimension coordinates, and then
+    /// the scalar prefetched arrays.
     pub fn body_input_types(&self) -> Vec<ArrayIrType> {
         self.parameters
             .iter()
@@ -439,8 +516,9 @@ impl KernelCallOperation {
             .collect()
     }
 
-    /// Returns operation-local `(output, input)` alias candidates for read-write parameters. The execution backend
-    /// must honor its ordinary donation and liveness rules before reusing storage; these are not external state slots.
+    /// Returns `(output, input)` alias candidates for read-write parameters, which are local to this operation. The
+    /// execution backend must honor its ordinary donation and liveness rules before reusing storage, because these are
+    /// not external state slots.
     pub fn aliases(&self) -> Vec<(usize, usize)> {
         let mut aliases = Vec::new();
         let mut input = 0;
@@ -459,7 +537,8 @@ impl KernelCallOperation {
         aliases
     }
 
-    /// Derives the body access declaration from the parameter metadata without storing a second access table.
+    /// Derives the body access declaration (i.e., the [`KernelBoundaryContract`]) from the parameter metadata without
+    /// storing a second access table.
     pub fn boundary_contract(&self) -> KernelBoundaryContract {
         KernelBoundaryContract::new(
             self.parameters
@@ -472,13 +551,23 @@ impl KernelCallOperation {
     }
 
     /// Specializes bounded grid extents while retaining the original coordinate identities and body signature.
-    /// Mapping programs and their bounds remain unchanged; the concrete grid becomes part of semantic identity.
+    /// Mapping programs and their bounds remain unchanged, and the concrete grid becomes part of semantic identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Grid`] when [`Grid::specialize`] rejects `extents`.
     pub fn specialize_grid(&self, extents: &[usize]) -> Result<Self, KernelError> {
         Ok(Self { grid: self.grid.specialize(extents)?, ..self.clone() })
     }
 
-    /// Specializes scalar-prefetched values into every mapping, checking each mapping's dimension bounds. Body
-    /// constants must be bound as well; use [`KernelDefinition::specialize_prefetch`] for an attached definition.
+    /// Specializes scalar prefetched values into every mapping, checking the dimension bounds of each mapping. Body
+    /// constants must be bound as well, so use [`KernelDefinition::specialize_prefetch`] for an attached definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Type`] when the number or types of `values` differ from [`Self::prefetch_types`],
+    /// [`KernelError::Program`] when a value does not convert to a dimension within the bounds of its mapping input,
+    /// and [`KernelError::Mapping`] when [`BlockMapping::specialize`] rejects the converted dimensions.
     pub fn specialize_prefetch(&self, values: &[Array]) -> Result<Self, KernelError> {
         if values.len() != self.prefetch_types.len() {
             return Err(TypeError::invalid(format!(
@@ -519,10 +608,12 @@ impl KernelCallOperation {
         Ok(Self { parameters, prefetch_types: vec![], ..self.clone() })
     }
 
-    /// Validates the exact attached body and applies the same region access policy used by ordinary program analysis.
-    /// Direct definitions and eager invocation must not bypass that policy merely because their outer call has not
-    /// been inserted into another program yet. A `shard_map` anywhere in the body's attached-region closure is
-    /// rejected first, with [`KernelError::UnsupportedOperation`].
+    /// Validates the exact attached body against the type signature and boundary contract of this call. A `shard_map`
+    /// anywhere in the attached region closure of the body is rejected first, with
+    /// [`KernelError::UnsupportedOperation`]. The region access policy of this call, which ordinary program analysis
+    /// applies to the body, admits every access that does not consume its parameter. The generic reference analysis
+    /// that [`validate_kernel_body`] runs already rejects every consumption of a body input, so direct definitions and
+    /// eager invocation enforce the same policy without checking it again.
     pub(crate) fn validate_body<Extension>(
         &self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
@@ -539,17 +630,7 @@ impl KernelCallOperation {
             return Err(KernelError::UnsupportedOperation { operation, instruction });
         }
         self.infer_output_types(&self.input_types(), std::slice::from_ref(region.interface()))?;
-        let references = validate_kernel_body(region, &self.boundary_contract())?;
-        for (parameter, summary) in references.parameters().iter().enumerate() {
-            if let Some(summary) = summary {
-                for &mode in summary.modes() {
-                    if !self.allows_reference_access_through_region_input(0, mode) {
-                        return Err(KernelError::DisallowedGridAccess { parameter, mode });
-                    }
-                }
-            }
-        }
-        Ok(references)
+        Ok(validate_kernel_body(region, &self.boundary_contract())?)
     }
 
     /// Collects nominal identity occurrences in metadata order so rendering preserves relationships between grid
@@ -602,21 +683,24 @@ impl Operation for KernelCallOperation {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         if region_interfaces.len() != 1 {
-            return Err(TypeError::invalid("`kernel_call` requires exactly one body region"));
+            return Err(TypeError::invalid(format!("`{KERNEL_CALL_OPERATION_NAME}` requires exactly one body region")));
         }
         if input_types != self.input_types() {
-            return Err(TypeError::invalid("`kernel_call` input types do not match its logical signature"));
+            return Err(TypeError::invalid(format!(
+                "`{KERNEL_CALL_OPERATION_NAME}` input types do not match its logical signature",
+            )));
         }
         let expected = self.body_input_types();
         if region_interfaces[0].input_types() != expected {
-            return Err(TypeError::invalid(
-                "`kernel_call` body input types do not match its logical block references and coordinates",
-            ));
+            return Err(TypeError::invalid(format!(
+                "`{KERNEL_CALL_OPERATION_NAME}` body input types do not match its logical block references and \
+                 coordinates",
+            )));
         }
         if !region_interfaces[0].output_types().is_empty() {
-            return Err(TypeError::invalid(
-                "`kernel_call` body must publish results through its declared output references",
-            ));
+            return Err(TypeError::invalid(format!(
+                "`{KERNEL_CALL_OPERATION_NAME}` body must publish results through its declared output references",
+            )));
         }
         Ok(self.output_types())
     }
@@ -634,10 +718,12 @@ impl Operation for KernelCallOperation {
     }
 
     fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
-        region_index == 0
-            && !mode.is_consuming()
-            && (mode != ReferenceAccessMode::Accumulate
-                || self.grid.dimensions().iter().all(|dimension| dimension.execution() == GridExecution::Sequential))
+        // Non-atomic accumulation is admitted on every grid, including grids with parallel axes. This is sound because
+        // the launch window qualification of `validate_kernel_initialization` counts an accumulated parameter as
+        // mutated and, unless every access of that parameter is atomic, rejects mutable windows of grid points that the
+        // grid does not order and that overlap with `KernelInitializationError::OverlappingWindows`. So two grid points
+        // that may run concurrently never accumulate into the same element.
+        region_index == 0 && !mode.is_consuming()
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -720,11 +806,39 @@ impl Operation for KernelCallOperation {
     }
 }
 
+impl ReferenceAccessOperation for KernelCallOperation {
+    type Transform = ArrayReferenceTransform;
+
+    fn base_input_count(&self) -> usize {
+        self.input_types().len()
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        // The call takes ordinary arrays at its outer boundary, so it accesses no reference of the enclosing program.
+        None
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        _transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::MalformedProgram(format!(
+            "operation `{}` does not support the requested transforms at input {input_index}",
+            self.name(),
+        )))
+    }
+}
+
 /// Immutable body and its validated logical call boundary. Rewrites produce a new [`FlatProgram`] and must construct
 /// a new definition so reference validation cannot remain attached to changed semantics.
 ///
-/// This boundary validation does not yet grant execution: initialization, output coverage, and parallel races are
-/// checked by the kernel execution verifier. The body remains an ordinary Ryft program, with no adapter dependencies.
+/// This boundary validation does not yet grant execution, because initialization, output coverage, and parallel races
+/// are checked by the kernel execution verifier (i.e., [`VerifiedKernel`](crate::compilation::VerifiedKernel)). The
+/// body remains an ordinary Ryft program, with no adapter dependencies.
 #[derive(Clone, Debug)]
 pub struct KernelDefinition<Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
     /// Full logical call metadata.
@@ -742,8 +856,14 @@ where
     Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
 {
     /// Validates the actual body and its call interface before retaining either. Reference constants, reference
-    /// outputs, undeclared accesses, incompatible block types, and `shard_map` instructions anywhere in the body's
-    /// attached-region closure fail before a definition becomes observable.
+    /// outputs, undeclared accesses, incompatible block types, and `shard_map` instructions anywhere in the attached
+    /// region closure of the body fail before a definition becomes observable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::UnsupportedOperation`] for a `shard_map` in the body, [`KernelError::Type`] when the body
+    /// interface does not match the call signature, and [`KernelError::Validation`] when [`validate_kernel_body`]
+    /// rejects the reference accesses of the body.
     pub fn new(
         operation: KernelCallOperation,
         body: FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
@@ -753,36 +873,37 @@ where
     }
 
     /// Traces a body through ordinary Ryft staging and validates the finalized program. The closure receives a
-    /// tuple of reference tracers in parameter order and dimension tracers in grid-axis order. Stores publish the
-    /// declared outputs. The closure runs once during staging; runtime branches and loops use canonical staged
-    /// control-flow capabilities. The canonical tuple parameter machinery flattens the finished body signature.
+    /// tuple of reference tracers in parameter order and dimension tracers in grid axis order. Stores publish the
+    /// declared outputs. The closure runs once during staging, and runtime branches and loops use canonical staged
+    /// control flow capabilities. The canonical tuple parameter machinery flattens the finished body signature.
     ///
     /// Foreign tracers, escaped builders, discarded captures, and poisoned operations retain the existing tracing
     /// diagnostics. No partially constructed definition is returned after either tracing or validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Program`] when tracing or `function` fails, and the errors of [`Self::new`] when the
+    /// traced body fails validation.
     pub fn trace<F>(operation: KernelCallOperation, function: F) -> Result<Self, KernelError>
     where
-        F: FnOnce(
-            (
-                Vec<Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>,
-                Vec<Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>,
-            ),
-        ) -> Result<(), ProgramError>,
+        F: FnOnce((Vec<KernelTracer<Extension>>, Vec<KernelTracer<Extension>>)) -> Result<(), ProgramError>,
     {
         Self::trace_with_prefetch(operation, |(references, coordinates, _prefetched)| {
             function((references, coordinates))
         })
     }
 
-    /// Traces references, grid coordinates, and scalar-prefetched arrays as three canonical parameter groups.
+    /// Traces references, grid coordinates, and scalar prefetched arrays as three canonical parameter groups.
     /// Prefetched values remain private arrays in the body until explicit specialization binds their constants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Program`] when tracing or `function` fails, and the errors of [`Self::new`] when the
+    /// traced body fails validation.
     pub fn trace_with_prefetch<F>(operation: KernelCallOperation, function: F) -> Result<Self, KernelError>
     where
         F: FnOnce(
-            (
-                Vec<Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>,
-                Vec<Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>,
-                Vec<Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>,
-            ),
+            (Vec<KernelTracer<Extension>>, Vec<KernelTracer<Extension>>, Vec<KernelTracer<Extension>>),
         ) -> Result<(), ProgramError>,
     {
         let input_types = (
@@ -793,7 +914,7 @@ where
         let (_, body) = TracingContext::<ArrayIrValue<Array>, KernelOperation<Extension>>::trace(
             |inputs| {
                 function(inputs)?;
-                Ok(Vec::<Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>::new())
+                Ok(Vec::<KernelTracer<Extension>>::new())
             },
             input_types,
         )?;
@@ -803,14 +924,23 @@ where
     /// Specializes a bounded grid without retracing the body. Existing coordinate identities and reference types
     /// remain valid, and the resulting definition is checked against its specialized call. Execution still verifies
     /// initialization and complete output coverage for the selected extents before allocating memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`KernelCallOperation::specialize_grid`] and of [`Self::new`].
     pub fn specialize_grid(&self, extents: &[usize]) -> Result<Self, KernelError> {
         Self::new(self.operation.specialize_grid(extents)?, self.body.clone())
     }
 
-    /// Binds scalar-prefetched arrays to canonical mapping and body constants without executing body effects. The
-    /// ordinary program splicer preserves nested regions and validates type identities; the resulting definition
-    /// retains the array-only functional boundary with these specialized inputs removed. Exact constant values
+    /// Binds scalar prefetched arrays to canonical mapping and body constants without executing body effects. The
+    /// ordinary program splicer preserves nested regions and validates type identities, and the resulting definition
+    /// retains the functional boundary of arrays with these specialized inputs removed. Exact constant values
     /// participate in [`Self::semantic_key`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`KernelCallOperation::specialize_prefetch`], [`KernelError::Program`] when splicing the
+    /// body fails, and the errors of [`Self::new`].
     pub fn specialize_prefetch(&self, values: &[Array]) -> Result<Self, KernelError> {
         let operation = self.operation.specialize_prefetch(values)?;
         let remaining = self.body.input_types().len() - values.len();
@@ -830,7 +960,11 @@ where
 
     /// Removes dead work with the existing program simplifier and validates the resulting body boundary again.
     /// Observable effects and their relative order survive, including reference writes whose results are unused.
-    /// This returns a new definition; any previous executable verification applies only to the original definition.
+    /// This returns a new definition, and any previous executable verification applies only to the original definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Program`] when simplification fails, and the errors of [`Self::new`].
     pub fn simplified(&self) -> Result<Self, KernelError> {
         Self::new(self.operation.clone(), self.body.clone().into_simplified()?)
     }
@@ -852,468 +986,71 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         &self.references
     }
 
-    /// Returns a versioned structural key for the closed portable kernel family. Nominal dimension names and
-    /// allocation addresses are replaced by occurrence-ordered identities; bounds and repeated identity relationships
-    /// remain significant. Region boundaries and graph edges are framed independently of diagnostic program rendering.
-    /// Typed literal arrays retain exact logical bytes in both atom and operation payloads, including mapping programs;
-    /// floating metadata retains its IEEE bits. Instruction provenance, adapter options, schedules, and invocation
-    /// values do not belong to this key.
+    /// Returns a versioned structural key of this definition, which identifies its semantics for caching.
     ///
-    /// This is a cache-identity encoding, not a round-trip executable serialization format. The closed payload schema
-    /// uses its audited structural fields, with explicit encodings for lossy value formats. Arbitrary extensions and
-    /// unsupported opaque descriptors return an error instead of inheriting identity from diagnostic formatting. A
-    /// registered extension provides its exact versioned payload through [`KernelExtension::semantic_key`].
+    /// The key is derived from the same wire records as [`KernelDefinition::to_source`], encoded in the key mode of
+    /// the serializer and written as compact JSON (refer to [`serialization`](crate::serialization) for the format).
+    /// Key mode projects out what is not semantic. Nominal dimension names are dropped, and identities are numbered
+    /// in order of occurrence, while bounds and repeated identity relationships remain significant. Grid axis names
+    /// and instruction provenance are excluded. Typed literal arrays retain their exact logical bytes in both atom and
+    /// operation payloads, including mapping programs, and floating-point metadata retains its IEEE bits. Adapter
+    /// options, schedules, and invocation values do not belong to this key.
+    ///
+    /// This is an encoding of cache identity, not a round trip executable serialization format, and it covers every
+    /// valid definition rather than only the transport subset. Features that [`KernelDefinition::to_source`] rejects
+    /// are encoded through key-only records. Nested kernel calls, custom calls, and attached composites are encoded
+    /// structurally, and a registered extension provides its exact versioned payload through
+    /// [`KernelExtension::semantic_key`]. Operations without a wire record and distributed type metadata are
+    /// transitionally encoded by their diagnostic renderings after canonical identity renaming. Definitions whose
+    /// identity is local to the process return an error instead of inheriting it from diagnostic formatting.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when the body contains a reference constant, an extension without an exact semantic
+    /// identity, or an operation whose identity is local to the process (e.g., `rematerialize` operations and
+    /// `composite` calls with retained rules that are not named composites).
     pub fn semantic_key(&self) -> Result<String, TypeError>
     where
         Extension: KernelExtension,
     {
-        let mut identities = self.operation.identity_occurrences();
-        for region in self.body.regions().iter() {
-            for instruction in region.instructions() {
-                if let KernelOperation::Call(operation) = instruction.operation() {
-                    identities.extend(operation.identity_occurrences());
-                }
-            }
-        }
-        for region in self.body.regions() {
-            for atom in region.atoms() {
-                identities.extend(atom.r#type().identities().map(|(_, identity)| identity.clone()));
-            }
-        }
-        let mut renaming = TypeIdentityRenaming::new();
-        for identity in identities {
-            if !renaming.replacements().iter().any(|(source, _)| source == &identity) {
-                let target =
-                    DimensionVariable::new(format!("dimension_{}", renaming.replacements().len()), identity.bounds());
-                renaming.insert(identity, target)?;
-            }
-        }
-        let operation = self.operation.rename_type_identities(&renaming)?;
-        let body = self.body.rename_type_identities(&renaming).map_err(TypeError::custom)?;
-        let bounds = renaming.replacements().iter().map(|(_, target)| target.bounds()).collect::<Vec<_>>();
-        let mut key = format!("kernel key 2; schema {KERNEL_SCHEMA_VERSION}\n");
-        Self::semantic_field(&mut key, &format!("{bounds:?}"));
-        Self::call_semantic_fields(&mut key, &operation)?;
-        Self::semantic_field(&mut key, &format!("body entry {}", body.entry().index()));
-        for region in body.regions().iter() {
-            Self::region_semantic_fields(&mut key, region.atoms(), region.input_ids(), region.output_ids())?;
-            for instruction in region.instructions() {
-                Self::semantic_field(
-                    &mut key,
-                    &format!("{:?}", (instruction.inputs(), instruction.outputs(), instruction.regions())),
-                );
-                match instruction.operation() {
-                    KernelOperation::Portable(operation) => Self::portable_semantic_fields(&mut key, operation)?,
-                    KernelOperation::Call(operation) => Self::call_semantic_fields(&mut key, operation)?,
-                    KernelOperation::Scratch(operation) => {
-                        Self::semantic_field(&mut key, &format!("Scratch({operation:?})"))
-                    }
-                    KernelOperation::TileLoad(operation) => {
-                        Self::semantic_field(&mut key, &format!("TileLoad({operation:?})"))
-                    }
-                    KernelOperation::AsyncCopy(operation) => {
-                        Self::semantic_field(&mut key, &format!("AsyncCopy({operation:?})"))
-                    }
-                    KernelOperation::Wait(operation) => Self::semantic_field(&mut key, &format!("Wait({operation:?})")),
-                    KernelOperation::MaskedLoad(operation) => {
-                        Self::semantic_field(&mut key, &format!("MaskedLoad({operation:?})"))
-                    }
-                    KernelOperation::MaskedStore(operation) => {
-                        Self::semantic_field(&mut key, &format!("MaskedStore({operation:?})"))
-                    }
-                    KernelOperation::MaskedSwap(operation) => {
-                        Self::semantic_field(&mut key, &format!("MaskedSwap({operation:?})"))
-                    }
-                    KernelOperation::Extension(operation) => {
-                        let payload = operation.semantic_key()?;
-                        let mut encoded = String::with_capacity(payload.len().saturating_mul(2));
-                        for byte in payload {
-                            write!(encoded, "{byte:02x}").unwrap();
-                        }
-                        Self::semantic_field(&mut key, "extension");
-                        Self::semantic_field(&mut key, &encoded);
-                    }
-                }
-            }
-            Self::semantic_field(&mut key, "end region");
-        }
-        Ok(key)
-    }
-
-    /// Appends a byte-length-framed UTF-8 field so punctuation and adjacent payloads cannot alias one another.
-    fn semantic_field(key: &mut String, value: &str) {
-        write!(key, "{}:{value}", value.len()).unwrap();
-    }
-
-    /// Encodes the typed atom table and public edges of one region, excluding diagnostic provenance.
-    fn region_semantic_fields(
-        key: &mut String,
-        atoms: &[Atom<ArrayIrValue<Array>>],
-        inputs: &[ryft_core::programs::AtomId],
-        outputs: &[ryft_core::programs::AtomId],
-    ) -> Result<(), TypeError> {
-        Self::semantic_field(key, &format!("region {:?}", (inputs, outputs)));
-        for atom in atoms {
-            Self::semantic_field(key, &format!("type {:?}", atom.r#type()));
-            match atom {
-                Atom::Variable(_) => Self::semantic_field(key, "variable"),
-                Atom::Constant(ArrayIrValue::Array(value)) => {
-                    Self::semantic_field(key, &format!("array bytes {:02x?}", value.logical_bytes()));
-                }
-                Atom::Constant(ArrayIrValue::Dimension(value)) => {
-                    Self::semantic_field(key, &format!("dimension {value:?}"));
-                }
-                Atom::Constant(ArrayIrValue::Reference(_)) => {
-                    return Err(TypeError::invalid("reference constants have no persistent kernel semantic identity"));
-                }
-            }
-        }
-        Self::semantic_field(key, "end atoms");
-        Ok(())
-    }
-
-    /// Encodes a call boundary and every mapping program through canonical typed fields and actual region graphs.
-    fn call_semantic_fields(key: &mut String, operation: &KernelCallOperation) -> Result<(), TypeError> {
-        Self::semantic_field(key, &format!("call {:?}", (operation.grid(), operation.prefetch_types())));
-        for parameter in operation.parameters() {
-            let mapping = parameter.mapping();
-            Self::semantic_field(
-                key,
-                &format!(
-                    "parameter {:?}",
-                    (
-                        parameter.r#type(),
-                        parameter.access(),
-                        parameter.body_type(),
-                        mapping.block_shape(),
-                        mapping.boundary_policy(),
-                    )
-                ),
-            );
-            Self::semantic_field(key, &format!("mapping entry {}", mapping.program().entry().index()));
-            for region in mapping.program().regions().iter() {
-                Self::region_semantic_fields(key, region.atoms(), region.input_ids(), region.output_ids())?;
-                for instruction in region.instructions() {
-                    Self::semantic_field(
-                        key,
-                        &format!("{:?}", (instruction.inputs(), instruction.outputs(), instruction.regions())),
-                    );
-                    Self::portable_semantic_fields(key, instruction.operation())?;
-                }
-                Self::semantic_field(key, "end region");
-            }
-            Self::semantic_field(key, "end mapping");
-        }
-        Self::semantic_field(key, "end call");
-        Ok(())
-    }
-
-    /// Encodes exact custom-call attribute kinds and bits rather than their untyped display forms.
-    fn custom_call_semantic_fields(key: &mut String, operation: &CustomCallOperation) {
-        Self::semantic_field(key, operation.target_name());
-        Self::custom_call_attribute_semantic_fields(key, operation.attributes());
-    }
-
-    /// Encodes named custom-call attributes, recursing into nested dictionaries, with floating-point values encoded
-    /// by their IEEE bits.
-    fn custom_call_attribute_semantic_fields(key: &mut String, attributes: &[(String, CustomCallAttribute)]) {
-        for (name, value) in attributes {
-            Self::semantic_field(key, name);
-            match value {
-                CustomCallAttribute::String(value) => {
-                    Self::semantic_field(key, "string");
-                    Self::semantic_field(key, value);
-                }
-                CustomCallAttribute::Bytes(value) => Self::semantic_field(key, &format!("bytes {value:02x?}")),
-                CustomCallAttribute::Boolean(value) => Self::semantic_field(key, &format!("boolean {value}")),
-                CustomCallAttribute::I8(value) => Self::semantic_field(key, &format!("i8 {value}")),
-                CustomCallAttribute::I16(value) => Self::semantic_field(key, &format!("i16 {value}")),
-                CustomCallAttribute::I32(value) => Self::semantic_field(key, &format!("i32 {value}")),
-                CustomCallAttribute::I64(value) => Self::semantic_field(key, &format!("i64 {value}")),
-                CustomCallAttribute::U8(value) => Self::semantic_field(key, &format!("u8 {value}")),
-                CustomCallAttribute::U16(value) => Self::semantic_field(key, &format!("u16 {value}")),
-                CustomCallAttribute::U32(value) => Self::semantic_field(key, &format!("u32 {value}")),
-                CustomCallAttribute::U64(value) => Self::semantic_field(key, &format!("u64 {value}")),
-                CustomCallAttribute::F32(value) => Self::semantic_field(key, &format!("f32 {:08x}", value.to_bits())),
-                CustomCallAttribute::F64(value) => Self::semantic_field(key, &format!("f64 {:016x}", value.to_bits())),
-                CustomCallAttribute::Array(array) => Self::semantic_field(
-                    key,
-                    &match array {
-                        CustomCallArrayAttribute::I8(values) => format!("i8 array {values:?}"),
-                        CustomCallArrayAttribute::I16(values) => format!("i16 array {values:?}"),
-                        CustomCallArrayAttribute::I32(values) => format!("i32 array {values:?}"),
-                        CustomCallArrayAttribute::I64(values) => format!("i64 array {values:?}"),
-                        CustomCallArrayAttribute::U8(values) => format!("u8 array {values:?}"),
-                        CustomCallArrayAttribute::U16(values) => format!("u16 array {values:?}"),
-                        CustomCallArrayAttribute::U32(values) => format!("u32 array {values:?}"),
-                        CustomCallArrayAttribute::U64(values) => format!("u64 array {values:?}"),
-                        CustomCallArrayAttribute::F32(values) => {
-                            format!("f32 array {:08x?}", values.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
-                        }
-                        CustomCallArrayAttribute::F64(values) => format!(
-                            "f64 array {:016x?}",
-                            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                        ),
-                    },
-                ),
-                CustomCallAttribute::Dictionary(attributes) => {
-                    Self::semantic_field(key, &format!("dictionary {}", attributes.len()));
-                    Self::custom_call_attribute_semantic_fields(key, attributes);
-                }
-            }
-        }
-    }
-
-    /// Returns the error that rejects the kernel semantic descriptor encoding of the composite operation named `name`
-    /// with retained rules, whose identity is local to the process.
-    fn retained_composite_encoding_error(name: &str) -> TypeError {
-        TypeError::invalid(format!(
-            "`{name}` operations with retained rules have no kernel semantic descriptor encoding, because the identity \
-             of their rules is local to the process",
-        ))
-    }
-
-    /// Returns the error that rejects the kernel semantic descriptor encoding of `rematerialize` operations, whose
-    /// residual policies have an identity that is local to the process.
-    fn rematerialize_encoding_error() -> TypeError {
-        TypeError::invalid(format!(
-            "`{REMATERIALIZE_OPERATION_NAME}` operations have no kernel semantic descriptor encoding, because the \
-             identity of their residual policies is local to the process",
-        ))
-    }
-
-    /// Encodes the semantic identity of a `composite` call with retained rules, which only a call of a named
-    /// definition has (refer to [`NamedComposite`](ryft_core::NamedComposite)), because its key identifies its rules
-    /// across processes. The key's [`Debug`](std::fmt::Debug) representation encodes floating-point attributes by
-    /// their IEEE bits, and its body is encoded with the other regions of the kernel. Calls of other definitions are
-    /// rejected, because the identity of their rules is local to the process, and calls with attached rules need no
-    /// fields beyond their regions.
-    fn composite_semantic_fields<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S>(
-        key: &mut String,
-        operation: &CompositeOperation<V, O, S>,
-    ) -> Result<(), TypeError>
-    where
-        S: CustomRuleSource<V, O>,
-    {
-        let Some(rules) = operation.rules() else {
-            return Ok(());
-        };
-        let Some(composite) = rules.key() else {
-            return Err(Self::retained_composite_encoding_error(COMPOSITE_OPERATION_NAME));
-        };
-        Self::semantic_field(key, &format!("named composite {composite:?}"));
-        Ok(())
-    }
-
-    /// Encodes the closed canonical portable payload family, with explicit eligibility for lossy/opaque forms.
-    fn portable_semantic_fields(key: &mut String, operation: &ArrayIrOperation<Array>) -> Result<(), TypeError> {
-        // Unlike the public Operation render contract, this closed structural representation includes typed variant
-        // tags and stored fields. Literal bytes and floating payloads below are explicit because Debug is lossy there.
-        // No adapter extension or user-supplied formatter can enter this branch.
-        Self::semantic_field(key, &format!("portable {operation:?}"));
-        match operation {
-            ArrayIrOperation::Array(operation) => match operation {
-                ArrayOperation::Constant(operation) => {
-                    Self::semantic_field(key, &format!("constant bytes {:02x?}", operation.value().logical_bytes()))
-                }
-                ArrayOperation::FillLike(operation) => {
-                    Self::semantic_field(key, &format!("fill bytes {:02x?}", operation.value().logical_bytes()))
-                }
-                ArrayOperation::Rematerialize(_) => return Err(Self::rematerialize_encoding_error()),
-                ArrayOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-                ArrayOperation::Dropout(operation) => {
-                    Self::semantic_field(key, &format!("dropout rate bits {:016x}", operation.rate().to_bits()))
-                }
-                ArrayOperation::Composite(operation) => Self::composite_semantic_fields(key, operation)?,
-                ArrayOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
-                    return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
-                }
-                ArrayOperation::CompositeTranspose(_) => {
-                    return Err(TypeError::invalid(format!(
-                        "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
-                         encoding",
-                    )));
-                }
-                ArrayOperation::Zero(_)
-                | ArrayOperation::ZeroLike(_)
-                | ArrayOperation::One(_)
-                | ArrayOperation::OneLike(_)
-                | ArrayOperation::Iota(_)
-                | ArrayOperation::IotaLike(_)
-                | ArrayOperation::Min(_)
-                | ArrayOperation::Max(_)
-                | ArrayOperation::Clamp(_)
-                | ArrayOperation::Neg(_)
-                | ArrayOperation::Add(_)
-                | ArrayOperation::Sub(_)
-                | ArrayOperation::SaturatingSub(_)
-                | ArrayOperation::Mul(_)
-                | ArrayOperation::Div(_)
-                | ArrayOperation::Abs(_)
-                | ArrayOperation::Sign(_)
-                | ArrayOperation::Rem(_)
-                | ArrayOperation::Pow(_)
-                | ArrayOperation::Sqrt(_)
-                | ArrayOperation::Rsqrt(_)
-                | ArrayOperation::Sin(_)
-                | ArrayOperation::Cos(_)
-                | ArrayOperation::Tan(_)
-                | ArrayOperation::Tanh(_)
-                | ArrayOperation::Atan2(_)
-                | ArrayOperation::Exp(_)
-                | ArrayOperation::ExpM1(_)
-                | ArrayOperation::Log(_)
-                | ArrayOperation::Logistic(_)
-                | ArrayOperation::Floor(_)
-                | ArrayOperation::Ceil(_)
-                | ArrayOperation::Round(_)
-                | ArrayOperation::Ln1p(_)
-                | ArrayOperation::LogAddExp(_)
-                | ArrayOperation::Erf(_)
-                | ArrayOperation::Not(_)
-                | ArrayOperation::And(_)
-                | ArrayOperation::Or(_)
-                | ArrayOperation::Xor(_)
-                | ArrayOperation::Complex(_)
-                | ArrayOperation::Conjugate(_)
-                | ArrayOperation::Real(_)
-                | ArrayOperation::Imaginary(_)
-                | ArrayOperation::Dot(_)
-                | ArrayOperation::RaggedDot(_)
-                | ArrayOperation::ScaledDot(_)
-                | ArrayOperation::Reduce(_)
-                | ArrayOperation::ArgMax(_)
-                | ArrayOperation::ArgMin(_)
-                | ArrayOperation::Cumulative(_)
-                | ArrayOperation::Sort(_)
-                | ArrayOperation::RngBitGenerator(_)
-                | ArrayOperation::ParallelReduce(_)
-                | ArrayOperation::ParallelVary(_)
-                | ArrayOperation::ParallelCast(_)
-                | ArrayOperation::ParallelAllGather(_)
-                | ArrayOperation::ParallelSumScatter(_)
-                | ArrayOperation::ParallelPermute(_)
-                | ArrayOperation::ParallelBroadcast(_)
-                | ArrayOperation::ParallelAllToAll(_)
-                | ArrayOperation::ParallelRaggedAllToAll(_)
-                | ArrayOperation::AxisIndex(_)
-                | ArrayOperation::Reverse(_)
-                | ArrayOperation::Transpose(_)
-                | ArrayOperation::Reshape(_)
-                | ArrayOperation::Broadcast(_)
-                | ArrayOperation::BroadcastLike(_)
-                | ArrayOperation::Pad(_)
-                | ArrayOperation::Concatenate(_)
-                | ArrayOperation::Gather(_)
-                | ArrayOperation::Scatter(_)
-                | ArrayOperation::Slice(_)
-                | ArrayOperation::UpdateSlice(_)
-                | ArrayOperation::DynamicSlice(_)
-                | ArrayOperation::DynamicUpdateSlice(_)
-                | ArrayOperation::Compare(_)
-                | ArrayOperation::Select(_)
-                | ArrayOperation::Condition(_)
-                | ArrayOperation::While(_)
-                | ArrayOperation::Scan(_)
-                | ArrayOperation::ConvertElementType(_)
-                | ArrayOperation::ReducePrecision(_)
-                | ArrayOperation::TransferToMemory(_)
-                | ArrayOperation::Reshard(_)
-                | ArrayOperation::ConstrainSharding(_)
-                | ArrayOperation::StopGradient(_)
-                | ArrayOperation::Tag(_)
-                | ArrayOperation::Assert(_)
-                | ArrayOperation::Guard(_)
-                | ArrayOperation::Cast(_)
-                | ArrayOperation::Print(_)
-                | ArrayOperation::LinearCall(_) => {}
-            },
-            ArrayIrOperation::Rematerialize(_) => return Err(Self::rematerialize_encoding_error()),
-            ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-            ArrayIrOperation::Composite(operation) => Self::composite_semantic_fields(key, operation)?,
-            ArrayIrOperation::LiftedComposite(operation) => Self::composite_semantic_fields(key, operation)?,
-            ArrayIrOperation::CompositeTranspose(operation) if operation.rules().is_some() => {
-                return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
-            }
-            ArrayIrOperation::LiftedCompositeTranspose(_) => {
-                return Err(Self::retained_composite_encoding_error(COMPOSITE_TRANSPOSE_OPERATION_NAME));
-            }
-            ArrayIrOperation::CompositeTranspose(_) => {
-                return Err(TypeError::invalid(format!(
-                    "`{COMPOSITE_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
-                     encoding",
-                )));
-            }
-            ArrayIrOperation::Zero(_)
-            | ArrayIrOperation::One(_)
-            | ArrayIrOperation::Iota(_)
-            | ArrayIrOperation::Dimension(_)
-            | ArrayIrOperation::Compare(_)
-            | ArrayIrOperation::DimensionSize(_)
-            | ArrayIrOperation::ReferenceNew(_)
-            | ArrayIrOperation::ReferenceRead(_)
-            | ArrayIrOperation::ReferenceWrite(_)
-            | ArrayIrOperation::ReferenceSwap(_)
-            | ArrayIrOperation::ReferenceAddUpdate(_)
-            | ArrayIrOperation::ReferenceAtomicAddUpdate(_)
-            | ArrayIrOperation::ReferenceFreeze(_)
-            | ArrayIrOperation::DimensionFromScalar(_)
-            | ArrayIrOperation::DimensionToScalar(_)
-            | ArrayIrOperation::Reshape(_)
-            | ArrayIrOperation::Broadcast(_)
-            | ArrayIrOperation::Concatenate(_)
-            | ArrayIrOperation::Pad(_)
-            | ArrayIrOperation::DynamicSlice(_)
-            | ArrayIrOperation::RngBitGenerator(_)
-            | ArrayIrOperation::ParallelAllGather(_)
-            | ArrayIrOperation::ParallelSumScatter(_)
-            | ArrayIrOperation::ParallelAllToAll(_)
-            | ArrayIrOperation::ParallelRaggedAllToAll(_)
-            | ArrayIrOperation::Condition(_)
-            | ArrayIrOperation::While(_)
-            | ArrayIrOperation::Scan(_)
-            | ArrayIrOperation::LinearCall(_)
-            | ArrayIrOperation::Assert(_)
-            | ArrayIrOperation::Guard(_)
-            | ArrayIrOperation::Cast(_) => {}
-            // Kernel definitions reject `shard_map` instructions (refer to `KernelError::UnsupportedOperation`), so no
-            // definition reaches this arm. The `Debug` rendering above would nevertheless encode every boundary field
-            // of the payload (i.e., its mesh, shardings, active manual axes, global boundary types, and forwarding).
-            ArrayIrOperation::ShardMap(_) => {}
-        }
-        Ok(())
+        encode_semantic_key(self)
     }
 }
 
+/// Tracer of a kernel body, which [`KernelDefinition::trace`] and [`KernelDefinition::trace_with_prefetch`] pass to
+/// their tracing closures.
+type KernelTracer<Extension> = Tracer<TracingContext<ArrayIrValue<Array>, KernelOperation<Extension>>>;
+
 #[cfg(test)]
 mod tests {
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, AttentionConfiguration,
-        AttentionInputs, AttentionKey, CompositeAttribute, CompositeJvpRule, CompositeKey, CompositeOperation,
-        CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
-        DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, NamedComposite, NothingSavable, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
-        ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceWrite,
-        ReferenceWriteOperation, RegionId, RematerializeOperation, ResidualPolicyReference, Shape, ShardMapBoundary,
-        ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
+        ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute, CompositeJvpRule, CompositeKey,
+        CompositeOperation, CompositeTransposeOperation, ConditionOperation, ConstantOperation, Context,
+        CustomCallAttribute, CustomCallOperation, CustomRuleDefinition, CustomRuleRegistration, DataType,
+        DimensionError, DimensionMulOperation, DimensionValue, EffectClass, EffectClasses, Layout, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, NamedComposite, NothingSavable, PrintOperation, Provenance, ProvenanceScope,
+        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId,
+        RematerializeOperation, ResidualPolicyReference, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
+        TiledLayout, ZeroOperation,
     };
 
-    use crate::authoring::whole_array_parameter;
+    use crate::authoring::{MappingExpression, ParameterWindow, mapped_call, whole_array_parameter};
     use crate::grids::{GridDimension, GridExecution};
-    use crate::mappings::BoundaryPolicy;
+    use crate::memory::{MaskedStoreOperation, WindowMaskOperation};
     use crate::operations::tests::TestExtension;
 
     use super::*;
 
-    /// Constant rank-zero mapping used by the scalar call boundary tests.
+    /// Constant rank-0 mapping used by the scalar call boundary tests.
     fn scalar_mapping() -> BlockMapping {
         let program: FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>> =
             ProgramBuilder::new().build(vec![], vec![], vec![]).unwrap();
         BlockMapping::new(program, vec![], BoundaryPolicy::InBounds).unwrap()
     }
 
-    /// Scalar parameter with a singleton whole-value block.
+    /// Scalar parameter with a singleton block that covers the whole value.
     fn parameter(access: KernelParameterAccess) -> KernelParameter {
         KernelParameter::new(ArrayType::scalar(DataType::I32), access, scalar_mapping()).unwrap()
     }
@@ -1333,7 +1070,7 @@ mod tests {
         KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
     }
 
-    /// Empty scalar body with independently named mapping and grid identities for semantic-key tests.
+    /// Empty scalar body with independently named mapping and grid identities for semantic key tests.
     fn dynamic_definition(name: &str, upper: usize, shared: bool) -> KernelDefinition {
         let variable = DimensionVariable::new(name, DimensionBounds::non_negative(Some(upper)).unwrap());
         let second = if shared { variable.clone() } else { DimensionVariable::new(name, variable.bounds()) };
@@ -1365,7 +1102,7 @@ mod tests {
         KernelDefinition::new(operation, body.build(vec![], vec![Placeholder; 3], vec![]).unwrap()).unwrap()
     }
 
-    /// Reads an offset-prefetched array window and publishes the prefetched scalar through a singleton output.
+    /// Reads an array window at a prefetched offset and publishes the prefetched scalar through a singleton output.
     fn prefetch_definition() -> KernelDefinition {
         let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(1)).unwrap());
         let offset = DimensionType::new("offset", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -1431,17 +1168,56 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_error_display() {
+        // Wrapped errors render exactly as the errors that they wrap.
+        let program = ProgramError::MalformedProgram("malformed body".to_owned());
+        assert_eq!(KernelError::Program(program.clone()).to_string(), program.to_string());
+        let r#type = TypeError::invalid("invalid body type");
+        assert_eq!(KernelError::Type(r#type.clone()).to_string(), r#type.to_string());
+        let grid = GridError::EmptyName;
+        assert_eq!(KernelError::Grid(grid.clone()).to_string(), grid.to_string());
+        let mapping = BlockMappingError::UnsupportedOperation { operation: "reference_read" };
+        assert_eq!(KernelError::Mapping(mapping.clone()).to_string(), mapping.to_string());
+        let validation = KernelValidationError::UndeclaredReferenceParameter { input_index: 0 };
+        assert_eq!(KernelError::Validation(validation.clone()).to_string(), validation.to_string());
+
+        let instruction = InstructionId::new(RegionId::new(0), 1);
+        assert_eq!(
+            KernelError::UnsupportedOperation { operation: "shard_map", instruction }.to_string(),
+            "kernel body instruction ^0[1] applies `shard_map`, which kernel bodies do not support",
+        );
+        assert_eq!(
+            KernelError::ParameterRank { array_rank: 1, block_rank: 0 }.to_string(),
+            "kernel parameter has array rank 1 but block rank 0",
+        );
+        assert_eq!(
+            KernelError::MappingInputCount { parameter: 0, expected: 1, actual: 0 }.to_string(),
+            "kernel parameter 0 mapping takes 0 inputs but the call requires 1",
+        );
+        assert_eq!(
+            KernelError::MappingInputIdentity { parameter: 0, first_axis: 0, second_axis: 1 }.to_string(),
+            "kernel parameter 0 mapping axes 0 and 1 share a dimension identity but may differ",
+        );
+        let expected = DimensionBounds::non_negative(Some(2)).unwrap();
+        let actual = DimensionBounds::non_negative(Some(1)).unwrap();
+        assert_eq!(
+            KernelError::MappingInputBounds { parameter: 0, axis: 1, expected, actual }.to_string(),
+            "kernel parameter 0 mapping axis 1 admits [0, 1), but the grid requires [0, 2)",
+        );
+    }
+
+    #[test]
     fn test_kernel_parameter_new() {
         let parameter = parameter(KernelParameterAccess::ReadOnly);
         assert_eq!(parameter.r#type().as_ref(), &ArrayType::scalar(DataType::I32));
-        assert!(matches!(
-            KernelParameter::new(
-                ArrayType::new_static(DataType::I32, [2]),
-                KernelParameterAccess::ReadOnly,
-                scalar_mapping()
-            ),
-            Err(KernelError::ParameterRank { array_rank: 1, block_rank: 0 }),
-        ));
+        let error = KernelParameter::new(
+            ArrayType::new_static(DataType::I32, [2]),
+            KernelParameterAccess::ReadOnly,
+            scalar_mapping(),
+        )
+        .unwrap_err();
+        assert_eq!(error, KernelError::ParameterRank { array_rank: 1, block_rank: 0 });
+        assert_eq!(error.to_string(), "kernel parameter has array rank 1 but block rank 0");
     }
 
     #[test]
@@ -1530,7 +1306,7 @@ mod tests {
             error,
             KernelError::Type(
                 DimensionError::InputDimensionMismatch { dimension: "extent".to_owned(), expected: 2, actual: 3 }
-                    .into()
+                    .into(),
             ),
         );
         let error = KernelParameter::from_refined_types(
@@ -1546,7 +1322,7 @@ mod tests {
                     value: 5,
                     bounds: DimensionBounds::non_negative(Some(5)).unwrap(),
                 }
-                .into()
+                .into(),
             ),
         );
         let mut distinct = refinement_parameters();
@@ -1593,7 +1369,7 @@ mod tests {
     fn test_kernel_parameter_body_type() {
         assert_eq!(
             parameter(KernelParameterAccess::ReadOnly).body_type(),
-            ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)),)
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32))),
         );
     }
 
@@ -1622,7 +1398,7 @@ mod tests {
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
         assert_eq!(
             partial.body_type(),
-            ArrayIrType::Reference(ReferenceType::new(transform.output_type(&full_type).unwrap()))
+            ArrayIrType::Reference(ReferenceType::new(transform.output_type(&full_type).unwrap())),
         );
     }
 
@@ -1634,63 +1410,33 @@ mod tests {
     #[test]
     fn test_kernel_call_operation_new() {
         let operation = copy_definition().operation().clone();
-        assert_eq!(operation.name(), "kernel_call");
-        assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
-        assert_eq!(operation.region_capture_input_count(0), Some(0));
+        assert_eq!(
+            operation.to_string(),
+            indoc! {"
+                kernel_call [
+                    grid=[],
+                    parameter_0=read-only i32[] [] InBounds,
+                    mapping_0={
+                        lambda  .
+                        in ()
+                    },
+                    parameter_1=write-only i32[] [] InBounds,
+                    mapping_1={
+                        lambda  .
+                        in ()
+                    },
+                ]"},
+        );
         let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
-        assert!(matches!(
-            KernelCallOperation::new(grid, vec![parameter(KernelParameterAccess::ReadOnly)]),
-            Err(KernelError::MappingInputCount { parameter: 0, expected: 1, actual: 0 }),
-        ));
-    }
-
-    #[test]
-    fn test_kernel_call_operation_input_region_provenance() {
-        let definition = dynamic_definition("extent", 4, true);
-        let operation = definition.operation();
-        // The reference and both generated coordinates share the same local provenance category.
-        assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Local);
-        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Local);
-        assert_eq!(operation.input_region_provenance(0, 2), InputRegionProvenance::Local);
-        assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::None);
-        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::None);
-    }
-
-    #[test]
-    fn test_kernel_call_operation_allows_reference_access_through_region_input() {
-        let parallel = KernelCallOperation::new(
-            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
-            vec![],
-        )
-        .unwrap();
-        let sequential = KernelCallOperation::new(
-            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Sequential)]).unwrap(),
-            vec![],
-        )
-        .unwrap();
-        for mode in [
-            ReferenceAccessMode::Read,
-            ReferenceAccessMode::Write,
-            ReferenceAccessMode::ReadWrite,
-            ReferenceAccessMode::AtomicAccumulate,
-        ] {
-            assert!(parallel.allows_reference_access_through_region_input(0, mode));
-            assert!(sequential.allows_reference_access_through_region_input(0, mode));
-            assert!(!parallel.allows_reference_access_through_region_input(1, mode));
-        }
-        assert!(!parallel.allows_reference_access_through_region_input(0, ReferenceAccessMode::Accumulate));
-        assert!(sequential.allows_reference_access_through_region_input(0, ReferenceAccessMode::Accumulate));
-        assert!(!sequential.allows_reference_access_through_region_input(0, ReferenceAccessMode::Consume));
+        let error = KernelCallOperation::new(grid, vec![parameter(KernelParameterAccess::ReadOnly)]).unwrap_err();
+        assert_eq!(error, KernelError::MappingInputCount { parameter: 0, expected: 1, actual: 0 });
+        assert_eq!(error.to_string(), "kernel parameter 0 mapping takes 0 inputs but the call requires 1");
     }
 
     #[test]
     fn test_kernel_call_operation_new_coordinate_bounds() {
-        for (extent, bounds, accepted) in [
-            (2, DimensionBounds::non_negative(Some(2)).unwrap(), true),
-            (2, DimensionBounds::non_negative(Some(1)).unwrap(), false),
-            (2, DimensionBounds::positive(Some(3)).unwrap(), false),
-            (0, DimensionBounds::positive(Some(3)).unwrap(), true),
-        ] {
+        // Builds a call over a grid of one axis with `extent` points whose mapping coordinate admits `bounds`.
+        let call = |extent: usize, bounds: DimensionBounds| {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             builder.add_input(ArrayIrType::Dimension(DimensionType::new("coordinate", bounds)));
             let mapping = BlockMapping::new(
@@ -1700,29 +1446,41 @@ mod tests {
             )
             .unwrap();
             let grid = Grid::new(vec![GridDimension::new(Dimension::Static(extent), GridExecution::Parallel)]).unwrap();
-            let result = KernelCallOperation::new(
+            KernelCallOperation::new(
                 grid,
                 vec![
                     KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadOnly, mapping)
                         .unwrap(),
                 ],
-            );
-            if accepted {
-                assert!(result.is_ok());
-            } else {
-                let Err(KernelError::MappingInputBounds { parameter, axis, expected, actual }) = result else {
-                    panic!("expected rejected coordinate bounds");
-                };
-                assert_eq!((parameter, axis), (0, 0));
-                assert_eq!(expected, DimensionBounds::non_negative(Some(extent)).unwrap());
-                assert_eq!(actual, bounds);
-            }
-        }
+            )
+        };
+
+        // Coordinate bounds that admit the whole grid are accepted, and an empty grid binds no coordinate at all.
+        let grid_bounds = DimensionBounds::non_negative(Some(2)).unwrap();
+        assert_eq!(call(2, grid_bounds).map(|operation| operation.coordinate_types()[0].bounds()), Ok(grid_bounds));
+        assert_eq!(
+            call(0, DimensionBounds::positive(Some(3)).unwrap())
+                .map(|operation| operation.coordinate_types()[0].bounds()),
+            Ok(DimensionBounds::non_negative(Some(1)).unwrap()),
+        );
+
+        // Coordinate bounds that exclude a grid point are rejected.
+        let narrow_bounds = DimensionBounds::non_negative(Some(1)).unwrap();
+        assert_eq!(
+            call(2, narrow_bounds).unwrap_err(),
+            KernelError::MappingInputBounds { parameter: 0, axis: 0, expected: grid_bounds, actual: narrow_bounds },
+        );
+        let positive_bounds = DimensionBounds::positive(Some(3)).unwrap();
+        assert_eq!(
+            call(2, positive_bounds).unwrap_err(),
+            KernelError::MappingInputBounds { parameter: 0, axis: 0, expected: grid_bounds, actual: positive_bounds },
+        );
     }
 
     #[test]
     fn test_kernel_call_operation_new_rejects_coordinate_identity_aliasing() {
-        for (extents, accepted) in [([2, 2], false), ([1, 2], false), ([1, 1], true), ([0, 2], true)] {
+        // Builds a call over a grid with the given `extents` whose mapping uses one identity for both coordinates.
+        let call = |extents: [usize; 2]| {
             let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             builder.add_input(ArrayIrType::Dimension(coordinate.clone()));
@@ -1733,7 +1491,7 @@ mod tests {
                 BoundaryPolicy::InBounds,
             )
             .unwrap();
-            let result = KernelCallOperation::new(
+            KernelCallOperation::new(
                 Grid::new(
                     extents
                         .into_iter()
@@ -1745,21 +1503,31 @@ mod tests {
                     KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadOnly, mapping)
                         .unwrap(),
                 ],
-            );
-            if accepted {
-                assert!(result.is_ok());
-            } else {
-                let error = result.unwrap_err();
-                assert!(matches!(
-                    error,
-                    KernelError::MappingInputIdentity { parameter: 0, first_axis: 0, second_axis: 1 }
-                ));
-                assert_eq!(
-                    error.to_string(),
-                    "kernel parameter 0 mapping axes 0 and 1 share a dimension identity but may differ"
-                );
-            }
-        }
+            )
+        };
+        let coordinate_bounds = |operation: KernelCallOperation| {
+            operation.coordinate_types().iter().map(DimensionType::bounds).collect::<Vec<_>>()
+        };
+
+        // A shared identity is rejected when the two coordinates may differ.
+        let error = call([2, 2]).unwrap_err();
+        assert_eq!(error, KernelError::MappingInputIdentity { parameter: 0, first_axis: 0, second_axis: 1 });
+        assert_eq!(
+            error.to_string(),
+            "kernel parameter 0 mapping axes 0 and 1 share a dimension identity but may differ",
+        );
+        assert_eq!(
+            call([1, 2]).unwrap_err(),
+            KernelError::MappingInputIdentity { parameter: 0, first_axis: 0, second_axis: 1 },
+        );
+
+        // A shared identity is accepted when both coordinates are always zero or when the grid is empty.
+        let singleton_bounds = DimensionBounds::non_negative(Some(1)).unwrap();
+        assert_eq!(call([1, 1]).map(coordinate_bounds), Ok(vec![singleton_bounds, singleton_bounds]));
+        assert_eq!(
+            call([0, 2]).map(coordinate_bounds),
+            Ok(vec![singleton_bounds, DimensionBounds::non_negative(Some(2)).unwrap()]),
+        );
     }
 
     #[test]
@@ -1767,10 +1535,17 @@ mod tests {
         let definition = prefetch_definition();
         assert_eq!(
             definition.operation().input_types(),
-            vec![ArrayType::new_static(DataType::I32, vec![8]).into(), ArrayType::scalar(DataType::I32).into(),]
+            vec![ArrayType::new_static(DataType::I32, vec![8]).into(), ArrayType::scalar(DataType::I32).into()],
         );
-        assert_eq!(definition.operation().body_input_types().len(), 4);
-        assert_eq!(definition.operation().body_input_types()[3], ArrayType::scalar(DataType::I32).into());
+        assert_eq!(
+            definition.operation().body_input_types(),
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![2]))),
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32))),
+                ArrayIrType::Dimension(definition.operation().coordinate_types()[0].clone()),
+                ArrayType::scalar(DataType::I32).into(),
+            ],
+        );
         let invalid = ArrayType::new_static(DataType::I32, vec![1]);
         assert_eq!(
             KernelCallOperation::new_with_prefetch(Grid::new(vec![]).unwrap(), vec![], vec![invalid.clone()])
@@ -1832,7 +1607,7 @@ mod tests {
         let definition = copy_definition();
         assert_eq!(
             definition.operation().parameters().iter().map(KernelParameter::access).collect::<Vec<_>>(),
-            vec![KernelParameterAccess::ReadOnly, KernelParameterAccess::WriteOnly]
+            vec![KernelParameterAccess::ReadOnly, KernelParameterAccess::WriteOnly],
         );
     }
 
@@ -1849,7 +1624,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             operation.coordinate_types().iter().map(DimensionType::bounds).collect::<Vec<_>>(),
-            vec![DimensionBounds::non_negative(Some(4)).unwrap(), DimensionBounds::non_negative(Some(1)).unwrap()]
+            vec![DimensionBounds::non_negative(Some(4)).unwrap(), DimensionBounds::non_negative(Some(1)).unwrap()],
         );
         assert_eq!(operation.input_types(), Vec::<ArrayIrType>::new());
         assert_eq!(operation.boundary_contract(), KernelBoundaryContract::new(vec![None, None]));
@@ -1868,7 +1643,7 @@ mod tests {
         assert_eq!(operation.body_input_types()[0], operation.parameters()[0].body_type());
         assert_eq!(
             &operation.body_input_types()[1..],
-            operation.coordinate_types().iter().cloned().map(ArrayIrType::Dimension).collect::<Vec<_>>()
+            operation.coordinate_types().iter().cloned().map(ArrayIrType::Dimension).collect::<Vec<_>>(),
         );
     }
 
@@ -1876,7 +1651,7 @@ mod tests {
     fn test_kernel_call_operation_input_types() {
         assert_eq!(
             copy_definition().operation().input_types(),
-            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))]
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))],
         );
     }
 
@@ -1884,7 +1659,7 @@ mod tests {
     fn test_kernel_call_operation_output_types() {
         assert_eq!(
             copy_definition().operation().output_types(),
-            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))]
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))],
         );
     }
 
@@ -1910,7 +1685,7 @@ mod tests {
             KernelBoundaryContract::new(vec![
                 Some(KernelParameterAccess::ReadOnly),
                 Some(KernelParameterAccess::WriteOnly),
-            ])
+            ]),
         );
     }
 
@@ -1925,7 +1700,7 @@ mod tests {
         assert!(matches!(operation.grid().dimensions()[0].extent(), Dimension::Dynamic(_)));
         assert_eq!(
             operation.specialize_grid(&[2, 3]).unwrap_err(),
-            KernelError::Grid(GridError::Dimension(ryft_core::arrays::DimensionError::InputDimensionMismatch {
+            KernelError::Grid(GridError::Dimension(DimensionError::InputDimensionMismatch {
                 dimension: "count".to_owned(),
                 expected: 2,
                 actual: 3,
@@ -1946,7 +1721,7 @@ mod tests {
                 .evaluate(&[DimensionValue::constant(0).unwrap()], &[8])
                 .unwrap()
                 .starts(),
-            &[2]
+            &[2],
         );
     }
 
@@ -1956,13 +1731,13 @@ mod tests {
         let operation = definition.operation();
         assert_eq!(
             operation.specialize_prefetch(&[]).unwrap_err(),
-            KernelError::Type(TypeError::invalid("kernel scalar prefetch value count must be 1 but is 0",))
+            KernelError::Type(TypeError::invalid("kernel scalar prefetch value count must be 1 but is 0")),
         );
         assert_eq!(
             operation.specialize_prefetch(&[Array::scalar(1i64).unwrap()]).unwrap_err(),
             KernelError::Type(TypeError::invalid(
                 "kernel scalar prefetch 0 expected type `i32[]` but received `i64[]`",
-            ))
+            )),
         );
         let ArrayIrType::Dimension(offset) = &operation.parameters()[0].mapping().program().input_types()[1] else {
             unreachable!()
@@ -1974,8 +1749,18 @@ mod tests {
         }
         assert_eq!(
             operation.specialize_prefetch(&[Array::scalar(0i32).unwrap()]).unwrap().prefetch_types(),
-            &[] as &[ArrayType]
+            &[] as &[ArrayType],
         );
+    }
+
+    #[test]
+    fn test_kernel_call_operation_name() {
+        assert_eq!(copy_definition().operation().name(), "kernel_call");
+    }
+
+    #[test]
+    fn test_kernel_call_operation_region_slots() {
+        assert_eq!(copy_definition().operation().region_slots(), &[RegionSlot::computation("body")]);
     }
 
     #[test]
@@ -1984,23 +1769,66 @@ mod tests {
         let operation = definition.operation();
         assert_eq!(
             operation.infer_output_types(&operation.input_types(), std::slice::from_ref(definition.body().interface())),
-            Ok(operation.output_types())
+            Ok(operation.output_types()),
         );
         assert_eq!(
             operation.infer_output_types(&operation.input_types(), &[]),
-            Err(TypeError::invalid("`kernel_call` requires exactly one body region"))
+            Err(TypeError::invalid("`kernel_call` requires exactly one body region")),
         );
         assert_eq!(
             operation.infer_output_types(&[], std::slice::from_ref(definition.body().interface())),
-            Err(TypeError::invalid("`kernel_call` input types do not match its logical signature"))
+            Err(TypeError::invalid("`kernel_call` input types do not match its logical signature")),
         );
         let interface = RegionInterface::new(vec![], vec![], EffectClasses::NONE);
         assert_eq!(
             operation.infer_output_types(&operation.input_types(), &[interface]),
             Err(TypeError::invalid(
-                "`kernel_call` body input types do not match its logical block references and coordinates"
-            ))
+                "`kernel_call` body input types do not match its logical block references and coordinates",
+            )),
         );
+    }
+
+    #[test]
+    fn test_kernel_call_operation_region_capture_input_count() {
+        assert_eq!(copy_definition().operation().region_capture_input_count(0), Some(0));
+    }
+
+    #[test]
+    fn test_kernel_call_operation_input_region_provenance() {
+        let definition = dynamic_definition("extent", 4, true);
+        let operation = definition.operation();
+        // The reference and both generated coordinates share the same local provenance category.
+        assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Local);
+        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Local);
+        assert_eq!(operation.input_region_provenance(0, 2), InputRegionProvenance::Local);
+        assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::None);
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::None);
+    }
+
+    #[test]
+    fn test_kernel_call_operation_allows_reference_access_through_region_input() {
+        let parallel = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let sequential = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Sequential)]).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        for mode in [
+            ReferenceAccessMode::Read,
+            ReferenceAccessMode::Write,
+            ReferenceAccessMode::ReadWrite,
+            ReferenceAccessMode::Accumulate,
+            ReferenceAccessMode::AtomicAccumulate,
+        ] {
+            assert!(parallel.allows_reference_access_through_region_input(0, mode));
+            assert!(sequential.allows_reference_access_through_region_input(0, mode));
+            assert!(!parallel.allows_reference_access_through_region_input(1, mode));
+        }
+        assert!(!sequential.allows_reference_access_through_region_input(0, ReferenceAccessMode::Consume));
     }
 
     #[test]
@@ -2016,30 +1844,35 @@ mod tests {
         let definition = copy_definition();
         assert_eq!(definition.references().parameters().len(), 2);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let reference = builder.add_input(parameter(KernelParameterAccess::WriteOnly).body_type());
-        builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![reference], None).unwrap();
+        let reference = builder.add_input(parameter(KernelParameterAccess::ReadOnly).body_type());
+        let value = builder.add_constant(ArrayIrValue::Array(Array::scalar(1i32).unwrap()));
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None)
+            .unwrap();
         let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
+        let entry = body.entry_region_ref().id();
         let operation =
-            KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![parameter(KernelParameterAccess::WriteOnly)])
+            KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![parameter(KernelParameterAccess::ReadOnly)])
                 .unwrap();
-        assert!(matches!(
-            KernelDefinition::new(operation, body),
-            Err(KernelError::Validation(KernelValidationError::DisallowedAccess {
+        assert_eq!(
+            KernelDefinition::new(operation, body).unwrap_err(),
+            KernelError::Validation(KernelValidationError::DisallowedAccess {
                 input_index: 0,
-                access: KernelParameterAccess::WriteOnly,
-                mode: ReferenceAccessMode::Read,
-                operation: "reference_read",
-                ..
-            },))
-        ));
+                access: KernelParameterAccess::ReadOnly,
+                mode: ReferenceAccessMode::Write,
+                operation: "reference_write",
+                instruction: InstructionId::new(entry, 0),
+            }),
+        );
     }
 
-    /// A kernel body runs on one device, so a `shard_map` anywhere in the attached-region closure of its body is
-    /// rejected, whether its result is used, unused, or produced inside a nested region.
     #[test]
     fn test_kernel_definition_new_rejects_shard_maps() {
+        // A kernel body runs on one device, so a `shard_map` anywhere in the attached region closure of its body is
+        // rejected, whether its result is used, unused, or produced inside a nested region.
+
         // Identity `shard_map` over an `i32` scalar that is replicated along the manual mesh axis `x`, whose body is
-        // attached as a kernel-family region. Its global input and output types carry the replicated sharding.
+        // attached as a kernel family region. Its global input and output types carry the replicated sharding.
         fn identity_shard_map() -> (ShardMapOperation, FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>>)
         {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -2083,13 +1916,14 @@ mod tests {
             (KernelDefinition::new(operation, body), entry)
         }
 
-        // Every case stages a well-typed body: the kernel parameters, the value read from the input, the `shard_map`
-        // input and output, and the written value all have the global type of the identity `shard_map` boundary.
+        // Every case stages a well typed body, because the kernel parameters, the value read from the input, the
+        // `shard_map` input and output, and the written value all have the global type of the identity `shard_map`
+        // boundary.
         let (operation, _) = identity_shard_map();
         assert_eq!(operation.global_output_types(), operation.global_input_types());
         let global_type = <&ArrayType>::try_from(&operation.global_input_types()[0]).unwrap().clone();
 
-        // An array-only `shard_map` whose result the kernel writes.
+        // A `shard_map` of arrays whose result the kernel writes.
         let (result, entry) = definition(&global_type, |builder, value| {
             let (operation, body) = identity_shard_map();
             let body = builder.import_program(body);
@@ -2124,7 +1958,7 @@ mod tests {
             KernelError::UnsupportedOperation { operation: "shard_map", instruction: InstructionId::new(entry, 1) },
         );
 
-        // A `shard_map` inside a nested region of the body is found through the attached-region closure, and the error
+        // A `shard_map` inside a nested region of the body is found through the attached region closure, and the error
         // names its instruction in that nested region.
         let mut nested_region = None;
         let (result, _) = definition(&global_type, |builder, value| {
@@ -2171,54 +2005,6 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_call_operation_validate_body_grid_access() {
-        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        mapping.add_input(ArrayIrType::Dimension(DimensionType::new(
-            "coordinate",
-            DimensionBounds::non_negative(None).unwrap(),
-        )));
-        let mapping = BlockMapping::new(
-            mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
-            vec![],
-            BoundaryPolicy::InBounds,
-        )
-        .unwrap();
-        let parameter =
-            KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite, mapping).unwrap();
-        let parallel = KernelCallOperation::new(
-            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
-            vec![parameter.clone()],
-        )
-        .unwrap();
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let reference = builder.add_input(parameter.body_type());
-        builder.add_input(parallel.coordinate_types()[0].clone().into());
-        let update = builder.add_constant(ArrayIrValue::Array(Array::scalar(1i32).unwrap()));
-        builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), vec![], vec![reference, update], None)
-            .unwrap();
-        let body: FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>> =
-            builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
-        let error = parallel.validate_body(body.entry_region_ref()).unwrap_err();
-        assert_eq!(error, KernelError::DisallowedGridAccess { parameter: 0, mode: ReferenceAccessMode::Accumulate });
-        assert_eq!(error.to_string(), "kernel grid does not permit `accumulate` access on parameter 0");
-        let atomic_body = body
-            .map_operations(|operation| {
-                Ok(match operation {
-                    KernelOperation::Portable(ArrayIrOperation::ReferenceAddUpdate(_)) => {
-                        KernelOperation::from(ReferenceAtomicAddUpdateOperation::new())
-                    }
-                    operation => operation.clone(),
-                })
-            })
-            .unwrap();
-        assert_eq!(
-            parallel.validate_body(atomic_body.entry_region_ref()).unwrap().parameter(0).unwrap().modes(),
-            &std::collections::BTreeSet::from([ReferenceAccessMode::AtomicAccumulate]),
-        );
-    }
-
-    #[test]
     fn test_kernel_definition_trace() {
         let explicit = copy_definition();
         let traced =
@@ -2240,7 +2026,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(KernelError::Program(ProgramError::MalformedProgram(message)))
-                if message == "traceable helper rejected its arguments"
+                if message == "traceable helper rejected its arguments",
         ));
     }
 
@@ -2248,7 +2034,13 @@ mod tests {
     fn test_kernel_definition_trace_with_prefetch() {
         let definition = prefetch_definition();
         assert_eq!(definition.body().input_types(), definition.operation().body_input_types());
-        assert_eq!(definition.body().entry_region_ref().instructions().len(), 1);
+        assert_eq!(
+            definition.body().to_string(),
+            indoc! {"
+                lambda %0:ref<i32[2]>, %1:ref<i32[]>, %2:dimension<0>, %3:i32[] .
+                let () = reference_write %1 %3
+                in ()"},
+        );
     }
 
     #[test]
@@ -2272,11 +2064,11 @@ mod tests {
         assert_eq!(specialized.body().input_types(), specialized.operation().body_input_types());
         assert_eq!(
             specialized.interpret(vec![Array::vector(vec![0i32; 8]).unwrap()], 1),
-            Ok(vec![Array::scalar(2i32).unwrap()])
+            Ok(vec![Array::scalar(2i32).unwrap()]),
         );
         assert_ne!(
             specialized.semantic_key().unwrap(),
-            definition.specialize_prefetch(&[Array::scalar(3i32).unwrap()]).unwrap().semantic_key().unwrap()
+            definition.specialize_prefetch(&[Array::scalar(3i32).unwrap()]).unwrap().semantic_key().unwrap(),
         );
         assert_eq!(
             specialized.semantic_key().unwrap(),
@@ -2284,7 +2076,7 @@ mod tests {
                 .specialize_prefetch(&[Array::scalar(2i32).unwrap()])
                 .unwrap()
                 .semantic_key()
-                .unwrap()
+                .unwrap(),
         );
     }
 
@@ -2298,6 +2090,70 @@ mod tests {
         let invalid = Array::scalar(8i32).unwrap();
         let expected = definition.specialize_prefetch(std::slice::from_ref(&invalid)).unwrap_err();
         assert_eq!(definition.interpret(vec![input, invalid], 1), Err(ProgramError::custom(expected)));
+    }
+
+    #[test]
+    fn test_kernel_definition_specialize_prefetch_rebuilds_mappings() {
+        // The table window starts at the prefetched block index times the block extent, which may overflow for an
+        // unbounded index and so requires a runtime assertion before specialization.
+        let operation = mapped_call(
+            Grid::new(vec![GridDimension::new(Dimension::Static(1), GridExecution::Parallel)]).unwrap(),
+            vec![
+                (
+                    ArrayType::new_static(DataType::I32, vec![8]),
+                    KernelParameterAccess::ReadOnly,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![2],
+                        boundary: BoundaryPolicy::InBounds,
+                        indices: vec![MappingExpression::Prefetch(0)],
+                    },
+                ),
+                (
+                    ArrayType::new_static(DataType::I32, vec![2]),
+                    KernelParameterAccess::WriteOnly,
+                    ParameterWindow::WholeArray,
+                ),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace_with_prefetch(operation, |(references, _coordinates, _values)| {
+                references[1].write(&references[0].read()?)
+            })
+            .unwrap();
+        assert_eq!(
+            definition.operation().parameters()[0].mapping().program().effects().classes(),
+            EffectClasses::single(EffectClass::OrderedAssertion),
+        );
+
+        // Specialization folds the start to a constant, so every mapping is pure.
+        let block = Array::scalar(2i32).unwrap();
+        let specialized = definition.specialize_prefetch(std::slice::from_ref(&block)).unwrap();
+        assert_eq!(
+            specialized.operation().parameters()[0].mapping().program().to_string(),
+            indoc! {"
+                lambda %0:dimension<0> .
+                let %1:dimension<2> = const 2
+                    %2:dimension<4> = const 4
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            specialized
+                .operation()
+                .parameters()
+                .iter()
+                .map(|parameter| parameter.mapping().program().effects().classes())
+                .collect::<Vec<_>>(),
+            vec![EffectClasses::NONE; 2],
+        );
+
+        // The runtime prefetch value and its specialization select the same window.
+        let table = Array::vector((0..8).collect::<Vec<i32>>()).unwrap();
+        let expected = Ok(vec![Array::vector(vec![4i32, 5]).unwrap()]);
+        assert_eq!(definition.interpret(vec![table.clone(), block], 1), expected);
+        assert_eq!(specialized.interpret(vec![table], 1), expected);
     }
 
     #[test]
@@ -2323,15 +2179,26 @@ mod tests {
         let definition =
             KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
         let simplified = definition.simplified().unwrap();
-        assert_eq!(definition.body().instructions().len(), 4);
         assert_eq!(
-            simplified
-                .body()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["reference_write", "reference_read", "reference_write"],
+            definition.body().to_string(),
+            indoc! {"
+                lambda %0:ref<i32[]>, %1:ref<i32[]> .
+                let %2:i32[] = zero [type=i32[]]
+                    %3:i32[] = const 9
+                    () = reference_write %1 %3
+                    %4:i32[] = reference_read %0
+                    () = reference_write %1 %4
+                in ()"},
+        );
+        assert_eq!(
+            simplified.body().to_string(),
+            indoc! {"
+                lambda %0:ref<i32[]>, %1:ref<i32[]> .
+                let %2:i32[] = const 9
+                    () = reference_write %1 %2
+                    %3:i32[] = reference_read %0
+                    () = reference_write %1 %3
+                in ()"},
         );
         assert_eq!(simplified.body().interface(), definition.body().interface());
         assert_eq!(simplified.body().effects(), definition.body().effects());
@@ -2347,7 +2214,14 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_body() {
-        assert_eq!(copy_definition().body().entry_region_ref().instructions().len(), 2);
+        assert_eq!(
+            copy_definition().body().to_string(),
+            indoc! {"
+                lambda %0:ref<i32[]>, %1:ref<i32[]> .
+                let %2:i32[] = reference_read %0
+                    () = reference_write %1 %2
+                in ()"},
+        );
     }
 
     #[test]
@@ -2360,8 +2234,23 @@ mod tests {
                 .iter()
                 .map(|parameter| parameter.as_ref().unwrap().access())
                 .collect::<Vec<_>>(),
-            vec![KernelParameterAccess::ReadOnly, KernelParameterAccess::WriteOnly]
+            vec![KernelParameterAccess::ReadOnly, KernelParameterAccess::WriteOnly],
         );
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key() {
+        let first = dynamic_definition("first", 4, true);
+        let renamed = dynamic_definition("second", 4, true);
+        let independent = dynamic_definition("first", 4, false);
+        let wider = dynamic_definition("first", 5, true);
+        let key = first.semantic_key().unwrap();
+        assert_eq!(key, first.clone().semantic_key().unwrap());
+        assert_eq!(key, renamed.semantic_key().unwrap());
+        assert_ne!(key, independent.semantic_key().unwrap());
+        assert_ne!(key, wider.semantic_key().unwrap());
+        assert!(!key.contains("first"));
+        assert!(key.starts_with(&format!("kernel key {KERNEL_KEY_VERSION}\n")));
     }
 
     #[test]
@@ -2385,7 +2274,7 @@ mod tests {
             })
             .unwrap()
         });
-        // Diagnostic floating-point rendering deliberately omits NaN payloads; semantic identity must retain them.
+        // Diagnostic floating-point rendering deliberately omits NaN payloads, but semantic identity must retain them.
         assert_eq!(first.body().to_string(), second.body().to_string());
         assert_ne!(first.semantic_key().unwrap(), second.semantic_key().unwrap());
     }
@@ -2409,9 +2298,7 @@ mod tests {
             let reference = body.add_input(operation.body_input_types()[0].clone());
             let value = body
                 .add_instruction(
-                    ArrayOperation::Constant(ryft_core::operations::ConstantOperation::new(
-                        Array::scalar(f32::from_bits(bits)).unwrap(),
-                    )),
+                    ArrayOperation::Constant(ConstantOperation::new(Array::scalar(f32::from_bits(bits)).unwrap())),
                     vec![],
                     vec![],
                     None,
@@ -2445,7 +2332,7 @@ mod tests {
             .unwrap()
         };
 
-        // Attributes of different kinds render differently (strings are quoted and narrow integers carry their
+        // Attributes of different kinds render differently (e.g., strings are quoted and narrow integers carry their
         // width), and their keys differ as well.
         for (attributes, renderings) in [
             (
@@ -2463,7 +2350,10 @@ mod tests {
             for (definition, rendering) in definitions.iter().zip(renderings) {
                 assert_eq!(
                     definition.body().to_string(),
-                    format!("lambda  .\nlet () = custom_call [target=test.foreign, {rendering}]\nin ()"),
+                    formatdoc! {"
+                        lambda  .
+                        let () = custom_call [target=test.foreign, {rendering}]
+                        in ()"},
                 );
             }
             assert_ne!(definitions[0].semantic_key().unwrap(), definitions[1].semantic_key().unwrap());
@@ -2484,30 +2374,6 @@ mod tests {
             let definitions = attributes.map(definition);
             assert_eq!(definitions[0].body().to_string(), definitions[1].body().to_string());
             assert_ne!(definitions[0].semantic_key().unwrap(), definitions[1].semantic_key().unwrap());
-        }
-    }
-
-    #[test]
-    fn test_kernel_definition_semantic_key_preserves_attention_bits() {
-        // Named attention calls are encoded by their composite keys, whose floating attributes keep their IEEE bits.
-        for configurations in [
-            [
-                AttentionConfiguration::new().with_scale(f64::from_bits(0x7ff8_0000_0000_0001)),
-                AttentionConfiguration::new().with_scale(f64::from_bits(0x7ff8_0000_0000_0002)),
-            ],
-            [AttentionConfiguration::new().with_dropout(0.5), AttentionConfiguration::new().with_dropout(0.25)],
-            [AttentionConfiguration::new().with_scale(0.0), AttentionConfiguration::new().with_scale(-0.0)],
-        ] {
-            let keys = configurations.map(|configuration| {
-                let key = AttentionKey::Forward {
-                    configuration,
-                    input_structure: AttentionInputs::new(Placeholder, Placeholder, Placeholder),
-                    return_residual: false,
-                }
-                .to_composite_key();
-                format!("{key:?}")
-            });
-            assert_ne!(keys[0], keys[1]);
         }
     }
 
@@ -2549,7 +2415,7 @@ mod tests {
                 definition.semantic_key(),
                 Err(TypeError::invalid(
                     "kernel extension `hidden_key_extension` has no exact semantic identity contract",
-                ))
+                )),
             );
         }
     }
@@ -2581,8 +2447,11 @@ mod tests {
         };
 
         // A call with attached rules is encoded structurally, because its rules are regions of the body.
-        let attached = CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, false);
-        assert!(definition(ArrayIrOperation::Composite(attached), 1).semantic_key().is_ok());
+        let attached = || CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, false);
+        assert_eq!(
+            definition(ArrayIrOperation::Composite(attached()), 1).semantic_key().unwrap(),
+            definition(ArrayIrOperation::Composite(attached()), 1).semantic_key().unwrap(),
+        );
 
         // Calls and carriers with retained rules have no encoding, whether their rules are registered in this family or
         // lifted from the array member family, because the identity of their rules is local to the process.
@@ -2639,9 +2508,9 @@ mod tests {
             definition(ArrayIrOperation::Composite(CompositeOperation::new(rules.reference())), 1).semantic_key()
         };
         let (first, second, other) = (named(true.into()), named(true.into()), named(false.into()));
-        assert!(first.definition().id() != second.definition().id());
+        assert_ne!(first.definition().id(), second.definition().id());
         assert_eq!(named_key(&first).unwrap(), named_key(&second).unwrap());
-        assert!(named_key(&first).unwrap() != named_key(&other).unwrap());
+        assert_ne!(named_key(&first).unwrap(), named_key(&other).unwrap());
 
         // Semantic descriptors preserve scalar kinds, optional structure, and float bits at every nesting level.
         for [left, right] in [
@@ -2663,32 +2532,32 @@ mod tests {
             assert_ne!(named_key(&first).unwrap(), named_key(&other).unwrap());
         }
 
-        let member_key = CompositeKey::new("ryft.tests.kernel_named_member", 1);
-        let member_rules = CustomRuleRegistration::new(
-            CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member").with_named_composite(
-                NamedComposite::new(
-                    member_key,
-                    |types: &[ArrayType]| Ok(types.to_vec()),
-                    |inputs: &[Tracer<TracingContext<Array, ArrayOperation<Array>>>]| Ok(inputs.to_vec()),
+        let named_member = || {
+            CustomRuleRegistration::new(
+                CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member").with_named_composite(
+                    NamedComposite::new(
+                        CompositeKey::new("ryft.tests.kernel_named_member", 1),
+                        |types: &[ArrayType]| Ok(types.to_vec()),
+                        |inputs: &[Tracer<TracingContext<Array, ArrayOperation<Array>>>]| Ok(inputs.to_vec()),
+                    ),
                 ),
-            ),
-        );
-        assert!(
-            definition(
-                ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(member_rules.reference()))),
-                1,
             )
-            .semantic_key()
-            .is_ok()
-        );
+        };
+        let named_member_key = |rules: &CustomRuleRegistration<Array, ArrayOperation<Array>>| {
+            definition(ArrayIrOperation::from(ArrayOperation::Composite(CompositeOperation::new(rules.reference()))), 1)
+                .semantic_key()
+        };
+        let (first, second) = (named_member(), named_member());
+        assert_ne!(first.definition().id(), second.definition().id());
+        assert_eq!(named_member_key(&first).unwrap(), named_member_key(&second).unwrap());
 
-        // A carrier with an attached backward rule is an unresolved reverse-mode obligation, so it has no encoding
+        // A carrier with an attached backward rule is an unresolved reverse mode obligation, so it has no encoding
         // either.
         let carrier =
             CompositeTransposeOperation::from_backward_region(0, vec![scalar_type.clone()], vec![scalar_type.clone()]);
         assert_eq!(
             definition(ArrayIrOperation::CompositeTranspose(carrier), 1).semantic_key(),
-            Err(TypeError::invalid("`composite_transpose` operations have no kernel semantic descriptor encoding",)),
+            Err(TypeError::invalid("`composite_transpose` operations have no kernel semantic descriptor encoding")),
         );
     }
 
@@ -2733,18 +2602,177 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_definition_semantic_key() {
-        let first = dynamic_definition("first", 4, true);
-        let renamed = dynamic_definition("second", 4, true);
-        let independent = dynamic_definition("first", 4, false);
-        let wider = dynamic_definition("first", 5, true);
-        let key = first.semantic_key().unwrap();
-        assert_eq!(key, first.clone().semantic_key().unwrap());
-        assert_eq!(key, renamed.semantic_key().unwrap());
-        assert_ne!(key, independent.semantic_key().unwrap());
-        assert_ne!(key, wider.semantic_key().unwrap());
-        assert!(!key.contains("first"));
-        assert!(key.starts_with(&format!("kernel key 2; schema {KERNEL_SCHEMA_VERSION}\n")));
+    fn test_kernel_definition_semantic_key_ignores_grid_names() {
+        let key = |dimension: GridDimension| {
+            let operation = KernelCallOperation::new(Grid::new(vec![dimension]).unwrap(), vec![]).unwrap();
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            for r#type in operation.body_input_types() {
+                body.add_input(r#type);
+            }
+            let definition =
+                KernelDefinition::new(operation, body.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
+            definition.semantic_key().unwrap()
+        };
+        let unnamed = GridDimension::new(Dimension::Static(2), GridExecution::Parallel);
+        let named = key(unnamed.clone().with_name("rows").unwrap());
+        assert_eq!(named, key(unnamed.clone()));
+        assert_eq!(named, key(unnamed.with_name("columns").unwrap()));
+        assert_ne!(named, key(GridDimension::new(Dimension::Static(2), GridExecution::Sequential)));
+        assert_ne!(named, key(GridDimension::new(Dimension::Static(3), GridExecution::Parallel)));
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_ignores_dimension_names() {
+        // A dimension arithmetic operation caches the name of its output, which is derived from the names of its
+        // operands and survives identity renaming, so the key must not depend on how a mapping names its coordinate.
+        let key = |name: &str| {
+            let coordinate_type = DimensionType::new(name, DimensionBounds::non_negative(Some(2)).unwrap());
+            let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let coordinate = mapping.add_input(ArrayIrType::Dimension(coordinate_type.clone()));
+            let size = DimensionValue::constant(1).unwrap();
+            let multiplication = DimensionMulOperation::new(&coordinate_type, size.r#type().as_ref()).unwrap();
+            let size = mapping.add_constant(ArrayIrValue::Dimension(size));
+            let start = mapping
+                .add_instruction(ArrayIrOperation::from(multiplication), vec![], vec![coordinate, size], None)
+                .unwrap()[0];
+            let mapping = BlockMapping::new(
+                mapping.build(vec![start], vec![Placeholder], vec![Placeholder]).unwrap(),
+                vec![1],
+                BoundaryPolicy::InBounds,
+            )
+            .unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            let parameter = KernelParameter::new(r#type, KernelParameterAccess::WriteOnly, mapping).unwrap();
+            let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
+            let operation = KernelCallOperation::new(grid, vec![parameter]).unwrap();
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let reference = body.add_input(operation.body_input_types()[0].clone());
+            body.add_input(operation.body_input_types()[1].clone());
+            let value = Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[1.5f32]).unwrap();
+            let value = body.add_constant(ArrayIrValue::Array(value));
+            body.add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None).unwrap();
+            let definition =
+                KernelDefinition::new(operation, body.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+            definition.semantic_key().unwrap()
+        };
+        assert_eq!(key("row"), key("column"));
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_ignores_provenance() {
+        let operation = copy_definition().operation().clone();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let input = builder.add_input(operation.parameters()[0].body_type());
+        let output = builder.add_input(operation.parameters()[1].body_type());
+        let provenance = Provenance::scope(ProvenanceScope::new("copy"), Provenance::unknown());
+        let value = builder
+            .add_instruction(ReferenceReadOperation::new(), vec![], vec![input], Some(provenance.clone()))
+            .unwrap()[0];
+        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], Some(provenance)).unwrap();
+        let definition =
+            KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+        assert_ne!(
+            definition.body().entry_region().instructions()[0].provenance(),
+            copy_definition().body().entry_region().instructions()[0].provenance(),
+        );
+        assert_eq!(definition.semantic_key().unwrap(), copy_definition().semantic_key().unwrap());
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_matches_source_roundtrip() {
+        // Decoding creates fresh nominal identities that keep their names, and the key matches either way.
+        for definition in [
+            copy_definition(),
+            dynamic_definition("first", 4, true),
+            dynamic_definition("first", 4, false),
+            dynamic_definition("first", 4, true).specialize_grid(&[2, 2]).unwrap(),
+            prefetch_definition(),
+            prefetch_definition().specialize_prefetch(&[Array::scalar(2i32).unwrap()]).unwrap(),
+        ] {
+            let decoded = KernelDefinition::from_source(definition.to_source().unwrap()).unwrap();
+            assert_eq!(decoded.semantic_key().unwrap(), definition.semantic_key().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_unsupported_source_features() {
+        // Builds a scalar copy kernel that prints its value with `label` on the way.
+        let definition = |label: &str| {
+            let operation = copy_definition().operation().clone();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = builder.add_input(operation.parameters()[0].body_type());
+            let output = builder.add_input(operation.parameters()[1].body_type());
+            let value = builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![input], None).unwrap()[0];
+            let value = builder
+                .add_instruction(ArrayOperation::Print(PrintOperation::new(label)), vec![], vec![value], None)
+                .unwrap()[0];
+            builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], None).unwrap();
+            KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
+        };
+
+        // The transport schema rejects the print, but the key still encodes it exactly.
+        assert!(definition("first").to_source().is_err_and(|error| error.to_string().ends_with("`print`")));
+        assert_eq!(definition("first").semantic_key().unwrap(), definition("first").semantic_key().unwrap());
+        assert_ne!(definition("first").semantic_key().unwrap(), definition("second").semantic_key().unwrap());
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_format() {
+        let coordinate_type = DimensionType::new("row", DimensionBounds::non_negative(Some(2)).unwrap());
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let coordinate = mapping.add_input(ArrayIrType::Dimension(coordinate_type.clone()));
+        let size = DimensionValue::constant(1).unwrap();
+        let multiplication = DimensionMulOperation::new(&coordinate_type, size.r#type().as_ref()).unwrap();
+        let size = mapping.add_constant(ArrayIrValue::Dimension(size));
+        let start = mapping
+            .add_instruction(ArrayIrOperation::from(multiplication), vec![], vec![coordinate, size], None)
+            .unwrap()[0];
+        let parameter = KernelParameter::new(
+            ArrayType::new_static(DataType::F32, [2]),
+            KernelParameterAccess::WriteOnly,
+            BlockMapping::new(
+                mapping.build(vec![start], vec![Placeholder], vec![Placeholder]).unwrap(),
+                vec![1],
+                BoundaryPolicy::InBounds,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
+        let operation = KernelCallOperation::new(grid, vec![parameter]).unwrap();
+        let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = body.add_input(operation.body_input_types()[0].clone());
+        body.add_input(operation.body_input_types()[1].clone());
+        let value = Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[1.5f32]).unwrap();
+        let value = body.add_constant(ArrayIrValue::Array(value));
+        body.add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None).unwrap();
+        let definition =
+            KernelDefinition::new(operation, body.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+
+        // A deliberate change to this string requires a `KERNEL_KEY_VERSION` bump.
+        assert_eq!(
+            definition.semantic_key().unwrap(),
+            concat!(
+                "kernel key 1\n",
+                r#"{"version":1,"variables":[{"name":"","lower":0,"upper":2},{"name":"","lower":0,"upper":2},"#,
+                r#"{"name":"","lower":0,"upper":2}],"call":{"grid":[{"extent":{"Static":2},"name":null,"#,
+                r#""execution":"Parallel"}],"parameters":[{"type":{"data_type":"F32","shape":[{"Static":2}],"#,
+                r#""layout":null,"memory":"Device"},"access":"WriteOnly","#,
+                r#""mapping":{"regions":[{"atoms":[{"Variable":{"Dimension":{"Dynamic":0}}},"#,
+                r#"{"Constant":{"Dimension":{"extent":1}}},{"Variable":{"Dimension":{"Dynamic":1}}}],"inputs":[0],"#,
+                r#""outputs":[2],"instructions":[{"operation":{"DimensionMul":{"left":{"Dynamic":0},"#,
+                r#""right":{"Static":1}}},"reference_transforms":[],"inputs":[0,1],"outputs":[2],"regions":[],"#,
+                r#""provenance":{"nodes":["Unknown"],"root":0}}]}],"entry":0},"block_shape":[1],"#,
+                r#""boundary_policy":"InBounds"}],"coordinates":[{"Dynamic":2}],"prefetch":[]},"#,
+                r#""body":{"regions":[{"atoms":[{"Variable":{"Reference":{"data_type":"F32","shape":[{"Static":1}],"#,
+                r#""layout":null,"memory":"Device"}}},{"Variable":{"Dimension":{"Dynamic":2}}},"#,
+                r#"{"Constant":{"Array":{"type":{"data_type":"F32","shape":[{"Static":1}],"layout":null,"#,
+                r#""memory":"Device"},"bytes":[0,0,192,63]}}}],"inputs":[0,1],"outputs":[],"#,
+                r#""instructions":[{"operation":"ReferenceWrite","reference_transforms":[{"input_index":0,"#,
+                r#""transforms":[]}],"inputs":[0,2],"outputs":[],"regions":[],"provenance":{"nodes":["Unknown"],"#,
+                r#""root":0}}]}],"entry":0}}"#,
+            ),
+        );
     }
 
     #[test]
@@ -2777,5 +2805,37 @@ mod tests {
             keys.push(definition.semantic_key().unwrap());
         }
         assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_window_mask() {
+        // A body that stores under the validity mask of its output differs from one that stores under a constant mask.
+        let mut keys = Vec::new();
+        for window_mask in [false, true] {
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![
+                    whole_array_parameter(ArrayType::new_static(DataType::I32, [2]), KernelParameterAccess::WriteOnly)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let output = builder.add_input(call.body_input_types()[0].clone());
+            let value = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![5i32, 7]).unwrap()));
+            let mask = if window_mask {
+                builder.add_instruction(WindowMaskOperation, vec![], vec![output], None).unwrap()[0]
+            } else {
+                builder.add_constant(ArrayIrValue::Array(Array::vector(vec![true, true]).unwrap()))
+            };
+            builder
+                .add_instruction(MaskedStoreOperation::new(), vec![], vec![output, value, mask], None)
+                .unwrap();
+            let definition =
+                KernelDefinition::new(call, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
+            keys.push(definition.semantic_key().unwrap());
+        }
+        assert_ne!(keys[0], keys[1]);
+        assert!(keys[1].contains(r#"{"operation":"WindowMask","#));
     }
 }

@@ -542,7 +542,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType};
-    use ryft_kernels::{KernelCallOperation, KernelDefinition};
+    use ryft_kernels::{KernelCallOperation, KernelDefinition, kernel};
 
     use super::*;
 
@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// A portable definition used to exercise the native compilation without changing its portable semantics.
-    #[ryft_kernels::kernel(crate = "ryft_kernels")]
+    #[kernel(crate = "ryft_kernels")]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &Array,
         #[input(data_type = F32, rank = 1)] right: &Array,
@@ -574,7 +574,7 @@ mod tests {
     }
 
     /// Bounded index conversion preserves its ordered assertion even before native lowering.
-    #[ryft_kernels::kernel(crate = "ryft_kernels")]
+    #[kernel(crate = "ryft_kernels")]
     fn matrix(
         #[input(data_type = F32, rank = 2)] left: &Array,
         #[input(data_type = F32, rank = 2)] right: &Array,

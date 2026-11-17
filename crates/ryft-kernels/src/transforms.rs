@@ -1,7 +1,41 @@
-//! Kernel transforms preserve canonical regions, array metadata, and confined reference effects.
+//! Contains transforms of kernel definitions, which currently consist of batching.
 //!
-//! Batching adds a grid coordinate and disjoint array windows rather than vectorizing mutable instructions. Static
-//! specialization uses the existing program splicer; derivative rules belong to the ordinary custom JVP/VJP carriers.
+//! Kernel transforms preserve canonical regions, array metadata, and confined reference effects. Batching turns a
+//! [`KernelDefinition`] that processes one item into one that processes a batch of independent items in a single
+//! launch. It adds a grid coordinate and disjoint array windows rather than vectorizing mutable instructions.
+//!
+//! # Batching Model
+//!
+//! [`KernelDefinition::batched`] appends a parallel grid dimension whose extent is the batch size, together with a
+//! matching `batch` coordinate, so every batch item runs as its own programs. Every mapped parameter gains a batch
+//! dimension in its full array type and in its block shape, and its block mapping selects a size one window at the
+//! batch coordinate along that dimension. The body keeps its instructions and attached regions. Every reference
+//! access of a mapped parameter receives a leading static index into its size one window, so the body reaches the
+//! original referents through folded access paths, and all other instructions are copied unchanged. Unmapped
+//! read-only parameters remain shared by all batch items.
+//!
+//! Batching rejects the inputs for which this rewrite is not sound, with a [`KernelTransformError::Unsupported`]
+//! that names the rejected contract.
+//!
+//!   - Every writable parameter must be mapped, including functional read-write aliases, because batch items would
+//!     otherwise race on one shared array.
+//!   - A mapped reference must only be used through reference accesses, because only an access path can receive the
+//!     batch selection. Passing it into an attached region (e.g., as a `condition` operand) or using it outside a
+//!     reference access (e.g., in a [`WindowMaskOperation`](crate::memory::WindowMaskOperation), whose window validity
+//!     would have the wrong shape) is rejected.
+//!   - Mapped parameters must not have explicit layouts, and scalar prefetched inputs must be specialized first.
+//!   - [`KernelDefinition::batched_inputs`], which derives the batch axes from packed batched inputs, rejects dynamic
+//!     batch extents, because the batch becomes a static grid dimension.
+//!
+//! The batched call and body are rebuilt through their canonical constructors, and the result is requalified by a new
+//! executable proof (i.e., [`VerifiedKernel`]) that checks all transformed accesses.
+//!
+//! # Composition with Ordinary Batching
+//!
+//! [`KernelOperation`] implements [`BatchableOperation`], so a kernel call staged in an ordinary program batches
+//! under the program transforms of `ryft-core`. The implementation rebuilds the complete definition from the call and
+//! its attached body, batches it with [`KernelDefinition::batched_inputs`], and binds the batched call in the parent
+//! context. Other kernel operations are only batched as part of their complete kernel call.
 
 use std::collections::BTreeMap;
 
@@ -36,26 +70,35 @@ pub enum KernelTransformError {
     /// The selected transform has no proven rule for this input contract.
     #[error("kernel transform is unsupported: {message}")]
     Unsupported {
-        /// Exact unsupported contract.
+        /// Description of the unsupported input contract.
         message: String,
     },
 }
 
 impl<Extension: KernelExtension> KernelDefinition<Extension> {
-    /// Adds an independent parallel batch coordinate and canonical size-one windows for mapped parameters. The body
+    /// Adds an independent parallel batch coordinate and canonical size one windows for mapped parameters. The body
     /// selects the original referents through folded access paths and executes once per batch item. Unmapped read-only
-    /// arrays remain shared; every writable parameter must be mapped, including functional read-write aliases.
+    /// arrays remain shared, and every writable parameter must be mapped, including functional read-write aliases.
     ///
-    /// `axes` follows all parameters, including write-only outputs. Each mapped axis is inserted into that parameter's
-    /// full array and block shape. Canonical type insertion preserves dtype, memory, and sharding while clearing
-    /// layout; explicit source layouts are rejected because restoring them on the selected referents is not justified.
-    /// Scalar-prefetched inputs must be specialized first. A new executable proof checks all transformed accesses.
+    /// `axes` follows all parameters, including write-only outputs. Each mapped axis is inserted into the full array
+    /// and block shape of its parameter. Canonical type insertion preserves the data type, memory, and sharding while
+    /// clearing the layout. Explicit source layouts are rejected because restoring them on the selected referents is
+    /// not justified. Scalar prefetched inputs must be specialized first (e.g., with
+    /// [`KernelDefinition::specialize_prefetch`]). A new executable proof checks all transformed accesses.
     ///
     /// # Parameters
     ///
-    ///   - `batch_size`: Static number of independent items; zero produces an empty launch.
+    ///   - `batch_size`: Static number of independent items. Zero produces an empty launch.
     ///   - `axes`: Inserted array dimension for each mapped parameter, or `None` for a shared read-only parameter.
     ///   - `maximum_programs`: Enumeration budget for executable qualification when affine proofs do not apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelTransformError::Unsupported`] when `axes` does not cover every parameter, when the call has
+    /// scalar prefetched inputs, when a writable parameter is unmapped, when a mapped parameter has an explicit layout,
+    /// or when the body uses a mapped reference outside a reference access. Returns [`KernelTransformError::Kernel`]
+    /// when canonical construction rejects the batched call or body, and [`KernelTransformError::Initialization`] when
+    /// the new executable proof rejects the transformed accesses.
     pub fn batched(
         &self,
         batch_size: usize,
@@ -63,12 +106,11 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
         maximum_programs: usize,
     ) -> Result<Self, KernelTransformError> {
         let call = self.operation();
-        let unsupported = |message: String| KernelTransformError::Unsupported { message };
         if axes.len() != call.parameters().len() {
-            return Err(unsupported("batch axes must match every kernel parameter".to_owned()));
+            return Err(unsupported("batch axes must match every kernel parameter"));
         }
         if !call.prefetch_types().is_empty() {
-            return Err(unsupported("scalar-prefetched inputs must be specialized before batching".to_owned()));
+            return Err(unsupported("scalar-prefetched inputs must be specialized before batching"));
         }
         let mut dimensions = call.grid().dimensions().to_vec();
         dimensions.push(GridDimension::new(Dimension::Static(batch_size), GridExecution::Parallel));
@@ -106,7 +148,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
                 .build(starts, vec![Placeholder; inputs.len() + 1], vec![Placeholder; shape.len()])
                 .map_err(KernelError::from)?;
             // No invocation exists for an empty batch. Padding preserves the formal selected referent type without
-            // constructing an invalid one-element slice of the empty full array.
+            // constructing an invalid slice with one element of the empty full array.
             let policy = if axis.is_some() && batch_size == 0 {
                 BoundaryPolicy::Masked
             } else {
@@ -185,18 +227,25 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
         Ok(definition)
     }
 
-    /// Derives parameter batch axes from canonical packed input carriers and batches the definition. Write-only
-    /// results acquire a leading batch axis; read-write results retain their input's axis. With entirely replicated
-    /// inputs the unchanged definition and replicated result axes are returned. Kernel batching adds a grid dimension
-    /// rather than a sealed program boundary, so it does not use the shared boundary transport of structurally batched
-    /// programs: a dynamic batch extent is rejected because the batch becomes a static grid dimension. Every batch
-    /// item uses the same statically shaped block windows.
+    /// Derives parameter batch axes from canonical packed input carriers and batches the definition with
+    /// [`KernelDefinition::batched`], returning the batched definition together with the batch axis of every output.
+    ///
+    /// Write-only results acquire a leading batch axis, and read-write results retain the axis of their input. With
+    /// entirely replicated inputs, the unchanged definition and replicated result axes are returned. Kernel batching
+    /// adds a grid dimension rather than a sealed program boundary, so it does not use the shared boundary transport of
+    /// structurally batched programs. A dynamic batch extent is therefore rejected, because the batch becomes a static
+    /// grid dimension. Every batch item uses the same statically shaped block windows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelTransformError::Unsupported`] when the unbatched input types differ from the kernel signature,
+    /// or when a batched input is not an ordinary array, has a dynamic batch extent, or has a batch extent that differs
+    /// from that of another input. Otherwise, returns the errors of [`KernelDefinition::batched`].
     pub fn batched_inputs<V: Value<Type = ArrayIrType>>(
         &self,
         inputs: &[ArrayIrBatch<V>],
         maximum_programs: usize,
     ) -> Result<(Self, Vec<Option<usize>>), KernelTransformError> {
-        let unsupported = |message: &str| KernelTransformError::Unsupported { message: message.to_owned() };
         if inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>() != self.operation().input_types() {
             return Err(unsupported("batched input types differ from the kernel signature"));
         }
@@ -255,6 +304,8 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // Batching rewrites the grid, the parameters, and the body of a kernel call together, so only a complete call
+        // can be batched. Its attached body region is the definition body.
         let Self::Call(call) = self else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("kernel operation `{}` must be batched through its complete kernel call", self.name()),
@@ -278,18 +329,52 @@ where
     }
 }
 
+/// Creates a diagnostic for an unsupported transform input contract.
+fn unsupported(message: impl Into<String>) -> KernelTransformError {
+    KernelTransformError::Unsupported { message: message.into() }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArraySliceAxis, ArrayType, ConditionOperation, DataType, ReferenceAccessOperation, ReferenceRead,
-        ReferenceWrite, ReferenceWriteOperation,
+        ArraySliceAxis, ArrayType, AttachedRegions, ConditionOperation, DataType, DimensionValue, DimensionVariable,
+        EagerContext, RecursiveBatchingDriver, ReferenceRead, ReferenceWrite, ReferenceWriteOperation, Shape, Tracer,
+        TracingContext,
     };
 
     use crate::authoring::whole_array_parameter;
-    use crate::memory::{AsyncCopyOperation, WaitOperation};
+    use crate::memory::{
+        AsyncCopyOperation, MaskedStoreOperation, WINDOW_MASK_OPERATION_NAME, WaitOperation, WindowMaskOperation,
+    };
 
     use super::*;
+
+    #[test]
+    fn test_kernel_transform_error_display() {
+        assert_eq!(
+            KernelTransformError::Kernel(KernelError::Program(ProgramError::MalformedProgram(
+                "missing entry region".to_owned(),
+            )))
+            .to_string(),
+            "encountered malformed program: missing entry region",
+        );
+        assert_eq!(
+            KernelTransformError::Initialization(KernelInitializationError::Program(ProgramError::MalformedProgram(
+                "missing entry region".to_owned(),
+            )))
+            .to_string(),
+            "encountered malformed program: missing entry region",
+        );
+        assert_eq!(
+            KernelTransformError::Unsupported { message: "batch axes must match every kernel parameter".to_owned() }
+                .to_string(),
+            "kernel transform is unsupported: batch axes must match every kernel parameter",
+        );
+    }
 
     #[test]
     fn test_kernel_definition_batched() {
@@ -309,14 +394,17 @@ mod tests {
         .unwrap();
         let batched = definition.batched(3, &[Some(0), Some(0)], 10).unwrap();
         assert_eq!(batched.operation().grid().dimensions().len(), 1);
-        assert_eq!(batched.body().instructions().len(), definition.body().instructions().len());
         assert_eq!(
-            batched.body().instructions()[0].operation().reference_access_descriptor(0).unwrap().transforms(),
-            &[ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }],
+            batched.body().to_string(),
+            indoc! {"
+                lambda %0:ref<i32[1]>, %1:ref<i32[1]>, %2:dimension<batch ∈ [0, 3)> .
+                let %3:i32[] = reference_read [transforms=[index(axis=0, index=0)]] %0
+                    () = reference_write [transforms=[index(axis=0, index=0)]] %1 %3
+                in ()"},
         );
         assert_eq!(
             batched.operation().output_types(),
-            vec![ArrayIrType::Array(ArrayType::new_static(DataType::I32, [3]))]
+            vec![ArrayIrType::Array(ArrayType::new_static(DataType::I32, [3]))],
         );
         let input = Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[2i32, 5, 9]).unwrap();
         assert_eq!(batched.interpret(vec![input.clone()], 10).unwrap(), vec![input]);
@@ -324,7 +412,7 @@ mod tests {
         let input = Array::from_elements(ArrayType::scalar(DataType::I32), &[7i32]).unwrap();
         assert_eq!(
             shared.interpret(vec![input], 10).unwrap(),
-            vec![Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[7i32, 7, 7]).unwrap(),]
+            vec![Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[7i32, 7, 7]).unwrap()],
         );
         let empty = definition.batched(0, &[Some(0), Some(0)], 0).unwrap();
         let input = Array::from_elements(ArrayType::new_static(DataType::I32, [0]), &[] as &[i32]).unwrap();
@@ -360,17 +448,16 @@ mod tests {
         let body = builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
         let definition = KernelDefinition::new(call, body).unwrap();
         let batched = definition.batched(3, &[Some(0), Some(1)], 10).unwrap();
-        let operation = batched.body().instructions()[0].operation();
         assert_eq!(
-            operation.reference_access_descriptor(0).unwrap().transforms(),
-            &[
-                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
-                selection.clone(),
-            ],
-        );
-        assert_eq!(
-            operation.reference_access_descriptor(1).unwrap().transforms(),
-            &[ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Static(0) }, selection,],
+            batched.body().to_string(),
+            indoc! {"
+                lambda %0:ref<i32[1, 2]>, %1:ref<i32[2, 1]>, %2:dimension<batch ∈ [0, 3)> .
+                let %3:ref<token[]> = async_copy [
+                    source_transforms=[index(axis=0, index=0), slice(axes=[0:2])],
+                    destination_transforms=[index(axis=1, index=0), slice(axes=[0:2])],
+                ] %0 %1
+                    () = wait %3
+                in ()"},
         );
         let input = Array::from_elements(ArrayType::new_static(DataType::I32, [3, 2]), &[1i32, 2, 3, 4, 5, 6]).unwrap();
         let output =
@@ -404,8 +491,8 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_batched_rejects_non_access_reference_uses() {
-        // A mapped reference can only be batched by prefixing an access path. Passing it into a region-carrying
-        // operation such as `condition` is not an access, so no path exists to receive the batch selection.
+        // A mapped reference can only be batched by prefixing an access path. Passing it into an operation that carries
+        // regions, such as `condition`, is not an access, so no path exists to receive the batch selection.
         let scalar = ArrayType::scalar(DataType::I32);
         let call = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),
@@ -444,6 +531,35 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_batched_rejects_window_masks() {
+        // The validity of a mapped window is not a reference access, so no access path can receive the batch
+        // selection and the widened window's validity would have the wrong shape. Batching therefore rejects it.
+        let vector = ArrayType::new_static(DataType::I32, [2]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(vector, KernelParameterAccess::WriteOnly).unwrap()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let output = builder.add_input(call.parameters()[0].body_type());
+        let value = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![5i32, 7]).unwrap()));
+        let mask = builder.add_instruction(WindowMaskOperation, vec![], vec![output], None).unwrap()[0];
+        builder
+            .add_instruction(MaskedStoreOperation::new(), vec![], vec![output, value, mask], None)
+            .unwrap();
+        let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
+        let definition = KernelDefinition::new(call, body).unwrap();
+        assert_eq!(definition.interpret(vec![], 1), Ok(vec![Array::vector(vec![5i32, 7]).unwrap()]));
+        assert!(matches!(
+            definition.batched(2, &[Some(0)], 10),
+            Err(KernelTransformError::Unsupported { message })
+                if message == format!(
+                    "operation `{WINDOW_MASK_OPERATION_NAME}` uses mapped reference input 0 outside a reference access",
+                ),
+        ));
+    }
+
+    #[test]
     fn test_kernel_definition_batched_inputs() {
         let vector = ArrayType::new_static(DataType::I32, [2]);
         let call = KernelCallOperation::new(
@@ -463,7 +579,7 @@ mod tests {
         assert_eq!(axes, vec![Some(0)]);
         assert_eq!(
             batched.interpret(vec![input], 3).unwrap(),
-            vec![Array::from_elements(ArrayType::new_static(DataType::I32, [3, 2]), &[1i32, 4, 2, 5, 3, 6],).unwrap()]
+            vec![Array::from_elements(ArrayType::new_static(DataType::I32, [3, 2]), &[1i32, 4, 2, 5, 3, 6]).unwrap()],
         );
         let value =
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[7i32, 9]).unwrap());
@@ -474,8 +590,6 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_batched_inputs_rejects_dynamic_batch_extents() {
-        use ryft_core::{DimensionVariable, Shape, Tracer, TracingContext};
-
         // The batch becomes a static grid dimension of the batched kernel, so a dynamic batch extent is rejected.
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let vector = ArrayType::new_static(DataType::I32, [4]);
@@ -513,10 +627,6 @@ mod tests {
 
     #[test]
     fn test_kernel_operation_batch() {
-        use std::sync::Arc;
-
-        use ryft_core::{AttachedRegions, DimensionValue, EagerContext, RecursiveBatchingDriver};
-
         let scalar = ArrayType::scalar(DataType::I32);
         let definition: KernelDefinition = KernelDefinition::trace(
             KernelCallOperation::new(

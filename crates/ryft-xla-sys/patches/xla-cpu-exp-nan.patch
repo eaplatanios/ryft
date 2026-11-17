@@ -1,0 +1,27 @@
+diff --git a/xla/backends/cpu/codegen/polynomial_approximations.cc b/xla/backends/cpu/codegen/polynomial_approximations.cc
+--- a/xla/backends/cpu/codegen/polynomial_approximations.cc
++++ b/xla/backends/cpu/codegen/polynomial_approximations.cc
+@@ -265,11 +265,18 @@
+   z = vb.MulAdd(z, vb.Mul(x, x), x);
+   z = vb.Add(one, z);
+ 
+-  // Convert n' to an i32.  This is safe because we clamped it above.
+-  // FPToSI(NaN) yields poison in LLVM IR; freeze it so smin/sub do not
+-  // propagate poison into pow2_1/pow2_2 and fold z * pow2 to poison on NaN.
+-  llvm::Value* n_i32 = b->CreateFreeze(b->CreateFPToSI(
+-      n, llvm::VectorType::get(b->getInt32Ty(), vector_width, false)));
++  // Convert n' to an i32.  This is safe for numbers because we clamped it
++  // above, but the clamp leaves a NaN in place and FPToSI(NaN) yields poison in
++  // LLVM IR. Freezing the poison is not enough: an arbitrary n' makes rem_bits
++  // arbitrary too, and adding rem_bits to the bits of a NaN z yields a value
++  // that is no longer a NaN (e.g., -inf). Convert zero in place of a NaN
++  // instead, so that rem_bits is 0, pow2 is 1.0f, and the NaN in z reaches the
++  // result.
++  llvm::Value* n_is_nan = b->CreateFCmpUNO(n, n);
++  llvm::Value* n_or_zero = b->CreateSelect(
++      n_is_nan, llvm::Constant::getNullValue(n->getType()), n);
++  llvm::Value* n_i32 = b->CreateFPToSI(
++      n_or_zero, llvm::VectorType::get(b->getInt32Ty(), vector_width, false));
+ 
+   auto splat_i32 = [&](int32_t v) {
+     return b->CreateVectorSplat(vector_width, b->getInt32(v));

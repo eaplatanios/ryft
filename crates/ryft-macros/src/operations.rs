@@ -23,11 +23,13 @@ const PROJECTED_ATTRIBUTE: Symbol = Symbol::new("projected");
 const MIXED_ATTRIBUTE: Symbol = Symbol::new("mixed");
 const COLLECTIVE_ATTRIBUTE: Symbol = Symbol::new("collective");
 const LOCKSTEP_ATTRIBUTE: Symbol = Symbol::new("lockstep");
+const FAMILY_ATTRIBUTE: Symbol = Symbol::new("family");
 const SKIP_FROM_ATTRIBUTE: Symbol = Symbol::new("skip_from");
 const STRUCTURAL_ROLE: Symbol = Symbol::new("structural");
 
 const IDENTITY_DISPATCHER: Symbol = Symbol::new("identity");
 const DISCHARGE_DISPATCHER: Symbol = Symbol::new("discharge");
+const PARTIAL_EVALUATION_DISPATCHER: Symbol = Symbol::new("partial_evaluation");
 const BATCHING_DISPATCHER: Symbol = Symbol::new("batching");
 const DIFFERENTIATION_DISPATCHER: Symbol = Symbol::new("differentiation");
 const TRANSPOSITION_DISPATCHER: Symbol = Symbol::new("transposition");
@@ -146,14 +148,6 @@ impl OperationCodeGenerator {
     ///     }
     ///
     ///     #[automatically_derived]
-    ///     impl<V: Value<Type = T>, __Context> ryft::PartiallyEvaluatableOperation<__Context> for CustomOperation<V>
-    ///     where
-    ///         ...
-    ///     {
-    ///         ...
-    ///     }
-    ///
-    ///     #[automatically_derived]
     ///     impl<V: Value<Type = T>> ryft::OperationPayloadProjection for CustomOperation<V> {
     ///         ...
     ///     }
@@ -222,7 +216,8 @@ impl OperationCodeGenerator {
         let operation = self.generate_operation_dispatcher();
         let discharge = self.dispatchers.discharge.then(|| self.generate_reference_discharge_dispatcher());
         let interpretation = self.generate_interpretation_dispatcher();
-        let partial_evaluation = self.generate_partial_evaluation_dispatcher();
+        let partial_evaluation =
+            self.dispatchers.partial_evaluation.then(|| self.generate_partial_evaluation_dispatcher());
         let batching = self.dispatchers.batching.then(|| self.generate_batching_dispatcher());
         let differentiation = self.dispatchers.differentiation.then(|| self.generate_differentiation_dispatcher());
         let transposition = self.dispatchers.transposition.then(|| self.generate_transposition_dispatcher());
@@ -786,11 +781,12 @@ impl OperationCodeGenerator {
         }
     }
 
-    /// Generates the `PartiallyEvaluatableOperation` dispatcher, which is generic over the partial evaluation context.
-    /// Family-native variants delegate to the partial evaluation rules of their payloads. Bare generic extension and
-    /// member variants instead use the canonical fold-or-residualize path of the complete enum, because a member
-    /// payload's own partial evaluation rule belongs to its native context and cannot consume the partial values
-    /// of the enclosing family without a separate parent-boundary contract.
+    /// Generates the `#[ryft(dispatch(partial_evaluation))]` implementation, which is a `PartiallyEvaluatableOperation`
+    /// dispatcher that is generic over the partial evaluation context. Family-native variants delegate to the partial
+    /// evaluation rules of their payloads. Bare generic extension, family, and member variants instead use the
+    /// canonical fold-or-residualize path of the complete enum, because the partial evaluation rule of a member or
+    /// family payload belongs to programs over its own family and cannot consume the partial values of the enclosing
+    /// family without a separate parent-boundary contract.
     fn generate_partial_evaluation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -799,7 +795,9 @@ impl OperationCodeGenerator {
         let value_type: syn::Type =
             syn::parse_quote!(#ryft::PartialEvaluationValue<<__Context as #ryft::Domain>::Value>);
         let delegates = |variant: &OperationVariant| {
-            !variant.is_generic_extension && matches!(variant.class, OperationVariantClass::FamilyNative)
+            !variant.is_generic_extension
+                && !variant.is_family
+                && matches!(variant.class, OperationVariantClass::FamilyNative)
         };
         let mut generics = self.program_generics.clone();
         generics.params.push(syn::parse_quote!(__Context));
@@ -1348,25 +1346,25 @@ impl OperationCodeGenerator {
         })
     }
 
-    /// Generates the `OperationPayloadProjection` implementation. Projected member variants delegate to their
-    /// member families in both directions, lifting constructed member operations through the `From<Member>`
+    /// Generates the `OperationPayloadProjection` implementation. Projected member and family variants delegate
+    /// to their payload families in both directions, lifting constructed operations through the `From<Payload>`
     /// conversion of the enum. Every other variant projects into its payload when the payload type is `'static`
     /// for every instantiation of the generic parameters of the enum (refer to [`is_unconditionally_static`]), and
-    /// such family-native variants are also constructed from their payloads, before any projected member is tried.
-    /// Mixed member variants are never constructed, and generic extension variants are neither projected nor
-    /// constructed.
+    /// such family-native variants are also constructed from their payloads, before any delegating variant is tried.
+    /// Delegating variants are tried in declaration order. Mixed member variants are never constructed, and generic
+    /// extension variants are neither projected nor constructed.
     fn generate_payload_projection_impl(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let self_type = &self.self_type;
         let mut generics = self.generics.clone();
         let mut projection_arms = Vec::new();
         let mut native_steps = Vec::new();
-        let mut member_steps = Vec::new();
+        let mut delegating_steps = Vec::new();
         for variant in self.variants.iter().filter(|variant| !variant.is_generic_extension) {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
-            if variant.class.projected_member_type().is_some() {
+            if variant.class.projected_member_type().is_some() || variant.is_family {
                 generics
                     .make_where_clause()
                     .predicates
@@ -1376,7 +1374,7 @@ impl OperationCodeGenerator {
                         <#payload_type as #ryft::OperationPayloadProjection>::project_payload(#receiver, payload)
                     }
                 });
-                member_steps.push(quote! {
+                delegating_steps.push(quote! {
                     let payload = match <#payload_type as #ryft::OperationPayloadProjection>::from_payload(payload) {
                         ::std::result::Result::Ok(operation) => {
                             return ::std::result::Result::Ok(<Self as ::std::convert::From<#payload_type>>::from(
@@ -1426,7 +1424,7 @@ impl OperationCodeGenerator {
                     payload: #ryft::ErasedOperation,
                 ) -> ::std::result::Result<Self, #ryft::ErasedOperation> {
                     #(#native_steps)*
-                    #(#member_steps)*
+                    #(#delegating_steps)*
                     ::std::result::Result::Err(payload)
                 }
             }
@@ -1911,8 +1909,9 @@ impl OperationParser {
     }
 
     /// Extracts the [`Dispatchers`] selected by a `#[ryft(dispatch(...))]` attribute into
-    /// [`OperationParser::dispatchers`]. Dispatchers may be listed in any order, but by convention `identity`
-    /// is listed first.
+    /// [`OperationParser::dispatchers`]. Dispatchers may be listed in any order, but by convention they are listed in
+    /// the order in which `ryft` places their implementations (i.e., `identity`, `discharge`, `partial_evaluation`,
+    /// `batching`, `differentiation`, and `transposition`).
     fn extract_dispatch_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
         if self.dispatchers.is_some() {
             return Err(meta.error("duplicate ryft attribute `dispatch(...)`"));
@@ -1928,13 +1927,14 @@ impl OperationParser {
             let selected = match &meta.path {
                 path if path == &IDENTITY_DISPATCHER => &mut dispatchers.identity,
                 path if path == &DISCHARGE_DISPATCHER => &mut dispatchers.discharge,
+                path if path == &PARTIAL_EVALUATION_DISPATCHER => &mut dispatchers.partial_evaluation,
                 path if path == &BATCHING_DISPATCHER => &mut dispatchers.batching,
                 path if path == &DIFFERENTIATION_DISPATCHER => &mut dispatchers.differentiation,
                 path if path == &TRANSPOSITION_DISPATCHER => &mut dispatchers.transposition,
                 _ => {
                     return Err(meta.error(format_args!(
-                        "invalid `#[ryft(dispatch(...))]` dispatcher `{}`; only `identity`, `discharge`, `batching`, \
-                         `differentiation`, and `transposition` are supported here",
+                        "invalid `#[ryft(dispatch(...))]` dispatcher `{}`; only `identity`, `discharge`, \
+                         `partial_evaluation`, `batching`, `differentiation`, and `transposition` are supported here",
                         meta.path.to_compact_string(),
                     )));
                 }
@@ -1968,7 +1968,7 @@ impl OperationParser {
     ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
     ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        let (class, generate_from, is_collective, is_lockstep) = self.extract_variant_attributes(variant);
+        let (class, generate_from, is_collective, is_lockstep, is_family) = self.extract_variant_attributes(variant);
         let field = match &variant.fields {
             syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
             _ => {
@@ -1994,6 +1994,13 @@ impl OperationParser {
             .ty
             .ident()
             .is_some_and(|ident| generics.type_params().any(|parameter| parameter.ident == *ident));
+        if is_family && is_generic_extension {
+            self.add_error(
+                &variant.ident,
+                "the `family` operation variant attribute requires a concrete payload family, but this variant holds \
+                 a bare generic payload",
+            );
+        }
 
         // Boxed payloads (i.e., type paths whose final segment is `Box` with exactly one type argument, like `Box<T>`
         // or `std::boxed::Box<T>`) dispatch to the boxed type.
@@ -2020,22 +2027,28 @@ impl OperationParser {
             generate_from,
             is_collective,
             is_lockstep,
+            is_family,
         })
     }
 
-    /// Extracts the [`OperationVariantClass`], the conversion policy, and the collective and lockstep markers declared
-    /// for the provided [`syn::Variant`] through its `#[ryft(...)]` attributes. Variants without a class marker are
-    /// family-native. The conversion policy is `false` when the variant declares `#[ryft(skip_from)]`, which suppresses
-    /// only its generated `From<Payload>` implementation so that a handwritten normalizing conversion can be used
-    /// instead. Its borrowed `TryFrom` projection is still generated. The collective marker is `true` when the variant
-    /// declares `#[ryft(collective)]`, which makes the generated `CollectiveOperation` implementation delegate to its
-    /// payload, and the lockstep marker is `true` when it declares `#[ryft(lockstep)]`, which does the same for the
-    /// generated `LockstepOperation` implementation.
-    fn extract_variant_attributes(&mut self, variant: &syn::Variant) -> (OperationVariantClass, bool, bool, bool) {
+    /// Extracts the [`OperationVariantClass`], the conversion policy, and the collective, lockstep, and family markers
+    /// declared for the provided [`syn::Variant`] through its `#[ryft(...)]` attributes. Variants without a class
+    /// marker are family-native. The conversion policy is `false` when the variant declares `#[ryft(skip_from)]`, which
+    /// suppresses only its generated `From<Payload>` implementation so that a handwritten normalizing conversion can be
+    /// used instead. Its borrowed `TryFrom` projection is still generated. The collective marker is `true` when the
+    /// variant declares `#[ryft(collective)]`, which makes the generated `CollectiveOperation` implementation delegate
+    /// to its payload, and the lockstep marker is `true` when it declares `#[ryft(lockstep)]`, which does the same for
+    /// the generated `LockstepOperation` implementation. The family marker is `true` when the variant declares
+    /// `#[ryft(family)]` (refer to [`OperationVariant::is_family`]), which only family-native variants may declare.
+    fn extract_variant_attributes(
+        &mut self,
+        variant: &syn::Variant,
+    ) -> (OperationVariantClass, bool, bool, bool, bool) {
         let mut class = None::<OperationVariantClass>;
         let mut generate_from = true;
         let mut is_collective = false;
         let mut is_lockstep = false;
+        let mut is_family = false;
         variant.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &SKIP_FROM_ATTRIBUTE && !generate_from => {
@@ -2057,6 +2070,13 @@ impl OperationParser {
                 }
                 path if path == &LOCKSTEP_ATTRIBUTE => {
                     is_lockstep = true;
+                    Ok(())
+                }
+                path if path == &FAMILY_ATTRIBUTE && is_family => {
+                    Err(meta.error("duplicate ryft operation variant attribute `family`"))
+                }
+                path if path == &FAMILY_ATTRIBUTE => {
+                    is_family = true;
                     Ok(())
                 }
                 path if path == &PROJECTED_ATTRIBUTE || path == &MIXED_ATTRIBUTE => {
@@ -2082,14 +2102,23 @@ impl OperationParser {
                      role form",
                 )),
                 _ => Err(meta.error(format_args!(
-                    "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, \
+                    "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, `family`, \
                      `collective`, `lockstep`, and `skip_from` are supported here",
                     meta.path.to_compact_string(),
                 ))),
             })
             .unwrap_or_else(|error| self.errors.push(error));
         });
-        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from, is_collective, is_lockstep)
+
+        // A family payload belongs to the primary operation type, and so it cannot also be a member payload.
+        if is_family && let Some(class) = &class {
+            self.add_error(
+                &variant.ident,
+                format_args!("contradictory ryft operation variant attributes `family` and `{}`", class.name()),
+            );
+        }
+
+        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from, is_collective, is_lockstep, is_family)
     }
 
     /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload conversions and
@@ -2327,6 +2356,9 @@ struct Dispatchers {
     /// Boolean flag indicating whether to generate the `ReferenceDischargeableOperation` dispatcher.
     discharge: bool,
 
+    /// Boolean flag indicating whether to generate the `PartiallyEvaluatableOperation` dispatcher.
+    partial_evaluation: bool,
+
     /// Boolean flag indicating whether to generate the `BatchableOperation` dispatcher.
     batching: bool,
 
@@ -2375,6 +2407,14 @@ struct OperationVariant {
     /// Boolean flag indicating whether the generated `LockstepOperation` implementation delegates to the payload of
     /// this [`OperationVariant`], which is the case when the variant declares `#[ryft(lockstep)]`.
     is_lockstep: bool,
+
+    /// Boolean flag indicating whether the payload of this [`OperationVariant`] is itself an operation family of the
+    /// primary operation type (e.g., an embedded `ArrayIrOperation`), which is the case when the variant declares
+    /// `#[ryft(family)]`. Such a variant is family-native, except that the generated `OperationPayloadProjection`
+    /// implementation delegates to the payload family in both directions and the generated partial evaluation
+    /// dispatcher uses the canonical fold-or-residualize path of the complete enum, because the partial evaluation
+    /// rule of the payload family belongs to programs over that family.
+    is_family: bool,
 }
 
 impl OperationVariant {
@@ -2848,12 +2888,13 @@ mod tests {
     #[test]
     fn test_operation_parser_extract_dispatch_attribute() {
         let parser = extract_attributes(quote! {
-            #[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]
+            #[ryft(dispatch(identity, discharge, partial_evaluation, batching, differentiation, transposition))]
             enum Operation<V: Value<Type = DataType>> {}
         });
         let dispatchers = parser.dispatchers.unwrap();
         assert!(dispatchers.identity);
         assert!(dispatchers.discharge);
+        assert!(dispatchers.partial_evaluation);
         assert!(dispatchers.batching);
         assert!(dispatchers.differentiation);
         assert!(dispatchers.transposition);
@@ -2865,6 +2906,7 @@ mod tests {
         let dispatchers = parser.dispatchers.unwrap();
         assert!(dispatchers.identity);
         assert!(!dispatchers.discharge);
+        assert!(!dispatchers.partial_evaluation);
         assert!(!dispatchers.batching);
         assert!(!dispatchers.differentiation);
         assert!(dispatchers.transposition);
@@ -2874,10 +2916,14 @@ mod tests {
             (quote!(#[ryft(dispatch())]), "`#[ryft(dispatch(...))]` must select at least one dispatcher"),
             (
                 quote!(#[ryft(dispatch(lowering))]),
-                "invalid `#[ryft(dispatch(...))]` dispatcher `lowering`; only `identity`, `discharge`, `batching`, \
-                 `differentiation`, and `transposition` are supported here",
+                "invalid `#[ryft(dispatch(...))]` dispatcher `lowering`; only `identity`, `discharge`, \
+                 `partial_evaluation`, `batching`, `differentiation`, and `transposition` are supported here",
             ),
             (quote!(#[ryft(dispatch(batching, batching))]), "duplicate ryft dispatcher `batching`"),
+            (
+                quote!(#[ryft(dispatch(partial_evaluation, partial_evaluation))]),
+                "duplicate ryft dispatcher `partial_evaluation`",
+            ),
             (quote!(#[ryft(dispatch(batching), dispatch(transposition))]), "duplicate ryft attribute `dispatch(...)`"),
         ] {
             let parser = extract_attributes(quote! {
@@ -2928,6 +2974,10 @@ mod tests {
                 Named { operation: ZeroOperation<DataType> },
                 Pair(ZeroOperation<DataType>, ZeroOperation<DataType>),
                 Field(#[ryft(projected(ArrayType))] ZeroOperation<DataType>),
+                #[ryft(family)]
+                Portable(ArrayIrOperation<V>),
+                #[ryft(family)]
+                FamilyExtension(Extension),
             }
         };
         let syn::Data::Enum(data) = &input.data else { unreachable!() };
@@ -2946,6 +2996,7 @@ mod tests {
         assert!(!zero.is_generic_extension);
         assert!(zero.generate_from);
         assert!(!zero.is_collective);
+        assert!(!zero.is_family);
         let array = variants[1].as_ref().unwrap();
         assert!(matches!(array.class, OperationVariantClass::ProjectedMember { structural: false, .. }));
         assert_eq!(array.payload_type.to_compact_string(), "ArrayOperation<V>");
@@ -2957,7 +3008,13 @@ mod tests {
         assert!(!extension.is_boxed);
         assert!(extension.is_generic_extension);
 
-        // Test using variants that are not tuple variants with exactly one payload field.
+        // Test extracting a family payload.
+        let portable = variants[7].as_ref().unwrap();
+        assert!(matches!(portable.class, OperationVariantClass::FamilyNative));
+        assert!(portable.is_family);
+
+        // Test using variants that are not tuple variants with exactly one payload field, and declaring a bare generic
+        // payload as a family.
         assert!(variants[3..6].iter().all(Option::is_none));
         assert!(variants[6].is_some());
         assert_eq!(
@@ -2968,6 +3025,8 @@ mod tests {
                 "operation enum variants must be tuple variants with exactly one payload field",
                 "operation field attributes are not supported; put operation member-class attributes on the \
                  enclosing variant",
+                "the `family` operation variant attribute requires a concrete payload family, but this variant \
+                 holds a bare generic payload",
             ],
         );
     }
@@ -2978,7 +3037,7 @@ mod tests {
         let variant: syn::Variant = syn::parse_quote!(Zero(ZeroOperation<DataType>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, false, false),
+            (OperationVariantClass::FamilyNative, true, false, false, false),
         ));
         let variant: syn::Variant = syn::parse_quote! {
             #[ryft(skip_from)]
@@ -2987,12 +3046,17 @@ mod tests {
         };
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::MixedMember { structural: true, .. }, false, true, false),
+            (OperationVariantClass::MixedMember { structural: true, .. }, false, true, false, false),
         ));
         let variant: syn::Variant = syn::parse_quote!(#[ryft(lockstep)] While(WhileOperation<ArrayIrType>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, false, true),
+            (OperationVariantClass::FamilyNative, true, false, true, false),
+        ));
+        let variant: syn::Variant = syn::parse_quote!(#[ryft(family, collective)] Portable(ArrayIrOperation<Array>));
+        assert!(matches!(
+            parser.extract_variant_attributes(&variant),
+            (OperationVariantClass::FamilyNative, true, true, false, true),
         ));
         assert_eq!(errors(&parser), Vec::<String>::new());
 
@@ -3001,6 +3065,15 @@ mod tests {
             (quote!(#[ryft(skip_from, skip_from)]), "duplicate ryft operation variant attribute `skip_from`"),
             (quote!(#[ryft(collective, collective)]), "duplicate ryft operation variant attribute `collective`"),
             (quote!(#[ryft(lockstep, lockstep)]), "duplicate ryft operation variant attribute `lockstep`"),
+            (quote!(#[ryft(family, family)]), "duplicate ryft operation variant attribute `family`"),
+            (
+                quote!(#[ryft(family, projected(ArrayType))]),
+                "contradictory ryft operation variant attributes `family` and `projected`",
+            ),
+            (
+                quote!(#[ryft(mixed(ArrayType))] #[ryft(family)]),
+                "contradictory ryft operation variant attributes `family` and `mixed`",
+            ),
             (
                 quote!(#[ryft(projected(ArrayType), projected(ArrayType))]),
                 "duplicate ryft operation variant class `projected`",
@@ -3015,7 +3088,7 @@ mod tests {
             ),
             (
                 quote!(#[ryft(transpose = custom)]),
-                "invalid operation variant `#[ryft(...)]` attribute `transpose`; only `projected`, `mixed`, \
+                "invalid operation variant `#[ryft(...)]` attribute `transpose`; only `projected`, `mixed`, `family`, \
                  `collective`, `lockstep`, and `skip_from` are supported here",
             ),
         ] {
@@ -3189,7 +3262,6 @@ mod tests {
                 "Display",
                 "Operation",
                 "InterpretableOperation",
-                "PartiallyEvaluatableOperation",
                 "OperationPayloadProjection",
                 "OperationProvider",
                 "From",
@@ -3199,7 +3271,7 @@ mod tests {
 
         let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
-            #[ryft(dispatch(transposition, differentiation, batching, discharge, identity))]
+            #[ryft(dispatch(transposition, differentiation, batching, partial_evaluation, discharge, identity))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
@@ -3657,12 +3729,16 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_partial_evaluation_dispatcher() {
+        // Family-native variants delegate to their payloads, while member, family, and generic extension variants use
+        // the canonical fold-or-residualize path of the complete enum.
         let operation = code_generator(quote! {
-            #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
+            #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), dispatch(partial_evaluation))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
                 Add(AddOperation<ArrayIrType>),
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
+                #[ryft(family)]
+                Portable(ArrayIrOperation<A>),
                 Extension(Extension),
             }
         });
@@ -3675,6 +3751,7 @@ mod tests {
                 where
                     AddOperation<ArrayIrType>: ryft::Operation<Type = ArrayIrType>,
                     ArrayOperation<A>: ryft::Operation<Type = ArrayType>,
+                    ArrayIrOperation<A>: ryft::Operation<Type = ArrayIrType>,
                     Extension: ryft::Operation<Type = ArrayIrType>,
                     ArrayType: ryft::Type<Identity = <ArrayIrType as ryft::Type>::Identity>,
                     ArrayIrType: ::std::convert::From<ArrayType>,
@@ -3703,6 +3780,9 @@ mod tests {
                                     partially_evaluate(operation, context, driver, inputs)
                             },
                             Self::Array(..) => {
+                                context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+                            },
+                            Self::Portable(..) => {
                                 context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
                             },
                             Self::Extension(..) => {
@@ -3739,6 +3819,9 @@ mod tests {
                                     split_on_residual_demand(operation, context, driver, inputs, demanded_outputs)
                             },
                             Self::Array(..) => {
+                                ::std::result::Result::Ok(::std::option::Option::None)
+                            },
+                            Self::Portable(..) => {
                                 ::std::result::Result::Ok(::std::option::Option::None)
                             },
                             Self::Extension(..) => {
@@ -4233,13 +4316,16 @@ mod tests {
     #[test]
     fn test_operation_code_generator_generate_payload_projection_impl() {
         // Mixed payloads project like native ones but are never constructed, native payloads are constructed before the
-        // projected member even though the member is declared first, and the generic-dependent payload and the generic
-        // extension neither project nor are constructed.
+        // projected member and the family even though these are declared first, the projected member and the family
+        // delegate in declaration order, and the generic-dependent payload and the generic extension neither project
+        // nor are constructed.
         let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
+                #[ryft(family)]
+                Portable(ArrayIrOperation<A>),
                 #[ryft(mixed(ArrayType))]
                 Gather(GatherOperation),
                 Dot(DotOperation),
@@ -4255,6 +4341,7 @@ mod tests {
                 impl<A: Value<Type = ArrayType>, Extension> ryft::OperationPayloadProjection for Operation<A, Extension>
                 where
                     ArrayOperation<A>: ryft::OperationPayloadProjection,
+                    ArrayIrOperation<A>: ryft::OperationPayloadProjection,
                 {
                     #[allow(unreachable_patterns)]
                     #[inline]
@@ -4265,6 +4352,10 @@ mod tests {
                         match self {
                             Self::Array(operation) => {
                                 <ArrayOperation<A> as ryft::OperationPayloadProjection>::
+                                    project_payload(operation, payload)
+                            }
+                            Self::Portable(operation) => {
+                                <ArrayIrOperation<A> as ryft::OperationPayloadProjection>::
                                     project_payload(operation, payload)
                             }
                             Self::Gather(operation) if payload == ::std::any::TypeId::of::<GatherOperation>() => {
@@ -4304,6 +4395,16 @@ mod tests {
                             ::std::result::Result::Ok(operation) => {
                                 return ::std::result::Result::Ok(
                                     <Self as ::std::convert::From<ArrayOperation<A>>>::from(operation),
+                                );
+                            }
+                            ::std::result::Result::Err(payload) => payload,
+                        };
+                        let payload = match <ArrayIrOperation<A> as ryft::OperationPayloadProjection>::
+                            from_payload(payload)
+                        {
+                            ::std::result::Result::Ok(operation) => {
+                                return ::std::result::Result::Ok(
+                                    <Self as ::std::convert::From<ArrayIrOperation<A>>>::from(operation),
                                 );
                             }
                             ::std::result::Result::Err(payload) => payload,

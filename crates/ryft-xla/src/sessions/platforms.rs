@@ -121,16 +121,18 @@ impl Platform {
     }
 
     /// Returns the options of the client that `ryft-xla` creates for this platform when a session supplies none.
-    /// These are the defaults of `ryft-pjrt` for the platform, except that a CUDA client allocates device memory on
-    /// demand instead of reserving most of it up front. The client is shared by every session of the process and is
-    /// never destroyed, and on devices whose memory is shared with the host an up-front reservation would also take
-    /// that memory from the rest of the system.
+    /// These are the defaults of `ryft-pjrt` for the platform, except that the allocator of a CUDA client grows on
+    /// demand instead of reserving most of the device memory up front. The client is shared by every session of the
+    /// process and is never destroyed, and on devices whose memory is shared with the host an up-front reservation
+    /// would also take that memory from the rest of the system. The allocator is still the best-fit one, and not
+    /// [`GpuMemoryAllocator::CudaAsync`], which asks the driver for every buffer. That costs about 100 microseconds
+    /// per eager operation and made an eager forward pass of a Transformer about five times slower.
     fn client_options(self) -> ClientOptions {
         match self {
             Self::Cpu => ClientOptions::CPU(CpuClientOptions::default()),
             Self::Cuda => ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                allocator: GpuMemoryAllocator::BFC { memory_fraction: 0.75, preallocate: false },
                 ..Default::default()
             }),
             Self::Rocm => {

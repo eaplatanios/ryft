@@ -1,22 +1,60 @@
-//! Dynamically selected kernel tiles over canonical reference views and array padding.
+//! Dynamically positioned tile loads over canonical reference views.
 //!
-//! Broadcast advanced indexing composes the existing [`BroadcastOperation`](ryft_core::operations::BroadcastOperation),
+//! A tile load reads a fixed size window of a reference view whose start along each axis is a runtime dimension value,
+//! so a kernel can read the tile that its grid point or loop iteration selects without knowing the tile position
+//! statically. [`TileLoadOperation`] (i.e., the `tile_load` operation) owns this access. Its result is an ordinary
+//! dense array, and an explicit [`BoundaryPolicy`] and padding value determine its contents where the window extends
+//! beyond the edge of the source view.
+//!
+//! # Inputs and Types
+//!
+//! The inputs of a tile load are the source reference, one dimension start per tile axis, and a rank-0 padding value
+//! with the data type and memory placement of the source, followed by the bindings of the source transforms. The
+//! transforms select a reference view of the source before the tile window applies, and that view must have a static
+//! shape with the rank of the tile. Type inference reuses the canonical rules rather than restating them. It infers the
+//! type of an empty slice of the view and pads that slice to the tile shape with [`PadOperation`], so the rules for
+//! distributed axes and padding values remain owned by those operations. The result drops any physical layout, because
+//! a tile load declares a dense result.
+//!
+//! # Boundary Semantics
+//!
+//! Each axis of the window starts at its dimension start and spans the tile extent. Under [`BoundaryPolicy::InBounds`],
+//! every window must lie inside the source view, and interpretation fails otherwise. Under
+//! [`BoundaryPolicy::Masked`], the window is clipped to the source view, and the result elements beyond its edge
+//! contain the exact encoding of the padding value, even when the clipped window is empty. Under either policy, only
+//! the valid clipped reference view is constructed and read, so no out-of-bounds reference is ever created or accessed,
+//! and a window limit beyond the canonical dimension width fails. Initialization validation conservatively requires the
+//! entire source view to be initialized, because the selected window is dynamic.
+//!
+//! # Authoring
+//!
+//! In a `#[kernel]` body, `input.tiles(shape).pad(value)` declares a tiled view of an input, which generates no code by
+//! itself. Each `load(indices)` of that view lowers to the [`tile_load`](crate::authoring::tile_load) authoring
+//! function. That function converts integer scalar tile indices into checked dimension values, multiplies each tile
+//! index by the tile extent to obtain an element start, and stages a tile load with [`BoundaryPolicy::Masked`] and the
+//! declared padding value.
+//!
+//! # Advanced Indexing
+//!
+//! This module defines no gather or scatter operations. Broadcast advanced indexing composes the existing
+//! [`BroadcastOperation`](ryft_core::operations::BroadcastOperation),
 //! [`ConcatenateOperation`](ryft_core::operations::ConcatenateOperation),
 //! [`GatherOperation`](ryft_core::operations::GatherOperation), and
 //! [`ScatterOperation`](ryft_core::operations::ScatterOperation). Broadcast signed integer query components to a common
-//! shape, append their index-vector axis, then concatenate the components. Use
-//! [`SelectOperation`](ryft_core::operations::SelectOperation) to replace an inactive query with a negative index and
+//! shape, append their index vector axis, and then concatenate the components. Use
+//! [`SelectOperation`](ryft_core::operations::SelectOperation) to replace an inactive query with a negative index, and
 //! [`GatherMode::Fill`](ryft_core::operations::GatherMode::Fill) to fill loads or
-//! [`ScatterMode::Drop`](ryft_core::operations::ScatterMode::Drop) to drop stores.
-//! Negative indices never wrap to the opposite array edge. Gather's explicit scalar fill preserves its exact encoding.
+//! [`ScatterMode::Drop`](ryft_core::operations::ScatterMode::Drop) to drop stores. Negative indices never wrap to the
+//! opposite array edge, and the explicit scalar fill of a gather preserves its exact encoding.
 //!
 //! Read the qualified reference with [`ReferenceRead`](ryft_core::operations::ReferenceRead) before gathering or
-//! scattering; publish the result with [`ReferenceWrite`](ryft_core::ReferenceWrite). This composition reads
-//! the complete source window. Indexed stores are full-window read-modify-write operations and require an already
+//! scattering, and publish the result with [`ReferenceWrite`](ryft_core::ReferenceWrite). This composition reads the
+//! complete source window. Indexed stores are read-modify-write operations over the whole window and require an already
 //! initialized destination, even when the selected indices happen to cover every element. Existing reference effects
-//! enforce that contract and reject unordered overlapping mutable windows. It does not establish partial write-only
-//! initialization or create an additional reference-view representation. More selective reference effects require a
-//! separate proof before admission; an inactive query mask alone does not waive full-window initialization.
+//! enforce that contract and reject unordered overlapping mutable windows. The composition does not establish partial
+//! write-only initialization or create an additional reference view representation. More selective reference effects
+//! require a separate proof before admission, and an inactive query mask alone does not waive the initialization of the
+//! whole window.
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -35,12 +73,14 @@ use crate::mappings::BoundaryPolicy;
 /// Canonical operation name for [`TileLoadOperation`].
 pub const TILE_LOAD_OPERATION_NAME: &str = "tile_load";
 
-/// Reads a dynamically selected fixed-size tile from a canonical reference. Inputs are the source reference,
-/// one checked dimension start per selected axis, and an explicit scalar padding value with the source dtype and
-/// memory, followed by the source path bindings. The source path is applied before the tile window.
-/// The result is an ordinary dense array. Masked loads create only a valid clipped reference view; all other result
-/// positions contain the exact padding-value encoding. No out-of-bounds reference is constructed or accessed.
-/// Initialization validation conservatively requires the entire source view initialized for dynamic selections.
+/// Reads a dynamically selected fixed size tile from a canonical reference as an ordinary dense array.
+///
+/// The inputs are the source reference, one checked dimension start per tile axis, and an explicit rank-0 padding value
+/// with the data type and memory placement of the source, followed by the bindings of the source transforms, which
+/// apply before the tile window. Under [`BoundaryPolicy::Masked`], the operation reads only a valid clipped reference
+/// view, and every other result element contains the exact encoding of the padding value. No out-of-bounds reference is
+/// constructed or accessed. Initialization validation conservatively requires the entire source view to be initialized,
+/// because the selection is dynamic.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLoadOperation {
     /// Static logical shape of each result tile.
@@ -54,12 +94,20 @@ pub struct TileLoadOperation {
 }
 
 impl TileLoadOperation {
-    /// Declares a tile shape and boundary policy, checking the canonical dimension-width limit.
+    /// Declares a tile shape and boundary policy, checking each extent against the canonical dimension width.
     pub fn new(block_shape: Vec<usize>, boundary_policy: BoundaryPolicy) -> Result<Self, TypeError> {
         if block_shape.iter().any(|&extent| extent > MAX_DIMENSION_EXTENT) {
-            return Err(TypeError::invalid("`tile_load` block shape exceeds the canonical dimension width"));
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` block shape exceeds the canonical dimension width",
+            )));
         }
         Ok(Self { block_shape, boundary_policy, transforms: Vec::new() })
+    }
+
+    /// Replaces the source selections applied before the tile window.
+    pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
+        self.transforms = transforms;
+        self
     }
 
     /// Returns the fixed result shape.
@@ -75,12 +123,6 @@ impl TileLoadOperation {
     /// Returns the boundary contract applied before reference access.
     pub fn boundary_policy(&self) -> BoundaryPolicy {
         self.boundary_policy
-    }
-
-    /// Replaces the source selections applied before the tile window.
-    pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
-        self.transforms = transforms;
-        self
     }
 }
 
@@ -107,7 +149,9 @@ impl Operation for TileLoadOperation {
         check_count!("input", input_types, rank + 2 + binding_count, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let ArrayIrType::Reference(reference) = &input_types[0] else {
-            return Err(TypeError::invalid("`tile_load` first input must be an array reference"));
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` first input must be an array reference",
+            )));
         };
         let source = infer_reference_view_type(
             reference.referent(),
@@ -116,16 +160,23 @@ impl Operation for TileLoadOperation {
             ReferenceAccessMode::Read,
         )?;
         if source.rank() != rank || source.static_shape().is_none() {
-            return Err(TypeError::invalid("`tile_load` source requires a static shape with the block rank"));
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` source requires a static shape with the block rank",
+            )));
         }
         if input_types[1..rank + 1].iter().any(|r#type| !matches!(r#type, ArrayIrType::Dimension(_))) {
-            return Err(TypeError::invalid("`tile_load` starts must be canonical dimensions"));
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` starts must be canonical dimensions",
+            )));
         }
         let ArrayIrType::Array(other) = &input_types[rank + 1] else {
-            return Err(TypeError::invalid("`tile_load` padding value must be a scalar array"));
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` padding value must be a scalar array",
+            )));
         };
-        // Infer through an empty valid slice and canonical padding, so distributed-axis and padding-value rules
-        // remain owned by the existing operations. Clear physical layout for the declared dense result contract.
+        // Infer through an empty valid slice and canonical padding, so the rules for distributed axes and padding
+        // values remain owned by the existing operations. Clear the physical layout for the declared dense result
+        // contract.
         let empty =
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1); rank] }.output_type(&source)?;
         let padding = PadOperation::<ArrayType>::new(
@@ -219,12 +270,16 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
         for ((start, &block), &extent) in inputs[1..rank + 1].iter().zip(&self.block_shape).zip(shape.dimensions()) {
             let ArrayIrValue::Dimension(start) = start else { unreachable!() };
             let start = start.extent();
-            let limit = start
-                .checked_add(block)
-                .filter(|&limit| limit <= MAX_DIMENSION_EXTENT)
-                .ok_or_else(|| TypeError::invalid("`tile_load` window limit exceeds the canonical dimension width"))?;
+            let limit = start.checked_add(block).filter(|&limit| limit <= MAX_DIMENSION_EXTENT).ok_or_else(|| {
+                TypeError::invalid(format!(
+                    "`{TILE_LOAD_OPERATION_NAME}` window limit exceeds the canonical dimension width",
+                ))
+            })?;
             if self.boundary_policy == BoundaryPolicy::InBounds && limit > extent {
-                return Err(TypeError::invalid("`tile_load` in-bounds window exceeds the source extent").into());
+                return Err(TypeError::invalid(format!(
+                    "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+                ))
+                .into());
             }
             let valid_start = start.min(extent);
             let valid_size = limit.min(extent).saturating_sub(valid_start);
@@ -246,20 +301,21 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex,
         BroadcastOperation, ConcatenateOperation, Context, DataType, DimensionValue, DotOperation,
-        GatherDimensionNumbers, GatherMode, GatherOperation, Placeholder, ProgramBuilder, ReferenceReadOperation,
-        ReferenceType, ReferenceWriteOperation, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-        ScatterReductionKind, SelectOperation,
+        GatherDimensionNumbers, GatherMode, GatherOperation, InstructionId, Placeholder, ProgramBuilder,
+        ReferenceReadOperation, ReferenceRoot, ReferenceType, ReferenceWriteOperation, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation,
     };
 
     use crate::authoring::{tiled_call, whole_array_parameter};
     use crate::calls::{KernelCallOperation, KernelDefinition, KernelError};
     use crate::grids::Grid;
+    use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
     use crate::operations::KernelOperation;
-    use crate::validation::{KernelParameterAccess, KernelValidationError};
+    use crate::validation::KernelParameterAccess;
 
     use super::*;
 
-    /// Broadcasts row/column queries and a mask into canonical gather/scatter index vectors.
+    /// Broadcasts row and column queries and a mask into canonical gather and scatter index vectors.
     fn advanced_index_definition(access: KernelParameterAccess) -> Result<KernelDefinition, KernelError> {
         let source_type = ArrayType::new_static(DataType::I32, [3, 4]);
         let query_type = ArrayType::new_static(DataType::I32, [2, 3]);
@@ -316,7 +372,7 @@ mod tests {
                     .unwrap()[0],
             );
         }
-        // Fill and drop modes treat the negative sentinel as invalid; it never wraps to the final source row.
+        // Fill and drop modes treat the negative sentinel as invalid, so it never wraps to the final source row.
         let rows = builder
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Select(SelectOperation::new())),
@@ -393,11 +449,13 @@ mod tests {
         let operation = TileLoadOperation::new(vec![2, 3], BoundaryPolicy::Masked).unwrap();
         assert_eq!(operation.block_shape(), &[2, 3]);
         assert_eq!(operation.boundary_policy(), BoundaryPolicy::Masked);
-        assert_eq!(operation.name(), "tile_load");
+        assert_eq!(operation.name(), TILE_LOAD_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "tile_load [block_shape=[2, 3], boundary=Masked]");
         assert_eq!(
             TileLoadOperation::new(vec![MAX_DIMENSION_EXTENT + 1], BoundaryPolicy::Masked),
-            Err(TypeError::invalid("`tile_load` block shape exceeds the canonical dimension width"))
+            Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` block shape exceeds the canonical dimension width",
+            ))),
         );
     }
 
@@ -407,12 +465,10 @@ mod tests {
         let operation =
             TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().with_transforms(transforms.clone());
         assert_eq!(operation.transforms(), transforms);
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
-        assert!(operation.reference_access_descriptor(1).is_none());
     }
 
     #[test]
-    fn test_tile_load_operation_infer_output_types() {
+    fn test_tile_load_operation_type_inference() {
         let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
         let inputs = vec![
             ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into(),
@@ -421,13 +477,54 @@ mod tests {
         ];
         assert_eq!(
             operation.infer_output_types(&inputs, &[]),
-            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))])
+            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))]),
         );
         let mut invalid = inputs;
         invalid[1] = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         assert_eq!(
             operation.infer_output_types(&invalid, &[]),
-            Err(TypeError::invalid("`tile_load` starts must be canonical dimensions"))
+            Err(TypeError::invalid(format!("`{TILE_LOAD_OPERATION_NAME}` starts must be canonical dimensions"))),
+        );
+    }
+
+    #[test]
+    fn test_tile_load_operation_effects() {
+        assert_eq!(
+            TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().effects().as_ref(),
+            &Effects::new(
+                EffectClasses::NONE,
+                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_tile_load_operation_render() {
+        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
+        assert_eq!(operation.to_string(), "tile_load [block_shape=[2], boundary=Masked]");
+        let operation = operation.with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Static(1),
+        }]);
+        assert_eq!(
+            operation.to_string(),
+            "tile_load [block_shape=[2], boundary=Masked, transforms=[index(axis=0, index=1)]]",
+        );
+
+        // Long metadata wraps one field per line.
+        let operation = operation.with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] },
+        ]);
+        assert_eq!(
+            operation.to_string(),
+            indoc! {"
+                tile_load [
+                    block_shape=[2],
+                    boundary=Masked,
+                    transforms=[index(axis=0, index=dynamic), slice(axes=[1:4])],
+                ]"},
         );
     }
 
@@ -446,18 +543,20 @@ mod tests {
         assert_eq!(
             context.bind(TileLoadOperation::new(vec![2, 2], BoundaryPolicy::Masked).unwrap(), vec![], &inputs),
             Ok(vec![ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[6i32, -1, -1, -1]).unwrap()
-            )])
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[6i32, -1, -1, -1]).unwrap(),
+            )]),
         );
         assert_eq!(
             context.bind(TileLoadOperation::new(vec![1, 1], BoundaryPolicy::InBounds).unwrap(), vec![], &inputs),
             Ok(vec![ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 1]), &[6i32]).unwrap()
-            )])
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 1]), &[6i32]).unwrap(),
+            )]),
         );
         assert_eq!(
             context.bind(TileLoadOperation::new(vec![2, 2], BoundaryPolicy::InBounds).unwrap(), vec![], &inputs),
-            Err(ProgramError::Type(TypeError::invalid("`tile_load` in-bounds window exceeds the source extent")))
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
         );
         assert_eq!(source.read().unwrap().elements::<i32>().unwrap(), vec![1, 2, 3, 4, 5, 6]);
     }
@@ -478,9 +577,9 @@ mod tests {
                     ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
                     ArrayIrValue::Array(Array::scalar(-7i32).unwrap()),
                     ArrayIrValue::Array(Array::scalar(1i64).unwrap()),
-                ]
+                ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![5i32, 6, -7]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![5i32, 6, -7]).unwrap())]),
         );
     }
 
@@ -500,7 +599,7 @@ mod tests {
         assert_eq!(value.logical_bytes(), other.logical_bytes().repeat(2));
         assert_eq!(
             context.bind(TileLoadOperation::new(vec![0], BoundaryPolicy::Masked).unwrap(), vec![], &inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())]),
         );
     }
 
@@ -562,51 +661,18 @@ mod tests {
                     Array::from_elements(source_type, &[1.0f32, 2.0, 3.0, 4.0, 5.0]).unwrap(),
                     Array::from_elements(filter_type, &[2.0f32, -1.0, 3.0]).unwrap(),
                 ],
-                3
+                3,
             ),
-            Ok(vec![Array::from_elements(output_type, &[9.0f32, 13.0, 17.0]).unwrap()])
+            Ok(vec![Array::from_elements(output_type, &[9.0f32, 13.0, 17.0]).unwrap()]),
         );
     }
 
     #[test]
-    fn test_tile_load_operation_effects() {
-        assert_eq!(
-            TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().effects().as_ref(),
-            &Effects::new(
-                EffectClasses::NONE,
-                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn test_tile_load_operation_render() {
-        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
-        assert_eq!(operation.to_string(), "tile_load [block_shape=[2], boundary=Masked]");
-        let operation = operation.with_transforms(vec![ArrayReferenceTransform::Index {
-            axis: 0,
-            index: ArrayReferenceTransformIndex::Static(1),
-        }]);
-        assert_eq!(
-            operation.to_string(),
-            "tile_load [block_shape=[2], boundary=Masked, transforms=[index(axis=0, index=1)]]",
-        );
-
-        // Long metadata wraps one field per line.
-        let operation = operation.with_transforms(vec![
-            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
-            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] },
-        ]);
-        assert_eq!(
-            operation.to_string(),
-            indoc! {"
-                tile_load [
-                    block_shape=[2],
-                    boundary=Masked,
-                    transforms=[index(axis=0, index=dynamic), slice(axes=[1:4])],
-                ]"},
-        );
+    fn test_tile_load_operation_reference_access_descriptor() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().with_transforms(transforms);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
+        assert!(operation.reference_access_descriptor(1).is_none());
     }
 
     #[test]
@@ -624,7 +690,7 @@ mod tests {
             ]),
         );
         assert_eq!(source, Array::matrix(3, 4, (0i32..12).collect()).unwrap());
-        // Explicit invalid active queries have exactly the same fill/drop semantics as inactive mask lanes.
+        // Explicit invalid active queries have exactly the same fill and drop semantics as inactive mask elements.
         assert_eq!(
             definition.interpret(
                 vec![
@@ -644,27 +710,16 @@ mod tests {
 
     #[test]
     fn test_kernel_advanced_indexing_requires_initialized_destination() {
-        let error = advanced_index_definition(KernelParameterAccess::WriteOnly).unwrap_err();
-        let KernelError::Validation(KernelValidationError::DisallowedAccess {
-            input_index,
-            access,
-            mode,
-            operation,
-            instruction,
-        }) = &error
-        else {
-            panic!("unexpected error: {error}")
-        };
-        assert_eq!(*input_index, 0);
-        assert_eq!(*access, KernelParameterAccess::WriteOnly);
-        assert_eq!(*mode, ReferenceAccessMode::Read);
-        assert_eq!(*operation, "reference_read");
-        assert_eq!(instruction.region().index(), 0);
-        assert_eq!(instruction.index(), 0);
+        // The boundary admits a read of a write-only destination, and the initialization analysis then rejects it
+        // because nothing has written the destination before the scatter reads it.
+        let definition = advanced_index_definition(KernelParameterAccess::WriteOnly).unwrap();
+        let body = definition.body().entry_region_ref();
         assert_eq!(
-            error.to_string(),
-            "operation `reference_read` at ^0[0] performs a `read` access on kernel input 0, which the boundary \
-             contract declares write-only",
+            validate_kernel_initialization(body, definition.operation(), 1),
+            Err(KernelInitializationError::UninitializedRead {
+                instruction: InstructionId::new(body.id(), 0),
+                root: ReferenceRoot::RegionInput { region: body.id(), input_index: 0 },
+            }),
         );
     }
 }

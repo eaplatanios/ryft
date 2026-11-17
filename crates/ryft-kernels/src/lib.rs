@@ -1,12 +1,41 @@
-//! Backend-independent kernel authoring over ordinary Ryft programs.
+//! Backend independent kernels, which express a computation over blocks of arrays as an ordinary Ryft program that
+//! runs once per point of a logical grid.
 //!
-//! Start with [`kernel`] and ordinary [`Array`](ryft_core::arrays::Array) annotations. The macro constructs canonical
-//! array, dimension, reference, and control-flow operations; it does not run a separate tracing graph or select a
-//! compiler. Native compilation belongs to a [`KernelCompiler`], and execution belongs to its integration backend.
-//! The portable contract is the common authoring surface. Adapter APIs and exact GPU extensions remain experimental;
-//! this documentation does not promise a stabilized upstream ABI or unrestricted lowering on every target.
+//! This crate defines what a kernel means, checks that a kernel is well formed, and interprets kernels on the host. It
+//! compiles nothing itself. Compiler adapters (e.g., `ryft-mosaic`, `ryft-triton`, and cuTile in `ryft-cuda`)
+//! implement [`KernelCompiler`], and execution integrations (e.g., the `kernels` module of `ryft-xla`) embed the
+//! outputs of those adapters into executable programs. Using this crate therefore requires no XLA, CUDA, PJRT, or
+//! Python installation. Adapter APIs and target specific extensions remain experimental, and this documentation
+//! promises neither a stable upstream ABI nor that every kernel lowers on every target.
 //!
-//! # Author, inspect, and verify
+//! # Kernels
+//!
+//! A kernel call is a [`KernelCallOperation`], which consists of a [`Grid`] and a list of [`KernelParameter`]s. Each
+//! point of the grid runs one program of the kernel. Each parameter is a full array with a declared
+//! [`KernelParameterAccess`] (i.e., read-only, write-only, or read-write) and a [`BlockMapping`], which maps the grid
+//! coordinates of a program to the window of that array that the program accesses. The [`BoundaryPolicy`] of a mapping
+//! states whether every window must lie within its array or whether windows may extend past it, in which case the
+//! program must mask the invalid elements. A call may also take scalar prefetch values, which are rank-0 integer
+//! arrays that its mappings receive as dimensions after the grid coordinates. At its outer boundary, a call takes the
+//! read-only and read-write arrays followed by the scalar prefetch values, and it returns the write-only and read-write
+//! arrays.
+//!
+//! The body of a kernel is an ordinary Ryft program over [`KernelOperation`], which extends the canonical array,
+//! dimension, reference, and control flow operations of `ryft-core` with kernel specific operations. The body receives
+//! one block reference per parameter, the grid coordinates of its program, and the scalar prefetch values, and it
+//! returns nothing, because its stores into the block references of the write-only and read-write parameters produce
+//! the results of the call.
+//!
+//! # Lifecycle
+//!
+//! A kernel is authored either with the [`kernel`] attribute macro or with [`KernelDefinition::trace`], which traces a
+//! closure over the body inputs of an explicitly constructed [`KernelCallOperation`]. Both paths validate the traced
+//! body into a [`KernelDefinition`], which [`validate_kernel_body`] checks against the declared parameter accesses.
+//! [`VerifiedKernel::new`] then verifies that the definition initializes every result completely, accesses only valid
+//! windows, and has no conflicting writes. A definition can be interpreted on the host through
+//! [`KernelDefinition::interpret`], which performs the same verification first, or compiled by passing its
+//! [`VerifiedKernel`] to [`VerifiedKernel::compile`] with a [`KernelCompiler`]. Compiler options never rewrite the
+//! definition, so different compilers can compile the same verified definition.
 //!
 //! ```
 //! use ryft_core::{Array, ArrayType, DataType};
@@ -31,57 +60,69 @@
 //! assert_eq!(verified.definition().semantic_key().unwrap(), definition.semantic_key().unwrap());
 //! ```
 //!
-//! The callable interprets concrete host arrays or stages through an existing supported value context. The generated
-//! `add::definition` function accepts logical types, validates annotations and `requires` constraints, and returns
-//! an inspectable [`KernelDefinition`]. Choose a different compiler by passing the same verified definition to
-//! [`VerifiedKernel::compile`]; backend options do not rewrite the macro body. XLA owns its selected compiler binding,
-//! custom-call ABI, and executable lifecycle. Using this crate requires no XLA, CUDA, PJRT, or Python installation.
+//! The [`kernel`] macro replaces the annotated function with a callable of the same name and a module that contains a
+//! `definition` function. The callable takes values of any [`KernelCall`] type. It interprets concrete host arrays and
+//! binds the call into the context of staged values. Host interpretation verifies the definition first, and that
+//! verification enumerates the grid points only when the mapping of a parameter lacks a separable tiling proof (i.e.,
+//! when [`BlockMapping::tiling_axes`] returns `None`). In that case, the callable rejects grids with more than
+//! [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`] points, and otherwise it does not cap the grid. The
+//! `definition` function takes the logical types of the inputs, checks them against the input annotations and the
+//! `requires` constraint, and returns the inspectable [`KernelDefinition`] that the body traces into.
 //!
 //! The code that [`kernel`] generates names this crate through the `ryft` facade path `ryft::kernels` by default, so
 //! `#[ryft::kernels::kernel]` and `#[ryft::kernel]` need no arguments. Crates that depend on `ryft-kernels` directly,
 //! as the example above does, pass `crate = "ryft_kernels"`, and other paths are passed the same way, as in
 //! `#[kernels_alias::kernel(crate = "kernels_alias")]` for a renamed dependency. The macro cannot infer this path
 //! because a re-exported procedural attribute cannot see the path through which it was invoked. The override always
-//! names this kernel namespace, never `ryft-core`; generated code reaches core items through a hidden macro-support
-//! re-export of this crate.
+//! names this kernel namespace and never `ryft-core`, because generated code reaches core items through a hidden
+//! macro support re-export of this crate.
 //!
-//! # Tiles and control flow
+//! # Authoring
 //!
-//! Input annotations constrain dtype and rank; output annotations specify shape, tile shape, and boundary policy.
-//! `output.tile_index()` exposes logical grid coordinates. `input.tiles([width]).pad(0.0).load([index])` expresses a
-//! clipped load with explicit padding. `output.store(value)` uses the declared output window. [`BoundaryPolicy`]
-//! distinguishes proved in-bounds access from masked edge windows: masked elements must never read invalid memory.
-//! Shapes and annotation expressions specialize the definition. Supported loops and conditions in the body stage
-//! as canonical control flow, not arbitrary host callbacks. Loop-carried arrays retain simultaneous-update semantics;
-//! checked scalar indices preserve observable bounds assertions. Unsupported syntax produces source-span diagnostics.
+//! The macro admits a deliberate subset of Rust, so an expression that Rust accepts outside a kernel is not
+//! automatically admitted inside one. Input annotations constrain the data type and rank of each input, and the
+//! output annotation specifies the shape of the output and optionally a tile shape and boundary policy, which make
+//! the body run once per output tile on a parallel grid. In a tiled kernel, the statement
+//! `let [row, column] = output.tile_index();` outside loops and conditions binds the coordinates of the current tile.
+//! A tile view is declared as a `let` initializer such as `let tiles = input.tiles([width]).pad(0.0);` and loaded with
+//! `tiles.load([index])`, where the index counts tiles. Such a load stages a [`TileLoadOperation`] whose elements
+//! outside the input take the padding value. `output.store(value)` writes the window of the current program. [`zeros`]
+//! and [`dot`] stage canonical array operations, and bounded `for` loops and `if` statements stage canonical control
+//! flow rather than host callbacks. The macro rejects syntax outside its subset with diagnostics at the offending
+//! tokens, whereas some other mistakes (e.g., a `tile_index` pattern whose binding count differs from the rank of the
+//! grid) are reported when the definition is built.
 //!
-//! [`zeros`], [`dot`], reduction expressions, and tile loads reuse canonical array operations. The macro supports a
-//! deliberate syntax subset; a Rust expression accepted outside a kernel is not automatically admitted inside one.
-//! Use [`KernelDefinition::trace`] with [`KernelCallOperation`], [`KernelParameter`], [`Grid`], and [`BlockMapping`]
-//! for explicit builder control. Both authoring paths share initialization, alias, effect, and write-conflict checks.
+//! [`KernelDefinition::trace`] gives explicit control over the [`Grid`], the [`KernelParameter`]s, and their
+//! [`BlockMapping`]s, and the functions of [`authoring`] stage the same operations that the macro uses.
+//! [`mapped_call`] constructs a call from a grid and one [`ParameterWindow`] per parameter, whose block indices or
+//! element starts are [`MappingExpression`]s over the grid coordinates and the scalar prefetch values, so explicit
+//! builders need not construct mapping programs themselves. Within a body, [`WindowMaskOperation`] returns which
+//! elements of a window are valid, and a [`MaskedStoreOperation`] under that mask initializes a masked output window
+//! completely. The [`memory`] module also provides scratch storage, masked loads and swaps, and asynchronous copies,
+//! which [`masked_load`], [`masked_store`], [`masked_swap`], [`window_mask`], [`accumulate`], [`scratch`],
+//! [`async_copy`], and [`wait`] stage. A [`KernelExtension`] adds target specific operations whose semantics an adapter
+//! owns.
 //!
-//! # Transforms and debugging
+//! # Transforms, Identity, and Debugging
 //!
-//! [`KernelDefinition::batched`] adds a canonical grid axis and requalifies write ownership. Unmapped read-only
-//! inputs may be shared; unsupported shared writes and dynamic batching fail explicitly. Specialize scalar-prefetch
-//! values using [`KernelDefinition::specialize_prefetch`]; transforms do not read device buffers back to the host.
-//! Mutable bodies have no implicit differentiation rule. Execution integrations may accept explicit custom JVP/VJP
-//! rules or a pure fallback using their existing transform machinery. Rematerialization preserves the whole call.
+//!   - [`KernelDefinition::batched`] adds a parallel grid dimension for a batch and maps each batched parameter along
+//!     it. Unmapped read-only inputs remain shared, and every writable parameter must be mapped.
+//!   - [`KernelDefinition::specialize_grid`] replaces dynamic grid extents with static ones, and
+//!     [`KernelDefinition::specialize_prefetch`] binds scalar prefetch values to constants. Transforms never read
+//!     device buffers back to the host, so prefetch values must be specialized explicitly (e.g., before batching).
+//!   - [`KernelDefinition::semantic_key`] returns a versioned structural key of a definition, which excludes compiler
+//!     options and schedules, so caches can combine it with the configuration key of a compiler.
+//!   - [`KernelDefinition::to_source`] and [`KernelDefinition::from_source`] convert a definition to and from a
+//!     versioned [`KernelSource`] document, and decoding validates the reconstructed definition again.
+//!   - [`KernelDefinition::interpret_with_trace`] interprets a definition under explicit [`KernelDebugOptions`] and
+//!     records the operations and reference accesses of every step. [`KernelDefinition::interpret_interleavings`]
+//!     interprets it under every interleaving of the instructions of its programs that preserves the order within
+//!     each program, up to explicit bounds.
 //!
-//! [`KernelDebugOptions`] bounds interpretation and exposes canonical source/access traces. A successful interpreter
-//! run proves only the interpreted case, not target support or native performance. [`VerifiedKernel`] rechecks the
-//! current immutable body before adapter admission. Preserve its semantic identity when comparing compiler outputs.
-//!
-//! Runnable examples and hardware qualification status live with the compiler adapters (`ryft-xla`, `ryft-mosaic`,
-//! `ryft-triton`, and cuTile in `ryft-cuda`) and their READMEs. No separate support matrix is published; adapter
-//! documentation distinguishes hardware measurements from unavailable counters.
-
-// TODO(eaplatanios): Review this module and all of its submodules.
-
-// The `#[kernel]` macro emits paths under the public `ryft::kernels` facade namespace by default. This `self`-alias,
-// together with the `kernels` alias below, lets those same generated paths resolve when the macro is used inside
-// `ryft-kernels` itself.
-extern crate self as ryft;
+//! A successful interpretation proves only the interpreted case, and it implies neither target support nor native
+//! performance. Kernel calls have no implicit differentiation rule. The `kernels` module of `ryft-xla` stages kernels
+//! with explicit derivative rules or a pure fallback program, and it preserves the complete call through batching,
+//! control flow, and rematerialization.
 
 pub use ryft_macros::kernel;
 
@@ -101,11 +142,12 @@ pub mod transforms;
 pub mod validation;
 
 pub use authoring::{
-    KernelCall, dot, for_loop, shape_div_ceil, static_extent, tile_load, tile_store, tiled_call, whole_array_parameter,
-    zeros,
+    KernelCall, MappingExpression, ParameterWindow, accumulate, async_copy, compare, compare_dimension, dot, for_loop,
+    full, iota, mapped_call, masked_load, masked_load_or, masked_store, masked_swap, ones, reference_slice, scratch,
+    select, tile_load, tile_store, wait, whole_array_parameter, window_mask, zeros,
 };
 pub use calls::{
-    KERNEL_CALL_OPERATION_NAME, KERNEL_SCHEMA_VERSION, KernelCallOperation, KernelDefinition, KernelError,
+    KERNEL_CALL_OPERATION_NAME, KERNEL_KEY_VERSION, KernelCallOperation, KernelDefinition, KernelError,
     KernelParameter,
 };
 pub use compilation::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
@@ -120,29 +162,26 @@ pub use mappings::{BlockMapping, BlockMappingError, BlockWindow, BoundaryPolicy}
 pub use memory::{
     ASYNC_COPY_OPERATION_NAME, AsyncCopyOperation, KernelMemoryError, MASKED_LOAD_OPERATION_NAME,
     MASKED_STORE_OPERATION_NAME, MASKED_SWAP_OPERATION_NAME, MaskedLoadOperation, MaskedStoreOperation,
-    MaskedSwapOperation, SCRATCH_OPERATION_NAME, ScratchOperation, WAIT_OPERATION_NAME, WaitOperation,
+    MaskedSwapOperation, SCRATCH_OPERATION_NAME, ScratchOperation, WAIT_OPERATION_NAME, WINDOW_MASK_OPERATION_NAME,
+    WaitOperation, WindowMaskOperation,
 };
 pub use operations::{KernelExtension, KernelExtensionMemory, KernelOperation, NoKernelExtension};
 pub use scheduling::{KernelInterleaving, KernelSchedulingError};
-pub use serialization::KernelSerializationError;
+pub use serialization::{KernelSerializationError, KernelSource};
 pub use transforms::KernelTransformError;
 pub use validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelParameterSummary, KernelReferenceOperation,
     KernelReferenceSummary, KernelSwapLowering, KernelValidationError, validate_kernel_body,
 };
 
-/// Alias of this crate under the name it has in the `ryft` facade. Not public API: it makes the [`kernel`] macro's
-/// default `ryft::kernels::...` paths resolve inside this crate exactly as they do through the facade.
-#[doc(hidden)]
-pub use crate as kernels;
-
-/// Macro-support re-exports used by the code that [`kernel`] generates. Not public API: the generated code needs
-/// the core crate at a path derived from the kernel namespace, because a re-exported procedural attribute cannot
-/// see which path invoked it.
+/// Macro support re-exports used by the code that [`kernel`] generates, which are not public API. The generated code
+/// needs the core crate at a path derived from the kernel namespace, because a re-exported procedural attribute cannot
+/// see which path invoked it. Generated `definition` functions also call the checked shape metadata helpers (i.e.,
+/// [`static_extent`](authoring::static_extent) and [`shape_div_ceil`](authoring::shape_div_ceil)) and the tiled kernel
+/// call constructor [`tiled_call`](authoring::tiled_call) re-exported here, which exist only for that generated code.
 #[doc(hidden)]
 pub mod __private {
     pub use ryft_core as core;
-}
 
-#[cfg(test)]
-mod tests;
+    pub use crate::authoring::{shape_div_ceil, static_extent, tiled_call};
+}

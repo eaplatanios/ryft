@@ -897,7 +897,7 @@ impl Concretizable<bool> for Constant {
         match self {
             Self::Boolean(value) => Ok(*value),
             _ => Err(ProgramError::Concretization {
-                message: format!("cannot extract a concrete boolean from the staged xla constant `{self}`"),
+                message: format!("cannot extract a concrete boolean from the staged XLA constant `{self}`"),
             }),
         }
     }
@@ -1935,7 +1935,7 @@ mod tests {
         assert_eq!(
             Constant::Dimension(DimensionValue::constant(3).unwrap()).concretize(),
             Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from the staged xla constant `3`".to_string(),
+                message: "cannot extract a concrete boolean from the staged XLA constant `3`".to_string(),
             }),
         );
     }

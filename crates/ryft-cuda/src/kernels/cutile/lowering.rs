@@ -2,6 +2,24 @@
 //!
 //! Global windows use bounds-checked gather/scatter, including completely empty edge windows. Tile values use
 //! power-of-two physical shapes; reductions mask logical padding with the reduction identity before arithmetic.
+//!
+//! The validity mask of a window excludes its logical tile padding, its elements beyond the enclosing window, and,
+//! for a window with [`BoundaryPolicy::Masked`], its elements beyond the end of the array. Reads, writes, and add
+//! updates, including [`TileLoadOperation`](ryft_kernels::TileLoadOperation), gather and scatter under that mask, and a
+//! [`WindowMaskOperation`](ryft_kernels::WindowMaskOperation) returns it as a Boolean tile whose padding is false. The
+//! masked accesses (i.e., [`MaskedLoadOperation`](ryft_kernels::MaskedLoadOperation),
+//! [`MaskedStoreOperation`](ryft_kernels::MaskedStoreOperation), and
+//! [`MaskedSwapOperation`](ryft_kernels::MaskedSwapOperation)) gather and scatter under the intersection of that mask
+//! with their explicit mask, so they never touch padding, and a load or swap takes the corresponding element of its
+//! `other` input for every element outside that intersection. A masked swap always reads before it writes, even when
+//! its old value is dead, which is equivalent to a store because the read selects only the elements that the swap then
+//! overwrites and its result is unused.
+//!
+//! A read that follows a write to the same parameter in one block observes that write. Tile IR orders memory
+//! operations only through tokens, and the cuTile front end threads them so that every load waits for the last store
+//! to any array that may alias its own. The exporter declares all parameters in one alias group, so that ordering
+//! covers every pair of parameters. Each scatter writes distinct affine indices, so no scatter overlaps itself. This
+//! relies on the token ordering pass of the pinned front end, which its documentation does not state as a contract.
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
@@ -9,7 +27,7 @@ use ryft_core::{
     DimensionValue, DotDimensionNumbers, Operation, ProgramError, ReductionKind, ReferenceAccessOperation, RegionRef,
     Typed, validated_reference_access_descriptors,
 };
-use ryft_kernels::{GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
+use ryft_kernels::{BoundaryPolicy, GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
 
 use crate::kernels::cutile::{Error, Options, Parameter, data_type_name, launch_grid};
 
@@ -148,7 +166,20 @@ pub(super) fn lower(
     for (parameter, declaration) in call.parameters().iter().enumerate() {
         let starts = lowering.mapping(declaration.mapping(), &coordinates)?;
         let shape = declaration.mapping().block_shape().to_vec();
-        let limits = starts.iter().zip(&shape).map(|(start, extent)| format!("({start} + {extent})")).collect();
+        // A masked window may cross the end of its array, so its limits also clip to the array extents. Its mask is
+        // then its exact validity, which masked accesses and window masks require, instead of relying on the bounds
+        // checks of `ct.gather` and `ct.scatter`.
+        let limits = match declaration.mapping().boundary_policy() {
+            BoundaryPolicy::InBounds => {
+                starts.iter().zip(&shape).map(|(start, extent)| format!("({start} + {extent})")).collect()
+            }
+            BoundaryPolicy::Masked => starts
+                .iter()
+                .zip(&shape)
+                .zip(checked_shape(&declaration.r#type())?)
+                .map(|((start, extent), size)| format!("ct.minimum(({start} + {extent}), {size})"))
+                .collect(),
+        };
         let axes = (0..shape.len()).collect();
         let fixed = vec![None; shape.len()];
         inputs.push(Value::Reference { parameter, starts, shape, limits, axes, fixed, validity: vec![] });
@@ -323,6 +354,27 @@ impl Lowering {
                     self.write(&inputs[0], &expression(1)?)?;
                     vec![Value::Expression(previous)]
                 }
+                KernelOperation::Portable(ArrayIrOperation::ReferenceAddUpdate(_)) => {
+                    // The update is a gather, an addition, and a scatter of one window under its validity mask, and
+                    // the scatter follows the gather because both access the same parameter. A rank-0 parameter has
+                    // no window indices, so its only element is loaded and stored directly.
+                    let update = expression(1)?;
+                    if matches!(&inputs[0], Value::Reference { fixed, .. } if fixed.is_empty()) {
+                        let current = self.read(&inputs[0], "0")?;
+                        let sum = self.assign(format!("({current} + {update})"));
+                        self.write(&inputs[0], &sum)?;
+                    } else {
+                        let (parameter, indices, mask) = self.window(&inputs[0])?;
+                        let current = self.assign(format!(
+                            "ct.gather(p{parameter}, {indices}, mask={mask}, padding_value=0, check_bounds=True)"
+                        ));
+                        let sum = self.assign(format!("({current} + {update})"));
+                        self.line(format!(
+                            "ct.scatter(p{parameter}, {indices}, {sum}, mask={mask}, check_bounds=True)"
+                        ));
+                    }
+                    vec![]
+                }
                 KernelOperation::TileLoad(operation) => {
                     let Value::Reference { parameter, starts, limits, axes, fixed, validity, .. } = &inputs[0] else {
                         unreachable!()
@@ -342,6 +394,33 @@ impl Lowering {
                         validity: validity.clone(),
                     };
                     vec![Value::Expression(self.read(&reference, &expression(inputs.len() - 1)?)?)]
+                }
+                KernelOperation::MaskedLoad(_) => {
+                    let (parameter, indices, mask) = self.masked_window(&inputs[0], &expression(1)?)?;
+                    vec![Value::Expression(self.masked_gather(parameter, &indices, &mask, &expression(2)?))]
+                }
+                KernelOperation::MaskedStore(_) => {
+                    let (parameter, indices, mask) = self.masked_window(&inputs[0], &expression(2)?)?;
+                    let value = expression(1)?;
+                    self.line(format!("ct.scatter(p{parameter}, {indices}, {value}, mask={mask}, check_bounds=True)"));
+                    vec![]
+                }
+                KernelOperation::MaskedSwap(_) => {
+                    let (parameter, indices, mask) = self.masked_window(&inputs[0], &expression(2)?)?;
+                    let previous = self.masked_gather(parameter, &indices, &mask, &expression(3)?);
+                    let value = expression(1)?;
+                    self.line(format!("ct.scatter(p{parameter}, {indices}, {value}, mask={mask}, check_bounds=True)"));
+                    vec![Value::Expression(previous)]
+                }
+                KernelOperation::WindowMask(_) => {
+                    let Value::Reference { shape, .. } = &inputs[0] else { unreachable!() };
+                    let shape = physical_shape(shape);
+                    let (_, _, mask) = self.window(&inputs[0])?;
+                    vec![Value::Expression(self.assign(if mask == "True" {
+                        format!("ct.full({shape}, True, ct.bool_)")
+                    } else {
+                        format!("ct.broadcast_to({mask}, {shape})")
+                    }))]
                 }
                 KernelOperation::Portable(ArrayIrOperation::While(operation)) => {
                     let bound = operation
@@ -516,14 +595,16 @@ impl Lowering {
         (indices, if masks.is_empty() { "True".to_owned() } else { masks.join(" & ") })
     }
 
-    /// Loads a clipped global window with an explicit exact padding value.
-    fn read(&mut self, reference: &Value, other: &str) -> Result<String, Error> {
+    /// Returns the parameter of a global window, its global element indices, and its validity mask, which excludes
+    /// logical tile padding, elements beyond the enclosing window, and indexed away coordinates outside their window.
+    /// A window into a rank-0 parameter selects its only element, which is always valid.
+    fn window(&mut self, reference: &Value) -> Result<(usize, String, String), Error> {
         let Value::Reference { parameter, starts, shape, limits, axes, fixed, validity } = reference else {
             unreachable!()
         };
         checked_tile(shape)?;
         if fixed.is_empty() {
-            return Ok(self.assign(format!("ct.reshape(ct.load(p{parameter}, (0,), (1,)), ())")));
+            return Ok((*parameter, "(0,)".to_owned(), "True".to_owned()));
         }
         let (logical_indices, mut mask) = self.window_indices(starts, shape, limits);
         for condition in validity {
@@ -533,7 +614,23 @@ impl Lowering {
         for (&axis, index) in axes.iter().zip(logical_indices) {
             indices[axis] = Some(index);
         }
-        let indices = tuple(&indices.into_iter().map(Option::unwrap).collect::<Vec<_>>());
+        Ok((*parameter, tuple(&indices.into_iter().map(Option::unwrap).collect::<Vec<_>>()), mask))
+    }
+
+    /// Returns the parameter and global element indices of a global window together with the name of the intersection
+    /// of its validity mask with the explicit Boolean tile `mask`.
+    fn masked_window(&mut self, reference: &Value, mask: &str) -> Result<(usize, String, String), Error> {
+        let (parameter, indices, validity) = self.window(reference)?;
+        let mask = if validity == "True" { mask.to_owned() } else { format!("({validity}) & ({mask})") };
+        Ok((parameter, indices, self.assign(mask)))
+    }
+
+    /// Loads a clipped global window with an explicit exact padding value.
+    fn read(&mut self, reference: &Value, other: &str) -> Result<String, Error> {
+        let (parameter, indices, mask) = self.window(reference)?;
+        if matches!(reference, Value::Reference { fixed, .. } if fixed.is_empty()) {
+            return Ok(self.assign(format!("ct.reshape(ct.load(p{parameter}, (0,), (1,)), ())")));
+        }
         Ok(self.assign(format!(
             "ct.gather(p{parameter}, {indices}, mask={mask}, padding_value={other}, check_bounds=True)"
         )))
@@ -541,25 +638,22 @@ impl Lowering {
 
     /// Publishes only valid logical/global coordinates.
     fn write(&mut self, reference: &Value, value: &str) -> Result<(), Error> {
-        let Value::Reference { parameter, starts, shape, limits, axes, fixed, validity } = reference else {
-            unreachable!()
-        };
-        checked_tile(shape)?;
-        if fixed.is_empty() {
+        let (parameter, indices, mask) = self.window(reference)?;
+        if matches!(reference, Value::Reference { fixed, .. } if fixed.is_empty()) {
             self.line(format!("ct.store(p{parameter}, (0,), ct.reshape({value}, (1,)))"));
             return Ok(());
         }
-        let (logical_indices, mut mask) = self.window_indices(starts, shape, limits);
-        for condition in validity {
-            mask = format!("({mask}) & ({condition})");
-        }
-        let mut indices = fixed.clone();
-        for (&axis, index) in axes.iter().zip(logical_indices) {
-            indices[axis] = Some(index);
-        }
-        let indices = tuple(&indices.into_iter().map(Option::unwrap).collect::<Vec<_>>());
         self.line(format!("ct.scatter(p{parameter}, {indices}, {value}, mask={mask}, check_bounds=True)"));
         Ok(())
+    }
+
+    /// Gathers the elements of parameter `parameter` at `indices` that `mask` selects, and takes the corresponding
+    /// element of `other`, which has the type of the gathered tile, for every other element. The selection is explicit
+    /// because `other` is a tile, while the padding value of `ct.gather` is a scalar.
+    fn masked_gather(&mut self, parameter: usize, indices: &str, mask: &str, other: &str) -> String {
+        let loaded =
+            self.assign(format!("ct.gather(p{parameter}, {indices}, mask={mask}, padding_value=0, check_bounds=True)"));
+        self.assign(format!("ct.where({mask}, {loaded}, {other})"))
     }
 
     /// Lowers ordinary array operations, retaining their canonical logical output type.
@@ -854,12 +948,38 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArraySliceAxis, BroadcastLikeOperation, DimensionBounds, DimensionMulOperation, DimensionType,
+        ArraySliceAxis, BroadcastLikeOperation, Context, DimensionBounds, DimensionMulOperation, DimensionType,
         FillLikeOperation, IotaLikeOperation, IotaOperation, ReferenceRead, ReferenceWrite,
     };
-    use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
+    use ryft_kernels::{
+        Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess, MappingExpression,
+        ParameterWindow, accumulate, mapped_call, masked_load_or, masked_store, masked_swap, whole_array_parameter,
+        window_mask,
+    };
 
     use super::*;
+
+    /// Builds a call over two parallel programs whose parameters have the given types, accesses, and boundary policies.
+    /// Every window has three elements, so the second window of a five element array has one padding element, and its
+    /// physical tile has four elements.
+    fn tiled_call(parameters: Vec<(ArrayType, KernelParameterAccess, BoundaryPolicy)>) -> KernelCallOperation {
+        mapped_call(
+            Grid::new(vec![GridDimension::new(2usize.into(), GridExecution::Parallel)]).unwrap(),
+            parameters
+                .into_iter()
+                .map(|(r#type, access, boundary)| {
+                    let window = ParameterWindow::BlockIndices {
+                        block_shape: vec![3],
+                        boundary,
+                        indices: vec![MappingExpression::GridCoordinate(0)],
+                    };
+                    (r#type, access, window)
+                })
+                .collect(),
+            vec![],
+        )
+        .unwrap()
+    }
 
     /// Builds one source-owned scalar copy without backend or tool dependencies.
     fn scalar_copy() -> KernelDefinition {
@@ -938,6 +1058,230 @@ mod tests {
             Err(Error::Unsupported { operation: "kernel_call", reason })
                 if reason == "source construction exceeds the instruction budget"
         ));
+    }
+
+    #[test]
+    fn test_lower_masked_load() {
+        // The masked window limits clip to the array, so the padding element of the second window and the physical
+        // padding of every tile take the value `other`.
+        let operation = tiled_call(vec![
+            (ArrayType::new_static(DataType::F32, [5]), KernelParameterAccess::ReadOnly, BoundaryPolicy::Masked),
+            (ArrayType::new_static(DataType::F32, [6]), KernelParameterAccess::WriteOnly, BoundaryPolicy::InBounds),
+        ]);
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            references[1].write(&masked_load_or(references[0].context(), &references[0], -1f32)?)
+        })
+        .unwrap();
+        let kernel = VerifiedKernel::new(&definition, 2).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(
+            source.code,
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0, p1):
+                v0 = (ct.astype(ct.bid(0), ct.int64) % 2)
+                v1 = (ct.astype(ct.bid(0), ct.int64) // 2)
+                v2 = (v0 * 3)
+                v3 = (v0 * 3)
+                v4 = ct.broadcast_to(ct.full((), True, ct.bool_), (4,))
+                v5 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), (4,))
+                v6 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v7 = (v2 + v6)
+                v8 = (((v6 < 3) & (v7 < ct.minimum((v2 + 3), 5)))) & (v4)
+                v9 = ct.gather(p0, (v7,), mask=v8, padding_value=0, check_bounds=True)
+                v10 = ct.where(v8, v9, v5)
+                v11 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v12 = (v3 + v11)
+                ct.scatter(p1, (v12,), v10, mask=((v11 < 3) & (v12 < (v3 + 3))), check_bounds=True)
+                return
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lower_masked_store() {
+        let operation = tiled_call(vec![(
+            ArrayType::new_static(DataType::F32, [5]),
+            KernelParameterAccess::WriteOnly,
+            BoundaryPolicy::Masked,
+        )]);
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::vector(vec![5f32; 3])?))?;
+            let mask = window_mask(context, &references[0])?;
+            masked_store(context, &references[0], &value, &mask)
+        })
+        .unwrap();
+        let kernel = VerifiedKernel::new(&definition, 2).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(
+            source.code,
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0):
+                v0 = (ct.astype(ct.bid(0), ct.int64) % 2)
+                v1 = (ct.astype(ct.bid(0), ct.int64) // 2)
+                v2 = (v0 * 3)
+                v3 = ct.broadcast_to(ct.bitcast(ct.full((), 1084227584, ct.uint32), ct.float32), (4,))
+                v4 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v5 = (v2 + v4)
+                v6 = ct.broadcast_to(((v4 < 3) & (v5 < ct.minimum((v2 + 3), 5))), (4,))
+                v7 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v8 = (v2 + v7)
+                v9 = (((v7 < 3) & (v8 < ct.minimum((v2 + 3), 5)))) & (v6)
+                ct.scatter(p0, (v8,), v3, mask=v9, check_bounds=True)
+                return
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lower_masked_swap() {
+        let operation = tiled_call(vec![
+            (ArrayType::new_static(DataType::F32, [5]), KernelParameterAccess::ReadWrite, BoundaryPolicy::Masked),
+            (ArrayType::new_static(DataType::F32, [6]), KernelParameterAccess::WriteOnly, BoundaryPolicy::InBounds),
+        ]);
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let mask = context.lift(ArrayIrValue::Array(Array::vector(vec![true; 3])?))?;
+            let replacement = context.lift(ArrayIrValue::Array(Array::vector(vec![9f32; 3])?))?;
+            references[1].write(&masked_swap(context, &references[0], &replacement, &mask, -1f32)?)
+        })
+        .unwrap();
+        let kernel = VerifiedKernel::new(&definition, 2).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(
+            source.code,
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0, p1):
+                v0 = (ct.astype(ct.bid(0), ct.int64) % 2)
+                v1 = (ct.astype(ct.bid(0), ct.int64) // 2)
+                v2 = (v0 * 3)
+                v3 = (v0 * 3)
+                v4 = ct.broadcast_to(ct.full((), True, ct.bool_), (4,))
+                v5 = ct.broadcast_to(ct.bitcast(ct.full((), 1091567616, ct.uint32), ct.float32), (4,))
+                v6 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), (4,))
+                v7 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v8 = (v2 + v7)
+                v9 = (((v7 < 3) & (v8 < ct.minimum((v2 + 3), 5)))) & (v4)
+                v10 = ct.gather(p0, (v8,), mask=v9, padding_value=0, check_bounds=True)
+                v11 = ct.where(v9, v10, v6)
+                ct.scatter(p0, (v8,), v5, mask=v9, check_bounds=True)
+                v12 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v13 = (v3 + v12)
+                ct.scatter(p1, (v13,), v11, mask=((v12 < 3) & (v13 < (v3 + 3))), check_bounds=True)
+                return
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lower_window_mask() {
+        // The mask is false at the padding element of the second window and at the physical padding of every tile.
+        let operation = tiled_call(vec![
+            (ArrayType::new_static(DataType::F32, [5]), KernelParameterAccess::ReadOnly, BoundaryPolicy::Masked),
+            (ArrayType::new_static(DataType::Boolean, [6]), KernelParameterAccess::WriteOnly, BoundaryPolicy::InBounds),
+        ]);
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            references[1].write(&window_mask(references[0].context(), &references[0])?)
+        })
+        .unwrap();
+        let kernel = VerifiedKernel::new(&definition, 2).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(
+            source.code,
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0, p1):
+                v0 = (ct.astype(ct.bid(0), ct.int64) % 2)
+                v1 = (ct.astype(ct.bid(0), ct.int64) // 2)
+                v2 = (v0 * 3)
+                v3 = (v0 * 3)
+                v4 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v5 = (v2 + v4)
+                v6 = ct.broadcast_to(((v4 < 3) & (v5 < ct.minimum((v2 + 3), 5))), (4,))
+                v7 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v8 = (v3 + v7)
+                ct.scatter(p1, (v8,), v6, mask=((v7 < 3) & (v8 < (v3 + 3))), check_bounds=True)
+                return
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lower_reference_add_update() {
+        // The update gathers the window, adds the update to it, and scatters the sum back under the same mask.
+        let operation = tiled_call(vec![(
+            ArrayType::new_static(DataType::F32, [6]),
+            KernelParameterAccess::ReadWrite,
+            BoundaryPolicy::InBounds,
+        )]);
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::vector(vec![5f32; 3])?))?;
+            accumulate(context, &references[0], &value, BoundaryPolicy::InBounds)
+        })
+        .unwrap();
+        let kernel = VerifiedKernel::new(&definition, 2).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(
+            source.code,
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0):
+                v0 = (ct.astype(ct.bid(0), ct.int64) % 2)
+                v1 = (ct.astype(ct.bid(0), ct.int64) // 2)
+                v2 = (v0 * 3)
+                v3 = ct.broadcast_to(ct.bitcast(ct.full((), 1084227584, ct.uint32), ct.float32), (4,))
+                v4 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v5 = (v2 + v4)
+                v6 = ct.gather(p0, (v5,), mask=((v4 < 3) & (v5 < (v2 + 3))), padding_value=0, check_bounds=True)
+                v7 = (v6 + v3)
+                ct.scatter(p0, (v5,), v7, mask=((v4 < 3) & (v5 < (v2 + 3))), check_bounds=True)
+                return
+        "}
+        );
+
+        // A rank-0 parameter has no window, so its only element is loaded and stored directly.
+        let r#type = ArrayType::scalar(DataType::F32);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(r#type, KernelParameterAccess::ReadWrite).unwrap()],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(call, |(references, _)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::scalar(5f32)?))?;
+            accumulate(context, &references[0], &value, BoundaryPolicy::InBounds)
+        })
+        .unwrap();
+        let kernel = VerifiedKernel::new(&definition, 1).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(
+            source.code,
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0):
+                v0 = ct.broadcast_to(ct.bitcast(ct.full((), 1084227584, ct.uint32), ct.float32), ())
+                v1 = ct.reshape(ct.load(p0, (0,), (1,)), ())
+                v2 = (v1 + v0)
+                ct.store(p0, (0,), ct.reshape(v2, (1,)))
+                return
+        "}
+        );
     }
 
     #[test]

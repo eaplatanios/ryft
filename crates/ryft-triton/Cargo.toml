@@ -1,6 +1,6 @@
 [package]
 name = "ryft-triton"
-version = "0.0.3"
+version = "0.0.1"
 description = "Direct Triton compiler adapters for Ryft kernels."
 readme = "README.md"
 authors.workspace = true

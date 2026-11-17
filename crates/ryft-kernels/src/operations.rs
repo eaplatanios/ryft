@@ -1,74 +1,101 @@
 //! Kernel operation families over the canonical array, dimension, and reference universe.
 //!
-//! [`KernelOperation`] embeds [`ArrayIrOperation`] without copying its primitive variants or redefining their
-//! semantics. Adapters supply a typed extension family; [`NoKernelExtension`] makes the portable family uninhabited
-//! on that branch. Operation-family membership alone is not target admission: kernel validation and compiler
-//! capability checks still determine which operations a particular kernel may contain.
+//! A kernel body is an ordinary program whose instructions are [`KernelOperation`]s. This family embeds the portable
+//! [`ArrayIrOperation`] family without copying its primitive variants or redefining their semantics, and adds the
+//! operations that this crate owns (i.e., kernel calls, scratch storage, tile loads, masked accesses, window masks, and
+//! asynchronous copies). Every variant uses [`ArrayIrType`] and retains the effects, reference identities, region
+//! contracts, and diagnostics of its payload.
+//!
+//! # Extensions
+//!
+//! Adapters supply one typed extension family for their target-specific operations by implementing
+//! [`KernelExtension`]. Its [`KernelExtensionMemory`] classification specifies when the reference accesses of an
+//! extension operation complete, and its semantic key identifies the operation exactly. [`NoKernelExtension`] makes the
+//! extension branch uninhabited for portable kernels, and [`KernelOperation::map_extension`] converts only the
+//! extension payload when a kernel moves to another execution integration. Membership in an operation family alone is
+//! not target admission, because kernel validation and compiler capability checks still determine which operations a
+//! particular kernel may contain.
+//!
+//! # Conversions and Projections
+//!
+//! Canonical payloads convert into the portable variant through `From` implementations that reuse their array IR
+//! conversions, and the payloads that this crate owns convert into their own variants. The family also implements the
+//! payload projection, collective, and lockstep contracts of `ryft-core`, in which only the portable variant can be a
+//! collective or have a lockstep rule, and an extension payload is never consulted.
 
-use std::any::{Any, TypeId};
-use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
-use ryft_core::macros::impl_guardless_operation;
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
-    CollectiveAxes, CollectiveOperation, ConditionOperation, ConstantOperation, Context, DimensionOperation,
-    DimensionSizeOperation, DimensionType, DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation,
-    HiddenAxes, InputRegionProvenance, InterpretableOperation, InterpretationDriver, LockstepDomain, LockstepOperation,
-    LockstepValue, Operation, OperationBoundaryPruning, OperationFoldOutput, OperationPayloadProjection,
-    OperationProjection, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-    ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
-    TypeIdentityRenaming,
+    ConditionOperation, ConstantOperation, Context, DimensionOperation, DimensionSizeOperation, DimensionType,
+    DimensionValue, Domain, DynamicBroadcastOperation, InterpretableOperation, InterpretationDriver, Operation,
+    OperationProjection, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, TypeError,
 };
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
 use crate::indexing::TileLoadOperation;
 use crate::memory::{
-    AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation, WaitOperation,
+    AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation,
+    WaitOperation, WindowMaskOperation,
 };
 use crate::validation::KernelReferenceOperation;
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
 ///
 /// Access modes, aliases, and allocated referents come exclusively from canonical operation effects and types.
-/// This descriptor specifies when those accesses complete; it does not declare an independent memory model.
+/// This descriptor specifies when those accesses complete, and it does not declare an independent memory model.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum KernelExtensionMemory {
-    /// All declared accesses complete synchronously; reference views retain their canonical alias semantics.
+    /// All declared accesses complete synchronously, and reference views retain their canonical alias semantics.
     Synchronous,
 
     /// Creates one uninitialized local reference allocation with no accesses.
-    Allocation { output_index: usize },
+    Allocation {
+        /// Index of the output that holds the new allocation.
+        output_index: usize,
+    },
 
     /// Reserves all declared accesses until the newly allocated completion reference is waited.
-    Asynchronous { completion_output_index: usize },
+    Asynchronous {
+        /// Index of the output that holds the new completion reference.
+        completion_output_index: usize,
+    },
 
     /// Observes a pending completion reference without completing its accesses or publishing writes.
-    /// Hardware group counts and commit ordering remain the adapter's responsibility.
-    Commit { completion_input_index: usize },
+    /// Hardware group counts and commit ordering remain the responsibility of the adapter.
+    Commit {
+        /// Index of the input that holds the observed completion reference.
+        completion_input_index: usize,
+    },
 
     /// Consumes a pending completion reference and publishes its deferred writes.
-    Wait { completion_input_index: usize },
+    Wait {
+        /// Index of the input that holds the consumed completion reference.
+        completion_input_index: usize,
+    },
 
     /// Consumes a local allocation after all outstanding accesses complete.
-    Release { input_index: usize },
+    Release {
+        /// Index of the input that holds the consumed allocation.
+        input_index: usize,
+    },
 }
 
-/// Adapter-owned kernel semantics over the canonical array and reference universe.
+/// Kernel semantics that an adapter owns, over the canonical array and reference universe.
 ///
 /// Implementations are trusted semantic contracts, not target admission. A compiler must still validate the exact
 /// architecture, instruction capabilities, and resource requirements before compiling an extension. Extensions are
 /// `'static` so that kernel interpretation can attach regions of any lifetime to the extended kernel operations
 /// through [`AttachedRegions`](ryft_core::AttachedRegions).
 pub trait KernelExtension:
-    ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> + 'static
+    'static + ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>
 {
     /// Returns the checked initialization timing and lifetime contract for this operation.
     ///
-    /// The verifier checks consistency with canonical effects, output referents, and completion-token types. Nested
+    /// The verifier checks consistency with canonical effects, output referents, and completion token types. Nested
     /// extension regions are not admitted by this contract. Unimplemented classifications fail conservatively.
     fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
         Err(TypeError::invalid(format!("kernel extension `{}` has no initialization contract", self.name())))
@@ -80,9 +107,9 @@ pub trait KernelExtension:
     /// semantic option, and exact floating-point bits. It must not depend on diagnostic formatting or addresses.
     /// Inputs, results, regions, and their types are encoded by the enclosing kernel. Type identities in the
     /// payload must participate in ordinary operation identity renaming before this function is called.
-    /// Unsupported payloads fail explicitly; implementing this function does not enable source deserialization.
+    /// Unsupported payloads fail explicitly, and implementing this function does not enable source deserialization.
     fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
-        Err(TypeError::invalid(format!("kernel extension `{}` has no exact semantic identity contract", self.name(),)))
+        Err(TypeError::invalid(format!("kernel extension `{}` has no exact semantic identity contract", self.name())))
     }
 }
 
@@ -158,18 +185,25 @@ impl ReferenceAccessOperation for NoKernelExtension {
     }
 }
 
-/// Kernel body operation with a canonical portable family and an adapter-owned extension family.
+/// Kernel body operation with a canonical portable family and an extension family that an adapter owns.
 ///
 /// All variants use [`ArrayIrType`] and retain their payload's effects, reference identities, region contracts, and
 /// diagnostics. The extension has no implicit conversion into portable operations and no fallback interpretation.
 /// Construct an extension explicitly with [`KernelOperation::Extension`]. Backend selection is not stored here.
 ///
-/// Partial evaluation uses the existing conservative fold-or-residualize rule for the complete operation. This
+/// The `Operation` contract, interpretation, payload projection, collective and lockstep contracts, guard provider, and
+/// payload conversions are derived through `#[derive(Operation)]`, which treats [`Portable`](Self::Portable) as a
+/// nested operation family of the same type universe (i.e., `#[ryft(family)]`), so that payload projection looks
+/// through it.
+///
+/// Partial evaluation uses the existing conservative rule that folds or residualizes the complete operation. This
 /// preserves effects and nested regions without pretending that a nested portable program has a different operation
 /// universe. More specialized partitioning rules can be added when the owning kernel transform contract requires them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Operation)]
+#[ryft(crate = "ryft_core", type(ArrayIrType), constant(ArrayIrValue<Array>))]
 pub enum KernelOperation<Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
     /// An operation from the existing array, dimension, and reference family.
+    #[ryft(family, collective, lockstep)]
     Portable(ArrayIrOperation<Array>),
 
     /// A functional call whose attached region owns its kernel reference windows.
@@ -184,7 +218,7 @@ pub enum KernelOperation<Extension: Operation<Type = ArrayIrType> = NoKernelExte
     /// Starts a qualified asynchronous reference copy.
     AsyncCopy(AsyncCopyOperation),
 
-    /// Completes pending qualified asynchronous copies.
+    /// Completes a pending qualified asynchronous copy.
     Wait(WaitOperation),
 
     /// Reads only selected elements from an already valid reference view.
@@ -196,13 +230,16 @@ pub enum KernelOperation<Extension: Operation<Type = ArrayIrType> = NoKernelExte
     /// Replaces selected elements and returns their old values with explicit fallback elsewhere.
     MaskedSwap(MaskedSwapOperation),
 
+    /// Returns which elements of a reference are valid for the current grid point without accessing its storage.
+    WindowMask(WindowMaskOperation),
+
     /// A typed exact operation whose semantics and supported targets belong to its adapter.
     Extension(Extension),
 }
 
 impl<Extension: Operation<Type = ArrayIrType>> KernelOperation<Extension> {
-    /// Converts only the adapter-owned payload, preserving every canonical portable operation unchanged.
-    /// The conversion can reject an extension family unavailable to the destination execution integration.
+    /// Converts only the extension payload that the adapter owns, preserving every canonical portable operation
+    /// unchanged. The conversion can reject an extension family unavailable to the destination execution integration.
     pub fn map_extension<Other: Operation<Type = ArrayIrType>>(
         self,
         map: impl FnOnce(Extension) -> Result<Other, ProgramError>,
@@ -217,377 +254,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOperation<Extension> {
             Self::MaskedLoad(operation) => KernelOperation::MaskedLoad(operation),
             Self::MaskedStore(operation) => KernelOperation::MaskedStore(operation),
             Self::MaskedSwap(operation) => KernelOperation::MaskedSwap(operation),
+            Self::WindowMask(operation) => KernelOperation::WindowMask(operation),
             Self::Extension(operation) => KernelOperation::Extension(map(operation)?),
         })
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> Display for KernelOperation<Extension> {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Extension> {
-    type Type = ArrayIrType;
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Portable(operation) => operation.name(),
-            Self::Call(operation) => operation.name(),
-            Self::Scratch(operation) => operation.name(),
-            Self::TileLoad(operation) => operation.name(),
-            Self::AsyncCopy(operation) => operation.name(),
-            Self::Wait(operation) => operation.name(),
-            Self::MaskedLoad(operation) => operation.name(),
-            Self::MaskedStore(operation) => operation.name(),
-            Self::MaskedSwap(operation) => operation.name(),
-            Self::Extension(operation) => operation.name(),
-        }
-    }
-
-    fn defined_type_identities(&self) -> Cow<'_, [<Self::Type as Type>::Identity]> {
-        match self {
-            Self::Portable(operation) => operation.defined_type_identities(),
-            Self::Call(operation) => operation.defined_type_identities(),
-            Self::Scratch(operation) => operation.defined_type_identities(),
-            Self::TileLoad(operation) => operation.defined_type_identities(),
-            Self::AsyncCopy(operation) => operation.defined_type_identities(),
-            Self::Wait(operation) => operation.defined_type_identities(),
-            Self::MaskedLoad(operation) => operation.defined_type_identities(),
-            Self::MaskedStore(operation) => operation.defined_type_identities(),
-            Self::MaskedSwap(operation) => operation.defined_type_identities(),
-            Self::Extension(operation) => operation.defined_type_identities(),
-        }
-    }
-
-    fn region_slots(&self) -> &'static [RegionSlot] {
-        match self {
-            Self::Portable(operation) => operation.region_slots(),
-            Self::Call(operation) => operation.region_slots(),
-            Self::Scratch(operation) => operation.region_slots(),
-            Self::TileLoad(operation) => operation.region_slots(),
-            Self::AsyncCopy(operation) => operation.region_slots(),
-            Self::Wait(operation) => operation.region_slots(),
-            Self::MaskedLoad(operation) => operation.region_slots(),
-            Self::MaskedStore(operation) => operation.region_slots(),
-            Self::MaskedSwap(operation) => operation.region_slots(),
-            Self::Extension(operation) => operation.region_slots(),
-        }
-    }
-
-    fn validate_region_interfaces(
-        &self,
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<(), ProgramError> {
-        match self {
-            Self::Portable(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::Call(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::Scratch(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::TileLoad(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::AsyncCopy(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::Wait(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::MaskedLoad(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::MaskedStore(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::MaskedSwap(operation) => operation.validate_region_interfaces(region_interfaces),
-            Self::Extension(operation) => operation.validate_region_interfaces(region_interfaces),
-        }
-    }
-
-    fn infer_region_input_types(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
-        match self {
-            Self::Portable(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Call(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Scratch(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::TileLoad(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::AsyncCopy(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Wait(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::MaskedLoad(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::MaskedStore(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::MaskedSwap(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-            Self::Extension(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-        }
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
-        match self {
-            Self::Portable(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Call(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Scratch(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::TileLoad(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::AsyncCopy(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Wait(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::MaskedLoad(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::MaskedStore(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::MaskedSwap(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Extension(operation) => operation.infer_output_types(input_types, region_interfaces),
-        }
-    }
-
-    fn fold(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
-        match self {
-            Self::Portable(operation) => operation.fold(input_types, region_interfaces),
-            Self::Call(operation) => operation.fold(input_types, region_interfaces),
-            Self::Scratch(operation) => operation.fold(input_types, region_interfaces),
-            Self::TileLoad(operation) => operation.fold(input_types, region_interfaces),
-            Self::AsyncCopy(operation) => operation.fold(input_types, region_interfaces),
-            Self::Wait(operation) => operation.fold(input_types, region_interfaces),
-            Self::MaskedLoad(operation) => operation.fold(input_types, region_interfaces),
-            Self::MaskedStore(operation) => operation.fold(input_types, region_interfaces),
-            Self::MaskedSwap(operation) => operation.fold(input_types, region_interfaces),
-            Self::Extension(operation) => operation.fold(input_types, region_interfaces),
-        }
-    }
-
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
-        match self {
-            Self::Portable(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::Call(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::Scratch(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::TileLoad(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::AsyncCopy(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::Wait(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::MaskedLoad(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::MaskedStore(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::MaskedSwap(operation) => operation.input_region_provenance(region_index, input_index),
-            Self::Extension(operation) => operation.input_region_provenance(region_index, input_index),
-        }
-    }
-
-    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        match self {
-            Self::Portable(operation) => operation.output_region_provenance(output_index),
-            Self::Call(operation) => operation.output_region_provenance(output_index),
-            Self::Scratch(operation) => operation.output_region_provenance(output_index),
-            Self::TileLoad(operation) => operation.output_region_provenance(output_index),
-            Self::AsyncCopy(operation) => operation.output_region_provenance(output_index),
-            Self::Wait(operation) => operation.output_region_provenance(output_index),
-            Self::MaskedLoad(operation) => operation.output_region_provenance(output_index),
-            Self::MaskedStore(operation) => operation.output_region_provenance(output_index),
-            Self::MaskedSwap(operation) => operation.output_region_provenance(output_index),
-            Self::Extension(operation) => operation.output_region_provenance(output_index),
-        }
-    }
-
-    fn region_data_flow(&self) -> RegionDataFlow<'_> {
-        match self {
-            Self::Portable(operation) => operation.region_data_flow(),
-            Self::Call(operation) => operation.region_data_flow(),
-            Self::Scratch(operation) => operation.region_data_flow(),
-            Self::TileLoad(operation) => operation.region_data_flow(),
-            Self::AsyncCopy(operation) => operation.region_data_flow(),
-            Self::Wait(operation) => operation.region_data_flow(),
-            Self::MaskedLoad(operation) => operation.region_data_flow(),
-            Self::MaskedStore(operation) => operation.region_data_flow(),
-            Self::MaskedSwap(operation) => operation.region_data_flow(),
-            Self::Extension(operation) => operation.region_data_flow(),
-        }
-    }
-
-    fn prune_boundary(
-        &self,
-        input_types: &[Self::Type],
-        used_outputs: &[bool],
-        regions: &mut dyn RegionLiveness,
-    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
-        match self {
-            Self::Portable(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::Portable))),
-            Self::Call(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::Call))),
-            Self::Scratch(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::Scratch))),
-            Self::TileLoad(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::TileLoad))),
-            Self::AsyncCopy(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::AsyncCopy))),
-            Self::Wait(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::Wait))),
-            Self::MaskedLoad(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::MaskedLoad))),
-            Self::MaskedStore(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::MaskedStore))),
-            Self::MaskedSwap(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::MaskedSwap))),
-            Self::Extension(operation) => Ok(operation
-                .prune_boundary(input_types, used_outputs, regions)?
-                .map(|pruning| pruning.map_operation(Self::Extension))),
-        }
-    }
-
-    fn is_zero(&self, output_index: usize) -> bool {
-        match self {
-            Self::Portable(operation) => operation.is_zero(output_index),
-            Self::Call(operation) => operation.is_zero(output_index),
-            Self::Scratch(operation) => operation.is_zero(output_index),
-            Self::TileLoad(operation) => operation.is_zero(output_index),
-            Self::AsyncCopy(operation) => operation.is_zero(output_index),
-            Self::Wait(operation) => operation.is_zero(output_index),
-            Self::MaskedLoad(operation) => operation.is_zero(output_index),
-            Self::MaskedStore(operation) => operation.is_zero(output_index),
-            Self::MaskedSwap(operation) => operation.is_zero(output_index),
-            Self::Extension(operation) => operation.is_zero(output_index),
-        }
-    }
-
-    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
-        match self {
-            Self::Portable(operation) => operation.region_capture_input_count(region_index),
-            Self::Call(operation) => operation.region_capture_input_count(region_index),
-            Self::Scratch(operation) => operation.region_capture_input_count(region_index),
-            Self::TileLoad(operation) => operation.region_capture_input_count(region_index),
-            Self::AsyncCopy(operation) => operation.region_capture_input_count(region_index),
-            Self::Wait(operation) => operation.region_capture_input_count(region_index),
-            Self::MaskedLoad(operation) => operation.region_capture_input_count(region_index),
-            Self::MaskedStore(operation) => operation.region_capture_input_count(region_index),
-            Self::MaskedSwap(operation) => operation.region_capture_input_count(region_index),
-            Self::Extension(operation) => operation.region_capture_input_count(region_index),
-        }
-    }
-
-    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
-        match self {
-            Self::Portable(operation) => operation.reference_output_identity_input(output_index),
-            Self::Call(operation) => operation.reference_output_identity_input(output_index),
-            Self::Scratch(operation) => operation.reference_output_identity_input(output_index),
-            Self::TileLoad(operation) => operation.reference_output_identity_input(output_index),
-            Self::AsyncCopy(operation) => operation.reference_output_identity_input(output_index),
-            Self::Wait(operation) => operation.reference_output_identity_input(output_index),
-            Self::MaskedLoad(operation) => operation.reference_output_identity_input(output_index),
-            Self::MaskedStore(operation) => operation.reference_output_identity_input(output_index),
-            Self::MaskedSwap(operation) => operation.reference_output_identity_input(output_index),
-            Self::Extension(operation) => operation.reference_output_identity_input(output_index),
-        }
-    }
-
-    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
-        match self {
-            Self::Portable(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::Call(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::Scratch(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::TileLoad(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::AsyncCopy(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::Wait(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::MaskedLoad(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::MaskedStore(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::MaskedSwap(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-            Self::Extension(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
-        }
-    }
-
-    fn defers_reference_discharge(&self) -> bool {
-        match self {
-            Self::Portable(operation) => operation.defers_reference_discharge(),
-            Self::Call(operation) => operation.defers_reference_discharge(),
-            Self::Scratch(operation) => operation.defers_reference_discharge(),
-            Self::TileLoad(operation) => operation.defers_reference_discharge(),
-            Self::AsyncCopy(operation) => operation.defers_reference_discharge(),
-            Self::Wait(operation) => operation.defers_reference_discharge(),
-            Self::MaskedLoad(operation) => operation.defers_reference_discharge(),
-            Self::MaskedStore(operation) => operation.defers_reference_discharge(),
-            Self::MaskedSwap(operation) => operation.defers_reference_discharge(),
-            Self::Extension(operation) => operation.defers_reference_discharge(),
-        }
-    }
-
-    fn effects(&self) -> Cow<'_, Effects> {
-        match self {
-            Self::Portable(operation) => operation.effects(),
-            Self::Call(operation) => operation.effects(),
-            Self::Scratch(operation) => operation.effects(),
-            Self::TileLoad(operation) => operation.effects(),
-            Self::AsyncCopy(operation) => operation.effects(),
-            Self::Wait(operation) => operation.effects(),
-            Self::MaskedLoad(operation) => operation.effects(),
-            Self::MaskedStore(operation) => operation.effects(),
-            Self::MaskedSwap(operation) => operation.effects(),
-            Self::Extension(operation) => operation.effects(),
-        }
-    }
-
-    fn render(&self, formatter: &mut Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Portable(operation) => operation.render(formatter, indentation),
-            Self::Call(operation) => operation.render(formatter, indentation),
-            Self::Scratch(operation) => operation.render(formatter, indentation),
-            Self::TileLoad(operation) => operation.render(formatter, indentation),
-            Self::AsyncCopy(operation) => operation.render(formatter, indentation),
-            Self::Wait(operation) => operation.render(formatter, indentation),
-            Self::MaskedLoad(operation) => operation.render(formatter, indentation),
-            Self::MaskedStore(operation) => operation.render(formatter, indentation),
-            Self::MaskedSwap(operation) => operation.render(formatter, indentation),
-            Self::Extension(operation) => operation.render(formatter, indentation),
-        }
-    }
-
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
-    ) -> Result<Self, TypeError> {
-        match self {
-            Self::Portable(operation) => Ok(Self::Portable(operation.rename_type_identities(renaming)?)),
-            Self::Call(operation) => Ok(Self::Call(operation.rename_type_identities(renaming)?)),
-            Self::Scratch(operation) => Ok(Self::Scratch(operation.rename_type_identities(renaming)?)),
-            Self::TileLoad(operation) => Ok(Self::TileLoad(operation.rename_type_identities(renaming)?)),
-            Self::AsyncCopy(operation) => Ok(Self::AsyncCopy(operation.rename_type_identities(renaming)?)),
-            Self::Wait(operation) => Ok(Self::Wait(operation.rename_type_identities(renaming)?)),
-            Self::MaskedLoad(operation) => Ok(Self::MaskedLoad(operation.rename_type_identities(renaming)?)),
-            Self::MaskedStore(operation) => Ok(Self::MaskedStore(operation.rename_type_identities(renaming)?)),
-            Self::MaskedSwap(operation) => Ok(Self::MaskedSwap(operation.rename_type_identities(renaming)?)),
-            Self::Extension(operation) => Ok(Self::Extension(operation.rename_type_identities(renaming)?)),
-        }
-    }
-}
-
-impl<C: Domain<Type = ArrayIrType>, Extension> InterpretableOperation<C> for KernelOperation<Extension>
-where
-    Extension: Operation<Type = ArrayIrType> + InterpretableOperation<C>,
-    ArrayIrOperation<Array>: InterpretableOperation<C>,
-    KernelCallOperation: InterpretableOperation<C>,
-    TileLoadOperation: InterpretableOperation<C>,
-    MaskedLoadOperation: InterpretableOperation<C>,
-    MaskedStoreOperation: InterpretableOperation<C>,
-    MaskedSwapOperation: InterpretableOperation<C>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        context: &C,
-        driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        match self {
-            Self::Portable(operation) => operation.interpret(context, driver, inputs),
-            Self::Call(operation) => operation.interpret(context, driver, inputs),
-            Self::Scratch(operation) => operation.interpret(context, driver, inputs),
-            Self::TileLoad(operation) => operation.interpret(context, driver, inputs),
-            Self::AsyncCopy(operation) => operation.interpret(context, driver, inputs),
-            Self::Wait(operation) => operation.interpret(context, driver, inputs),
-            Self::MaskedLoad(operation) => operation.interpret(context, driver, inputs),
-            Self::MaskedStore(operation) => operation.interpret(context, driver, inputs),
-            Self::MaskedSwap(operation) => operation.interpret(context, driver, inputs),
-            Self::Extension(operation) => operation.interpret(context, driver, inputs),
-        }
     }
 }
 
@@ -603,8 +272,8 @@ where
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let regions = driver.region_programs();
         if let Self::Call(call) = self {
-            // Only concrete scalar-prefetch values specialize the call. Ordinary data inputs remain residual,
-            // even when known: static transforms must never execute a kernel's mutations.
+            // Only concrete scalar prefetch values specialize the call. Ordinary data inputs remain residual, even when
+            // known, because static transforms must never execute the mutations of a kernel.
             if !call.prefetch_types().is_empty() {
                 let remaining = inputs.len() - call.prefetch_types().len();
                 let values = inputs[remaining..]
@@ -641,14 +310,15 @@ where
     fn base_input_count(&self) -> usize {
         match self {
             Self::Portable(operation) => operation.base_input_count(),
-            Self::Call(operation) => operation.input_types().len(),
-            Self::Scratch(_) => 0,
+            Self::Call(operation) => operation.base_input_count(),
+            Self::Scratch(operation) => operation.base_input_count(),
             Self::TileLoad(operation) => operation.base_input_count(),
             Self::AsyncCopy(operation) => operation.base_input_count(),
-            Self::Wait(_) => 1,
+            Self::Wait(operation) => operation.base_input_count(),
             Self::MaskedLoad(operation) => operation.base_input_count(),
             Self::MaskedStore(operation) => operation.base_input_count(),
             Self::MaskedSwap(operation) => operation.base_input_count(),
+            Self::WindowMask(operation) => operation.base_input_count(),
             Self::Extension(operation) => operation.base_input_count(),
         }
     }
@@ -659,13 +329,15 @@ where
     ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
         match self {
             Self::Portable(operation) => operation.reference_access_descriptor(input_index),
-            Self::Call(_) | Self::Scratch(_) => None,
+            Self::Call(operation) => operation.reference_access_descriptor(input_index),
+            Self::Scratch(operation) => operation.reference_access_descriptor(input_index),
             Self::TileLoad(operation) => operation.reference_access_descriptor(input_index),
             Self::AsyncCopy(operation) => operation.reference_access_descriptor(input_index),
-            Self::Wait(_) => (input_index == 0).then(|| ReferenceAccessDescriptor::new(&[], 1..1)),
+            Self::Wait(operation) => operation.reference_access_descriptor(input_index),
             Self::MaskedLoad(operation) => operation.reference_access_descriptor(input_index),
             Self::MaskedStore(operation) => operation.reference_access_descriptor(input_index),
             Self::MaskedSwap(operation) => operation.reference_access_descriptor(input_index),
+            Self::WindowMask(operation) => operation.reference_access_descriptor(input_index),
             Self::Extension(operation) => operation.reference_access_descriptor(input_index),
         }
     }
@@ -679,12 +351,17 @@ where
             Self::Portable(operation) => {
                 Self::Portable(operation.with_reference_access_transforms(input_index, transforms)?)
             }
+            Self::Call(operation) => Self::Call(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::Scratch(operation) => {
+                Self::Scratch(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
             Self::TileLoad(operation) => {
                 Self::TileLoad(operation.with_reference_access_transforms(input_index, transforms)?)
             }
             Self::AsyncCopy(operation) => {
                 Self::AsyncCopy(operation.with_reference_access_transforms(input_index, transforms)?)
             }
+            Self::Wait(operation) => Self::Wait(operation.with_reference_access_transforms(input_index, transforms)?),
             Self::MaskedLoad(operation) => {
                 Self::MaskedLoad(operation.with_reference_access_transforms(input_index, transforms)?)
             }
@@ -694,48 +371,41 @@ where
             Self::MaskedSwap(operation) => {
                 Self::MaskedSwap(operation.with_reference_access_transforms(input_index, transforms)?)
             }
+            Self::WindowMask(operation) => {
+                Self::WindowMask(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
             Self::Extension(operation) => {
                 Self::Extension(operation.with_reference_access_transforms(input_index, transforms)?)
-            }
-            Self::Wait(_) if input_index == 0 && transforms.is_empty() => self.clone(),
-            _ => {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{}` does not support the requested transforms at input {input_index}",
-                    self.name(),
-                )));
             }
         })
     }
 }
 
-/// Implements lifts of canonical payloads into the kernel operation family.
+/// Implements the lift of one canonical payload into the portable variant of the kernel operation family.
 macro_rules! kernel_operation_from {
-    // Each listed payload uses its existing array-IR conversion, preserving normalization.
-    ($($operation:ty),* $(,)?) => {
-        $(impl<Extension: Operation<Type = ArrayIrType>> From<$operation> for KernelOperation<Extension> {
+    // Lifts the payload through its existing array IR conversion, which preserves its normalization.
+    ($operation:ty) => {
+        impl<Extension: Operation<Type = ArrayIrType>> From<$operation> for KernelOperation<Extension> {
             fn from(operation: $operation) -> Self {
                 Self::Portable(operation.into())
             }
-        })*
+        }
     };
 }
 
-kernel_operation_from!(
-    ArrayIrOperation<Array>,
-    ArrayOperation<Array>,
-    ConditionOperation<ArrayIrType>,
-    DimensionOperation<DimensionValue>,
-    ConstantOperation<DimensionValue>,
-    DimensionSizeOperation,
-    DynamicBroadcastOperation,
-    ReferenceNewOperation<ArrayType, ArrayIrType>,
-    ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-    ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-    ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-    ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-    ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
-    ReferenceFreezeOperation<ArrayType, ArrayIrType>,
-);
+kernel_operation_from!(ArrayOperation<Array>);
+kernel_operation_from!(ConditionOperation<ArrayIrType>);
+kernel_operation_from!(DimensionOperation<DimensionValue>);
+kernel_operation_from!(ConstantOperation<DimensionValue>);
+kernel_operation_from!(DimensionSizeOperation);
+kernel_operation_from!(DynamicBroadcastOperation);
+kernel_operation_from!(ReferenceNewOperation<ArrayType, ArrayIrType>);
+kernel_operation_from!(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>);
+kernel_operation_from!(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>);
+kernel_operation_from!(ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>);
+kernel_operation_from!(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>);
+kernel_operation_from!(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>);
+kernel_operation_from!(ReferenceFreezeOperation<ArrayType, ArrayIrType>);
 
 impl<Extension> KernelReferenceOperation for KernelOperation<Extension>
 where
@@ -751,163 +421,12 @@ where
     }
 }
 
-impl_guardless_operation!(
-    <Extension> KernelOperation<Extension> where Extension: Operation<Type = ArrayIrType>
-);
-
-impl<Extension: Operation<Type = ArrayIrType>> From<MaskedLoadOperation> for KernelOperation<Extension> {
-    fn from(operation: MaskedLoadOperation) -> Self {
-        Self::MaskedLoad(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<MaskedStoreOperation> for KernelOperation<Extension> {
-    fn from(operation: MaskedStoreOperation) -> Self {
-        Self::MaskedStore(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<MaskedSwapOperation> for KernelOperation<Extension> {
-    fn from(operation: MaskedSwapOperation) -> Self {
-        Self::MaskedSwap(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<AsyncCopyOperation> for KernelOperation<Extension> {
-    fn from(operation: AsyncCopyOperation) -> Self {
-        Self::AsyncCopy(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<WaitOperation> for KernelOperation<Extension> {
-    fn from(operation: WaitOperation) -> Self {
-        Self::Wait(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<TileLoadOperation> for KernelOperation<Extension> {
-    fn from(operation: TileLoadOperation) -> Self {
-        Self::TileLoad(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<ScratchOperation> for KernelOperation<Extension> {
-    fn from(operation: ScratchOperation) -> Self {
-        Self::Scratch(operation)
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> From<KernelCallOperation> for KernelOperation<Extension> {
-    fn from(operation: KernelCallOperation) -> Self {
-        Self::Call(operation)
-    }
-}
-
 impl<Extension: Operation<Type = ArrayIrType>> OperationProjection<ArrayType> for KernelOperation<Extension> {
     type Projected = ArrayOperation<Array>;
 }
 
 impl<Extension: Operation<Type = ArrayIrType>> OperationProjection<DimensionType> for KernelOperation<Extension> {
     type Projected = DimensionOperation<DimensionValue>;
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> OperationPayloadProjection for KernelOperation<Extension> {
-    fn project_payload(&self, payload: TypeId) -> Option<&dyn Any> {
-        // Portable operations delegate to the array-IR family, as projected member variants do in derived families,
-        // and the kernel-owned payloads are exposed directly. The adapter-owned extension is a generic payload, so it
-        // exposes nothing, as generic extension variants do in derived families.
-        let operation: &dyn Any = match self {
-            Self::Portable(operation) => return operation.project_payload(payload),
-            Self::Call(operation) => operation,
-            Self::Scratch(operation) => operation,
-            Self::TileLoad(operation) => operation,
-            Self::AsyncCopy(operation) => operation,
-            Self::Wait(operation) => operation,
-            Self::MaskedLoad(operation) => operation,
-            Self::MaskedStore(operation) => operation,
-            Self::MaskedSwap(operation) => operation,
-            Self::Extension(_) => return None,
-        };
-        (operation.type_id() == payload).then_some(operation)
-    }
-
-    fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
-        // The kernel-owned payloads take precedence over the portable family, as a derived family's own variants take
-        // precedence over its member families. The adapter-owned extension is never constructed.
-        payload
-            .downcast()
-            .map(Self::Call)
-            .or_else(|payload| payload.downcast().map(Self::Scratch))
-            .or_else(|payload| payload.downcast().map(Self::TileLoad))
-            .or_else(|payload| payload.downcast().map(Self::AsyncCopy))
-            .or_else(|payload| payload.downcast().map(Self::Wait))
-            .or_else(|payload| payload.downcast().map(Self::MaskedLoad))
-            .or_else(|payload| payload.downcast().map(Self::MaskedStore))
-            .or_else(|payload| payload.downcast().map(Self::MaskedSwap))
-            .or_else(|payload| ArrayIrOperation::<Array>::from_payload(payload).map(Self::Portable))
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>> CollectiveOperation for KernelOperation<Extension> {
-    fn axes(&self) -> Cow<'_, CollectiveAxes> {
-        // Only the portable operations can be collectives. The adapter-owned extension is a generic payload, so it is
-        // not consulted, as in the payload projection.
-        match self {
-            Self::Portable(operation) => operation.axes(),
-            Self::Call(_)
-            | Self::Scratch(_)
-            | Self::TileLoad(_)
-            | Self::AsyncCopy(_)
-            | Self::Wait(_)
-            | Self::MaskedLoad(_)
-            | Self::MaskedStore(_)
-            | Self::MaskedSwap(_)
-            | Self::Extension(_) => Cow::Owned(CollectiveAxes::default()),
-        }
-    }
-
-    fn hidden_axes(&self) -> HiddenAxes {
-        // Only the portable operations can have rules that are traced lazily (i.e., composite calls). The call's
-        // attached region reveals its own axes, and the extension is not consulted, as for the collective axes.
-        match self {
-            Self::Portable(operation) => operation.hidden_axes(),
-            Self::Call(_)
-            | Self::Scratch(_)
-            | Self::TileLoad(_)
-            | Self::AsyncCopy(_)
-            | Self::Wait(_)
-            | Self::MaskedLoad(_)
-            | Self::MaskedStore(_)
-            | Self::MaskedSwap(_)
-            | Self::Extension(_) => HiddenAxes::None,
-        }
-    }
-}
-
-impl<Extension: Operation<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> LockstepOperation<O>
-    for KernelOperation<Extension>
-{
-    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
-        &self,
-        context: &LockstepDomain<O>,
-        driver: &D,
-        inputs: &[LockstepValue<O>],
-    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
-        // Only the portable operations can have a rule over all emulated devices. The adapter-owned extension is a
-        // generic payload, so it is not consulted, as for the collective axes.
-        match self {
-            Self::Portable(operation) => operation.interpret_in_lockstep(context, driver, inputs),
-            Self::Call(_)
-            | Self::Scratch(_)
-            | Self::TileLoad(_)
-            | Self::AsyncCopy(_)
-            | Self::Wait(_)
-            | Self::MaskedLoad(_)
-            | Self::MaskedStore(_)
-            | Self::MaskedSwap(_)
-            | Self::Extension(_) => None,
-        }
-    }
 }
 
 impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<Extension>>
@@ -925,7 +444,8 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
             | KernelOperation::Wait(_)
             | KernelOperation::MaskedLoad(_)
             | KernelOperation::MaskedStore(_)
-            | KernelOperation::MaskedSwap(_) => {
+            | KernelOperation::MaskedSwap(_)
+            | KernelOperation::WindowMask(_) => {
                 Err(TypeError::invalid("cannot project a kernel-specific operation into a reference swap"))
             }
             KernelOperation::Extension(operation) => Err(TypeError::invalid(format!(
@@ -938,18 +458,19 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::borrow::Cow;
     use std::cell::Cell;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::macros::check_count;
     use ryft_core::{
-        AddOperation, ArrayIrValue, ArrayReferenceTransformIndex, AttachedRegions, Condition, DataType, Dimension,
-        DimensionBounds, DimensionMulOperation, DimensionVariable, EagerContext, EffectClasses, EmptyRegionDriver,
-        NegOperation,
-        PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder, ReferenceEffect, ReferenceRead,
-        ReferenceSwap, ReferenceType, ReferenceWrite, ScanOperation, Shape, StagingContext, SubOperation, TagOperation,
-        Tracer, TracingContext, TypedProgram,
+        AddOperation, ArrayReferenceTransformIndex, AttachedRegions, Condition, DataType, Dimension, DimensionBounds,
+        DimensionMulOperation, DimensionVariable, EagerContext, EffectClasses, Effects, EmptyRegionDriver,
+        ErasedOperation, NegOperation, OperationFoldOutput, OperationPayloadProjection, PartialEvaluationOutput,
+        PartialValue, Placeholder, ProgramBuilder, ReferenceAccessMode, ReferenceEffect, ReferenceRead, ReferenceSwap,
+        ReferenceType, ReferenceWrite, RegionDataFlow, ScanOperation, Shape, SubOperation, TagOperation, Tracer,
+        TracingContext,
     };
 
     use crate::calls::KernelParameter;
@@ -961,8 +482,8 @@ pub(crate) mod tests {
 
     /// Kernel extension family shared by the kernel unit tests, so that they instantiate one extended operation family.
     ///
-    /// Each variant reproduces one test fixture; the trait implementations dispatch per variant, and variants that
-    /// do not implement a contract fail with the same diagnostics as the corresponding [`KernelExtension`] defaults.
+    /// Each variant reproduces one test fixture. The trait implementations dispatch per variant, and variants that do
+    /// not implement a contract fail with the same diagnostics as the corresponding [`KernelExtension`] defaults.
     #[derive(Clone, Debug)]
     pub(crate) enum TestExtension {
         /// Subtracts its input from itself by binding a `sub` through its interpretation driver, as higher-order rules
@@ -982,7 +503,7 @@ pub(crate) mod tests {
         /// Has no accesses and completes synchronously.
         Synchronous,
 
-        /// Multi-source asynchronous update that reads two references, writes a third, and allocates a completion.
+        /// Asynchronous update from two sources that reads two references, writes a third, and allocates a completion.
         Update,
 
         /// Observes a pending completion reference.
@@ -1022,12 +543,12 @@ pub(crate) mod tests {
                     check_count!("input", input_types, 1, TypeError);
                     input_types.to_vec()
                 }
+                Self::HiddenKey { .. } | Self::Synchronous | Self::Commit | Self::Wait | Self::Release => vec![],
                 Self::Allocate(referent) => vec![ArrayIrType::Reference(ReferenceType::new(referent.clone()))],
-                Self::Update => vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
                 Self::MisclassifiedAllocation => {
                     vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)))]
                 }
-                Self::HiddenKey { .. } | Self::Synchronous | Self::Commit | Self::Wait | Self::Release => vec![],
+                Self::Update => vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
             })
         }
 
@@ -1106,6 +627,9 @@ pub(crate) mod tests {
     impl KernelExtension for TestExtension {
         fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
             Ok(match self {
+                Self::Rebinding | Self::MisclassifiedAllocation | Self::Synchronous => {
+                    KernelExtensionMemory::Synchronous
+                }
                 Self::HiddenKey { .. } => {
                     return Err(TypeError::invalid(format!(
                         "kernel extension `{}` has no initialization contract",
@@ -1113,9 +637,6 @@ pub(crate) mod tests {
                     )));
                 }
                 Self::Allocate(_) => KernelExtensionMemory::Allocation { output_index: 0 },
-                Self::Rebinding | Self::MisclassifiedAllocation | Self::Synchronous => {
-                    KernelExtensionMemory::Synchronous
-                }
                 Self::Update => KernelExtensionMemory::Asynchronous { completion_output_index: 0 },
                 Self::Commit => KernelExtensionMemory::Commit { completion_input_index: 0 },
                 Self::Wait => KernelExtensionMemory::Wait { completion_input_index: 0 },
@@ -1168,6 +689,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_map_extension() {
+        let portable = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
+        let mapped = portable.map_extension::<ArrayIrOperation<Array>>(|extension| match extension {}).unwrap();
+        assert!(matches!(mapped, KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_)))));
+        let extension =
+            KernelOperation::Extension(ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())));
+        assert!(matches!(extension.clone().map_extension(Ok).unwrap(), KernelOperation::Extension(_)));
+        assert_eq!(
+            extension
+                .map_extension::<NoKernelExtension>(|_| Err(ProgramError::UnsupportedOperation {
+                    message: "destination rejects this extension family".to_owned(),
+                }))
+                .unwrap_err(),
+            ProgramError::UnsupportedOperation { message: "destination rejects this extension family".to_owned() },
+        );
+    }
+
+    #[test]
     fn test_kernel_operation_identity_forwarding() {
         #[derive(Clone)]
         struct IdentityDefiningOperation {
@@ -1202,24 +741,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_kernel_operation_map_extension() {
-        let portable = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
-        let mapped = portable.map_extension::<ArrayIrOperation<Array>>(|extension| match extension {}).unwrap();
-        assert!(matches!(mapped, KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_)))));
-        let extension =
-            KernelOperation::Extension(ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())));
-        assert!(matches!(extension.clone().map_extension(Ok).unwrap(), KernelOperation::Extension(_)));
-        assert_eq!(
-            extension
-                .map_extension::<NoKernelExtension>(|_| Err(ProgramError::UnsupportedOperation {
-                    message: "destination rejects this extension family".to_owned(),
-                }))
-                .unwrap_err(),
-            ProgramError::UnsupportedOperation { message: "destination rejects this extension family".to_owned() },
-        );
-    }
-
-    #[test]
     fn test_kernel_operation_type_inference() {
         let operation = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
         let r#type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
@@ -1228,8 +749,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_operation_condition_region_interfaces() {
-        // Type inference and region-interface validation dispatch through the kernel wrapper exactly like through the
-        // bare `condition` operation that it wraps.
+        // Type inference and the validation of region interfaces dispatch through the kernel wrapper exactly like
+        // through the bare `condition` operation that it wraps.
         let bare = ConditionOperation::<ArrayIrType>::new();
         let operation =
             KernelOperation::<NoKernelExtension>::Portable(ArrayIrOperation::Condition(ConditionOperation::new()));
@@ -1316,23 +837,20 @@ pub(crate) mod tests {
         assert!(matches!(opaque.region_data_flow(), RegionDataFlow::Opaque));
         assert!(matches!(ordinary.region_data_flow(), RegionDataFlow::Provenance));
 
+        // Kernel dispatch forwards the custom region data flow of a portable or extension payload itself.
         let recurrent = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(ScanOperation::new(2, 3usize)));
-        for operation in [
-            KernelOperation::<ArrayIrOperation<Array>>::Portable(recurrent.clone()),
-            KernelOperation::Extension(recurrent),
-        ] {
-            let payload = match &operation {
-                KernelOperation::Portable(payload) | KernelOperation::Extension(payload) => payload,
-                _ => unreachable!(),
-            };
-            let RegionDataFlow::Custom(expected) = payload.region_data_flow() else {
-                panic!("a scan must declare its custom region data flow");
-            };
-            let RegionDataFlow::Custom(forwarded) = operation.region_data_flow() else {
-                panic!("kernel dispatch must retain custom region data flow");
-            };
-            assert!(std::ptr::eq(forwarded, expected));
-        }
+        let portable = KernelOperation::<ArrayIrOperation<Array>>::Portable(recurrent.clone());
+        let KernelOperation::Portable(payload) = &portable else { unreachable!() };
+        assert!(matches!(
+            (portable.region_data_flow(), payload.region_data_flow()),
+            (RegionDataFlow::Custom(forwarded), RegionDataFlow::Custom(expected)) if std::ptr::eq(forwarded, expected),
+        ));
+        let extension = KernelOperation::<ArrayIrOperation<Array>>::Extension(recurrent);
+        let KernelOperation::Extension(payload) = &extension else { unreachable!() };
+        assert!(matches!(
+            (extension.region_data_flow(), payload.region_data_flow()),
+            (RegionDataFlow::Custom(forwarded), RegionDataFlow::Custom(expected)) if std::ptr::eq(forwarded, expected),
+        ));
     }
 
     #[test]
@@ -1468,6 +986,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_partial_evaluation() {
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
+        let call = KernelCallOperation::new_with_prefetch(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::scalar(DataType::I32),
+                    KernelParameterAccess::WriteOnly,
+                    BlockMapping::new(
+                        mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
+                        vec![],
+                        BoundaryPolicy::InBounds,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace_with_prefetch(call, |(references, _, values)| references[0].write(&values[0]))
+                .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let region = builder.import_region(definition.body().entry_region_ref());
+        let outputs = builder
+            .add_instruction(KernelOperation::Call(definition.operation().clone()), vec![region], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let value = ArrayIrValue::Array(Array::scalar(2i32).unwrap());
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(value.clone())]).unwrap();
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:i32[] = kernel_call [
+                    grid=[],
+                    parameter_0=write-only i32[] [] InBounds,
+                    mapping_0={
+                        lambda  .
+                        let %0:dimension<2> = const 2
+                        in ()
+                    },
+                ] [
+                    body={
+                        lambda %0:ref<i32[]> .
+                        let %1:i32[] = const 2
+                            () = reference_write %0 %1
+                        in ()
+                    },
+                ]
+                in (%0)"},
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]).unwrap(), vec![value]);
+        let unknown = program
+            .partially_evaluate(&[PartialValue::Unknown(ArrayType::scalar(DataType::I32).into())])
+            .unwrap();
+        assert_eq!(
+            unknown.program().to_string(),
+            indoc! {"
+                lambda %0:i32[] .
+                let %1:i32[] = kernel_call [
+                    grid=[],
+                    prefetch_0=i32[],
+                    identities=[0],
+                    identity_0_bounds=[0, 4),
+                    parameter_0=write-only i32[] [] InBounds,
+                    mapping_0={
+                        lambda %0:dimension<offset ∈ [0, 4)> .
+                        in ()
+                    },
+                ] %0 [
+                    body={
+                        lambda %0:ref<i32[]>, %1:i32[] .
+                        let () = reference_write %0 %1
+                        in ()
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
     fn test_kernel_operation_reference_access_descriptor() {
         let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
         let canonical =
@@ -1483,14 +1090,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_project_payload() {
+        // Payloads that this crate owns are exposed directly, portable payloads through the array IR family, and
+        // extension payloads not at all.
+        let wait = KernelOperation::<NoKernelExtension>::from(WaitOperation);
+        let add = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
+        let extension =
+            KernelOperation::Extension(ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())));
+        assert_eq!(wait.projected_payload::<WaitOperation>(), Some(&WaitOperation));
+        assert!(wait.projected_payload::<AddOperation<ArrayType>>().is_none());
+        assert!(add.projected_payload::<AddOperation<ArrayType>>().is_some());
+        assert!(add.projected_payload::<WaitOperation>().is_none());
+        assert!(extension.projected_payload::<AddOperation<ArrayType>>().is_none());
+    }
+
+    #[test]
+    fn test_kernel_operation_from_payload() {
+        // Payloads that this crate owns construct their own variants and portable payloads construct through the array
+        // IR family, while payloads that no variant holds are returned unchanged.
+        let wait = KernelOperation::<NoKernelExtension>::from_payload(ErasedOperation::new(WaitOperation));
+        assert!(matches!(wait, Ok(KernelOperation::Wait(WaitOperation))));
+        let add = ErasedOperation::new(AddOperation::<ArrayType>::new());
+        let add = KernelOperation::<NoKernelExtension>::from_payload(add);
+        assert!(matches!(add, Ok(KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_))))));
+        let payload = ErasedOperation::new(TagOperation::<ArrayIrType>::new("unsupported"));
+        let payload = KernelOperation::<NoKernelExtension>::from_payload(payload).unwrap_err();
+        assert_eq!(payload.type_name(), std::any::type_name::<TagOperation<ArrayIrType>>());
+    }
+
+    #[test]
     fn test_kernel_operation_reference_staging() {
-        let context = TracingContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let r#type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)));
-        let reference = context.input(r#type);
-        let value = reference.read().unwrap();
-        reference.swap(&value).unwrap();
-        let builder = context.builder().borrow();
-        let swap = builder.instructions()[1].operation();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                let value = inputs[0].read()?;
+                Ok(vec![inputs[0].swap(&value)?])
+            },
+            vec![r#type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<i32[]> .
+                let %1:i32[] = reference_read %0
+                    %2:i32[] = reference_swap %0 %1
+                in (%2)"},
+        );
+        let swap = program.instructions()[1].operation();
         let projected =
             <&ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>::try_from(swap).unwrap();
         assert_eq!(projected.name(), "reference_swap");
@@ -1572,7 +1219,7 @@ pub(crate) mod tests {
             Err(TypeError::invalid("extension requires a reference input")),
         );
         assert_eq!(
-            operation.interpret(&EagerContext::<ArrayIrValue<Array>, KernelOperation>::new(), &EmptyRegionDriver, &[],),
+            operation.interpret(&EagerContext::<ArrayIrValue<Array>, KernelOperation>::new(), &EmptyRegionDriver, &[]),
             Err(ProgramError::MalformedProgram("extension has no registered interpreter".to_owned())),
         );
         assert_eq!(
@@ -1582,89 +1229,5 @@ pub(crate) mod tests {
                 "cannot project extension operation `unavailable_extension` into a canonical reference swap",
             )),
         );
-    }
-
-    #[test]
-    fn test_kernel_operation_partially_evaluate() {
-        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
-        let call = KernelCallOperation::new_with_prefetch(
-            Grid::new(vec![]).unwrap(),
-            vec![
-                KernelParameter::new(
-                    ArrayType::scalar(DataType::I32),
-                    KernelParameterAccess::WriteOnly,
-                    BlockMapping::new(
-                        mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
-                        vec![],
-                        BoundaryPolicy::InBounds,
-                    )
-                    .unwrap(),
-                )
-                .unwrap(),
-            ],
-            vec![ArrayType::scalar(DataType::I32)],
-        )
-        .unwrap();
-        let definition: KernelDefinition =
-            KernelDefinition::trace_with_prefetch(call, |(references, _, values)| references[0].write(&values[0]))
-                .unwrap();
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::I32).into());
-        let region = builder.import_region(definition.body().entry_region_ref());
-        let outputs = builder
-            .add_instruction(KernelOperation::Call(definition.operation().clone()), vec![region], vec![input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let value = ArrayIrValue::Array(Array::scalar(2i32).unwrap());
-        let evaluation = program.partially_evaluate(&[PartialValue::Known(value.clone())]).unwrap();
-        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
-        assert_eq!(evaluation.program().instructions().len(), 1);
-        assert!(evaluation.program().input_types().is_empty());
-        let KernelOperation::Call(specialized) = evaluation.program().instructions()[0].operation() else {
-            panic!("expected a residual kernel call");
-        };
-        assert!(specialized.prefetch_types().is_empty());
-        assert!(specialized.parameters()[0].mapping().program().input_types().is_empty());
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]).unwrap(), vec![value]);
-        let unknown = program
-            .partially_evaluate(&[PartialValue::Unknown(ArrayType::scalar(DataType::I32).into())])
-            .unwrap();
-        let KernelOperation::Call(residual) = unknown.program().instructions()[0].operation() else {
-            panic!("expected a residual kernel call");
-        };
-        assert_eq!(residual.prefetch_types(), definition.operation().prefetch_types());
-    }
-
-    #[test]
-    fn test_kernel_operation_project_payload() {
-        // Kernel-owned payloads are exposed directly, portable payloads through the array-IR family, and extension
-        // payloads not at all.
-        let wait = KernelOperation::<NoKernelExtension>::from(WaitOperation);
-        let add = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
-        let extension =
-            KernelOperation::Extension(ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())));
-        assert_eq!(wait.projected_payload::<WaitOperation>(), Some(&WaitOperation));
-        assert!(wait.projected_payload::<AddOperation<ArrayType>>().is_none());
-        assert!(add.projected_payload::<AddOperation<ArrayType>>().is_some());
-        assert!(add.projected_payload::<WaitOperation>().is_none());
-        assert!(extension.projected_payload::<AddOperation<ArrayType>>().is_none());
-    }
-
-    #[test]
-    fn test_kernel_operation_from_payload() {
-        // Kernel-owned payloads construct their own variants and portable payloads construct through the array-IR
-        // family, while payloads that no variant holds are returned unchanged.
-        let wait = KernelOperation::<NoKernelExtension>::from_payload(ErasedOperation::new(WaitOperation));
-        assert!(matches!(wait, Ok(KernelOperation::Wait(WaitOperation))));
-        let add = ErasedOperation::new(AddOperation::<ArrayType>::new());
-        let add = KernelOperation::<NoKernelExtension>::from_payload(add);
-        assert!(matches!(add, Ok(KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_))))));
-        let payload = ErasedOperation::new(TagOperation::<ArrayIrType>::new("unsupported"));
-        let payload = KernelOperation::<NoKernelExtension>::from_payload(payload).unwrap_err();
-        assert_eq!(payload.type_name(), std::any::type_name::<TagOperation<ArrayIrType>>());
     }
 }

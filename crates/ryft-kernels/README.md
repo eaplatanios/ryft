@@ -3,10 +3,12 @@
 > [!WARNING]
 > `ryft` is currently a work in progress and is evolving very actively. APIs and module or crate boundaries may change.
 
-`ryft-kernels` hosts Ryft's backend-independent kernel subsystem: the `#[kernel]` authoring macro, the kernel
-operation family, kernel definitions and verification, host interpretation for debugging, serialization, transforms,
-and the `KernelCompiler` interface that native compiler adapters implement. Kernel bodies are ordinary
-[`ryft-core`](../ryft-core) programs built from canonical array, dimension, reference, and control-flow operations.
+`ryft-kernels` hosts Ryft's backend-independent kernel subsystem: the kernel operation family, kernel definitions and
+verification, host interpretation for debugging, serialization, transforms, and the `KernelCompiler` interface that
+native compiler adapters implement. It also re-exports the `#[kernel]` authoring macro, which `ryft-macros` defines.
+Kernel bodies are ordinary [`ryft-core`](../ryft-core) programs built from canonical array, dimension, reference, and
+control-flow operations together with the kernel operations of this crate (e.g., tile loads and masked memory
+accesses).
 
 This crate has no native compiler, MLIR, PJRT, CUDA, ROCm, Mosaic, Triton, or XLA dependency. Native compilation and
 execution belong to the adapter crates and the XLA integration. The `ryft` crate re-exports this crate as

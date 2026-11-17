@@ -16,12 +16,7 @@ impl<'c, 't> Lowering<'c, 't> {
         operation: &DimensionOperation<DimensionValue>,
         inputs: &[KernelValue<'c, 't>],
     ) -> Result<Vec<KernelValue<'c, 't>>, Error> {
-        if !operation.effects().is_pure() {
-            return Err(Error::Unsupported {
-                operation: operation.name(),
-                reason: "runtime dimension assertions require native failure propagation".to_owned(),
-            });
-        }
+        validate_dimension(operation)?;
         let result = match operation {
             DimensionOperation::Constant(operation) => self.index(block, operation.value().extent())?,
             DimensionOperation::Add(_) => append(block, arith::addi(inputs[0], inputs[1], self.location)?)?,
@@ -35,12 +30,7 @@ impl<'c, 't> Lowering<'c, 't> {
             DimensionOperation::Rem(_) => append(block, arith::remui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Min(_) => append(block, arith::minui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Max(_) => append(block, arith::maxui(inputs[0], inputs[1], self.location)?)?,
-            DimensionOperation::Pow(_) => {
-                return Err(Error::Unsupported {
-                    operation: operation.name(),
-                    reason: "dimension operation is outside the native arithmetic baseline".to_owned(),
-                });
-            }
+            DimensionOperation::Pow(_) => unreachable!(),
         };
         Ok(vec![result])
     }
@@ -80,6 +70,25 @@ impl<'c, 't> Lowering<'c, 't> {
         }
         Ok(program.output_ids().iter().map(|output| values[output.index()].unwrap()).collect())
     }
+}
+
+/// Checks that [`Lowering::dimension`] lowers `operation`. Admission applies this same check to every dimension
+/// operation of a kernel body and of its block mappings, so it rejects exactly the dimension arithmetic that lowering
+/// rejects. Arithmetic that may fail at runtime is rejected until native device failure propagation is supported.
+pub(super) fn validate_dimension(operation: &DimensionOperation<DimensionValue>) -> Result<(), Error> {
+    if !operation.effects().is_pure() {
+        return Err(Error::Unsupported {
+            operation: operation.name(),
+            reason: "runtime dimension assertions require native failure propagation".to_owned(),
+        });
+    }
+    if let DimensionOperation::Pow(_) = operation {
+        return Err(Error::Unsupported {
+            operation: operation.name(),
+            reason: "dimension operation is outside the native arithmetic baseline".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

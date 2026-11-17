@@ -27,6 +27,8 @@ enum BadVariantClassesOperation {
     TooManyArguments(ZeroOperation<ArrayType>),
     #[ryft(mixed)]
     UndeclaredMembers(ZeroOperation<ArrayType>),
+    #[ryft(family, projected(ArrayType))]
+    ProjectedFamily(ZeroOperation<ArrayType>),
 }
 
 #[derive(ryft::Operation)]
@@ -36,6 +38,13 @@ enum BadDeclaredMemberTypesOperation {
     UndeclaredMemberType(ZeroOperation<ArrayType>),
     #[ryft(mixed(structural))]
     AmbiguousDefaultMemberType(ZeroOperation<ArrayType>),
+}
+
+#[derive(ryft::Operation)]
+#[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>))]
+enum BadFamilyOperation<Extension> {
+    #[ryft(family)]
+    GenericFamily(Extension),
 }
 
 fn main() {}

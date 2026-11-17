@@ -1,7 +1,39 @@
-//! Logical kernel grids with checked, bounded extents and deterministic enumeration.
+//! Logical kernel grids, which determine the programs that one kernel call runs.
 //!
-//! Grid dimensions reuse [`Dimension`] identities and bounds. A rank-zero grid contains one program; a grid with
-//! any zero extent contains none. Enumeration is row-major and does not imply an execution order for parallel axes.
+//! A [`Grid`] is an ordered list of [`GridDimension`]s, each with an extent, an optional name, and a [`GridExecution`].
+//! A kernel body runs once per grid point (i.e., once per tuple with one coordinate per dimension), and the block
+//! mappings of its parameters turn that tuple into the windows the program accesses. The grid is logical, so its
+//! dimensions are independent of the physical launch dimensions that a compiler adapter chooses.
+//!
+//! # Extents and Names
+//!
+//! Each extent is a [`Dimension`], which is either static or a [`DimensionVariable`] with bounds that execution binds
+//! to a concrete value. [`Grid::new`] requires every dynamic extent to have a finite upper bound and every extent to
+//! fit within [`MAX_DIMENSION_EXTENT`], so the number of programs is always bounded. Dimensions that share a variable
+//! share its identity and must therefore receive identical extents. A rank-0 grid contains exactly one program, and a
+//! grid with any zero extent contains none.
+//!
+//! Names are optional labels that [`Grid::named_axis`] resolves to positions. They must be non-empty and unique within
+//! a grid, and they do not affect which programs run or in which order.
+//!
+//! # Execution Order
+//!
+//! Programs at different coordinates of a [`GridExecution::Parallel`] dimension may run concurrently, and the
+//! coordinates of a [`GridExecution::Sequential`] dimension run in increasing order within each fixed tuple of the
+//! other coordinates. Two grid points are therefore ordered only when they agree on every parallel coordinate and all
+//! of their differing sequential coordinates move in the same direction. Points that move in opposite directions along
+//! two sequential dimensions are incomparable, because serial host replay alone does not establish a semantic order
+//! between them. [`validate_kernel_initialization`](crate::initialization::validate_kernel_initialization) uses this
+//! partial order and requires the mutable windows of every two unordered programs to be disjoint.
+//!
+//! # Enumeration and Specialization
+//!
+//! [`Grid::points`] binds concrete extents and returns [`GridPoints`], which enumerates the grid points in row-major
+//! order (i.e., the last dimension varies fastest). That order is deterministic, but it implies no execution order
+//! for parallel dimensions. Binding extents through [`Grid::points`] leaves the grid unchanged, whereas
+//! [`Grid::specialize`] returns a new grid whose dynamic extents are replaced by the bound static extents and which
+//! therefore has its own semantic identity. [`Grid::rename_type_identities`] renames the dimension variables of a grid
+//! together with the surrounding program.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -13,33 +45,64 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-/// Errors constructing a grid or binding its runtime extents.
+/// Error produced when constructing a [`Grid`], resolving one of its dimensions, or binding its runtime extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum GridError {
+    /// An extent exceeds [`MAX_DIMENSION_EXTENT`], or a runtime extent violates the bounds or the identity of its
+    /// dimension variable.
     #[error(transparent)]
     Dimension(#[from] DimensionError),
 
+    /// A positional axis is outside the rank of the grid.
     #[error(transparent)]
     Axis(#[from] AxisError),
 
+    /// Renaming the dimension variable of an extent failed.
     #[error(transparent)]
     Type(#[from] TypeError),
 
+    /// A dynamic extent has no finite upper bound.
     #[error("kernel grid dimension {axis} must have a finite upper bound")]
-    UnboundedDimension { axis: usize },
+    UnboundedDimension {
+        /// Position of the unbounded dimension.
+        axis: usize,
+    },
 
+    /// Two dimensions of the grid have the same name.
     #[error("kernel grid axis name `{name}` is repeated")]
-    DuplicateName { name: String },
+    DuplicateName {
+        /// Repeated dimension name.
+        name: String,
+    },
 
+    /// A dimension name is empty.
     #[error("kernel grid axis name cannot be empty")]
     EmptyName,
 
+    /// The number of runtime extents differs from the rank of the grid.
     #[error("kernel grid expects {expected} extents but received {actual}")]
-    RankMismatch { expected: usize, actual: usize },
+    RankMismatch {
+        /// Rank of the grid.
+        expected: usize,
 
+        /// Number of supplied extents.
+        actual: usize,
+    },
+
+    /// A runtime extent differs from the static extent of its dimension.
     #[error("kernel grid dimension {axis} expected extent {expected} but received {actual}")]
-    ExtentMismatch { axis: usize, expected: usize, actual: usize },
+    ExtentMismatch {
+        /// Position of the static dimension.
+        axis: usize,
 
+        /// Static extent of the dimension.
+        expected: usize,
+
+        /// Supplied runtime extent.
+        actual: usize,
+    },
+
+    /// The number of grid points (i.e., the product of the runtime extents) does not fit in a `usize`.
     #[error("kernel grid program count exceeds the host index range")]
     ProgramCountOverflow,
 }
@@ -69,7 +132,7 @@ pub struct GridDimension {
     /// Canonical extent and symbolic identity.
     extent: Dimension,
 
-    /// Optional name used to select this dimension within the kernel.
+    /// Optional label that [`Grid::named_axis`] resolves to the position of this dimension.
     name: Option<String>,
 
     /// Whether distinct coordinates may execute concurrently.
@@ -80,6 +143,16 @@ impl GridDimension {
     /// Creates an unnamed dimension. [`Grid::new`] validates finite bounds before the dimension is used.
     pub fn new(extent: Dimension, execution: GridExecution) -> Self {
         Self { extent, name: None, execution }
+    }
+
+    /// Names this dimension. Names must be non-empty and unique within a [`Grid`].
+    pub fn with_name(mut self, name: impl Into<String>) -> Result<Self, GridError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(GridError::EmptyName);
+        }
+        self.name = Some(name);
+        Ok(self)
     }
 
     /// Returns the canonical dimension extent.
@@ -95,16 +168,6 @@ impl GridDimension {
     /// Returns the ordering semantics of this dimension.
     pub fn execution(&self) -> GridExecution {
         self.execution
-    }
-
-    /// Names this dimension. Names must be nonempty and unique within a [`Grid`].
-    pub fn with_name(mut self, name: impl Into<String>) -> Result<Self, GridError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(GridError::EmptyName);
-        }
-        self.name = Some(name);
-        Ok(self)
     }
 }
 
@@ -131,6 +194,12 @@ pub struct Grid {
 
 impl Grid {
     /// Creates a grid with finite portable extents and unique dimension names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GridError::UnboundedDimension`] when a dynamic extent has no finite upper bound,
+    /// [`GridError::Dimension`] when a static extent or the largest value of a dynamic extent exceeds
+    /// [`MAX_DIMENSION_EXTENT`], and [`GridError::DuplicateName`] when two dimensions have the same name.
     pub fn new(dimensions: Vec<GridDimension>) -> Result<Self, GridError> {
         let mut names = HashSet::new();
         for (axis, dimension) in dimensions.iter().enumerate() {
@@ -173,7 +242,7 @@ impl Grid {
 
     /// Returns whether two validated coordinates are ordered by the sequential axes. Parallel coordinates must
     /// agree, and all changing sequential coordinates must move in the same direction. Opposite moves along two
-    /// sequential axes are incomparable: serial host replay alone does not establish a semantic ordering.
+    /// sequential axes are incomparable, because serial host replay alone does not establish a semantic ordering.
     pub(crate) fn points_are_ordered(&self, first: &[usize], second: &[usize]) -> bool {
         debug_assert_eq!(first.len(), self.dimensions.len());
         debug_assert_eq!(second.len(), self.dimensions.len());
@@ -236,9 +305,10 @@ impl Grid {
         Ok(GridPoints { extents: extents.to_vec(), coordinate: vec![0; extents.len()], remaining })
     }
 
-    /// Specializes bounded symbolic extents to checked concrete values. Names and execution semantics are retained;
-    /// repeated symbolic identities must receive the same extent. The original grid remains unchanged. A specialized
-    /// grid has its own semantic identity, unlike merely enumerating runtime bindings with [`Self::points`].
+    /// Specializes bounded symbolic extents to checked concrete values. Names and execution semantics are retained,
+    /// and repeated symbolic identities must receive the same extent. The original grid remains unchanged. A
+    /// specialized grid has its own semantic identity, unlike merely enumerating runtime bindings with
+    /// [`Self::points`].
     pub fn specialize(&self, extents: &[usize]) -> Result<Self, GridError> {
         self.points(extents)?;
         Ok(Self {
@@ -252,7 +322,7 @@ impl Grid {
     }
 
     /// Renames symbolic extents with the surrounding program and revalidates their finite bounds. Names and
-    /// execution semantics are preserved; no concrete runtime extent is added to the specialization metadata.
+    /// execution semantics are preserved, and no concrete runtime extent is added to the specialization metadata.
     pub fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<DimensionVariable>,
@@ -337,6 +407,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_grid_error() {
+        assert_eq!(
+            GridError::Dimension(DimensionError::ExtentExceedsBackendWidth { value: 5, maximum: 4 }).to_string(),
+            "dimension extent 5 exceeds backend maximum 4",
+        );
+        assert_eq!(
+            GridError::Axis(AxisError::OutOfBounds { axis: Axis::from(1), rank: 1 }).to_string(),
+            "axis 1 is out of bounds for rank 1",
+        );
+        assert_eq!(GridError::Type(TypeError::invalid("invalid renaming")).to_string(), "invalid renaming");
+        assert_eq!(
+            GridError::UnboundedDimension { axis: 1 }.to_string(),
+            "kernel grid dimension 1 must have a finite upper bound",
+        );
+        assert_eq!(
+            GridError::DuplicateName { name: "row".to_owned() }.to_string(),
+            "kernel grid axis name `row` is repeated",
+        );
+        assert_eq!(GridError::EmptyName.to_string(), "kernel grid axis name cannot be empty");
+        assert_eq!(
+            GridError::RankMismatch { expected: 2, actual: 1 }.to_string(),
+            "kernel grid expects 2 extents but received 1",
+        );
+        assert_eq!(
+            GridError::ExtentMismatch { axis: 0, expected: 2, actual: 3 }.to_string(),
+            "kernel grid dimension 0 expected extent 2 but received 3",
+        );
+        assert_eq!(
+            GridError::ProgramCountOverflow.to_string(),
+            "kernel grid program count exceeds the host index range",
+        );
+    }
+
+    #[test]
     fn test_grid_execution() {
         assert_eq!(GridExecution::Parallel.to_string(), "parallel");
         assert_eq!(GridExecution::Sequential.to_string(), "sequential");
@@ -356,6 +460,15 @@ mod tests {
     }
 
     #[test]
+    fn test_grid_dimension_with_name() {
+        let dimension = GridDimension::new(Dimension::Static(3), GridExecution::Parallel).with_name("row").unwrap();
+        assert_eq!(dimension.name(), Some("row"));
+        assert_eq!(dimension.to_string(), "\"row\"=3:parallel");
+        assert_eq!(dimension.clone().with_name("row\nnext").unwrap().to_string(), "\"row\\nnext\"=3:parallel");
+        assert_eq!(dimension.with_name(""), Err(GridError::EmptyName));
+    }
+
+    #[test]
     fn test_grid_dimension_extent() {
         assert_eq!(GridDimension::new(Dimension::Static(3), GridExecution::Parallel).extent(), &Dimension::Static(3));
     }
@@ -369,17 +482,8 @@ mod tests {
     fn test_grid_dimension_execution() {
         assert_eq!(
             GridDimension::new(Dimension::Static(3), GridExecution::Sequential).execution(),
-            GridExecution::Sequential
+            GridExecution::Sequential,
         );
-    }
-
-    #[test]
-    fn test_grid_dimension_with_name() {
-        let dimension = GridDimension::new(Dimension::Static(3), GridExecution::Parallel).with_name("row").unwrap();
-        assert_eq!(dimension.name(), Some("row"));
-        assert_eq!(dimension.to_string(), "\"row\"=3:parallel");
-        assert_eq!(dimension.clone().with_name("row\nnext").unwrap().to_string(), "\"row\\nnext\"=3:parallel");
-        assert_eq!(dimension.with_name(""), Err(GridError::EmptyName));
     }
 
     #[test]
@@ -480,7 +584,7 @@ mod tests {
                 dimension: "count".into(),
                 expected: 2,
                 actual: 3,
-            })
+            }),
         );
         assert_eq!(
             grid.points(&[4, 4]).unwrap_err(),
@@ -488,7 +592,7 @@ mod tests {
                 variable: "count".into(),
                 value: 4,
                 bounds: DimensionBounds::non_negative(Some(4)).unwrap(),
-            })
+            }),
         );
     }
 
@@ -547,7 +651,7 @@ mod tests {
                 dimension: "count".to_owned(),
                 expected: 2,
                 actual: 3,
-            }))
+            })),
         );
         assert_eq!(
             grid.specialize(&[4, 4]),
@@ -555,7 +659,7 @@ mod tests {
                 variable: "count".to_owned(),
                 value: 4,
                 bounds: variable.bounds(),
-            }))
+            })),
         );
         let static_grid = grid.specialize(&[2, 2]).unwrap();
         assert_eq!(static_grid.specialize(&[3, 3]), Err(GridError::ExtentMismatch { axis: 0, expected: 2, actual: 3 }));
@@ -585,7 +689,7 @@ mod tests {
             grid.rename_type_identities(&invalid),
             Err(GridError::Type(TypeError::invalid(
                 "cannot rename dimension variable source with bounds [0, 4) to unbounded with bounds [0, ∞)",
-            )))
+            ))),
         );
         let mut wider = TypeIdentityRenaming::new();
         wider
@@ -595,7 +699,7 @@ mod tests {
             grid.rename_type_identities(&wider),
             Err(GridError::Type(TypeError::invalid(
                 "cannot rename dimension variable source with bounds [0, 4) to wider with bounds [0, 5)",
-            )))
+            ))),
         );
     }
 }

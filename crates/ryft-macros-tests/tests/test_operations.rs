@@ -12,17 +12,17 @@ use ryft::{
     BatchingContext, CollectiveAxes, CollectiveOperation, ConstantOperation, Context, CotangentAccumulator, DataType,
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionBounds, DimensionOperation,
-    DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext, EffectClass, EffectClasses, Effects,
-    EmptyRegionDriver, ErasedOperation, GuardOperation, InputRegionProvenance, InterpretableOperation,
-    InterpretationDriver, MaybeZero, MemberDifferentiableOperation, MemberOperation, MemberTransposableOperation,
-    NegOperation, Operation, OperationBoundaryPruning, OperationFoldOutput, OperationPayloadProjection,
-    OperationProjection, OperationProvider, OutputRegionProvenance, ParallelPermuteOperation, ParallelVaryOperation,
-    PartialEvaluationInput, PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-    ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceFreezeOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule,
-    RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRole, RegionSlot, Shape, StagingContext,
-    TagOperation, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, TypeError,
-    TypeIdentityRenaming, Typed, Value, ZeroOperation, check_count,
+    DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext, EffectClass,
+    EffectClasses, Effects, EmptyRegionDriver, ErasedOperation, GuardOperation, InputRegionProvenance,
+    InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation, MemberOperation,
+    MemberTransposableOperation, NegOperation, Operation, OperationBoundaryPruning, OperationFoldOutput,
+    OperationPayloadProjection, OperationProjection, OperationProvider, OutputRegionProvenance,
+    ParallelPermuteOperation, ParallelVaryOperation, PartialEvaluationInput, PartialEvaluationOutput, PartialValue,
+    Placeholder, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary,
+    RegionDataFlowRule, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRole, RegionSlot, Shape,
+    StagingContext, TagOperation, Tracer, TracingContext, TransposableOperation, TranspositionContext,
+    TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ZeroOperation, check_count,
 };
 
 /// Payload that overrides every optional [`Operation`] method with a distinctive answer, so that generated forwarding
@@ -209,7 +209,7 @@ enum ProbeFamily {
 
 /// Homogeneous array family whose operation and constant types are inferred from its single value parameter.
 #[derive(Clone, Debug, Operation)]
-#[ryft(dispatch(identity))]
+#[ryft(dispatch(identity, partial_evaluation))]
 enum ArrayFamily<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Add(AddOperation<ArrayType>),
@@ -239,12 +239,24 @@ impl<V: Value<Type = ArrayType>> OperationProvider<ArrayType, AddOperation<Array
 /// Heterogeneous family whose member variants are both projected classes, built from production member families.
 #[derive(Clone, Debug, Operation)]
 #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), members(ArrayType, structural(DimensionType)))]
+#[ryft(dispatch(partial_evaluation))]
 enum ArrayIrFamily<A: Value<Type = ArrayType>> {
     #[ryft(projected(ArrayType), collective)]
     Array(ArrayOperation<A>),
 
     #[ryft(projected(DimensionType, structural))]
     Dimension(DimensionOperation<DimensionValue>),
+}
+
+/// Array IR family that embeds the complete production array IR family as a nested family, next to a native payload
+/// that the nested family also holds.
+#[derive(Clone, Debug, Operation)]
+#[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), dispatch(partial_evaluation))]
+enum NestedFamily {
+    #[ryft(family, collective, lockstep)]
+    Portable(ArrayIrOperation<Array>),
+
+    DimensionSize(DimensionSizeOperation),
 }
 
 /// Mixed member payload whose parent instruction interleaves its two array data inputs with two first-class dimension
@@ -951,6 +963,27 @@ fn test_operation_partially_evaluate() {
         evaluation.outputs(),
         &[PartialEvaluationOutput::Known(ArrayIrValue::Array(Array::scalar(6f32).unwrap()))]
     );
+
+    // Family variants also take the family's canonical fold-or-residualize path, because the partial evaluation rule of
+    // the nested family belongs to programs over that family.
+    let mut builder = ProgramBuilder::<ArrayIrValue<Array>, NestedFamily>::new();
+    let a = builder.add_input(ArrayIrType::from(ArrayType::scalar(DataType::F32)));
+    let add = NestedFamily::from(ArrayIrOperation::from(ArrayOperation::from(AddOperation::new())));
+    let doubled = builder.add_instruction(add, Vec::new(), vec![a, a], None).unwrap()[0];
+    let program = builder
+        .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![doubled],
+            vec![Placeholder],
+            vec![Placeholder],
+        )
+        .unwrap();
+    let evaluation = program
+        .partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::scalar(3f32).unwrap()))])
+        .unwrap();
+    assert_eq!(
+        evaluation.outputs(),
+        &[PartialEvaluationOutput::Known(ArrayIrValue::Array(Array::scalar(6f32).unwrap()))]
+    );
 }
 
 #[test]
@@ -1257,6 +1290,23 @@ fn test_operation_payload_projection() {
         MixedFamily::<Array>::from_payload(ErasedOperation::new(InterleavedOperation)),
         Ok(MixedFamily::Array(MixedMemberFamily::Interleaved(_))),
     ));
+
+    // Family variants delegate to their nested families in both directions, and construction tries them after the
+    // native variants, so a native variant takes precedence over a nested family that holds the same payload type.
+    let operation = NestedFamily::from(ArrayIrOperation::from(ArrayOperation::from(AddOperation::new())));
+    assert_eq!(operation.projected_payload::<AddOperation<ArrayType>>(), Some(&AddOperation::new()));
+    assert!(operation.projected_payload::<ArrayIrOperation<Array>>().is_none());
+    assert!(matches!(
+        NestedFamily::from_payload(ErasedOperation::new(AddOperation::<ArrayType>::new())),
+        Ok(NestedFamily::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_)))),
+    ));
+    let size = DimensionSizeOperation::new(&ArrayType::new_static(DataType::F32, [2]), 0).unwrap();
+    assert!(matches!(
+        NestedFamily::from_payload(ErasedOperation::new(size)),
+        Ok(NestedFamily::DimensionSize(_)),
+    ));
+    let payload = ErasedOperation::new(ProbeOperation::<0>::new());
+    assert!(NestedFamily::from_payload(payload).unwrap_err().downcast::<ProbeOperation<0>>().is_ok());
 }
 
 #[test]
