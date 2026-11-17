@@ -110,14 +110,12 @@ mod tests {
         Trace, TransferToMemory, Typed, ZeroOperation,
     };
 
-    use crate::lowering::tests::{ProgramBuilder, test_vector_type};
-    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_mlir_module_for_plain_program};
     use crate::operations::Operation;
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayError, CompiledFunction, Constant, Error, Session, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, ArrayError, CompiledFunction, Constant, Error, compile, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -236,7 +234,7 @@ mod tests {
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
         let device_id = device.id().unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = ArrayType::new_static(DataType::I64, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();

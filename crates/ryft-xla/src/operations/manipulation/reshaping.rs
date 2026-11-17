@@ -311,9 +311,8 @@ mod tests {
     use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
         ragged_dot_cpu_compilation_options, shard_map_module, test_matrix_type, test_vector_type,
-        unproject_plain_program,
+        to_mlir_module_for_plain_program, unproject_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_to_bytes};

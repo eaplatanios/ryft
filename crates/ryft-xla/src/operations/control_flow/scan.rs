@@ -682,10 +682,10 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, program_array, read_f32s, read_f64s};
+    use crate::sessions::tests::{domain_mesh, program_array, read_f32s, read_f64s, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, Constant, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
+        Array, CompiledFunction, Constant, Error, FromPjrt, Options, Value, compile, compile_statefully,
         to_mlir_module_for_program,
     };
 
@@ -1949,7 +1949,7 @@ mod tests {
         );
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         // Staging succeeds, so the error comes from the discharge that precedes lowering.
         let mut staged = false;
         let error = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -4105,7 +4105,7 @@ mod tests {
         // lowering.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4158,7 +4158,7 @@ mod tests {
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let value = |dimensions: &[usize], values: &[f32]| {
             Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };

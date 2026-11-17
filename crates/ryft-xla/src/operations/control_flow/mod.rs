@@ -523,8 +523,9 @@ mod tests {
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::runtimes::builtin_requirement;
+    use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, ExecutionArguments, FromPjrt, Session, to_mlir_module_for_program};
+    use crate::{Array, ExecutionArguments, FromPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -586,7 +587,7 @@ mod tests {
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &test_spmd_compilation_options(2))
             .unwrap();
-        let session = Session::with_client(client);
+        let session = session_with_client(client);
         let device_ids = executable
             .addressable_devices()
             .unwrap()

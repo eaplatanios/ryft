@@ -900,8 +900,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ConvertElementTypeOperation, Placeholder, ReferenceType, TiledLayout};
 
-    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension};
-    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program};
 
     use super::*;
 

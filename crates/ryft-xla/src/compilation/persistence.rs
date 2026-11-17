@@ -1457,7 +1457,7 @@ mod tests {
     use crate::compilation::options::Options;
     use crate::sessions::tests::{
         domain_mesh, external_reference_read_program, f32_scalar, f64_vector, program_array, read_f32s,
-        replicated_scalar_type, replicated_vector_type,
+        replicated_scalar_type, replicated_vector_type, session_with_client,
     };
     use crate::tests::{cpu_client, values_to_bytes};
     use crate::{Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Value};
@@ -1567,7 +1567,7 @@ mod tests {
     fn test_compiled_program_serialize() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -1714,7 +1714,7 @@ mod tests {
             vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
         )
         .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = ProgramBuilder::new();
@@ -1944,7 +1944,7 @@ mod tests {
     fn test_compiled_program_serialize_round_trips_bounded_dynamic_read_only_reference_state() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1994,7 +1994,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
@@ -2047,7 +2047,7 @@ mod tests {
     fn test_session_deserialize_compiled_program_requires_runtime_contracts_for_effect_metadata() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let mut builder = ProgramBuilder::new();
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
@@ -2127,7 +2127,7 @@ mod tests {
     #[test]
     fn test_session_deserialize_compiled_program_rejects_malformed_and_incompatible_metadata() {
         let client = cpu_client(1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
 
         assert!(matches!(
             session.deserialize_program(b"truncated"),

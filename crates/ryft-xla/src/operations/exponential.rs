@@ -742,11 +742,12 @@ mod tests {
         differentiate_at,
     };
 
-    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module};
-    use crate::lowering::to_mlir_module_for_plain_program;
-    use crate::sessions::tests::domain_mesh;
+    use crate::ArrayConstant;
+    use crate::lowering::tests::{
+        ProgramBuilder, dynamic_dimension, lowered_unary_module, to_mlir_module_for_plain_program,
+    };
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Session};
 
     use super::*;
 
@@ -875,7 +876,7 @@ mod tests {
     #[test]
     fn test_log_operation_lower_f8e8m0fnu() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The logarithm of one in a format with only exponent bits is an unrepresentable zero and converts to NaN.
@@ -1001,7 +1002,7 @@ mod tests {
     #[test]
     fn test_logistic_operation_lower_saturated() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The derivative `logistic(x) · logistic(-x)` evaluates both sign branches of the lowering, so neither
@@ -1048,7 +1049,7 @@ mod tests {
     #[test]
     fn test_lower_log_add_exp_to_mlir() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Narrow formats evaluate the whole composition in `f32` and round only the final output, here for an
@@ -1100,7 +1101,7 @@ mod tests {
     #[test]
     fn test_lower_log_add_exp_to_mlir_complex() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let c128_vector = |value: Complex<f64>| {
             replicated_array(&session, &mesh, DataType::C128, &[1], values_to_bytes(&[value]).as_slice())
@@ -1151,7 +1152,7 @@ mod tests {
     #[test]
     fn test_lower_complex_exp_m1_to_mlir() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Tiny arguments keep both tiny components, and the real component keeps the `cos - 1` cancellation through
@@ -1174,7 +1175,7 @@ mod tests {
     #[test]
     fn test_lower_complex_ln_1p_to_mlir() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // An input near zero keeps both tiny components, and inputs on the negative real branch cut keep their side.

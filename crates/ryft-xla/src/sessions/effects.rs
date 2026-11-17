@@ -388,8 +388,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::sessions::Session;
-    use crate::sessions::tests::{domain_mesh, f64_vector};
+    use crate::sessions::tests::{domain_mesh, f64_vector, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_to_bytes};
     use crate::{
         Array, CompilationError, Constant, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
@@ -407,7 +406,7 @@ mod tests {
     /// is recorded, so there the chain is proven through submission order and barrier completion alone.
     fn assert_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
         let mesh = domain_mesh(client, "x", 1);
-        let session = Session::with_client(client);
+        let session = session_with_client(client);
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
         let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
         let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
@@ -458,7 +457,7 @@ mod tests {
     /// [`assert_session_array_ordered_effects`] for why that fixture only works on CPU.
     fn assert_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
         let mesh = domain_mesh(client, "x", 1);
-        let session = Session::with_client(client);
+        let session = session_with_client(client);
         ensure_print_handler_registered(client).unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
         let mut builder = ProgramBuilder::new();
@@ -706,7 +705,7 @@ mod tests {
     #[test]
     fn test_ensure_effect_dispatch_allowed_rejects_managed_callback_reentrancy() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scope = EffectScope::default();
         let guard = EffectCallbackGuard::enter();
         let reason = "execution and effect barriers cannot be entered from a managed callback";
@@ -802,7 +801,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         ensure_print_handler_registered(&client).unwrap();
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![2])))
             .with_sharding(

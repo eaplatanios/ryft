@@ -2328,11 +2328,11 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::runtimes::builtin_requirement;
-    use crate::sessions::tests::{domain_mesh, read_f32s};
+    use crate::sessions::tests::{domain_mesh, read_f32s, session_with_client};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Options, Session, StagedFunction, ToPjrt, Value, compile,
-        stage, to_mlir_module_for_program, with_runtime_requirements,
+        Array, ArrayConstant, CompiledFunction, Constant, Options, StagedFunction, ToPjrt, Value, compile, stage,
+        to_mlir_module_for_program, with_runtime_requirements,
     };
 
     use super::*;
@@ -3731,7 +3731,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
         let value_type = value_type.unwrap();
         let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
@@ -4143,7 +4143,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
         let r#type = ArrayIrType::Array(array_type.clone());
 
@@ -6539,7 +6539,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();

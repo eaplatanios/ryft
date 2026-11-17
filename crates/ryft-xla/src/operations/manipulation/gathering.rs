@@ -275,11 +275,12 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
-    use crate::lowering::to_mlir_module_for_plain_program;
-    use crate::sessions::tests::{domain_mesh, read_f64s};
+    use crate::lowering::tests::{
+        ProgramBuilder, ragged_dot_cpu_compilation_options, to_mlir_module_for_plain_program, unproject_plain_program,
+    };
+    use crate::sessions::tests::{domain_mesh, read_f64s, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, Options, Session, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Options, to_mlir_module_for_program};
 
     #[test]
     fn test_gather_operation_lower() {
@@ -707,7 +708,7 @@ mod tests {
     #[test]
     fn test_gather_operation_lower_fill_differentiation() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[10f32, 20.0, 30.0]));
         let indices = replicated_array(&session, &mesh, DataType::I32, &[4, 1], &values_to_bytes(&[-1i32, 1, 1, 3]));
@@ -735,7 +736,7 @@ mod tests {
         // A diagonal is a slice of its two axes followed by one gather over iota indices, which lowers and executes
         // like the reference backend, including for offsets, axes with different extents, and empty diagonals.
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let values = (0..18).map(|value| value as f32).collect::<Vec<_>>();
         let reference =
@@ -829,7 +830,7 @@ mod tests {
         // pullback.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, CoreDimension::Static(1)]));

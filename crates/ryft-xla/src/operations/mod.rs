@@ -861,10 +861,11 @@ mod tests {
         TypedProgram, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation, rematerialize,
     };
 
-    use crate::lowering::tests::{PlainProgram, ProgramBuilder as PlainProgramBuilder, lowered_unary_module};
-    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::lowering::tests::{
+        PlainProgram, ProgramBuilder as PlainProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program,
+    };
     use crate::operations::jit_call::JitCallOperation;
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type};
     use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, Tracer, to_mlir_module_for_program};
 
@@ -1808,7 +1809,7 @@ mod tests {
     #[test]
     fn test_elementwise_lowering_matches_reference_backend() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let left_values = [0.5f32, 1.25, 2.0, 3.75];
         let right_values = [4.0f32, 0.25, -1.5, 2.5];
@@ -1901,7 +1902,7 @@ mod tests {
     #[test]
     fn test_lower_accuracy_matches_reference_backend() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let values = [0.5f32, -1.0, 2.0];
         let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));

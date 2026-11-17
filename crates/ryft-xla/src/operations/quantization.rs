@@ -549,7 +549,7 @@ mod tests {
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
     use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, Session, compile,
@@ -707,7 +707,7 @@ mod tests {
         // `f32` product on both backends. Every element, scale, product, and sum is exact, so the comparison is exact
         // whether XLA runs the portable decomposition of the `xla.scaled_dot` composite or a native kernel.
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let element_candidates = [0f64, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
         let elements = |seed: usize| {
@@ -1188,7 +1188,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let placed = |data_type: DataType, shape: &[usize]| {
             ArrayType::new_static(data_type, shape.to_vec())
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))

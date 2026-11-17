@@ -252,8 +252,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayIrType, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
 
-    use crate::sessions::Session;
-    use crate::sessions::tests::{domain_mesh, replicated_vector_type};
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client};
     use crate::tests::cpu_client;
     use crate::{FlatProgram, Operation, Options, ProgramBuilder};
 
@@ -293,7 +292,7 @@ mod tests {
     #[test]
     fn test_target_from_client() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let target = session.target().unwrap();
         assert!(std::ptr::eq(target, session.clone().target().unwrap()));
         assert_eq!(target.platform_name(), client.platform_name().unwrap());

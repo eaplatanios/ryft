@@ -165,15 +165,16 @@ mod tests {
     use ryft_pjrt::{BufferType, Program};
 
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
+    use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
+    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, TracedProgram, trace};
 
     use super::*;
 
     #[test]
     fn test_parallel_all_gather_operation_lower() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -300,7 +301,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower_untiled_inserts_rank() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -458,7 +459,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower_executes_invariant_gradient_on_cpu() {
         let client = cpu_client(4);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =

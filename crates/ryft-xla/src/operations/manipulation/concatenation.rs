@@ -235,14 +235,14 @@ mod tests {
 
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type,
+        to_mlir_module_for_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::lowering::types::physical_bound_type;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, ToPjrt, compile, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -669,7 +669,7 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
             |(first, second)| first.concatenate_with([&second], 0).unwrap(),
             (input_type.clone(), input_type.clone()),

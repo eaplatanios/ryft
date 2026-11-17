@@ -564,7 +564,7 @@ mod tests {
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::runtimes::builtin_requirement;
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{
         ADD_ONE_CUSTOM_CALL_TARGET, cpu_client, ensure_add_one_handler_registered, replicated_array, values_from_bytes,
         values_to_bytes,
@@ -1529,7 +1529,7 @@ mod tests {
     fn test_custom_call_operation_lower_executes_registered_ffi_handler() {
         let client = cpu_client(1);
         ensure_add_one_handler_registered(&client).unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Eager dispatch compiles a single `stablehlo.custom_call` that resolves to the registered handler at
@@ -1631,7 +1631,7 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.0]));
         let operation = CustomCallOperation::new(TARGET, Vec::new())
@@ -1721,7 +1721,7 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let values = values_to_bytes(&[1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
@@ -1807,7 +1807,7 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // A call without array inputs binds directly in the eager session and runs a source kernel that only fills its
@@ -1824,7 +1824,7 @@ mod tests {
     fn test_custom_call_operation_lower_executes_batched_ffi_handler() {
         let client = cpu_client(1);
         ensure_add_one_handler_registered(&client).unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let row_type = replicated_f32_type(&mesh, &[2]);
         let input = replicated_array(
@@ -1879,7 +1879,7 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_inside_manual_region_executes_on_cpu() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         ensure_add_one_handler_registered(&client).unwrap();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -2000,7 +2000,7 @@ mod tests {
     fn test_custom_call_operation_lower_executes_under_composite_differentiation() {
         let client = cpu_client(1);
         ensure_add_one_handler_registered(&client).unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
 

@@ -593,9 +593,11 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     #[cfg(feature = "cuda-13")]
+    use crate::sessions::tests::session_with_client;
+    #[cfg(feature = "cuda-13")]
     use crate::tests::{values_from_bytes, values_to_bytes};
     #[cfg(feature = "cuda-13")]
-    use crate::{Array, ExecutionArguments, FromPjrt, Session};
+    use crate::{Array, ExecutionArguments, FromPjrt};
     use crate::{ArrayTracer, TracedProgram, trace};
 
     use super::*;
@@ -1107,7 +1109,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         if client_devices.len() < 2 {
             return;

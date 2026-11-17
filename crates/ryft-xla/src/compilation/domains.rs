@@ -930,7 +930,7 @@ mod tests {
     use crate::compilation::functions::StatefulCompileTracer;
     use crate::sessions::tests::{
         boolean_scalar, domain_mesh, external_reference_read_program, f32_scalar, f32_vector, read_f32s, read_f64s,
-        replicated_scalar_type, replicated_vector_type,
+        replicated_scalar_type, replicated_vector_type, session_with_client,
     };
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
@@ -943,7 +943,7 @@ mod tests {
     fn test_session_compilation_domain_pipeline() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client).with_mesh(mesh.clone());
+        let engine = session_with_client(&client).with_mesh(mesh.clone());
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1009,7 +1009,7 @@ mod tests {
     fn test_session_lower_staged_program_rejects_reference_boundary_shardings() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
@@ -1078,7 +1078,7 @@ mod tests {
     fn test_session_lower_staged_program_rejects_reference_outputs() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
 
         fn allocate_reference<'c>(
@@ -1111,7 +1111,7 @@ mod tests {
     fn test_session_lower_staged_program_requires_input_shardings() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let options = Options::new(mesh.clone())
             .with_input_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
@@ -1154,7 +1154,7 @@ mod tests {
     #[test]
     fn test_session_lower_staged_program_requires_output_shardings() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = |axis_type| {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let devices = client
@@ -1266,7 +1266,7 @@ mod tests {
     fn test_session_lower_program_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1389,7 +1389,7 @@ mod tests {
     fn test_session_lower_program_rejects_shard_maps_in_bounded_dynamic_programs() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -1453,7 +1453,7 @@ mod tests {
     fn test_session_lower_program_uses_the_replica_path_for_internal_dynamic_tensors() {
         let client = cpu_client(4);
         let mesh = domain_mesh(&client, "x", 4);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -1526,7 +1526,7 @@ mod tests {
     fn test_session_lower_program_rejects_unsupported_external_reference_storage_classes() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
@@ -1647,7 +1647,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_reference_state() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = ProgramBuilder::new();
@@ -1724,7 +1724,7 @@ mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
@@ -1815,7 +1815,7 @@ mod tests {
     fn test_session_lower_program_accumulates_slice_cotangents_into_existing_state() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(replicated_vector_type(&mesh, 4).into());
         let output = builder
@@ -1846,7 +1846,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_index_and_slice_reference_transforms() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
         let mut builder = ProgramBuilder::new();
@@ -1963,7 +1963,7 @@ mod tests {
     fn test_session_lower_program_discharges_writes_through_reference_views() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
         let mut builder = ProgramBuilder::new();
@@ -2001,7 +2001,7 @@ mod tests {
     fn test_session_lower_program_indexed_reference_mutation() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::new();
@@ -2096,7 +2096,7 @@ mod tests {
     fn test_session_lower_program_preserves_capture_scope_inside_condition_regions() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
 
@@ -2132,7 +2132,7 @@ mod tests {
     fn test_session_lower_program_validates_capture_count() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar_type.into());
@@ -2154,7 +2154,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_reference_state_through_condition() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2263,7 +2263,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_reference_state_through_while() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2320,7 +2320,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_reference_state_through_static_scan() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2380,7 +2380,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_reference_state_through_dynamic_scan() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
         let length_variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
@@ -2450,7 +2450,7 @@ mod tests {
     fn test_session_lower_program_discharges_local_reference_state_through_nested_jit_call() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -2500,7 +2500,7 @@ mod tests {
     fn test_session_lower_program_carries_external_reference_state_metadata() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
 
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
@@ -2530,7 +2530,7 @@ mod tests {
     fn test_session_lower_program_preserves_provenance_locations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::F64);
 
         // Builds `-(x * x)` with the multiplication carrying the provided provenance.
@@ -2615,7 +2615,7 @@ mod tests {
     fn test_session_lower_program_recreates_reference_views_inside_condition_branches() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(vector_type.clone());
@@ -2759,7 +2759,7 @@ mod tests {
 
         // The foreign executable keeps the requesting lowering's boundary types so that it loads and passes every
         // output type check in the core crate, and differs only in the donation contract the runtime call path trusts.
-        let producer = Session::with_client(&client);
+        let producer = session_with_client(&client);
         let staged = crate::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),

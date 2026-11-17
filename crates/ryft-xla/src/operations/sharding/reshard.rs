@@ -35,7 +35,7 @@ mod tests {
     use ryft_pjrt::Client;
 
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
-    use crate::sessions::tests::{read_f32s, two_device_mesh};
+    use crate::sessions::tests::{read_f32s, session_with_client, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, Session, TracedProgram, compile,
@@ -152,7 +152,7 @@ mod tests {
         // replicated sharding governs the output buffer.
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_auto_axes_executes_on_cpu() {
         let client = cpu_client(4);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let logical_mesh = explicit_mesh();
         let mesh = device_mesh(&client, logical_mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn test_explicit_axes_executes_on_cpu() {
         let client = cpu_client(4);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let logical_mesh = explicit_mesh().with_axis_types(["x", "y"], MeshAxisType::Auto).unwrap();
         let mesh = device_mesh(&client, logical_mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
@@ -316,7 +316,7 @@ mod tests {
         // An eager `shard_map` over the mesh with `x` manual returns its output typed over the explicit mesh of its
         // input, as JAX's `shard_map` types its outputs over its context mesh, so `auto_axes` switches it directly.
         let client = cpu_client(4);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let logical_mesh = explicit_mesh();
         let map_mesh = logical_mesh.with_axis_types(["x"], MeshAxisType::Manual).unwrap();
         let mesh = device_mesh(&client, logical_mesh.clone());
@@ -364,7 +364,7 @@ mod tests {
         // function takes that placement as an input sharding override. The gradient through `explicit_axes` keeps the
         // input's placement, with the values of the JAX oracle `grad explicit_axes`.
         let client = cpu_client(4);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let logical_mesh = explicit_mesh().with_axis_types(["x", "y"], MeshAxisType::Auto).unwrap();
         let mesh = device_mesh(&client, logical_mesh.clone());
         let input_placement = sharding(&logical_mesh, &[Some("x"), Some("y")]);

@@ -355,9 +355,11 @@ mod tests {
         Sharding, associative_scan,
     };
 
-    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
-    use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type};
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::tests::{
+        ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
+    };
+    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Value, compile};
 
@@ -470,7 +472,7 @@ mod tests {
     fn test_cumulative_operation_lower_sum_executes_with_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let values = [1.0f32, 2.0, 3.0, 4.0];
@@ -645,7 +647,7 @@ mod tests {
     fn test_cumulative_operation_lower_log_sum_exp_executes() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let source = |values: [f32; 4]| {
@@ -805,7 +807,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_executes() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let increasing = replicated_array(
             &session,
@@ -857,7 +859,7 @@ mod tests {
         // `f32` prefix sum exact, so every form must agree with a sequential scan bit for bit, including along a
         // scanned axis longer than one thousand elements, which spans several levels of the parallel scan.
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let (rows, columns) = (3, 1025);
         let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
@@ -941,7 +943,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_one_bit_integers_matches_reference_backend() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let bits = [1, 1, 0, 1];
         for data_type in [DataType::I1, DataType::U1] {
@@ -1053,7 +1055,7 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         for (data_type, lowest) in [
             (DataType::F4E2M1FN, vec![0x0f]),
@@ -1071,7 +1073,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_log_sum_exp_complex() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Every window is padded with `-∞ + 0i` initial values, and an operand whose real component is negative
@@ -1144,7 +1146,7 @@ mod tests {
         // count, exactly like the reference backend's cumulative maximum.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =

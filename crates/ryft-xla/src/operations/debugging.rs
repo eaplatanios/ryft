@@ -563,11 +563,10 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
-    use crate::sessions::tests::{array_domain, domain_mesh, f64_vector, read_f64s};
+    use crate::sessions::tests::{array_domain, domain_mesh, f64_vector, read_f64s, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, compile, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -852,7 +851,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -917,7 +916,7 @@ mod tests {
         let client = cpu_client(1);
         ensure_print_handler_registered(&client).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input = f64_vector(&session, &mesh, &[1.5, 2.5]);
 
         // Eager batching binds one print of the whole batch through the `@ryft.print` host callback.

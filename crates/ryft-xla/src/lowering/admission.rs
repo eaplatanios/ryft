@@ -402,7 +402,9 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use crate::sessions::tests::{domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type};
+    use crate::sessions::tests::{
+        domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type, session_with_client,
+    };
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
     use crate::{Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Value};
 
@@ -705,7 +707,7 @@ mod tests {
     fn test_validate_data_dependent_compilation() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
 
         let mut builder = ProgramBuilder::new();
@@ -1015,7 +1017,7 @@ mod tests {
     fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -1142,7 +1144,7 @@ mod tests {
     fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_scaled_dot_attention_fixture(
@@ -1276,7 +1278,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -1336,7 +1338,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [
             (DataType::F4E2M1FN, DataType::F8E4M3FN),
             (DataType::F8E4M3FN, DataType::F8E8M0FNU),

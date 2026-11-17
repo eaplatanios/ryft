@@ -38,16 +38,16 @@ mod tests {
     };
 
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, read_f64s};
+    use crate::sessions::tests::{domain_mesh, read_f64s, session_with_client};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{Array, Constant, Options, Session};
+    use crate::{Array, Constant, Options};
 
     #[test]
     fn test_compiled_indexing() {
         // Compiled basic and broadcast advanced reads and repeated indexed updates.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_types = vec![
             ArrayType::new_static(DataType::F64, [3, 4]),
             ArrayType::new_static(DataType::I64, [2, 1]),
@@ -97,7 +97,7 @@ mod tests {
         // One symbolic indexing graph replays at distinct concrete extents.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
@@ -180,7 +180,7 @@ mod tests {
     fn test_compiled_symbolic_manipulation_primal_and_pullback() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in the
         // pinned JAX oracle, plus empty rows for the conveniences that admit them. Keep dimension residuals internal to
         // a fused primal and pullback. This verifies retained graph specialization, without asserting reuse of one

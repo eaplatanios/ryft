@@ -17,18 +17,6 @@ use crate::{Constant, Error, FlatProgram, Program};
 
 // TODO(eaplatanios): Review this module.
 
-#[cfg(test)]
-use ryft_core::ArrayType;
-#[cfg(test)]
-use ryft_mlir::Type;
-
-#[cfg(test)]
-use crate::Operation;
-#[cfg(test)]
-use crate::lowering::types::lower_literal_value;
-#[cfg(test)]
-use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
-
 /// Inlines a nested program into the given block by mapping the provided input MLIR values to the input atoms of its
 /// body, lowering constants and instructions in topological order, and returning the lowered values that correspond
 /// to the output atoms of the program.
@@ -69,72 +57,6 @@ pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperat
         nested_functions,
         collective_state,
         effect_tokens,
-    )
-}
-
-/// Lowers one plain traced program to values inside `block`, whose arguments are the program inputs. This test-only
-/// path supports no attached regions.
-#[cfg(test)]
-pub(crate) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    program: &CoreProgram<V, O, Input, Output>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    collective_state: &CollectiveLoweringState,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
-where
-    V: MlirLowerableValue,
-    O: LowerableOperation<Type = ArrayType>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
-    let input_values = (0..program.input_ids().len())
-        .map(|index| block.argument(index).unwrap().as_ref())
-        .collect::<Vec<_>>();
-    // The per-class effect chains of the function body are created lazily and dropped at the end of that body.
-    let mut effect_tokens = EffectTokens::default();
-    replay_program_into_block(
-        program,
-        input_values,
-        block,
-        context,
-        location,
-        |_, value, block, context, location| lower_literal_value(value, block, context, location),
-        |instruction, inputs, block, context, location| {
-            let input_types = instruction
-                .inputs()
-                .iter()
-                .map(|input| program.atoms()[input.index()].r#type().into_owned())
-                .collect::<Vec<_>>();
-            let output_types = instruction
-                .outputs()
-                .iter()
-                .map(|output| program.atoms()[output.index()].r#type().into_owned())
-                .collect::<Vec<_>>();
-            if !instruction.regions().is_empty() {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: instruction.operation().name().to_string(),
-                    reason: format!(
-                        "plain-program lowering does not support attached regions for `{}`; use the production \
-                         array IR XLA lowerer",
-                        instruction.operation().name(),
-                    ),
-                }));
-            }
-            let location = collective_state.instruction_location(context, instruction.provenance(), location);
-            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(*block, context, location)
-                .with_effect_tokens(std::mem::take(&mut effect_tokens))
-                .with_collective_state(collective_state.clone());
-            let outputs =
-                instruction
-                    .operation()
-                    .lower(&mut lowerer, inputs, input_types.as_slice(), output_types.as_slice())?;
-            if lowerer.effect_tokens.ordered_assertion.is_some() {
-                collective_state.has_assertions.set(true);
-            }
-            effect_tokens = lowerer.effect_tokens;
-            Ok(outputs)
-        },
     )
 }
 
@@ -391,18 +313,86 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::lowering) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{AddOperation, ArrayType, DataType, MulOperation, Placeholder, PrintOperation};
     use ryft_mlir::dialects::func;
     use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, TypeAndAttributes, Value as MlirValue};
 
-    use crate::ArrayConstant;
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
-    use crate::lowering::types::lower_tensor_type;
+    use crate::lowering::types::{lower_literal_value, lower_tensor_type};
+    use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
+    use crate::{ArrayConstant, Operation};
 
     use super::*;
+
+    /// Lowers one plain traced program to values inside `block`, whose arguments are the program inputs. This test-only
+    /// path supports no attached regions.
+    pub(in crate::lowering) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+        program: &CoreProgram<V, O, Input, Output>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        collective_state: &CollectiveLoweringState,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
+    where
+        V: MlirLowerableValue,
+        O: LowerableOperation<Type = ArrayType>,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+    {
+        let input_values = (0..program.input_ids().len())
+            .map(|index| block.argument(index).unwrap().as_ref())
+            .collect::<Vec<_>>();
+        // The per-class effect chains of the function body are created lazily and dropped at the end of that body.
+        let mut effect_tokens = EffectTokens::default();
+        replay_program_into_block(
+            program,
+            input_values,
+            block,
+            context,
+            location,
+            |_, value, block, context, location| lower_literal_value(value, block, context, location),
+            |instruction, inputs, block, context, location| {
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| program.atoms()[input.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let output_types = instruction
+                    .outputs()
+                    .iter()
+                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                if !instruction.regions().is_empty() {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: instruction.operation().name().to_string(),
+                        reason: format!(
+                            "plain-program lowering does not support attached regions for `{}`; use the production \
+                             array IR XLA lowerer",
+                            instruction.operation().name(),
+                        ),
+                    }));
+                }
+                let location = collective_state.instruction_location(context, instruction.provenance(), location);
+                let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(*block, context, location)
+                    .with_effect_tokens(std::mem::take(&mut effect_tokens))
+                    .with_collective_state(collective_state.clone());
+                let outputs = instruction.operation().lower(
+                    &mut lowerer,
+                    inputs,
+                    input_types.as_slice(),
+                    output_types.as_slice(),
+                )?;
+                if lowerer.effect_tokens.ordered_assertion.is_some() {
+                    collective_state.has_assertions.set(true);
+                }
+                effect_tokens = lowerer.effect_tokens;
+                Ok(outputs)
+            },
+        )
+    }
 
     /// Inlines `program` into the body of a `main` function behind an optimization barrier on all of its inputs,
     /// returns the inlined outputs from that function, and renders the verified module. When `ordered_io` is set, the

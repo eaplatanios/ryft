@@ -653,9 +653,8 @@ mod tests {
 
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
-        test_vector_type,
+        test_vector_type, to_mlir_module_for_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::{array_domain, read_f32s, read_u64s};

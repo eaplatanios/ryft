@@ -697,15 +697,16 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, unproject_plain_program,
+        ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, to_mlir_module_for_plain_program,
+        unproject_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{
         domain_mesh, f32_vector, program_array, read_f32s, read_f64s, replicated_scalar_type, replicated_vector_type,
+        session_with_client,
     };
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, Constant, Options, Session, Value, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Constant, Options, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -720,7 +721,7 @@ mod tests {
     #[test]
     fn test_slice_operation_lower() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
         let output = input.slice(&[1], &[3], &[1]).unwrap();
@@ -1038,7 +1039,7 @@ mod tests {
     #[test]
     fn test_update_slice_operation_lower() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
         let update = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
@@ -1208,7 +1209,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_clamps_unsigned_indices_without_narrowing() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input = Value::Array(f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]));
         let index = Value::Array(
             Array::from_host_buffer(&session, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
@@ -1244,7 +1245,7 @@ mod tests {
         // extents, with an in-bounds start and a start that clamps to the last rows.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
@@ -1654,7 +1655,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_with_dimensions() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
@@ -1731,7 +1732,7 @@ mod tests {
         // points, including an empty result.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let mut builder = ArrayIrProgramBuilder::new();
@@ -1801,7 +1802,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_pullback_with_runtime_input_shape() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
         let scalar_type = ArrayType::scalar(DataType::I64);
         let context = TracingContext::<Constant, Operation>::new();
@@ -1909,7 +1910,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_checks_runtime_extents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());

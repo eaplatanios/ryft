@@ -529,9 +529,9 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, program_array, read_f32s};
+    use crate::sessions::tests::{domain_mesh, program_array, read_f32s, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Constant, Session, Value, to_mlir_module_for_program};
+    use crate::{Constant, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1626,7 +1626,7 @@ mod tests {
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let value = |dimensions: &[usize], values: &[f32]| {
             Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };

@@ -142,7 +142,7 @@ mod tests {
     use crate::lowering::tests::test_vector_type;
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::{FlatProgram, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type};
+    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type, session_with_client};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{Array, CompiledFunction, Constant, Session, Tracer, compile, to_mlir_module_for_program};
 
@@ -170,7 +170,7 @@ mod tests {
     fn test_stop_gradient_operation_lower_executes_as_the_identity() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =

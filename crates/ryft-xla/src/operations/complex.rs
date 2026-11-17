@@ -177,11 +177,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayOperation, Conjugate, Placeholder, Real, differentiate_at};
 
-    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module};
-    use crate::lowering::to_mlir_module_for_plain_program;
-    use crate::sessions::tests::domain_mesh;
+    use crate::ArrayConstant;
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program};
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Session};
 
     use super::*;
 
@@ -230,7 +229,7 @@ mod tests {
     #[test]
     fn test_conjugate_operation_lower_differentiation() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let z = Complex::new(0.7f32, -0.3);
         let input = replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[z]));

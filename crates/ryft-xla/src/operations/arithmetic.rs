@@ -346,11 +346,12 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Client, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, test_spmd_compilation_options};
-    use crate::lowering::to_mlir_module_for_plain_program;
-    use crate::sessions::tests::domain_mesh;
+    use crate::ArrayConstant;
+    use crate::lowering::tests::{
+        ProgramBuilder, lowered_unary_module, test_spmd_compilation_options, to_mlir_module_for_plain_program,
+    };
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Session};
 
     use super::*;
 
@@ -703,7 +704,7 @@ mod tests {
     #[test]
     fn test_abs_operation_lower_differentiation_at_zero() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // The JVP of `abs` uses its explicit origin convention after XLA compiles the comparison and selection that
@@ -752,7 +753,7 @@ mod tests {
     #[test]
     fn test_normalize_arithmetic_inputs_signed_one_bit_promotion() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let signed = replicated_array(&session, &mesh, DataType::I1, &[2], &[1, 0]);
         let two = replicated_array(&session, &mesh, DataType::I8, &[], &[2]);
@@ -796,7 +797,7 @@ mod tests {
     #[test]
     fn test_lower_arithmetic_output_one_bit() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let cpu = client.platform_name().unwrap().eq_ignore_ascii_case("cpu");
 

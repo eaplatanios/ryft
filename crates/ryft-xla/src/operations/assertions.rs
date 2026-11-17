@@ -1661,9 +1661,11 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{boolean_vector, domain_mesh, f32_vector, read_i64s, replicated_scalar_type};
+    use crate::sessions::tests::{
+        boolean_vector, domain_mesh, f32_vector, read_i64s, replicated_scalar_type, session_with_client,
+    };
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, Options, RuntimeError, Session, to_mlir_module_for_program};
+    use crate::{Array, Constant, Options, RuntimeError, to_mlir_module_for_program};
 
     use super::*;
 
@@ -2485,7 +2487,7 @@ mod tests {
         let client = cpu_client(1);
         ensure_print_handler_registered(&client).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2551,7 +2553,7 @@ mod tests {
     fn test_assert_operation_lower_reports_the_first_failure() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let first_type = DimensionType::new("first", bounds);
@@ -2633,7 +2635,7 @@ mod tests {
     fn test_assert_operation_lower_preserves_diagnostics() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2768,7 +2770,7 @@ mod tests {
     fn test_assert_operation_lower_reports_bounded_element_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         for mode in [0, 1, 2] {
             let predicates = boolean_vector(&session, &mesh, &[true, false, false, false]);
             let observations = f32_vector(&session, &mesh, &[10., 20., 30., 40.]);
@@ -2836,7 +2838,7 @@ mod tests {
     fn test_assert_operation_lower_reports_bounded_sub_byte_observations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         for (data_type, values) in [
             (DataType::I1, [0., -1., 0., -1.]),
             (DataType::U1, [0., 1., 0., 1.]),
@@ -2889,7 +2891,7 @@ mod tests {
     fn test_assert_operation_lower_reports_scalar_observations() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
         for observations in [
             vec![],
@@ -2989,7 +2991,7 @@ mod tests {
     fn test_assert_operation_lower_reports_dynamically_batched_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
@@ -3090,7 +3092,7 @@ mod tests {
     fn test_assert_operation_lower_reports_dynamically_batched_replicated_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(&client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let context = TracingContext::<Constant, Operation>::new();

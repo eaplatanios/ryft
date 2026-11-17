@@ -2324,7 +2324,7 @@ mod tests {
     use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
     use crate::sessions::tests::{
         domain_mesh, read_f32s, read_f64s, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
-        two_device_mesh,
+        session_with_client, two_device_mesh,
     };
     use crate::tests::{assert_send_sync, cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
@@ -2356,7 +2356,7 @@ mod tests {
     fn test_compiled_function_dispatcher_execute() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let function: CompiledFunctionDispatcher<'_, _, bool, ArrayType, ArrayType> = jit(
             |apply_sine, input: CompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
             &session,
@@ -2386,7 +2386,7 @@ mod tests {
     fn test_compiled_function_dispatcher_execute_specializes_on_input_placement_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]);
@@ -2427,7 +2427,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
             jit(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, mesh.clone());
@@ -2459,7 +2459,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call_reads_axis_index_inside_jvp() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let xs = Array::from_host_buffer(
             &engine,
@@ -2514,7 +2514,7 @@ mod tests {
     fn test_compiled_function_dispatcher_call_with_named_axes() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
@@ -2589,7 +2589,7 @@ mod tests {
     fn test_stateful_compiled_function_dispatcher_execute_statefully_and_wait() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let function = jit_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
@@ -2626,7 +2626,7 @@ mod tests {
     fn test_stateful_compiled_function_dispatcher_execute_statefully() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let function = jit_statefully_with_options::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
@@ -2658,7 +2658,7 @@ mod tests {
         // The public output types exclude the hidden final state output that the mutated reference appends.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -2679,7 +2679,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -2731,7 +2731,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_commits_tangent_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2797,7 +2797,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_commits_cotangent_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2855,7 +2855,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_without_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |input| {
@@ -2878,7 +2878,7 @@ mod tests {
     fn test_stateful_compiled_function_execute_statefully_and_wait_keeps_read_only_holder_ready() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
@@ -2910,7 +2910,7 @@ mod tests {
         // carrying the execution fence rather than an already completed result.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |input| {
@@ -2933,7 +2933,7 @@ mod tests {
     fn test_compile_statefully_reference_transforms_match_uncompiled_transforms() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
@@ -3026,7 +3026,7 @@ mod tests {
     fn test_compile_statefully_commits_accumulating_custom_backward_buffers() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = ArrayType::new_static(DataType::F32, [4]);
 
         // `x ↦ x[1]`, whose accumulating backward rule adds its seed to only the affected entry of the caller buffer.
@@ -3096,7 +3096,7 @@ mod tests {
     fn test_compile_statefully_rejects_escaping_reference_outputs() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
 
         // A reference allocated inside the program has no host identity the ABI could hand back.
@@ -3137,7 +3137,7 @@ mod tests {
     fn test_compile_statefully_forwards_references_through_nested_calls() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -3180,7 +3180,7 @@ mod tests {
     fn test_compile_statefully_rejects_nested_calls_that_return_allocated_references() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
 
         fn allocate_reference<'c>(
@@ -3224,7 +3224,7 @@ mod tests {
     fn test_compile_statefully_reads_bounded_dynamic_state_and_rejects_mutation() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -3280,7 +3280,7 @@ mod tests {
     fn test_compile_statefully_with_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference = ArrayReference::new(
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
@@ -3308,7 +3308,7 @@ mod tests {
     fn test_compile_statefully_with_captures_rejects_duplicate_reference_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference = ArrayReference::new(
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
@@ -3340,7 +3340,7 @@ mod tests {
         // which threads its captures into the outer compiled function. Only the outer program is compiled.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -3386,7 +3386,7 @@ mod tests {
         // `g(x) = sin(x) + sin(x) = 2 sin(x)`.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -3420,7 +3420,7 @@ mod tests {
     fn test_staged_function_call_in_context_without_input_leaves() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = ArrayType::scalar(DataType::F32);
         let capture = Value::Array(
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice()).unwrap(),
@@ -3470,7 +3470,7 @@ mod tests {
     fn test_executable_function_mesh() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh.clone()).unwrap();
@@ -3481,7 +3481,7 @@ mod tests {
     fn test_executable_function_execute() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 1);
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
@@ -3504,8 +3504,8 @@ mod tests {
         let other_client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let other_mesh = domain_mesh(&other_client, "x", 1);
-        let session = Session::with_client(&client);
-        let other_session = Session::with_client(&other_client);
+        let session = session_with_client(&client);
+        let other_session = session_with_client(&other_client);
         let input_type = replicated_vector_type(&mesh, 1);
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
@@ -3549,7 +3549,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 1);
         let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
@@ -3568,7 +3568,7 @@ mod tests {
     fn test_executable_function_execute_reshards_mismatched_inputs() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         // The executable expects an input sharded along `x` across both devices, but the caller passes a fully
         // replicated array, which `ExecutableFunction::execute` silently reshards before executing.
@@ -3616,7 +3616,7 @@ mod tests {
     fn test_executable_function_execute_async_rejects_stateful_executables() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
             |reference| reference.read().map_err(Into::into),
@@ -3642,7 +3642,7 @@ mod tests {
     fn test_executable_function_execute_async_retains_zero_output_completion() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 1);
         let compiled: CompiledFunction<'_, ArrayType, ()> =
@@ -3668,7 +3668,7 @@ mod tests {
         // direct `compile` of the same closure numerically.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -3703,7 +3703,7 @@ mod tests {
     fn test_session_adaptive_profile_guided_recompilation_rejects_cpu() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 1);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh).unwrap();
@@ -3722,7 +3722,7 @@ mod tests {
         // arrays first, and the captured gradient of `f(x; c) = (x + c) · c` is `c`.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_vector_type(&mesh, 2);
         let vector = |values: &[f32]| {
             Value::Array(
@@ -3752,7 +3752,7 @@ mod tests {
         // x) x`, which the residual placement must not change.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let array_type = replicated_vector_type(&mesh, 3);
         let values = [0.1f32, 0.2, 0.3];
         let dot = values.iter().map(|value| value * value).sum::<f32>();
@@ -3801,7 +3801,7 @@ mod tests {
         // printing the IR) and transform composition through `CompiledFunction::call` build on.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -3820,7 +3820,7 @@ mod tests {
     fn test_compiled_function_mesh() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh.clone()).unwrap();
@@ -3836,7 +3836,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
 
@@ -3885,7 +3885,7 @@ mod tests {
     fn test_compiled_function_call_imports_captures_into_compile() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let bias = Array::from_host_buffer(
@@ -3926,7 +3926,7 @@ mod tests {
     fn test_compiled_function_call_imports_captures_of_multiple_functions_into_compile() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let left_bias = Array::from_host_buffer(
@@ -3987,7 +3987,7 @@ mod tests {
     fn test_compiled_function_call_constrains_inputs_to_input_sharding_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(1)).unwrap();
@@ -4077,7 +4077,7 @@ mod tests {
     fn test_compiled_function_call_returns_output_sharding_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = replicated_vector_type(&mesh, 4);
         let input = Array::from_host_buffer(
@@ -4119,7 +4119,7 @@ mod tests {
     fn test_compiled_function_call_agrees_with_execution_for_auto_axis_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
@@ -4205,7 +4205,7 @@ mod tests {
     fn test_compiled_function_call_under_eager_parents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -4258,7 +4258,7 @@ mod tests {
         // Composite rules must be `'static`, and so the compiled function that they call must outlive every borrow.
         let client = Box::leak(Box::new(execution_client()));
         let mesh = domain_mesh(client, "x", 1);
-        let engine = Session::with_client(client);
+        let engine = session_with_client(client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -4327,7 +4327,7 @@ mod tests {
         type Body = Tracer<TracingContext<Constant, Operation>>;
         let client = Box::leak(Box::new(execution_client()));
         let mesh = domain_mesh(client, "x", 1);
-        let engine = Session::with_client(client);
+        let engine = session_with_client(client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -4404,7 +4404,7 @@ mod tests {
     fn test_compiled_function_call_inside_batch_in_parent() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -4457,7 +4457,7 @@ mod tests {
     fn test_compiled_function_call_inside_differentiate_in_parent_at() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -4557,7 +4557,7 @@ mod tests {
     fn test_compiled_function_derived_functions_keep_lowering_options() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let strategy = RaggedDotLoweringStrategy::Instruction;
         let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
@@ -4583,7 +4583,7 @@ mod tests {
     fn test_compiled_function_gradient_materializes_disconnected_symbolic_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4614,7 +4614,7 @@ mod tests {
     fn test_compiled_function_gradient_materializes_disconnected_condition_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4708,7 +4708,7 @@ mod tests {
     fn test_compiled_function_gradient_materializes_disconnected_scanned_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let slice_type = scalar_type.clone();
@@ -4812,7 +4812,7 @@ mod tests {
         // differentiate through that transposed call again.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4902,7 +4902,7 @@ mod tests {
     fn test_compiled_function_gradient_preserves_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -4939,7 +4939,7 @@ mod tests {
         // the shared derived function must still produce their own correct gradients, which depend on those inputs.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -4969,7 +4969,7 @@ mod tests {
         }
 
         // A different session identity misses, produces a fresh derivative, and replaces the retained slot.
-        let other_engine = Session::with_client(&client);
+        let other_engine = session_with_client(&client);
         let third = compiled.gradient(&other_engine).unwrap();
         assert!(!std::ptr::eq(first.function.compiled_program(), third.function.compiled_program()));
         let other_statistics = other_engine.compilation_context().statistics();
@@ -4982,7 +4982,7 @@ mod tests {
     fn test_compiled_function_gradient_rejects_non_scalar_output() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh).unwrap();
@@ -5004,7 +5004,7 @@ mod tests {
         // it at `(primal, tangent)` returns `(sin(primal), cos(primal) * tangent)` within `1e-5`.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5088,7 +5088,7 @@ mod tests {
     fn test_compiled_function_jvp_preserves_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5138,7 +5138,7 @@ mod tests {
         const CALLEE_OPERATIONS: usize = 600;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5189,7 +5189,7 @@ mod tests {
         // `CompiledFunction::jvp` path.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5223,7 +5223,7 @@ mod tests {
     fn test_compiled_function_jvp_executes_zero_space_boundaries() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5251,7 +5251,7 @@ mod tests {
     fn test_compiled_function_batch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
         let vector_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated(1)).unwrap();
         let array = |r#type: ArrayType, values: &[f32]| {
@@ -5314,7 +5314,7 @@ mod tests {
     fn test_compiled_function_batch_places_batch_dimension() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_sharding = Sharding::new(
             mesh.logical_mesh().clone(),
@@ -5361,7 +5361,7 @@ mod tests {
     fn test_compiled_function_batch_requires_static_extent() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let function: CompiledFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), scalar_type, &engine, mesh).unwrap();
@@ -5379,7 +5379,7 @@ mod tests {
     fn test_compile() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -5401,7 +5401,7 @@ mod tests {
     fn test_compile_broadcast_capture() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -5433,7 +5433,7 @@ mod tests {
     fn test_compile_discharges_local_reference_state_without_changing_the_array_abi() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
@@ -5462,7 +5462,7 @@ mod tests {
     fn test_compile_local_reference_value_and_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
         // The inner gradient differentiates reference contents at entry, while the outer compiled function returns
@@ -5517,7 +5517,7 @@ mod tests {
     fn test_compile_scan_indexes_its_captured_reference_root_in_nested_call() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]));
             let reference_type = ArrayIrType::Reference(ReferenceType::new(input_type.clone()));
@@ -5728,7 +5728,7 @@ mod tests {
         type Body = Tracer<TracingContext<Constant, Operation>>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 8);
         let array = |values: &[f32]| {
             Array::from_host_buffer(
@@ -5782,7 +5782,7 @@ mod tests {
     fn test_compile_dense_differentiation_of_array_ir_values() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 2);
 
         // The dense builders run directly on array IR values, rather than on their array projections, whose packed
@@ -5836,7 +5836,7 @@ mod tests {
     fn test_compile_dense_differentiation_as_part_of_the_enclosing_program() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let forward: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
@@ -5963,7 +5963,7 @@ mod tests {
     fn test_compile_dense_differentiation_of_promoted_broadcast() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -6010,7 +6010,7 @@ mod tests {
     fn test_compile_stable_cross_entropy_gradients() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
         let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<Session<'_>, ArrayType>>(-1);
@@ -6082,7 +6082,7 @@ mod tests {
         // a replicated integer label match the unsharded arithmetic.
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let logits_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
@@ -6143,7 +6143,7 @@ mod tests {
         // runtime extents the lowered program reads.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let classes = DimensionVariable::new("classes", DimensionBounds::new(1, Some(5)).unwrap());
         let replicated = |r#type: ArrayType| {
@@ -6209,7 +6209,7 @@ mod tests {
     fn test_compile_stages_jvp_of_compiled_function_call_with_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6277,7 +6277,7 @@ mod tests {
     fn test_compile_binary_function_with_tuple_input() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let shape = Shape::new(vec![CoreDimension::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -6307,7 +6307,7 @@ mod tests {
     fn test_compile_reuses_cached_lowering_on_repeated_call_site() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 4);
 
         assert_eq!(engine.program_count(), 0);
@@ -6323,7 +6323,7 @@ mod tests {
     fn test_compile_shares_cache_across_call_sites_for_equivalent_lowerings() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 4);
 
         assert_eq!(engine.program_count(), 0);
@@ -6349,7 +6349,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let array_type = replicated_vector_type(&mesh, 4);
 
         for batch_size in [32usize, 64usize] {
@@ -6365,7 +6365,7 @@ mod tests {
         type Body = Tracer<TracingContext<Constant, Operation>>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let array = |r#type: &ArrayType, values: &[f32]| {
@@ -6436,7 +6436,7 @@ mod tests {
     fn test_compile_applies_trace_local_pushforward_under_batch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 2);
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -6501,7 +6501,7 @@ mod tests {
     fn test_compile_with_captures() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let bias = Array::from_host_buffer(
@@ -6546,7 +6546,7 @@ mod tests {
     fn test_compile_with_captures_erases_zero_space_capture_argument() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6572,7 +6572,7 @@ mod tests {
     fn test_compile_with_captures_keeps_captured_array_placement_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
@@ -6607,7 +6607,7 @@ mod tests {
     fn test_compile_with_options_donates_argument() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 3);
         let options = Options::new(mesh.clone()).with_donate(true);
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
@@ -6632,7 +6632,7 @@ mod tests {
     fn test_compile_with_options_rejects_donation_arity_mismatch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         // A tree of three donation flags does not match the one flat input of the function.
         let options = Options::new(mesh.clone()).with_donate((true, false, false));
@@ -6648,7 +6648,7 @@ mod tests {
     fn test_compile_with_options_input_shardings_override_replaces_input_sharding() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         // `input_type` carries the abstract shape and data type but a replicated sharding, which the `input_shardings`
         // override replaces with a sharding along `x` before tracing, so the compiled program shards the input across
@@ -6698,7 +6698,7 @@ mod tests {
     fn test_compile_with_options_rejects_input_shardings_arity_mismatch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input must fail.
@@ -6715,7 +6715,7 @@ mod tests {
     fn test_compile_with_options_output_shardings_override_propagates_to_output_array() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -6762,7 +6762,7 @@ mod tests {
     fn test_compile_with_options_rejects_output_shardings_arity_mismatch() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let options = Options::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
@@ -6779,7 +6779,7 @@ mod tests {
         // Input sharding overrides change the input types before tracing begins.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
 
         // The input type declares no sharding, so the sharding of the staged input can only come from the override.
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
@@ -6799,7 +6799,7 @@ mod tests {
     fn test_infer_output_types() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 7);
 
         let output_type: ArrayType = infer_output_types(|x| x.sin().unwrap(), input_type.clone()).unwrap();

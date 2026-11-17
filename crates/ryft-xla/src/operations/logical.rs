@@ -89,8 +89,7 @@ mod tests {
     use ryft_core::{ArrayOperation, DataType, Placeholder};
 
     use crate::ArrayConstant;
-    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module};
-    use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program};
 
     use super::*;
 

@@ -169,9 +169,9 @@ mod tests {
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Session, to_mlir_module_for_program};
+    use crate::{ArrayConstant, to_mlir_module_for_program};
 
     use super::*;
 
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn test_select_operation_lower_promotes_signed_one_bit_branches() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let condition = replicated_array(&session, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
         let signed = replicated_array(&session, &mesh, DataType::I1, &[4], &[1, 1, 0, 0]);

@@ -33,9 +33,9 @@ mod tests {
 
     use crate::ArrayConstant;
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, to_mlir_module_for_plain_program,
+        unproject_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::execution_client;
 
     use super::*;

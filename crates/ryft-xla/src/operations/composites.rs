@@ -322,7 +322,7 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Constant, Session, to_mlir_module_for_program};
 
@@ -556,7 +556,7 @@ mod tests {
         // while batching it, before or after differentiating it, applies the rule, which computes `2x²` so that its use
         // is observable.
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[0.5f32, 1.0, 1.5]));
         let tangent = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 1.0, 1.0]));
@@ -593,7 +593,7 @@ mod tests {
         // tangent is mapped yields the exact tangents `3(ẋy + xẏ)` of each batch item, which requires taking a
         // diagonal on device.
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let function = composite(|(x, y): (ArrayTracer<'_>, ArrayTracer<'_>)| Ok(x * y))
             .with_broadcast_sensitive_batching(

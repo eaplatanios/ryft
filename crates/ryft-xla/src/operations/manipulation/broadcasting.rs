@@ -364,14 +364,13 @@ mod tests {
     use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
         ragged_dot_cpu_compilation_options, shard_map_module, test_manual_mesh, test_spmd_compilation_options,
-        test_vector_type,
+        test_vector_type, to_mlir_module_for_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, replicated_vector_type};
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, ExecutionArguments, FromPjrt, Session, compile,
+        Array, ArrayConstant, CompiledFunction, Constant, ExecutionArguments, FromPjrt, compile,
         to_mlir_module_for_program,
     };
 
@@ -892,7 +891,7 @@ mod tests {
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let input = Array::from_host_buffer(
-            &Session::with_client(&client),
+            &session_with_client(&client),
             input_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -944,7 +943,7 @@ mod tests {
     fn test_broadcast_operation_lower_converted_operand() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::with_client(&client);
+        let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 3);
         let output_type = ArrayType::new_static(DataType::C64, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))

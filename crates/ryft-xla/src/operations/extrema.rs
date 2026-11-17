@@ -351,7 +351,7 @@ mod tests {
 
     use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Array, Constant, Session};
 
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_max_operation_lower() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Boolean maxima are disjunctions.
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn test_max_operation_lower_complex() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn test_min_operation_lower() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Boolean minima are conjunctions.
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn test_min_operation_lower_complex() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_clamp_operation_lower() {
         let client = execution_client();
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
 
         // Floating-point values below, inside, and above the interval keep their exact bytes, NaN inputs propagate,

@@ -341,8 +341,8 @@ mod tests {
 
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_vector_type,
+        to_mlir_module_for_plain_program,
     };
-    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};

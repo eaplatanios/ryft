@@ -406,8 +406,7 @@ mod tests {
     use ryft_core::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, Typed};
     use ryft_pjrt::BufferType;
 
-    use crate::Session;
-    use crate::sessions::tests::domain_mesh;
+    use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -444,7 +443,7 @@ mod tests {
     #[test]
     fn test_session_device_put_uploads_host_leaves() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
 
         // Without a destination, a host leaf is committed to the first local device.
@@ -475,7 +474,7 @@ mod tests {
     #[test]
     fn test_session_device_put_uploads_reference_backend_arrays() {
         let client = cpu_client(1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let matrix = CoreArray::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap();
         let array = session.device_put(matrix, DevicePutOptions::defaults()).unwrap();
         assert_eq!(
@@ -488,7 +487,7 @@ mod tests {
     #[test]
     fn test_session_device_put_broadcasts_root_placement_over_array_tuple() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -560,7 +559,7 @@ mod tests {
     #[test]
     fn test_session_device_put_donation_and_aliasing() {
         let client = cpu_client(2);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -627,7 +626,7 @@ mod tests {
     #[test]
     fn test_session_device_put_preserves_partially_addressable_array_when_device_is_absent() {
         let client = cpu_client(1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -664,7 +663,7 @@ mod tests {
     #[test]
     fn test_session_device_put_rejects_mismatched_source_for_array_leaf() {
         let client = cpu_client(1);
-        let session = Session::with_client(&client);
+        let session = session_with_client(&client);
         let source_mesh = domain_mesh(&client, "x", 1);
         let source_device = source_mesh.devices()[0];
         let source_sharding = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
