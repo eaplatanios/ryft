@@ -7,10 +7,10 @@
 //! initialization and adapter admission remain separate requirements, just as for an explicitly built definition.
 //!
 //! The array subset is constant, zero, add/subtract/saturating subtract/multiply/divide/remainder,
-//! negate/absolute/minimum/maximum, exp/log/sqrt/rsqrt/tanh, Boolean not/and/or/xor, select, compare and dot. Dimension
-//! arithmetic supports add, subtract, saturating subtract, multiply, floor division and remainder when canonical
-//! reconstruction preserves its complete cached metadata; scalar conversions, conditions and while loops are also
-//! supported. Reference allocation/read/write/swap,
+//! negate/absolute/minimum/maximum, exp/log/sqrt/rsqrt/tanh, Boolean not/and/or/xor, select, compare, reduce and dot.
+//! Dimension arithmetic supports add, subtract, saturating subtract, multiply, floor division and remainder when
+//! canonical reconstruction preserves its complete cached metadata; scalar conversions, conditions and while loops are
+//! also supported. Reference allocation/read/write/swap,
 //! freeze/add-update/atomic-add-update, scratch, tile load, masked load/store/swap and async copy/wait are supported.
 //! Folded reference paths retain their canonical trailing bindings. Other operation payloads, distributed metadata
 //! and dynamically shaped explicit layouts report eligibility errors. Sequence sizes are bounded before allocation
@@ -29,11 +29,11 @@ use ryft_core::{
     DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, DivOperation, DotDimensionNumbers,
     DotOperation, EagerContext, ExpOperation, FlatProgram, Instruction, Layout, LogOperation, MAX_DIMENSION_EXTENT,
     MaxOperation, Memory, MinOperation, MulOperation, NegOperation, NotOperation, Operation, OrOperation, Placeholder,
-    Program, ProgramError, Provenance, ProvenanceScope, ReferenceAccessOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Region, RegionId, RemOperation, RsqrtOperation,
-    SaturatingSubOperation, SelectOperation, Shape, SqrtOperation, StridedLayout, SubOperation, TanhOperation, Tile,
-    TileDimension, TiledLayout, Typed, WhileOperation, XorOperation, ZeroOperation,
+    Program, ProgramError, Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAccessOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Region, RegionId,
+    RemOperation, RsqrtOperation, SaturatingSubOperation, SelectOperation, Shape, SqrtOperation, StridedLayout,
+    SubOperation, TanhOperation, Tile, TileDimension, TiledLayout, Typed, WhileOperation, XorOperation, ZeroOperation,
     validated_reference_access_descriptors,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -246,7 +246,7 @@ impl WireReferenceTransform {
                 Self::DynamicIndex { axis: *axis }
             }
             ArrayReferenceTransform::Slice { axes } => {
-                check_records(axes.len())?;
+                validate_encoded_records(axes.len())?;
                 Self::Slice {
                     axes: axes
                         .iter()
@@ -561,6 +561,11 @@ enum WireOperation {
     },
     SaturatingSub,
     SaturatingSubDimension,
+    Reduce {
+        #[serde(deserialize_with = "bounded_records")]
+        axes: Vec<usize>,
+        kind: WireReductionKind,
+    },
 }
 
 /// Explicit comparison predicate.
@@ -600,13 +605,56 @@ impl From<WireComparison> for ComparisonDirection {
     }
 }
 
+/// Explicit reduction kind.
+#[derive(Copy, Clone, Serialize, Deserialize)]
+enum WireReductionKind {
+    Sum,
+    Product,
+    Mean,
+    LogSumExp,
+    Max,
+    Min,
+    Any,
+    All,
+}
+
+impl From<ReductionKind> for WireReductionKind {
+    fn from(value: ReductionKind) -> Self {
+        match value {
+            ReductionKind::Sum => Self::Sum,
+            ReductionKind::Product => Self::Product,
+            ReductionKind::Mean => Self::Mean,
+            ReductionKind::LogSumExp => Self::LogSumExp,
+            ReductionKind::Max => Self::Max,
+            ReductionKind::Min => Self::Min,
+            ReductionKind::Any => Self::Any,
+            ReductionKind::All => Self::All,
+        }
+    }
+}
+
+impl From<WireReductionKind> for ReductionKind {
+    fn from(value: WireReductionKind) -> Self {
+        match value {
+            WireReductionKind::Sum => Self::Sum,
+            WireReductionKind::Product => Self::Product,
+            WireReductionKind::Mean => Self::Mean,
+            WireReductionKind::LogSumExp => Self::LogSumExp,
+            WireReductionKind::Max => Self::Max,
+            WireReductionKind::Min => Self::Min,
+            WireReductionKind::Any => Self::Any,
+            WireReductionKind::All => Self::All,
+        }
+    }
+}
+
 impl Serialize for KernelDefinition {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut encoder = Encoder::default();
         let call = encoder.call(self.operation()).map_err(serde::ser::Error::custom)?;
         let body =
             encoder.program(self.body(), |operation| Ok(operation.clone())).map_err(serde::ser::Error::custom)?;
-        check_records(encoder.variables.len()).map_err(serde::ser::Error::custom)?;
+        validate_encoded_records(encoder.variables.len()).map_err(serde::ser::Error::custom)?;
         WireDefinition { version: SOURCE_SCHEMA_VERSION, variables: encoder.variables, call, body }
             .serialize(serializer)
     }
@@ -720,7 +768,7 @@ impl Encoder {
                 self.literal_bytes = self
                     .literal_bytes
                     .checked_add(addressing.storage_byte_len())
-                    .ok_or_else(|| invalid("literal storage size overflows"))?;
+                    .ok_or_else(|| unsupported("literal storage exceeds source allocation budget"))?;
                 if self.literal_bytes > MAXIMUM_LITERAL_BYTES || addressing.element_count() > MAXIMUM_LITERAL_BYTES {
                     return Err(unsupported("literal storage exceeds source allocation budget"));
                 }
@@ -737,13 +785,13 @@ impl Encoder {
         program: &FlatProgram<EagerContext<ArrayIrValue<Array>, O>>,
         lift: F,
     ) -> Result<WireProgram, KernelSerializationError> {
-        check_records(program.regions().len())?;
+        validate_encoded_records(program.regions().len())?;
         let regions = program
             .regions()
             .iter()
             .map(|region| {
-                check_records(region.atoms().len())?;
-                check_records(region.instructions().len())?;
+                validate_encoded_records(region.atoms().len())?;
+                validate_encoded_records(region.instructions().len())?;
                 let atoms = region
                     .atoms()
                     .iter()
@@ -764,7 +812,7 @@ impl Encoder {
                             validated_reference_access_descriptors(&operation, instruction.inputs().len())?;
                         for (input_index, descriptor) in descriptors.iter().enumerate() {
                             let Some(descriptor) = descriptor else { continue };
-                            check_records(descriptor.transforms().len())?;
+                            validate_encoded_records(descriptor.transforms().len())?;
                             reference_transforms.push(WireReferenceAccessDescriptor {
                                 input_index,
                                 transforms: descriptor
@@ -839,6 +887,12 @@ impl Encoder {
                     }
                     ArrayOperation::Zero(operation) => WireOperation::Zero(self.array_type(operation.r#type())?),
                     ArrayOperation::Compare(operation) => WireOperation::Compare(operation.direction().into()),
+                    ArrayOperation::Reduce(operation) => {
+                        if operation.output_sharding().is_some() {
+                            return Err(unsupported("reduce output sharding"));
+                        }
+                        WireOperation::Reduce { axes: operation.axes().to_vec(), kind: operation.kind().into() }
+                    }
                     ArrayOperation::Dot(operation) => {
                         if operation.output_sharding().is_some() {
                             return Err(unsupported("dot output sharding"));
@@ -1016,9 +1070,10 @@ impl Decoder {
             .ok_or_else(|| invalid(format!("dimension identity {index} is out of bounds")))
     }
 
-    /// Validates static extents before passing them to type constructors.
+    /// Validates static extents before passing them to type constructors. A symbolic dimension keeps its identity even
+    /// when its bounds admit a single extent, so the decoded dimension is exactly the encoded one.
     fn dimension(&self, dimension: WireDimension) -> Result<Dimension, KernelSerializationError> {
-        Ok(self.dimension_type(dimension)?.simplified_dimension())
+        Ok(self.dimension_type(dimension)?.dimension().clone())
     }
 
     /// Reconstructs a first-class dimension type, keeping a symbolic type's identity even when its bounds admit a
@@ -1133,6 +1188,9 @@ impl Decoder {
             }
             WireOperation::DimensionCompare(direction) => {
                 ArrayIrOperation::Compare(CompareOperation::new(direction.into())).into()
+            }
+            WireOperation::Reduce { axes, kind } => {
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(axes, kind.into()))).into()
             }
             WireOperation::Dot { dimensions, accumulation } => {
                 let [left_contracting, right_contracting, left_batching, right_batching] = dimensions;
@@ -1389,7 +1447,7 @@ impl WireProvenance {
         if depth > 128 {
             return Err(unsupported("provenance nesting deeper than 128"));
         }
-        check_records(nodes.len() + 1)?;
+        validate_encoded_records(nodes.len() + 1)?;
         let node = if let Some((scope, origin)) = provenance.as_scope() {
             WireProvenanceNode::Scope {
                 name: scope.name().to_owned(),
@@ -1402,7 +1460,7 @@ impl WireProvenance {
         } else {
             WireProvenanceNode::Unknown
         };
-        check_records(nodes.len() + 1)?;
+        validate_encoded_records(nodes.len() + 1)?;
         let index = nodes.len();
         nodes.push(node);
         Ok(index)
@@ -1447,6 +1505,16 @@ fn boundary(masked: bool) -> BoundaryPolicy {
 /// Checks collection sizes before constructing canonical arena metadata.
 fn check_records(count: usize) -> Result<(), KernelSerializationError> {
     if count > MAXIMUM_RECORDS { Err(invalid(format!("record count exceeds {MAXIMUM_RECORDS}"))) } else { Ok(()) }
+}
+
+/// Validates collection sizes while encoding. An in-memory definition that exceeds the record budget is valid but
+/// cannot be transported, so it is reported as unsupported rather than malformed.
+fn validate_encoded_records(count: usize) -> Result<(), KernelSerializationError> {
+    if count > MAXIMUM_RECORDS {
+        Err(unsupported(format!("record count exceeding {MAXIMUM_RECORDS}")))
+    } else {
+        Ok(())
+    }
 }
 
 /// Creates an explicit unsupported-payload diagnostic.
@@ -1522,8 +1590,8 @@ fn bounded_dot_dimensions<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Context, DotInputPrecision, ProgramBuilder, SinOperation, TanOperation, TanhOperation, TypeIdentityRenaming,
-        TypedProgram,
+        Context, DotInputPrecision, LogicalMesh, MeshAxis, MeshAxisType, ProgramBuilder, Sharding, SinOperation,
+        TanOperation, TanhOperation, TypeIdentityRenaming, TypedProgram,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1677,6 +1745,22 @@ mod tests {
             let input = DimensionValue::new(input_type, coordinate).unwrap();
             assert_eq!(mapping.evaluate(&[input], &[4]).unwrap().starts(), &[expected]);
         }
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_reduce() {
+        #[crate::kernel]
+        fn sum(
+            #[input(data_type = F32, rank = 1)] input: &Array,
+            #[output(data_type = F32, shape = [])] output: &mut Array,
+        ) {
+            output.store(input.load().sum([0]));
+        }
+
+        let input = Array::vector(vec![1.0f32, -2.0, 4.0]).unwrap();
+        let definition = sum::definition(&input.r#type()).unwrap();
+        let decoded = roundtrip(&definition);
+        assert_eq!(decoded.interpret(vec![input], 1), Ok(vec![Array::scalar(3.0f32).unwrap()]));
     }
 
     #[test]
@@ -1847,6 +1931,28 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_serialize_in_bounds_arithmetic() {
+        #[crate::kernel]
+        fn affine(
+            #[input(data_type = F32, rank = 1)] input: &Array,
+            #[output(data_type = F32, shape = [input.shape()[0]], tile = [2], boundary = in_bounds)]
+            output: &mut Array,
+        ) {
+            let [block] = output.tile_index();
+            let tiles = input.tiles([2]).pad(0.0);
+            output.store((tiles.load([block]) - 1.0f32) * 3.0f32 / 2.0f32);
+        }
+
+        let input = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let definition = affine::definition(&input.r#type()).unwrap();
+        let decoded = roundtrip(&definition);
+        assert_eq!(
+            decoded.interpret(vec![input], DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS),
+            Ok(vec![Array::vector(vec![0.0f32, 1.5, 3.0, 4.5]).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_serialize_exact_literal_bits_and_layout() {
         let r#type = ArrayType::new_static(DataType::F32, [2]).with_layout(Some(StridedLayout::new(vec![-4]).into()));
         let bytes = [0x00, 0x00, 0x00, 0x80, 0x45, 0x23, 0xc1, 0x7f];
@@ -1891,6 +1997,18 @@ mod tests {
             Encoder::default().operation(&operation).err().unwrap().to_string(),
             "kernel source serialization does not support `dot precision`",
         );
+
+        // Requested reduction output shardings are distributed metadata, which the wire records exclude.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let operation = KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Reduce(
+            ReduceOperation::new(vec![0], ReductionKind::Sum)
+                .with_output_sharding(Sharding::replicated(mesh, 0))
+                .unwrap(),
+        )));
+        assert!(matches!(
+            Encoder::default().operation(&operation),
+            Err(KernelSerializationError::Unsupported { feature }) if feature == "reduce output sharding",
+        ));
     }
 
     #[test]
@@ -1983,6 +2101,22 @@ mod tests {
             Encoder::default().operation(&operation).err().unwrap().to_string(),
             "kernel source serialization does not support `dimension_mul cached inference metadata`",
         );
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_singleton_dimension_bounds() {
+        let extent = DimensionVariable::new("programs", DimensionBounds::new(2, Some(3)).unwrap());
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Dynamic(extent), GridExecution::Parallel)]).unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace(KernelCallOperation::new(grid, vec![]).unwrap(), |_| Ok(())).unwrap();
+        let decoded = roundtrip(&definition);
+
+        // Decoding creates a fresh nominal identity, so the grid extent is compared by its name and bounds.
+        let Dimension::Dynamic(variable) = decoded.operation().grid().dimensions()[0].extent() else {
+            panic!("expected a dynamic grid extent");
+        };
+        assert_eq!(variable.name(), "programs");
+        assert_eq!(variable.bounds(), DimensionBounds::new(2, Some(3)).unwrap());
     }
 
     #[test]
@@ -2091,6 +2225,15 @@ mod tests {
             Decoder::new(vec![]).value(wire).unwrap_err().to_string(),
             format!("invalid serialized kernel source: literal storage exceeds {MAXIMUM_LITERAL_BYTES} bytes"),
         );
+    }
+
+    #[test]
+    fn test_validate_encoded_records() {
+        assert!(matches!(validate_encoded_records(MAXIMUM_RECORDS), Ok(())));
+        assert!(matches!(
+            validate_encoded_records(MAXIMUM_RECORDS + 1),
+            Err(KernelSerializationError::Unsupported { feature }) if feature == "record count exceeding 1000000",
+        ));
     }
 
     #[test]

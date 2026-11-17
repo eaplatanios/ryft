@@ -99,6 +99,17 @@ fn conditional_accumulate(
     output.store(accumulator);
 }
 
+/// Multiplies a vector by twice itself through a compound assignment whose right operand is a binary expression.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn compound_assignment(
+    #[input(data_type = F32, rank = 1)] input: &Array,
+    #[output(data_type = F32, shape = [input.shape()[0]])] output: &mut Array,
+) {
+    let mut value = input.load();
+    value *= input.load() + input.load();
+    output.store(value);
+}
+
 /// Kernel whose paths resolve relative to its module: its namespace is a `use` alias and its element type is a type
 /// alias, neither of which is visible from the generated definition module unless that module imports its parent.
 mod relative {
@@ -353,6 +364,13 @@ fn test_kernel_conditions() {
         conditional_accumulate(&Array::scalar(false).unwrap(), &input),
         Ok(Array::vector(vec![-3.0f32, -6.0]).unwrap()),
     );
+}
+
+#[test]
+fn test_kernel_compound_assignment_grouping() {
+    // The right operand is evaluated as a whole, so each element `x` becomes `x * (x + x)` and not `x * x + x`.
+    let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+    assert_eq!(compound_assignment(&input), Ok(Array::vector(vec![2.0f32, 8.0]).unwrap()));
 }
 
 #[test]

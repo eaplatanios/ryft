@@ -7,7 +7,7 @@
 
 use ryft_core::{
     Array, ArrayIrType, ArrayIrValue, Domain, EagerContext, InterpretableOperation, Operation, ProgramError,
-    ReferenceAccessMode, Typed,
+    ReferenceAccessMode, Typed, infer_reference_view_type, validated_reference_access_descriptors,
 };
 use thiserror::Error;
 
@@ -115,11 +115,26 @@ where
         }
         let body = self.body().entry_region_ref();
         for instruction in body.instructions() {
+            let descriptors =
+                validated_reference_access_descriptors(instruction.operation(), instruction.inputs().len())?;
             for (input, mode) in instruction.operation().effects().accesses() {
                 if mode == ReferenceAccessMode::AtomicAccumulate {
                     let r#type = body.atoms()[instruction.inputs()[input].index()].r#type();
                     let ArrayIrType::Reference(reference) = r#type.as_ref() else { unreachable!() };
-                    if reference.referent().element_count()?.is_none_or(|count| count > 1) {
+                    // Every declared access has a validated descriptor, and the update applies to the view that its
+                    // transforms select rather than to the complete referent.
+                    let Some(descriptor) = &descriptors[input] else { unreachable!() };
+                    let bindings = instruction.inputs()[descriptor.bindings()]
+                        .iter()
+                        .map(|binding| body.atoms()[binding.index()].r#type())
+                        .collect::<Vec<_>>();
+                    let view = infer_reference_view_type(
+                        reference.referent(),
+                        descriptor.transforms(),
+                        &bindings.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                        mode,
+                    )?;
+                    if view.element_count()?.is_none_or(|count| count > 1) {
                         return Err(ProgramError::custom(KernelSchedulingError::Unsupported {
                             reason: "non-scalar atomic updates",
                         }));
@@ -243,9 +258,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, ArrayType, CompareOperation, ComparisonDirection, ConditionOperation,
-        Context, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, Placeholder, ProgramBuilder,
-        Provenance, ReferenceAtomicAddUpdate, SelectOperation,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType,
+        CompareOperation, ComparisonDirection, ConditionOperation, Context, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, Placeholder, ProgramBuilder, Provenance, ReferenceAtomicAddUpdate,
+        ReferenceAtomicAddUpdateOperation, SelectOperation,
     };
 
     use crate::calls::{KernelCallOperation, KernelParameter};
@@ -470,6 +486,67 @@ mod tests {
             Some(&KernelSchedulingError::Unsupported { reason: "non-scalar atomic updates" }),
         );
         assert_eq!(error.to_string(), "kernel interleaving exploration does not support non-scalar atomic updates");
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_interleavings_element_atomics() {
+        // Both programs select the whole vector, and their atomic updates index the same single element of it.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(ArrayIrType::Dimension(DimensionType::new(
+            "coordinate",
+            DimensionBounds::non_negative(Some(2)).unwrap(),
+        )));
+        let zero = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
+        let mapping = BlockMapping::new(
+            builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap(),
+            vec![2],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let input = Array::vector(vec![0f32, 0f32]).unwrap();
+        let call = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![KernelParameter::new(input.r#type().into_owned(), KernelParameterAccess::ReadWrite, mapping).unwrap()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = builder.add_input(call.parameters()[0].body_type());
+        builder.add_input(call.coordinate_types()[0].clone().into());
+        let update = builder.add_constant(ArrayIrValue::Array(Array::scalar(1f32).unwrap()));
+        builder
+            .add_instruction(
+                ReferenceAtomicAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(0),
+                }]),
+                vec![],
+                vec![reference, update],
+                None,
+            )
+            .unwrap();
+        let definition =
+            KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+        let executions = definition.interpret_interleavings(vec![input], &KernelDebugOptions::default(), 2).unwrap();
+        assert_eq!(executions.len(), 2);
+        let output = Array::vector(vec![2f32, 0f32]).unwrap();
+        assert_eq!(executions[0].result, Ok(vec![output.clone()]));
+        assert_eq!(
+            executions[0]
+                .trace
+                .iter()
+                .map(|entry| (entry.coordinate.clone(), entry.operation))
+                .collect::<Vec<_>>(),
+            vec![(vec![0], "reference_atomic_add_update"), (vec![1], "reference_atomic_add_update")],
+        );
+        assert_eq!(executions[1].result, Ok(vec![output]));
+        assert_eq!(
+            executions[1]
+                .trace
+                .iter()
+                .map(|entry| (entry.coordinate.clone(), entry.operation))
+                .collect::<Vec<_>>(),
+            vec![(vec![1], "reference_atomic_add_update"), (vec![0], "reference_atomic_add_update")],
+        );
     }
 
     #[test]

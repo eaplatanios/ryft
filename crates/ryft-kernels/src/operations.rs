@@ -15,12 +15,13 @@ use ryft_core::{
     CollectiveAxes, CollectiveOperation, ConditionOperation, ConstantOperation, Context, DimensionOperation,
     DimensionSizeOperation, DimensionType, DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation,
     HiddenAxes, InputRegionProvenance, InterpretableOperation, InterpretationDriver, LockstepDomain, LockstepOperation,
-    LockstepValue, Operation, OperationBoundaryPruning, OperationPayloadProjection, OperationProjection,
-    OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
-    PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionDataFlow,
-    RegionInterface, RegionLiveness, RegionSlot, Type, TypeError, TypeIdentityRenaming,
+    LockstepValue, Operation, OperationBoundaryPruning, OperationFoldOutput, OperationPayloadProjection,
+    OperationProjection, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
+    TypeIdentityRenaming,
 };
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
@@ -331,6 +332,25 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
         }
     }
 
+    fn fold(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        match self {
+            Self::Portable(operation) => operation.fold(input_types, region_interfaces),
+            Self::Call(operation) => operation.fold(input_types, region_interfaces),
+            Self::Scratch(operation) => operation.fold(input_types, region_interfaces),
+            Self::TileLoad(operation) => operation.fold(input_types, region_interfaces),
+            Self::AsyncCopy(operation) => operation.fold(input_types, region_interfaces),
+            Self::Wait(operation) => operation.fold(input_types, region_interfaces),
+            Self::MaskedLoad(operation) => operation.fold(input_types, region_interfaces),
+            Self::MaskedStore(operation) => operation.fold(input_types, region_interfaces),
+            Self::MaskedSwap(operation) => operation.fold(input_types, region_interfaces),
+            Self::Extension(operation) => operation.fold(input_types, region_interfaces),
+        }
+    }
+
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         match self {
             Self::Portable(operation) => operation.input_region_provenance(region_index, input_index),
@@ -473,6 +493,21 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
             Self::MaskedStore(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
             Self::MaskedSwap(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
             Self::Extension(operation) => operation.allows_reference_access_through_region_input(region_index, mode),
+        }
+    }
+
+    fn defers_reference_discharge(&self) -> bool {
+        match self {
+            Self::Portable(operation) => operation.defers_reference_discharge(),
+            Self::Call(operation) => operation.defers_reference_discharge(),
+            Self::Scratch(operation) => operation.defers_reference_discharge(),
+            Self::TileLoad(operation) => operation.defers_reference_discharge(),
+            Self::AsyncCopy(operation) => operation.defers_reference_discharge(),
+            Self::Wait(operation) => operation.defers_reference_discharge(),
+            Self::MaskedLoad(operation) => operation.defers_reference_discharge(),
+            Self::MaskedStore(operation) => operation.defers_reference_discharge(),
+            Self::MaskedSwap(operation) => operation.defers_reference_discharge(),
+            Self::Extension(operation) => operation.defers_reference_discharge(),
         }
     }
 
@@ -910,7 +945,8 @@ pub(crate) mod tests {
     use ryft_core::macros::check_count;
     use ryft_core::{
         AddOperation, ArrayIrValue, ArrayReferenceTransformIndex, AttachedRegions, Condition, DataType, Dimension,
-        DimensionBounds, DimensionVariable, EagerContext, EffectClasses, EmptyRegionDriver, NegOperation,
+        DimensionBounds, DimensionMulOperation, DimensionVariable, EagerContext, EffectClasses, EmptyRegionDriver,
+        NegOperation,
         PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder, ReferenceEffect, ReferenceRead,
         ReferenceSwap, ReferenceType, ReferenceWrite, ScanOperation, Shape, StagingContext, SubOperation, TagOperation,
         Tracer, TracingContext, TypedProgram,
@@ -1256,6 +1292,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_fold() {
+        // A kernel body must fold exactly like the portable family that it wraps, so that the same source stages the
+        // same instructions in both families.
+        let rows = DimensionType::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let one = DimensionType::new("one", DimensionBounds::new(1, Some(2)).unwrap());
+        let multiplication = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&rows, &one).unwrap());
+        let operation = KernelOperation::<NoKernelExtension>::Portable(multiplication.clone());
+        let input_types = [ArrayIrType::Dimension(rows), ArrayIrType::Dimension(one)];
+        assert_eq!(multiplication.fold(&input_types, &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+        assert_eq!(operation.fold(&input_types, &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+
+        // Operations without a fold rule keep reporting that they do not fold.
+        let addition = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
+        let r#type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        assert_eq!(addition.fold(&[r#type.clone(), r#type], &[]), Ok(None));
+    }
+
+    #[test]
     fn test_kernel_operation_region_data_flow() {
         let opaque = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
         let ordinary = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Condition(ConditionOperation::new()));
@@ -1279,6 +1333,36 @@ pub(crate) mod tests {
             };
             assert!(std::ptr::eq(forwarded, expected));
         }
+    }
+
+    #[test]
+    fn test_kernel_operation_defers_reference_discharge() {
+        #[derive(Clone)]
+        struct DeferringOperation;
+
+        impl Operation for DeferringOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "deferring"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(Vec::new())
+            }
+
+            fn defers_reference_discharge(&self) -> bool {
+                true
+            }
+        }
+
+        assert!(KernelOperation::Extension(DeferringOperation).defers_reference_discharge());
+        let portable = KernelOperation::<DeferringOperation>::from(ArrayOperation::Add(AddOperation::new()));
+        assert!(!portable.defers_reference_discharge());
     }
 
     #[test]

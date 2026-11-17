@@ -15,9 +15,9 @@ use ryft_core::{
     CompositeOperation, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, CustomRuleSource,
     DifferentiableType, Dimension, DimensionBounds, DimensionFromScalar, DimensionFromScalarOperation, DimensionType,
     DimensionVariable, EagerContext, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
-    PadOperation, Parameter, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAccessOperation,
-    ReferenceType, RegionInterface, RegionRef, RegionSlot, Tracer, TracingContext, Type, TypeError,
-    TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
+    PadOperation, Parameter, Placeholder, ProgramBuilder, ProgramError, REMATERIALIZE_OPERATION_NAME,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot, Tracer,
+    TracingContext, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
 };
 use thiserror::Error;
 
@@ -82,7 +82,8 @@ pub enum KernelError {
     #[error("kernel parameter {parameter} mapping takes {actual} inputs but the call requires {expected}")]
     MappingInputCount { parameter: usize, expected: usize, actual: usize },
 
-    /// Independent grid axes cannot impose equality through a shared mapping dimension identity.
+    /// Independent grid axes, or a grid axis and a scalar prefetched dimension, cannot impose equality through a shared
+    /// mapping dimension identity.
     #[error(
         "kernel parameter {parameter} mapping axes {first_axis} and {second_axis} share a dimension identity but may \
          differ"
@@ -92,7 +93,8 @@ pub enum KernelError {
         parameter: usize,
         /// First logical axis using the identity.
         first_axis: usize,
-        /// Later logical axis using the same identity.
+        /// Later mapping input using the same identity, which is a logical axis or a scalar prefetched dimension
+        /// following the grid coordinates.
         second_axis: usize,
     },
 
@@ -278,7 +280,8 @@ impl KernelCallOperation {
     /// Creates a call with scalar-prefetched arrays after its ordinary array inputs. Each mapping takes grid
     /// coordinates followed by checked dimensions converted from these rank-zero integer arrays. Body inputs append
     /// the original scalar arrays after references and coordinates. Values must be explicitly specialized before
-    /// executable qualification; this preserves the ordinary array ABI at native call boundaries.
+    /// executable qualification; this preserves the ordinary array ABI at native call boundaries. A prefetched
+    /// dimension cannot share its identity with a grid coordinate, because specialization binds it to a constant.
     pub fn new_with_prefetch(
         grid: Grid,
         parameters: Vec<KernelParameter>,
@@ -327,6 +330,24 @@ impl KernelCallOperation {
                     }
                 }
             }
+            // Specialization binds every prefetched dimension to a constant, which cannot preserve a runtime equality
+            // with a remaining grid coordinate, so `BlockMapping::specialize` rejects such a shared identity for every
+            // prefetched value, even on an empty grid.
+            let input_types = metadata.mapping.program().input_types();
+            let (coordinate_types, prefetch_input_types) = input_types.split_at(grid.dimensions().len());
+            for (offset, prefetch_type) in prefetch_input_types.iter().enumerate() {
+                let ArrayIrType::Dimension(prefetch_type) = prefetch_type else { unreachable!() };
+                for (first_axis, r#type) in coordinate_types.iter().enumerate() {
+                    let ArrayIrType::Dimension(r#type) = r#type else { unreachable!() };
+                    if prefetch_type.variable().is_some() && r#type.variable() == prefetch_type.variable() {
+                        return Err(KernelError::MappingInputIdentity {
+                            parameter,
+                            first_axis,
+                            second_axis: grid.dimensions().len() + offset,
+                        });
+                    }
+                }
+            }
         }
         let coordinate_types = maximum_extents
             .iter()
@@ -350,7 +371,7 @@ impl KernelCallOperation {
     ) -> Result<Self, KernelError> {
         let mut operation = Self::new_with_prefetch(grid, parameters, prefetch_types)?;
         if coordinate_types.len() != operation.coordinate_types.len() {
-            return Err(TypeError::invalid("serialized coordinate count differs from the grid rank").into());
+            return Err(TypeError::invalid("coordinate type count differs from the grid rank").into());
         }
         for (axis, (actual, required)) in coordinate_types.iter().zip(&operation.coordinate_types).enumerate() {
             if actual.bounds().upper().is_none() || !actual.bounds().contains_bounds(required.bounds()) {
@@ -461,7 +482,7 @@ impl KernelCallOperation {
     pub fn specialize_prefetch(&self, values: &[Array]) -> Result<Self, KernelError> {
         if values.len() != self.prefetch_types.len() {
             return Err(TypeError::invalid(format!(
-                "kernel scalar prefetch expects {} values but received {}",
+                "kernel scalar prefetch value count must be {} but is {}",
                 self.prefetch_types.len(),
                 values.len(),
             ))
@@ -1052,6 +1073,15 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         ))
     }
 
+    /// Returns the error that rejects the kernel semantic descriptor encoding of `rematerialize` operations, whose
+    /// residual policies have an identity that is local to the process.
+    fn rematerialize_encoding_error() -> TypeError {
+        TypeError::invalid(format!(
+            "`{REMATERIALIZE_OPERATION_NAME}` operations have no kernel semantic descriptor encoding, because the \
+             identity of their residual policies is local to the process",
+        ))
+    }
+
     /// Encodes the semantic identity of a `composite` call with retained rules, which only a call of a named
     /// definition has (refer to [`NamedComposite`](ryft_core::NamedComposite)), because its key identifies its rules
     /// across processes. The key's [`Debug`](std::fmt::Debug) representation encodes floating-point attributes by
@@ -1089,6 +1119,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 ArrayOperation::FillLike(operation) => {
                     Self::semantic_field(key, &format!("fill bytes {:02x?}", operation.value().logical_bytes()))
                 }
+                ArrayOperation::Rematerialize(_) => return Err(Self::rematerialize_encoding_error()),
                 ArrayOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
                 ArrayOperation::Dropout(operation) => {
                     Self::semantic_field(key, &format!("dropout rate bits {:016x}", operation.rate().to_bits()))
@@ -1191,13 +1222,13 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::ConstrainSharding(_)
                 | ArrayOperation::StopGradient(_)
                 | ArrayOperation::Tag(_)
-                | ArrayOperation::Rematerialize(_)
                 | ArrayOperation::Assert(_)
                 | ArrayOperation::Guard(_)
                 | ArrayOperation::Cast(_)
                 | ArrayOperation::Print(_)
                 | ArrayOperation::LinearCall(_) => {}
             },
+            ArrayIrOperation::Rematerialize(_) => return Err(Self::rematerialize_encoding_error()),
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
             ArrayIrOperation::Composite(operation) => Self::composite_semantic_fields(key, operation)?,
             ArrayIrOperation::LiftedComposite(operation) => Self::composite_semantic_fields(key, operation)?,
@@ -1244,8 +1275,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Guard(_)
-            | ArrayIrOperation::Cast(_)
-            | ArrayIrOperation::Rematerialize(_) => {}
+            | ArrayIrOperation::Cast(_) => {}
             // Kernel definitions reject `shard_map` instructions (refer to `KernelError::UnsupportedOperation`), so no
             // definition reaches this arm. The `Debug` rendering above would nevertheless encode every boundary field
             // of the payload (i.e., its mesh, shardings, active manual axes, global boundary types, and forwarding).
@@ -1263,10 +1293,10 @@ mod tests {
         AttentionInputs, AttentionKey, CompositeAttribute, CompositeJvpRule, CompositeKey, CompositeOperation,
         CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
         DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, NamedComposite, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
+        MeshAxisType, NamedComposite, NothingSavable, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
         ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceWrite,
-        ReferenceWriteOperation, RegionId, Shape, ShardMapBoundary, ShardMapOperation, Sharding, TiledLayout,
-        TypedProgram, ZeroOperation,
+        ReferenceWriteOperation, RegionId, RematerializeOperation, ResidualPolicyReference, Shape, ShardMapBoundary,
+        ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1752,6 +1782,47 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_call_operation_new_with_prefetch_rejects_prefetch_identity_aliasing() {
+        // A prefetched dimension that shares its identity with a grid coordinate can never be specialized, because
+        // binding it to a constant cannot preserve the runtime equality with the remaining coordinate.
+        let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(1)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(coordinate.clone().into());
+        builder.add_input(coordinate.into());
+        let mapping = BlockMapping::new(
+            builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap(),
+            vec![],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let error = KernelCallOperation::new_with_prefetch(
+            Grid::new(vec![GridDimension::new(Dimension::Static(1), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadOnly, mapping)
+                    .unwrap(),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap_err();
+        assert_eq!(error, KernelError::MappingInputIdentity { parameter: 0, first_axis: 0, second_axis: 1 });
+        assert_eq!(
+            error.to_string(),
+            "kernel parameter 0 mapping axes 0 and 1 share a dimension identity but may differ",
+        );
+    }
+
+    #[test]
+    fn test_kernel_call_operation_from_parts() {
+        let operation = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+        assert_eq!(KernelCallOperation::from_parts(Grid::new(vec![]).unwrap(), vec![], vec![], vec![]), Ok(operation));
+        let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(1)).unwrap());
+        assert_eq!(
+            KernelCallOperation::from_parts(Grid::new(vec![]).unwrap(), vec![], vec![], vec![coordinate]),
+            Err(KernelError::Type(TypeError::invalid("coordinate type count differs from the grid rank"))),
+        );
+    }
+
+    #[test]
     fn test_kernel_call_operation_grid() {
         assert_eq!(copy_definition().operation().grid(), &Grid::new(vec![]).unwrap());
     }
@@ -1885,7 +1956,7 @@ mod tests {
         let operation = definition.operation();
         assert_eq!(
             operation.specialize_prefetch(&[]).unwrap_err(),
-            KernelError::Type(TypeError::invalid("kernel scalar prefetch expects 1 values but received 0",))
+            KernelError::Type(TypeError::invalid("kernel scalar prefetch value count must be 1 but is 0",))
         );
         assert_eq!(
             operation.specialize_prefetch(&[Array::scalar(1i64).unwrap()]).unwrap_err(),
@@ -2619,6 +2690,46 @@ mod tests {
             definition(ArrayIrOperation::CompositeTranspose(carrier), 1).semantic_key(),
             Err(TypeError::invalid("`composite_transpose` operations have no kernel semantic descriptor encoding",)),
         );
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_rejects_rematerialize() {
+        // Builds a kernel whose body applies `operation` to one scalar constant through an attached scalar identity.
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let definition = |operation: ArrayIrOperation<Array>| {
+            let mut identity = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = identity.add_input(scalar_type.clone());
+            let identity = identity
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![input],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let region = body.import_program(identity);
+            let input = body.add_constant(ArrayIrValue::Array(Array::scalar(1f32).unwrap()));
+            body.add_instruction(KernelOperation::Portable(operation), vec![region], vec![input], None).unwrap();
+            KernelDefinition::new(
+                KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),
+                body.build(vec![], vec![], vec![]).unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Each registration mints a new policy identity that is local to the process, so calls in either family have
+        // no encoding.
+        let expected = Err(TypeError::invalid(
+            "`rematerialize` operations have no kernel semantic descriptor encoding, because the identity of their \
+             residual policies is local to the process",
+        ));
+        let array_operation = ArrayIrOperation::from(ArrayOperation::Rematerialize(RematerializeOperation::new(
+            ResidualPolicyReference::new(NothingSavable),
+        )));
+        assert_eq!(definition(array_operation).semantic_key(), expected);
+        let array_ir_operation =
+            ArrayIrOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable)));
+        assert_eq!(definition(array_ir_operation).semantic_key(), expected);
     }
 
     #[test]

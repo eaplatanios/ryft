@@ -48,6 +48,16 @@ pub enum BlockMappingError {
         actual: usize,
     },
 
+    /// Specialization supplies more values than the mapping program has inputs.
+    #[error("block mapping specialization value count {values} exceeds the mapping input count {inputs}")]
+    SpecializationValueCount {
+        /// Number of mapping program inputs.
+        inputs: usize,
+
+        /// Number of supplied specialization values.
+        values: usize,
+    },
+
     /// An extent or window limit exceeds the canonical dimension width.
     #[error("block mapping {boundary} at axis {axis} exceeds the maximum dimension extent {MAX_DIMENSION_EXTENT}")]
     Overflow {
@@ -153,11 +163,9 @@ impl BlockMapping {
     /// device effect can occur in a validated mapping.
     pub fn specialize(&self, values: &[DimensionValue]) -> Result<Self, BlockMappingError> {
         let input_count = self.program.input_types().len();
-        let remaining = input_count.checked_sub(values.len()).ok_or(BlockMappingError::RankMismatch {
-            boundary: "specialization",
-            expected: input_count,
-            actual: values.len(),
-        })?;
+        let remaining = input_count
+            .checked_sub(values.len())
+            .ok_or(BlockMappingError::SpecializationValueCount { inputs: input_count, values: values.len() })?;
         let mut builder = ProgramBuilder::new();
         let mut inputs = self
             .program
@@ -548,6 +556,16 @@ mod tests {
                 "block mapping parameter 1 shares a dimension identity with remaining input 0"
             )),)
         );
+    }
+
+    #[test]
+    fn test_block_mapping_specialize_rejects_excess_values() {
+        let mapping = BlockMapping::new(identity_program(1), vec![1], BoundaryPolicy::InBounds).unwrap();
+        let error = mapping
+            .specialize(&[DimensionValue::constant(1).unwrap(), DimensionValue::constant(2).unwrap()])
+            .unwrap_err();
+        assert_eq!(error, BlockMappingError::SpecializationValueCount { inputs: 1, values: 2 });
+        assert_eq!(error.to_string(), "block mapping specialization value count 2 exceeds the mapping input count 1");
     }
 
     #[test]

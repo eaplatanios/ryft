@@ -40,18 +40,18 @@ use num_complex::Complex;
 use ryft_core::{
     Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
     ArraySliceAxis, ArrayType, AttachedRegions, Context, DataType, DimensionValue, Domain, EagerContext,
-    EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, Operation, ProgramError, Provenance,
-    ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, RegionDriver, RegionInterpreter, RegionRef,
-    TypeError, Typed, TypedProgram, ValueResolution, Zero, validated_reference_access_descriptors,
+    EagerInterpretationDriver, InstructionId, InterpretableOperation, InterpretationDriver, Operation, ProgramError,
+    Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, RegionDriver, RegionInterpreter,
+    RegionRef, TypeError, Typed, TypedProgram, ValueResolution, Zero, validated_reference_access_descriptors,
 };
 use thiserror::Error;
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
-use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
+use crate::initialization::{KernelInitializationError, validated_kernel_references};
 use crate::mappings::BoundaryPolicy;
 use crate::memory::{KernelMemoryError, ScratchOperation};
 use crate::operations::{KernelExtension, KernelOperation};
-use crate::validation::KernelParameterAccess;
+use crate::validation::{KernelParameterAccess, KernelReferenceOperation, KernelReferenceSummary, KernelSwapLowering};
 
 /// Host debugging limits exceeded while replaying a kernel; these limits do not alter its device semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -156,7 +156,9 @@ pub struct KernelTraceAccess {
     pub mode: ReferenceAccessMode,
     /// Allocation number assigned on first observation during this invocation.
     pub root: usize,
-    /// Canonical transform path from this allocation to the selected elements, rendered as `/`-prefixed transforms.
+    /// Canonical transform path from this allocation to the selected elements, rendered as the [`Display`] form of
+    /// each [`ArrayReferenceTransform`] prefixed with `/` (e.g., `/slice(axes=[0:2])`). An empty path selects the
+    /// complete allocation.
     pub path: String,
 }
 
@@ -185,14 +187,21 @@ struct KernelTraceState {
     check_nans: bool,
 }
 
-/// Default host replay budget, counting operation bindings and region entries across the entire grid. Counting region
-/// entries also bounds loops with constant conditions and empty bodies. This limit is excluded from semantic identity.
+/// Default host replay budget of [`KernelDebugOptions`], counting operation bindings and region entries across the
+/// entire grid. Counting region entries also bounds loops with constant conditions and empty bodies. Only the debug
+/// entry points [`KernelDefinition::interpret_with_limits`] and [`KernelDefinition::interpret_with_trace`] apply a step
+/// limit. [`KernelDefinition::interpret`], [`KernelCall`](crate::authoring::KernelCall) for host arrays, and ordinary
+/// program interpretation of a `kernel_call` replay without one, because kernel bodies admit only bounded loops. This
+/// limit is excluded from semantic identity.
 pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS: usize = 1_000_000;
 
-/// Maximum number of logical programs qualified by an ordinary
-/// [`Program::interpret`](ryft_core::programs::Program::interpret) kernel call. [`KernelDefinition::interpret`] accepts
-/// an explicit budget for larger debug launches. This is a host resource limit, not part of a kernel's semantic
-/// identity or a device launch limit.
+/// Default grid size bound for host interpretation. Ordinary
+/// [`Program::interpret`](ryft_core::programs::Program::interpret) of a `kernel_call` and
+/// [`KernelCall`](crate::authoring::KernelCall) for host arrays use it as the maximum grid size to enumerate when a
+/// parameter mapping lacks a separable tiling proof, so launches whose mappings all have such proofs are not limited by
+/// it. [`KernelDebugOptions`] uses it as a hard cap on grid points for [`KernelDefinition::interpret_with_trace`].
+/// [`KernelDefinition::interpret`] and [`KernelDefinition::interpret_with_limits`] accept an explicit bound instead.
+/// This is a host resource limit, not part of a kernel's semantic identity or a device launch limit.
 pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS: usize = 10_000;
 
 impl<Extension> KernelDefinition<Extension>
@@ -207,15 +216,17 @@ where
 {
     /// Interprets this definition on host arrays after checking initialization, output coverage, and races. The
     /// inputs and results follow the functional signature: write-only parameters consume no input, and read-only
-    /// parameters produce no result. A failure never publishes a partially updated array or mutates an input.
+    /// parameters produce no result. A failure never publishes a partially updated array or mutates an input. Grid
+    /// points are not capped when every parameter mapping has a separable tiling proof, and replay has no step limit
+    /// because kernel bodies admit only bounded loops. Use [`Self::interpret_with_limits`] to bound both.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: arrays in the definition's ordinary input order.
-    ///   - `maximum_programs`: maximum logical grid size allowed by this host invocation; zero permits only an empty
-    ///     launch. Qualification rejects a larger grid before allocating reference storage or replaying a body.
+    ///   - `maximum_programs`: maximum grid size to enumerate when a parameter mapping lacks a separable tiling proof.
+    ///     Qualification rejects such a larger grid before allocating reference storage or replaying a body.
     pub fn interpret(&self, inputs: Vec<Array>, maximum_programs: usize) -> Result<Vec<Array>, ProgramError> {
-        self.interpret_with_limits(inputs, maximum_programs, DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS)
+        self.interpret_recorded(inputs, maximum_programs, None, None, None)
     }
 
     /// Interprets this definition with explicit host grid and replay limits. A replay step is an operation binding or
@@ -225,7 +236,8 @@ where
     /// # Parameters
     ///
     ///   - `inputs`: arrays in the definition's ordinary input order.
-    ///   - `maximum_programs`: maximum number of grid points allowed before execution begins.
+    ///   - `maximum_programs`: maximum number of grid points allowed before execution begins, even when every
+    ///     parameter mapping has a separable tiling proof.
     ///   - `maximum_steps`: maximum operation bindings and region entries across the invocation. Zero permits an
     ///     empty grid but rejects the first body entry of a nonempty launch.
     pub fn interpret_with_limits(
@@ -234,7 +246,7 @@ where
         maximum_programs: usize,
         maximum_steps: usize,
     ) -> Result<Vec<Array>, ProgramError> {
-        self.interpret_recorded(inputs, maximum_programs, maximum_steps, None, None)
+        self.interpret_recorded(inputs, maximum_programs, Some(maximum_steps), None, None)
     }
 
     /// Interprets with an operation trace retained on success or failure. Existing entries are cleared before
@@ -264,7 +276,7 @@ where
         let result = self.interpret_recorded(
             inputs,
             options.maximum_programs,
-            options.maximum_steps,
+            Some(options.maximum_steps),
             Some(state.clone()),
             order,
         );
@@ -272,12 +284,12 @@ where
         result
     }
 
-    /// Runs the ordinary interpreter with an optional invocation-local trace collector.
+    /// Runs the ordinary interpreter with optional debug limits and an optional invocation-local trace collector.
     fn interpret_recorded(
         &self,
         inputs: Vec<Array>,
         maximum_programs: usize,
-        maximum_steps: usize,
+        maximum_steps: Option<usize>,
         trace: Option<Rc<RefCell<KernelTraceState>>>,
         order: Option<&[usize]>,
     ) -> Result<Vec<Array>, ProgramError> {
@@ -325,7 +337,7 @@ where
             driver,
             inputs,
             DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS,
-            DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS,
+            None,
             None,
             None,
         )
@@ -334,13 +346,16 @@ where
 
 impl KernelCallOperation {
     /// Qualifies and executes an attached body without relying on a previously constructed definition's summary.
+    /// `maximum_programs` bounds grid enumeration in [`validated_kernel_references`]. The debug entry points supply
+    /// `maximum_steps`, which also caps the number of grid points before qualification, while ordinary interpretation
+    /// passes [`None`] and replays without either limit.
     fn interpret_with_budget<Extension, D>(
         &self,
         context: &EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>,
         driver: &D,
         inputs: &[ArrayIrValue<Array>],
         maximum_programs: usize,
-        maximum_steps: usize,
+        maximum_steps: Option<usize>,
         trace: Option<Rc<RefCell<KernelTraceState>>>,
         order: Option<&[usize]>,
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError>
@@ -396,13 +411,17 @@ impl KernelCallOperation {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let points = self.grid().points(&extents).map_err(ProgramError::custom)?;
-        if points.len() > maximum_programs {
+        if maximum_steps.is_some() && points.len() > maximum_programs {
             return Err(ProgramError::custom(KernelInitializationError::QualificationLimit {
                 programs: points.len(),
                 maximum: maximum_programs,
             }));
         }
-        validate_kernel_initialization(body, self, maximum_programs).map_err(ProgramError::custom)?;
+        let references =
+            Rc::new(validated_kernel_references(body, self, maximum_programs).map_err(ProgramError::custom)?);
+        // Kernel bodies admit only bounded loops, so ordinary interpretation needs no step limit and replays with a
+        // budget that it cannot exhaust.
+        let maximum_steps = maximum_steps.unwrap_or(usize::MAX);
 
         let array_context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let mut input_values = inputs.iter();
@@ -504,6 +523,8 @@ impl KernelCallOperation {
             let qualified = QualifiedKernelContext {
                 eager: *context,
                 validity,
+                references: references.clone(),
+                instruction: Rc::new(Cell::new(None)),
                 coordinate,
                 maximum_steps,
                 remaining_steps: remaining_steps.clone(),
@@ -516,7 +537,7 @@ impl KernelCallOperation {
                 continue;
             }
             qualified.check_step(self.name())?;
-            body.interpret_in_context(&qualified, windows)?;
+            qualified.replay_region(body, windows)?;
             let pending = qualified.pending_copies.borrow().len();
             if pending != 0 {
                 return Err(ProgramError::custom(KernelInterpretationError::PendingCopies {
@@ -530,12 +551,15 @@ impl KernelCallOperation {
         }
         if let Some(order) = order {
             let mut started = vec![false; scheduled.len()];
+            let mut positions = vec![0; scheduled.len()];
             for &program in order {
                 let state = scheduled[program].take().unwrap();
                 if !started[program] {
                     state.context().check_step(self.name())?;
                     started[program] = true;
                 }
+                state.context().instruction.set(Some(InstructionId::new(body.id(), positions[program])));
+                positions[program] += 1;
                 scheduled[program] = Some(state.step()?);
             }
             for (program, state) in scheduled.into_iter().enumerate() {
@@ -594,6 +618,11 @@ struct QualifiedKernelContext<Extension: Operation<Type = ArrayIrType>> {
     eager: EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>,
     /// Per-tile valid coordinates; private physical padding never counts as readable full array storage.
     validity: BTreeMap<ReferenceId, ArrayReference<Array>>,
+    /// Validated summary of the attached body, which classifies every swap as a store or an exchange.
+    references: Rc<KernelReferenceSummary>,
+    /// Body instruction whose replay step is in progress. The first swap bound during that step takes it to look up
+    /// the validated lowering, so a swap that a rule binds on its own behalf never inherits a store lowering.
+    instruction: Rc<Cell<Option<InstructionId>>>,
     /// Logical program being replayed for diagnostics.
     coordinate: Vec<usize>,
     /// Invocation-wide host limit, retained for exact diagnostics.
@@ -691,6 +720,32 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
         }
         selected.read().map(Some)
     }
+
+    /// Replays `region` one instruction at a time, recording each instruction so that [`Context::bind`] can apply
+    /// its validated swap lowering. The enclosing instruction is restored afterwards, because a nested region runs
+    /// within the step of the instruction that attaches it.
+    fn replay_region(
+        &self,
+        region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
+        inputs: Vec<ArrayIrValue<Array>>,
+    ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError>
+    where
+        Self: Context<
+                Type = ArrayIrType,
+                Value = ArrayIrValue<Array>,
+                Constant = ArrayIrValue<Array>,
+                Operation = KernelOperation<Extension>,
+            >,
+    {
+        let enclosing = self.instruction.get();
+        let mut interpreter = RegionInterpreter::new(self.clone(), region, inputs)?;
+        for index in 0..region.instructions().len() {
+            self.instruction.set(Some(InstructionId::new(region.id(), index)));
+            interpreter = interpreter.step()?;
+        }
+        self.instruction.set(enclosing);
+        interpreter.finish()
+    }
 }
 
 impl<Extension: Operation<Type = ArrayIrType>> Domain for QualifiedKernelContext<Extension> {
@@ -754,7 +809,7 @@ where
                 if let Some(reference) = selected_references.get(&input) {
                     let next = trace.roots.len();
                     let root = *trace.roots.entry(reference.id()).or_insert(next);
-                    let path = reference.path().transforms().map(|transform| format!("/{transform:?}")).collect();
+                    let path = reference.path().transforms().map(|transform| format!("/{transform}")).collect();
                     accesses.push(KernelTraceAccess { input, mode, root, path });
                 }
             }
@@ -813,9 +868,14 @@ where
                 }
             } else {
                 // Writes may fill private padding because only valid coordinates are published. An unmasked read or
-                // read-modify-write must never expose physical padding as initialized full array data.
+                // read-modify-write must never expose physical padding as initialized full array data. A swap whose
+                // old value is never used lowers to a store, so it reads nothing.
+                let store = operation.swap_output_index().is_some()
+                    && self.instruction.take().and_then(|instruction| self.references.swap_lowering(instruction))
+                        == Some(KernelSwapLowering::Store);
                 for (input_index, mode) in operation.effects().accesses() {
                     if mode != ReferenceAccessMode::Write
+                        && !store
                         && let Some(reference) = selected_references.get(&input_index)
                         && let Some(validity) = self.window_validity(reference)?
                         && validity.elements::<bool>()?.iter().any(|valid| !valid)
@@ -835,7 +895,6 @@ where
                     let source = selected_references.get(&0).unwrap();
                     let destination = selected_references.get(&1).unwrap();
                     let source = source.read()?;
-                    self.check_nans(operation.name(), "input", &[ArrayIrValue::Array(source.clone())])?;
                     let token = ArrayReference::new(Array::new(ArrayType::scalar(DataType::Token), vec![])?);
                     self.pending_copies
                         .borrow_mut()
@@ -941,7 +1000,7 @@ where
         inputs: Vec<ArrayIrValue<Array>>,
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
         self.context.check_step(self.operation)?;
-        self.region(index)?.interpret_in_context(self.context, inputs)
+        self.context.replay_region(self.region(index)?, inputs)
     }
 
     fn bind(
@@ -962,9 +1021,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayReferenceTransformIndex, ArrayType, ConditionOperation, Context, DataType,
-        Dimension, DimensionBounds, DimensionMulOperation, DimensionToScalarOperation, DimensionType, Layout, Memory,
-        Placeholder, ProgramBuilder, ReduceOperation, ReductionKind, ReferenceRead, ReferenceWrite,
-        ReferenceWriteOperation, ScaledDotOperation, StridedLayout, TracingContext, WhileOperation,
+        Dimension, DimensionAddOperation, DimensionBounds, DimensionMulOperation, DimensionToScalarOperation,
+        DimensionType, Layout, Memory, Placeholder, ProgramBuilder, ReduceOperation, ReductionKind, ReferenceRead,
+        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, StridedLayout,
+        TracingContext, WhileOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1108,11 +1168,11 @@ mod tests {
                 input: 0,
                 mode: ReferenceAccessMode::Read,
                 root: 1,
-                path: "/slice[0:2]".to_owned(),
+                path: "/slice(axes=[0:2])".to_owned(),
             }],
             pending_copies: vec![4],
         };
-        assert_eq!(entry.to_string(), "[2, 3] reference_read input[0]=read(root[1]/slice[0:2]) pending=[4]");
+        assert_eq!(entry.to_string(), "[2, 3] reference_read input[0]=read(root[1]/slice(axes=[0:2])) pending=[4]");
     }
 
     #[test]
@@ -1212,21 +1272,70 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_interpret_budget() {
-        let error = definition(false, false).interpret(vec![Array::scalar(17i32).unwrap()], 0).unwrap_err();
+        // Adding zero to the coordinate hides the separable tiling proof, so qualification enumerates the grid.
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
+        let coordinate = mapping.add_input(ArrayIrType::Dimension(coordinate_type.clone()));
+        let zero = DimensionValue::constant(0).unwrap();
+        let zero_id = mapping.add_constant(ArrayIrValue::Dimension(zero.clone()));
+        let start = mapping
+            .add_instruction(
+                DimensionAddOperation::new(&coordinate_type, zero.r#type().as_ref()).unwrap(),
+                vec![],
+                vec![coordinate, zero_id],
+                None,
+            )
+            .unwrap()[0];
+        let mapping = BlockMapping::new(
+            mapping.build(vec![start], vec![Placeholder], vec![Placeholder]).unwrap(),
+            vec![1],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        assert_eq!(mapping.tiling_axes(), None);
+        let r#type = ArrayType::new_static(DataType::I32, [2]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadOnly, mapping.clone()).unwrap(),
+                KernelParameter::new(r#type, KernelParameterAccess::WriteOnly, mapping).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            references[1].write(&references[0].read()?)
+        })
+        .unwrap();
+        let input = Array::vector(vec![3i32, 5]).unwrap();
+        assert_eq!(definition.interpret(vec![input.clone()], 2), Ok(vec![input.clone()]));
+        let error = definition.interpret(vec![input], 1).unwrap_err();
         assert_eq!(
             error.downcast_custom::<KernelInitializationError>(),
-            Some(&KernelInitializationError::QualificationLimit { programs: 1, maximum: 0 }),
+            Some(&KernelInitializationError::QualificationLimit { programs: 2, maximum: 1 }),
         );
     }
 
     #[test]
-    fn test_kernel_definition_interpret_budget_applies_to_tiled_proofs() {
-        let error =
-            definition(true, false).interpret(vec![Array::vector(vec![1i32, 2, 3, 4]).unwrap()], 3).unwrap_err();
+    fn test_kernel_definition_interpret_budget_skips_tiled_proofs() {
+        let input = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        assert_eq!(definition(true, false).interpret(vec![input.clone()], 0), Ok(vec![input]));
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_without_step_limit() {
+        let definition = definition(false, false);
+        let input = Array::scalar(17i32).unwrap();
+        let error = definition.interpret_with_limits(vec![input.clone()], 1, 2).unwrap_err();
         assert_eq!(
-            error.downcast_custom::<KernelInitializationError>(),
-            Some(&KernelInitializationError::QualificationLimit { programs: 4, maximum: 3 }),
+            error.downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::StepLimit {
+                maximum_steps: 2,
+                coordinate: vec![],
+                operation: "reference_write",
+                provenance: Provenance::unknown(),
+            }),
         );
+        assert_eq!(definition.interpret(vec![input.clone()], 1), Ok(vec![input]));
     }
 
     #[test]
@@ -1423,6 +1532,50 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_masked_dead_swap_is_store() {
+        let mapping = tiled_mapping(vec![2]);
+        let r#type = ArrayType::new_static(DataType::I32, [3]);
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
+        let operation = KernelCallOperation::new(
+            grid.clone(),
+            vec![KernelParameter::new(r#type.clone(), KernelParameterAccess::WriteOnly, mapping.clone()).unwrap()],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::vector(vec![5i32, 7])?))?;
+            context.bind(ReferenceSwapOperation::new(), vec![], &[references[0].clone(), value])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(definition.interpret(vec![], 2), Ok(vec![Array::vector(vec![5i32, 7, 5]).unwrap()]));
+
+        // A swap whose old value is used reads the padded edge window, so qualification still rejects it.
+        let operation = KernelCallOperation::new(
+            grid,
+            vec![
+                KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadWrite, mapping.clone()).unwrap(),
+                KernelParameter::new(r#type, KernelParameterAccess::WriteOnly, mapping).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let value = context.lift(ArrayIrValue::Array(Array::vector(vec![5i32, 7])?))?;
+            let old = context.bind(ReferenceSwapOperation::new(), vec![], &[references[0].clone(), value])?.remove(0);
+            references[1].write(&old)
+        })
+        .unwrap();
+        let error = definition.interpret(vec![Array::vector(vec![1i32, 2, 3]).unwrap()], 2).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInitializationError>(),
+            Some(&KernelInitializationError::Memory(KernelMemoryError::UnmaskedWindowAccess {
+                operation: "reference_swap",
+            })),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_with_limits() {
         let definition = definition(false, false);
         let input = Array::scalar(17i32).unwrap();
@@ -1438,7 +1591,27 @@ mod tests {
             }),
         );
         assert_eq!(error.to_string(), "kernel interpretation exceeded 2 steps at grid point [] in `reference_write`");
+        let error = definition.interpret_with_limits(vec![input.clone()], 0, 3).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInitializationError>(),
+            Some(&KernelInitializationError::QualificationLimit { programs: 1, maximum: 0 }),
+        );
         assert_eq!(input, Array::scalar(17i32).unwrap());
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_with_limits_caps_tiled_grids() {
+        let error = definition(true, false)
+            .interpret_with_limits(
+                vec![Array::vector(vec![1i32, 2, 3, 4]).unwrap()],
+                3,
+                DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInitializationError>(),
+            Some(&KernelInitializationError::QualificationLimit { programs: 4, maximum: 3 }),
+        );
     }
 
     #[test]
@@ -1538,6 +1711,7 @@ mod tests {
         );
         assert_eq!(trace[0].accesses[0].mode, ReferenceAccessMode::Read);
         assert_eq!(trace[0].accesses[0].root, 0);
+        assert_eq!(trace[0].accesses[0].path, "/slice(axes=[])");
         assert_eq!(trace[1].accesses[0].mode, ReferenceAccessMode::Write);
         assert_eq!(trace[1].accesses[0].root, 1);
         assert_eq!(trace[0].pending_copies, Vec::<usize>::new());
@@ -1674,6 +1848,34 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_with_trace_nan_skips_async_copy_storage() {
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let token = context
+                .bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), references[1].clone()])?
+                .remove(0);
+            context.bind(WaitOperation, vec![], &[token])?;
+            Ok(())
+        })
+        .unwrap();
+        let mut trace = Vec::new();
+        let options = KernelDebugOptions { check_nans: true, ..Default::default() };
+        let outputs = definition
+            .interpret_with_trace(vec![Array::scalar(f32::NAN).unwrap()], &options, &mut trace)
+            .unwrap();
+        assert_eq!(outputs[0].elements::<f32>().unwrap()[0].to_bits(), f32::NAN.to_bits());
+        assert_eq!(trace.iter().map(|entry| entry.operation).collect::<Vec<_>>(), vec!["async_copy", "wait"]);
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_with_trace_failure() {
         let definition = definition(false, false);
         let input = Array::scalar(17i32).unwrap();
@@ -1719,6 +1921,8 @@ mod tests {
         let context = QualifiedKernelContext::<NoKernelExtension> {
             eager: EagerContext::new(),
             validity: BTreeMap::new(),
+            references: Rc::new(definition(false, false).references().clone()),
+            instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 10,
             remaining_steps: Rc::new(Cell::new(10)),
@@ -1753,6 +1957,8 @@ mod tests {
         let context = QualifiedKernelContext::<NoKernelExtension> {
             eager: EagerContext::new(),
             validity: BTreeMap::new(),
+            references: Rc::new(definition(false, false).references().clone()),
+            instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 10,
             remaining_steps: Rc::new(Cell::new(10)),
@@ -1796,6 +2002,8 @@ mod tests {
         let context = QualifiedKernelContext::<NoKernelExtension> {
             eager: EagerContext::new(),
             validity: BTreeMap::from([(reference.id(), validity)]),
+            references: Rc::new(definition(false, false).references().clone()),
+            instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 10,
             remaining_steps: Rc::new(Cell::new(10)),

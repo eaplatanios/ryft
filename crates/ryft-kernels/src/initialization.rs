@@ -166,12 +166,28 @@ pub enum KernelInitializationError {
 ///   - `call`: its canonical grid, full array types, accesses, and mappings.
 ///   - `maximum_programs`: maximum grid size to enumerate when a mapping lacks a separable tiling proof. Such larger
 ///     launches are rejected before body traversal. This resource limit does not participate in kernel semantic
-///     identity; interpreters separately enforce their execution limits even when no enumeration is needed here.
+///     identity. Only the debug interpreter entry points (e.g.,
+///     [`KernelDefinition::interpret_with_limits`](crate::calls::KernelDefinition::interpret_with_limits)) also cap
+///     grid points when no enumeration is needed here.
 pub fn validate_kernel_initialization<Extension>(
     region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
     call: &KernelCallOperation,
     maximum_programs: usize,
 ) -> Result<(), KernelInitializationError>
+where
+    Extension: KernelExtension,
+{
+    validated_kernel_references(region, call, maximum_programs).map(|_| ())
+}
+
+/// Validates `region` against `call` exactly like [`validate_kernel_initialization`] and returns the reference summary
+/// of the validated body. The host interpreter replays the body with that summary, so it does not validate the body a
+/// second time.
+pub(crate) fn validated_kernel_references<Extension>(
+    region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
+    call: &KernelCallOperation,
+    maximum_programs: usize,
+) -> Result<KernelReferenceSummary, KernelInitializationError>
 where
     Extension: KernelExtension,
 {
@@ -187,7 +203,7 @@ where
             _ => Err(KernelInitializationError::UnsupportedLaunch { boundary: "grid extents" }),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let points = call.grid().points(&extents).map_err(ProgramError::custom)?;
+    let points = call.grid().points(&extents).map_err(KernelError::from)?;
     let tiling_axes = call
         .parameters()
         .iter()
@@ -369,7 +385,7 @@ where
         }
     }
 
-    Ok(())
+    Ok(references)
 }
 
 /// Canonical accesses reserved until a completion token is consumed.
@@ -386,7 +402,8 @@ struct Initialization<'a> {
     states: BTreeMap<ReferenceRoot, Vec<Range<usize>>>,
     /// Static root array types used to interpret canonical selections.
     types: BTreeMap<ReferenceRoot, ArrayType>,
-    /// Ordinary reads and read-write accesses checked against actual launch validity after body initialization.
+    /// Ordinary reads and read-write accesses checked against actual launch validity after body initialization. Swaps
+    /// lowered to stores never read, so they are not recorded.
     unmasked_accesses: Vec<(ReferenceRoot, &'static str, Vec<ArraySliceAxis>)>,
     /// Outstanding asynchronous access reservations keyed by their canonical completion allocation.
     pending_copies: BTreeMap<ReferenceRoot, PendingCopy>,
@@ -720,12 +737,12 @@ impl Initialization<'_> {
             if self.pending_copies.contains_key(&root) {
                 return Err(KernelInitializationError::InvalidCopyTokenAccess { instruction: id, token: root });
             }
-            if mask.is_none() && access.mode() != ReferenceAccessMode::Write {
+            let writes_only = access.mode() == ReferenceAccessMode::Write
+                || self.references.swap_lowering(id) == Some(KernelSwapLowering::Store);
+            if mask.is_none() && !writes_only {
                 self.unmasked_accesses.push((root, instruction.operation().name(), axes.clone()));
             }
             let addressing = ArrayAddressing::new(self.types[&root].clone())?;
-            let writes_only = access.mode() == ReferenceAccessMode::Write
-                || self.references.swap_lowering(id) == Some(KernelSwapLowering::Store);
             let establishes_write = writes_only && !(mask.is_some() && known_mask.is_none()) && !deferred;
             let mut mask_offset = 0;
             for range in addressing.ranges(&axes)? {
@@ -891,7 +908,7 @@ mod tests {
     };
 
     use crate::calls::KernelParameter;
-    use crate::grids::{Grid, GridDimension, GridExecution};
+    use crate::grids::{Grid, GridDimension, GridError, GridExecution};
     use crate::mappings::BlockMapping;
     use crate::memory::{
         AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation,
@@ -2019,7 +2036,15 @@ mod tests {
             ],
         )
         .unwrap();
-        for (swap, selected) in [(false, None), (false, Some(0)), (false, Some(1)), (true, None), (true, Some(0))] {
+        // A swap whose old value is unused lowers to a store, which never reads the padded window.
+        for (swap, live, selected) in [
+            (false, false, None),
+            (false, false, Some(0)),
+            (false, false, Some(1)),
+            (true, false, None),
+            (true, true, None),
+            (true, true, Some(0)),
+        ] {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
             let reference = builder.add_input(call.parameters()[0].body_type());
             builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
@@ -2034,14 +2059,24 @@ mod tests {
                 } else {
                     contents(&call)
                 });
-                builder
+                let old = builder
                     .add_instruction(
-                        ReferenceSwapOperation::new().with_transforms(transforms),
+                        ReferenceSwapOperation::new().with_transforms(transforms.clone()),
                         vec![],
                         vec![reference, value],
                         None,
                     )
-                    .unwrap();
+                    .unwrap()[0];
+                if live {
+                    builder
+                        .add_instruction(
+                            ReferenceWriteOperation::new().with_transforms(transforms),
+                            vec![],
+                            vec![reference, old],
+                            None,
+                        )
+                        .unwrap();
+                }
             } else {
                 builder
                     .add_instruction(
@@ -2055,7 +2090,7 @@ mod tests {
             let body = builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
                 .unwrap();
-            let expected = if selected == Some(0) {
+            let expected = if selected == Some(0) || (swap && !live) {
                 Ok(())
             } else {
                 Err(KernelInitializationError::Memory(KernelMemoryError::UnmaskedWindowAccess {
@@ -2096,6 +2131,65 @@ mod tests {
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
             .unwrap();
         assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 0), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_masked_dead_swap_is_store() {
+        let original = call(3, 2, 2);
+        let mapping =
+            BlockMapping::new(original.parameters()[0].mapping().program().clone(), vec![2], BoundaryPolicy::Masked)
+                .unwrap();
+        let call = KernelCallOperation::new(
+            original.grid().clone(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::I32, vec![3]),
+                    KernelParameterAccess::WriteOnly,
+                    mapping,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = builder.add_input(call.parameters()[0].body_type());
+        builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+        let value = builder.add_constant(contents(&call));
+        builder
+            .add_instruction(ReferenceSwapOperation::new(), vec![], vec![reference, value], None)
+            .unwrap();
+        let body = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 0), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_program_count_overflow() {
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        for _ in 0..2 {
+            mapping.add_input(DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap()).into());
+        }
+        let mapping = BlockMapping::new(
+            mapping.build(vec![], vec![Placeholder; 2], vec![]).unwrap(),
+            vec![],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let call = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(usize::MAX / 2), GridExecution::Sequential); 2])
+                .unwrap(),
+            vec![
+                KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite, mapping)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let body = repeated_body(&call, &[ReferenceAccessMode::Read]);
+        assert_eq!(
+            validate_kernel_initialization(body.entry_region_ref(), &call, 0),
+            Err(KernelInitializationError::Call(KernelError::Grid(GridError::ProgramCountOverflow))),
+        );
     }
 
     #[test]

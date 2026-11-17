@@ -766,7 +766,10 @@ impl KernelCodeGenerator {
     }
 
     /// Generates the lowering of a compound assignment (e.g., `left += right`), which is lowered as the assignment of
-    /// the binary `operator` applied to its target and its right operand (e.g., `left = left + right`).
+    /// the binary `operator` applied to its target and its right operand (e.g., `left = left + (right)`). The right
+    /// operand is parenthesized because it is a complete expression of its own, so that an operand such as
+    /// `first + second` in `left *= first + second` keeps its grouping instead of being parsed again under
+    /// the precedence of `operator`.
     fn generate_compound_assignment(
         &self,
         binary: &syn::ExprBinary,
@@ -775,7 +778,7 @@ impl KernelCodeGenerator {
     ) -> syn::Result<TokenStream> {
         let target = &binary.left;
         let right = &binary.right;
-        let value: syn::Expr = syn::parse_quote!(#target #operator #right);
+        let value: syn::Expr = syn::parse_quote!(#target #operator (#right));
         self.generate_assignment(target, &value, scope)
     }
 
@@ -1897,6 +1900,16 @@ mod tests {
             )?.remove(0)
         });
         assert_eq!(statement(parse_quote!(accumulator /= left.load();)), Ok(quote!(accumulator = #sum;).to_string()));
+
+        // The right operand of a compound assignment keeps its grouping, whatever the precedence of its operator.
+        assert_eq!(
+            statement(parse_quote!(accumulator *= left.load() + left.load();)),
+            statement(parse_quote!(accumulator = accumulator * (left.load() + left.load());)),
+        );
+        assert_ne!(
+            statement(parse_quote!(accumulator *= left.load() + left.load();)),
+            statement(parse_quote!(accumulator = accumulator * left.load() + left.load();)),
+        );
 
         // Unsupported statements and assignment targets.
         assert_eq!(

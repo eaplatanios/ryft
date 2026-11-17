@@ -23,6 +23,11 @@ use crate::validation::KernelParameterAccess;
 /// interpreter; projected symbolic arrays bind the same call and immutable body into their existing context.
 /// Backend array families may implement this capability through their own compilation domain and selected adapter.
 /// A definition remains independently inspectable and compilable through [`KernelDefinition`].
+///
+/// Host arrays are interpreted through [`KernelDefinition::interpret`] with
+/// [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`] as the maximum grid size to enumerate when a parameter mapping
+/// lacks a separable tiling proof. Grid points are otherwise not capped, and replay has no step limit because kernel
+/// bodies admit only bounded loops.
 pub trait KernelCall: Clone + Typed<Type = ArrayType> {
     /// Invokes or stages one portable definition with its ordinary array inputs and results.
     fn call_kernel(definition: &KernelDefinition, inputs: &[Self]) -> Result<Vec<Self>, ProgramError>;
