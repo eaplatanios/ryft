@@ -316,7 +316,9 @@ impl CoreValue for Value {
         // folded static extent and the scalars later derived from it) on that array's mesh, rather than on the
         // client's default devices.
         match self {
-            Self::Array(value) if value.session().mesh().is_err() => value.session().with_mesh(value.mesh().clone()),
+            Self::Array(value) if value.session().device_mesh().is_err() => {
+                value.session().with_device_mesh(value.mesh().clone())
+            }
             _ => self.session().clone(),
         }
     }
@@ -1205,16 +1207,16 @@ mod tests {
 
         // A session without a mesh that is recovered from an array adopts that array's mesh, while a session with a
         // mesh keeps its own.
-        assert_eq!(array.domain().mesh().unwrap(), &mesh);
+        assert_eq!(array.domain().device_mesh().unwrap(), &mesh);
         assert!(matches!(
-            dimension(&session, 3).domain().mesh(),
+            dimension(&session, 3).domain().device_mesh(),
             Err(crate::Error::Array(error)) if matches!(*error, ArrayError::MissingMesh),
         ));
         let other_mesh = mesh_on(client, 1);
         assert_ne!(other_mesh, mesh);
-        let meshed_session = session.with_mesh(other_mesh.clone());
+        let meshed_session = session.with_device_mesh(other_mesh.clone());
         let meshed_array = Value::Array(super::tests::array(&meshed_session, &mesh, DataType::F32, &[1.0f32], &[]));
-        assert_eq!(meshed_array.domain().mesh().unwrap(), &other_mesh);
+        assert_eq!(meshed_array.domain().device_mesh().unwrap(), &other_mesh);
     }
 
     #[test]

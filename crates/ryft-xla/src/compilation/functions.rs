@@ -1956,7 +1956,7 @@ impl SessionWitness {
 
     /// Returns whether `session` is interchangeable with the session that produced the retained artifact.
     fn matches(&self, session: &Session) -> bool {
-        self.session.is_same_session(session) && self.session.mesh().ok() == session.mesh().ok()
+        self.session.is_same_session(session) && self.session.device_mesh().ok() == session.device_mesh().ok()
     }
 }
 
@@ -5825,7 +5825,11 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        assert_eq!(session.cached_program_count(), 2, "an equivalent dense transform should reuse its enclosing compilation");
+        assert_eq!(
+            session.cached_program_count(),
+            2,
+            "an equivalent dense transform should reuse its enclosing compilation"
+        );
 
         assert_eq!(
             forward.source_program().program().to_string(),

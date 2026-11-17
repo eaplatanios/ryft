@@ -256,7 +256,7 @@ impl Session {
     /// [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g., `shard_map(.., None, ..)`).
     /// The handle shares the resources and the effect scope of this session.
     #[inline]
-    pub fn with_mesh(&self, mesh: DeviceMesh) -> Self {
+    pub fn with_device_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
     }
 
@@ -575,7 +575,7 @@ impl Session {
             let extent = array.dimension_size(operation.axis())?;
             // Arrays derived from this dimension are placed on the mesh of the array that it was read from.
             let value = DimensionValue::new(operation.output_type().clone(), extent)?;
-            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_mesh(array.mesh().clone())))]);
+            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
         }
         if let Operation::DimensionFromScalar(operation) = &operation {
             check_count!("input", inputs, 1, ProgramError);
@@ -583,7 +583,7 @@ impl Session {
             let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
             let value = array.to_dimension(operation.output_type().to_variable())?;
-            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_mesh(array.mesh().clone())))]);
+            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
         }
 
         if matches!(&operation, Operation::DimensionToScalar(_)) {
@@ -685,7 +685,7 @@ impl Session {
             &operation,
             region_keys.as_slice(),
             inputs,
-            array_inputs.first().map(Array::mesh).or_else(|| self.mesh().ok()),
+            array_inputs.first().map(Array::mesh).or_else(|| self.device_mesh().ok()),
         );
         let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
@@ -882,7 +882,7 @@ impl Session {
         if let Some(input) = inputs.first() {
             return Ok(input.mesh().clone());
         }
-        if let Ok(mesh) = self.mesh() {
+        if let Ok(mesh) = self.device_mesh() {
             return Ok(mesh.clone());
         }
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
@@ -925,7 +925,7 @@ impl Session {
     /// does not have a static shape, and an [`Error`] if `array_type` cannot be replicated over that mesh or the
     /// constant cannot be materialized.
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array, Error> {
-        let mesh = self.mesh()?;
+        let mesh = self.device_mesh()?;
         if array_type.static_shape().is_none() {
             return Err(ArrayError::DynamicShape { shape: array_type.shape().clone() }.into());
         }
@@ -1024,7 +1024,7 @@ impl Context for Session {
             // fall through to the compiled eager path below, which derives a default execution mesh instead. So do
             // the data types whose value of one has no host encoding here (e.g., the 8-bit floating-point types).
             let kind = if name == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
-            if self.mesh().is_ok() && kind.has_host_encoding(array_type.data_type()) {
+            if self.device_mesh().is_ok() && kind.has_host_encoding(array_type.data_type()) {
                 let value = self
                     .constant(&array_type, kind)
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
@@ -1753,11 +1753,11 @@ pub(crate) mod tests {
     fn test_session_clone() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let clone = session.clone();
         assert!(clone.is_same_session(&session));
         assert!(std::ptr::eq(clone.effect_scope(), session.effect_scope()));
-        assert_eq!(clone.mesh().unwrap(), &mesh);
+        assert_eq!(clone.device_mesh().unwrap(), &mesh);
 
         // The shared state of a session lives for as long as any of its handles.
         let state = Arc::downgrade(&session.state);
@@ -1787,7 +1787,7 @@ pub(crate) mod tests {
         assert_eq!(session.compilation_options(), &CompilationOptions::default());
         assert!(session.compilation_cache().disk_cache().is_none());
         assert_eq!(session.cached_program_count(), 0);
-        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
     }
 
     #[test]
@@ -1795,24 +1795,24 @@ pub(crate) mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let meshed = session.with_mesh(mesh.clone());
-        assert_eq!(meshed.mesh().unwrap(), &mesh);
+        let meshed = session.with_device_mesh(mesh.clone());
+        assert_eq!(meshed.device_mesh().unwrap(), &mesh);
         assert!(meshed.is_same_session(&session));
         assert!(std::ptr::eq(meshed.effect_scope(), session.effect_scope()));
 
         // The handle that the mesh was added to is unaffected.
-        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
     }
 
     #[test]
     fn test_session_with_new_effect_scope() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let fork = session.with_new_effect_scope();
         assert!(fork.is_same_session(&session));
         assert!(!std::ptr::eq(fork.effect_scope(), session.effect_scope()));
-        assert_eq!(fork.mesh().unwrap(), &mesh);
+        assert_eq!(fork.device_mesh().unwrap(), &mesh);
 
         // A barrier of the new scope does not wait for effects that are pending in the scope of the original handle.
         let pending = session.effect_scope().reserve(None).unwrap();
@@ -1846,8 +1846,8 @@ pub(crate) mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
-        assert_eq!(session.with_mesh(mesh.clone()).mesh().unwrap(), &mesh);
+        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert_eq!(session.with_device_mesh(mesh.clone()).device_mesh().unwrap(), &mesh);
     }
 
     #[test]
@@ -1863,7 +1863,7 @@ pub(crate) mod tests {
         // Every handle of a session returns the template that the session was built with.
         assert_eq!(session.compilation_options(), &compilation_options);
         assert_eq!(session.with_new_effect_scope().compilation_options(), &compilation_options);
-        assert_eq!(session.with_mesh(mesh).compilation_options(), &compilation_options);
+        assert_eq!(session.with_device_mesh(mesh).compilation_options(), &compilation_options);
     }
 
     #[test]
@@ -1883,7 +1883,7 @@ pub(crate) mod tests {
         assert!(session.is_same_session(&session));
         assert!(session.is_same_session(&session.clone()));
         assert!(session.is_same_session(&session.with_new_effect_scope()));
-        assert!(session.is_same_session(&session.with_mesh(mesh)));
+        assert!(session.is_same_session(&session.with_device_mesh(mesh)));
         assert!(!session.is_same_session(&session_with_client(client)));
     }
 
@@ -1951,7 +1951,7 @@ pub(crate) mod tests {
         assert_eq!(mesh.devices(), &devices[..2]);
 
         // Creating a mesh does not make it the mesh of the session.
-        assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
 
         // Invalid axes and meshes that need more devices than the client has are rejected.
         assert!(matches!(
@@ -1990,7 +1990,7 @@ pub(crate) mod tests {
 
         // A handle with a mesh uploads to that mesh.
         let mesh = domain_mesh(client, "z", 1);
-        let array = session.with_mesh(mesh.clone()).array(r#type.clone(), bytes.as_slice()).unwrap();
+        let array = session.with_device_mesh(mesh.clone()).array(r#type.clone(), bytes.as_slice()).unwrap();
         assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
         assert_eq!(array.mesh(), &mesh);
         assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
@@ -2111,7 +2111,7 @@ pub(crate) mod tests {
     fn test_session_constant_zero_space_array_is_bufferless() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh);
+        let session = session_with_client(client).with_device_mesh(mesh);
         let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
 
         let array = session.constant(&array_type, ConstantKind::Zero).unwrap();
@@ -2124,7 +2124,7 @@ pub(crate) mod tests {
     fn test_session_constant_defaults_missing_sharding_to_replicated() {
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
 
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
@@ -2156,7 +2156,7 @@ pub(crate) mod tests {
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
-        let session = session_with_client(client).with_mesh(mesh);
+        let session = session_with_client(client).with_device_mesh(mesh);
 
         let array = session.constant(&array_type, ConstantKind::One).unwrap();
 
@@ -2178,7 +2178,7 @@ pub(crate) mod tests {
             Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh),
         ));
 
-        let session = session.with_mesh(domain_mesh(client, "x", 1));
+        let session = session.with_device_mesh(domain_mesh(client, "x", 1));
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(4)).unwrap());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows)]));
         assert!(matches!(
@@ -2206,7 +2206,7 @@ pub(crate) mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         assert_eq!(session.default_mesh(), None);
-        assert_eq!(session.with_mesh(mesh.clone()).default_mesh(), Some(mesh.logical_mesh().clone()));
+        assert_eq!(session.with_device_mesh(mesh.clone()).default_mesh(), Some(mesh.logical_mesh().clone()));
     }
 
     #[test]
@@ -2243,7 +2243,7 @@ pub(crate) mod tests {
         // from host bytes and stages a program for it like a session without a mesh.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh);
+        let session = session_with_client(client).with_device_mesh(mesh);
         for data_type in [DataType::U4, DataType::F8E5M2] {
             let outputs = session.bind(OneOperation::new(ArrayType::scalar(data_type)), Vec::new(), &[]).unwrap();
             assert_eq!(outputs.len(), 1);
@@ -2269,7 +2269,7 @@ pub(crate) mod tests {
     fn test_session_bind_identity_fast_path_rejects_attached_regions() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh);
+        let session = session_with_client(client).with_device_mesh(mesh);
         let array_type = ArrayType::scalar(DataType::F32);
         let operations = [
             Operation::provide(ZeroOperation::new(ArrayIrType::Array(array_type.clone())), &[]).unwrap(),
@@ -2419,7 +2419,7 @@ pub(crate) mod tests {
     fn test_session_bind_dimension_operations_run_on_the_host_without_compilation() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh);
+        let session = session_with_client(client).with_device_mesh(mesh);
         let left = DimensionValue::constant(2).unwrap();
         let right = DimensionValue::constant(3).unwrap();
         let add = DimensionAddOperation::new(left.r#type().as_ref(), right.r#type().as_ref()).unwrap();
@@ -2470,7 +2470,7 @@ pub(crate) mod tests {
     fn test_session_bind_mixed_shape_operations_specialize_dimensions_and_share_the_array_kernel_cache() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
         let input = f32_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         let extent = session
@@ -2883,7 +2883,8 @@ pub(crate) mod tests {
         let client = execution_client();
         let default_mesh = domain_mesh(client, "x", 1);
         let input_mesh = domain_mesh(client, "y", 1);
-        let domain = ProjectedContext::<Session, ArrayType>::new(session_with_client(client).with_mesh(default_mesh));
+        let domain =
+            ProjectedContext::<Session, ArrayType>::new(session_with_client(client).with_device_mesh(default_mesh));
         let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
         let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -2899,7 +2900,8 @@ pub(crate) mod tests {
             vec![default_mesh.devices()[0]],
         )
         .unwrap();
-        let domain = ProjectedContext::<Session, ArrayType>::new(session_with_client(client).with_mesh(default_mesh));
+        let domain =
+            ProjectedContext::<Session, ArrayType>::new(session_with_client(client).with_device_mesh(default_mesh));
         let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
         let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -2907,9 +2909,11 @@ pub(crate) mod tests {
         assert_eq!(read_f32s(client, &outputs[0]), vec![-1.0, 2.0]);
 
         // An input on a device other than the first one of the client stays on that device.
-        let input_mesh =
-            DeviceMesh::new(input_mesh.logical_mesh().clone(), vec![domain.parent().mesh().unwrap().devices()[1]])
-                .unwrap();
+        let input_mesh = DeviceMesh::new(
+            input_mesh.logical_mesh().clone(),
+            vec![domain.parent().device_mesh().unwrap().devices()[1]],
+        )
+        .unwrap();
         let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
         let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -3707,7 +3711,7 @@ pub(crate) mod tests {
 
         // A session that was given a device mesh owns its logical view as the default mesh, so a top-level map in it
         // can omit the mesh, as under JAX's `jax.set_mesh`.
-        let meshed_session = session.with_mesh(mesh.clone());
+        let meshed_session = session.with_device_mesh(mesh.clone());
         let input =
             Array::from_host_buffer(&meshed_session, r#type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let doubled = shard_map(
@@ -3905,7 +3909,7 @@ pub(crate) mod tests {
 
         // A session with a mesh materializes the zero directly, while a session without one compiles a program for it.
         for (session, program_count) in
-            [(session_with_client(client).with_mesh(mesh), 0), (session_with_client(client), 1)]
+            [(session_with_client(client).with_device_mesh(mesh), 0), (session_with_client(client), 1)]
         {
             let zero = session.zero(&r#type).unwrap();
             assert_eq!(read_f32s(client, program_array(&zero)), vec![0.0, 0.0]);

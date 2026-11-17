@@ -72,7 +72,8 @@ mod benchmark {
         fn to_pjrt(self) -> GpuMemoryAllocator {
             match self {
                 Self::CudaAsync => GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                Self::Bfc => GpuMemoryAllocator::BFC { memory_fraction: 0.75, preallocate: true },
+                // Growing on demand keeps this safe on machines whose GPU shares memory with the host.
+                Self::Bfc => GpuMemoryAllocator::BFC { memory_fraction: 0.75, preallocate: false },
             }
         }
     }
