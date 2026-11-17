@@ -37,12 +37,15 @@
 //! accumulated from the other slots rather than subtracting a rounded probability from one, and small losses and
 //! derivatives survive even when the largest probability rounds to one. This is the collapse-resistant construction
 //! of ["A Fix for Softmax and Cross-Entropy"](https://jonbarron.info/softmaxfix/), which the probabilities and both
-//! losses inherit. [`softmax_cross_entropy_with_target_logits`] additionally computes the prediction gradient from
-//! the logits' difference before rounding either distribution to probabilities, through a retained custom derivative
-//! rule that remains differentiable at higher orders, so nearly matching prediction and target distributions do not
-//! cancel. None of these functions is linear, so reverse mode transposes the linearizations of the staged operations.
-//! Probability targets are differentiable as well, whereas integer labels, masks, and target logits have
-//! structural-zero derivatives.
+//! losses inherit. [`softmax`](Softmax::softmax) exponentiates these log-probabilities before it replaces the rows with
+//! non-finite logits by NaN, and [`masked_softmax`](Softmax::masked_softmax) then gives unselected classes a zero
+//! probability, because a backend that compiles the whole computation may not apply `exp` to a constant reliably.
+//! [`softmax_cross_entropy_with_target_logits`] additionally computes the prediction gradient from the logits'
+//! difference before rounding either distribution to probabilities, through a retained custom derivative rule that
+//! remains differentiable at higher orders, so nearly matching prediction and target distributions do not cancel. None
+//! of these functions is linear, so reverse mode transposes the linearizations of the staged operations. Probability
+//! targets are differentiable as well, whereas integer labels, masks, and target logits have structural-zero
+//! derivatives.
 //!
 //! # Example
 //!
@@ -131,9 +134,11 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns class probabilities `qᵢ = exp(xᵢ) / ∑ⱼ exp(xⱼ)` for logits `x = self`. The indices range over the
     /// classes along `axes`; all other axes are processed independently. The output has the logits' shape and element
-    /// type, and small derivatives survive even when a probability rounds to one. Each operation of the computation is
-    /// a separate dispatch on an eager backend, so hold a [`SoftmaxComposite`] created by [`softmax`](fn@softmax) to
-    /// execute it as one compiled unit there.
+    /// type, and small derivatives survive even when a probability rounds to one. The probabilities are the
+    /// exponentials of the log-probabilities of [`Self::log_softmax`], and rows with non-finite logits become NaN only
+    /// after the exponential, because a backend that compiles the whole computation may not apply `exp` to a constant
+    /// NaN reliably. Each operation of the computation is a separate dispatch on an eager backend, so hold a
+    /// [`SoftmaxComposite`] created by [`softmax`](fn@softmax) to execute it as one compiled unit there.
     ///
     /// # Errors
     ///
@@ -268,49 +273,39 @@ impl<
         let (axes, working_type) = validate_normalization("softmax", &self.r#type(), axes.into())?;
 
         // Keep the exponential widened too as narrowing log-probabilities first would lose their small corrections.
-        self.convert_element_type(working_type)?
-            .log_softmax(axes)?
-            .exp()?
-            .convert_element_type(self.r#type().data_type())
+        // Rows with non-finite logits become NaN only after the exponential, because a backend that compiles the
+        // whole computation may not apply `exp` to a constant NaN reliably (e.g., XLA's CPU backend on aarch64 Linux).
+        let normalization = FlattenedLogSoftmax::new(self.convert_element_type(working_type)?, &axes)?;
+        let probabilities = normalization.log_probabilities.exp()?;
+        let output = normalization.finite.select(&probabilities, &normalization.nan)?;
+        normalization.flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
     fn masked_softmax<A: Into<Axes>>(&self, mask: &Self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("masked_softmax", &self.r#type(), axes.into())?;
         validate_normalization_mask("masked_softmax", &self.r#type(), &mask.r#type())?;
+        let aligned = V::align_manual_variation(&[self.convert_element_type(working_type)?, mask.clone()])?;
+        let mut flattened = FlattenedClassInputs::new(aligned, &axes)?;
+        let mask = flattened.inputs.pop().unwrap();
+        let input = flattened.inputs.pop().unwrap();
 
-        // The exponential of a negative infinite log-probability is the zero probability of an unselected class.
-        self.convert_element_type(working_type)?
-            .masked_log_softmax(mask, axes)?
-            .exp()?
-            .convert_element_type(self.r#type().data_type())
+        // Unselected classes are excluded exactly like `-∞` logits, as in `masked_log_softmax`. As in `softmax`, NaN
+        // replaces the probabilities of rows with non-finite logits only after the exponential, and unselected
+        // classes then take a zero probability directly rather than the exponential of a constant `-∞`, which also
+        // turns a row without a selected class into zeros.
+        let negative_infinity = input.fill_like(f64::NEG_INFINITY)?;
+        let normalization = FlattenedLogSoftmax::new(mask.select(&input, &negative_infinity)?, &[flattened.axis])?;
+        let probabilities = normalization.log_probabilities.exp()?;
+        let probabilities = normalization.finite.select(&probabilities, &normalization.nan)?;
+        let output = mask.select(&probabilities, &normalization.zero)?;
+        flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
     fn log_softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let (axes, working_type) = validate_normalization("log_softmax", &self.r#type(), axes.into())?;
-        let mut flattened = FlattenedClassInputs::new(vec![self.convert_element_type(working_type)?], &axes)?;
-        let input = flattened.inputs.pop().unwrap();
-        let axis = flattened.axis;
-        let pivot = input.argmax_with_index_data_type(axis, DataType::I64)?;
-        let mask = one_hot_mask(&input, &pivot, axis)?;
-        let zero = input.zero_like()?;
-        let pivot_value = mask.select(&input, &zero)?.reduce_sum(&[axis], None)?;
-        let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
-        let pivot_value = pivot_value.broadcast_like(&input, &output_axes)?;
-
-        // The pivot must be a constant zero rather than `input[pivot] - input[pivot]`: the latter permits an automatic
-        // differentiation implementation to subtract two rounded coefficients and erase its small gradient. Selecting
-        // one index also preserves the full derivative at ties, unlike treating every maximum as a constant zero.
-        let shifted = mask.select(&zero, &input.sub(&pivot_value)?)?;
-        let tail = mask.select(&zero, &shifted.exp()?)?.reduce_sum(&[axis], None)?;
-        let correction = tail.ln_1p()?.broadcast_like(&input, &output_axes)?;
-        let output = shifted.sub(&correction)?;
-
-        // A singleton still follows the documented non-finite semantics. The finite test also propagates a NaN
-        // chosen by argmax without relying on arithmetic in an otherwise excluded slot.
-        let finite = pivot_value.sub(&pivot_value)?.equal(&zero)?;
-        let nan = input.fill_like(f64::NAN)?;
-        let output = finite.select(&output, &nan)?;
-        flattened.restore(output)?.convert_element_type(self.r#type().data_type())
+        let normalization = FlattenedLogSoftmax::new(self.convert_element_type(working_type)?, &axes)?;
+        let output = normalization.finite.select(&normalization.log_probabilities, &normalization.nan)?;
+        normalization.flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
 
     fn masked_log_softmax<A: Into<Axes>>(&self, mask: &Self, axes: A) -> Result<Self, ProgramError> {
@@ -428,8 +423,10 @@ pub const SOFTMAX_COMPOSITE_VERSION: u32 = 1;
 /// Softmax function created by [`softmax`], which calls [`Softmax::softmax`] along fixed class axes as one named
 /// composite. The body of the composite is the decomposition of [`Softmax::softmax`] itself, so calls have the same
 /// numerical contract and derivatives, including the documented treatment of ties, saturated rows, non-finite rows,
-/// and narrow formats, and interpreting a call computes exactly what the capability computes. The two forms differ
-/// only in how their operations reach a backend:
+/// and narrow formats, and interpreting a call computes exactly what the capability computes. In particular, the body
+/// selects the NaN of rows with non-finite logits after its exponential, so that a backend that compiles the body as
+/// one unit never applies `exp` to a constant NaN, which some backends do not do reliably. The two forms differ only
+/// in how their operations reach a backend:
 ///
 ///   - A staged program holds one `composite` instruction for each call, and the calls with equal input types share
 ///     one body. A backend lowers the body, sharing one function between repeated calls.
@@ -665,7 +662,12 @@ where
             let CrossEntropyInputsWithTargetLogits { target_logits, logits, class_axes, axis, output_data_type } =
                 inputs;
             let log_probabilities = logits.log_softmax(axis)?;
+
+            // As in `softmax`, the NaN of the rows with non-finite logits is selected again after the exponential,
+            // because a backend that compiles the whole computation may not apply `exp` to a constant NaN reliably.
             let probabilities = log_probabilities.exp()?;
+            let nan = probabilities.fill_like(f64::NAN)?;
+            let probabilities = log_probabilities.equal(&log_probabilities)?.select(&probabilities, &nan)?;
             let target_probabilities = target_logits.softmax(axis)?;
 
             // Avoid multiplying zero target probabilities by masked log-probabilities. This literal has the
@@ -800,6 +802,80 @@ impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
                 value.reshape(transposed_shape.clone())?.transpose(inverse_permutation.clone())
             }
         }
+    }
+}
+
+/// Log-probabilities of [`Softmax::log_softmax`] along one flattened class axis before the rows with non-finite logits
+/// are replaced by NaN, together with what the normalizations need to finish them. [`Softmax::log_softmax`] replaces
+/// those rows right away, whereas [`Softmax::softmax`] and [`Softmax::masked_softmax`] replace them only after the
+/// exponential, because a backend that compiles the whole computation may not apply `exp` to a constant NaN reliably.
+struct FlattenedLogSoftmax<V> {
+    /// Flattened class axes of the logits, which restore the original shape and axis order of an output. Its inputs
+    /// have been taken.
+    flattened: FlattenedClassInputs<V>,
+
+    /// Log-probabilities with the flattened shape, which are meaningless in the rows where [`Self::finite`] is false.
+    log_probabilities: V,
+
+    /// Boolean array with the flattened shape that is false in every row whose logits contain NaN or positive
+    /// infinity or consist entirely of negative infinity.
+    finite: V,
+
+    /// Zero with the flattened shape and the working element type.
+    zero: V,
+
+    /// NaN with the flattened shape and the working element type.
+    nan: V,
+}
+
+impl<
+    V: Value<Type = ArrayType>
+        + ZeroLike
+        + FillLike
+        + IotaLike
+        + Sub
+        + Exp
+        + Ln1p
+        + Compare
+        + Select
+        + BroadcastLike
+        + Reshape
+        + Transpose
+        + Reduce
+        + ArgMax,
+> FlattenedLogSoftmax<V>
+{
+    /// Creates a new [`FlattenedLogSoftmax`] instance by flattening the class `axes` of `input` and normalizing it
+    /// along the flattened class axis. Callers provide logits in working precision and class axes validated by
+    /// [`validate_normalization`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if one of the staged operations fails.
+    fn new(input: V, axes: &[usize]) -> Result<Self, ProgramError> {
+        let mut flattened = FlattenedClassInputs::new(vec![input], axes)?;
+        let input = flattened.inputs.pop().unwrap();
+        let axis = flattened.axis;
+        let pivot = input.argmax_with_index_data_type(axis, DataType::I64)?;
+        let mask = one_hot_mask(&input, &pivot, axis)?;
+        let zero = input.zero_like()?;
+        let pivot_value = mask.select(&input, &zero)?.reduce_sum(&[axis], None)?;
+        let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
+        let pivot_value = pivot_value.broadcast_like(&input, &output_axes)?;
+
+        // The pivot must be a constant zero rather than `input[pivot] - input[pivot]`: the latter permits an automatic
+        // differentiation implementation to subtract two rounded coefficients and erase its small gradient. Selecting
+        // one index also preserves the full derivative at ties, unlike treating every maximum as a constant zero.
+        let shifted = mask.select(&zero, &input.sub(&pivot_value)?)?;
+        let tail = mask.select(&zero, &shifted.exp()?)?.reduce_sum(&[axis], None)?;
+        let correction = tail.ln_1p()?.broadcast_like(&input, &output_axes)?;
+        let log_probabilities = shifted.sub(&correction)?;
+
+        // A singleton still follows the documented non-finite semantics. The finite test also propagates a NaN
+        // chosen by argmax without relying on arithmetic in an otherwise excluded slot.
+        let finite = pivot_value.sub(&pivot_value)?.equal(&zero)?;
+        let nan = input.fill_like(f64::NAN)?;
+        Ok(Self { flattened, log_probabilities, finite, zero, nan })
     }
 }
 
@@ -1304,8 +1380,8 @@ mod tests {
                 %19:bool[2] = compare [direction=Equal] %18 %6
                 %20:f32[] = constant [value=NaN]
                 %21:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %20
-                %22:f32[2] = select %19 %17 %21
-                %23:f32[2] = exp %22
+                %22:f32[2] = exp %17
+                %23:f32[2] = select %19 %22 %21
                 %24:bf16[2] = convert_element_type [data_type=bf16] %23
             in (%24)
         "}
@@ -1356,8 +1432,8 @@ mod tests {
                 %19:f32[][sharding={mesh<['d'=2:explicit]>, []}] = constant [value=NaN]
                 %20:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
                     broadcast [output_type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %19
-                %21:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %18 %16 %20
-                %22:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = exp %21
+                %21:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = exp %16
+                %22:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %18 %21 %20
             in (%22)
         "}
             .trim_end(),
@@ -1397,10 +1473,10 @@ mod tests {
                 %20:bool[3, 4] = compare [direction=Equal] %19 %7
                 %21:f32[] = constant [value=NaN]
                 %22:f32[3, 4] = broadcast [output_type=f32[3, 4], output_axes=[]] %21
-                %23:f32[3, 4] = select %20 %18 %22
-                %24:f32[3, 2, 2] = reshape [shape=[3, 2, 2]] %23
-                %25:f32[2, 3, 2] = transpose [permutation=[1, 0, 2]] %24
-                %26:f32[2, 3, 2] = exp %25
+                %23:f32[3, 4] = exp %18
+                %24:f32[3, 4] = select %20 %23 %22
+                %25:f32[3, 2, 2] = reshape [shape=[3, 2, 2]] %24
+                %26:f32[2, 3, 2] = transpose [permutation=[1, 0, 2]] %25
             in (%26)
         "}
             .trim_end(),
@@ -1446,8 +1522,8 @@ mod tests {
                     %17:f32[batch, classes] = sub %8 %8
                     %18:bool[batch, classes] = compare [direction=Equal] %17 %5
                     %19:f32[batch, classes] = fill_like [value=NaN] %0
-                    %20:f32[batch, classes] = select %18 %16 %19
-                    %21:f32[batch, classes] = exp %20
+                    %20:f32[batch, classes] = exp %16
+                    %21:f32[batch, classes] = select %18 %20 %19
                 in (%21)
             "}
             .trim_end(),
@@ -1487,8 +1563,8 @@ mod tests {
                     %17:f32[batch, 3] = sub %8 %8
                     %18:bool[batch, 3] = compare [direction=Equal] %17 %5
                     %19:f32[batch, 3] = fill_like [value=NaN] %0
-                    %20:f32[batch, 3] = select %18 %16 %19
-                    %21:f32[batch, 3] = exp %20
+                    %20:f32[batch, 3] = exp %16
+                    %21:f32[batch, 3] = select %18 %20 %19
                 in (%21)
             "}
             .trim_end(),
@@ -1697,8 +1773,8 @@ mod tests {
                 %17:f64[] = ln_1p %16
                 %18:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %17
                 %19:f64[3] = sub %13 %18
-                %20:f64[3] = select %11 %19 %3
-                %21:f64[3] = exp %20
+                %20:f64[3] = exp %19
+                %21:f64[3] = select %11 %20 %3
             in (%21)
         "}
             .trim_end(),
@@ -1855,6 +1931,56 @@ mod tests {
             Array::vector(vec![1i32, 0]).unwrap().masked_softmax(&Array::vector(vec![true, true]).unwrap(), 0),
             Err(ProgramError::Type(TypeError::invalid("`masked_softmax` requires real floating-point logits"))),
         );
+    }
+
+    #[test]
+    fn test_masked_softmax_staging() {
+        // Unselected classes enter the normalization as `-∞` logits and leave it as zero probabilities. The NaN of
+        // rows with non-finite logits and the zero of unselected classes are selected after the exponential, so that
+        // no exponential applies to a constant.
+        let (_, program) = ArrayContext::trace(
+            |(logits, mask): (_, _)| logits.masked_softmax(&mask, 0),
+            (ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::Boolean, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f32[2], %1:bool[2] .
+            let %2:f32[] = constant [value=-inf]
+                %3:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %2
+                %4:f32[2] = select %1 %0 %3
+                %5:i64[] = argmax [axis=0, index_data_type=i64] %4
+                %6:i64[2] = iota [type=i64[2], dimension=0]
+                %7:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %5
+                %8:bool[2] = compare [direction=Equal] %6 %7
+                %9:f32[2] = zero [type=f32[2]]
+                %10:f32[2] = select %8 %4 %9
+                %11:f32[] = reduce [kind=sum, axes=[0]] %10
+                %12:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %11
+                %13:f32[2] = sub %4 %12
+                %14:f32[2] = select %8 %9 %13
+                %15:f32[2] = exp %14
+                %16:f32[2] = select %8 %9 %15
+                %17:f32[] = reduce [kind=sum, axes=[0]] %16
+                %18:f32[] = ln_1p %17
+                %19:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %18
+                %20:f32[2] = sub %14 %19
+                %21:f32[2] = sub %12 %12
+                %22:bool[2] = compare [direction=Equal] %21 %9
+                %23:f32[] = constant [value=NaN]
+                %24:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %23
+                %25:f32[2] = exp %20
+                %26:f32[2] = select %22 %25 %24
+                %27:f32[2] = select %1 %26 %9
+            in (%27)
+        "}
+            .trim_end(),
+        );
+        let logits = Array::vector(vec![9.0f32, -9.0]).unwrap();
+        let mask = Array::vector(vec![false, true]).unwrap();
+        assert_eq!(program.interpret((logits.clone(), mask.clone())), Ok(Array::vector(vec![0.0f32, 1.0]).unwrap()));
+        assert_eq!(logits.masked_softmax(&mask, 0), Ok(Array::vector(vec![0.0f32, 1.0]).unwrap()));
     }
 
     #[test]
@@ -3726,8 +3852,8 @@ mod tests {
                             %18:bool[2] = compare [direction=Equal] %17 %5
                             %19:f32[] = constant [value=NaN]
                             %20:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %19
-                            %21:f32[2] = select %18 %16 %20
-                            %22:f32[2] = exp %21
+                            %21:f32[2] = exp %16
+                            %22:f32[2] = select %18 %21 %20
                         in (%22)
                     },
                 ]
@@ -3773,8 +3899,8 @@ mod tests {
                             %17:f32[batch, 3] = sub %8 %8
                             %18:bool[batch, 3] = compare [direction=Equal] %17 %5
                             %19:f32[batch, 3] = fill_like [value=NaN] %0
-                            %20:f32[batch, 3] = select %18 %16 %19
-                            %21:f32[batch, 3] = exp %20
+                            %20:f32[batch, 3] = exp %16
+                            %21:f32[batch, 3] = select %18 %20 %19
                         in (%21)
                     },
                 ]
@@ -3816,7 +3942,7 @@ mod tests {
         );
 
         // Reverse mode keeps the small gradient of a saturated maximum, exactly like the capability, and so do the
-        // zero derivatives of a row that contains NaN.
+        // derivatives of a row that contains NaN.
         let cotangent = Array::vector(vec![1.0f32, 0.0, 0.0]).unwrap();
         for input in [vec![9.0f32, -9.0, -9.0], vec![f32::NAN, 0.0, 1.0]] {
             let input = Array::vector(input).unwrap();
@@ -4082,8 +4208,8 @@ mod tests {
                             %19:bool[2] = compare [direction=Equal] %18 %6
                             %20:f32[] = constant [value=NaN]
                             %21:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %20
-                            %22:f32[2] = select %19 %17 %21
-                            %23:f32[2] = exp %22
+                            %22:f32[2] = exp %17
+                            %23:f32[2] = select %19 %22 %21
                             %24:i64[] = argmax [axis=0, index_data_type=i64] %1
                             %25:i64[2] = iota [type=i64[2], dimension=0]
                             %26:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %24
@@ -4186,8 +4312,8 @@ mod tests {
                                 output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                                 output_axes=[],
                             ] %20
-                            %22:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %19 %17 %21
-                            %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %22
+                            %22:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %17
+                            %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %19 %22 %21
                             %24:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = argmax [axis=0, index_data_type=i64] %1
                             %25:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
                                 type=i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -4295,13 +4421,13 @@ mod tests {
                     output_axes=[],
                 ] %19
                 %21:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %15 %20
-                %22:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
-                %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                %22:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %21
+                %23:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
+                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
-                ] %22
-                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %13 %21 %23
-                %25:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %24
+                ] %23
+                %25:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %13 %22 %24
                 %26:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=0.0]
                 %27:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -4419,24 +4545,34 @@ mod tests {
                 %97:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = and %87 %96
                 %98:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp_m1 %94
                 %99:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %25 %98
-                %100:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %49
-                %101:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %100 %25
-                %102:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %97 %99 %101
-                %103:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %102
-                %104:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                %100:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    compare [direction=Equal] %49 %49
+                %101:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = exp %49
+                %102:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
+                %103:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
-                ] %103
-                %105:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %100 %104
-                %106:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %102 %105
-                %107:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = one [type=f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                ] %102
+                %104:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %100 %101 %103
+                %105:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %104 %25
+                %106:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %97 %99 %105
+                %107:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %106
                 %108:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
                     output_axes=[],
                 ] %107
-                %109:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %106 %108
-                %110:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %109
-            in (%110)
+                %109:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %104 %108
+                %110:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sub %106 %109
+                %111:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    one [type=f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                %112:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %111
+                %113:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %110 %112
+                %114:f32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                    parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %113
+            in (%114)
         "}
             .trim_end(),
         );
@@ -4553,10 +4689,10 @@ mod tests {
                         %17:f64[] = ln_1p %16
                         %18:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %17
                         %19:f64[2] = sub %13 %18
-                        %20:f64[] = constant [value=NaN]
-                        %21:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %20
-                        %22:f64[2] = select %11 %19 %21
-                        %23:f64[2] = exp %22
+                        %20:f64[2] = exp %19
+                        %21:f64[] = constant [value=NaN]
+                        %22:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %21
+                        %23:f64[2] = select %11 %20 %22
                         %24:f64[] = constant [value=0.0]
                         %25:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %24
                         %26:bool[2] = compare [direction=Equal] %23 %25

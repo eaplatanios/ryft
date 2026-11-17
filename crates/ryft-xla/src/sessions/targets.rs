@@ -1,52 +1,38 @@
-//! Snapshots of the platform and devices that a PJRT client compiles for and executes on.
-//!
-//! A [`Target`] captures the platform name and version, the PJRT version, the plugin attributes, the process index, and
-//! a [`TargetDevice`] for every device that the client can see, without retaining any live client or device handle.
-//! Each [`Session`](crate::Session) captures its target lazily on first use and exposes it through
-//! [`Session::target`](crate::Session::target). Lowering selects implementations from these facts, compiled programs
-//! record them for cache identity and compatibility checks, and execution uses the captured addressability to validate
-//! placements.
-
 use std::collections::{BTreeMap, HashSet};
 
 use ryft_core::{Device, DeviceId, DeviceMesh};
-use ryft_pjrt::{Client, Value as PjrtValue};
+use ryft_pjrt::{Client, Value as PjrtValue, Version as PjrtVersion};
 
 use crate::{CompilationError, Error, FromPjrt};
 
-// TODO(eaplatanios): Review this module.
-
 /// Owned snapshot of the platform, plugin, and devices used for compilation and execution by a
-/// [`Session`](crate::Session).
-///
-/// Lowering reads the platform and device capabilities to select implementations. The metadata of compiled programs
-/// records target facts for cache identity and compatibility checks when loading persisted executables. Execution also
-/// uses the captured process and device addressability to validate placements for reference state and ordered effects.
+/// [`Session`](crate::Session). Lowering reads the platform and device capabilities to select implementations.
+/// The metadata of compiled programs records target facts for cache identity and compatibility checks when loading
+/// persisted executables. Execution also uses the captured process and device addressability to validate placements
+/// for reference state and ordered effects.
 ///
 /// Create a snapshot with [`Self::from_client`], or obtain the one retained by a session through
 /// [`Session::target`](crate::Session::target). All strings, attributes, and device descriptions are owned, so a
 /// snapshot can be inspected or cloned independently of the client. Loading executables, allocating buffers, and
-/// submitting work still require the live client and session resources.
-///
-/// Keeping these facts separate gives lowering a fixed target description within each session and leaves room for
-/// future descriptions obtained from a PJRT topology for compilation without the target hardware. The current
-/// constructor captures facts from a live client.
+/// submitting work still require the live client and session resources. Keeping these facts separate gives lowering
+/// a fixed target description within each session and leaves room for future descriptions obtained from a PJRT
+/// topology for compilation without the target hardware. The current constructor captures facts from a live client.
 #[derive(Clone, Debug)]
 pub struct Target {
     /// Platform name reported by the capturing client (e.g., `"cpu"` or `"cuda"`).
     platform_name: String,
 
-    /// Opaque platform implementation version reported by the capturing client.
+    /// Platform implementation version reported by the capturing client.
     platform_version: String,
 
     /// PJRT C API version exposed by the client's plugin.
-    pjrt_version: ryft_pjrt::Version,
+    pjrt_version: PjrtVersion,
 
     /// Availability of the PJRT FFI extension when the snapshot was captured.
-    has_ffi_extension: bool,
+    has_pjrt_ffi_extension: bool,
 
-    /// Owned plugin attributes, ordered by attribute name.
-    attributes: BTreeMap<String, PjrtValue>,
+    /// Owned PJRT plugin attributes, ordered by attribute name.
+    pjrt_attributes: BTreeMap<String, PjrtValue>,
 
     /// Process index reported by the capturing client.
     process_index: usize,
@@ -54,6 +40,8 @@ pub struct Target {
     /// All devices visible to the client, including remote devices, in the captured enumeration order.
     devices: Vec<TargetDevice>,
 }
+
+// TODO(eaplatanios): Review this module.
 
 /// Owned snapshot of one device's identity, capabilities, and addressability within a [`Target`].
 ///
@@ -111,8 +99,8 @@ impl Target {
             platform_name: client.platform_name()?.into_owned(),
             platform_version: client.platform_version()?.into_owned(),
             pjrt_version: client.version(),
-            has_ffi_extension: client.ffi_extension().is_ok(),
-            attributes: client.attributes()?.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
+            has_pjrt_ffi_extension: client.ffi_extension().is_ok(),
+            pjrt_attributes: client.attributes()?.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
             process_index: client.process_index()?,
             devices,
         })
@@ -132,20 +120,20 @@ impl Target {
 
     /// Returns the PJRT C API version exposed by the capturing client's plugin.
     #[inline]
-    pub fn pjrt_version(&self) -> ryft_pjrt::Version {
+    pub fn pjrt_version(&self) -> PjrtVersion {
         self.pjrt_version
     }
 
     /// Returns whether the PJRT FFI extension was available when this snapshot was captured.
     #[inline]
     pub fn has_ffi_extension(&self) -> bool {
-        self.has_ffi_extension
+        self.has_pjrt_ffi_extension
     }
 
     /// Returns the captured plugin attributes, ordered by attribute name.
     #[inline]
     pub fn attributes(&self) -> &BTreeMap<String, PjrtValue> {
-        &self.attributes
+        &self.pjrt_attributes
     }
 
     /// Returns the process index reported by the client that this snapshot describes.
@@ -264,9 +252,9 @@ mod tests {
         Target {
             platform_name: "test".into(),
             platform_version: "test".into(),
-            pjrt_version: ryft_pjrt::Version { major: 0, minor: 0 },
-            has_ffi_extension: false,
-            attributes: BTreeMap::new(),
+            pjrt_version: PjrtVersion { major: 0, minor: 0 },
+            has_pjrt_ffi_extension: false,
+            pjrt_attributes: BTreeMap::new(),
             process_index: 0,
             devices: devices
                 .iter()
