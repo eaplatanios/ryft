@@ -15,11 +15,14 @@
 //! its old value is dead, which is equivalent to a store because the read selects only the elements that the swap then
 //! overwrites and its result is unused.
 //!
-//! A read that follows a write to the same parameter in one block observes that write. Tile IR orders memory
-//! operations only through tokens, and the cuTile front end threads them so that every load waits for the last store
-//! to any array that may alias its own. The exporter declares all parameters in one alias group, so that ordering
-//! covers every pair of parameters. Each scatter writes distinct affine indices, so no scatter overlaps itself. This
-//! relies on the token ordering pass of the pinned front end, which its documentation does not state as a contract.
+//! A read that follows a write to the same parameter in one block is expected to observe that write. Tile IR orders
+//! memory operations only through tokens, and the cuTile front end threads them so that every load waits for the last
+//! store to any array that may alias its own. The exporter declares all parameters in one alias group, so that
+//! ordering covers every pair of parameters. Each scatter writes distinct affine indices, so no scatter overlaps
+//! itself. This relies on the token ordering pass of the front end, which its documentation does not state as a
+//! contract. That pass was read from the main branch of the cuTile sources at commit `98cd15e`, while the pinned
+//! release is 1.5.0, so it has not been confirmed against the pinned front end, and no generated source has been
+//! compiled or run.
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,

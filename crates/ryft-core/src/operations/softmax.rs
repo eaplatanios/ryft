@@ -37,9 +37,9 @@
 //! accumulated from the other slots rather than subtracting a rounded probability from one, and small losses and
 //! derivatives survive even when the largest probability rounds to one. This is the collapse-resistant construction
 //! of ["A Fix for Softmax and Cross-Entropy"](https://jonbarron.info/softmaxfix/), which the probabilities and both
-//! losses inherit. [`softmax`](Softmax::softmax) exponentiates these log-probabilities before it replaces the rows with
-//! non-finite logits by NaN, and [`masked_softmax`](Softmax::masked_softmax) then gives unselected classes a zero
-//! probability, because a backend that compiles the whole computation may not apply `exp` to a constant reliably.
+//! losses inherit. [`softmax`](Softmax::softmax) exponentiates these log-probabilities before it replaces invalid rows
+//! by NaN, and [`masked_softmax`](Softmax::masked_softmax) then gives unselected classes a zero probability. The NaN
+//! of an invalid row is a constant, so the forward-mode tangents of such a row are zero.
 //! [`softmax_cross_entropy_with_target_logits`] additionally computes the prediction gradient from the logits'
 //! difference before rounding either distribution to probabilities, through a retained custom derivative rule that
 //! remains differentiable at higher orders, so nearly matching prediction and target distributions do not cancel. None
@@ -135,10 +135,11 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns class probabilities `qᵢ = exp(xᵢ) / ∑ⱼ exp(xⱼ)` for logits `x = self`. The indices range over the
     /// classes along `axes`; all other axes are processed independently. The output has the logits' shape and element
     /// type, and small derivatives survive even when a probability rounds to one. The probabilities are the
-    /// exponentials of the log-probabilities of [`Self::log_softmax`], and rows with non-finite logits become NaN only
-    /// after the exponential, because a backend that compiles the whole computation may not apply `exp` to a constant
-    /// NaN reliably. Each operation of the computation is a separate dispatch on an eager backend, so hold a
-    /// [`SoftmaxComposite`] created by [`softmax`](fn@softmax) to execute it as one compiled unit there.
+    /// exponentials of the log-probabilities of [`Self::log_softmax`]. A logit of negative infinity excludes its class,
+    /// which gets probability zero. A row is invalid, and consists of NaNs, if it contains NaN or positive infinity or
+    /// if all of its logits are negative infinity, and the forward-mode tangents of an invalid row are zero. Each
+    /// operation of the computation is a separate dispatch on an eager backend, so hold a [`SoftmaxComposite`] created
+    /// by [`softmax`](fn@softmax) to execute it as one compiled unit there.
     ///
     /// # Errors
     ///
@@ -273,8 +274,9 @@ impl<
         let (axes, working_type) = validate_normalization("softmax", &self.r#type(), axes.into())?;
 
         // Keep the exponential widened too as narrowing log-probabilities first would lose their small corrections.
-        // Rows with non-finite logits become NaN only after the exponential, because a backend that compiles the
-        // whole computation may not apply `exp` to a constant NaN reliably (e.g., XLA's CPU backend on aarch64 Linux).
+        // Invalid rows (i.e., those with NaN or positive infinity, or with only negative infinity) become NaN only
+        // after the exponential, because a backend that compiles the whole computation may not apply `exp` to a
+        // constant NaN reliably. The `exp` of XLA's CPU backend returned arbitrary values for one on aarch64 Linux.
         let normalization = FlattenedLogSoftmax::new(self.convert_element_type(working_type)?, &axes)?;
         let probabilities = normalization.log_probabilities.exp()?;
         let output = normalization.finite.select(&probabilities, &normalization.nan)?;
@@ -290,9 +292,9 @@ impl<
         let input = flattened.inputs.pop().unwrap();
 
         // Unselected classes are excluded exactly like `-∞` logits, as in `masked_log_softmax`. As in `softmax`, NaN
-        // replaces the probabilities of rows with non-finite logits only after the exponential, and unselected
-        // classes then take a zero probability directly rather than the exponential of a constant `-∞`, which also
-        // turns a row without a selected class into zeros.
+        // replaces the probabilities of invalid rows only after the exponential, and unselected classes then take a
+        // zero probability directly rather than the exponential of a constant `-∞`, which also turns a row without a
+        // selected class into zeros.
         let negative_infinity = input.fill_like(f64::NEG_INFINITY)?;
         let normalization = FlattenedLogSoftmax::new(mask.select(&input, &negative_infinity)?, &[flattened.axis])?;
         let probabilities = normalization.log_probabilities.exp()?;
@@ -422,11 +424,9 @@ pub const SOFTMAX_COMPOSITE_VERSION: u32 = 1;
 
 /// Softmax function created by [`softmax`], which calls [`Softmax::softmax`] along fixed class axes as one named
 /// composite. The body of the composite is the decomposition of [`Softmax::softmax`] itself, so calls have the same
-/// numerical contract and derivatives, including the documented treatment of ties, saturated rows, non-finite rows,
-/// and narrow formats, and interpreting a call computes exactly what the capability computes. In particular, the body
-/// selects the NaN of rows with non-finite logits after its exponential, so that a backend that compiles the body as
-/// one unit never applies `exp` to a constant NaN, which some backends do not do reliably. The two forms differ only
-/// in how their operations reach a backend:
+/// numerical contract and derivatives, including the documented treatment of ties, saturated rows, invalid rows, and
+/// narrow formats, and interpreting a call computes exactly what the capability computes. The two forms differ only in
+/// how their operations reach a backend:
 ///
 ///   - A staged program holds one `composite` instruction for each call, and the calls with equal input types share
 ///     one body. A backend lowers the body, sharing one function between repeated calls.
@@ -663,8 +663,7 @@ where
                 inputs;
             let log_probabilities = logits.log_softmax(axis)?;
 
-            // As in `softmax`, the NaN of the rows with non-finite logits is selected again after the exponential,
-            // because a backend that compiles the whole computation may not apply `exp` to a constant NaN reliably.
+            // As in `softmax`, the NaN of invalid rows is selected again after the exponential.
             let probabilities = log_probabilities.exp()?;
             let nan = probabilities.fill_like(f64::NAN)?;
             let probabilities = log_probabilities.equal(&log_probabilities)?.select(&probabilities, &nan)?;
@@ -805,10 +804,10 @@ impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
     }
 }
 
-/// Log-probabilities of [`Softmax::log_softmax`] along one flattened class axis before the rows with non-finite logits
-/// are replaced by NaN, together with what the normalizations need to finish them. [`Softmax::log_softmax`] replaces
-/// those rows right away, whereas [`Softmax::softmax`] and [`Softmax::masked_softmax`] replace them only after the
-/// exponential, because a backend that compiles the whole computation may not apply `exp` to a constant NaN reliably.
+/// Log-probabilities of [`Softmax::log_softmax`] along one flattened class axis before invalid rows (i.e., those
+/// that contain NaN or positive infinity, or only negative infinity) are replaced by NaN, together with what the
+/// normalizations need to finish them. [`Softmax::log_softmax`] replaces those rows right away, whereas
+/// [`Softmax::softmax`] and [`Softmax::masked_softmax`] replace them only after the exponential.
 struct FlattenedLogSoftmax<V> {
     /// Flattened class axes of the logits, which restore the original shape and axis order of an output. Its inputs
     /// have been taken.
@@ -1831,6 +1830,26 @@ mod tests {
         assert_abs_diff_eq!(tangent[0], 2.0 / 9.0, epsilon = 1e-15);
         assert_abs_diff_eq!(tangent[1], -1.0 / 9.0, epsilon = 1e-15);
         assert_abs_diff_eq!(tangent[2], -1.0 / 9.0, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_softmax_differentiation_invalid_rows() {
+        // The NaN of a row that contains NaN or positive infinity, or only negative infinity, is a constant,
+        // and so the forward-mode tangents of such a row are zero rather than NaN.
+        for logits in [vec![f64::INFINITY, 0.0], vec![f64::NAN, 0.0], vec![f64::NEG_INFINITY, f64::NEG_INFINITY]] {
+            let (output, tangent) = differentiate_at(Array::vector(logits).unwrap())
+                .jvp(Array::vector(vec![1.0f64, 0.0]).unwrap(), |input| input.softmax(0))
+                .unwrap();
+            assert!(output.elements::<f64>().unwrap().iter().all(|probability| probability.is_nan()));
+            assert_eq!(tangent, Array::vector(vec![0.0f64, 0.0]).unwrap());
+        }
+
+        // An excluded class does not make its row invalid.
+        let (output, tangent) = differentiate_at(Array::vector(vec![f64::NEG_INFINITY, 0.0]).unwrap())
+            .jvp(Array::vector(vec![1.0f64, 0.0]).unwrap(), |input| input.softmax(0))
+            .unwrap();
+        assert_eq!(output, Array::vector(vec![0.0f64, 1.0]).unwrap());
+        assert_eq!(tangent, Array::vector(vec![0.0f64, 0.0]).unwrap());
     }
 
     #[test]
