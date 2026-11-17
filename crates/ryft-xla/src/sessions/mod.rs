@@ -79,7 +79,6 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ryft_core::macros::check_count;
@@ -123,9 +122,6 @@ pub use runtimes::{
 pub use targets::{Target, TargetDevice};
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Source of the identifiers of sessions, which are unique within the process.
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Default maximum number of compiled operation applications retained in a session's eager dispatch cache, which
 /// [`SessionBuilder::eager_dispatch_cache_capacity`] overrides.
@@ -271,7 +267,6 @@ impl<'c> Session<'c> {
     ) -> Self {
         Self {
             state: Arc::new(SessionState {
-                id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
                 client,
                 target: OnceLock::new(),
                 cache,
@@ -437,23 +432,18 @@ impl<'c> Session<'c> {
     /// # Errors
     ///
     /// Returns a [`ProgramError::Type`] error if `constant` was not retained by this session or is no longer in the
-    /// constant table of this session.
+    /// constant table of this session. Both cases are recognized by the ownership token of `constant`, which only
+    /// the table entry that it was created for shares.
     pub(crate) fn retained_constant(&self, constant: &SessionConstant) -> Result<Array<'c>, ProgramError> {
-        if constant.session() != self.state.id {
-            return Err(TypeError::invalid(format!(
-                "session constant `{constant}` belongs to session #{} but was resolved by session #{}",
-                constant.session(),
-                self.state.id,
-            ))
-            .into());
-        }
         let constants = self.state.constants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let retained = constants
             .get(constant.index())
             .and_then(Option::as_ref)
             .filter(|retained| std::ptr::eq(retained.owner.as_ptr(), Arc::as_ptr(constant.owner())))
             .ok_or_else(|| {
-                TypeError::invalid(format!("session constant `{constant}` is not in the constant table of its session"))
+                TypeError::invalid(format!(
+                    "session constant `{constant}` is not in the constant table of this session"
+                ))
             })?;
         Ok(retained.storage.to_array(self))
     }
@@ -476,7 +466,7 @@ impl<'c> Session<'c> {
             Some((index, constant.owner.upgrade()?, constant.storage.r#type().clone()))
         });
         if let Some((index, owner, r#type)) = existing {
-            return SessionConstant::new(self.state.id, index, r#type, owner);
+            return SessionConstant::new(index, r#type, owner);
         }
         let owner = Arc::new(SessionConstantOwner);
         let constant = RetainedConstant { owner: Arc::downgrade(&owner), storage: array.retain() };
@@ -491,7 +481,7 @@ impl<'c> Session<'c> {
                 constants.len() - 1
             }
         };
-        SessionConstant::new(self.state.id, index, r#type, owner)
+        SessionConstant::new(index, r#type, owner)
     }
 
     /// Executes `operation` eagerly on reference handles on the host if it is a reference operation, and returns
@@ -1345,14 +1335,13 @@ impl<'c> SessionBuilder<'c> {
 ///
 /// Every handle co-owns its table entry through a shared ownership token, and so the programs, regions, derivative
 /// rules, and caches that hold a handle, or a clone of it, keep the array alive. The session reclaims an entry once no
-/// handle to it remains, and only then may it reuse its position for another array. Handles compare and hash by their
-/// session, position, and type, which therefore identify one array for as long as any handle exists.
+/// handle to it remains, and only then may it reuse its position for another array. Handles compare and hash by the
+/// identity of that token and by their type, which therefore identify one array of one session for as long as any
+/// handle exists. The token is needed because a handle has no lifetime, and so it can hold neither its session nor the
+/// retained array, both of which borrow the PJRT client.
 #[derive(Clone, Debug, Parameter)]
 pub struct SessionConstant {
-    /// Identifier of the [`Session`] that retains the array.
-    session: u64,
-
-    /// Position of the array in the constant table of that session.
+    /// Position of the array in the constant table of the session that retains it.
     index: usize,
 
     /// [`ArrayType`] of the retained array.
@@ -1363,17 +1352,11 @@ pub struct SessionConstant {
 }
 
 impl SessionConstant {
-    /// Creates a new [`SessionConstant`] for the array at `index` in the constant table of session `session`, which
-    /// co-owns that entry through `owner`.
+    /// Creates a new [`SessionConstant`] for the array at `index` in the constant table of a session, which co-owns
+    /// that entry through `owner`.
     #[inline]
-    fn new(session: u64, index: usize, r#type: ArrayType, owner: Arc<SessionConstantOwner>) -> Self {
-        Self { session, index, r#type, owner }
-    }
-
-    /// Returns the identifier of the session that retains the array.
-    #[inline]
-    pub fn session(&self) -> u64 {
-        self.session
+    fn new(index: usize, r#type: ArrayType, owner: Arc<SessionConstantOwner>) -> Self {
+        Self { index, r#type, owner }
     }
 
     /// Returns the position of the array in the constant table of its session.
@@ -1393,21 +1376,17 @@ impl SessionConstant {
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        Ok(Self {
-            session: self.session,
-            index: self.index,
-            r#type: self.r#type.rename_identities(renaming)?,
-            owner: Arc::clone(&self.owner),
-        })
+        Ok(Self { index: self.index, r#type: self.r#type.rename_identities(renaming)?, owner: Arc::clone(&self.owner) })
     }
 }
 
-// Handles are identified by their session, position, and type. The ownership token is shared by every handle to one
-// array and carries no identity of its own.
+// Handles are identified by their ownership token and their type. Every handle to one retained array shares one token,
+// and tokens of different arrays, including arrays of different sessions, are distinct allocations for as long as
+// their handles exist, so the address of the token identifies the array without a session identifier.
 impl PartialEq for SessionConstant {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.session == other.session && self.index == other.index && self.r#type == other.r#type
+        Arc::ptr_eq(&self.owner, &other.owner) && self.r#type == other.r#type
     }
 }
 
@@ -1416,8 +1395,7 @@ impl Eq for SessionConstant {}
 impl Hash for SessionConstant {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.session.hash(state);
-        self.index.hash(state);
+        Arc::as_ptr(&self.owner).hash(state);
         self.r#type.hash(state);
     }
 }
@@ -1468,9 +1446,6 @@ where
 /// Resources that all handles of one [`Session`] share. Its caches, runtime instances, and constant table are mutated
 /// through interior mutability, while its configuration is immutable after construction.
 struct SessionState<'c> {
-    /// Identifier of the session, unique within the process, which [`SessionConstant`] handles use to refer to it.
-    id: u64,
-
     /// Client of the session, which outlives cached executables and effect carriers. It is either owned by the caller
     /// or one of the clients that `ryft-xla` created and that live for the rest of the process.
     client: &'c Client<'c>,
@@ -2127,18 +2102,16 @@ pub(crate) mod tests {
         assert_eq!(
             other_session.retained_constant(&handle),
             Err(TypeError::invalid(format!(
-                "session constant `{handle}` belongs to session #{} but was resolved by session #{}",
-                session.state.id, other_session.state.id,
+                "session constant `{handle}` is not in the constant table of this session"
             ))
             .into()),
         );
 
         // Handles whose entries were reclaimed and reused by another array no longer resolve.
-        let stale =
-            SessionConstant::new(session.state.id, 0, handle.r#type().into_owned(), Arc::new(SessionConstantOwner));
+        let stale = SessionConstant::new(0, handle.r#type().into_owned(), Arc::new(SessionConstantOwner));
         assert_eq!(
             session.retained_constant(&stale),
-            Err(TypeError::invalid(format!("session constant `{stale}` is not in the constant table of its session"))
+            Err(TypeError::invalid(format!("session constant `{stale}` is not in the constant table of this session"))
                 .into()),
         );
     }
@@ -4417,15 +4390,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_constant_session() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
-        assert_eq!(session.retain_constant(&array).session(), session.state.id);
-    }
-
-    #[test]
     fn test_session_constant_index() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
@@ -4460,7 +4424,7 @@ pub(crate) mod tests {
         let other = other_session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&first);
 
-        // Handles are equal when they refer to the same position of the same session with the same type.
+        // Handles are equal when they refer to the same retained array of the same session with the same type.
         assert_eq!(handle, handle.clone());
         assert_eq!(handle, session.retain_constant(&first));
         assert_ne!(handle, session.retain_constant(&second));
