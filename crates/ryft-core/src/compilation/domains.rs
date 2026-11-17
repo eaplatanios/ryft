@@ -128,9 +128,9 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// those of the lowered program.
     ///
     /// Caching backends usually obtain the executable through
-    /// [`CompilationContext::compile`](crate::CompilationContext::compile). The cache must store only the executable,
-    /// which callers with different captured values share, while the hidden capture values belong to `program` and are
-    /// resolved for every request, including cache hits.
+    /// [`CompilationCache::compile`](crate::CompilationCache::compile). The cache must store only the executable,
+    /// which callers with different captured values share, while the hidden capture values belong to `program` and
+    /// are resolved for every request, including cache hits.
     fn compile(
         &self,
         program: &Self::LoweredProgram,
@@ -167,7 +167,7 @@ pub trait StatefulCompilationDomain: CompilationDomain {
     ) -> StatefulExecution<Vec<Self::Value>, Self::Error>;
 }
 
-/// Optional capability for caching backend-compiled programs in a [`CompilationContext`](crate::CompilationContext).
+/// Optional capability for caching backend-compiled programs in a [`CompilationCache`](crate::CompilationCache).
 /// Cache identity is derived from the lowered program alone. [`CompilationDomain::lower`] folds every option, compiler,
 /// target, and topology property that affects compilation into [`CompilationDomain::LoweredProgram`], so key equality
 /// always means that compiled programs are interchangeable.
@@ -186,13 +186,12 @@ pub trait CompilationCacheDomain: CompilationDomain {
     /// when this function violates that contract.
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error>;
 
-    /// Compiles `program` without consulting any cache.
-    /// [`CompilationContext::compile`](crate::CompilationContext::compile) invokes this function only when no cached or
-    /// exchanged program can serve `program`, and callers otherwise go through that function so that every compilation
-    /// shares the cache.
+    /// Compiles `program` without consulting any cache. [`CompilationCache::compile`](crate::CompilationCache::compile)
+    /// invokes this function only when no cached or exchanged program can serve `program`, and callers otherwise go
+    /// through that function so that every compilation shares the cache.
     fn compile_uncached(&self, program: &Self::LoweredProgram) -> Result<Self::CompiledProgram, Self::Error>;
 
-    /// Validates that `compiled`, which a [`CompilationContext`](crate::CompilationContext) resolved from its in-memory
+    /// Validates that `compiled`, which a [`CompilationCache`](crate::CompilationCache) resolved from its in-memory
     /// tier, another producer, persistent storage, or the artifact exchange instead of compiling it for this request,
     /// can serve the requesting `program`. Backends use it to guard the invocation contract that their calls trust
     /// (e.g., signatures and donation flags) against colliding or corrupted artifacts. A rejected persistent or

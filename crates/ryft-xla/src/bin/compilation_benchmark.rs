@@ -11,7 +11,7 @@
 //!     runs an eager reverse mode gradient, the repeated construction of [`CompiledFunction::gradient`] and
 //!     [`CompiledFunction::jvp`], which retain their derived functions after the first construction, and the cost of
 //!     transforming one shared `jit_call` callee for several distinct outer functions. The latter is split into the
-//!     backend compilation time that the shared compilation context records and the remaining frontend time, for a
+//!     backend compilation time that the shared compilation cache records and the remaining frontend time, for a
 //!     short and a long callee, so that the frontend cost that grows with the callee is visible.
 //!   - **`attention`**: Measures the staging, lowering, and compilation times and the synchronized execution time and
 //!     throughput of bf16 scaled dot-product attention, on the CPU or, with the `cuda-13` feature and
@@ -224,9 +224,9 @@ fn dispatcher_statistics(statistics: DispatcherStatistics) -> JsonValue {
     })
 }
 
-/// Returns the counters and durations of the compilation context of `session` as JSON.
+/// Returns the counters and durations of the compilation cache of `session` as JSON.
 fn compilation_statistics(session: &Session<'_>) -> JsonValue {
-    let statistics = session.compilation_context().statistics();
+    let statistics = session.compilation_cache().statistics();
     json!({
         "memory_hits": statistics.memory_hits,
         "persistent_hits": statistics.persistent_hits,
@@ -317,7 +317,7 @@ fn persistent_restore(
     let start = Instant::now();
     restored_lowered.compile(&restored)?;
     let duration = duration_nanoseconds(start);
-    let statistics = restored.compilation_context().statistics();
+    let statistics = restored.compilation_cache().statistics();
     Ok(json!({
         "requested": true,
         "restored": statistics.persistent_hits == 1 && statistics.compilations == 0,
@@ -334,14 +334,14 @@ fn replicated_f32_type(mesh: &DeviceMesh, shape: &[usize]) -> Result<ArrayType, 
 }
 
 /// Returns the cold duration of `construct`, the warm durations of `iterations` further calls, and the counters and
-/// durations of the compilation context of `session` across them as JSON. The constructed values are dropped outside
+/// durations of the compilation cache of `session` across them as JSON. The constructed values are dropped outside
 /// the timed region.
 fn repeated_construction<T>(
     session: &Session<'_>,
     iterations: usize,
     mut construct: impl FnMut() -> Result<T, ryft_xla::Error>,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
-    session.compilation_context().clear_statistics();
+    session.compilation_cache().clear_statistics();
     let start = Instant::now();
     let constructed = construct()?;
     let cold_nanoseconds = duration_nanoseconds(start);
@@ -380,7 +380,7 @@ fn jit_eager_gradient(
         &session,
         mesh.clone(),
     );
-    session.compilation_context().clear_statistics();
+    session.compilation_cache().clear_statistics();
     let input = |value: f32| Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), value.to_ne_bytes());
 
     let mut samples = Vec::with_capacity(iterations + 1);
@@ -427,7 +427,7 @@ fn jit_eager_gradient(
 /// The transform cache of the callee region derives its linearizations and transpositions once and serves them to every
 /// later outer function, so the frontend cost that still grows with the callee is the work outside of the retained
 /// artifacts (e.g., replaying the derived programs into each outer function). Every construction is reported with its
-/// total time, the backend compilation time that the shared compilation context records during it, and the remaining
+/// total time, the backend compilation time that the shared compilation cache records during it, and the remaining
 /// frontend time. The derived programs of distinct outer functions are distinct compilations that no frontend cache
 /// can remove.
 fn shared_callee_transforms<'c>(
@@ -482,7 +482,7 @@ fn shared_callee_transforms<'c>(
         outers.push(outer);
     }
 
-    let compilation_duration = || session.compilation_context().statistics().compilation_duration;
+    let compilation_duration = || session.compilation_cache().statistics().compilation_duration;
     let mut constructions = serde_json::Map::new();
     let mut mean_frontend_nanoseconds = serde_json::Map::new();
     for transform in ["jvp", "gradient"] {

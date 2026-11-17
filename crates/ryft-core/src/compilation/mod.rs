@@ -10,7 +10,7 @@
 //! # Retained JIT Lifecycle
 //!
 //! A warm call follows the cache-hit edge directly to execution. A cold call stages and lowers once in the producing
-//! thread, delegates backend artifact reuse to the shared compilation context, publishes the executable, and then
+//! thread, delegates backend artifact reuse to the shared compilation cache, publishes the executable, and then
 //! executes it. Refer to [`CompiledFunctionDispatcher`] for a rendered diagram of this dispatch loop.
 //!
 //! Two transitions exist outside this dispatch loop. A staged function can be embedded as a nested call boundary in
@@ -84,7 +84,7 @@
 //!      immediately under an eager parent, records it under a staging parent, and transforms it under a transform
 //!      parent.
 //!   2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
-//!      options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
+//!      options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationCache`].
 //!   3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
 //!      transformations. Pure runtime execution uses [`ExecutableFunction::execute`]; transactional external state uses
 //!      [`ExecutableFunction::execute_statefully`].
@@ -115,7 +115,7 @@
 //! miss stages the Rust closure, lowers the staged source, requests compilation, and inserts the resulting executable.
 //! Staging and lowering are cheap relative to backend compilation, so execution has no intermediate staging or
 //! lowering caches. After an eviction or failure, the miss path simply reruns those phases, and the shared
-//! [`CompilationContext`] below still deduplicates the expensive backend compilation.
+//! [`CompilationCache`] below still deduplicates the expensive backend compilation.
 //!
 //! Calls (i.e., [`CompiledFunctionDispatcher::call_in_context`]) keep their staged functions in a second cache
 //! of the same kind, keyed by the static parameters, the input parameter structure, the staged input types, and the
@@ -137,11 +137,11 @@
 //! different threads deliberately duplicate the cheap frontend work with idempotent inserts and leave the coordination
 //! of backend compilation to the shared context.
 //!
-//! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle, and
+//! [`CompilationCache`] is the backend-artifact cache shared by every compilation using the same domain handle, and
 //! it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, waiting on in-flight compilations,
 //! optional persistent storage, optional distributed exchange, and finally backend compilation. Backends own their
 //! contexts, so users configure caching and exchange when they construct a backend handle. Refer to
-//! [`CompilationContext`] for the resolution diagram and a configuration example.
+//! [`CompilationCache`] for the resolution diagram and a configuration example.
 //!
 //! Misses for the same key are deduplicated, while different keys may compile concurrently. [`DiskCache`] provides
 //! optional checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts
@@ -156,10 +156,10 @@
 //! signatures, and flat execution. Lowering must fold every compile-relevant option, compiler, target, and topology
 //! property into the lowered artifact, which keeps that artifact self-describing for caching and persistence.
 //!
-//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity
+//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationCache`]: it derives cache identity
 //! from the lowered program alone, and key equality must mean that compiled artifacts are interchangeable.
 //! It also supplies the uncached backend compilation, and its [`CompilationDomain::compile`] delegates to
-//! [`CompilationContext::compile`], so that every compilation resolves through the cache and every reused program
+//! [`CompilationCache::compile`], so that every compilation resolves through the cache and every reused program
 //! is validated against the requesting lowered program. Optional hooks add that validation, persistent keying,
 //! and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or memory
 //! analysis without recompilation, and implement [`StagedCallOperation`] on the operation
@@ -181,7 +181,7 @@ pub mod functions;
 pub mod operations;
 
 pub use caching::{
-    CompilationCacheStatistics, CompilationCacheTier, CompilationContext, CompilationEvent, CompilationLookupOutcome,
+    CompilationCache, CompilationCacheStatistics, CompilationCacheTier, CompilationEvent, CompilationLookupOutcome,
     CompilationMissReason, CompilationSkipReason, CompilationStep, CompilationStepError, CompilationStepOutcome,
     DiskCache,
 };
@@ -205,7 +205,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::captures::CaptureReference;
-    use crate::compilation::caching::CompilationContext;
+    use crate::compilation::caching::CompilationCache;
     use crate::compilation::domains::{
         CompilationCacheDomain, CompilationDomain, Compile, DispatchInputs, StatefulCompilationDomain,
     };
@@ -299,13 +299,13 @@ mod tests {
         pub(super) compiled_output_types: Option<Vec<ArrayType>>,
     }
 
-    /// Compilation domain over [`Array`] values. It compiles through a [`CompilationContext`], so equivalent lowered
+    /// Compilation domain over [`Array`] values. It compiles through a [`CompilationCache`], so equivalent lowered
     /// programs compile once, and it executes programs by interpreting every instruction as a negation after checking
     /// that the runtime inputs refine the declared input types. Clones share their cache and compilation counter.
     #[derive(Clone)]
     pub(super) struct TestDomain {
         /// Compilation cache shared by every clone of this domain.
-        pub(super) cache: Arc<CompilationContext<'static, Self>>,
+        pub(super) cache: Arc<CompilationCache<'static, Self>>,
 
         /// Number of backend compilations, shared by every clone of this domain.
         compilations: Arc<AtomicUsize>,
@@ -314,7 +314,7 @@ mod tests {
     impl TestDomain {
         /// Creates a domain with an empty compilation cache.
         pub(super) fn new() -> Self {
-            Self { cache: Arc::new(CompilationContext::new()), compilations: Arc::new(AtomicUsize::new(0)) }
+            Self { cache: Arc::new(CompilationCache::new()), compilations: Arc::new(AtomicUsize::new(0)) }
         }
 
         /// Returns the number of backend compilations performed so far, excluding compilation cache hits.

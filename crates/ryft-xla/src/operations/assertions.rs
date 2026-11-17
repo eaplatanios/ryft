@@ -2323,17 +2323,18 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(lowered.requires_assertion_handler());
-        assert_eq!(lowered.runtime_requirements(), &[builtin_requirement(ASSERT_CUSTOM_CALL_TARGET)]);
-        assert!(lowered.signature().requires_assertion_handler());
-        assert!(lowered.signature().has_effects());
-        assert!(!lowered.signature().has_ordered_io());
-        assert!(!lowered.signature().has_unordered_io());
-        assert_eq!(lowered.signature().ordered_io_input_index(), None);
-        assert_eq!(lowered.signature().ordered_io_output_index(), None);
-        assert_eq!(lowered.signature().physical_input_count(), 2);
+        let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
+        assert!(requires_assertion_handler);
+        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement(ASSERT_CUSTOM_CALL_TARGET)]);
+        assert!(signature.requires_assertion_handler());
+        assert!(signature.has_effects());
+        assert!(!signature.has_ordered_io());
+        assert!(!signature.has_unordered_io());
+        assert_eq!(signature.ordered_io_input_index(), None);
+        assert_eq!(signature.ordered_io_output_index(), None);
+        assert_eq!(signature.physical_input_count(), 2);
         assert_eq!(
-            lowered.stable_hlo(),
+            stable_hlo,
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) {

@@ -183,9 +183,9 @@ pub enum CompilationStep {
     },
 }
 
-/// Structured diagnostic event for one [`CompilationStep`] of a [`CompilationContext`]. Contexts retain recent
-/// events when configured via [`CompilationContext::with_event_capacity`] and report every event to the hook
-/// installed via [`CompilationContext::with_event_reporter`].
+/// Structured diagnostic event for one [`CompilationStep`] of a [`CompilationCache`]. Caches retain recent
+/// events when configured via [`CompilationCache::with_event_capacity`] and report every event to the hook
+/// installed via [`CompilationCache::with_event_reporter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompilationEvent {
     /// Step being reported and its result.
@@ -195,9 +195,9 @@ pub struct CompilationEvent {
     pub duration: Duration,
 }
 
-/// Snapshot of the activity of one [`CompilationContext`] across its cache lookups, artifact exchange, and backend
-/// compilation. The statistics accumulate from construction or from the latest [`CompilationContext::clear_statistics`]
-/// call and are unaffected by [`CompilationContext::clear_cache`]. Each field is read independently, so a snapshot
+/// Snapshot of the activity of one [`CompilationCache`] across its cache lookups, artifact exchange, and backend
+/// compilation. The statistics accumulate from construction or from the latest [`CompilationCache::clear_statistics`]
+/// call and are unaffected by [`CompilationCache::clear_cache`]. Each field is read independently, so a snapshot
 /// taken during concurrent compilations need not correspond to a single point in time. Every attempt of a lookup counts
 /// as exactly one of [`Self::memory_hits`], [`Self::waits`], and [`Self::misses`], and a waiter whose producer fails
 /// retries and counts again. A memory hit or wait whose program [`CompilationCacheDomain::validate_cached_program`]
@@ -405,8 +405,8 @@ impl<P> InFlightCompilation<P> {
 /// [`Self::finish`] (e.g., when compilation fails or panics) removes its in-flight marker and wakes its waiters,
 /// which then retry, and the first of them to miss again becomes the new producer.
 struct InFlightProducer<'o, C: CompilationCacheDomain> {
-    /// Compilation context in which this producer registered its in-flight compilation.
-    context: &'o CompilationContext<'o, C>,
+    /// Compilation cache in which this producer registered its in-flight compilation.
+    cache: &'o CompilationCache<'o, C>,
 
     /// Cache key owned by this producer, which is taken when the producer finishes.
     cache_key: Option<C::CacheKey>,
@@ -418,11 +418,11 @@ struct InFlightProducer<'o, C: CompilationCacheDomain> {
 impl<'o, C: CompilationCacheDomain> InFlightProducer<'o, C> {
     /// Creates the producer for `cache_key`.
     fn new(
-        context: &'o CompilationContext<'o, C>,
+        cache: &'o CompilationCache<'o, C>,
         cache_key: C::CacheKey,
         in_flight: Arc<InFlightCompilation<C::CompiledProgram>>,
     ) -> Self {
-        Self { context, cache_key: Some(cache_key), in_flight: Some(in_flight) }
+        Self { cache, cache_key: Some(cache_key), in_flight: Some(in_flight) }
     }
 
     /// Returns the cache key owned by this producer.
@@ -438,12 +438,12 @@ impl<'o, C: CompilationCacheDomain> InFlightProducer<'o, C> {
 
         // Publish to memory before releasing the producer slot so a racing lookup can find this program.
         // Release each lock before acquiring the next one or notifying waiters.
-        self.context
+        self.cache
             .programs
             .lock()
             .expect("compilation cache mutex should not be poisoned")
             .put(cache_key.clone(), Arc::clone(&program));
-        self.context
+        self.cache
             .in_flight
             .lock()
             .expect("in-flight cache mutex should not be poisoned")
@@ -458,7 +458,7 @@ impl<C: CompilationCacheDomain> Drop for InFlightProducer<'_, C> {
         // A producer that never finished releases its waiters so that one of them can become the new producer.
         if let (Some(cache_key), Some(in_flight)) = (self.cache_key.take(), self.in_flight.take()) {
             // Remove the marker before waking waiters so their retries can elect a new producer.
-            self.context
+            self.cache
                 .in_flight
                 .lock()
                 .expect("in-flight cache mutex should not be poisoned")
@@ -489,16 +489,16 @@ impl ActiveExchange<'_> {
     }
 }
 
-/// Default capacity of the in-memory cache tier of a [`CompilationContext`]. Use [`CompilationContext::with_capacity`]
+/// Default capacity of the in-memory cache tier of a [`CompilationCache`]. Use [`CompilationCache::with_capacity`]
 /// when a workload needs a different bound.
 const DEFAULT_CACHE_CAPACITY: usize = 8192;
 
 /// Default number of structured compilation events retained for diagnostics, which disables retention until
-/// [`CompilationContext::with_event_capacity`] enables it.
+/// [`CompilationCache::with_event_capacity`] enables it.
 const DEFAULT_EVENT_CAPACITY: usize = 0;
 
 /// Process-local cache of compiled programs, generic over the [`CompilationCacheDomain`] backend. Construct one
-/// [`CompilationContext`] per backend handle at program start and reuse it across compilations and any backend-specific
+/// [`CompilationCache`] per backend handle at program start and reuse it across compilations and any backend-specific
 /// helpers that look up entries in the cache.
 ///
 /// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
@@ -508,10 +508,10 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// does not compile itself must pass [`CompilationCacheDomain::validate_cached_program`] for that request.
 ///
 /// The in-memory tier uses LRU eviction with a default capacity of `8192` entries, which
-/// [`CompilationContext::with_capacity`] overrides.
+/// [`CompilationCache::with_capacity`] overrides.
 ///
-/// An optional [`DiskCache`] tier is attached via [`CompilationContext::with_disk_cache`] or
-/// [`CompilationContext::with_disk_cache_from_env`]. When present, the disk tier is consulted between the
+/// An optional [`DiskCache`] tier is attached via [`CompilationCache::with_disk_cache`] or
+/// [`CompilationCache::with_disk_cache_from_env`]. When present, the disk tier is consulted between the
 /// in-memory tier and backend compilation. The cache uses [`CompilationCacheDomain::serialize_program`] and
 /// [`CompilationCacheDomain::deserialize_program`] to persist and restore programs, and it records failures of either
 /// function and of the disk itself without failing the compilation. An optional [`CompilationArtifactExchange`] may
@@ -519,7 +519,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// [`CompilationArtifactExchangePolicy`].
 ///
 /// The attached artifact exchange and event reporter may borrow data that lives for `'o` (e.g., a backend client),
-/// so the context cannot outlive that data. A context whose exchange and reporter own all of their state can use
+/// so the cache cannot outlive that data. A cache whose exchange and reporter own all of their state can use
 /// `'static`.
 ///
 /// # Cache Resolution
@@ -562,7 +562,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 ///
 /// # Example
 ///
-/// Backends own their context (e.g., one per XLA session), so users configure caching and artifact exchange when they
+/// Backends own their cache (e.g., one per XLA session), so users configure caching and artifact exchange when they
 /// construct a backend handle. The following function configures both for any caching domain. It bounds the in-memory
 /// tier, persists only compilations that take at least ten seconds in a disk cache capped at 10 GiB, and prefers
 /// artifacts that the exchange leader publishes while still allowing followers to compile locally after a miss.
@@ -573,26 +573,26 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// # use std::sync::Arc;
 /// # use std::time::Duration;
 /// # use ryft_core::{
-/// #     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationContext,
+/// #     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationCache,
 /// #     DiskCache,
 /// # };
-/// fn compilation_context<'o, C: CompilationCacheDomain>(
+/// fn compilation_cache<'o, C: CompilationCacheDomain>(
 ///     directory: &Path,
 ///     exchange: Arc<dyn 'o + CompilationArtifactExchange>,
-/// ) -> std::io::Result<CompilationContext<'o, C>> {
+/// ) -> std::io::Result<CompilationCache<'o, C>> {
 ///     let disk_cache = DiskCache::with_max_bytes(directory, 10 << 30)?
 ///         .with_write_thresholds(Duration::from_secs(10), 0);
 ///     let policy = CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(60) };
-///     Ok(CompilationContext::with_capacity(1024)
+///     Ok(CompilationCache::with_capacity(1024)
 ///         .with_disk_cache(disk_cache)
 ///         .with_artifact_exchange(exchange, policy)
 ///         .with_event_capacity(64))
 /// }
 /// ```
 ///
-/// Contexts never read the environment on their own. Use [`CompilationContext::with_disk_cache_from_env`] to opt into
+/// Caches never read the environment on their own. Use [`CompilationCache::with_disk_cache_from_env`] to opt into
 /// the disk cache that the [`DiskCache::ENV_VAR`] and [`DiskCache::MAX_BYTES_ENV_VAR`] environment variables configure.
-pub struct CompilationContext<'o, C: CompilationCacheDomain> {
+pub struct CompilationCache<'o, C: CompilationCacheDomain> {
     /// In-memory LRU cache keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain.
     programs: Mutex<LruCache<C::CacheKey, Arc<C::CompiledProgram>>>,
 
@@ -622,14 +622,14 @@ pub struct CompilationContext<'o, C: CompilationCacheDomain> {
     event_reporter: Option<Arc<dyn 'o + Fn(&CompilationEvent) + Send + Sync>>,
 }
 
-impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
-    /// Creates a [`CompilationContext`] with the default cache capacity and no persistent cache or artifact exchange.
+impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
+    /// Creates a [`CompilationCache`] with the default cache capacity and no persistent cache or artifact exchange.
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CACHE_CAPACITY)
     }
 
-    /// Creates a [`CompilationContext`] whose in-memory tier retains at most `capacity` compiled programs.
+    /// Creates a [`CompilationCache`] whose in-memory tier retains at most `capacity` compiled programs.
     /// Note that a `capacity` of zero is clamped to one entry.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
@@ -647,7 +647,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         }
     }
 
-    /// Attaches `disk_cache` as a persistent tier behind the in-memory tier of this context, with its size cap and
+    /// Attaches `disk_cache` as a persistent tier behind the in-memory tier of this cache, with its size cap and
     /// write thresholds. On a memory miss, [`Self::compile`] consults the disk before compiling the program. Domains
     /// that explicitly support persistence can then serialize sufficiently expensive compilations so that future
     /// processes restart warm. Persistent read, write, and codec errors are recorded in [`Self::statistics`] and
@@ -659,7 +659,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
     }
 
     /// Attaches the [`DiskCache`] configured by the [`DiskCache::ENV_VAR`] environment variable, if it is set,
-    /// and leaves this context unchanged otherwise.
+    /// and leaves this cache unchanged otherwise.
     ///
     /// # Errors
     ///
@@ -732,7 +732,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
         self.programs.lock().expect("compilation cache mutex should not be poisoned").len()
     }
 
-    /// Returns a lock-free snapshot of the activity counters of this context.
+    /// Returns a lock-free snapshot of the activity counters of this cache.
     #[inline]
     pub fn statistics(&self) -> CompilationCacheStatistics {
         self.statistics.snapshot()
@@ -802,7 +802,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
             let lookup_start = Instant::now();
 
             // Lookup refreshes the LRU position. Clone the handle and release the cache lock before validation and
-            // event callbacks, which may access this context again.
+            // event callbacks, which may access this cache again.
             let cached = self
                 .programs
                 .lock()
@@ -1403,7 +1403,7 @@ impl<'o, C: CompilationCacheDomain> CompilationContext<'o, C> {
     }
 }
 
-impl<C: CompilationCacheDomain> Default for CompilationContext<'_, C> {
+impl<C: CompilationCacheDomain> Default for CompilationCache<'_, C> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -1447,10 +1447,9 @@ const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 /// Directory-backed persistent cache of serialized compiled programs. A [`DiskCache`] persists serialized compiled
 /// programs across processes, similar to JAX's
 /// [persistent compilation cache](https://docs.jax.dev/en/latest/persistent_compilation_cache.html). When attached
-/// to a [`CompilationContext`], it serves as a second tier below the in-memory LRU cache. That context manages
-/// executable persistence through the serialization hooks of [`CompilationCacheDomain`], restoring programs on memory
-/// misses and persisting new compilations that meet the write thresholds configured via
-/// [`Self::with_write_thresholds`].
+/// to a [`CompilationCache`], it serves as a second tier below the in-memory LRU cache. That cache manages executable
+/// persistence through the serialization hooks of [`CompilationCacheDomain`], restoring programs on memory misses and
+/// persisting new compilations that meet the write thresholds configured via [`Self::with_write_thresholds`].
 ///
 /// Entries are stored gzip compressed as `<directory>/<sha256>.executable`. A backend opts into this tier by providing
 /// canonical bytes for the complete persistent cache key through [`CompilationCacheDomain::persistent_cache_key`].
@@ -1461,15 +1460,15 @@ const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 /// (e.g., tuning results), stored as `<directory>/<sha256>.metadata` entries with the same envelope.
 ///
 /// Writes are atomic because they use the standard pattern of writing a temporary file and renaming it. Filesystem and
-/// validation failures are returned to the [`CompilationContext`], which records each failure and degrades it to a
-/// cache miss.
+/// validation failures are returned to the [`CompilationCache`], which records each failure and degrades it to a cache
+/// miss.
 ///
 /// When constructed via [`DiskCache::with_max_bytes`] or with the [`DiskCache::MAX_BYTES_ENV_VAR`] environment variable
 /// set, the cache evicts the least recently written entries after each write to keep its footprint on disk under the
 /// configured cap. Caches opened via [`DiskCache::open`] have no cap.
 ///
-/// Wire one into a [`CompilationContext`] via [`CompilationContext::with_disk_cache`] or
-/// [`CompilationContext::with_disk_cache_from_env`].
+/// Wire one into a [`CompilationCache`] via [`CompilationCache::with_disk_cache`] or
+/// [`CompilationCache::with_disk_cache_from_env`].
 pub struct DiskCache {
     /// Filesystem directory holding the cached entries.
     directory: PathBuf,
@@ -1643,7 +1642,7 @@ impl DiskCache {
     /// Atomically writes `data` to the cache under `digest`, so that a partial write or process crash can never leave
     /// a half-written entry visible to other readers. After a successful write, evicts the least recently written
     /// entries when a size cap is configured. Returns any write, synchronization, rename, cleanup, or eviction failure
-    /// explicitly. The compilation context records such failures before degrading to an in-memory result.
+    /// explicitly. The compilation cache records such failures before degrading to an in-memory result.
     fn put(&self, digest: &DiskCacheDigest, data: &[u8]) -> std::io::Result<()> {
         self.write_entry(&self.entry_path(digest), digest, EXECUTABLE_EXTENSION, data)
     }
@@ -2133,10 +2132,10 @@ mod tests {
         }
     }
 
-    /// Compiles a synthetic cache request through [`CompilationContext::compile`] with a one-shot backend compiler.
+    /// Compiles a synthetic cache request through [`CompilationCache::compile`] with a one-shot backend compiler.
     /// Direct calls keep the fixture's output-count validation enabled.
     fn compile_with(
-        context: &CompilationContext<'_, TestDomain>,
+        context: &CompilationCache<'_, TestDomain>,
         domain: &TestDomain,
         cache_key: u8,
         compiler: impl 'static + Send + FnOnce() -> Result<TestCompiledProgram, ProgramError>,
@@ -2245,7 +2244,7 @@ mod tests {
     }
 
     /// Returns the steps retained by `context`, preserving their reported order.
-    fn event_steps(context: &CompilationContext<'_, TestDomain>) -> Vec<CompilationStep> {
+    fn event_steps(context: &CompilationCache<'_, TestDomain>) -> Vec<CompilationStep> {
         context.recent_events().into_iter().map(|event| event.step).collect()
     }
 
@@ -2310,8 +2309,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_new() {
-        let context = CompilationContext::<TestDomain>::new();
+    fn test_compilation_cache_new() {
+        let context = CompilationCache::<TestDomain>::new();
         assert!(context.disk_cache().is_none());
         assert!(context.artifact_exchange().is_none());
         assert_eq!(context.artifact_exchange_policy(), CompilationArtifactExchangePolicy::Disabled);
@@ -2325,8 +2324,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_capacity() {
-        let context = CompilationContext::<TestDomain>::with_capacity(1);
+    fn test_compilation_cache_with_capacity() {
+        let context = CompilationCache::<TestDomain>::with_capacity(1);
         let domain = TestDomain::default();
         let producer_calls = Arc::new(AtomicUsize::new(0));
         for key in [1, 2, 1] {
@@ -2345,24 +2344,23 @@ mod tests {
         assert_eq!(context.program_count(), 1);
 
         // A zero capacity is clamped to one entry.
-        let context = CompilationContext::<TestDomain>::with_capacity(0);
+        let context = CompilationCache::<TestDomain>::with_capacity(0);
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
         compile_with(&context, &domain, 2, move || Ok(TestCompiledProgram(2))).unwrap();
         assert_eq!(context.program_count(), 1);
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache() {
+    fn test_compilation_cache_with_disk_cache() {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let first_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
+        let first_context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
         compile_with(&first_context, &domain, 3, move || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(first_context.disk_cache().unwrap().directory(), directory.path());
 
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let second_context =
-            CompilationContext::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
+        let second_context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_disk_cache(disk_cache);
         let restored =
             compile_with(&second_context, &domain, 3, move || -> Result<TestCompiledProgram, ProgramError> {
                 panic!("persistent hit must not invoke producer")
@@ -2405,12 +2403,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache_lookup_failures() {
+    fn test_compilation_cache_with_disk_cache_lookup_failures() {
         // A payload that fails to deserialize is a failed lookup, which counts as a persistent error.
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
         cache.put(&DiskCacheDigest::from_key(&[1]), b"invalid payload").unwrap();
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let program =
             compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(17))).unwrap();
         assert_eq!(program.0, 17);
@@ -2440,7 +2438,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
         cache.put(&DiskCacheDigest::from_key(&[2]), &19usize.to_le_bytes()).unwrap();
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let domain = TestDomain { persistent: true, deserialization_incompatible: true, ..TestDomain::default() };
         assert_eq!(compile_with(&context, &domain, 2, move || Ok(TestCompiledProgram(23))).unwrap().0, 23);
         assert_eq!(
@@ -2467,7 +2465,7 @@ mod tests {
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::MAX, 0);
         fs::create_dir(cache.entry_path(&DiskCacheDigest::from_key(&[3]))).unwrap();
         let read_message = cache.get(&DiskCacheDigest::from_key(&[3])).unwrap_err().to_string();
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
         let program =
             compile_with(&context, &TestDomain::persistent(), 3, move || Ok(TestCompiledProgram(29))).unwrap();
         assert_eq!(program.0, 29);
@@ -2494,10 +2492,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache_unsupported_domain() {
+    fn test_compilation_cache_with_disk_cache_unsupported_domain() {
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
         compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
 
         // A domain without persistent keys skips both the persistent lookup and the store, even though the write
@@ -2517,10 +2515,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache_default_write_thresholds() {
+    fn test_compilation_cache_with_disk_cache_default_write_thresholds() {
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap();
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
         let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
 
@@ -2548,11 +2546,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache_below_minimum_entry_size() {
+    fn test_compilation_cache_with_disk_cache_below_minimum_entry_size() {
         // A serialized program that is smaller than the minimum entry size is skipped after serialization.
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, usize::MAX);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache);
         compile_with(&context, &TestDomain::persistent(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(context.statistics().persistent_errors, 0);
@@ -2576,10 +2574,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache_serialization_failure() {
+    fn test_compilation_cache_with_disk_cache_serialization_failure() {
         let directory = tempfile::tempdir().unwrap();
         let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache).with_event_capacity(8);
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(disk_cache).with_event_capacity(8);
         let domain = TestDomain { persistent: true, serialization_fails: true, ..TestDomain::default() };
 
         // Serialization failures degrade to an in-memory result and are recorded separately from persistent write
@@ -2610,11 +2608,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_disk_cache_write_failure() {
+    fn test_compilation_cache_with_disk_cache_write_failure() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let entry_path = cache.entry_path(&DiskCacheDigest::from_key(&[1]));
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(cache).with_event_capacity(8);
 
         // Create the obstruction after the lookup, so only the store fails and compilation still succeeds.
         let program = compile_with(&context, &TestDomain::persistent(), 1, move || {
@@ -2652,10 +2650,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange() {
+    fn test_compilation_cache_with_artifact_exchange() {
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
-        let follower_context = CompilationContext::<TestDomain>::new()
+        let follower_context = CompilationCache::<TestDomain>::new()
             .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(1, Arc::clone(&state))), policy);
         assert_eq!(follower_context.artifact_exchange().unwrap().process_index(), 1);
@@ -2673,7 +2671,7 @@ mod tests {
             (program.0, follower_context.statistics(), follower_context.recent_events())
         });
 
-        let leader_context = CompilationContext::<TestDomain>::new()
+        let leader_context = CompilationCache::<TestDomain>::new()
             .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, Arc::clone(&state))), policy);
         let leader =
@@ -2717,8 +2715,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_borrowed_exchanges() {
-        /// Exchange that borrows another exchange, which contexts accept for as long as the borrowed exchange lives.
+    fn test_compilation_cache_with_artifact_exchange_borrowed_exchanges() {
+        /// Exchange that borrows another exchange, which caches accept for as long as the borrowed exchange lives.
         struct BorrowedExchange<'o>(&'o TestExchange);
 
         impl CompilationArtifactExchange for BorrowedExchange<'_> {
@@ -2760,13 +2758,13 @@ mod tests {
         let follower_exchange = TestExchange::new(1, state);
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
 
-        // The leader publishes before the follower looks up the key, so both contexts can borrow exchanges that live on
+        // The leader publishes before the follower looks up the key, so both caches can borrow exchanges that live on
         // this stack frame instead of owning them.
-        let leader_context = CompilationContext::<TestDomain>::new()
+        let leader_context = CompilationCache::<TestDomain>::new()
             .with_artifact_exchange(Arc::new(BorrowedExchange(&leader_exchange)), policy);
         let leader =
             compile_with(&leader_context, &TestDomain::persistent(), 7, move || Ok(TestCompiledProgram(29))).unwrap();
-        let follower_context = CompilationContext::<TestDomain>::new()
+        let follower_context = CompilationCache::<TestDomain>::new()
             .with_artifact_exchange(Arc::new(BorrowedExchange(&follower_exchange)), policy);
         let follower = compile_with(
             &follower_context,
@@ -2786,10 +2784,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_inactive() {
+    fn test_compilation_cache_with_artifact_exchange_inactive() {
         // A disabled policy never consults the exchange, so a follower compiles without waiting for its leader.
         let state = Arc::new(TestExchangeState::default());
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::clone(&state))),
             CompilationArtifactExchangePolicy::Disabled,
         );
@@ -2809,7 +2807,7 @@ mod tests {
         );
 
         // An exchange with a single process has no peers, so even a policy that requires sharing ignores it.
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange { process_index: 0, process_count: 1, state: Arc::clone(&state) }),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
@@ -2831,18 +2829,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_publishes_leader_persistent_hit() {
+    fn test_compilation_cache_with_artifact_exchange_publishes_leader_persistent_hit() {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let seed_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        compile_with(&CompilationContext::<TestDomain>::new().with_disk_cache(seed_cache), &domain, 8, move || {
+        compile_with(&CompilationCache::<TestDomain>::new().with_disk_cache(seed_cache), &domain, 8, move || {
             Ok(TestCompiledProgram(53))
         })
         .unwrap();
 
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
-        let follower_context = CompilationContext::<TestDomain>::new()
+        let follower_context = CompilationCache::<TestDomain>::new()
             .with_artifact_exchange(Arc::new(TestExchange::new(1, Arc::clone(&state))), policy);
         let follower = thread::spawn(move || {
             compile_with(
@@ -2858,7 +2856,7 @@ mod tests {
         });
 
         let leader_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let leader_context = CompilationContext::<TestDomain>::new()
+        let leader_context = CompilationCache::<TestDomain>::new()
             .with_event_capacity(16)
             .with_disk_cache(leader_cache)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, state)), policy);
@@ -2891,10 +2889,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_publishes_leader_compilation_failure() {
+    fn test_compilation_cache_with_artifact_exchange_publishes_leader_compilation_failure() {
         let state = Arc::new(TestExchangeState::default());
         let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(30) };
-        let leader_context = CompilationContext::<TestDomain>::new()
+        let leader_context = CompilationCache::<TestDomain>::new()
             .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(0, Arc::clone(&state))), policy);
         let producer_error = ProgramError::MalformedProgram("expected test failure".to_string());
@@ -2908,7 +2906,7 @@ mod tests {
         );
 
         // The follower observes the terminal failure published by the leader instead of waiting for its deadline.
-        let follower_context = CompilationContext::<TestDomain>::new()
+        let follower_context = CompilationCache::<TestDomain>::new()
             .with_event_capacity(16)
             .with_artifact_exchange(Arc::new(TestExchange::new(1, state)), policy);
         let start = Instant::now();
@@ -2965,10 +2963,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_failure_notification_failure() {
+    fn test_compilation_cache_with_artifact_exchange_failure_notification_failure() {
         let state = Arc::new(TestExchangeState::default());
         state.failure_publish_fails.store(true, Ordering::Relaxed);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
@@ -3012,9 +3010,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_serialization_failure_fallback() {
+    fn test_compilation_cache_with_artifact_exchange_serialization_failure_fallback() {
         let state = Arc::new(TestExchangeState::default());
-        let leader_context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
+        let leader_context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, Arc::clone(&state))),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(30) },
         );
@@ -3056,11 +3054,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_serialization_failure_required() {
+    fn test_compilation_cache_with_artifact_exchange_serialization_failure_required() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let state = Arc::new(TestExchangeState::default());
-        let context = CompilationContext::<TestDomain>::new()
+        let context = CompilationCache::<TestDomain>::new()
             .with_disk_cache(cache)
             .with_event_capacity(8)
             .with_artifact_exchange(
@@ -3100,11 +3098,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_serialization_unsupported() {
+    fn test_compilation_cache_with_artifact_exchange_serialization_unsupported() {
         let directory = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
         let state = Arc::new(TestExchangeState::default());
-        let context = CompilationContext::<TestDomain>::new()
+        let context = CompilationCache::<TestDomain>::new()
             .with_disk_cache(cache)
             .with_event_capacity(8)
             .with_artifact_exchange(
@@ -3146,10 +3144,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_receive_failure_fallback() {
+    fn test_compilation_cache_with_artifact_exchange_receive_failure_fallback() {
         let state = Arc::new(TestExchangeState::default());
         state.receive_fails.store(true, Ordering::Relaxed);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_millis(10) },
         );
@@ -3185,10 +3183,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_receive_incompatible() {
+    fn test_compilation_cache_with_artifact_exchange_receive_incompatible() {
         let state = Arc::new(TestExchangeState::default());
         state.receive_incompatible.store(true, Ordering::Relaxed);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
@@ -3219,7 +3217,7 @@ mod tests {
         // Receiving bytes succeeds, but rejecting their backend compatibility is a lookup miss.
         let state = Arc::new(TestExchangeState::default());
         state.artifacts.lock().unwrap().insert(vec![1], Ok(5usize.to_le_bytes().to_vec()));
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
@@ -3244,11 +3242,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_deserialization_failure() {
+    fn test_compilation_cache_with_artifact_exchange_deserialization_failure() {
         // A policy that requires sharing returns the deserialization error of the domain instead of compiling.
         let state = Arc::new(TestExchangeState::default());
         state.artifacts.lock().unwrap().insert(vec![1], Ok(vec![0]));
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
@@ -3287,7 +3285,7 @@ mod tests {
         // A policy that permits a fallback compiles locally instead.
         let state = Arc::new(TestExchangeState::default());
         state.artifacts.lock().unwrap().insert(vec![1], Ok(vec![0]));
-        let context = CompilationContext::<TestDomain>::new().with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_artifact_exchange(
             Arc::new(TestExchange::new(1, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
@@ -3301,10 +3299,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_publish_failure() {
+    fn test_compilation_cache_with_artifact_exchange_publish_failure() {
         let state = Arc::new(TestExchangeState::default());
         state.publish_fails.store(true, Ordering::Relaxed);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
@@ -3336,12 +3334,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_rejects_compatibility_disagreement() {
+    fn test_compilation_cache_with_artifact_exchange_rejects_compatibility_disagreement() {
         let state = Arc::new(TestExchangeState::default());
         *state.compatibility_error.lock().unwrap() = Some(CompilationArtifactExchangeError::Incompatible {
             message: "expected exchange incompatibility".to_string(),
         });
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
@@ -3385,12 +3383,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_compatibility_validation_failure() {
+    fn test_compilation_cache_with_artifact_exchange_compatibility_validation_failure() {
         // A coordination failure deactivates the exchange, so a policy that permits a fallback compiles locally.
         let state = Arc::new(TestExchangeState::default());
         *state.compatibility_error.lock().unwrap() =
             Some(CompilationArtifactExchangeError::Failed { message: "expected coordination failure".to_string() });
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
@@ -3420,7 +3418,7 @@ mod tests {
         // A validation that times out counts as an exchange timeout rather than as an exchange error.
         let state = Arc::new(TestExchangeState::default());
         *state.compatibility_error.lock().unwrap() = Some(CompilationArtifactExchangeError::TimedOut);
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_artifact_exchange(
             Arc::new(TestExchange::new(0, state)),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(1) },
         );
@@ -3447,8 +3445,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_rejects_unsupported_domain_without_waiting() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
+    fn test_compilation_cache_with_artifact_exchange_rejects_unsupported_domain_without_waiting() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(30) },
         );
@@ -3482,8 +3480,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_timeout_required() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
+    fn test_compilation_cache_with_artifact_exchange_timeout_required() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_millis(1) },
         );
@@ -3525,8 +3523,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_artifact_exchange_timeout_fallback() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
+    fn test_compilation_cache_with_artifact_exchange_timeout_fallback() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(16).with_artifact_exchange(
             Arc::new(TestExchange::new(1, Arc::new(TestExchangeState::default()))),
             CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_millis(1) },
         );
@@ -3556,8 +3554,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_event_capacity() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(2);
+    fn test_compilation_cache_with_event_capacity() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(2);
         let domain = TestDomain::default();
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(43))).unwrap();
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(47))).unwrap();
@@ -3576,10 +3574,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_event_reporter() {
+    fn test_compilation_cache_with_event_reporter() {
         // The reporter borrows `reported`, which outlives the context.
         let reported = Mutex::new(Vec::new());
-        let context = CompilationContext::<TestDomain>::new()
+        let context = CompilationCache::<TestDomain>::new()
             .with_event_reporter(Arc::new(|event: &CompilationEvent| reported.lock().unwrap().push(event.clone())));
         compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(43))).unwrap();
 
@@ -3599,9 +3597,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_with_event_reporter_matches_retained_events() {
+    fn test_compilation_cache_with_event_reporter_matches_retained_events() {
         let reported = Mutex::new(Vec::new());
-        let context = CompilationContext::<TestDomain>::new()
+        let context = CompilationCache::<TestDomain>::new()
             .with_event_capacity(2)
             .with_event_reporter(Arc::new(|event: &CompilationEvent| reported.lock().unwrap().push(event.clone())));
         let error = ProgramError::MalformedProgram("expected reported producer failure".to_string());
@@ -3634,8 +3632,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_clear_cache() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+    fn test_compilation_cache_clear_cache() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8);
         let domain = TestDomain::default();
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(context.program_count(), 1);
@@ -3650,8 +3648,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_clear_statistics() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+    fn test_compilation_cache_clear_statistics() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8);
         compile_with(&context, &TestDomain::default(), 1, move || Ok(TestCompiledProgram(1))).unwrap();
         assert_ne!(context.statistics(), CompilationCacheStatistics::default());
 
@@ -3663,8 +3661,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_clear_events() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+    fn test_compilation_cache_clear_events() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8);
         let domain = TestDomain::default();
         compile_with(&context, &domain, 1, move || Ok(TestCompiledProgram(1))).unwrap();
         assert_eq!(context.recent_events().len(), 2);
@@ -3685,8 +3683,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+    fn test_compilation_cache_compile() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8);
         let domain = TestDomain::default();
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
             .stage(|input: CompilationTracer<TestDomain>| input, ArrayType::scalar(DataType::F32), ())
@@ -3719,8 +3717,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_rejects_incompatible_memory_hits() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8);
+    fn test_compilation_cache_compile_rejects_incompatible_memory_hits() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8);
         let domain = TestDomain::default();
         compile_with(&context, &domain, 0, move || Ok(TestCompiledProgram(2))).unwrap();
         context.clear_events();
@@ -3757,8 +3755,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_rejects_incompatible_shared_programs() {
-        let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(8));
+    fn test_compilation_cache_compile_rejects_incompatible_shared_programs() {
+        let context = Arc::new(CompilationCache::<TestDomain>::new().with_event_capacity(8));
         let release = Arc::new(AtomicBool::new(false));
         let producer = {
             let context = Arc::clone(&context);
@@ -3813,17 +3811,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_recompiles_incompatible_persistent_artifacts() {
+    fn test_compilation_cache_compile_recompiles_incompatible_persistent_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let disk_cache = || DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        compile_with(&CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache()), &domain, 0, move || {
+        compile_with(&CompilationCache::<TestDomain>::new().with_disk_cache(disk_cache()), &domain, 0, move || {
             Ok(TestCompiledProgram(2))
         })
         .unwrap();
 
         // A rejected persistent artifact is an incompatible miss, and the fresh compilation replaces it.
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache());
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(8).with_disk_cache(disk_cache());
         let lowered = TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]);
         assert_eq!(context.compile(&domain, &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
         assert_eq!(context.statistics().persistent_hits, 0);
@@ -3845,18 +3843,18 @@ mod tests {
             ],
         );
 
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache());
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(disk_cache());
         assert_eq!(context.compile(&domain, &lowered).unwrap().as_ref(), &TestCompiledProgram(1));
         assert_eq!(context.statistics().persistent_hits, 1);
         assert_eq!(context.statistics().compilations, 0);
     }
 
     #[test]
-    fn test_compilation_context_compile_falls_back_from_incompatible_exchange_artifacts() {
+    fn test_compilation_cache_compile_falls_back_from_incompatible_exchange_artifacts() {
         let follower_context = |policy| {
             let state = Arc::new(TestExchangeState::default());
             state.artifacts.lock().unwrap().insert(vec![0], Ok(2usize.to_le_bytes().to_vec()));
-            CompilationContext::<TestDomain>::new()
+            CompilationCache::<TestDomain>::new()
                 .with_event_capacity(8)
                 .with_artifact_exchange(Arc::new(TestExchange::new(1, state)), policy)
         };
@@ -3900,18 +3898,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_publishes_fresh_artifacts_after_incompatible_persistent_artifacts() {
+    fn test_compilation_cache_compile_publishes_fresh_artifacts_after_incompatible_persistent_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let domain = TestDomain::persistent();
         let disk_cache = || DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        compile_with(&CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache()), &domain, 0, move || {
+        compile_with(&CompilationCache::<TestDomain>::new().with_disk_cache(disk_cache()), &domain, 0, move || {
             Ok(TestCompiledProgram(2))
         })
         .unwrap();
 
         // A leader never publishes a persistent artifact that the domain rejects, so followers receive the fresh one.
         let state = Arc::new(TestExchangeState::default());
-        let context = CompilationContext::<TestDomain>::new().with_disk_cache(disk_cache()).with_artifact_exchange(
+        let context = CompilationCache::<TestDomain>::new().with_disk_cache(disk_cache()).with_artifact_exchange(
             Arc::new(TestExchange::new(0, Arc::clone(&state))),
             CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(1) },
         );
@@ -3927,10 +3925,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_retries_after_miss_reporter_panic() {
+    fn test_compilation_cache_compile_retries_after_miss_reporter_panic() {
         let panic_on_miss = AtomicBool::new(true);
         let context =
-            CompilationContext::<TestDomain>::new().with_event_reporter(Arc::new(|event: &CompilationEvent| {
+            CompilationCache::<TestDomain>::new().with_event_reporter(Arc::new(|event: &CompilationEvent| {
                 if matches!(
                     &event.step,
                     CompilationStep::CacheLookup {
@@ -3956,8 +3954,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_retries_after_backend_error() {
-        let context = CompilationContext::<TestDomain>::new().with_event_capacity(16);
+    fn test_compilation_cache_compile_retries_after_backend_error() {
+        let context = CompilationCache::<TestDomain>::new().with_event_capacity(16);
         let domain = TestDomain::default();
 
         // Producer errors are returned to their caller and never cached.
@@ -3997,8 +3995,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_retries_after_backend_panic() {
-        let context = CompilationContext::<TestDomain>::new();
+    fn test_compilation_cache_compile_retries_after_backend_panic() {
+        let context = CompilationCache::<TestDomain>::new();
         let domain = TestDomain::default();
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4017,8 +4015,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_retries_waiters_after_producer_failure() {
-        let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(8));
+    fn test_compilation_cache_compile_retries_waiters_after_producer_failure() {
+        let context = Arc::new(CompilationCache::<TestDomain>::new().with_event_capacity(8));
         let release = Arc::new(AtomicBool::new(false));
         let error = ProgramError::MalformedProgram("expected producer failure".to_string());
         let producer = {
@@ -4077,10 +4075,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_deduplicates_same_key_misses() {
+    fn test_compilation_cache_compile_deduplicates_same_key_misses() {
         const THREAD_COUNT: usize = 8;
 
-        let context = Arc::new(CompilationContext::<TestDomain>::new().with_event_capacity(16));
+        let context = Arc::new(CompilationCache::<TestDomain>::new().with_event_capacity(16));
         let start = Arc::new(Barrier::new(THREAD_COUNT + 1));
         let release = Arc::new(AtomicBool::new(false));
         let producer_calls = Arc::new(AtomicUsize::new(0));
@@ -4139,8 +4137,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_context_compile_compiles_unrelated_keys_concurrently() {
-        let context = Arc::new(CompilationContext::<TestDomain>::new());
+    fn test_compilation_cache_compile_compiles_unrelated_keys_concurrently() {
+        let context = Arc::new(CompilationCache::<TestDomain>::new());
         let start = Arc::new(Barrier::new(3));
         let release = Arc::new(AtomicBool::new(false));
         let (entered_sender, entered_receiver) = mpsc::channel();

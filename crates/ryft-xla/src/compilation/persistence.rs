@@ -2090,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_deserialize_compiled_program_restores_into_a_fresh_compilation_context() {
+    fn test_session_deserialize_compiled_program_restores_into_a_fresh_compilation_cache() {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
@@ -2109,7 +2109,7 @@ mod tests {
         .into_inner();
         let first: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&first_session).unwrap().compile(&first_session).unwrap();
-        assert_eq!(first_session.compilation_context().statistics().compilations, 1);
+        assert_eq!(first_session.compilation_cache().statistics().compilations, 1);
         drop(first);
         drop(first_session);
 
@@ -2119,7 +2119,7 @@ mod tests {
             .into_inner();
         let _restored: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
             staged.lower(&second_session).unwrap().compile(&second_session).unwrap();
-        let statistics = second_session.compilation_context().statistics();
+        let statistics = second_session.compilation_cache().statistics();
         assert_eq!(statistics.persistent_hits, 1);
         assert_eq!(statistics.compilations, 0, "restoration must not invoke backend compilation");
     }

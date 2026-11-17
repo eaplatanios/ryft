@@ -447,7 +447,7 @@ mod tests {
             assert!(second_pending);
         }
         assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
-        assert_eq!(session.compilation_context().program_count(), 2);
+        assert_eq!(session.compilation_cache().program_count(), 2);
     }
 
     /// Compiles ordered and unordered prints on `client`, checks the persisted effect metadata roundtrip and its

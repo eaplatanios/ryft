@@ -236,7 +236,7 @@ mod tests {
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
             Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
         let result = operation.lower(&mut lowerer, &[input], &[input_type], output_types);
-        assert_eq!(state.channel_ids().get(), 1);
+        assert_eq!(state.next_channel_id(), 1);
         assert!(block.operations()?.collect::<Result<Vec<_>, _>>()?.is_empty());
         let outputs = result?;
         assert_eq!(outputs, vec![input]);
@@ -684,10 +684,9 @@ mod tests {
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
         let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
-        let state = CollectiveLoweringState::new().enter_manual_region(
+        let boundary =
             ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![replicated.clone()], Vec::new())
-                .unwrap(),
-        );
+                .unwrap();
         let exchange = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
         let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
         let incompatible_mesh = test_manual_mesh("x", 3);
@@ -707,6 +706,7 @@ mod tests {
                 let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
                 let block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap().as_ref();
+                let state = CollectiveLoweringState::new().enter_manual_region(boundary.clone());
                 let mut lowerer: Lowerer<'_, '_, '_, Operation> =
                     Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
                 let result = operation.lower(&mut lowerer, &[input], &[input_type], &output_types);
@@ -735,14 +735,12 @@ mod tests {
                     None
                 };
                 match (result, expected) {
-                    (Ok(outputs), None) => {
-                        assert_eq!(outputs.len(), 1);
-                        state.channel_ids().set(1);
-                    }
+                    (Ok(outputs), None) => assert_eq!(outputs.len(), 1),
                     (Err(Error::Core(error)), Some(expected)) => {
                         assert_eq!(error.as_ref(), &ryft_core::Error::Program(expected));
-                        // Reject the contract before allocating a channel or emitting a communication operation.
-                        assert_eq!(state.channel_ids().get(), 1);
+                        // Reject the contract before allocating a channel or emitting a communication operation, so
+                        // the next channel of the state is still its first one.
+                        assert_eq!(state.next_channel_id(), 1);
                     }
                     (result, expected) => panic!("{operation}: expected {expected:?} but got {result:?}"),
                 }

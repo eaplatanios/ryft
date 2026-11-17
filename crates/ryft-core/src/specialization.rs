@@ -54,9 +54,9 @@
 //! Cross-thread duplicate production is deliberate. Front-end work (i.e., tracing and lowering) is cheap relative
 //! to backend compilation, duplicate results are interchangeable by construction because the key defines
 //! interchangeability, and the expensive backend compile is already deduplicated per key by
-//! [`CompilationContext`](crate::CompilationContext). This primitive therefore **never blocks and never waits**,
-//! and it must not be "improved" into making same-key misses wait: waiting coordination belongs exclusively to
-//! [`CompilationContext`](crate::CompilationContext), which additionally owns persistence, distributed
+//! [`CompilationCache`](crate::CompilationCache). This primitive therefore **never blocks and never waits**,
+//! and it must not be "improved" into making same-key misses wait: waiting coordination belongs exclusively
+//! to [`CompilationCache`](crate::CompilationCache), which additionally owns persistence, distributed
 //! artifact exchange, and an event model that this primitive intentionally lacks.
 //!
 //! # Thread Safety

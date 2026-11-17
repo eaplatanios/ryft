@@ -892,9 +892,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(lowered.runtime_requirements(), &[first, second]);
+        let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
+        assert_eq!(runtime_requirements.as_ref(), &[first, second]);
         assert_eq!(
-            lowered.stable_hlo(),
+            stable_hlo,
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {
@@ -1233,11 +1234,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(lowered.runtime_requirements(), &[builtin_requirement("ryft.assert")]);
+        let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
+        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement("ryft.assert")]);
         // This direct lowering fixture has no ordered boundary slot and needs no transport admission.
-        assert!(!lowered.signature().has_ordered_io());
-        assert!(lowered.requires_assertion_handler());
-        let module = lowered.stable_hlo();
+        assert!(!signature.has_ordered_io());
+        assert!(requires_assertion_handler);
+        let module = stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"

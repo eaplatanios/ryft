@@ -678,8 +678,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(active.requires_assertion_handler());
-        assert_eq!(active.runtime_requirements(), &[builtin_requirement("ryft.assert")],);
+        let (_, _, requires_assertion_handler, runtime_requirements) = active.into_parts();
+        assert!(requires_assertion_handler);
+        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement("ryft.assert")],);
 
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
@@ -709,10 +710,11 @@ mod tests {
         .unwrap();
 
         assert!(lowered_effect_classes(&program).unwrap().is_empty());
-        assert!(!dormant.requires_assertion_handler());
-        assert!(dormant.runtime_requirements().is_empty());
+        let (stable_hlo, _, requires_assertion_handler, runtime_requirements) = dormant.into_parts();
+        assert!(!requires_assertion_handler);
+        assert!(runtime_requirements.is_empty());
         assert_eq!(
-            dormant.stable_hlo(),
+            stable_hlo,
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {

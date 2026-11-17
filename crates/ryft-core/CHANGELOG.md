@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     traces through `StagedCallOperation`s.
   - Retained JIT dispatch via `jit` and `Compile::jit`, which return `CompiledFunctionDispatcher`s that keep the
     compiled executables of their specializations in a bounded LRU cache.
-  - A shared `CompilationContext` that deduplicates backend compilation, with caching in memory, optional persistent
+  - A shared `CompilationCache` that deduplicates backend compilation, with caching in memory, optional persistent
     caching via `DiskCache`, and optional artifact exchange among processes via `CompilationArtifactExchange`, and
     which reports `CompilationCacheStatistics` and `CompilationEvent`s.
   - Execution with transactional external state for backends that implement `StatefulCompilationDomain`.

@@ -920,7 +920,7 @@ mod tests {
                         Some(target_platform),
                     )
                     .unwrap()
-                    .stable_hlo(),
+                    .into_stable_hlo(),
                     indoc! {"
                         module {
                           func.func @main(%arg0: tensor<2x4xi1>) -> tensor<2x4xi1> {

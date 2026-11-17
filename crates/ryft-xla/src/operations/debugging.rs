@@ -799,20 +799,21 @@ mod tests {
                 &[],
             )
             .unwrap();
-            assert_eq!(lowered.signature().has_ordered_io(), ordered);
+            let (stable_hlo, signature, _, runtime_requirements) = lowered.into_parts();
+            assert_eq!(signature.has_ordered_io(), ordered);
             let requirements = if ordered {
                 vec![builtin_requirement("ryft.ordered-io"), builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
             } else {
                 vec![builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
             };
-            assert_eq!(lowered.runtime_requirements(), requirements);
-            assert_eq!(lowered.signature().has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
-            assert_eq!(lowered.signature().has_unordered_io(), !ordered);
-            assert!(lowered.signature().has_effects());
-            assert!(!lowered.signature().requires_assertion_handler());
-            assert_eq!(lowered.signature().ordered_io_input_index(), ordered.then_some(1));
-            assert_eq!(lowered.signature().ordered_io_output_index(), ordered.then_some(0));
-            assert_eq!(lowered.signature().physical_input_count(), 1 + usize::from(ordered));
+            assert_eq!(runtime_requirements.as_ref(), requirements);
+            assert_eq!(signature.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
+            assert_eq!(signature.has_unordered_io(), !ordered);
+            assert!(signature.has_effects());
+            assert!(!signature.requires_assertion_handler());
+            assert_eq!(signature.ordered_io_input_index(), ordered.then_some(1));
+            assert_eq!(signature.ordered_io_output_index(), ordered.then_some(0));
+            assert_eq!(signature.physical_input_count(), 1 + usize::from(ordered));
             let expected = if ordered {
                 indoc! {"
                     module {
@@ -837,7 +838,7 @@ mod tests {
                     }
                 "}
             };
-            assert_eq!(lowered.stable_hlo(), expected);
+            assert_eq!(stable_hlo, expected);
         }
     }
 

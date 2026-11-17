@@ -2853,9 +2853,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(lowered.runtime_requirements(), &[builtin_requirement("test.active")]);
+        let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
+        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement("test.active")]);
         assert_eq!(
-            lowered.stable_hlo(),
+            stable_hlo,
             indoc! {r#"
                 module {
                   func.func private @jit_call_0(%arg0: tensor<4xf32>) -> tensor<4xf32> {
@@ -2906,9 +2907,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(lowered.runtime_requirements().is_empty());
+        let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
+        assert!(runtime_requirements.is_empty());
         assert_eq!(
-            lowered.stable_hlo(),
+            stable_hlo,
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {

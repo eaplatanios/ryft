@@ -1789,7 +1789,7 @@ mod tests {
         assert_eq!(printed, vec![guarded]);
         let print = lowerer
             .effect_tokens()
-            .ordered_io()
+            .get(EffectClass::OrderedIo)
             .unwrap()
             .cast::<OperationResultRef>()
             .unwrap()

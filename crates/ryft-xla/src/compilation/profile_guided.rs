@@ -518,7 +518,7 @@ where
         let profile = FeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let session = &self.inner.session;
-        let program = session.compilation_context().compile(session, &lowered_program)?;
+        let program = session.compilation_cache().compile(session, &lowered_program)?;
         session.replace_executable_program(&self.inner.baseline, program)
     }
 
@@ -528,7 +528,7 @@ where
         let Some(key) = self.inner.profile_sidecar_key.as_deref() else {
             return;
         };
-        let Some(disk_cache) = self.inner.session.compilation_context().disk_cache() else {
+        let Some(disk_cache) = self.inner.session.compilation_cache().disk_cache() else {
             return;
         };
         let profile = match disk_cache.get_auxiliary(ADAPTIVE_PROFILE_CACHE_NAMESPACE, key) {
@@ -573,7 +573,7 @@ where
         let Some(key) = self.inner.profile_sidecar_key.as_deref() else {
             return;
         };
-        let Some(disk_cache) = self.inner.session.compilation_context().disk_cache() else {
+        let Some(disk_cache) = self.inner.session.compilation_cache().disk_cache() else {
             return;
         };
         match disk_cache.put_auxiliary(ADAPTIVE_PROFILE_CACHE_NAMESPACE, key, profile) {
@@ -895,7 +895,7 @@ fn adaptive_profile_sidecar_key<'c>(
     lowered_program: &LoweredProgram,
     options: AdaptiveProfileGuidedOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let cache = session.compilation_context();
+    let cache = session.compilation_cache();
     if cache.disk_cache().is_none() {
         return Ok(None);
     }

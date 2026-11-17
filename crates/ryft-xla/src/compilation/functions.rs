@@ -4,7 +4,7 @@
 //! creates a [`CompiledFunctionDispatcher`] that selects specializations from runtime inputs. Its first execution of a
 //! specialization stages, lowers, and requests compilation, while warm executions reuse the retained executable.
 //! [`compile`] stages and obtains a [`CompiledFunction`] for one explicit abstract signature immediately. Both paths
-//! share the session's [`CompilationContext`](ryft_core::CompilationContext) cache.
+//! share the session's [`CompilationCache`](ryft_core::CompilationCache) cache.
 //!
 //! [`stage`] returns a [`StagedFunction`] for functions that are composed into larger programs before compilation.
 //! Staged functions register runtime captures in their retained capture table instead of embedding runtime arrays in
@@ -1341,7 +1341,7 @@ where
     /// one. The retained artifact is a compiled program whose residuals are runtime values, so reuse across calls with
     /// different runtime inputs is sound by construction. Retention is not single-flight. Concurrent cold calls may
     /// each derive a gradient, and because those derivations are interchangeable, the inserts are idempotent and the
-    /// last one wins, while the shared [`CompilationContext`](ryft_core::compilation::CompilationContext) still
+    /// last one wins, while the shared [`CompilationCache`](ryft_core::compilation::CompilationCache) still
     /// deduplicates their backend compilation.
     #[track_caller]
     pub fn gradient(&self, session: &Session<'c>) -> Result<CompiledFunction<'c, In, In>, Error>
@@ -1454,7 +1454,7 @@ where
     /// lowering, while a call with a different session identity produces a fresh derivative and replaces the retained
     /// one. Retention is not single-flight. Concurrent cold calls may each derive a JVP, and because those derivations
     /// are interchangeable, the inserts are idempotent and the last one wins, while the shared
-    /// [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates their backend compilation.
+    /// [`CompilationCache`](ryft_core::compilation::CompilationCache) still deduplicates their backend compilation.
     #[track_caller]
     pub fn jvp(&self, session: &Session<'c>) -> Result<CompiledFunction<'c, (In, In), (Out, Out)>, Error>
     where
@@ -1693,7 +1693,7 @@ where
 ///
 /// The function is traced into a fresh XLA program, in which compiled functions that it calls register their runtime
 /// captures as captures of the new program (refer to [`StagedFunction::call`]). The resulting program is then
-/// compiled and executed against `session`. Its [`CompilationContext`](ryft_core::compilation::CompilationContext)
+/// compiled and executed against `session`. Its [`CompilationCache`](ryft_core::compilation::CompilationCache)
 /// structurally shares equivalent lowerings even when they originate at different Rust call sites.
 #[track_caller]
 pub fn compile<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
@@ -1956,7 +1956,7 @@ type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
 /// A slot is a retention slot and not a single-flight barrier. Its lock is released before the artifact is derived, so
 /// concurrent cold calls may each derive their own copy and the last insert wins. That is sound because the copies are
 /// interchangeable derivations of the same source program, and it is deliberate because waiting single-flight belongs
-/// exclusively to the shared [`CompilationContext`](ryft_core::compilation::CompilationContext), which still
+/// exclusively to the shared [`CompilationCache`](ryft_core::compilation::CompilationCache), which still
 /// deduplicates the backend compilation those duplicate derivations request.
 struct DerivedFunctionSlots<'c, Gradient, Jvp> {
     /// Retained reverse mode gradient function, if any.
@@ -4935,7 +4935,7 @@ mod tests {
     #[test]
     fn test_compiled_function_gradient_retains_derived_function_per_session() {
         // For `f = |x| x * x`, repeated `f.gradient(&session)` calls with one session must reuse the retained derived
-        // function without deriving it again or querying the compilation context, while different runtime inputs to
+        // function without deriving it again or querying the compilation cache, while different runtime inputs to
         // the shared derived function must still produce their own correct gradients, which depend on those inputs.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
@@ -4947,12 +4947,12 @@ mod tests {
             compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let first: CompiledFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
-        let statistics = engine.compilation_context().statistics();
+        let statistics = engine.compilation_cache().statistics();
         let second = compiled.gradient(&engine).unwrap();
 
-        // The warm call reuses the retained executable and never reaches the shared compilation context.
+        // The warm call reuses the retained executable and never reaches the shared compilation cache.
         assert!(std::ptr::eq(first.function.compiled_program(), second.function.compiled_program()));
-        assert_eq!(engine.compilation_context().statistics(), statistics);
+        assert_eq!(engine.compilation_cache().statistics(), statistics);
 
         // The retained derived function keeps residuals as runtime values. Different primals through the shared
         // executable produce different, correct gradients, which depend on those primals (i.e., `d(x*x)/dx = 2x`).
@@ -4972,10 +4972,10 @@ mod tests {
         let other_engine = session_with_client(&client);
         let third = compiled.gradient(&other_engine).unwrap();
         assert!(!std::ptr::eq(first.function.compiled_program(), third.function.compiled_program()));
-        let other_statistics = other_engine.compilation_context().statistics();
+        let other_statistics = other_engine.compilation_cache().statistics();
         let fourth = compiled.gradient(&other_engine).unwrap();
         assert!(std::ptr::eq(third.function.compiled_program(), fourth.function.compiled_program()));
-        assert_eq!(other_engine.compilation_context().statistics(), other_statistics);
+        assert_eq!(other_engine.compilation_cache().statistics(), other_statistics);
     }
 
     #[test]
@@ -5198,11 +5198,11 @@ mod tests {
 
         let first: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.jvp(&engine).unwrap();
-        let statistics = engine.compilation_context().statistics();
+        let statistics = engine.compilation_cache().statistics();
         let second = compiled.jvp(&engine).unwrap();
 
         assert!(std::ptr::eq(first.function.compiled_program(), second.function.compiled_program()));
-        assert_eq!(engine.compilation_context().statistics(), statistics);
+        assert_eq!(engine.compilation_cache().statistics(), statistics);
 
         // The retained JVP computes `(x * x, 2 * x * t)` for runtime `(x, t)` supplied per call.
         let primal = Array::from_host_buffer(

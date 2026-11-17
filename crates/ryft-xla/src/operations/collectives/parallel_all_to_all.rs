@@ -446,9 +446,8 @@ mod tests {
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
         let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
-        let state = CollectiveLoweringState::new().enter_manual_region(
-            ShardMapBoundary::new(mesh, vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
-        );
+        let boundary =
+            ShardMapBoundary::new(mesh, vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap();
         let extent = DimensionType::new("items", DimensionBounds::new(0, Some(9)).unwrap());
         let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
         for sharding in [&replicated, &varying, &unreduced] {
@@ -466,6 +465,7 @@ mod tests {
             let block = context.block(&mlir_types);
             let inputs =
                 (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+            let state = CollectiveLoweringState::new().enter_manual_region(boundary.clone());
             let mut lowerer: Lowerer<'_, '_, '_, Operation> =
                 Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
             let result = operation.lower_in_parent(&mut lowerer, &inputs, &input_types, &output_types);
@@ -480,13 +480,11 @@ mod tests {
                 None
             };
             match (result, expected) {
-                (Ok(outputs), None) => {
-                    assert_eq!(outputs.len(), 1);
-                    state.channel_ids().set(1);
-                }
+                (Ok(outputs), None) => assert_eq!(outputs.len(), 1),
                 (Err(Error::Core(error)), Some(expected)) => {
                     assert_eq!(error.as_ref(), &ryft_core::Error::Program(expected));
-                    assert_eq!(state.channel_ids().get(), 1);
+                    // Rejection happens before a channel is allocated, so the next channel is still the first one.
+                    assert_eq!(state.next_channel_id(), 1);
                 }
                 (result, expected) => panic!("{sharding}: expected {expected:?} but got {result:?}"),
             }

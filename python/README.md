@@ -278,7 +278,7 @@ Add `--smoke` for the CI-suitable counter/invariant mode. Add `--cache-dir PATH`
 persistent-cache subdirectory. The report times trace, lower, backend compile, warm dispatch, enqueue-only execution,
 and explicitly synchronized execution separately; it never interprets enqueue latency as device execution latency.
 Persistent-cache benchmark mode uses zero compile-duration and entry-size write thresholds in both frameworks so the
-second fresh compilation context actually measures executable restoration rather than silently recompiling.
+second fresh compilation cache actually measures executable restoration rather than silently recompiling.
 
 Run the following command to verify the curated preserved historical dump corpus against the committed `syrupy`
 snapshots:

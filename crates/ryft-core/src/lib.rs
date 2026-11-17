@@ -54,8 +54,8 @@ pub use captures::{
 };
 pub use compilation::{
     AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangeError,
-    CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationCacheStatistics, CompilationCacheTier,
-    CompilationContext, CompilationDomain, CompilationEvent, CompilationLookupOutcome, CompilationMissReason,
+    CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain, CompilationCacheStatistics,
+    CompilationCacheTier, CompilationDomain, CompilationEvent, CompilationLookupOutcome, CompilationMissReason,
     CompilationSkipReason, CompilationStep, CompilationStepError, CompilationStepOutcome, CompilationTracer, Compile,
     CompiledFunction, CompiledFunctionDispatcher, DiskCache, DispatchInputs, DispatcherStatistics, ExecutableFunction,
     LoweredFunction, StagedCallOperation, StagedFunction, StagedProgram, StatefulCompilationDomain, StatefulExecution,

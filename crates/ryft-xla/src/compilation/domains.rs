@@ -54,7 +54,7 @@ impl<'c> CompilationDomain for Session<'c> {
             .iter()
             .map(|constant| Ok(Value::Array(self.retained_constant(constant)?)))
             .collect::<Result<Vec<_>, Error>>()?;
-        let compiled = self.compilation_context().compile(self, program)?;
+        let compiled = self.compilation_cache().compile(self, program)?;
 
         // A program that was compiled for another lowering (e.g., an earlier one in this session or a persisted
         // executable) has the boundary of `program` up to the identities of its dimension variables, which the cache
@@ -913,7 +913,7 @@ mod tests {
     use ryft_core::{
         AddOperation, Array as CoreArray, ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex,
         ArraySliceAxis, ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
-        CompilationArtifactExchangePolicy, CompilationCacheDomain, CompilationContext, CompilationTracer,
+        CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain, CompilationTracer,
         ConditionOperation, ConstantOperation, CotangentDestinationKind, DataType, Device, DeviceMesh,
         Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation,
         DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable,
@@ -2776,7 +2776,7 @@ mod tests {
                 Arc::new(CollidingArtifactExchange { artifact: artifact.clone() });
             Session::builder()
                 .client(&client)
-                .compilation_context(CompilationContext::new().with_artifact_exchange(exchange, policy))
+                .compilation_cache(CompilationCache::new().with_artifact_exchange(exchange, policy))
                 .build()
                 .unwrap()
         };
@@ -2795,7 +2795,7 @@ mod tests {
             fallback_consumer.validate_cached_program(lowered.lowered_program(), compiled.compiled_program()),
             Ok(()),
         ));
-        let statistics = fallback_consumer.compilation_context().statistics();
+        let statistics = fallback_consumer.compilation_cache().statistics();
         assert_eq!(statistics.exchange_hits, 0);
         assert_eq!(statistics.exchange_fallbacks, 1);
         assert_eq!(statistics.compilations, 1);
@@ -2813,6 +2813,6 @@ mod tests {
                         incompatible donation flags",
             ),
         ));
-        assert_eq!(required_consumer.compilation_context().statistics().compilations, 0);
+        assert_eq!(required_consumer.compilation_cache().statistics().compilations, 0);
     }
 }

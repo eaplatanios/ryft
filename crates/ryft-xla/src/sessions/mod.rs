@@ -35,7 +35,7 @@
 //! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
 //! [`CompiledProgram`] contains the loaded executable and its invocation contract. These flat artifacts are distinct
 //! from the typed function handles in [`crate::compilation::functions`], which also retain input and output container
-//! structures. The session's [`CompilationContext`] coordinates artifact reuse, and
+//! structures. The session's [`CompilationCache`] coordinates artifact reuse, and
 //! [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation configuration.
 //! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
 //! expose compiler diagnostics for a compiled program.
@@ -85,7 +85,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext, CastType,
-    Compare, CompilationContext, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device,
+    Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device,
     DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache,
     Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext, InterpretableOperation,
     LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis, NestedTracingContext, ONE_OPERATION_NAME,
@@ -127,8 +127,9 @@ pub use targets::{Target, TargetDevice};
 /// Source of the identifiers of sessions, which are unique within the process.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum number of compiled operation applications retained in a session's eager dispatch cache.
-const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
+/// Default maximum number of compiled operation applications retained in a session's eager dispatch cache, which
+/// [`SessionBuilder::eager_dispatch_cache_capacity`] overrides.
+const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
 /// [`Client`].
@@ -167,13 +168,13 @@ const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 ///
 /// # Compilation Caching
 ///
-/// Each session owns one [`CompilationContext`], which its builder configures. By default, it keeps compiled programs
+/// Each session owns one [`CompilationCache`], which its builder configures. By default, it keeps compiled programs
 /// only in memory. [`SessionBuilder::disk_cache`] adds a persistent [`DiskCache`] so that later processes restart
 /// warm, and [`SessionBuilder::disk_cache_from_env`] adds the one that the [`DiskCache::ENV_VAR`] environment variable
-/// configures, which sessions never read otherwise. [`SessionBuilder::compilation_context`] supplies a whole context
+/// configures, which sessions never read otherwise. [`SessionBuilder::compilation_cache`] supplies a whole context
 /// (e.g., one with a bounded in-memory tier or, for multi-process programs, one with an exchange from
 /// [`DistributedRuntime::compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange)).
-/// Refer to [`CompilationContext`] for a configuration example.
+/// Refer to [`CompilationCache`] for a configuration example.
 ///
 /// # Effects and Completion
 ///
@@ -251,8 +252,9 @@ impl<'c> Session<'c> {
         SessionBuilder {
             client_source: ClientSource::Platform(Platform::Auto),
             client_options: None,
-            compilation_context: CompilationContext::new(),
+            compilation_cache: CompilationCache::new(),
             disk_cache: None,
+            eager_dispatch_cache_capacity: DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY,
             runtime_extensions: RuntimeExtensions::new(),
             default_compilation_options: CompilationOptions::default(),
         }
@@ -262,7 +264,8 @@ impl<'c> Session<'c> {
     /// resources that its handles share.
     fn from_parts(
         client: &'c Client<'c>,
-        cache: CompilationContext<'c, Self>,
+        cache: CompilationCache<'c, Self>,
+        eager_dispatch_cache_capacity: usize,
         extensions: RuntimeExtensions<'c>,
         default_compilation_options: CompilationOptions,
     ) -> Self {
@@ -272,7 +275,7 @@ impl<'c> Session<'c> {
                 client,
                 target: OnceLock::new(),
                 cache,
-                eager_dispatch_cache: SpecializationCache::new(EAGER_DISPATCH_CACHE_CAPACITY),
+                eager_dispatch_cache: SpecializationCache::new(eager_dispatch_cache_capacity),
                 default_compilation_options,
                 runtimes: RuntimeRegistry::new(client, extensions),
                 constants: Mutex::new(Vec::new()),
@@ -332,7 +335,7 @@ impl<'c> Session<'c> {
 
     /// Returns the compilation cache that all handles of this session share.
     #[inline]
-    pub fn compilation_context(&self) -> &CompilationContext<'c, Self> {
+    pub fn compilation_cache(&self) -> &CompilationCache<'c, Self> {
         &self.state.cache
     }
 
@@ -365,7 +368,7 @@ impl<'c> Session<'c> {
     /// Returns the number of compiled programs currently cached in the in-memory tier.
     #[inline]
     pub fn program_count(&self) -> usize {
-        self.compilation_context().program_count()
+        self.compilation_cache().program_count()
     }
 
     /// Returns a snapshot of the activity of this session's eager dispatch cache, which maps eager operation
@@ -383,7 +386,7 @@ impl<'c> Session<'c> {
     /// operations that already ran. XLA itself reads the variable when it initializes its debug options.
     #[inline]
     pub fn clear_cache(&self) {
-        self.compilation_context().clear_cache();
+        self.compilation_cache().clear_cache();
         self.state.eager_dispatch_cache.clear();
     }
 
@@ -865,7 +868,7 @@ impl<'c> Session<'c> {
             .lower_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let program = self
-            .compilation_context()
+            .compilation_cache()
             .compile(self, &lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         Ok(EagerDispatchProgram { program, session_constants: Arc::clone(lowered.session_constants()), outputs })
@@ -1181,10 +1184,13 @@ pub struct SessionBuilder<'c> {
     client_options: Option<ClientOptions>,
 
     /// Compilation cache of the session, before [`Self::disk_cache`] is applied to it.
-    compilation_context: CompilationContext<'c, Session<'c>>,
+    compilation_cache: CompilationCache<'c, Session<'c>>,
 
-    /// Persistent tier that replaces the one of [`Self::compilation_context`], if the caller requested one.
+    /// Persistent tier that replaces the one of [`Self::compilation_cache`], if the caller requested one.
     disk_cache: Option<DiskCacheSource>,
+
+    /// Maximum number of compiled operation applications that the eager dispatch cache of the session retains.
+    eager_dispatch_cache_capacity: usize,
 
     /// Runtime provider configuration of the session.
     runtime_extensions: RuntimeExtensions<'c>,
@@ -1226,16 +1232,16 @@ impl<'c> SessionBuilder<'c> {
     }
 
     /// Supplies the compilation cache of the session in place of the default one, which keeps up to its default
-    /// number of compiled programs in memory. Refer to [`CompilationContext`] for information on its tiers, its
+    /// number of compiled programs in memory. Refer to [`CompilationCache`] for information on its tiers, its
     /// artifact exchange, and its event reporting.
-    pub fn compilation_context(mut self, compilation_context: CompilationContext<'c, Session<'c>>) -> Self {
-        self.compilation_context = compilation_context;
+    pub fn compilation_cache(mut self, compilation_cache: CompilationCache<'c, Session<'c>>) -> Self {
+        self.compilation_cache = compilation_cache;
         self
     }
 
     /// Makes the compilation cache of the session also write through to `disk_cache`, with its size cap and write
     /// thresholds, so that later processes restart warm. This replaces the disk cache of a context that was supplied
-    /// through [`Self::compilation_context`].
+    /// through [`Self::compilation_cache`].
     pub fn disk_cache(mut self, disk_cache: DiskCache) -> Self {
         self.disk_cache = Some(DiskCacheSource::Explicit(disk_cache));
         self
@@ -1246,6 +1252,17 @@ impl<'c> SessionBuilder<'c> {
     /// it is otherwise configured. The variable is read when the session is built.
     pub fn disk_cache_from_env(mut self) -> Self {
         self.disk_cache = Some(DiskCacheSource::Environment);
+        self
+    }
+
+    /// Sets the maximum number of compiled operation applications that the eager dispatch cache of the session
+    /// retains, in place of its default of 4096. This cache maps eager operation applications directly to their
+    /// compiled programs, in front of the compilation cache, whose own capacity is that of the session's
+    /// [`CompilationCache`] (i.e., [`CompilationCache::with_capacity`], with a default of 8192). The two caches
+    /// are bounded independently, like the corresponding caches of JAX, and a program stays alive for as long as
+    /// either cache retains it.
+    pub fn eager_dispatch_cache_capacity(mut self, capacity: usize) -> Self {
+        self.eager_dispatch_cache_capacity = capacity;
         self
     }
 
@@ -1298,12 +1315,18 @@ impl<'c> SessionBuilder<'c> {
                 .into());
             }
         };
-        let compilation_context = match self.disk_cache {
-            None => self.compilation_context,
-            Some(DiskCacheSource::Explicit(disk_cache)) => self.compilation_context.with_disk_cache(disk_cache),
-            Some(DiskCacheSource::Environment) => self.compilation_context.with_disk_cache_from_env()?,
+        let compilation_cache = match self.disk_cache {
+            None => self.compilation_cache,
+            Some(DiskCacheSource::Explicit(disk_cache)) => self.compilation_cache.with_disk_cache(disk_cache),
+            Some(DiskCacheSource::Environment) => self.compilation_cache.with_disk_cache_from_env()?,
         };
-        Ok(Session::from_parts(client, compilation_context, self.runtime_extensions, self.default_compilation_options))
+        Ok(Session::from_parts(
+            client,
+            compilation_cache,
+            self.eager_dispatch_cache_capacity,
+            self.runtime_extensions,
+            self.default_compilation_options,
+        ))
     }
 }
 
@@ -1456,9 +1479,9 @@ struct SessionState<'c> {
     /// session, including a failed read.
     target: OnceLock<Result<Target, Error>>,
 
-    /// Compilation cache of the session, which [`Session::compilation_context`] exposes. Cached artifacts contain no
+    /// Compilation cache of the session, which [`Session::compilation_cache`] exposes. Cached artifacts contain no
     /// runtime execution association.
-    cache: CompilationContext<'c, Session<'c>>,
+    cache: CompilationCache<'c, Session<'c>>,
 
     /// Compiled programs of eager operation applications, keyed ahead of program construction and lowering. Refer to
     /// the documentation of [`EagerDispatchKey`] for information on what the key captures.
@@ -1842,7 +1865,7 @@ pub(crate) mod tests {
         let session: Session<'static> = Session::builder().build().unwrap();
         assert!(std::ptr::eq(session.client(), Session::new().unwrap().client()));
         assert_eq!(session.default_compilation_options(), &CompilationOptions::default());
-        assert!(session.compilation_context().disk_cache().is_none());
+        assert!(session.compilation_cache().disk_cache().is_none());
         assert_eq!(session.program_count(), 0);
         assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
     }
@@ -1927,12 +1950,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_compilation_context() {
+    fn test_session_compilation_cache() {
         let client = execution_client();
         let session = session_with_client(&client);
-        assert!(std::ptr::eq(session.clone().compilation_context(), session.compilation_context()));
-        assert!(std::ptr::eq(session.fork_effect_scope().compilation_context(), session.compilation_context()));
-        assert!(!std::ptr::eq(session_with_client(&client).compilation_context(), session.compilation_context()));
+        assert!(std::ptr::eq(session.clone().compilation_cache(), session.compilation_cache()));
+        assert!(std::ptr::eq(session.fork_effect_scope().compilation_cache(), session.compilation_cache()));
+        assert!(!std::ptr::eq(session_with_client(&client).compilation_cache(), session.compilation_cache()));
     }
 
     #[test]
@@ -2727,7 +2750,7 @@ pub(crate) mod tests {
 
         // The hit never reached the compilation cache, so it skipped program construction, lowering, and key
         // construction.
-        let compilation_statistics = session.compilation_context().statistics();
+        let compilation_statistics = session.compilation_cache().statistics();
         assert_eq!((compilation_statistics.misses, compilation_statistics.memory_hits), (1, 0));
         assert_eq!(compilation_statistics.compilations, 1);
     }
@@ -2841,7 +2864,7 @@ pub(crate) mod tests {
         let outputs = session.bind(Operation::Condition(ConditionOperation::new()), branches, &inputs).unwrap();
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![0.0, 0.0]);
         assert_eq!(session.eager_dispatch_statistics().misses, 2);
-        assert_eq!(session.compilation_context().statistics().compilations, 2);
+        assert_eq!(session.compilation_cache().statistics().compilations, 2);
     }
 
     #[test]
@@ -3753,18 +3776,15 @@ pub(crate) mod tests {
         let session = session_with_client(&client);
 
         // Arrays constructed independently of each other in one session dispatch through their own recovered sessions,
-        // which share that session's compilation context so that the same eager operation compiles exactly once.
+        // which share that session's compilation cache so that the same eager operation compiles exactly once.
         let first = f32_vector(&session, &mesh, &[1.0, 2.0]);
         let second = f32_vector(&session, &mesh, &[3.0, 4.0]);
         let first_sum = first.add(&first).unwrap();
         let second_sum = second.add(&second).unwrap();
         let first_domain = first_sum.domain();
         let second_domain = second_sum.domain();
-        assert!(std::ptr::eq(
-            first_domain.parent().compilation_context(),
-            second_domain.parent().compilation_context(),
-        ));
-        assert_eq!(first_domain.parent().compilation_context().statistics().compilations, 1);
+        assert!(std::ptr::eq(first_domain.parent().compilation_cache(), second_domain.parent().compilation_cache(),));
+        assert_eq!(first_domain.parent().compilation_cache().statistics().compilations, 1);
         assert_eq!(read_f32s(&client, &first_sum), vec![2.0, 4.0]);
         assert_eq!(read_f32s(&client, &second_sum), vec![6.0, 8.0]);
 
@@ -3842,7 +3862,7 @@ pub(crate) mod tests {
         let program = build_program();
         let options = Options::new(mesh.clone());
         let lowered = session.lower_program(&program, 0, &options).unwrap();
-        let compiled = session.compilation_context().compile(&session, &lowered).unwrap();
+        let compiled = session.compilation_cache().compile(&session, &lowered).unwrap();
         measure("step: build one-instruction program", &mut || {
             build_program();
         });
@@ -3853,7 +3873,7 @@ pub(crate) mod tests {
             session.compilation_key(&lowered).unwrap();
         });
         measure("step: cached compilation (hit)", &mut || {
-            session.compilation_context().compile(&session, &lowered).unwrap();
+            session.compilation_cache().compile(&session, &lowered).unwrap();
         });
         measure("step: execute", &mut || {
             session.execute_program(&compiled, vec![input.clone(), input.clone()]).unwrap();
@@ -4292,19 +4312,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_builder_compilation_context() {
+    fn test_session_builder_compilation_cache() {
         // The session compiles through the supplied context, whose in-memory tier here retains a single program.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = Session::builder()
             .client(&client)
-            .compilation_context(CompilationContext::with_capacity(1))
+            .compilation_cache(CompilationCache::with_capacity(1))
             .build()
             .unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0])).unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
         assert_eq!(session.program_count(), 1);
-        assert_eq!(session.compilation_context().statistics().compilations, 2);
+        assert_eq!(session.compilation_cache().statistics().compilations, 2);
     }
 
     #[test]
@@ -4317,19 +4337,19 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let expected_directory = DiskCache::open(directory.path()).unwrap().directory().to_path_buf();
-        assert_eq!(session.compilation_context().disk_cache().unwrap().directory(), expected_directory);
+        assert_eq!(session.compilation_cache().disk_cache().unwrap().directory(), expected_directory);
 
-        // An explicit disk cache replaces the one of a supplied compilation context, irrespective of their order.
+        // An explicit disk cache replaces the one of a supplied compilation cache, irrespective of their order.
         let context_directory = tempfile::tempdir().unwrap();
         let session = Session::builder()
             .client(&client)
             .disk_cache(DiskCache::open(directory.path()).unwrap())
-            .compilation_context(
-                CompilationContext::new().with_disk_cache(DiskCache::open(context_directory.path()).unwrap()),
+            .compilation_cache(
+                CompilationCache::new().with_disk_cache(DiskCache::open(context_directory.path()).unwrap()),
             )
             .build()
             .unwrap();
-        assert_eq!(session.compilation_context().disk_cache().unwrap().directory(), expected_directory);
+        assert_eq!(session.compilation_cache().disk_cache().unwrap().directory(), expected_directory);
     }
 
     #[test]
@@ -4339,9 +4359,21 @@ pub(crate) mod tests {
         let client = execution_client();
         let session = Session::builder().client(&client).disk_cache_from_env().build().unwrap();
         assert_eq!(
-            session.compilation_context().disk_cache().map(|disk_cache| disk_cache.directory().to_path_buf()),
+            session.compilation_cache().disk_cache().map(|disk_cache| disk_cache.directory().to_path_buf()),
             DiskCache::from_env().unwrap().map(|disk_cache| disk_cache.directory().to_path_buf()),
         );
+    }
+
+    #[test]
+    fn test_session_builder_eager_dispatch_cache_capacity() {
+        // The eager dispatch cache retains at most the configured number of applications, independently of the
+        // compilation cache, which keeps its own default capacity.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::builder().client(&client).eager_dispatch_cache_capacity(1).build().unwrap();
+        Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0])).unwrap();
+        Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
+        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 2));
     }
 
     #[test]

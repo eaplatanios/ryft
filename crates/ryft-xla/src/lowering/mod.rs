@@ -153,13 +153,6 @@ pub(crate) struct LoweredModule {
 }
 
 impl LoweredModule {
-    /// Returns the textual StableHLO/Shardy module.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn stable_hlo(&self) -> &str {
-        &self.stable_hlo
-    }
-
     /// Returns the rendered StableHLO module of this lowering, consuming it.
     #[inline]
     pub(crate) fn into_stable_hlo(self) -> String {
@@ -171,20 +164,6 @@ impl LoweredModule {
     #[inline]
     pub(crate) fn signature(&self) -> &ExecutableSignature {
         &self.signature
-    }
-
-    /// Returns whether execution requires the host runtime assertion handler.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn requires_assertion_handler(&self) -> bool {
-        self.requires_assertion_handler
-    }
-
-    /// Returns the canonical runtime contracts required by emitted calls and synthesized checks.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn runtime_requirements(&self) -> &[RuntimeRequirement] {
-        &self.runtime_requirements
     }
 
     /// Returns the module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the
@@ -233,13 +212,6 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
     #[inline]
     pub(crate) fn ordered_assertion(&self) -> Option<ValueRef<'b, 'c, 't>> {
         self.ordered_assertion
-    }
-
-    /// Returns the current ordered I/O token, created lazily by the first ordered I/O operation in this scope.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn ordered_io(&self) -> Option<ValueRef<'b, 'c, 't>> {
-        self.ordered_io
     }
 
     /// Replaces the current token for one ordered effect class.
@@ -1026,13 +998,6 @@ impl CollectiveLoweringState {
     /// [`Provenance`].
     pub(crate) fn has_provenance(&self) -> bool {
         self.has_provenance.get()
-    }
-
-    /// Returns the module-scoped counter producing the next collective channel id.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn channel_ids(&self) -> &Rc<Cell<usize>> {
-        &self.channel_ids
     }
 
     /// Returns the axes bound by every enclosing manual region, excluded from shard-local placement constraints.

@@ -1119,7 +1119,7 @@ struct StagedSpecializationKey<Static, Structure, T> {
 /// structurally from those field types. Recursive dispatch on one thread of the specialization currently being produced
 /// is rejected with an error. Concurrent cold misses for one specialization on different threads instead deliberately
 /// duplicate the frontend work, because staging and lowering are cheap and inserts are idempotent, while the shared
-/// [`CompilationContext`](crate::CompilationContext) of the domain still coordinates the expensive backend compilation.
+/// [`CompilationCache`](crate::CompilationCache) of the domain still coordinates the expensive backend compilation.
 ///
 /// # Retained JIT Lifecycle
 ///
@@ -1145,7 +1145,7 @@ struct StagedSpecializationKey<Static, Structure, T> {
 ///     ┌┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘      │ lower            ▲
 ///     ▼ `call` in an active context              ▼                  │ restore or compile
 /// ┌────────────────────────────┐       ┌────────────────────┐   ┌───┴─────────────────────────┐
-/// │ Nested Call Operation      │       │ `LoweredFunction`  ├──▶│ Shared `CompilationContext` │
+/// │ Nested Call Operation      │       │ `LoweredFunction`  ├──▶│ Shared `CompilationCache`   │
 /// └────────────────────────────┘       └────────────────────┘   └─────────────────────────────┘
 /// ```
 ///
@@ -1939,7 +1939,7 @@ impl<Output, Error> StatefulExecution<Output, Error> {
 /// exceed elapsed wall-clock time. Backend compilation time is not included, because a compilation request may be
 /// served by a compilation cache. Refer to
 /// [`CompilationCacheStatistics::compilation_duration`](crate::CompilationCacheStatistics::compilation_duration)
-/// for the backend compilation activity of a shared [`CompilationContext`](crate::CompilationContext).
+/// for the backend compilation activity of a shared [`CompilationCache`](crate::CompilationCache).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DispatcherStatistics {
     /// Executions served by a retained executable specialization.
@@ -3470,7 +3470,7 @@ mod tests {
         });
 
         // Cross-thread same-key cold misses deliberately race and may duplicate frontend production; both inserts are
-        // idempotent and exactly one retained entry remains, while the shared compilation context deduplicates the
+        // idempotent and exactly one retained entry remains, while the shared compilation cache deduplicates the
         // backend compilation itself.
         assert_eq!(function.executable_specialization_count(), 1);
         let statistics = function.statistics();

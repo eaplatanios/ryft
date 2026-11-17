@@ -318,7 +318,7 @@ pub(in crate::lowering) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{AddOperation, ArrayType, DataType, MulOperation, Placeholder, PrintOperation};
     use ryft_mlir::dialects::func;
-    use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, TypeAndAttributes, Value as MlirValue};
+    use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, Type, TypeAndAttributes, Value as MlirValue};
 
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::lowering::types::{lower_literal_value, lower_tensor_type};
