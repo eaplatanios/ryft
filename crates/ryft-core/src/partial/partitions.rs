@@ -1559,7 +1559,7 @@ mod tests {
 
     /// Operation family of the [`MalformedSplitOperation`] tests.
     #[derive(Clone, Debug, Operation)]
-    #[ryft(type(ArrayType), constant(Array))]
+    #[ryft(type(ArrayType), constant(Array), dispatch(partial_evaluation))]
     enum MalformedSplitFamily {
         MalformedSplit(MalformedSplitOperation),
         Guard(GuardOperation<ArrayType>),
@@ -3389,7 +3389,7 @@ mod tests {
 
         /// Operation family that exposes a split hook behind the shared safety boundary.
         #[derive(Clone, Debug, Operation)]
-        #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>))]
+        #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), dispatch(partial_evaluation))]
         enum GuardedSplitFamily {
             Guarded(GuardedSplitOperation),
             Guard(GuardOperation<ArrayIrType>),

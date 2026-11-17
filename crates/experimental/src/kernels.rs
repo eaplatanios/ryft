@@ -651,8 +651,11 @@ fn test_double_in_place() {
 fn test_keep_weighted() {
     let values = (0..256).map(|index| index as f32 + 1.0).collect::<Vec<_>>();
     let weights = (0..256).map(|index| (index % 3) as f32 - 1.0).collect::<Vec<_>>();
-    let expected =
-        values.iter().zip(&weights).map(|(value, weight)| if *weight > 0.0 { *value } else { 0.0 }).collect::<Vec<_>>();
+    let expected = values
+        .iter()
+        .zip(&weights)
+        .map(|(value, weight)| if *weight > 0.0 { *value } else { 0.0 })
+        .collect::<Vec<_>>();
     assert_eq!(
         keep_weighted(&Array::vector(values).unwrap(), &Array::vector(weights).unwrap()),
         Ok(Array::vector(expected).unwrap()),
@@ -2937,11 +2940,9 @@ mod adapters {
     fn test_adapter_admission() {
         // Verification requires every prefetched scalar to be specialized into a constant first, so no adapter
         // receives a runtime prefetch, and `definitions` specializes `gather_block` to the block index 2.
-        let definition = gather_block::definition(
-            &ArrayType::new_static(DataType::F32, [512]),
-            &ArrayType::scalar(DataType::I32),
-        )
-        .unwrap();
+        let definition =
+            gather_block::definition(&ArrayType::new_static(DataType::F32, [512]), &ArrayType::scalar(DataType::I32))
+                .unwrap();
         assert!(matches!(
             VerifiedKernel::new(&definition, 1024),
             Err(KernelInitializationError::UnsupportedLaunch { boundary: "unspecialized scalar prefetch" }),
@@ -2968,17 +2969,15 @@ mod adapters {
             )
         };
         // Triton orders no global memory access across the threads of one program without a CTA barrier, which
-        // ryft-mlir does not expose, so it rejects every read that follows a write of the same parameter.
-        let read_after_write = triton_unsupported(
-            "kernel_call",
-            "reads after writes of one parameter need a CTA barrier, which ryft-mlir does not expose",
-        );
+        // ryft-mlir does not expose. It therefore keeps the carried output blocks of the blocked products in SSA
+        // values that it stores once, and it rejects the old values of the swap of `extract_negatives` because they
+        // are read from a read-write parameter and reach the store of another one.
         let expected = vec![
             ("vector_add", [lowers(), lowers(), lowers()]),
             ("sum", [lowers(), lowers(), lowers()]),
             ("matmul", [lowers(), lowers(), lowers()]),
-            ("blocked_matmul", [lowers(), read_after_write.clone(), lowers()]),
-            ("masked_blocked_matmul", [lowers(), read_after_write, lowers()]),
+            ("blocked_matmul", [lowers(), lowers(), lowers()]),
+            ("masked_blocked_matmul", [lowers(), lowers(), lowers()]),
             ("sum_and_difference", [lowers(), lowers(), lowers()]),
             ("add_in_place", [lowers(), lowers(), lowers()]),
             ("relu_in_place", [lowers(), lowers(), lowers()]),
@@ -2989,8 +2988,9 @@ mod adapters {
                 [
                     lowers(),
                     triton_unsupported(
-                        "masked_swap",
-                        "swaps whose old value is used need a CTA barrier, which ryft-mlir does not expose",
+                        "reference_write",
+                        "values read from a read-write parameter may reach memory only elementwise through its own \
+                         write",
                     ),
                     lowers(),
                 ],
@@ -3011,10 +3011,7 @@ mod adapters {
                     cutile_unsupported("scratch", "operation is outside the portable cuTile subset"),
                 ],
             ),
-            (
-                "gather_block",
-                [lowers(), triton_unsupported("constant", "unsupported constant element type"), lowers()],
-            ),
+            ("gather_block", [lowers(), triton_unsupported("constant", "unsupported constant element type"), lowers()]),
             ("reverse_blocks", [lowers(), lowers(), lowers()]),
             (
                 "parallel_sum",

@@ -1,22 +1,58 @@
 //! Typed TTIR construction from the verified portable kernel arena.
 //!
-//! Every parameter is a global F32 pointer, and each access of a window loads or stores a pointer tensor under the
-//! validity mask of that window, which excludes its physical tile padding, its elements beyond the enclosing window,
-//! and its elements beyond the array. Reference reads and [`TileLoadOperation`](ryft_kernels::TileLoadOperation)
-//! lower to `tt.load` with that mask and an explicit `other` value, and reference writes lower to `tt.store` with that
-//! mask. [`MaskedLoadOperation`](ryft_kernels::MaskedLoadOperation) and
-//! [`MaskedStoreOperation`](ryft_kernels::MaskedStoreOperation) intersect that mask with their explicit mask, so they
-//! never touch padding, and a masked load takes the corresponding element of its `other` input for every element
+//! Every parameter is a global F32 pointer, and each access of a window in global memory loads or stores a pointer
+//! tensor under the validity mask of that window, which excludes its physical tile padding, its elements beyond the
+//! enclosing window, and its elements beyond the array. Reference reads and
+//! [`TileLoadOperation`](ryft_kernels::TileLoadOperation) lower to `tt.load` with that mask and an explicit `other`
+//! value, and reference writes lower to `tt.store` with that mask.
+//! [`MaskedLoadOperation`](ryft_kernels::MaskedLoadOperation) and
+//! [`MaskedStoreOperation`](ryft_kernels::MaskedStoreOperation) intersect that mask with their explicit mask, so
+//! they never touch padding, and a masked load takes the corresponding element of its `other` input for every element
 //! outside that intersection. A [`WindowMaskOperation`](ryft_kernels::WindowMaskOperation) returns the validity mask
 //! itself, which is false on the physical padding. A [`MaskedSwapOperation`](ryft_kernels::MaskedSwapOperation) or a
-//! reference swap lowers only when its old value is dead (i.e., when it is a
+//! reference swap of a window in global memory lowers only when its old value is dead (i.e., when it is a
 //! [`KernelSwapLowering::Store`](ryft_kernels::KernelSwapLowering::Store)), as a store. A reference add update loads
 //! its window under the validity mask, adds the update, and stores the sum through the same pointers under the same
 //! mask. A reference atomic add update is one masked `tt.atomic_rmw fadd` with `acq_rel` semantics at `gpu` scope,
 //! and a scalar update of either is broadcast to the window.
 //!
 //! Sequential grid axes become `scf.for` loops inside each program, nested in declared axis order, so every program
-//! visits its steps in the lexicographic order of the grid. The launch grid covers only the parallel axes.
+//! visits its steps in the lexicographic order of the grid. The launch grid covers only the parallel axes. Bounded
+//! `while` loops become `scf.while` loops and conditions become `scf.if` operations.
+//!
+//! # Promoted Windows
+//!
+//! Some windows of mutable parameters live in SSA values instead of global memory, like the accumulator tile of a
+//! hand-written Triton kernel. Admission promotes a window when accessing it through global memory would need ordering
+//! that Triton does not provide (refer to the next section) and every access of it uses its whole window (i.e., it is
+//! a reference read, write, swap, or add update, or a masked load, store, or swap, without reference transforms). The
+//! SSA value is one tile of the physical window shape that holds the current contents of the window, and every access
+//! becomes a pure operation on it:
+//!
+//!   - A write replaces the value, and an add update adds the update to it.
+//!   - A masked store selects the stored value where its mask and the window validity both hold, and it keeps the
+//!     current value elsewhere.
+//!   - A read returns the value, and a masked load selects the value under the same intersection and its `other`
+//!     input elsewhere. A window mask is the validity mask, as for windows in global memory.
+//!   - A swap returns the previous value, which a masked swap selects like a masked load, and then acts like the
+//!     corresponding store.
+//!
+//! A read returns padding and invalid elements unmasked, which is unobservable, because the verifier rejects unmasked
+//! reads of invalid elements and the lowering never lets physical padding reach memory, reductions, or dots.
+//!
+//! The scope of the value begins at the grid axis that follows the last sequential axis that the window tiles, so every
+//! later sequential axis leaves the window unchanged. A window that a sequential axis tiles inside the loop of an axis
+//! along which it repeats changes inside that loop and is not promoted. At the beginning of its scope, a read-write
+//! window is loaded once under its validity mask, and a write-only window starts from zeros. No read observes those
+//! zeros, because the verifier proves that every read follows a definite write (including through the first step rule
+//! of a carry axis), and they equal the zeroed storage that the host interpreter gives write-only parameters. Every
+//! `scf.for` loop, `while` loop, and condition inside the scope carries the value. The loops carry it after their
+//! ordinary carries and before the iteration counter of a `while` loop, the bounded condition of a `while` loop yields
+//! it next to its predicate, and both branches of a condition yield it after their ordinary outputs. The scope ends
+//! with one store of the value under the validity mask, so no padding element and no element beyond the array is ever
+//! stored, and the verifier proves that a write-only window is completely written whenever its scope ends. When a grid
+//! extent is zero, admission promotes nothing (refer to the next section), so the initial zeros of a write-only window
+//! can never be stored.
 //!
 //! # Memory Ordering
 //!
@@ -36,36 +72,55 @@
 //! pipeline stages, it issues the loads that feed a dot in an innermost `scf.for` one iteration early, without any
 //! alias analysis against the stores of the loop, and it never pipelines `scf.while`.
 //!
-//! Admission therefore rejects every body whose correctness would depend on such ordering:
+//! Admission therefore admits only bodies whose correctness does not depend on such ordering, promoting windows where
+//! that removes the dependence:
 //!
-//!   - A write-only parameter is never read. Unless its window is a scalar, which only the first thread of a program
-//!     ever stores, it is written by at most one access of the entry region, outside control flow.
-//!   - A read-write parameter is accessed only by the entry region and only through its whole window, all of its
-//!     reads precede its only write, and every value read from it reaches memory only through elementwise operations
-//!     into that write. The thread that writes an element then computes it from a load of the same element, whose
-//!     value the store depends on (in its own program order or through a layout conversion), so that load cannot
-//!     observe the store, and every other load of that element feeds no memory. A swap whose old value is used fails
-//!     this test because another thread may load that value after the swap stores over it.
-//!   - A parameter that is accumulated atomically has no other access. Atomic updates are atomic among themselves in
-//!     every order, and the interpreter admits every order of floating-point accumulation.
-//!   - Every other mutable window changes at every step of each sequential axis with more than one step (i.e., its
-//!     mapping tiles that axis), so no step of a program touches memory that another step writes and no load in a
-//!     sequential loop reads memory that the loop writes.
+//!   - A write-only window stays in global memory when it is never read and, unless it is a scalar, which only the
+//!     first thread of a program ever stores, it is written by at most one access of the entry region, outside control
+//!     flow. A read-write window stays in global memory when it is accessed only by the entry region, all of its reads
+//!     precede its only write, and no swap uses its old value. Every such window that is not a scalar changes at every
+//!     step of each sequential axis with more than one step (i.e., its mapping tiles that axis).
+//!   - Every other mutable window that is not accumulated atomically is promoted. A window that cannot be promoted
+//!     (i.e., one with a partial access, or one that a sequential axis tiles inside the loop of an axis along which it
+//!     repeats) is rejected with the reason why global memory would need ordering.
+//!   - A promoted write-only window is never loaded, so nothing can observe its store out of order, and one thread
+//!     stores each of its elements once per scope. The scopes of one program store distinct windows, because the axes
+//!     outside a scope tile the window and the verifier proves that the windows of parallel programs are disjoint.
+//!     The old value of a swap of such a window is an SSA value, so it may flow anywhere.
+//!   - A read-write parameter, in global memory or promoted, is accessed only through its whole window, and every
+//!     value read from it reaches memory only through elementwise operations into a write of that parameter. The
+//!     values read from it include the old values of its swaps, and they may neither enter nor leave a region, which
+//!     also keeps them out of every predicate. The thread that stores an element then computes it from a load of the
+//!     same element, whose value the store depends on (in its own program order or through a layout conversion), so
+//!     that load cannot observe the store, and every other load of that element feeds no memory. For a promoted
+//!     window, that load is its entry load, that store is its exit store, and every update of the SSA value between
+//!     them is elementwise, so the argument is unchanged. A swap whose old value flows anywhere else fails this test,
+//!     because another thread may load that value after the store overwrites it.
+//!   - A parameter that is accumulated atomically has no other access and is never promoted. Atomic updates are atomic
+//!     among themselves in every order, and the interpreter admits every order of floating-point accumulation.
+//!   - No load in a sequential loop reads memory that another iteration of that loop stores. A window in global memory
+//!     changes at every step, and a promoted window is loaded and stored only outside the loops of the axes along which
+//!     it repeats and at a different window for every step of the axes that tile it. Pipelining a load into an earlier
+//!     iteration therefore never moves it past a store of the same memory. Within one step, the entry load of a
+//!     promoted read-write window precedes its exit store as the previous rule requires.
 //!
 //! Parallel programs need no ordering, because the verifier proves that their mutable windows are disjoint or only
-//! accumulated atomically.
+//! accumulated atomically. A grid with a zero extent runs the body at no grid point, and the single program that its
+//! launch still runs masks every access by its inactive grid point, so admission applies no ordering rule to it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayType, Atom, AtomId, ComparisonDirection, DataType, Dimension,
     DimensionOperation, DimensionValue, DotDimensionNumbers, InstructionId, Layout, Memory, Operation as CoreOperation,
-    ReductionKind, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot, RegionRef, Typed,
+    ReductionKind, ReferenceAccess, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot, RegionRef, Typed,
     validated_reference_access_descriptors,
 };
 use ryft_kernels::{
-    GridExecution, KernelOperation, KernelParameterAccess, KernelSchedule, KernelSwapLowering, VerifiedKernel,
+    ASYNC_COPY_OPERATION_NAME, GridExecution, KernelCallOperation, KernelOperation, KernelParameter,
+    KernelParameterAccess, KernelReferenceSummary, KernelSchedule, KernelSwapLowering, TILE_LOAD_OPERATION_NAME,
+    VerifiedKernel,
 };
 use ryft_mlir::dialects::{arith, scf, triton::tt};
 use ryft_mlir::{
@@ -143,6 +198,28 @@ impl<'c, 't> LoweringValue<'c, 't> {
     }
 }
 
+/// Whole window of a mutable parameter that the lowering keeps in an SSA value instead of global memory, which the
+/// module documentation describes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Promotion {
+    /// Position of the promoted parameter.
+    parameter: usize,
+
+    /// Grid axis at which the scope of the SSA value begins. Every sequential axis from this one onward leaves the
+    /// window unchanged, so the window is loaded or initialized before the loops of those axes and stored after them.
+    axis: usize,
+}
+
+/// Current SSA value of the window of a promoted parameter.
+#[derive(Copy, Clone)]
+struct PromotedWindow<'c, 't> {
+    /// Global scalar pointer of the parameter, which identifies the references to its window.
+    pointer: Native<'c, 't>,
+
+    /// Value of the whole physical window at the current point of construction.
+    value: Native<'c, 't>,
+}
+
 /// Bounded construction state; it owns no runtime buffers or compiler resources.
 struct Lowering<'c, 't> {
     /// Context owning the complete generated module.
@@ -156,6 +233,12 @@ struct Lowering<'c, 't> {
 
     /// Maximum physical elements in one tile.
     maximum_tile_elements: usize,
+
+    /// Promoted windows that [`validate_memory_ordering`] admitted.
+    promotions: Vec<Promotion>,
+
+    /// Promoted windows whose scope encloses the current point of construction, in the order in which they started.
+    windows: Vec<PromotedWindow<'c, 't>>,
 }
 
 /// Admits and constructs a complete native module without invoking a target compiler.
@@ -166,7 +249,7 @@ pub(super) fn lower<'c, 't>(
     _schedule: &KernelSchedule,
 ) -> Result<Lowered<'c, 't>, Error> {
     let call = kernel.definition().operation();
-    validate_memory_ordering(kernel)?;
+    let promotions = validate_memory_ordering(kernel)?;
     if !call.prefetch_types().is_empty() {
         return Err(unsupported("kernel_call", "scalar prefetch must be specialized before Triton compilation"));
     }
@@ -180,6 +263,8 @@ pub(super) fn lower<'c, 't>(
         location,
         remaining: options.maximum_instructions(),
         maximum_tile_elements: options.maximum_tile_elements(),
+        promotions,
+        windows: Vec::new(),
     };
     lowering.charge(call.parameters().len() + call.grid().dimensions().len())?;
     let mut parameter_types = Vec::new();
@@ -744,7 +829,9 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 
     /// Nests the sequential grid axes from `axis` onward as `scf.for` loops in declared axis order, and lowers the body
-    /// once at the innermost step over windows evaluated at `coordinates`. Parallel coordinates are already bound.
+    /// once at the innermost step over windows evaluated at `coordinates`. Parallel coordinates are already bound. The
+    /// promoted windows whose scope begins at `axis` start before those loops and are stored after them, and every
+    /// loop carries the values of all promoted windows whose scope encloses it.
     fn grid(
         &mut self,
         block: &mut DetachedBlock<'c, 't>,
@@ -755,45 +842,152 @@ impl<'c, 't> Lowering<'c, 't> {
         axis: usize,
     ) -> Result<(), Error> {
         let call = kernel.definition().operation();
+        let opened = self.open_windows(block, call, pointers, coordinates, active, axis)?;
         if let Some(dimension) = call.grid().dimensions().get(axis) {
             if dimension.execution() == GridExecution::Parallel {
-                return self.grid(block, kernel, pointers, coordinates, active, axis + 1);
+                self.grid(block, kernel, pointers, coordinates, active, axis + 1)?;
+            } else {
+                let Dimension::Static(extent) = dimension.extent() else { unreachable!() };
+                let lower = self.integer(block, 0)?;
+                let upper = self.integer(block, *extent as i64)?;
+                let step = self.integer(block, 1)?;
+                let carried = self.windows.iter().map(|window| window.value).collect::<Vec<_>>();
+                let mut arguments = vec![(self.context.signless_integer_type(64).as_ref(), self.location)];
+                for value in &carried {
+                    arguments.push((value.r#type()?, self.location));
+                }
+                let mut body = self.context.block(&arguments);
+                coordinates[axis] = body.argument(0)?.as_ref();
+                for (index, window) in self.windows.iter_mut().enumerate() {
+                    window.value = body.argument(index + 1)?.as_ref();
+                }
+                self.grid(&mut body, kernel, pointers, coordinates, active, axis + 1)?;
+                let yielded = self.windows.iter().map(|window| window.value).collect::<Vec<_>>();
+                body.append_operation(scf::r#yield(&yielded, self.location)?)?;
+                let operation = block.append_operation(scf::r#for(
+                    lower,
+                    upper,
+                    step,
+                    &carried,
+                    false,
+                    body.try_into()?,
+                    self.location,
+                )?)?;
+                for (index, window) in self.windows.iter_mut().enumerate() {
+                    window.value = operation.result(index)?.as_ref();
+                }
             }
-            let Dimension::Static(extent) = dimension.extent() else { unreachable!() };
-            let lower = self.integer(block, 0)?;
-            let upper = self.integer(block, *extent as i64)?;
-            let step = self.integer(block, 1)?;
-            let mut body = self.context.block(&[(self.context.signless_integer_type(64).as_ref(), self.location)]);
-            coordinates[axis] = body.argument(0)?.as_ref();
-            self.grid(&mut body, kernel, pointers, coordinates, active, axis + 1)?;
-            body.append_operation(scf::r#yield(&[], self.location)?)?;
-            block.append_operation(scf::r#for(lower, upper, step, &[], false, body.try_into()?, self.location)?)?;
-            return Ok(());
-        }
-        let mut inputs = Vec::new();
-        for (index, parameter) in call.parameters().iter().enumerate() {
-            let starts = self.mapping(block, parameter.mapping(), coordinates)?;
-            let tile = parameter.mapping().block_shape().to_vec();
-            let mut limits = Vec::new();
-            for (start, extent) in starts.iter().zip(&tile) {
-                let extent = self.integer(block, *extent as i64)?;
-                limits.push(append(block, arith::addi(*start, extent, self.location)?)?);
+        } else {
+            let mut inputs = Vec::new();
+            for (parameter, pointer) in call.parameters().iter().zip(pointers) {
+                inputs.push(LoweringValue::Reference(self.window(block, parameter, *pointer, coordinates, active)?));
             }
-            let allocation = shape(&parameter.r#type())?;
-            inputs.push(LoweringValue::Reference(Reference {
-                pointer: pointers[index],
-                axes: (0..tile.len()).collect(),
-                fixed: vec![None; allocation.len()],
-                allocation,
-                starts,
-                limits,
-                shape: tile,
-                valid: active,
-            }));
+            inputs.extend(coordinates.iter().copied().map(LoweringValue::Native));
+            self.region(block, kernel.definition().body().entry_region_ref(), &inputs)?;
         }
-        inputs.extend(coordinates.iter().copied().map(LoweringValue::Native));
-        self.region(block, kernel.definition().body().entry_region_ref(), &inputs)?;
+        // Each scope ends in the block where it began, after every scope that began inside it has ended.
+        let windows = self.windows.split_off(self.windows.len() - opened.len());
+        for (window, reference) in windows.iter().zip(&opened) {
+            self.write(block, reference, window.value, None)?;
+        }
         Ok(())
+    }
+
+    /// Starts the SSA values of the promoted windows whose scope begins at grid axis `axis` and returns their windows,
+    /// which [`Self::grid`] stores when the scope ends. Every sequential axis from `axis` onward leaves these windows
+    /// unchanged, so they are evaluated with the coordinates of those axes, which are not bound yet, set to zero. A
+    /// read-write window starts from one load of its contents. A write-only window starts from zeros, which no read
+    /// observes because the verifier proves that every read follows a definite write, and which equal the zeroed
+    /// storage that the host interpreter gives write-only parameters.
+    fn open_windows(
+        &mut self,
+        block: &mut DetachedBlock<'c, 't>,
+        call: &KernelCallOperation,
+        pointers: &[Native<'c, 't>],
+        coordinates: &[Native<'c, 't>],
+        active: Native<'c, 't>,
+        axis: usize,
+    ) -> Result<Vec<Reference<'c, 't>>, Error> {
+        let promoted = self
+            .promotions
+            .iter()
+            .filter(|promotion| promotion.axis == axis)
+            .map(|promotion| promotion.parameter)
+            .collect::<Vec<_>>();
+        if promoted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut coordinates = coordinates.to_vec();
+        let zero = self.integer(block, 0)?;
+        for (position, dimension) in call.grid().dimensions().iter().enumerate().skip(axis) {
+            if dimension.execution() != GridExecution::Parallel {
+                coordinates[position] = zero;
+            }
+        }
+        let mut opened = Vec::new();
+        for index in promoted {
+            let parameter = &call.parameters()[index];
+            let reference = self.window(block, parameter, pointers[index], &coordinates, active)?;
+            let zero = append(
+                block,
+                arith::constant(self.context.float_attribute(self.context.float32_type(), 0.0), self.location)?,
+            )?;
+            let zero = self.splat(block, zero, DataType::F32, &reference.shape)?;
+            let value = match parameter.access() {
+                KernelParameterAccess::ReadWrite => self.read(block, &reference, None, zero)?,
+                _ => zero,
+            };
+            self.windows.push(PromotedWindow { pointer: reference.pointer, value });
+            opened.push(reference);
+        }
+        Ok(opened)
+    }
+
+    /// Evaluates the window of `parameter` at the grid point `coordinates` as a global reference through `pointer`,
+    /// which is valid only where `active` holds.
+    fn window(
+        &mut self,
+        block: &mut DetachedBlock<'c, 't>,
+        parameter: &KernelParameter,
+        pointer: Native<'c, 't>,
+        coordinates: &[Native<'c, 't>],
+        active: Native<'c, 't>,
+    ) -> Result<Reference<'c, 't>, Error> {
+        let starts = self.mapping(block, parameter.mapping(), coordinates)?;
+        let tile = parameter.mapping().block_shape().to_vec();
+        let mut limits = Vec::new();
+        for (start, extent) in starts.iter().zip(&tile) {
+            let extent = self.integer(block, *extent as i64)?;
+            limits.push(append(block, arith::addi(*start, extent, self.location)?)?);
+        }
+        let allocation = shape(&parameter.r#type())?;
+        Ok(Reference {
+            pointer,
+            axes: (0..tile.len()).collect(),
+            fixed: vec![None; allocation.len()],
+            allocation,
+            starts,
+            limits,
+            shape: tile,
+            valid: active,
+        })
+    }
+
+    /// Returns the position in [`Self::windows`] of the promoted window that `reference` addresses, if any. Promoted
+    /// windows are accessed only through their whole window, so their references are never transformed.
+    fn promoted(&self, reference: &Reference<'c, 't>) -> Option<usize> {
+        self.windows.iter().position(|window| window.pointer == reference.pointer)
+    }
+
+    /// Restricts the Boolean tile `mask` to the valid elements of the global window `reference`.
+    fn valid(
+        &self,
+        block: &mut DetachedBlock<'c, 't>,
+        reference: &Reference<'c, 't>,
+        mask: Native<'c, 't>,
+    ) -> Result<Native<'c, 't>, Error> {
+        let (_, valid) = self.validity(block, reference)?;
+        append(block, arith::andi(valid, mask, self.location)?)
     }
 
     /// Replays canonical regions into typed SSA without changing portable operation semantics.
@@ -926,6 +1120,13 @@ impl<'c, 't> Lowering<'c, 't> {
                         )?,
                     )]
                 }
+                KernelOperation::Portable(ArrayIrOperation::ReferenceRead(_))
+                    if let Some(window) = self.promoted(inputs[0].reference()?) =>
+                {
+                    // The verifier rejects unmasked reads of invalid elements, and the physical padding never reaches
+                    // memory, so the whole value is the read.
+                    vec![LoweringValue::Native(self.windows[window].value)]
+                }
                 KernelOperation::Portable(ArrayIrOperation::ReferenceRead(_)) => {
                     let zero = append(
                         block,
@@ -936,10 +1137,26 @@ impl<'c, 't> Lowering<'c, 't> {
                     vec![LoweringValue::Native(self.read(block, reference, None, zero)?)]
                 }
                 KernelOperation::Portable(ArrayIrOperation::ReferenceWrite(_))
+                | KernelOperation::Portable(ArrayIrOperation::ReferenceSwap(_))
+                    if let Some(window) = self.promoted(inputs[0].reference()?) =>
+                {
+                    // A write has no outputs, so the previous value binds only the old value of a swap.
+                    vec![LoweringValue::Native(std::mem::replace(&mut self.windows[window].value, native(1)?))]
+                }
+                KernelOperation::Portable(ArrayIrOperation::ReferenceWrite(_))
                 | KernelOperation::Portable(ArrayIrOperation::ReferenceSwap(_)) => {
-                    // Admission rejects every swap whose old value is used, so a swap is a store whose dead old value
-                    // is never bound.
+                    // Admission promotes or rejects every window whose swap has a used old value, so a swap through
+                    // memory is a store whose dead old value is never bound.
                     self.write(block, inputs[0].reference()?, native(1)?, None)?;
+                    vec![]
+                }
+                KernelOperation::Portable(ArrayIrOperation::ReferenceAddUpdate(_))
+                    if let Some(window) = self.promoted(inputs[0].reference()?) =>
+                {
+                    let reference = inputs[0].reference()?;
+                    let update = self.update(block, operation.name(), reference, native(1)?, &input_types[1])?;
+                    let sum = append(block, arith::addf(self.windows[window].value, update, location)?)?;
+                    self.windows[window].value = sum;
                     vec![]
                 }
                 KernelOperation::Portable(ArrayIrOperation::ReferenceAddUpdate(_)) => {
@@ -983,27 +1200,112 @@ impl<'c, 't> Lowering<'c, 't> {
                     let other = self.splat(block, native(inputs.len() - 1)?, DataType::F32, &reference.shape)?;
                     vec![LoweringValue::Native(self.read(block, &reference, None, other)?)]
                 }
+                KernelOperation::MaskedLoad(_) if let Some(window) = self.promoted(inputs[0].reference()?) => {
+                    let mask = self.valid(block, inputs[0].reference()?, native(1)?)?;
+                    let value = self.windows[window].value;
+                    vec![LoweringValue::Native(append(block, arith::select(mask, value, native(2)?, location)?)?)]
+                }
                 KernelOperation::MaskedLoad(_) => {
-                    vec![LoweringValue::Native(self.read(block, inputs[0].reference()?, Some(native(1)?), native(2)?)?)]
+                    vec![LoweringValue::Native(self.read(
+                        block,
+                        inputs[0].reference()?,
+                        Some(native(1)?),
+                        native(2)?,
+                    )?)]
+                }
+                KernelOperation::MaskedStore(_) | KernelOperation::MaskedSwap(_)
+                    if let Some(window) = self.promoted(inputs[0].reference()?) =>
+                {
+                    // The old value of a masked swap takes `other` outside the mask, like a masked load.
+                    let mask = self.valid(block, inputs[0].reference()?, native(2)?)?;
+                    let previous = self.windows[window].value;
+                    let old = match instruction.operation() {
+                        KernelOperation::MaskedSwap(_) => vec![LoweringValue::Native(append(
+                            block,
+                            arith::select(mask, previous, native(3)?, location)?,
+                        )?)],
+                        _ => vec![],
+                    };
+                    self.windows[window].value = append(block, arith::select(mask, native(1)?, previous, location)?)?;
+                    old
                 }
                 KernelOperation::MaskedStore(_) => {
                     self.write(block, inputs[0].reference()?, native(1)?, Some(native(2)?))?;
                     vec![]
                 }
                 KernelOperation::MaskedSwap(_) => {
-                    // Admission rejects every swap whose old value is used, so this one is a masked store and its
-                    // dead old value is never bound.
+                    // Admission promotes or rejects every window whose swap has a used old value, so a masked swap
+                    // through memory is a masked store whose dead old value is never bound.
                     self.write(block, inputs[0].reference()?, native(1)?, Some(native(2)?))?;
                     vec![]
                 }
                 KernelOperation::WindowMask(_) => {
                     vec![LoweringValue::Native(self.validity(block, inputs[0].reference()?)?.1)]
                 }
+                KernelOperation::Portable(ArrayIrOperation::Condition(_)) => {
+                    // Both branches start from the values of the promoted windows before the condition and yield their
+                    // ordinary outputs followed by the values of those windows.
+                    let carried = self.windows.iter().map(|window| window.value).collect::<Vec<_>>();
+                    let mut branches = Vec::new();
+                    for slot in instruction.regions() {
+                        for (window, value) in self.windows.iter_mut().zip(&carried) {
+                            window.value = *value;
+                        }
+                        let mut branch = self.context.block_with_no_arguments();
+                        let outputs = self.region(&mut branch, region.with_id(*slot)?, &inputs[1..])?;
+                        let mut yielded = outputs
+                            .iter()
+                            .filter_map(|output| match output {
+                                LoweringValue::Native(value) => Some(*value),
+                                LoweringValue::Reference(_) => None,
+                            })
+                            .collect::<Vec<_>>();
+                        yielded.extend(self.windows.iter().map(|window| window.value));
+                        branch.append_operation(scf::r#yield(&yielded, location)?)?;
+                        branches.push((branch, outputs, yielded));
+                    }
+                    let (else_branch, else_outputs, _) = branches.pop().unwrap();
+                    let (then_branch, then_outputs, yielded) = branches.pop().unwrap();
+                    let types = yielded.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
+                    let operation = block.append_operation(scf::r#if(
+                        native(0)?,
+                        &types,
+                        then_branch.try_into()?,
+                        Some(else_branch.try_into()?),
+                        location,
+                    )?)?;
+                    let mut position = 0;
+                    let mut results = Vec::new();
+                    for (then_output, else_output) in then_outputs.iter().zip(&else_outputs) {
+                        match (then_output, else_output) {
+                            (LoweringValue::Native(_), LoweringValue::Native(_)) => {
+                                results.push(LoweringValue::Native(operation.result(position)?.as_ref()));
+                                position += 1;
+                            }
+                            (LoweringValue::Reference(left), LoweringValue::Reference(right)) if left == right => {
+                                results.push(then_output.clone());
+                            }
+                            _ => {
+                                return Err(unsupported(
+                                    "condition",
+                                    "branch reference outputs must denote the same window",
+                                ));
+                            }
+                        }
+                    }
+                    for window in &mut self.windows {
+                        window.value = operation.result(position)?.as_ref();
+                        position += 1;
+                    }
+                    results
+                }
                 KernelOperation::Portable(ArrayIrOperation::While(operation)) => {
                     let bound = operation
                         .iteration_bound()
                         .filter(|bound| *bound <= i64::MAX as usize)
                         .ok_or_else(|| unsupported("while", "requires a finite signed 64-bit iteration bound"))?;
+                    // The loop carries its ordinary inputs, then the values of the promoted windows, and then its
+                    // iteration counter.
                     let mut initial = inputs
                         .iter()
                         .filter_map(|input| match input {
@@ -1011,11 +1313,16 @@ impl<'c, 't> Lowering<'c, 't> {
                             _ => None,
                         })
                         .collect::<Vec<_>>();
+                    let count = initial.len();
+                    initial.extend(self.windows.iter().map(|window| window.value));
                     initial.push(self.integer(block, 0)?);
                     let types = initial.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
                     let arguments = types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
                     let mut before = self.context.block(&arguments);
                     let before_values = carried_values(&before, &inputs)?;
+                    let entering = (count..types.len() - 1)
+                        .map(|index| before.argument(index).map(|value| value.as_ref()))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let counter = before.argument(types.len() - 1)?.as_ref();
                     let limit = self.integer(&mut before, bound as i64)?;
                     let within = append(
@@ -1024,29 +1331,41 @@ impl<'c, 't> Lowering<'c, 't> {
                     )?;
                     // The semantic bound is checked before the condition, including reference writes or assertions
                     // in that condition. A Boolean conjunction would evaluate the condition once too often.
+                    for (window, value) in self.windows.iter_mut().zip(&entering) {
+                        window.value = *value;
+                    }
                     let mut condition = self.context.block_with_no_arguments();
                     let predicate =
                         self.region(&mut condition, region.with_id(instruction.regions()[0])?, &before_values)?;
-                    condition.append_operation(scf::r#yield(&[predicate[0].native()?], location)?)?;
+                    let mut yielded = vec![predicate[0].native()?];
+                    yielded.extend(self.windows.iter().map(|window| window.value));
+                    condition.append_operation(scf::r#yield(&yielded, location)?)?;
                     let mut exhausted = self.context.block_with_no_arguments();
-                    let stopped = self.boolean(&mut exhausted, false)?;
-                    exhausted.append_operation(scf::r#yield(&[stopped], location)?)?;
-                    let predicate = append(
-                        &mut before,
-                        scf::r#if(
-                            within,
-                            &[self.context.signless_integer_type(1).as_ref()],
-                            condition.try_into()?,
-                            Some(exhausted.try_into()?),
-                            location,
-                        )?,
-                    )?;
-                    let forwarded = (0..types.len())
+                    let mut stopped = vec![self.boolean(&mut exhausted, false)?];
+                    stopped.extend(&entering);
+                    exhausted.append_operation(scf::r#yield(&stopped, location)?)?;
+                    let mut predicate_types = vec![self.context.signless_integer_type(1).as_ref()];
+                    predicate_types.extend(&types[count..types.len() - 1]);
+                    let predicate = before.append_operation(scf::r#if(
+                        within,
+                        &predicate_types,
+                        condition.try_into()?,
+                        Some(exhausted.try_into()?),
+                        location,
+                    )?)?;
+                    let mut forwarded = (0..count)
                         .map(|index| before.argument(index).map(|value| value.as_ref()))
                         .collect::<Result<Vec<_>, _>>()?;
-                    before.append_operation(scf::condition(predicate, &forwarded, location)?)?;
+                    for index in 0..entering.len() {
+                        forwarded.push(predicate.result(index + 1)?.as_ref());
+                    }
+                    forwarded.push(counter);
+                    before.append_operation(scf::condition(predicate.result(0)?.as_ref(), &forwarded, location)?)?;
                     let mut after = self.context.block(&arguments);
                     let after_values = carried_values(&after, &inputs)?;
+                    for (index, window) in self.windows.iter_mut().enumerate() {
+                        window.value = after.argument(count + index)?.as_ref();
+                    }
                     let next = self.region(&mut after, region.with_id(instruction.regions()[1])?, &after_values)?;
                     let mut yielded = Vec::new();
                     for (input, value) in inputs.iter().zip(&next) {
@@ -1061,6 +1380,7 @@ impl<'c, 't> Lowering<'c, 't> {
                             }
                         }
                     }
+                    yielded.extend(self.windows.iter().map(|window| window.value));
                     let counter = after.argument(types.len() - 1)?.as_ref();
                     let one = self.integer(&mut after, 1)?;
                     yielded.push(append(&mut after, arith::addi(counter, one, location)?)?);
@@ -1072,6 +1392,9 @@ impl<'c, 't> Lowering<'c, 't> {
                         after.try_into()?,
                         location,
                     )?)?;
+                    for (index, window) in self.windows.iter_mut().enumerate() {
+                        window.value = operation.result(count + index)?.as_ref();
+                    }
                     let mut position = 0;
                     inputs
                         .iter()
@@ -1296,23 +1619,46 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 }
 
-/// Rejects every body whose memory accesses need ordering between the threads of one program, which the module
-/// documentation describes.
-fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<(), Error> {
+/// Rejects every body whose memory accesses need ordering between the threads of one program and returns the windows
+/// that the lowering promotes to SSA values instead, which the module documentation describes.
+fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion>, Error> {
     let call = kernel.definition().operation();
     let body = kernel.definition().body().entry_region_ref();
     let references = kernel.definition().references();
-    if let Some((_, instruction)) = body
-        .instructions_in_closure()
-        .find(|(id, _)| references.swap_lowering(*id) == Some(KernelSwapLowering::Exchange))
-    {
-        return Err(unordered(instruction.operation().name(), "swaps whose old value is used"));
+    let analysis = references.analysis().analysis();
+
+    // A grid with a zero extent runs the body at no grid point, and the single program that its launch still runs
+    // masks every memory access by its inactive grid point, so no access needs ordering and nothing is promoted.
+    if call.grid().dimensions().iter().any(|dimension| matches!(dimension.extent(), Dimension::Static(0))) {
+        return Ok(Vec::new());
     }
 
-    // Roots of the parameters whose accesses the scan below orders, with whether each one is read-write.
-    let mut ordered = HashMap::new();
-    for (parameter, summary) in call.parameters().iter().zip(references.parameters()) {
+    // Direct accesses by instruction, in program order within each region, together with the roots of the body that
+    // they reach. Roots of nested region inputs resolve through the bindings of their attachments.
+    let mut bindings = HashMap::<ReferenceRoot, Vec<ReferenceRoot>>::new();
+    for binding in analysis.region_input_bindings() {
+        // Bound inputs are reference-typed inputs of the attached region, which the analysis resolved.
+        bindings.entry(analysis.root_of(binding.input()).unwrap()).or_default().push(binding.root());
+    }
+    let mut accesses = BTreeMap::<InstructionId, Vec<(ReferenceAccess, ReferenceRoot)>>::new();
+    for access in analysis.access_modes() {
+        let mut roots = vec![access.root()];
+        while let Some(root) = roots.pop() {
+            match bindings.get(&root) {
+                Some(bound) => roots.extend(bound),
+                None => accesses.entry(access.instruction()).or_default().push((*access, root)),
+            }
+        }
+    }
+    let operation = |instruction: InstructionId| -> Result<&'static str, Error> {
+        Ok(body.with_id(instruction.region())?.instructions()[instruction.index()].operation().name())
+    };
+
+    let mut promotions = Vec::new();
+    let mut read_write = HashSet::new();
+    for (index, (parameter, summary)) in call.parameters().iter().zip(references.parameters()).enumerate() {
         let Some(summary) = summary else { continue };
+        let root = summary.root();
         let modes = summary.modes();
         if modes.contains(&ReferenceAccessMode::AtomicAccumulate) {
             if modes.len() > 1 {
@@ -1320,81 +1666,167 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<(), Error> {
             }
             continue;
         }
-        let read_write = match parameter.access() {
+        let read_write_parameter = match parameter.access() {
             KernelParameterAccess::ReadOnly => continue,
-            KernelParameterAccess::WriteOnly => {
-                // A swap of a write-only parameter is a store, because swaps whose old value is used are rejected.
-                if modes.iter().any(|mode| !matches!(mode, ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite))
-                {
-                    return Err(unordered("kernel_call", "reads after writes of one parameter"));
-                }
-                if parameter.mapping().block_shape().is_empty() {
-                    continue;
-                }
-                false
-            }
+            KernelParameterAccess::WriteOnly => false,
             KernelParameterAccess::ReadWrite => true,
         };
-        let tiling = parameter.mapping().tiling_axes();
-        if call.grid().dimensions().iter().enumerate().any(|(axis, dimension)| {
-            dimension.execution() != GridExecution::Parallel
-                && !matches!(dimension.extent(), Dimension::Static(0 | 1))
-                && !tiling.as_ref().is_some_and(|axes| axes.contains(&Some(axis)))
-        }) {
-            return Err(unordered("kernel_call", "windows that repeat along a sequential grid axis"));
+        let parameter_accesses = accesses
+            .iter()
+            .flat_map(|(instruction, accesses)| {
+                accesses.iter().filter(|(_, accessed)| *accessed == root).map(|(access, _)| (*instruction, *access))
+            })
+            .collect::<Vec<_>>();
+        // Only reference reads, writes, swaps, and add updates and masked loads, stores, and swaps access a promoted
+        // window, which they all do through their whole window.
+        let mut partial = None;
+        for (instruction, access) in &parameter_accesses {
+            let whole = references.path(*instruction, access.input_index()).is_some_and(|path| path.is_root());
+            let name = operation(*instruction)?;
+            if partial.is_none() && (!whole || [TILE_LOAD_OPERATION_NAME, ASYNC_COPY_OPERATION_NAME].contains(&name)) {
+                partial = Some(name);
+            }
         }
-        ordered.insert(summary.root(), read_write);
-    }
+        if read_write_parameter && let Some(name) = partial {
+            return Err(unsupported(name, "read-write parameters must be accessed through their whole window"));
+        }
 
-    // Direct accesses of the ordered parameters by entry instruction, in program order.
-    let analysis = references.analysis().analysis();
-    let mut accesses = HashMap::<usize, Vec<_>>::new();
-    for access in analysis.access_modes() {
-        if access.instruction().region() == body.id() && ordered.contains_key(&access.root()) {
-            accesses.entry(access.instruction().index()).or_default().push(*access);
-        }
-    }
-    for (index, instruction) in body.instructions().iter().enumerate() {
-        if !instruction.regions().is_empty()
-            && analysis
-                .transitive_access(InstructionId::new(body.id(), index))
-                .is_some_and(|access| access.roots().any(|root| ordered.contains_key(&root)))
+        // The first reason, if any, why accessing the window through memory would need ordering.
+        let reason = if let Some((instruction, _)) = parameter_accesses
+            .iter()
+            .find(|(instruction, _)| references.swap_lowering(*instruction) == Some(KernelSwapLowering::Exchange))
         {
-            return Err(unordered(instruction.operation().name(), "accesses of a mutable window inside control flow"));
+            Some(unordered(operation(*instruction)?, "swaps whose old value is used"))
+        } else if !read_write_parameter
+            && modes
+                .iter()
+                .any(|mode| !matches!(mode, ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite))
+        {
+            Some(unordered("kernel_call", "reads after writes of one parameter"))
+        } else if !read_write_parameter && parameter.mapping().block_shape().is_empty() {
+            // Only the first thread of a program stores a scalar, in program order.
+            continue;
+        } else if call.grid().dimensions().iter().enumerate().any(|(axis, dimension)| {
+            dimension.execution() != GridExecution::Parallel
+                && !matches!(dimension.extent(), Dimension::Static(1))
+                && !parameter.mapping().tiling_axes().is_some_and(|axes| axes.contains(&Some(axis)))
+        }) {
+            Some(unordered("kernel_call", "windows that repeat along a sequential grid axis"))
+        } else if let Some(instruction) = body.instructions().iter().enumerate().find_map(|(index, instruction)| {
+            (!instruction.regions().is_empty()
+                && analysis
+                    .transitive_access(InstructionId::new(body.id(), index))
+                    .is_some_and(|access| access.roots().any(|accessed| accessed == root)))
+            .then_some(instruction)
+        }) {
+            Some(unordered(instruction.operation().name(), "accesses of a mutable window inside control flow"))
+        } else {
+            let mut written = false;
+            let mut reason = None;
+            for (instruction, access) in &parameter_accesses {
+                match access.mode() {
+                    ReferenceAccessMode::Read | ReferenceAccessMode::Accumulate if written => {
+                        reason = Some(unordered(operation(*instruction)?, "reads after writes of one parameter"));
+                    }
+                    ReferenceAccessMode::Read => continue,
+                    _ if written => reason = Some(unordered(operation(*instruction)?, "repeated writes of one window")),
+                    _ => {
+                        written = true;
+                        continue;
+                    }
+                }
+                break;
+            }
+            reason
+        };
+        match reason {
+            None => {}
+            Some(reason) if partial.is_some() => return Err(reason),
+            Some(reason) => {
+                // The window stays the same along every sequential axis from the axis that follows the last one that
+                // it tiles, so one SSA value can hold it across those axes. A window that some sequential axis tiles
+                // inside the loop of an axis along which it repeats changes inside that loop and keeps its reason.
+                let Some(tiling) = parameter.mapping().tiling_axes() else { return Err(reason) };
+                let mut axis = 0;
+                let mut repeats = false;
+                for (position, dimension) in call.grid().dimensions().iter().enumerate() {
+                    if dimension.execution() == GridExecution::Parallel
+                        || matches!(dimension.extent(), Dimension::Static(1))
+                    {
+                        continue;
+                    }
+                    if !tiling.contains(&Some(position)) {
+                        repeats = true;
+                    } else if repeats {
+                        return Err(reason);
+                    } else {
+                        axis = position + 1;
+                    }
+                }
+                promotions.push(Promotion { parameter: index, axis });
+            }
+        }
+        if read_write_parameter {
+            read_write.insert(root);
         }
     }
-    let mut written = HashSet::new();
+    validate_read_write_values(body, None, &accesses, references, &read_write)?;
+    Ok(promotions)
+}
+
+/// Rejects every value read from a read-write parameter in `region` that may reach memory other than elementwise
+/// through a write of that parameter, which the module documentation describes. Such values may not enter or leave
+/// a region, so `owner` names the operation that attaches a nested `region`, which must not return them.
+fn validate_read_write_values(
+    region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation>,
+    owner: Option<&'static str>,
+    accesses: &BTreeMap<InstructionId, Vec<(ReferenceAccess, ReferenceRoot)>>,
+    references: &KernelReferenceSummary,
+    read_write: &HashSet<ReferenceRoot>,
+) -> Result<(), Error> {
+    let flow = |operation| {
+        unsupported(
+            operation,
+            "values read from a read-write parameter may reach memory only elementwise through its own write",
+        )
+    };
     // Values computed elementwise from reads of read-write parameters, with the root of the parameter read.
     let mut read = HashMap::<AtomId, ReferenceRoot>::new();
-    for (index, instruction) in body.instructions().iter().enumerate() {
+    for (index, instruction) in region.instructions().iter().enumerate() {
         let operation = instruction.operation();
+        let id = InstructionId::new(region.id(), index);
         let mut target = None;
-        for access in accesses.get(&index).into_iter().flatten() {
-            let root = access.root();
-            if ordered[&root]
-                && (matches!(operation, KernelOperation::TileLoad(_))
-                    || !references.path(access.instruction(), access.input_index()).is_some_and(|path| path.is_root()))
-            {
-                return Err(unsupported(
-                    operation.name(),
-                    "read-write parameters must be accessed through their whole window",
-                ));
+        for (access, root) in accesses.get(&id).into_iter().flatten() {
+            if !read_write.contains(root) {
+                continue;
             }
             match access.mode() {
-                ReferenceAccessMode::Read if written.contains(&root) => {
-                    return Err(unordered(operation.name(), "reads after writes of one parameter"));
+                ReferenceAccessMode::Read => read.extend(instruction.outputs().iter().map(|output| (*output, *root))),
+                ReferenceAccessMode::ReadWrite
+                    if references.swap_lowering(id) == Some(KernelSwapLowering::Exchange) =>
+                {
+                    read.extend(instruction.outputs().iter().map(|output| (*output, *root)));
+                    target = Some(*root);
                 }
-                ReferenceAccessMode::Read => read.extend(instruction.outputs().iter().map(|output| (*output, root))),
-                ReferenceAccessMode::Accumulate if written.contains(&root) => {
-                    return Err(unordered(operation.name(), "reads after writes of one parameter"));
-                }
-                _ if !written.insert(root) => {
-                    return Err(unordered(operation.name(), "repeated writes of one window"));
-                }
-                _ => target = Some(root),
+                _ => target = Some(*root),
             }
         }
         let sources = instruction.inputs().iter().filter_map(|input| read.get(input).copied()).collect::<HashSet<_>>();
+        if !instruction.regions().is_empty() {
+            if !sources.is_empty() {
+                return Err(flow(operation.name()));
+            }
+            for nested in instruction.regions() {
+                validate_read_write_values(
+                    region.with_id(*nested)?,
+                    Some(operation.name()),
+                    accesses,
+                    references,
+                    read_write,
+                )?;
+            }
+            continue;
+        }
         let elementwise = matches!(
             operation,
             KernelOperation::Portable(
@@ -1413,15 +1845,13 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<(), Error> {
             [] => {}
             [root] if elementwise => read.extend(instruction.outputs().iter().map(|output| (*output, *root))),
             [root] if target == Some(*root) => {}
-            _ => {
-                return Err(unsupported(
-                    operation.name(),
-                    "values read from a read-write parameter may reach memory only elementwise through its own write",
-                ));
-            }
+            _ => return Err(flow(operation.name())),
         }
     }
-    Ok(())
+    match owner {
+        Some(owner) if region.output_ids().iter().any(|output| read.contains_key(output)) => Err(flow(owner)),
+        _ => Ok(()),
+    }
 }
 
 /// Appends one-result operations while preserving context-owned native lifetimes.
@@ -1559,7 +1989,10 @@ mod tests {
     fn lowered_module(definition: &KernelDefinition) -> String {
         let context = Context::new();
         let verified = VerifiedKernel::new(definition, 1).unwrap();
-        lower(&context, &verified, &Options::default(), &KernelSchedule::default()).unwrap().module.to_string()
+        lower(&context, &verified, &Options::default(), &KernelSchedule::default())
+            .unwrap()
+            .module
+            .to_string()
     }
 
     /// Lowers one array operation over native block arguments of the given input types. It returns the names of the
@@ -1575,6 +2008,8 @@ mod tests {
             location: context.unknown_location(),
             remaining: 100,
             maximum_tile_elements: 1024,
+            promotions: Vec::new(),
+            windows: Vec::new(),
         };
         let arguments = types
             .iter()
@@ -1700,13 +2135,69 @@ mod tests {
         output.accumulate(input.load_or(0.0));
     }
 
-    /// Stores every input window into the same output window, so the last step of the sequential axis wins.
-    #[kernel(crate = "ryft_kernels", grid(k = sequential(input.shape()[0].div_ceil(2))))]
-    fn carried_copy(
+    /// Sums the rows of a matrix into masked output blocks of two rows, zeroing each block at the first step of the
+    /// sequential axis that walks the masked column blocks of the input.
+    #[kernel(
+        crate = "ryft_kernels",
+        grid(i = input.shape()[0].div_ceil(2), k = sequential(input.shape()[1].div_ceil(2))),
+    )]
+    fn row_sums(
+        #[input(data_type = F32, rank = 2, block = [2, 2], index = [i, k], boundary = masked)] input: &Array,
+        #[output(data_type = F32, shape = [input.shape()[0]], block = [2], index = [i], boundary = masked)]
+        output: &mut Array,
+    ) {
+        if k == 0 {
+            output.store(zeros::<f32>([2]));
+        }
+        output.accumulate(input.load_or(0.0).sum([1]));
+    }
+
+    /// Stores every input window of two elements into the same output window on one sequential axis, but tiles the
+    /// output along a second sequential axis that the first one encloses.
+    #[kernel(
+        crate = "ryft_kernels",
+        grid(repeat = sequential(2), k = sequential(input.shape()[0].div_ceil(2))),
+    )]
+    fn repeated_copy(
         #[input(data_type = F32, rank = 1, block = [2], index = [k])] input: &Array,
-        #[output(data_type = F32, shape = [2])] output: &mut Array,
+        #[output(data_type = F32, shape = [input.shape()[0]], block = [2], index = [k])] output: &mut Array,
     ) {
         output.store(input.load());
+    }
+
+    /// Copies `input` into `output` and then doubles `output` by reading it back.
+    #[kernel(crate = "ryft_kernels")]
+    fn copy_and_double(
+        #[input(data_type = F32, rank = 1)] input: &Array,
+        #[output(data_type = F32, shape = [input.shape()[0]])] output: &mut Array,
+    ) {
+        output.store(input.load());
+        output.store(output.load() + output.load());
+    }
+
+    /// Copies every window of two elements of `input` and then zeroes the window of the first program.
+    #[kernel(crate = "ryft_kernels", grid(i = input.shape()[0].div_ceil(2)))]
+    fn zero_first(
+        #[input(data_type = F32, rank = 1, block = [2], index = [i])] input: &Array,
+        #[output(data_type = F32, shape = [input.shape()[0]], block = [2], index = [i])] output: &mut Array,
+    ) {
+        output.store(input.load());
+        if i == 0 {
+            output.store(zeros::<f32>([2]));
+        }
+    }
+
+    /// Adds every window of two elements of `input` into `total` in place on a sequential axis.
+    #[kernel(
+        crate = "ryft_kernels",
+        grid(k = sequential(input.shape()[0].div_ceil(2))),
+        requires = total.shape()[0] == 2,
+    )]
+    fn accumulate_windows(
+        #[input(data_type = F32, rank = 1, block = [2], index = [k])] input: &Array,
+        #[inout(data_type = F32, rank = 1)] total: &mut Array,
+    ) {
+        total.accumulate(input.load());
     }
 
     /// Reads `values` back after writing it.
@@ -1727,6 +2218,25 @@ mod tests {
     ) {
         output.store(input.load());
         output.store(input.load() + input.load());
+    }
+
+    /// Writes the output window and then overwrites its first element through a slice.
+    #[kernel(crate = "ryft_kernels", requires = input.shape()[0] >= 1)]
+    fn overwrite_first(
+        #[input(data_type = F32, rank = 1)] input: &Array,
+        #[output(data_type = F32, shape = [input.shape()[0]])] output: &mut Array,
+    ) {
+        output.store(input.load());
+        output.slice([0..1]).store(input.slice([0..1]).load() + input.slice([0..1]).load());
+    }
+
+    /// Reads `values` before a loop that stores twice that value into `values` in every iteration.
+    #[kernel(crate = "ryft_kernels")]
+    fn double_before_loop(#[inout(data_type = F32, rank = 1)] values: &mut Array) {
+        let value = values.load();
+        for step in 0..values.shape()[0] {
+            values.store(value + value);
+        }
     }
 
     /// Updates the first element of `values` in place through a slice of its window.
@@ -2383,10 +2893,8 @@ mod tests {
             parallel_sum::definition(&ArrayType::new_static(DataType::F32, [4]), &ArrayType::scalar(DataType::F32))
                 .unwrap();
         assert_eq!(
-            definition.interpret(
-                vec![Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap(), Array::scalar(10f32).unwrap()],
-                1,
-            ),
+            definition
+                .interpret(vec![Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap(), Array::scalar(10f32).unwrap()], 1,),
             Ok(vec![Array::scalar(20f32).unwrap()]),
         );
         assert_eq!(
@@ -2467,7 +2975,7 @@ mod tests {
                 %49 = arith.select %48, %c0_i64_10, %c0_i64_10 : i64
                 %50 = tt.addptr %arg1, %49 : !tt.ptr<f32>, i64
                 %51 = \
-                    tt.atomic_rmw fadd, acq_rel, gpu, %50, %47, %48 \
+                        tt.atomic_rmw fadd, acq_rel, gpu, %50, %47, %48 \
                     {operand_segment_sizes = array<i32: 1, 1, 1>} : (!tt.ptr<f32>, f32, i1) -> f32
                 tt.return
               }
@@ -2477,85 +2985,1126 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_rejects_reads_of_write_only_parameters() {
-        // The kernel verifier admits a read of a write-only parameter that follows a definite write, but another thread
-        // of the program may load the element before the store lands, so admission rejects it.
-        let r#type = ArrayType::scalar(DataType::F32);
-        let call = KernelCallOperation::new(
-            Grid::new(vec![]).unwrap(),
-            vec![whole_array_parameter(r#type, KernelParameterAccess::WriteOnly).unwrap()],
-        )
-        .unwrap();
-        let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let reference = body.add_input(call.parameters()[0].body_type());
-        let two = body.add_constant(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()));
-        body.add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, two], None).unwrap();
-        body.add_instruction(ReferenceReadOperation::new(), vec![], vec![reference], None).unwrap();
-        let body = body
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
-            .unwrap();
-        let definition = KernelDefinition::new(call, body).unwrap();
+    fn test_lower_promoted_carried_accumulation() {
+        // The output repeats along the sequential axis, so its window lives in one SSA value that starts from zeros, is
+        // zeroed again at the first step, and accumulates every masked input window. The loop stores nothing, and the
+        // value is stored once after it.
+        let definition = carried_sum::definition(&ArrayType::new_static(DataType::F32, [4])).unwrap();
         assert_eq!(
-            rejection(&definition),
-            (
-                "kernel_call",
-                "reads after writes of one parameter need a CTA barrier, which ryft-mlir does not expose".to_owned(),
-            ),
+            definition.interpret(vec![Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap()], 1),
+            Ok(vec![Array::vector(vec![4f32, 6.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c0_i64_0 = arith.constant 0 : i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.addi %c0_i64_0, %c2_i64 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %3 = tt.splat %cst : f32 -> tensor<2xf32>
+                %c0_i64_1 = arith.constant 0 : i64
+                %c2_i64_2 = arith.constant 2 : i64
+                %c1_i64 = arith.constant 1 : i64
+                %4 = \
+                        scf.for %arg2 = %c0_i64_1 to %c2_i64_2 step %c1_i64 iter_args(%arg3 = %3) -> (tensor<2xf32>)  : \
+                    i64 {
+                  %c2_i64_9 = arith.constant 2 : i64
+                  %34 = arith.muli %arg2, %c2_i64_9 : i64
+                  %c2_i64_10 = arith.constant 2 : i64
+                  %35 = arith.addi %34, %c2_i64_10 : i64
+                  %c0_i64_11 = arith.constant 0 : i64
+                  %c2_i64_12 = arith.constant 2 : i64
+                  %36 = arith.addi %c0_i64_11, %c2_i64_12 : i64
+                  %c0_i64_13 = arith.constant 0 : i64
+                  %true_14 = arith.constant true
+                  %37 = tt.splat %true_14 : i1 -> tensor<2xi1>
+                  %c0_i32 = arith.constant 0 : i32
+                  %38 = arith.bitcast %c0_i32 : i32 to f32
+                  %39 = tt.splat %38 : f32 -> tensor<2xf32>
+                  %40 = arith.cmpi eq, %arg2, %c0_i64_13 : i64
+                  %41 = scf.if %40 -> (tensor<2xf32>) {
+                    %cst_20 = arith.constant 0.000000e+00 : f32
+                    %74 = tt.splat %cst_20 : f32 -> tensor<2xf32>
+                    scf.yield %74 : tensor<2xf32>
+                  } else {
+                    scf.yield %arg3 : tensor<2xf32>
+                  }
+                  %true_15 = arith.constant true
+                  %42 = tt.splat %true_15 : i1 -> tensor<2xi1>
+                  %43 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %44 = tt.reshape %43 : tensor<2xi32> -> tensor<2xi32>
+                  %45 = arith.extsi %44 : tensor<2xi32> to tensor<2xi64>
+                  %46 = tt.broadcast %45 : tensor<2xi64> -> tensor<2xi64>
+                  %c2_i64_16 = arith.constant 2 : i64
+                  %47 = tt.splat %c2_i64_16 : i64 -> tensor<2xi64>
+                  %48 = arith.cmpi slt, %46, %47 : tensor<2xi64>
+                  %49 = arith.andi %42, %48 : tensor<2xi1>
+                  %50 = tt.splat %true : i1 -> tensor<2xi1>
+                  %51 = arith.andi %49, %50 : tensor<2xi1>
+                  %c0_i64_17 = arith.constant 0 : i64
+                  %52 = tt.splat %c0_i64_17 : i64 -> tensor<2xi64>
+                  %53 = tt.splat %34 : i64 -> tensor<2xi64>
+                  %54 = arith.addi %53, %46 : tensor<2xi64>
+                  %55 = tt.splat %35 : i64 -> tensor<2xi64>
+                  %56 = arith.cmpi slt, %54, %55 : tensor<2xi64>
+                  %57 = arith.andi %51, %56 : tensor<2xi1>
+                  %c4_i64 = arith.constant 4 : i64
+                  %58 = tt.splat %c4_i64 : i64 -> tensor<2xi64>
+                  %59 = arith.cmpi sge, %54, %52 : tensor<2xi64>
+                  %60 = arith.cmpi slt, %54, %58 : tensor<2xi64>
+                  %61 = arith.andi %59, %60 : tensor<2xi1>
+                  %62 = arith.andi %57, %61 : tensor<2xi1>
+                  %c0_i64_18 = arith.constant 0 : i64
+                  %63 = tt.splat %c0_i64_18 : i64 -> tensor<2xi64>
+                  %64 = arith.select %61, %54, %63 : tensor<2xi1>, tensor<2xi64>
+                  %c1_i64_19 = arith.constant 1 : i64
+                  %65 = tt.splat %c1_i64_19 : i64 -> tensor<2xi64>
+                  %66 = arith.muli %64, %65 : tensor<2xi64>
+                  %67 = arith.addi %63, %66 : tensor<2xi64>
+                  %68 = arith.select %62, %67, %63 : tensor<2xi1>, tensor<2xi64>
+                  %69 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                  %70 = tt.addptr %69, %68 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                  %71 = arith.andi %62, %37 : tensor<2xi1>
+                  %72 = tt.load %70, %71, %39 : tensor<2x!tt.ptr<f32>>
+                  %73 = arith.addf %41, %72 : tensor<2xf32>
+                  scf.yield %73 : tensor<2xf32>
+                }
+                %true_3 = arith.constant true
+                %5 = tt.splat %true_3 : i1 -> tensor<2xi1>
+                %6 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %7 = tt.reshape %6 : tensor<2xi32> -> tensor<2xi32>
+                %8 = arith.extsi %7 : tensor<2xi32> to tensor<2xi64>
+                %9 = tt.broadcast %8 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_4 = arith.constant 2 : i64
+                %10 = tt.splat %c2_i64_4 : i64 -> tensor<2xi64>
+                %11 = arith.cmpi slt, %9, %10 : tensor<2xi64>
+                %12 = arith.andi %5, %11 : tensor<2xi1>
+                %13 = tt.splat %true : i1 -> tensor<2xi1>
+                %14 = arith.andi %12, %13 : tensor<2xi1>
+                %c0_i64_5 = arith.constant 0 : i64
+                %15 = tt.splat %c0_i64_5 : i64 -> tensor<2xi64>
+                %16 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %17 = arith.addi %16, %9 : tensor<2xi64>
+                %18 = tt.splat %2 : i64 -> tensor<2xi64>
+                %19 = arith.cmpi slt, %17, %18 : tensor<2xi64>
+                %20 = arith.andi %14, %19 : tensor<2xi1>
+                %c2_i64_6 = arith.constant 2 : i64
+                %21 = tt.splat %c2_i64_6 : i64 -> tensor<2xi64>
+                %22 = arith.cmpi sge, %17, %15 : tensor<2xi64>
+                %23 = arith.cmpi slt, %17, %21 : tensor<2xi64>
+                %24 = arith.andi %22, %23 : tensor<2xi1>
+                %25 = arith.andi %20, %24 : tensor<2xi1>
+                %c0_i64_7 = arith.constant 0 : i64
+                %26 = tt.splat %c0_i64_7 : i64 -> tensor<2xi64>
+                %27 = arith.select %24, %17, %26 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_8 = arith.constant 1 : i64
+                %28 = tt.splat %c1_i64_8 : i64 -> tensor<2xi64>
+                %29 = arith.muli %27, %28 : tensor<2xi64>
+                %30 = arith.addi %26, %29 : tensor<2xi64>
+                %31 = arith.select %25, %30, %26 : tensor<2xi1>, tensor<2xi64>
+                %32 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %33 = tt.addptr %32, %31 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %33, %4, %25 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
         );
     }
 
     #[test]
-    fn test_lower_rejects_carried_accumulation() {
-        // The first step of the sequential axis initializes the carried output, and every step then reads it back
-        // through an add update over a masked input window.
-        let definition = carried_sum::definition(&ArrayType::new_static(DataType::F32, [3])).unwrap();
+    fn test_lower_promoted_carried_accumulation_masked_edges() {
+        // The second output window and the input windows of the last row and column cross the ends of their arrays.
+        // The masked accumulation selects only valid elements of the promoted value, and its final store is masked by
+        // the window validity, so the padding element of the output is never stored.
+        let definition = row_sums::definition(&ArrayType::new_static(DataType::F32, [3, 3])).unwrap();
         assert_eq!(
-            definition.interpret(vec![Array::vector(vec![1f32, 2.0, 3.0]).unwrap()], 1),
-            Ok(vec![Array::vector(vec![4f32, 2.0]).unwrap()]),
+            definition
+                .interpret(vec![Array::matrix(3, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap()], 1,),
+            Ok(vec![Array::vector(vec![6f32, 15.0, 24.0]).unwrap()]),
         );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.remsi %1, %c2_i64 : i64
+                %3 = arith.divsi %1, %c2_i64 : i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c2_i64_0 = arith.constant 2 : i64
+                %4 = arith.muli %2, %c2_i64_0 : i64
+                %c2_i64_1 = arith.constant 2 : i64
+                %5 = arith.addi %4, %c2_i64_1 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %6 = tt.splat %cst : f32 -> tensor<2xf32>
+                %c0_i64_2 = arith.constant 0 : i64
+                %c2_i64_3 = arith.constant 2 : i64
+                %c1_i64 = arith.constant 1 : i64
+                %7 = \
+                        scf.for %arg2 = %c0_i64_2 to %c2_i64_3 step %c1_i64 iter_args(%arg3 = %6) -> (tensor<2xf32>)  : \
+                    i64 {
+                  %c2_i64_9 = arith.constant 2 : i64
+                  %c2_i64_10 = arith.constant 2 : i64
+                  %37 = arith.muli %2, %c2_i64_9 : i64
+                  %38 = arith.muli %arg2, %c2_i64_10 : i64
+                  %c2_i64_11 = arith.constant 2 : i64
+                  %39 = arith.addi %37, %c2_i64_11 : i64
+                  %c2_i64_12 = arith.constant 2 : i64
+                  %40 = arith.addi %38, %c2_i64_12 : i64
+                  %c2_i64_13 = arith.constant 2 : i64
+                  %41 = arith.muli %2, %c2_i64_13 : i64
+                  %c2_i64_14 = arith.constant 2 : i64
+                  %42 = arith.addi %41, %c2_i64_14 : i64
+                  %c0_i64_15 = arith.constant 0 : i64
+                  %true_16 = arith.constant true
+                  %43 = tt.splat %true_16 : i1 -> tensor<2x2xi1>
+                  %c0_i32 = arith.constant 0 : i32
+                  %44 = arith.bitcast %c0_i32 : i32 to f32
+                  %45 = tt.splat %44 : f32 -> tensor<2x2xf32>
+                  %true_17 = arith.constant true
+                  %46 = tt.splat %true_17 : i1 -> tensor<2xi1>
+                  %47 = arith.cmpi eq, %arg2, %c0_i64_15 : i64
+                  %48 = scf.if %47 -> (tensor<2xf32>) {
+                    %cst_40 = arith.constant 0.000000e+00 : f32
+                    %167 = tt.splat %cst_40 : f32 -> tensor<2xf32>
+                    scf.yield %167 : tensor<2xf32>
+                  } else {
+                    scf.yield %arg3 : tensor<2xf32>
+                  }
+                  %true_18 = arith.constant true
+                  %49 = tt.splat %true_18 : i1 -> tensor<2x2xi1>
+                  %50 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %51 = tt.reshape %50 : tensor<2xi32> -> tensor<2x1xi32>
+                  %52 = arith.extsi %51 : tensor<2x1xi32> to tensor<2x1xi64>
+                  %53 = tt.broadcast %52 : tensor<2x1xi64> -> tensor<2x2xi64>
+                  %c2_i64_19 = arith.constant 2 : i64
+                  %54 = tt.splat %c2_i64_19 : i64 -> tensor<2x2xi64>
+                  %55 = arith.cmpi slt, %53, %54 : tensor<2x2xi64>
+                  %56 = arith.andi %49, %55 : tensor<2x2xi1>
+                  %57 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %58 = tt.reshape %57 : tensor<2xi32> -> tensor<1x2xi32>
+                  %59 = arith.extsi %58 : tensor<1x2xi32> to tensor<1x2xi64>
+                  %60 = tt.broadcast %59 : tensor<1x2xi64> -> tensor<2x2xi64>
+                  %c2_i64_20 = arith.constant 2 : i64
+                  %61 = tt.splat %c2_i64_20 : i64 -> tensor<2x2xi64>
+                  %62 = arith.cmpi slt, %60, %61 : tensor<2x2xi64>
+                  %63 = arith.andi %56, %62 : tensor<2x2xi1>
+                  %64 = tt.splat %true : i1 -> tensor<2x2xi1>
+                  %65 = arith.andi %63, %64 : tensor<2x2xi1>
+                  %c0_i64_21 = arith.constant 0 : i64
+                  %66 = tt.splat %c0_i64_21 : i64 -> tensor<2x2xi64>
+                  %67 = tt.splat %37 : i64 -> tensor<2x2xi64>
+                  %68 = arith.addi %67, %53 : tensor<2x2xi64>
+                  %69 = tt.splat %39 : i64 -> tensor<2x2xi64>
+                  %70 = arith.cmpi slt, %68, %69 : tensor<2x2xi64>
+                  %71 = arith.andi %65, %70 : tensor<2x2xi1>
+                  %c3_i64_22 = arith.constant 3 : i64
+                  %72 = tt.splat %c3_i64_22 : i64 -> tensor<2x2xi64>
+                  %73 = arith.cmpi sge, %68, %66 : tensor<2x2xi64>
+                  %74 = arith.cmpi slt, %68, %72 : tensor<2x2xi64>
+                  %75 = arith.andi %73, %74 : tensor<2x2xi1>
+                  %76 = arith.andi %71, %75 : tensor<2x2xi1>
+                  %77 = tt.splat %38 : i64 -> tensor<2x2xi64>
+                  %78 = arith.addi %77, %60 : tensor<2x2xi64>
+                  %79 = tt.splat %40 : i64 -> tensor<2x2xi64>
+                  %80 = arith.cmpi slt, %78, %79 : tensor<2x2xi64>
+                  %81 = arith.andi %76, %80 : tensor<2x2xi1>
+                  %c3_i64_23 = arith.constant 3 : i64
+                  %82 = tt.splat %c3_i64_23 : i64 -> tensor<2x2xi64>
+                  %83 = arith.cmpi sge, %78, %66 : tensor<2x2xi64>
+                  %84 = arith.cmpi slt, %78, %82 : tensor<2x2xi64>
+                  %85 = arith.andi %83, %84 : tensor<2x2xi1>
+                  %86 = arith.andi %81, %85 : tensor<2x2xi1>
+                  %c0_i64_24 = arith.constant 0 : i64
+                  %87 = tt.splat %c0_i64_24 : i64 -> tensor<2x2xi64>
+                  %88 = arith.select %85, %78, %87 : tensor<2x2xi1>, tensor<2x2xi64>
+                  %c1_i64_25 = arith.constant 1 : i64
+                  %89 = tt.splat %c1_i64_25 : i64 -> tensor<2x2xi64>
+                  %90 = arith.muli %88, %89 : tensor<2x2xi64>
+                  %91 = arith.addi %87, %90 : tensor<2x2xi64>
+                  %92 = arith.select %75, %68, %87 : tensor<2x2xi1>, tensor<2x2xi64>
+                  %c3_i64_26 = arith.constant 3 : i64
+                  %93 = tt.splat %c3_i64_26 : i64 -> tensor<2x2xi64>
+                  %94 = arith.muli %92, %93 : tensor<2x2xi64>
+                  %95 = arith.addi %91, %94 : tensor<2x2xi64>
+                  %96 = arith.select %86, %95, %87 : tensor<2x2xi1>, tensor<2x2xi64>
+                  %97 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x2x!tt.ptr<f32>>
+                  %98 = tt.addptr %97, %96 : tensor<2x2x!tt.ptr<f32>>, tensor<2x2xi64>
+                  %99 = arith.andi %86, %43 : tensor<2x2xi1>
+                  %100 = tt.load %98, %99, %45 : tensor<2x2x!tt.ptr<f32>>
+                  %true_27 = arith.constant true
+                  %101 = tt.splat %true_27 : i1 -> tensor<2x2xi1>
+                  %102 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %103 = tt.reshape %102 : tensor<2xi32> -> tensor<2x1xi32>
+                  %104 = arith.extsi %103 : tensor<2x1xi32> to tensor<2x1xi64>
+                  %105 = tt.broadcast %104 : tensor<2x1xi64> -> tensor<2x2xi64>
+                  %c2_i64_28 = arith.constant 2 : i64
+                  %106 = tt.splat %c2_i64_28 : i64 -> tensor<2x2xi64>
+                  %107 = arith.cmpi slt, %105, %106 : tensor<2x2xi64>
+                  %108 = arith.andi %101, %107 : tensor<2x2xi1>
+                  %109 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %110 = tt.reshape %109 : tensor<2xi32> -> tensor<1x2xi32>
+                  %111 = arith.extsi %110 : tensor<1x2xi32> to tensor<1x2xi64>
+                  %112 = tt.broadcast %111 : tensor<1x2xi64> -> tensor<2x2xi64>
+                  %c2_i64_29 = arith.constant 2 : i64
+                  %113 = tt.splat %c2_i64_29 : i64 -> tensor<2x2xi64>
+                  %114 = arith.cmpi slt, %112, %113 : tensor<2x2xi64>
+                  %115 = arith.andi %108, %114 : tensor<2x2xi1>
+                  %cst_30 = arith.constant 0.000000e+00 : f32
+                  %116 = tt.splat %cst_30 : f32 -> tensor<2x2xf32>
+                  %117 = arith.select %115, %100, %116 : tensor<2x2xi1>, tensor<2x2xf32>
+                  %118 = \"tt.reduce\"(%117) <{axis = 1 : i32}> ({
+                  ^bb0(%arg4: f32, %arg5: f32):
+                    %167 = arith.addf %arg4, %arg5 : f32
+                    tt.reduce.return %167 : f32
+                  }) : (tensor<2x2xf32>) -> tensor<2xf32>
+                  %cst_31 = arith.constant 0.000000e+00 : f32
+                  %119 = tt.splat %cst_31 : f32 -> tensor<2xf32>
+                  %true_32 = arith.constant true
+                  %120 = tt.splat %true_32 : i1 -> tensor<2xi1>
+                  %121 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %122 = tt.reshape %121 : tensor<2xi32> -> tensor<2xi32>
+                  %123 = arith.extsi %122 : tensor<2xi32> to tensor<2xi64>
+                  %124 = tt.broadcast %123 : tensor<2xi64> -> tensor<2xi64>
+                  %c2_i64_33 = arith.constant 2 : i64
+                  %125 = tt.splat %c2_i64_33 : i64 -> tensor<2xi64>
+                  %126 = arith.cmpi slt, %124, %125 : tensor<2xi64>
+                  %127 = arith.andi %120, %126 : tensor<2xi1>
+                  %128 = tt.splat %true : i1 -> tensor<2xi1>
+                  %129 = arith.andi %127, %128 : tensor<2xi1>
+                  %c0_i64_34 = arith.constant 0 : i64
+                  %130 = tt.splat %c0_i64_34 : i64 -> tensor<2xi64>
+                  %131 = tt.splat %41 : i64 -> tensor<2xi64>
+                  %132 = arith.addi %131, %124 : tensor<2xi64>
+                  %133 = tt.splat %42 : i64 -> tensor<2xi64>
+                  %134 = arith.cmpi slt, %132, %133 : tensor<2xi64>
+                  %135 = arith.andi %129, %134 : tensor<2xi1>
+                  %c3_i64_35 = arith.constant 3 : i64
+                  %136 = tt.splat %c3_i64_35 : i64 -> tensor<2xi64>
+                  %137 = arith.cmpi sge, %132, %130 : tensor<2xi64>
+                  %138 = arith.cmpi slt, %132, %136 : tensor<2xi64>
+                  %139 = arith.andi %137, %138 : tensor<2xi1>
+                  %140 = arith.andi %135, %139 : tensor<2xi1>
+                  %141 = arith.andi %140, %46 : tensor<2xi1>
+                  %142 = arith.select %141, %48, %119 : tensor<2xi1>, tensor<2xf32>
+                  %143 = arith.addf %142, %118 : tensor<2xf32>
+                  %true_36 = arith.constant true
+                  %144 = tt.splat %true_36 : i1 -> tensor<2xi1>
+                  %145 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %146 = tt.reshape %145 : tensor<2xi32> -> tensor<2xi32>
+                  %147 = arith.extsi %146 : tensor<2xi32> to tensor<2xi64>
+                  %148 = tt.broadcast %147 : tensor<2xi64> -> tensor<2xi64>
+                  %c2_i64_37 = arith.constant 2 : i64
+                  %149 = tt.splat %c2_i64_37 : i64 -> tensor<2xi64>
+                  %150 = arith.cmpi slt, %148, %149 : tensor<2xi64>
+                  %151 = arith.andi %144, %150 : tensor<2xi1>
+                  %152 = tt.splat %true : i1 -> tensor<2xi1>
+                  %153 = arith.andi %151, %152 : tensor<2xi1>
+                  %c0_i64_38 = arith.constant 0 : i64
+                  %154 = tt.splat %c0_i64_38 : i64 -> tensor<2xi64>
+                  %155 = tt.splat %41 : i64 -> tensor<2xi64>
+                  %156 = arith.addi %155, %148 : tensor<2xi64>
+                  %157 = tt.splat %42 : i64 -> tensor<2xi64>
+                  %158 = arith.cmpi slt, %156, %157 : tensor<2xi64>
+                  %159 = arith.andi %153, %158 : tensor<2xi1>
+                  %c3_i64_39 = arith.constant 3 : i64
+                  %160 = tt.splat %c3_i64_39 : i64 -> tensor<2xi64>
+                  %161 = arith.cmpi sge, %156, %154 : tensor<2xi64>
+                  %162 = arith.cmpi slt, %156, %160 : tensor<2xi64>
+                  %163 = arith.andi %161, %162 : tensor<2xi1>
+                  %164 = arith.andi %159, %163 : tensor<2xi1>
+                  %165 = arith.andi %164, %46 : tensor<2xi1>
+                  %166 = arith.select %165, %143, %48 : tensor<2xi1>, tensor<2xf32>
+                  scf.yield %166 : tensor<2xf32>
+                }
+                %true_4 = arith.constant true
+                %8 = tt.splat %true_4 : i1 -> tensor<2xi1>
+                %9 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %10 = tt.reshape %9 : tensor<2xi32> -> tensor<2xi32>
+                %11 = arith.extsi %10 : tensor<2xi32> to tensor<2xi64>
+                %12 = tt.broadcast %11 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_5 = arith.constant 2 : i64
+                %13 = tt.splat %c2_i64_5 : i64 -> tensor<2xi64>
+                %14 = arith.cmpi slt, %12, %13 : tensor<2xi64>
+                %15 = arith.andi %8, %14 : tensor<2xi1>
+                %16 = tt.splat %true : i1 -> tensor<2xi1>
+                %17 = arith.andi %15, %16 : tensor<2xi1>
+                %c0_i64_6 = arith.constant 0 : i64
+                %18 = tt.splat %c0_i64_6 : i64 -> tensor<2xi64>
+                %19 = tt.splat %4 : i64 -> tensor<2xi64>
+                %20 = arith.addi %19, %12 : tensor<2xi64>
+                %21 = tt.splat %5 : i64 -> tensor<2xi64>
+                %22 = arith.cmpi slt, %20, %21 : tensor<2xi64>
+                %23 = arith.andi %17, %22 : tensor<2xi1>
+                %c3_i64 = arith.constant 3 : i64
+                %24 = tt.splat %c3_i64 : i64 -> tensor<2xi64>
+                %25 = arith.cmpi sge, %20, %18 : tensor<2xi64>
+                %26 = arith.cmpi slt, %20, %24 : tensor<2xi64>
+                %27 = arith.andi %25, %26 : tensor<2xi1>
+                %28 = arith.andi %23, %27 : tensor<2xi1>
+                %c0_i64_7 = arith.constant 0 : i64
+                %29 = tt.splat %c0_i64_7 : i64 -> tensor<2xi64>
+                %30 = arith.select %27, %20, %29 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_8 = arith.constant 1 : i64
+                %31 = tt.splat %c1_i64_8 : i64 -> tensor<2xi64>
+                %32 = arith.muli %30, %31 : tensor<2xi64>
+                %33 = arith.addi %29, %32 : tensor<2xi64>
+                %34 = arith.select %28, %33, %29 : tensor<2xi1>, tensor<2xi64>
+                %35 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %36 = tt.addptr %35, %34 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %36, %7, %28 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+    }
+
+    #[test]
+    fn test_lower_promoted_repeated_writes() {
+        // The second write replaces the promoted value, and only that value is stored.
+        let definition = write_twice::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1f32, 2.0]).unwrap()], 1),
+            Ok(vec![Array::vector(vec![2f32, 4.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c0_i64_0 = arith.constant 0 : i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.addi %c0_i64_0, %c2_i64 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %3 = tt.splat %cst : f32 -> tensor<2xf32>
+                %c0_i64_1 = arith.constant 0 : i64
+                %c2_i64_2 = arith.constant 2 : i64
+                %4 = arith.addi %c0_i64_1, %c2_i64_2 : i64
+                %c0_i64_3 = arith.constant 0 : i64
+                %c2_i64_4 = arith.constant 2 : i64
+                %5 = arith.addi %c0_i64_3, %c2_i64_4 : i64
+                %cst_5 = arith.constant 0.000000e+00 : f32
+                %6 = tt.splat %cst_5 : f32 -> tensor<2xf32>
+                %true_6 = arith.constant true
+                %7 = tt.splat %true_6 : i1 -> tensor<2xi1>
+                %8 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %9 = tt.reshape %8 : tensor<2xi32> -> tensor<2xi32>
+                %10 = arith.extsi %9 : tensor<2xi32> to tensor<2xi64>
+                %11 = tt.broadcast %10 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_7 = arith.constant 2 : i64
+                %12 = tt.splat %c2_i64_7 : i64 -> tensor<2xi64>
+                %13 = arith.cmpi slt, %11, %12 : tensor<2xi64>
+                %14 = arith.andi %7, %13 : tensor<2xi1>
+                %15 = tt.splat %true : i1 -> tensor<2xi1>
+                %16 = arith.andi %14, %15 : tensor<2xi1>
+                %c0_i64_8 = arith.constant 0 : i64
+                %17 = tt.splat %c0_i64_8 : i64 -> tensor<2xi64>
+                %18 = tt.splat %c0_i64_1 : i64 -> tensor<2xi64>
+                %19 = arith.addi %18, %11 : tensor<2xi64>
+                %20 = tt.splat %4 : i64 -> tensor<2xi64>
+                %21 = arith.cmpi slt, %19, %20 : tensor<2xi64>
+                %22 = arith.andi %16, %21 : tensor<2xi1>
+                %c2_i64_9 = arith.constant 2 : i64
+                %23 = tt.splat %c2_i64_9 : i64 -> tensor<2xi64>
+                %24 = arith.cmpi sge, %19, %17 : tensor<2xi64>
+                %25 = arith.cmpi slt, %19, %23 : tensor<2xi64>
+                %26 = arith.andi %24, %25 : tensor<2xi1>
+                %27 = arith.andi %22, %26 : tensor<2xi1>
+                %c0_i64_10 = arith.constant 0 : i64
+                %28 = tt.splat %c0_i64_10 : i64 -> tensor<2xi64>
+                %29 = arith.select %26, %19, %28 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64 = arith.constant 1 : i64
+                %30 = tt.splat %c1_i64 : i64 -> tensor<2xi64>
+                %31 = arith.muli %29, %30 : tensor<2xi64>
+                %32 = arith.addi %28, %31 : tensor<2xi64>
+                %33 = arith.select %27, %32, %28 : tensor<2xi1>, tensor<2xi64>
+                %34 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %35 = tt.addptr %34, %33 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %36 = tt.load %35, %27, %6 : tensor<2x!tt.ptr<f32>>
+                %cst_11 = arith.constant 0.000000e+00 : f32
+                %37 = tt.splat %cst_11 : f32 -> tensor<2xf32>
+                %true_12 = arith.constant true
+                %38 = tt.splat %true_12 : i1 -> tensor<2xi1>
+                %39 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %40 = tt.reshape %39 : tensor<2xi32> -> tensor<2xi32>
+                %41 = arith.extsi %40 : tensor<2xi32> to tensor<2xi64>
+                %42 = tt.broadcast %41 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_13 = arith.constant 2 : i64
+                %43 = tt.splat %c2_i64_13 : i64 -> tensor<2xi64>
+                %44 = arith.cmpi slt, %42, %43 : tensor<2xi64>
+                %45 = arith.andi %38, %44 : tensor<2xi1>
+                %46 = tt.splat %true : i1 -> tensor<2xi1>
+                %47 = arith.andi %45, %46 : tensor<2xi1>
+                %c0_i64_14 = arith.constant 0 : i64
+                %48 = tt.splat %c0_i64_14 : i64 -> tensor<2xi64>
+                %49 = tt.splat %c0_i64_1 : i64 -> tensor<2xi64>
+                %50 = arith.addi %49, %42 : tensor<2xi64>
+                %51 = tt.splat %4 : i64 -> tensor<2xi64>
+                %52 = arith.cmpi slt, %50, %51 : tensor<2xi64>
+                %53 = arith.andi %47, %52 : tensor<2xi1>
+                %c2_i64_15 = arith.constant 2 : i64
+                %54 = tt.splat %c2_i64_15 : i64 -> tensor<2xi64>
+                %55 = arith.cmpi sge, %50, %48 : tensor<2xi64>
+                %56 = arith.cmpi slt, %50, %54 : tensor<2xi64>
+                %57 = arith.andi %55, %56 : tensor<2xi1>
+                %58 = arith.andi %53, %57 : tensor<2xi1>
+                %c0_i64_16 = arith.constant 0 : i64
+                %59 = tt.splat %c0_i64_16 : i64 -> tensor<2xi64>
+                %60 = arith.select %57, %50, %59 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_17 = arith.constant 1 : i64
+                %61 = tt.splat %c1_i64_17 : i64 -> tensor<2xi64>
+                %62 = arith.muli %60, %61 : tensor<2xi64>
+                %63 = arith.addi %59, %62 : tensor<2xi64>
+                %64 = arith.select %58, %63, %59 : tensor<2xi1>, tensor<2xi64>
+                %65 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %66 = tt.addptr %65, %64 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %67 = tt.load %66, %58, %37 : tensor<2x!tt.ptr<f32>>
+                %cst_18 = arith.constant 0.000000e+00 : f32
+                %68 = tt.splat %cst_18 : f32 -> tensor<2xf32>
+                %true_19 = arith.constant true
+                %69 = tt.splat %true_19 : i1 -> tensor<2xi1>
+                %70 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %71 = tt.reshape %70 : tensor<2xi32> -> tensor<2xi32>
+                %72 = arith.extsi %71 : tensor<2xi32> to tensor<2xi64>
+                %73 = tt.broadcast %72 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_20 = arith.constant 2 : i64
+                %74 = tt.splat %c2_i64_20 : i64 -> tensor<2xi64>
+                %75 = arith.cmpi slt, %73, %74 : tensor<2xi64>
+                %76 = arith.andi %69, %75 : tensor<2xi1>
+                %77 = tt.splat %true : i1 -> tensor<2xi1>
+                %78 = arith.andi %76, %77 : tensor<2xi1>
+                %c0_i64_21 = arith.constant 0 : i64
+                %79 = tt.splat %c0_i64_21 : i64 -> tensor<2xi64>
+                %80 = tt.splat %c0_i64_1 : i64 -> tensor<2xi64>
+                %81 = arith.addi %80, %73 : tensor<2xi64>
+                %82 = tt.splat %4 : i64 -> tensor<2xi64>
+                %83 = arith.cmpi slt, %81, %82 : tensor<2xi64>
+                %84 = arith.andi %78, %83 : tensor<2xi1>
+                %c2_i64_22 = arith.constant 2 : i64
+                %85 = tt.splat %c2_i64_22 : i64 -> tensor<2xi64>
+                %86 = arith.cmpi sge, %81, %79 : tensor<2xi64>
+                %87 = arith.cmpi slt, %81, %85 : tensor<2xi64>
+                %88 = arith.andi %86, %87 : tensor<2xi1>
+                %89 = arith.andi %84, %88 : tensor<2xi1>
+                %c0_i64_23 = arith.constant 0 : i64
+                %90 = tt.splat %c0_i64_23 : i64 -> tensor<2xi64>
+                %91 = arith.select %88, %81, %90 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_24 = arith.constant 1 : i64
+                %92 = tt.splat %c1_i64_24 : i64 -> tensor<2xi64>
+                %93 = arith.muli %91, %92 : tensor<2xi64>
+                %94 = arith.addi %90, %93 : tensor<2xi64>
+                %95 = arith.select %89, %94, %90 : tensor<2xi1>, tensor<2xi64>
+                %96 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %97 = tt.addptr %96, %95 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %98 = tt.load %97, %89, %68 : tensor<2x!tt.ptr<f32>>
+                %99 = arith.addf %67, %98 : tensor<2xf32>
+                %true_25 = arith.constant true
+                %100 = tt.splat %true_25 : i1 -> tensor<2xi1>
+                %101 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %102 = tt.reshape %101 : tensor<2xi32> -> tensor<2xi32>
+                %103 = arith.extsi %102 : tensor<2xi32> to tensor<2xi64>
+                %104 = tt.broadcast %103 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_26 = arith.constant 2 : i64
+                %105 = tt.splat %c2_i64_26 : i64 -> tensor<2xi64>
+                %106 = arith.cmpi slt, %104, %105 : tensor<2xi64>
+                %107 = arith.andi %100, %106 : tensor<2xi1>
+                %108 = tt.splat %true : i1 -> tensor<2xi1>
+                %109 = arith.andi %107, %108 : tensor<2xi1>
+                %c0_i64_27 = arith.constant 0 : i64
+                %110 = tt.splat %c0_i64_27 : i64 -> tensor<2xi64>
+                %111 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %112 = arith.addi %111, %104 : tensor<2xi64>
+                %113 = tt.splat %2 : i64 -> tensor<2xi64>
+                %114 = arith.cmpi slt, %112, %113 : tensor<2xi64>
+                %115 = arith.andi %109, %114 : tensor<2xi1>
+                %c2_i64_28 = arith.constant 2 : i64
+                %116 = tt.splat %c2_i64_28 : i64 -> tensor<2xi64>
+                %117 = arith.cmpi sge, %112, %110 : tensor<2xi64>
+                %118 = arith.cmpi slt, %112, %116 : tensor<2xi64>
+                %119 = arith.andi %117, %118 : tensor<2xi1>
+                %120 = arith.andi %115, %119 : tensor<2xi1>
+                %c0_i64_29 = arith.constant 0 : i64
+                %121 = tt.splat %c0_i64_29 : i64 -> tensor<2xi64>
+                %122 = arith.select %119, %112, %121 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_30 = arith.constant 1 : i64
+                %123 = tt.splat %c1_i64_30 : i64 -> tensor<2xi64>
+                %124 = arith.muli %122, %123 : tensor<2xi64>
+                %125 = arith.addi %121, %124 : tensor<2xi64>
+                %126 = arith.select %120, %125, %121 : tensor<2xi1>, tensor<2xi64>
+                %127 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %128 = tt.addptr %127, %126 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %128, %99, %120 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+    }
+
+    #[test]
+    fn test_lower_promoted_read_after_write() {
+        // The reads of the output return the value that the first write left in its promoted value, so the output is
+        // never loaded.
+        let definition = copy_and_double::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1f32, 2.0]).unwrap()], 1),
+            Ok(vec![Array::vector(vec![2f32, 4.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c0_i64_0 = arith.constant 0 : i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.addi %c0_i64_0, %c2_i64 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %3 = tt.splat %cst : f32 -> tensor<2xf32>
+                %c0_i64_1 = arith.constant 0 : i64
+                %c2_i64_2 = arith.constant 2 : i64
+                %4 = arith.addi %c0_i64_1, %c2_i64_2 : i64
+                %c0_i64_3 = arith.constant 0 : i64
+                %c2_i64_4 = arith.constant 2 : i64
+                %5 = arith.addi %c0_i64_3, %c2_i64_4 : i64
+                %cst_5 = arith.constant 0.000000e+00 : f32
+                %6 = tt.splat %cst_5 : f32 -> tensor<2xf32>
+                %true_6 = arith.constant true
+                %7 = tt.splat %true_6 : i1 -> tensor<2xi1>
+                %8 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %9 = tt.reshape %8 : tensor<2xi32> -> tensor<2xi32>
+                %10 = arith.extsi %9 : tensor<2xi32> to tensor<2xi64>
+                %11 = tt.broadcast %10 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_7 = arith.constant 2 : i64
+                %12 = tt.splat %c2_i64_7 : i64 -> tensor<2xi64>
+                %13 = arith.cmpi slt, %11, %12 : tensor<2xi64>
+                %14 = arith.andi %7, %13 : tensor<2xi1>
+                %15 = tt.splat %true : i1 -> tensor<2xi1>
+                %16 = arith.andi %14, %15 : tensor<2xi1>
+                %c0_i64_8 = arith.constant 0 : i64
+                %17 = tt.splat %c0_i64_8 : i64 -> tensor<2xi64>
+                %18 = tt.splat %c0_i64_1 : i64 -> tensor<2xi64>
+                %19 = arith.addi %18, %11 : tensor<2xi64>
+                %20 = tt.splat %4 : i64 -> tensor<2xi64>
+                %21 = arith.cmpi slt, %19, %20 : tensor<2xi64>
+                %22 = arith.andi %16, %21 : tensor<2xi1>
+                %c2_i64_9 = arith.constant 2 : i64
+                %23 = tt.splat %c2_i64_9 : i64 -> tensor<2xi64>
+                %24 = arith.cmpi sge, %19, %17 : tensor<2xi64>
+                %25 = arith.cmpi slt, %19, %23 : tensor<2xi64>
+                %26 = arith.andi %24, %25 : tensor<2xi1>
+                %27 = arith.andi %22, %26 : tensor<2xi1>
+                %c0_i64_10 = arith.constant 0 : i64
+                %28 = tt.splat %c0_i64_10 : i64 -> tensor<2xi64>
+                %29 = arith.select %26, %19, %28 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64 = arith.constant 1 : i64
+                %30 = tt.splat %c1_i64 : i64 -> tensor<2xi64>
+                %31 = arith.muli %29, %30 : tensor<2xi64>
+                %32 = arith.addi %28, %31 : tensor<2xi64>
+                %33 = arith.select %27, %32, %28 : tensor<2xi1>, tensor<2xi64>
+                %34 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %35 = tt.addptr %34, %33 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %36 = tt.load %35, %27, %6 : tensor<2x!tt.ptr<f32>>
+                %37 = arith.addf %36, %36 : tensor<2xf32>
+                %true_11 = arith.constant true
+                %38 = tt.splat %true_11 : i1 -> tensor<2xi1>
+                %39 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %40 = tt.reshape %39 : tensor<2xi32> -> tensor<2xi32>
+                %41 = arith.extsi %40 : tensor<2xi32> to tensor<2xi64>
+                %42 = tt.broadcast %41 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_12 = arith.constant 2 : i64
+                %43 = tt.splat %c2_i64_12 : i64 -> tensor<2xi64>
+                %44 = arith.cmpi slt, %42, %43 : tensor<2xi64>
+                %45 = arith.andi %38, %44 : tensor<2xi1>
+                %46 = tt.splat %true : i1 -> tensor<2xi1>
+                %47 = arith.andi %45, %46 : tensor<2xi1>
+                %c0_i64_13 = arith.constant 0 : i64
+                %48 = tt.splat %c0_i64_13 : i64 -> tensor<2xi64>
+                %49 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %50 = arith.addi %49, %42 : tensor<2xi64>
+                %51 = tt.splat %2 : i64 -> tensor<2xi64>
+                %52 = arith.cmpi slt, %50, %51 : tensor<2xi64>
+                %53 = arith.andi %47, %52 : tensor<2xi1>
+                %c2_i64_14 = arith.constant 2 : i64
+                %54 = tt.splat %c2_i64_14 : i64 -> tensor<2xi64>
+                %55 = arith.cmpi sge, %50, %48 : tensor<2xi64>
+                %56 = arith.cmpi slt, %50, %54 : tensor<2xi64>
+                %57 = arith.andi %55, %56 : tensor<2xi1>
+                %58 = arith.andi %53, %57 : tensor<2xi1>
+                %c0_i64_15 = arith.constant 0 : i64
+                %59 = tt.splat %c0_i64_15 : i64 -> tensor<2xi64>
+                %60 = arith.select %57, %50, %59 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_16 = arith.constant 1 : i64
+                %61 = tt.splat %c1_i64_16 : i64 -> tensor<2xi64>
+                %62 = arith.muli %60, %61 : tensor<2xi64>
+                %63 = arith.addi %59, %62 : tensor<2xi64>
+                %64 = arith.select %58, %63, %59 : tensor<2xi1>, tensor<2xi64>
+                %65 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %66 = tt.addptr %65, %64 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %66, %37, %58 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+    }
+
+    #[test]
+    fn test_lower_promoted_condition_write() {
+        // The condition yields the promoted value from both branches, and the first program stores zeros.
+        let definition = zero_first::definition(&ArrayType::new_static(DataType::F32, [4])).unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap()], 1),
+            Ok(vec![Array::vector(vec![0f32, 0.0, 3.0, 4.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.remsi %1, %c2_i64 : i64
+                %3 = arith.divsi %1, %c2_i64 : i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c2_i64_0 = arith.constant 2 : i64
+                %4 = arith.muli %2, %c2_i64_0 : i64
+                %c2_i64_1 = arith.constant 2 : i64
+                %5 = arith.addi %4, %c2_i64_1 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %6 = tt.splat %cst : f32 -> tensor<2xf32>
+                %c2_i64_2 = arith.constant 2 : i64
+                %7 = arith.muli %2, %c2_i64_2 : i64
+                %c2_i64_3 = arith.constant 2 : i64
+                %8 = arith.addi %7, %c2_i64_3 : i64
+                %c2_i64_4 = arith.constant 2 : i64
+                %9 = arith.muli %2, %c2_i64_4 : i64
+                %c2_i64_5 = arith.constant 2 : i64
+                %10 = arith.addi %9, %c2_i64_5 : i64
+                %c0_i64_6 = arith.constant 0 : i64
+                %cst_7 = arith.constant 0.000000e+00 : f32
+                %11 = tt.splat %cst_7 : f32 -> tensor<2xf32>
+                %true_8 = arith.constant true
+                %12 = tt.splat %true_8 : i1 -> tensor<2xi1>
+                %13 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %14 = tt.reshape %13 : tensor<2xi32> -> tensor<2xi32>
+                %15 = arith.extsi %14 : tensor<2xi32> to tensor<2xi64>
+                %16 = tt.broadcast %15 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_9 = arith.constant 2 : i64
+                %17 = tt.splat %c2_i64_9 : i64 -> tensor<2xi64>
+                %18 = arith.cmpi slt, %16, %17 : tensor<2xi64>
+                %19 = arith.andi %12, %18 : tensor<2xi1>
+                %20 = tt.splat %true : i1 -> tensor<2xi1>
+                %21 = arith.andi %19, %20 : tensor<2xi1>
+                %c0_i64_10 = arith.constant 0 : i64
+                %22 = tt.splat %c0_i64_10 : i64 -> tensor<2xi64>
+                %23 = tt.splat %7 : i64 -> tensor<2xi64>
+                %24 = arith.addi %23, %16 : tensor<2xi64>
+                %25 = tt.splat %8 : i64 -> tensor<2xi64>
+                %26 = arith.cmpi slt, %24, %25 : tensor<2xi64>
+                %27 = arith.andi %21, %26 : tensor<2xi1>
+                %c4_i64 = arith.constant 4 : i64
+                %28 = tt.splat %c4_i64 : i64 -> tensor<2xi64>
+                %29 = arith.cmpi sge, %24, %22 : tensor<2xi64>
+                %30 = arith.cmpi slt, %24, %28 : tensor<2xi64>
+                %31 = arith.andi %29, %30 : tensor<2xi1>
+                %32 = arith.andi %27, %31 : tensor<2xi1>
+                %c0_i64_11 = arith.constant 0 : i64
+                %33 = tt.splat %c0_i64_11 : i64 -> tensor<2xi64>
+                %34 = arith.select %31, %24, %33 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64 = arith.constant 1 : i64
+                %35 = tt.splat %c1_i64 : i64 -> tensor<2xi64>
+                %36 = arith.muli %34, %35 : tensor<2xi64>
+                %37 = arith.addi %33, %36 : tensor<2xi64>
+                %38 = arith.select %32, %37, %33 : tensor<2xi1>, tensor<2xi64>
+                %39 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %40 = tt.addptr %39, %38 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %41 = tt.load %40, %32, %11 : tensor<2x!tt.ptr<f32>>
+                %42 = arith.cmpi eq, %2, %c0_i64_6 : i64
+                %43 = scf.if %42 -> (tensor<2xf32>) {
+                  %cst_18 = arith.constant 0.000000e+00 : f32
+                  %73 = tt.splat %cst_18 : f32 -> tensor<2xf32>
+                  scf.yield %73 : tensor<2xf32>
+                } else {
+                  scf.yield %41 : tensor<2xf32>
+                }
+                %true_12 = arith.constant true
+                %44 = tt.splat %true_12 : i1 -> tensor<2xi1>
+                %45 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %46 = tt.reshape %45 : tensor<2xi32> -> tensor<2xi32>
+                %47 = arith.extsi %46 : tensor<2xi32> to tensor<2xi64>
+                %48 = tt.broadcast %47 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_13 = arith.constant 2 : i64
+                %49 = tt.splat %c2_i64_13 : i64 -> tensor<2xi64>
+                %50 = arith.cmpi slt, %48, %49 : tensor<2xi64>
+                %51 = arith.andi %44, %50 : tensor<2xi1>
+                %52 = tt.splat %true : i1 -> tensor<2xi1>
+                %53 = arith.andi %51, %52 : tensor<2xi1>
+                %c0_i64_14 = arith.constant 0 : i64
+                %54 = tt.splat %c0_i64_14 : i64 -> tensor<2xi64>
+                %55 = tt.splat %4 : i64 -> tensor<2xi64>
+                %56 = arith.addi %55, %48 : tensor<2xi64>
+                %57 = tt.splat %5 : i64 -> tensor<2xi64>
+                %58 = arith.cmpi slt, %56, %57 : tensor<2xi64>
+                %59 = arith.andi %53, %58 : tensor<2xi1>
+                %c4_i64_15 = arith.constant 4 : i64
+                %60 = tt.splat %c4_i64_15 : i64 -> tensor<2xi64>
+                %61 = arith.cmpi sge, %56, %54 : tensor<2xi64>
+                %62 = arith.cmpi slt, %56, %60 : tensor<2xi64>
+                %63 = arith.andi %61, %62 : tensor<2xi1>
+                %64 = arith.andi %59, %63 : tensor<2xi1>
+                %c0_i64_16 = arith.constant 0 : i64
+                %65 = tt.splat %c0_i64_16 : i64 -> tensor<2xi64>
+                %66 = arith.select %63, %56, %65 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_17 = arith.constant 1 : i64
+                %67 = tt.splat %c1_i64_17 : i64 -> tensor<2xi64>
+                %68 = arith.muli %66, %67 : tensor<2xi64>
+                %69 = arith.addi %65, %68 : tensor<2xi64>
+                %70 = arith.select %64, %69, %65 : tensor<2xi1>, tensor<2xi64>
+                %71 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %72 = tt.addptr %71, %70 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %72, %43, %64 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+    }
+
+    #[test]
+    fn test_lower_promoted_read_write_accumulation() {
+        // The read-write total is loaded once before the sequential loop, accumulates every input window in the loop,
+        // and is stored once after it.
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let definition = accumulate_windows::definition(&ArrayType::new_static(DataType::F32, [4]), &r#type).unwrap();
+        assert_eq!(
+            definition.interpret(
+                vec![Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![10f32, 20.0]).unwrap()],
+                1,
+            ),
+            Ok(vec![Array::vector(vec![14f32, 26.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c0_i64_0 = arith.constant 0 : i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.addi %c0_i64_0, %c2_i64 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %3 = tt.splat %cst : f32 -> tensor<2xf32>
+                %true_1 = arith.constant true
+                %4 = tt.splat %true_1 : i1 -> tensor<2xi1>
+                %5 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %6 = tt.reshape %5 : tensor<2xi32> -> tensor<2xi32>
+                %7 = arith.extsi %6 : tensor<2xi32> to tensor<2xi64>
+                %8 = tt.broadcast %7 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_2 = arith.constant 2 : i64
+                %9 = tt.splat %c2_i64_2 : i64 -> tensor<2xi64>
+                %10 = arith.cmpi slt, %8, %9 : tensor<2xi64>
+                %11 = arith.andi %4, %10 : tensor<2xi1>
+                %12 = tt.splat %true : i1 -> tensor<2xi1>
+                %13 = arith.andi %11, %12 : tensor<2xi1>
+                %c0_i64_3 = arith.constant 0 : i64
+                %14 = tt.splat %c0_i64_3 : i64 -> tensor<2xi64>
+                %15 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %16 = arith.addi %15, %8 : tensor<2xi64>
+                %17 = tt.splat %2 : i64 -> tensor<2xi64>
+                %18 = arith.cmpi slt, %16, %17 : tensor<2xi64>
+                %19 = arith.andi %13, %18 : tensor<2xi1>
+                %c2_i64_4 = arith.constant 2 : i64
+                %20 = tt.splat %c2_i64_4 : i64 -> tensor<2xi64>
+                %21 = arith.cmpi sge, %16, %14 : tensor<2xi64>
+                %22 = arith.cmpi slt, %16, %20 : tensor<2xi64>
+                %23 = arith.andi %21, %22 : tensor<2xi1>
+                %24 = arith.andi %19, %23 : tensor<2xi1>
+                %c0_i64_5 = arith.constant 0 : i64
+                %25 = tt.splat %c0_i64_5 : i64 -> tensor<2xi64>
+                %26 = arith.select %23, %16, %25 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64 = arith.constant 1 : i64
+                %27 = tt.splat %c1_i64 : i64 -> tensor<2xi64>
+                %28 = arith.muli %26, %27 : tensor<2xi64>
+                %29 = arith.addi %25, %28 : tensor<2xi64>
+                %30 = arith.select %24, %29, %25 : tensor<2xi1>, tensor<2xi64>
+                %31 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %32 = tt.addptr %31, %30 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %33 = tt.load %32, %24, %3 : tensor<2x!tt.ptr<f32>>
+                %c0_i64_6 = arith.constant 0 : i64
+                %c2_i64_7 = arith.constant 2 : i64
+                %c1_i64_8 = arith.constant 1 : i64
+                %34 = \
+                        scf.for %arg2 = %c0_i64_6 to %c2_i64_7 step %c1_i64_8 iter_args(%arg3 = %33) -> (tensor<2xf32>)  : \
+                    i64 {
+                  %c2_i64_15 = arith.constant 2 : i64
+                  %64 = arith.muli %arg2, %c2_i64_15 : i64
+                  %c2_i64_16 = arith.constant 2 : i64
+                  %65 = arith.addi %64, %c2_i64_16 : i64
+                  %c0_i64_17 = arith.constant 0 : i64
+                  %c2_i64_18 = arith.constant 2 : i64
+                  %66 = arith.addi %c0_i64_17, %c2_i64_18 : i64
+                  %cst_19 = arith.constant 0.000000e+00 : f32
+                  %67 = tt.splat %cst_19 : f32 -> tensor<2xf32>
+                  %true_20 = arith.constant true
+                  %68 = tt.splat %true_20 : i1 -> tensor<2xi1>
+                  %69 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %70 = tt.reshape %69 : tensor<2xi32> -> tensor<2xi32>
+                  %71 = arith.extsi %70 : tensor<2xi32> to tensor<2xi64>
+                  %72 = tt.broadcast %71 : tensor<2xi64> -> tensor<2xi64>
+                  %c2_i64_21 = arith.constant 2 : i64
+                  %73 = tt.splat %c2_i64_21 : i64 -> tensor<2xi64>
+                  %74 = arith.cmpi slt, %72, %73 : tensor<2xi64>
+                  %75 = arith.andi %68, %74 : tensor<2xi1>
+                  %76 = tt.splat %true : i1 -> tensor<2xi1>
+                  %77 = arith.andi %75, %76 : tensor<2xi1>
+                  %c0_i64_22 = arith.constant 0 : i64
+                  %78 = tt.splat %c0_i64_22 : i64 -> tensor<2xi64>
+                  %79 = tt.splat %64 : i64 -> tensor<2xi64>
+                  %80 = arith.addi %79, %72 : tensor<2xi64>
+                  %81 = tt.splat %65 : i64 -> tensor<2xi64>
+                  %82 = arith.cmpi slt, %80, %81 : tensor<2xi64>
+                  %83 = arith.andi %77, %82 : tensor<2xi1>
+                  %c4_i64 = arith.constant 4 : i64
+                  %84 = tt.splat %c4_i64 : i64 -> tensor<2xi64>
+                  %85 = arith.cmpi sge, %80, %78 : tensor<2xi64>
+                  %86 = arith.cmpi slt, %80, %84 : tensor<2xi64>
+                  %87 = arith.andi %85, %86 : tensor<2xi1>
+                  %88 = arith.andi %83, %87 : tensor<2xi1>
+                  %c0_i64_23 = arith.constant 0 : i64
+                  %89 = tt.splat %c0_i64_23 : i64 -> tensor<2xi64>
+                  %90 = arith.select %87, %80, %89 : tensor<2xi1>, tensor<2xi64>
+                  %c1_i64_24 = arith.constant 1 : i64
+                  %91 = tt.splat %c1_i64_24 : i64 -> tensor<2xi64>
+                  %92 = arith.muli %90, %91 : tensor<2xi64>
+                  %93 = arith.addi %89, %92 : tensor<2xi64>
+                  %94 = arith.select %88, %93, %89 : tensor<2xi1>, tensor<2xi64>
+                  %95 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                  %96 = tt.addptr %95, %94 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                  %97 = tt.load %96, %88, %67 : tensor<2x!tt.ptr<f32>>
+                  %98 = arith.addf %arg3, %97 : tensor<2xf32>
+                  scf.yield %98 : tensor<2xf32>
+                }
+                %true_9 = arith.constant true
+                %35 = tt.splat %true_9 : i1 -> tensor<2xi1>
+                %36 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %37 = tt.reshape %36 : tensor<2xi32> -> tensor<2xi32>
+                %38 = arith.extsi %37 : tensor<2xi32> to tensor<2xi64>
+                %39 = tt.broadcast %38 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_10 = arith.constant 2 : i64
+                %40 = tt.splat %c2_i64_10 : i64 -> tensor<2xi64>
+                %41 = arith.cmpi slt, %39, %40 : tensor<2xi64>
+                %42 = arith.andi %35, %41 : tensor<2xi1>
+                %43 = tt.splat %true : i1 -> tensor<2xi1>
+                %44 = arith.andi %42, %43 : tensor<2xi1>
+                %c0_i64_11 = arith.constant 0 : i64
+                %45 = tt.splat %c0_i64_11 : i64 -> tensor<2xi64>
+                %46 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %47 = arith.addi %46, %39 : tensor<2xi64>
+                %48 = tt.splat %2 : i64 -> tensor<2xi64>
+                %49 = arith.cmpi slt, %47, %48 : tensor<2xi64>
+                %50 = arith.andi %44, %49 : tensor<2xi1>
+                %c2_i64_12 = arith.constant 2 : i64
+                %51 = tt.splat %c2_i64_12 : i64 -> tensor<2xi64>
+                %52 = arith.cmpi sge, %47, %45 : tensor<2xi64>
+                %53 = arith.cmpi slt, %47, %51 : tensor<2xi64>
+                %54 = arith.andi %52, %53 : tensor<2xi1>
+                %55 = arith.andi %50, %54 : tensor<2xi1>
+                %c0_i64_13 = arith.constant 0 : i64
+                %56 = tt.splat %c0_i64_13 : i64 -> tensor<2xi64>
+                %57 = arith.select %54, %47, %56 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_14 = arith.constant 1 : i64
+                %58 = tt.splat %c1_i64_14 : i64 -> tensor<2xi64>
+                %59 = arith.muli %57, %58 : tensor<2xi64>
+                %60 = arith.addi %56, %59 : tensor<2xi64>
+                %61 = arith.select %55, %60, %56 : tensor<2xi1>, tensor<2xi64>
+                %62 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %63 = tt.addptr %62, %61 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %63, %34, %55 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+    }
+
+    #[test]
+    fn test_lower_promoted_read_write_loop() {
+        // The `while` loop carries the promoted value after its ordinary carries and before its iteration counter,
+        // and its condition yields the value unchanged.
+        let definition = double_repeatedly::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![1f32, 2.0]).unwrap()], 1),
+            Ok(vec![Array::vector(vec![4f32, 8.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c0_i64_0 = arith.constant 0 : i64
+                %c2_i64 = arith.constant 2 : i64
+                %2 = arith.addi %c0_i64_0, %c2_i64 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %3 = tt.splat %cst : f32 -> tensor<2xf32>
+                %true_1 = arith.constant true
+                %4 = tt.splat %true_1 : i1 -> tensor<2xi1>
+                %5 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %6 = tt.reshape %5 : tensor<2xi32> -> tensor<2xi32>
+                %7 = arith.extsi %6 : tensor<2xi32> to tensor<2xi64>
+                %8 = tt.broadcast %7 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_2 = arith.constant 2 : i64
+                %9 = tt.splat %c2_i64_2 : i64 -> tensor<2xi64>
+                %10 = arith.cmpi slt, %8, %9 : tensor<2xi64>
+                %11 = arith.andi %4, %10 : tensor<2xi1>
+                %12 = tt.splat %true : i1 -> tensor<2xi1>
+                %13 = arith.andi %11, %12 : tensor<2xi1>
+                %c0_i64_3 = arith.constant 0 : i64
+                %14 = tt.splat %c0_i64_3 : i64 -> tensor<2xi64>
+                %15 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %16 = arith.addi %15, %8 : tensor<2xi64>
+                %17 = tt.splat %2 : i64 -> tensor<2xi64>
+                %18 = arith.cmpi slt, %16, %17 : tensor<2xi64>
+                %19 = arith.andi %13, %18 : tensor<2xi1>
+                %c2_i64_4 = arith.constant 2 : i64
+                %20 = tt.splat %c2_i64_4 : i64 -> tensor<2xi64>
+                %21 = arith.cmpi sge, %16, %14 : tensor<2xi64>
+                %22 = arith.cmpi slt, %16, %20 : tensor<2xi64>
+                %23 = arith.andi %21, %22 : tensor<2xi1>
+                %24 = arith.andi %19, %23 : tensor<2xi1>
+                %c0_i64_5 = arith.constant 0 : i64
+                %25 = tt.splat %c0_i64_5 : i64 -> tensor<2xi64>
+                %26 = arith.select %23, %16, %25 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64 = arith.constant 1 : i64
+                %27 = tt.splat %c1_i64 : i64 -> tensor<2xi64>
+                %28 = arith.muli %26, %27 : tensor<2xi64>
+                %29 = arith.addi %25, %28 : tensor<2xi64>
+                %30 = arith.select %24, %29, %25 : tensor<2xi1>, tensor<2xi64>
+                %31 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %32 = tt.addptr %31, %30 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %33 = tt.load %32, %24, %3 : tensor<2x!tt.ptr<f32>>
+                %c0_i64_6 = arith.constant 0 : i64
+                %c2_i64_7 = arith.constant 2 : i64
+                %34 = arith.addi %c0_i64_6, %c2_i64_7 : i64
+                %c0_i64_8 = arith.constant 0 : i64
+                %c0_i64_9 = arith.constant 0 : i64
+                %35:3 = \
+                        scf.while (%arg1 = %c0_i64_8, %arg2 = %33, %arg3 = %c0_i64_9) : (i64, tensor<2xf32>, i64) -> (i64, \
+                    tensor<2xf32>, i64) {
+                  %c2_i64_16 = arith.constant 2 : i64
+                  %65 = arith.cmpi slt, %arg3, %c2_i64_16 : i64
+                  %66:2 = scf.if %65 -> (i1, tensor<2xf32>) {
+                    %c2_i64_17 = arith.constant 2 : i64
+                    %67 = arith.cmpi slt, %arg1, %c2_i64_17 : i64
+                    scf.yield %67, %arg2 : i1, tensor<2xf32>
+                  } else {
+                    %false = arith.constant false
+                    scf.yield %false, %arg2 : i1, tensor<2xf32>
+                  }
+                  scf.condition(%66#0) %arg1, %66#1, %arg3 : i64, tensor<2xf32>, i64
+                } do {
+                ^bb0(%arg1: i64, %arg2: tensor<2xf32>, %arg3: i64):
+                  %c1_i64_16 = arith.constant 1 : i64
+                  %65 = arith.addf %arg2, %arg2 : tensor<2xf32>
+                  %66 = arith.addi %arg1, %c1_i64_16 : i64
+                  %c1_i64_17 = arith.constant 1 : i64
+                  %67 = arith.addi %arg3, %c1_i64_17 : i64
+                  scf.yield %66, %65, %67 : i64, tensor<2xf32>, i64
+                }
+                %true_10 = arith.constant true
+                %36 = tt.splat %true_10 : i1 -> tensor<2xi1>
+                %37 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %38 = tt.reshape %37 : tensor<2xi32> -> tensor<2xi32>
+                %39 = arith.extsi %38 : tensor<2xi32> to tensor<2xi64>
+                %40 = tt.broadcast %39 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_11 = arith.constant 2 : i64
+                %41 = tt.splat %c2_i64_11 : i64 -> tensor<2xi64>
+                %42 = arith.cmpi slt, %40, %41 : tensor<2xi64>
+                %43 = arith.andi %36, %42 : tensor<2xi1>
+                %44 = tt.splat %true : i1 -> tensor<2xi1>
+                %45 = arith.andi %43, %44 : tensor<2xi1>
+                %c0_i64_12 = arith.constant 0 : i64
+                %46 = tt.splat %c0_i64_12 : i64 -> tensor<2xi64>
+                %47 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %48 = arith.addi %47, %40 : tensor<2xi64>
+                %49 = tt.splat %2 : i64 -> tensor<2xi64>
+                %50 = arith.cmpi slt, %48, %49 : tensor<2xi64>
+                %51 = arith.andi %45, %50 : tensor<2xi1>
+                %c2_i64_13 = arith.constant 2 : i64
+                %52 = tt.splat %c2_i64_13 : i64 -> tensor<2xi64>
+                %53 = arith.cmpi sge, %48, %46 : tensor<2xi64>
+                %54 = arith.cmpi slt, %48, %52 : tensor<2xi64>
+                %55 = arith.andi %53, %54 : tensor<2xi1>
+                %56 = arith.andi %51, %55 : tensor<2xi1>
+                %c0_i64_14 = arith.constant 0 : i64
+                %57 = tt.splat %c0_i64_14 : i64 -> tensor<2xi64>
+                %58 = arith.select %55, %48, %57 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_15 = arith.constant 1 : i64
+                %59 = tt.splat %c1_i64_15 : i64 -> tensor<2xi64>
+                %60 = arith.muli %58, %59 : tensor<2xi64>
+                %61 = arith.addi %57, %60 : tensor<2xi64>
+                %62 = arith.select %56, %61, %57 : tensor<2xi1>, tensor<2xi64>
+                %63 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %64 = tt.addptr %63, %62 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %64, %35#1, %56 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+    }
+
+    #[test]
+    fn test_lower_rejects_partial_promoted_windows() {
+        // Only whole windows are promoted, so the second write of the output through a slice keeps its reason.
+        let definition = overwrite_first::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
         assert_eq!(
             rejection(&definition),
             (
-                "kernel_call",
-                "reads after writes of one parameter need a CTA barrier, which ryft-mlir does not expose".to_owned(),
+                "reference_write",
+                "repeated writes of one window need a CTA barrier, which ryft-mlir does not expose".to_owned(),
             ),
         );
     }
 
     #[test]
     fn test_lower_rejects_carried_windows() {
-        // Every step stores into the same window, so the stores of two steps could land in either order.
-        let definition = carried_copy::definition(&ArrayType::new_static(DataType::F32, [4])).unwrap();
+        // The output window repeats along the outer sequential axis but changes along the inner one, so no SSA value
+        // can hold it across the outer loop, and the stores of two of its steps could land in either order.
+        let definition = repeated_copy::definition(&ArrayType::new_static(DataType::F32, [4])).unwrap();
         assert_eq!(
             rejection(&definition),
             (
                 "kernel_call",
                 "windows that repeat along a sequential grid axis need a CTA barrier, which ryft-mlir does not expose"
                     .to_owned(),
-            ),
-        );
-    }
-
-    #[test]
-    fn test_lower_rejects_reads_after_writes() {
-        let definition = read_after_write::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
-        assert_eq!(
-            rejection(&definition),
-            (
-                "reference_read",
-                "reads after writes of one parameter need a CTA barrier, which ryft-mlir does not expose".to_owned(),
-            ),
-        );
-    }
-
-    #[test]
-    fn test_lower_rejects_repeated_writes() {
-        let definition = write_twice::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
-        assert_eq!(
-            rejection(&definition),
-            (
-                "reference_write",
-                "repeated writes of one window need a CTA barrier, which ryft-mlir does not expose".to_owned(),
             ),
         );
     }
@@ -2572,12 +4121,27 @@ mod tests {
     #[test]
     fn test_lower_rejects_read_write_values_reaching_other_writes() {
         // Another thread may load an element of `values` after the store of `values` overwrites it and copy that new
-        // value into `output`.
-        let definition = copy_then_update::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
+        // value into `output`. Promoting `values` for its read after a write leaves one entry load and one exit store,
+        // which are just as unordered.
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let reason = (
+            "reference_write",
+            "values read from a read-write parameter may reach memory only elementwise through its own write"
+                .to_owned(),
+        );
+        assert_eq!(rejection(&copy_then_update::definition(&r#type).unwrap()), reason);
+        assert_eq!(rejection(&read_after_write::definition(&r#type).unwrap()), reason);
+    }
+
+    #[test]
+    fn test_lower_rejects_read_write_values_entering_control_flow() {
+        // The value read before the loop enters it as a carry, and values read from a read-write parameter may not
+        // cross region boundaries.
+        let definition = double_before_loop::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
         assert_eq!(
             rejection(&definition),
             (
-                "reference_write",
+                "while",
                 "values read from a read-write parameter may reach memory only elementwise through its own write"
                     .to_owned(),
             ),
@@ -2585,23 +4149,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_rejects_read_write_accesses_in_control_flow() {
-        let definition = double_repeatedly::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
-        assert_eq!(
-            rejection(&definition),
-            (
-                "while",
-                "accesses of a mutable window inside control flow need a CTA barrier, which ryft-mlir does not expose"
-                    .to_owned(),
-            ),
-        );
-    }
-
-    #[test]
     fn test_lower_rejects_mixed_atomic_accesses() {
-        let definition =
-            read_atomic_total::definition(&ArrayType::new_static(DataType::F32, [2]), &ArrayType::scalar(DataType::F32))
-                .unwrap();
+        let definition = read_atomic_total::definition(
+            &ArrayType::new_static(DataType::F32, [2]),
+            &ArrayType::scalar(DataType::F32),
+        )
+        .unwrap();
         assert_eq!(
             rejection(&definition),
             (
@@ -2896,7 +4449,9 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_masked_swap_rejects_used_old_values() {
+    fn test_lower_masked_swap_used_old_value() {
+        // The first output is promoted, so the swap takes its old value from the promoted value, with `other` at the
+        // padding element and at the physical padding, and the second output stores that old value.
         let operation = tiled_call(vec![
             (ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly, BoundaryPolicy::Masked),
             (ArrayType::new_static(DataType::F32, [3]), KernelParameterAccess::WriteOnly, BoundaryPolicy::InBounds),
@@ -2911,11 +4466,197 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            rejection(&definition),
-            (
-                "masked_swap",
-                "swaps whose old value is used need a CTA barrier, which ryft-mlir does not expose".to_owned(),
-            ),
+            definition.interpret(vec![], 1),
+            Ok(vec![Array::vector(vec![5f32, 5.0]).unwrap(), Array::vector(vec![5f32, 5.0, -1.0]).unwrap()]),
+        );
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %c1_i64 = arith.constant 1 : i64
+                %2 = arith.remsi %1, %c1_i64 : i64
+                %3 = arith.divsi %1, %c1_i64 : i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c3_i64 = arith.constant 3 : i64
+                %4 = arith.muli %2, %c3_i64 : i64
+                %c3_i64_0 = arith.constant 3 : i64
+                %5 = arith.addi %4, %c3_i64_0 : i64
+                %cst = arith.constant 0.000000e+00 : f32
+                %6 = tt.splat %cst : f32 -> tensor<4xf32>
+                %c3_i64_1 = arith.constant 3 : i64
+                %7 = arith.muli %2, %c3_i64_1 : i64
+                %c3_i64_2 = arith.constant 3 : i64
+                %8 = arith.addi %7, %c3_i64_2 : i64
+                %c3_i64_3 = arith.constant 3 : i64
+                %9 = arith.muli %2, %c3_i64_3 : i64
+                %c3_i64_4 = arith.constant 3 : i64
+                %10 = arith.addi %9, %c3_i64_4 : i64
+                %c1084227584_i32 = arith.constant 1084227584 : i32
+                %11 = arith.bitcast %c1084227584_i32 : i32 to f32
+                %12 = tt.splat %11 : f32 -> tensor<4xf32>
+                %c-1082130432_i32 = arith.constant -1082130432 : i32
+                %13 = arith.bitcast %c-1082130432_i32 : i32 to f32
+                %14 = tt.splat %13 : f32 -> tensor<4xf32>
+                %true_5 = arith.constant true
+                %15 = tt.splat %true_5 : i1 -> tensor<4xi1>
+                %16 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %17 = tt.reshape %16 : tensor<4xi32> -> tensor<4xi32>
+                %18 = arith.extsi %17 : tensor<4xi32> to tensor<4xi64>
+                %19 = tt.broadcast %18 : tensor<4xi64> -> tensor<4xi64>
+                %c3_i64_6 = arith.constant 3 : i64
+                %20 = tt.splat %c3_i64_6 : i64 -> tensor<4xi64>
+                %21 = arith.cmpi slt, %19, %20 : tensor<4xi64>
+                %22 = arith.andi %15, %21 : tensor<4xi1>
+                %23 = tt.splat %true : i1 -> tensor<4xi1>
+                %24 = arith.andi %22, %23 : tensor<4xi1>
+                %c0_i64_7 = arith.constant 0 : i64
+                %25 = tt.splat %c0_i64_7 : i64 -> tensor<4xi64>
+                %26 = tt.splat %7 : i64 -> tensor<4xi64>
+                %27 = arith.addi %26, %19 : tensor<4xi64>
+                %28 = tt.splat %8 : i64 -> tensor<4xi64>
+                %29 = arith.cmpi slt, %27, %28 : tensor<4xi64>
+                %30 = arith.andi %24, %29 : tensor<4xi1>
+                %c2_i64 = arith.constant 2 : i64
+                %31 = tt.splat %c2_i64 : i64 -> tensor<4xi64>
+                %32 = arith.cmpi sge, %27, %25 : tensor<4xi64>
+                %33 = arith.cmpi slt, %27, %31 : tensor<4xi64>
+                %34 = arith.andi %32, %33 : tensor<4xi1>
+                %35 = arith.andi %30, %34 : tensor<4xi1>
+                %true_8 = arith.constant true
+                %36 = tt.splat %true_8 : i1 -> tensor<4xi1>
+                %37 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %38 = tt.reshape %37 : tensor<4xi32> -> tensor<4xi32>
+                %39 = arith.extsi %38 : tensor<4xi32> to tensor<4xi64>
+                %40 = tt.broadcast %39 : tensor<4xi64> -> tensor<4xi64>
+                %c3_i64_9 = arith.constant 3 : i64
+                %41 = tt.splat %c3_i64_9 : i64 -> tensor<4xi64>
+                %42 = arith.cmpi slt, %40, %41 : tensor<4xi64>
+                %43 = arith.andi %36, %42 : tensor<4xi1>
+                %44 = tt.splat %true : i1 -> tensor<4xi1>
+                %45 = arith.andi %43, %44 : tensor<4xi1>
+                %c0_i64_10 = arith.constant 0 : i64
+                %46 = tt.splat %c0_i64_10 : i64 -> tensor<4xi64>
+                %47 = tt.splat %7 : i64 -> tensor<4xi64>
+                %48 = arith.addi %47, %40 : tensor<4xi64>
+                %49 = tt.splat %8 : i64 -> tensor<4xi64>
+                %50 = arith.cmpi slt, %48, %49 : tensor<4xi64>
+                %51 = arith.andi %45, %50 : tensor<4xi1>
+                %c2_i64_11 = arith.constant 2 : i64
+                %52 = tt.splat %c2_i64_11 : i64 -> tensor<4xi64>
+                %53 = arith.cmpi sge, %48, %46 : tensor<4xi64>
+                %54 = arith.cmpi slt, %48, %52 : tensor<4xi64>
+                %55 = arith.andi %53, %54 : tensor<4xi1>
+                %56 = arith.andi %51, %55 : tensor<4xi1>
+                %57 = arith.andi %56, %35 : tensor<4xi1>
+                %58 = arith.select %57, %12, %6 : tensor<4xi1>, tensor<4xf32>
+                %true_12 = arith.constant true
+                %59 = tt.splat %true_12 : i1 -> tensor<4xi1>
+                %60 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %61 = tt.reshape %60 : tensor<4xi32> -> tensor<4xi32>
+                %62 = arith.extsi %61 : tensor<4xi32> to tensor<4xi64>
+                %63 = tt.broadcast %62 : tensor<4xi64> -> tensor<4xi64>
+                %c3_i64_13 = arith.constant 3 : i64
+                %64 = tt.splat %c3_i64_13 : i64 -> tensor<4xi64>
+                %65 = arith.cmpi slt, %63, %64 : tensor<4xi64>
+                %66 = arith.andi %59, %65 : tensor<4xi1>
+                %67 = tt.splat %true : i1 -> tensor<4xi1>
+                %68 = arith.andi %66, %67 : tensor<4xi1>
+                %c0_i64_14 = arith.constant 0 : i64
+                %69 = tt.splat %c0_i64_14 : i64 -> tensor<4xi64>
+                %70 = tt.splat %7 : i64 -> tensor<4xi64>
+                %71 = arith.addi %70, %63 : tensor<4xi64>
+                %72 = tt.splat %8 : i64 -> tensor<4xi64>
+                %73 = arith.cmpi slt, %71, %72 : tensor<4xi64>
+                %74 = arith.andi %68, %73 : tensor<4xi1>
+                %c2_i64_15 = arith.constant 2 : i64
+                %75 = tt.splat %c2_i64_15 : i64 -> tensor<4xi64>
+                %76 = arith.cmpi sge, %71, %69 : tensor<4xi64>
+                %77 = arith.cmpi slt, %71, %75 : tensor<4xi64>
+                %78 = arith.andi %76, %77 : tensor<4xi1>
+                %79 = arith.andi %74, %78 : tensor<4xi1>
+                %80 = arith.andi %79, %35 : tensor<4xi1>
+                %81 = arith.select %80, %58, %14 : tensor<4xi1>, tensor<4xf32>
+                %82 = arith.select %80, %12, %58 : tensor<4xi1>, tensor<4xf32>
+                %true_16 = arith.constant true
+                %83 = tt.splat %true_16 : i1 -> tensor<4xi1>
+                %84 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %85 = tt.reshape %84 : tensor<4xi32> -> tensor<4xi32>
+                %86 = arith.extsi %85 : tensor<4xi32> to tensor<4xi64>
+                %87 = tt.broadcast %86 : tensor<4xi64> -> tensor<4xi64>
+                %c3_i64_17 = arith.constant 3 : i64
+                %88 = tt.splat %c3_i64_17 : i64 -> tensor<4xi64>
+                %89 = arith.cmpi slt, %87, %88 : tensor<4xi64>
+                %90 = arith.andi %83, %89 : tensor<4xi1>
+                %91 = tt.splat %true : i1 -> tensor<4xi1>
+                %92 = arith.andi %90, %91 : tensor<4xi1>
+                %c0_i64_18 = arith.constant 0 : i64
+                %93 = tt.splat %c0_i64_18 : i64 -> tensor<4xi64>
+                %94 = tt.splat %9 : i64 -> tensor<4xi64>
+                %95 = arith.addi %94, %87 : tensor<4xi64>
+                %96 = tt.splat %10 : i64 -> tensor<4xi64>
+                %97 = arith.cmpi slt, %95, %96 : tensor<4xi64>
+                %98 = arith.andi %92, %97 : tensor<4xi1>
+                %c3_i64_19 = arith.constant 3 : i64
+                %99 = tt.splat %c3_i64_19 : i64 -> tensor<4xi64>
+                %100 = arith.cmpi sge, %95, %93 : tensor<4xi64>
+                %101 = arith.cmpi slt, %95, %99 : tensor<4xi64>
+                %102 = arith.andi %100, %101 : tensor<4xi1>
+                %103 = arith.andi %98, %102 : tensor<4xi1>
+                %c0_i64_20 = arith.constant 0 : i64
+                %104 = tt.splat %c0_i64_20 : i64 -> tensor<4xi64>
+                %105 = arith.select %102, %95, %104 : tensor<4xi1>, tensor<4xi64>
+                %c1_i64_21 = arith.constant 1 : i64
+                %106 = tt.splat %c1_i64_21 : i64 -> tensor<4xi64>
+                %107 = arith.muli %105, %106 : tensor<4xi64>
+                %108 = arith.addi %104, %107 : tensor<4xi64>
+                %109 = arith.select %103, %108, %104 : tensor<4xi1>, tensor<4xi64>
+                %110 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+                %111 = tt.addptr %110, %109 : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
+                tt.store %111, %81, %103 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<4x!tt.ptr<f32>>
+                %true_22 = arith.constant true
+                %112 = tt.splat %true_22 : i1 -> tensor<4xi1>
+                %113 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %114 = tt.reshape %113 : tensor<4xi32> -> tensor<4xi32>
+                %115 = arith.extsi %114 : tensor<4xi32> to tensor<4xi64>
+                %116 = tt.broadcast %115 : tensor<4xi64> -> tensor<4xi64>
+                %c3_i64_23 = arith.constant 3 : i64
+                %117 = tt.splat %c3_i64_23 : i64 -> tensor<4xi64>
+                %118 = arith.cmpi slt, %116, %117 : tensor<4xi64>
+                %119 = arith.andi %112, %118 : tensor<4xi1>
+                %120 = tt.splat %true : i1 -> tensor<4xi1>
+                %121 = arith.andi %119, %120 : tensor<4xi1>
+                %c0_i64_24 = arith.constant 0 : i64
+                %122 = tt.splat %c0_i64_24 : i64 -> tensor<4xi64>
+                %123 = tt.splat %4 : i64 -> tensor<4xi64>
+                %124 = arith.addi %123, %116 : tensor<4xi64>
+                %125 = tt.splat %5 : i64 -> tensor<4xi64>
+                %126 = arith.cmpi slt, %124, %125 : tensor<4xi64>
+                %127 = arith.andi %121, %126 : tensor<4xi1>
+                %c2_i64_25 = arith.constant 2 : i64
+                %128 = tt.splat %c2_i64_25 : i64 -> tensor<4xi64>
+                %129 = arith.cmpi sge, %124, %122 : tensor<4xi64>
+                %130 = arith.cmpi slt, %124, %128 : tensor<4xi64>
+                %131 = arith.andi %129, %130 : tensor<4xi1>
+                %132 = arith.andi %127, %131 : tensor<4xi1>
+                %c0_i64_26 = arith.constant 0 : i64
+                %133 = tt.splat %c0_i64_26 : i64 -> tensor<4xi64>
+                %134 = arith.select %131, %124, %133 : tensor<4xi1>, tensor<4xi64>
+                %c1_i64_27 = arith.constant 1 : i64
+                %135 = tt.splat %c1_i64_27 : i64 -> tensor<4xi64>
+                %136 = arith.muli %134, %135 : tensor<4xi64>
+                %137 = arith.addi %133, %136 : tensor<4xi64>
+                %138 = arith.select %132, %137, %133 : tensor<4xi1>, tensor<4xi64>
+                %139 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+                %140 = tt.addptr %139, %138 : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
+                tt.store %140, %82, %132 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<4x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
         );
     }
 
@@ -3217,6 +4958,8 @@ mod tests {
                 location: context.unknown_location(),
                 remaining: 100,
                 maximum_tile_elements: 1024,
+                promotions: Vec::new(),
+                windows: Vec::new(),
             };
             let mut block = context.block_with_no_arguments();
             let predicate = lowering.boolean(&mut block, true).unwrap();
@@ -3237,6 +4980,8 @@ mod tests {
             location: context.unknown_location(),
             remaining: 100,
             maximum_tile_elements: 1024,
+            promotions: Vec::new(),
+            windows: Vec::new(),
         };
         let mut block = context.block_with_no_arguments();
         let left = lowering.boolean(&mut block, false).unwrap();
@@ -3475,6 +5220,8 @@ mod tests {
             location: context.unknown_location(),
             remaining: 100,
             maximum_tile_elements: 1024,
+            promotions: Vec::new(),
+            windows: Vec::new(),
         };
         let mut block = context.block_with_no_arguments();
         let zero = lowering.integer(&mut block, 0).unwrap();
@@ -3530,6 +5277,8 @@ mod tests {
             location: context.unknown_location(),
             remaining: 100,
             maximum_tile_elements: 1024,
+            promotions: Vec::new(),
+            windows: Vec::new(),
         };
         assert_eq!(lowering.physical(&[0, 3]).unwrap(), vec![1, 4]);
         assert_eq!(lowering.physical(&[32, 32]).unwrap(), vec![32, 32]);
@@ -3549,6 +5298,8 @@ mod tests {
             location: context.unknown_location(),
             remaining: 2,
             maximum_tile_elements: 1024,
+            promotions: Vec::new(),
+            windows: Vec::new(),
         };
         lowering.charge(2).unwrap();
         assert_eq!(lowering.remaining, 0);

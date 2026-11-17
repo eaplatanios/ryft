@@ -228,19 +228,24 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// ### Dispatchers
 ///
 /// `#[ryft(dispatch(...))]` selects the optional dispatchers. They are accepted in any order, although by convention
-/// `identity` is typically listed first:
+/// they are listed in the order in which the implementations are generated (i.e., `identity, discharge,
+/// partial_evaluation, batching, differentiation, transposition`):
 ///
-/// | Token             | Generated Dispatcher                                                        |
-/// | ----------------- | --------------------------------------------------------------------------- |
-/// | `identity`        | Payload-delegating `PartialEq`, `Eq`, and `Hash` (see below)                |
-/// | `discharge`       | [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) |
-/// | `batching`        | [`BatchableOperation`](crate::BatchableOperation)                           |
-/// | `differentiation` | [`DifferentiableOperation`](crate::DifferentiableOperation)                 |
-/// | `transposition`   | [`TransposableOperation`](crate::TransposableOperation)                     |
+/// | Token                | Generated Dispatcher                                                        |
+/// | -------------------- | --------------------------------------------------------------------------- |
+/// | `identity`           | Payload-delegating `PartialEq`, `Eq`, and `Hash` (see below)                |
+/// | `discharge`          | [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) |
+/// | `partial_evaluation` | [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation)     |
+/// | `batching`           | [`BatchableOperation`](crate::BatchableOperation)                           |
+/// | `differentiation`    | [`DifferentiableOperation`](crate::DifferentiableOperation)                 |
+/// | `transposition`      | [`TransposableOperation`](crate::TransposableOperation)                     |
 ///
-/// An empty list, an unknown token, and a repeated token are all compilation errors. Interpretation and partial
-/// evaluation implementations are always generated and therefore never appear in `dispatch(...)`. The selected
-/// dispatchers generate the following per-variant arms:
+/// An empty list, an unknown token, and a repeated token are all compilation errors. The interpretation implementation
+/// is always generated and therefore never appears in `dispatch(...)`. Select a dispatcher only when a program over the
+/// family needs it, because every generated implementation adds code and trait obligations. A family that needs its own
+/// rule for one of these traits (e.g., a partial evaluation rule that specializes one of its variants) leaves the
+/// dispatcher unselected and implements the trait by hand. The selected dispatchers generate the following
+/// per-variant arms:
 ///
 ///   - `identity` generates [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to the payload of each
 ///     variant, under which two operations are considered equal when they are the same variant with equal payloads, and
@@ -262,6 +267,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     destination context's constant type free, unlike the interpretation and partial evaluation implementations,
 ///     which pin it: no discharge rule reads a constant, and pinning it would exclude a capture-lifted program, whose
 ///     constants name its caller's captures rather than carrying the family's values.
+///   - `partial_evaluation` delegates native variants to the payload's own
+///     [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) rule, and the generated per-payload
+///     predicates transport that rule's value and context requirements to the enum's use site. Bare generic extension,
+///     [family](#nested-families), and member variants instead use the enclosing operation's canonical
+///     fold-or-residualize path, which also consults their [`Operation::fold`] rules without a second partial-value
+///     protocol, because the partial evaluation rule of a member or nested family belongs to programs over that family.
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
 ///     implementation and dispatches mixed variants in either role to the payload's parent-universe
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy
@@ -360,6 +371,20 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// homogeneous values. That adapter projects the inputs and forwards cotangent contributions to the original
 /// accumulators.
 ///
+/// ### Nested Families
+///
+/// A native variant whose payload is itself a complete operation family of the enum's primary type `T` (e.g., an
+/// [`ArrayIrOperation`](crate::ArrayIrOperation) embedded in a backend family that adds its own operations) may declare
+/// `#[ryft(family)]`. The marker cannot be combined with a member class, because the payload belongs to `T`, and it
+/// cannot be placed on a bare generic payload variant, which has no owned conversion. The variant remains native in
+/// every generated implementation except two:
+///
+///   - The [`OperationPayloadProjection`] implementation delegates to the nested family in both directions, exactly
+///     like a projected member variant, so that payloads held anywhere inside the nested family are recognized and
+///     constructed. Construction tries the enum's own native variants first, so a native variant takes precedence
+///     over a nested family that holds the same payload type.
+///   - The `partial_evaluation` dispatcher uses the canonical fold-or-residualize path for the variant.
+///
 /// ### Suppressing The Owned Conversion
 ///
 /// A variant may additionally use `#[ryft(skip_from)]` to suppress its generated owned `From<Payload>` conversion.
@@ -383,18 +408,16 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards native variants
 ///     directly and projects member variants into their native eager value family. Operation-specific eager semantics
 ///     still live on the payload implementations; the enum is only an adapter and dispatcher.
-///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that forwards native
-///     variants to their payload rules. Member variants use the enclosing operation's canonical fold-or-residualize
-///     path, which also consults projected [`Operation::fold`] rules without a second partial-value protocol.
-///   - [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
+///   - [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation),
+///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
 ///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers, when selected through
 ///     [`#[ryft(dispatch(...))]`](#dispatchers).
 ///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
 ///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
 ///     homogeneous operation-family projection.
 ///   - An [`OperationPayloadProjection`] implementation, which recognizes and constructs payloads without naming the
-///     family that holds them, delegating through projected member variants. Refer to its documentation for which
-///     payloads it exposes and for the construction precedence.
+///     family that holds them, delegating through projected member and [nested family](#nested-families) variants.
+///     Refer to its documentation for which payloads it exposes and for the construction precedence.
 ///   - An [`OperationProvider<T, GuardOperation<T>>`](OperationProvider) implementation that rejects every request
 ///     with [`GuardOperation::unsupported_error`](crate::GuardOperation::unsupported_error), generated only when no
 ///     family-native variant stores a [`GuardOperation`](crate::GuardOperation). Every [`Context`](crate::Context)
@@ -443,8 +466,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Generated semantic dispatchers place their required bounds on the participating payloads. Payload-specific
 ///     value and context requirements belong on the payload's own semantic-trait implementation; the enum does not
 ///     duplicate them.
-///   - Reference discharge, batching, differentiation, and transposition require selecting the corresponding
-///     dispatcher. Interpretation and partial evaluation are always generated and therefore do not appear in the
+///   - Reference discharge, partial evaluation, batching, differentiation, and transposition require selecting the
+///     corresponding dispatcher. Interpretation is always generated and therefore does not appear in the
 ///     `dispatch(...)` attribute.
 ///
 /// ## Examples
@@ -1262,16 +1285,17 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///
 /// `#[derive(Operation)]` generates the implementation of every derived family:
 ///
-///   - A projected member variant delegates to its member family in both directions. Payloads that a member family
-///     constructs are lifted through the family's `From` conversion from that member family, exactly as staging a
-///     member operation would.
+///   - A projected member variant, and a native variant that declares `#[ryft(family)]` (i.e., whose payload is a
+///     nested operation family of the same type), delegates to its payload family in both directions. Payloads that
+///     the payload family constructs are lifted through the family's `From` conversion from that payload family,
+///     exactly as staging a payload family operation would.
 ///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
 ///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
 ///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
 ///     such as `CompositeOperation<V, ArrayOperation<V>>` are not exposed.
 ///   - [`from_payload`](Self::from_payload) tries the family's own (family-native) variants first, in declaration
-///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
-///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
+///     order, and then its delegating variants, in declaration order, so a family's own variant takes precedence over
+///     a member or nested family that holds the same payload type. Mixed member variants are never constructed, because
 ///     their instruction boundaries differ from those of their payloads, and the derive rejects two family-native
 ///     variants that hold the same constructible payload type.
 ///

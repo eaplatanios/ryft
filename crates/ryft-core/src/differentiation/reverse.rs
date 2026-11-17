@@ -10121,7 +10121,7 @@ pub(crate) mod tests {
             type(ArrayIrType),
             constant(ArrayIrValue<Array>),
             members(ArrayType),
-            dispatch(differentiation, transposition),
+            dispatch(partial_evaluation, differentiation, transposition),
         )]
         enum ValueOnlyOperation {
             Constant(ConstantOperation<ArrayIrValue<Array>>),

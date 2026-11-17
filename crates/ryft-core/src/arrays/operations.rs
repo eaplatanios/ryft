@@ -45,7 +45,7 @@ use crate::programs::{Operation, TypeError, Typed};
 
 /// [`Operation`] family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
-#[ryft(dispatch(identity, batching, differentiation, transposition))]
+#[ryft(dispatch(identity, partial_evaluation, batching, differentiation, transposition))]
 pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation<ArrayType>),
@@ -254,7 +254,7 @@ impl<
 
 /// [`Operation`] family used for staged [`Program`](crate::Program)s over [`DimensionValue`]s.
 #[derive(Clone, Debug, Operation)]
-#[ryft(dispatch(identity))]
+#[ryft(dispatch(identity, partial_evaluation))]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Constant(ConstantOperation<V>),
     Max(DimensionMaxOperation),
@@ -334,7 +334,7 @@ impl<
     type(ArrayIrType),
     constant(ArrayIrValue<A>),
     members(ArrayType, structural(DimensionType)),
-    dispatch(identity, discharge, batching, differentiation, transposition),
+    dispatch(identity, discharge, partial_evaluation, batching, differentiation, transposition),
 )]
 pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Constructs a zero-filled array of the stored type using explicit runtime extents.

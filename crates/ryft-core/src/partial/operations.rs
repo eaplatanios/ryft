@@ -440,13 +440,14 @@ where
 ///
 /// # Deriving Partially Evaluatable Operation Enums
 ///
-/// The `#[derive(Operation)]` macro generates a [`PartiallyEvaluatableOperation`] implementation for operation enums.
-/// Native variants forward to their payload's own rule, and the generated per-payload predicates transport that rule's
-/// value and context requirements to the enum's use site. Declared member variants instead use the enclosing enum's
-/// canonical fold-or-residualize path because member-side partial values cannot represent values belonging to other
-/// members of the heterogeneous universe. This preserves correct folding and residualization without a second projected
-/// partial-value protocol. Refer to the documentation of [`Operation`] for the full derive contract. Partial evaluation
-/// is always generated and does not require a `dispatch(...)` selection.
+/// The `#[derive(Operation)]` macro generates a [`PartiallyEvaluatableOperation`] implementation for operation enums
+/// that select `#[ryft(dispatch(partial_evaluation))]`. Native variants forward to their payload's own rule, and the
+/// generated per-payload predicates transport that rule's value and context requirements to the enum's use site.
+/// Declared member variants instead use the enclosing enum's canonical fold-or-residualize path because member-side
+/// partial values cannot represent values belonging to other members of the heterogeneous universe. This preserves
+/// correct folding and residualization without a second projected partial-value protocol. Variants that declare
+/// `#[ryft(family)]` use the same path, because the rule of a nested family belongs to programs over that family.
+/// Refer to the documentation of [`Operation`] for the full derive contract.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses

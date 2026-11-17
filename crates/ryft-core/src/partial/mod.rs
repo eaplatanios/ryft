@@ -153,7 +153,7 @@ mod tests {
 
     /// Reference access family for capture-backed staging and partial-evaluation tests.
     #[derive(Clone, Debug, Operation)]
-    #[ryft(type(ArrayIrType), constant(TestCapture))]
+    #[ryft(type(ArrayIrType), constant(TestCapture), dispatch(partial_evaluation))]
     pub(super) enum TestCaptureOperation {
         Read(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
         Write(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
