@@ -64,14 +64,14 @@ impl EffectCompletion {
 /// asynchronously. [`Self::barrier`] waits for earlier reservations and reports failures in submission order.
 /// [`Self::acknowledge`] permits recovery only after affected work has completed and its failures have been observed.
 #[derive(Default)]
-pub(crate) struct EffectScope<'c> {
+pub(crate) struct EffectScope {
     /// Reservation, observation, and recovery state, which is never held across PJRT calls or device waits.
-    state: Mutex<EffectScopeState<'c>>,
+    state: Mutex<EffectScopeState>,
 }
 
-impl<'c> EffectScope<'c> {
+impl EffectScope {
     /// Reserves a position and snapshots the predecessor atomically before releasing the scope mutex.
-    pub(crate) fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation<'c>, Error> {
+    pub(crate) fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation, Error> {
         ensure_effect_dispatch_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         if device.is_some()
@@ -192,28 +192,31 @@ impl<'c> EffectScope<'c> {
     }
 }
 
-/// Reservation that borrows the client and is released on every preparation or submission failure.
-pub(crate) struct EffectReservation<'c> {
+/// Reservation that is released on every preparation or submission failure.
+pub(crate) struct EffectReservation {
     /// Invocation being prepared or published.
-    submission: Arc<EffectSubmission<'c>>,
+    submission: Arc<EffectSubmission>,
 
     /// Predecessor whose carrier will be forwarded if submission fails before handoff.
-    predecessor: Option<Arc<EffectSubmission<'c>>>,
+    predecessor: Option<Arc<EffectSubmission>>,
 
     /// Whether device work and its carrier have been published.
     published: bool,
 }
 
-impl<'c> EffectReservation<'c> {
+impl EffectReservation {
     /// Waits for the predecessor of this reservation to publish and returns its ordered carrier, which this submission
     /// must consume. Returns [`None`] when the reservation has no predecessor or the predecessor carries no tokens.
-    pub(crate) fn predecessor_carrier(&self) -> Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>> {
+    pub(crate) fn predecessor_carrier(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
         self.predecessor.as_ref().map_or(Ok(None), |previous| previous.carrier())
     }
 
     /// Publishes the ordered carrier or the boundary failure of this submission to its successors, and returns the
     /// completion that the caller must complete once the submitted device work is done.
-    pub(crate) fn publish(&self, carrier: Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>>) -> Arc<EffectCompletion> {
+    pub(crate) fn publish(
+        &self,
+        carrier: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
+    ) -> Arc<EffectCompletion> {
         self.submission.publish(carrier);
         Arc::clone(&self.submission.completion)
     }
@@ -224,7 +227,7 @@ impl<'c> EffectReservation<'c> {
     }
 }
 
-impl Drop for EffectReservation<'_> {
+impl Drop for EffectReservation {
     fn drop(&mut self) {
         if !self.published {
             // Cancellation must not wait, because the predecessor may still be prepared on this same calling thread.
@@ -279,20 +282,20 @@ pub(crate) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
 
 /// Host publication state for an effect carrier, including cancellation forwarding without a host wait.
 #[derive(Clone, Default)]
-enum EffectCarrier<'c> {
+enum EffectCarrier {
     /// The invocation has not published its physical result yet.
     #[default]
     Pending,
 
     /// The invocation published its physical result or submission failure.
-    Published(Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>>),
+    Published(Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>),
 
     /// Preparation was cancelled, so successors inherit the eventual carrier of the preceding invocation.
-    Forward(Option<Arc<EffectSubmission<'c>>>),
+    Forward(Option<Arc<EffectSubmission>>),
 }
 
 /// One reserved invocation. Carrier ownership remains tied to the client lifetime through ordinary buffers.
-struct EffectSubmission<'c> {
+struct EffectSubmission {
     /// Monotonically increasing submission identity, local to its scope.
     identity: u64,
 
@@ -303,15 +306,15 @@ struct EffectSubmission<'c> {
     completion: Arc<EffectCompletion>,
 
     /// Physical carrier publication or nonblocking forwarding of a cancelled reservation.
-    carrier: Mutex<EffectCarrier<'c>>,
+    carrier: Mutex<EffectCarrier>,
 
     /// Wakes submitting threads once the predecessor's physical result is available.
     published: Condvar,
 }
 
-impl<'c> EffectSubmission<'c> {
+impl EffectSubmission {
     /// Waits only for host publication, following cancelled reservations without recursion or device waits.
-    pub(super) fn carrier(&self) -> Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>> {
+    pub(super) fn carrier(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
         let mut carrier = self.publication();
         loop {
             match carrier {
@@ -324,13 +327,13 @@ impl<'c> EffectSubmission<'c> {
     }
 
     /// Publishes a carrier after execution handoff, or forwards the predecessor after a cancelled submission.
-    pub(super) fn publish(&self, carrier: Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>>) {
+    pub(super) fn publish(&self, carrier: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>) {
         *self.carrier.lock().expect("effect publication mutex poisoned") = EffectCarrier::Published(carrier);
         self.published.notify_all();
     }
 
     /// Waits for this reservation's publication state, without following forwarding links under its mutex.
-    fn publication(&self) -> EffectCarrier<'c> {
+    fn publication(&self) -> EffectCarrier {
         let mut carrier = self.carrier.lock().expect("effect publication mutex poisoned");
         while matches!(*carrier, EffectCarrier::Pending) {
             carrier = self.published.wait(carrier).expect("effect publication mutex poisoned");
@@ -339,7 +342,7 @@ impl<'c> EffectSubmission<'c> {
     }
 }
 
-impl Drop for EffectSubmission<'_> {
+impl Drop for EffectSubmission {
     fn drop(&mut self) {
         // Cancelled reservations can form a long forwarding chain. Detach uniquely owned links before dropping
         // each node so scope teardown does not consume one stack frame per cancelled submission.
@@ -357,15 +360,15 @@ impl Drop for EffectSubmission<'_> {
 
 /// Synchronized scope metadata. Callbacks never acquire this mutex or own this state.
 #[derive(Default)]
-struct EffectScopeState<'c> {
+struct EffectScopeState {
     /// Identity of the next reserved invocation.
     next_identity: u64,
 
     /// Latest ordered invocation, retained even after its successful completion is retired.
-    tail: Option<Arc<EffectSubmission<'c>>>,
+    tail: Option<Arc<EffectSubmission>>,
 
     /// Outstanding invocations and unacknowledged failures, in reservation order.
-    submissions: Vec<Arc<EffectSubmission<'c>>>,
+    submissions: Vec<Arc<EffectSubmission>>,
 
     /// Failures reported by completed barriers.
     observed: HashSet<u64>,
@@ -388,6 +391,8 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{domain_mesh, f64_vector, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_to_bytes};
     use crate::{
@@ -404,7 +409,7 @@ mod tests {
     /// That fixture only works on plugins that submit executables without waiting for unrecorded input definition
     /// events on the host, such as the CPU plugin. The CUDA plugin blocks the submitting thread until every input event
     /// is recorded, so there the chain is proven through submission order and barrier completion alone.
-    fn assert_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
+    fn assert_session_array_ordered_effects(client: &'static Client<'static>, hold_predecessor: bool) {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
@@ -455,7 +460,10 @@ mod tests {
     /// prints fire twice and the unordered print once. With `hold_predecessor`, the executions are submitted behind
     /// an outstanding predecessor token that is released only afterwards. Refer to
     /// [`assert_session_array_ordered_effects`] for why that fixture only works on CPU.
-    fn assert_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
+    fn assert_domain_effect_metadata_reload_and_unordered_completion(
+        client: &'static Client<'static>,
+        hold_predecessor: bool,
+    ) {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         ensure_print_handler_registered(client).unwrap();
@@ -758,13 +766,15 @@ mod tests {
         // from the host to the device gate CUDA executions, and the CUDA print handler observes device values in
         // submission order.
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         assert_session_array_ordered_effects(&client, false);
     }
 
@@ -778,13 +788,15 @@ mod tests {
     #[test]
     fn test_session_effect_metadata_reload_and_unordered_completion_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         assert_domain_effect_metadata_reload_and_unordered_completion(&client, false);
     }
 

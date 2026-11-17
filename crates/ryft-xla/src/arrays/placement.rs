@@ -87,7 +87,7 @@ impl From<Device> for DevicePutTarget {
     }
 }
 
-impl<'o> Array<'o> {
+impl Array {
     /// Moves or copies this array to the provided placement without donating the source buffers, so the original
     /// [`Array`] remains fully usable after the call returns. This is the `ryft` analogue of JAX's
     /// `jax.device_put(arr, sharding, donate=False)`.
@@ -116,7 +116,7 @@ impl<'o> Array<'o> {
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: [`DevicePutTarget`] that resolves to the destination [`DeviceMesh`] and [`Sharding`].
-    pub fn to_placement(&self, session: &Session<'o>, target: DevicePutTarget) -> Result<Self, Error> {
+    pub fn to_placement(&self, session: &Session, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
@@ -139,7 +139,7 @@ impl<'o> Array<'o> {
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: [`DevicePutTarget`] that resolves to the destination [`DeviceMesh`] and [`Sharding`].
-    pub fn into_placement(self, session: &Session<'o>, target: DevicePutTarget) -> Result<Self, Error> {
+    pub fn into_placement(self, session: &Session, target: DevicePutTarget) -> Result<Self, Error> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
@@ -161,7 +161,7 @@ impl<'o> Array<'o> {
     ///     its output. The donation only takes effect when this array is the only handle of its buffers.
     pub(crate) fn reshard_on_devices(
         self,
-        session: &Session<'o>,
+        session: &Session,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         donate: bool,
@@ -171,7 +171,7 @@ impl<'o> Array<'o> {
 
     /// Returns an array with the type and the placement of this array whose addressable shards are copies of the
     /// shards of this array on the same devices, so that the result shares no buffer with any other array.
-    pub(crate) fn with_copied_shard_buffers(&self, session: &Session<'o>) -> Result<Self, Error> {
+    pub(crate) fn with_copied_shard_buffers(&self, session: &Session) -> Result<Self, Error> {
         let buffers = self
             .addressable_shards()
             .filter_map(ArrayShard::buffer)
@@ -195,7 +195,7 @@ impl<'o> Array<'o> {
     /// because a host round trip cannot reuse device buffers.
     fn run_placement_dispatch(
         self,
-        session: &Session<'o>,
+        session: &Session,
         target_mesh: DeviceMesh,
         target_sharding: Sharding,
         donate: bool,
@@ -245,7 +245,7 @@ impl<'o> Array<'o> {
     /// this process issued, so that the readiness functions of the result surface the errors of those sends.
     fn place_exact_shards(
         &self,
-        session: &Session<'o>,
+        session: &Session,
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<Option<Self>, Error> {
@@ -288,11 +288,11 @@ impl<'o> Array<'o> {
     /// [`issue_cross_host_transfers`] issues the transfers of all processes in one global order.
     fn exact_shard_buffers(
         &self,
-        client: &'o Client<'_>,
+        client: &'static Client<'_>,
         global_shape: &StaticShape,
         mesh: &DeviceMesh,
         sharding: &Sharding,
-    ) -> Result<Option<(Vec<Arc<Buffer<'o>>>, Option<ExecutionFence>)>, Error> {
+    ) -> Result<Option<(Vec<Arc<Buffer<'static>>>, Option<ExecutionFence>)>, Error> {
         let client_process_index = client.process_index()?;
         let plan = match self.plan_exact_shard_put(client_process_index, global_shape, mesh, sharding)? {
             Some(plan) => plan,
@@ -404,7 +404,7 @@ impl<'o> Array<'o> {
             return Ok(None);
         }
 
-        let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&ArrayShard<'o>>>::new();
+        let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&ArrayShard>>::new();
         for shard in self.shards() {
             source_shards_by_slices.entry(shard.slice().to_vec()).or_default().push(shard);
         }
@@ -491,7 +491,7 @@ impl<'o> Array<'o> {
     #[allow(clippy::result_large_err)]
     fn reshard_on_devices_or_return(
         self,
-        session: &Session<'o>,
+        session: &Session,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         donate: bool,
@@ -526,7 +526,7 @@ impl<'o> Array<'o> {
     /// [`ArrayError::ManualReshardingAxis`] when the destination mesh has a `Manual` axis, while `Auto` and `Explicit`
     /// axes are supported, and [`ArrayError::MissingShardBuffer`] when a source shard on the current process has no
     /// buffer.
-    fn validate_compiled_reshard(&self, session: &Session<'o>, destination_mesh: &DeviceMesh) -> Result<(), Error> {
+    fn validate_compiled_reshard(&self, session: &Session, destination_mesh: &DeviceMesh) -> Result<(), Error> {
         // `Manual` axes are managed explicitly by the user (e.g., inside `shard_map`) and cannot be planned by the SPMD
         // partitioner from the top level. `Auto` and `Explicit` axes both go through SPMD partitioning, so both are
         // allowed.
@@ -556,7 +556,7 @@ impl<'o> Array<'o> {
     /// which requires the executed array to be the only handle of its buffers.
     fn reshard_on_same_mesh(
         self,
-        session: &Session<'o>,
+        session: &Session,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         donate: bool,
@@ -573,11 +573,11 @@ impl<'o> Array<'o> {
     /// annotations and PJRT options.
     fn compile_reshard_on_same_mesh(
         &self,
-        session: &Session<'o>,
+        session: &Session,
         destination_mesh: &DeviceMesh,
         destination_sharding: &Sharding,
         donate: bool,
-    ) -> Result<CompiledFunction<'o, ArrayType, ArrayType>, Error> {
+    ) -> Result<CompiledFunction<ArrayType, ArrayType>, Error> {
         let element_type = self.data_type();
         let shape = self.shape();
         let source_sharding = self.sharding().clone();
@@ -592,7 +592,7 @@ impl<'o> Array<'o> {
             .with_output_shardings(vec![destination_sharding.clone()])
             .with_donate(donate);
 
-        let staged: crate::StagedFunction<'_, ArrayType, ArrayType> =
+        let staged: crate::StagedFunction<ArrayType, ArrayType> =
             crate::stage(|input| input, bare_input_type, options)?;
         session.compile_staged_function(staged)
     }
@@ -604,10 +604,10 @@ impl<'o> Array<'o> {
     /// [`Self::block_until_ready`] surface their errors without this function waiting for them.
     fn reshard_replicated_across_meshes(
         &self,
-        session: &Session<'o>,
+        session: &Session,
         destination_mesh: &DeviceMesh,
         destination_sharding: &Sharding,
-    ) -> Result<Array<'o>, Error> {
+    ) -> Result<Array, Error> {
         let client = session.client();
         let client_process_index = client.process_index()?;
         let addressable_devices = client.addressable_devices()?;
@@ -639,7 +639,7 @@ impl<'o> Array<'o> {
         // this process owns a device of the source mesh, or by a cross-host receive otherwise. Remote destinations of
         // processes that own no device of the source mesh are served by cross-host sends from the process of the
         // canonical sender, and every other remote destination is ignored.
-        let mut local_buffers: HashMap<DeviceId, Buffer<'o>> = HashMap::new();
+        let mut local_buffers: HashMap<DeviceId, Buffer<'static>> = HashMap::new();
         let mut transfers = Vec::new();
         let element_type = self.data_type().to_pjrt();
         let dimensions = self.shape().as_slice().iter().map(|&size| size as i64).collect::<Vec<_>>();
@@ -742,10 +742,10 @@ impl<'o> Array<'o> {
     /// output shardings pay the compilation cost once.
     fn reshard_sharded_across_meshes(
         &self,
-        session: &Session<'o>,
+        session: &Session,
         destination_mesh: &DeviceMesh,
         destination_sharding: &Sharding,
-    ) -> Result<Array<'o>, Error> {
+    ) -> Result<Array, Error> {
         let source_mesh = self.mesh();
         let replicated_on_source = Sharding::replicated(source_mesh.logical_mesh().clone(), self.sharding().rank());
         // The source array is owned externally, so it is not donated to the all-gather. The gathered intermediate is
@@ -983,7 +983,7 @@ impl CrossHostShardReceivePlan {
 }
 
 /// One PJRT cross-host transfer that the current process takes part in, which [`issue_cross_host_transfers`] issues.
-enum CrossHostTransfer<'b, 'o> {
+enum CrossHostTransfer<'b> {
     /// Send of `buffer` from its device `source` of the current process to the device `destination` of another
     /// process.
     Send {
@@ -997,7 +997,7 @@ enum CrossHostTransfer<'b, 'o> {
         transfer_key: CrossHostTransferKey,
 
         /// Buffer to send.
-        buffer: &'b Buffer<'o>,
+        buffer: &'b Buffer<'static>,
     },
 
     /// Receive of a buffer of `element_type` and `dimensions` from the device `source` of another process onto
@@ -1013,7 +1013,7 @@ enum CrossHostTransfer<'b, 'o> {
         transfer_key: CrossHostTransferKey,
 
         /// Destination device.
-        device: &'b PjrtDevice<'o>,
+        device: &'b PjrtDevice<'static>,
 
         /// Element type of the received buffer.
         element_type: BufferType,
@@ -1023,7 +1023,7 @@ enum CrossHostTransfer<'b, 'o> {
     },
 }
 
-impl CrossHostTransfer<'_, '_> {
+impl CrossHostTransfer<'_> {
     /// Returns the IDs of the source and destination devices of this transfer.
     fn devices(&self) -> (DeviceId, DeviceId) {
         match self {
@@ -1082,10 +1082,10 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
 /// its matching transfer. Two processes that each send before they receive would therefore deadlock when they swap
 /// shards. Every process derives the same transfers from global metadata and issues its own in this one global order,
 /// so the first pair of devices with a pending transfer always has both of its processes waiting for it.
-fn issue_cross_host_transfers<'o>(
-    client: &'o Client<'_>,
-    mut transfers: Vec<CrossHostTransfer<'_, 'o>>,
-) -> Result<(Vec<Event<()>>, Vec<(DeviceId, Buffer<'o>)>), Error> {
+fn issue_cross_host_transfers(
+    client: &'static Client<'_>,
+    mut transfers: Vec<CrossHostTransfer<'_>>,
+) -> Result<(Vec<Event<()>>, Vec<(DeviceId, Buffer<'static>)>), Error> {
     transfers.sort_by_key(CrossHostTransfer::devices);
     let mut send_events = Vec::new();
     let mut received_buffers = Vec::new();
@@ -1117,10 +1117,10 @@ fn issue_cross_host_transfers<'o>(
 /// The preference is deterministic and depends only on global shard metadata, so that every process chooses the same
 /// source shard for a given destination shard. It prefers a source shard on the process of the destination shard,
 /// then a source shard on the device of the destination shard, and finally breaks ties by device ID and shard index.
-fn preferred_exact_source_shard<'o, 'c>(
-    source_shards: &[&'o ArrayShard<'c>],
+fn preferred_exact_source_shard<'o>(
+    source_shards: &[&'o ArrayShard],
     destination_shard: &ShardDescriptor,
-) -> &'o ArrayShard<'c> {
+) -> &'o ArrayShard {
     source_shards
         .iter()
         .min_by_key(|source_shard| {
@@ -1155,7 +1155,7 @@ mod tests {
     use super::*;
 
     // Returns the `f32` values that the devices of `array` hold, in the device order of its mesh.
-    fn shard_values(array: &Array<'_>) -> Vec<Vec<f32>> {
+    fn shard_values(array: &Array) -> Vec<Vec<f32>> {
         array
             .shards()
             .iter()
@@ -2072,7 +2072,7 @@ mod tests {
         .unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         let tiled = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let shared_buffers = |left: &Array<'_>, right: &Array<'_>| {
+        let shared_buffers = |left: &Array, right: &Array| {
             left.shards()
                 .iter()
                 .zip(right.shards())

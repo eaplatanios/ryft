@@ -307,7 +307,7 @@ impl<'o> std::borrow::Borrow<dyn EagerDispatchKeyView + 'o> for EagerDispatchKey
 
 /// Borrowed [`EagerDispatchKey`] over the arguments of one eager application, used to look up cache hits without
 /// building an owned key.
-pub(crate) struct EagerDispatchQuery<'o, 'c> {
+pub(crate) struct EagerDispatchQuery<'o> {
     /// Applied operation.
     operation: &'o Operation,
 
@@ -315,25 +315,25 @@ pub(crate) struct EagerDispatchQuery<'o, 'c> {
     regions: &'o [RegionKey<Constant, Operation>],
 
     /// Inputs of the application, which contain no references.
-    inputs: &'o [Value<'c>],
+    inputs: &'o [Value],
 
     /// Mesh that the eager lowering compiles against, as documented on [`EagerDispatchKey`].
     mesh: Option<&'o DeviceMesh>,
 }
 
-impl<'o, 'c> EagerDispatchQuery<'o, 'c> {
+impl<'o> EagerDispatchQuery<'o> {
     /// Creates a query that borrows the arguments of one eager operation application.
     pub(crate) fn new(
         operation: &'o Operation,
         regions: &'o [RegionKey<Constant, Operation>],
-        inputs: &'o [Value<'c>],
+        inputs: &'o [Value],
         mesh: Option<&'o DeviceMesh>,
     ) -> Self {
         Self { operation, regions, inputs, mesh }
     }
 }
 
-impl EagerDispatchKeyView for EagerDispatchQuery<'_, '_> {
+impl EagerDispatchKeyView for EagerDispatchQuery<'_> {
     fn operation(&self) -> &Operation {
         self.operation
     }
@@ -363,8 +363,8 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_, '_> {
 /// placements for one dispatch request. This function implements
 /// [`CompilationSession::dispatch_signature`](ryft_core::CompilationSession::dispatch_signature) for
 /// [`Session`](crate::Session).
-pub(super) fn dispatch_signature<'c>(
-    inputs: DispatchInputs<'_, '_, Value<'c>>,
+pub(super) fn dispatch_signature(
+    inputs: DispatchInputs<'_, '_, Value>,
     options: &Options,
 ) -> Result<(DispatchKey, Arc<[ArrayIrType]>, Option<Options>), Error> {
     let (input_types, values) = match inputs {
@@ -783,6 +783,8 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
+    #[cfg(feature = "cuda-13")]
     use crate::sessions::tests::replicated_vector_type;
     use crate::sessions::tests::{
         domain_mesh, external_reference_read_program, f32_vector, program_array, read_f32s, replicated_scalar_type,
@@ -798,10 +800,10 @@ mod tests {
 
     /// Traces the sum of `value` broadcast to the data-derived `extent` that `size` selects, from the inputs
     /// `[size, value]`.
-    fn trace_data_derived<'c>(
+    fn trace_data_derived(
         extent: DimensionVariable,
-        inputs: Vec<CompilationTracer<Session<'c>>>,
-    ) -> Result<CompilationTracer<Session<'c>>, Error> {
+        inputs: Vec<CompilationTracer<Session>>,
+    ) -> Result<CompilationTracer<Session>, Error> {
         let [size, value] = inputs.as_slice() else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };
@@ -827,7 +829,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let key = session.compilation_key(compiled.lowered().lowered_program()).unwrap();
         let independent_session = session_with_client(&client);
@@ -1031,7 +1033,7 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let function: CompiledFunctionDispatcher<Session<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = session
+        let function: CompiledFunctionDispatcher<Session, (), Vec<ArrayIrType>, ArrayIrType, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
 
         let call = |size: i64| {
@@ -1060,13 +1062,15 @@ mod tests {
     #[test]
     fn test_session_dispatch_signature_reuses_one_specialization_for_bounded_dynamic_programs_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
@@ -1080,7 +1084,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(session.program_count(), 1);
 
@@ -1114,7 +1118,7 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: CompiledFunctionDispatcher<Session<'_>, (), Vec<ArrayIrType>, ArrayIrType, _> = session
+        let function: CompiledFunctionDispatcher<Session, (), Vec<ArrayIrType>, ArrayIrType, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
         let call = |size: i64| {
             let size =
@@ -1195,7 +1199,7 @@ mod tests {
 
     #[test]
     fn test_normalize_dispatch_signature_reuses_power_of_two_specializations() {
-        fn trace<'c>(input: CompilationTracer<Session<'c>>) -> Result<CompilationTracer<Session<'c>>, Error> {
+        fn trace(input: CompilationTracer<Session>) -> Result<CompilationTracer<Session>, Error> {
             let context = input.context().clone();
             Ok(context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input])?.remove(0))
         }
@@ -1203,11 +1207,10 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<Session<'_>, (), ArrayIrType, ArrayIrType, _> = session
-            .jit_with_options(
-                |(), input| trace(input),
-                Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
-            );
+        let function: CompiledFunctionDispatcher<Session, (), ArrayIrType, ArrayIrType, _> = session.jit_with_options(
+            |(), input| trace(input),
+            Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
+        );
         let call = |values: &[f32]| {
             let input = f32_vector(&session, &mesh, values);
             function.execute((), Value::Array(input)).unwrap()

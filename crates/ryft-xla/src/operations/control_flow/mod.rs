@@ -560,7 +560,7 @@ mod tests {
     }
 
     /// Returns a two-device CPU client and a device mesh over its devices with the single mesh axis `x` of `axis_type`.
-    pub(super) fn two_device_mesh(axis_type: MeshAxisType) -> (Client<'static>, DeviceMesh) {
+    pub(super) fn two_device_mesh(axis_type: MeshAxisType) -> (&'static Client<'static>, DeviceMesh) {
         let client = cpu_client(2);
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(),
@@ -579,7 +579,7 @@ mod tests {
     /// given types, runtime placements, which default to those of the types, and values, and returns the `f32` shard
     /// of each output on each device.
     pub(super) fn execute_on_two_devices(
-        client: &Client<'static>,
+        client: &'static Client<'static>,
         mesh: &DeviceMesh,
         module: &str,
         inputs: &[(&ArrayType, Option<&Sharding>, &[f32])],

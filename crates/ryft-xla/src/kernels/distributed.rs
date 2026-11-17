@@ -218,9 +218,9 @@ impl DistributedKernelOptions {
 /// atomic delivery to every host, because a network failure after readiness may prevent one process from receiving a
 /// result already visible elsewhere. Cancellation cannot revoke a returned immutable output or abort submitted device
 /// work. The runtime, the loaded kernel, and their existing client and session resources must outlive this coordinator.
-pub struct DistributedKernel<'o, 'c> {
+pub struct DistributedKernel<'o> {
     /// Existing loaded kernel, whose client and session lifetime is retained by the caller.
-    kernel: &'o LoadedKernel<'c>,
+    kernel: &'o LoadedKernel,
 
     /// Shared coordination ownership, also retained by pending native completions.
     coordination: Arc<KernelCoordination>,
@@ -235,12 +235,12 @@ pub struct DistributedKernel<'o, 'c> {
     previous: Option<CoreReferenceCompletion>,
 }
 
-impl<'o, 'c> DistributedKernel<'o, 'c> {
+impl<'o> DistributedKernel<'o> {
     /// Creates one coordinator over a loaded stateless kernel and an existing distributed runtime.
     /// The initial transport supports one fully addressable device per participant and static array boundaries.
     pub fn new(
         runtime: &DistributedRuntime,
-        kernel: &'o LoadedKernel<'c>,
+        kernel: &'o LoadedKernel,
         options: DistributedKernelOptions,
     ) -> Result<Self, DistributedKernelError> {
         let options = DistributedKernelOptions::new(options.maximum_transfer_bytes, options.timeout)?
@@ -319,10 +319,10 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
     /// coordinator.
     pub fn call_async(
         &mut self,
-        inputs: Vec<Array<'c>>,
+        inputs: Vec<Array>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<StatefulExecution<Vec<Array<'c>>, DistributedKernelError>, DistributedKernelError> {
+    ) -> Result<StatefulExecution<Vec<Array>, DistributedKernelError>, DistributedKernelError> {
         if let Some(previous) = self.previous.take() {
             previous.r#await().map_err(|message| DistributedKernelError::Completion { message })?;
         }
@@ -359,10 +359,10 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
     /// Waits for the existing pending call surface and returns only globally ready functional outputs.
     pub fn call(
         &mut self,
-        inputs: Vec<Array<'c>>,
+        inputs: Vec<Array>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<Vec<Array<'c>>, DistributedKernelError> {
+    ) -> Result<Vec<Array>, DistributedKernelError> {
         self.call_async(inputs, sources, cancelled)?.r#await()
     }
 
@@ -370,11 +370,11 @@ impl<'o, 'c> DistributedKernel<'o, 'c> {
     fn run(
         &self,
         round: u64,
-        inputs: Vec<Array<'c>>,
+        inputs: Vec<Array>,
         sources: &[usize],
         cancelled: &AtomicBool,
         deadline: Instant,
-    ) -> Result<Execution<Vec<Array<'c>>>, DistributedKernelError> {
+    ) -> Result<Execution<Vec<Array>>, DistributedKernelError> {
         self.coordination.validate_progress(cancelled, deadline)?;
         let (session, types, mesh, identity, execution) = self.kernel.distributed_parts();
         if inputs.len() != types.len()
@@ -770,13 +770,14 @@ mod tests {
     use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, execution_client};
 
     use super::*;
 
     /// Produces a real scalar identity loaded on the CPU through the existing AOT persistence fixture.
-    fn loaded<'c>(session: &crate::Session<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
+    fn loaded(session: &crate::Session, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
         crate::kernels::aot::tests::executable_bundle(session, mesh, ryft_core::DataType::I32, false, &compiler)
             .load(session, &compiler, mesh)
@@ -784,7 +785,7 @@ mod tests {
     }
 
     /// Downloads one completed scalar result for independent host assertions.
-    fn scalar(array: &Array<'_>) -> i32 {
+    fn scalar(array: &Array) -> i32 {
         array.block_until_ready().unwrap();
         let bytes = array
             .addressable_shards()
@@ -942,15 +943,17 @@ mod tests {
         let mode = std::env::var("RYFT_KERNEL_MODE").unwrap();
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process as u32).unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = process_client(
+            &plugin,
+            ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }),
+        )
+        .unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![]).unwrap(),
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let compiler_options = if mode == "configuration" { 1 + process as u32 } else { 1 };
         let kernel = loaded(&session, &mesh, compiler_options);
         let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();

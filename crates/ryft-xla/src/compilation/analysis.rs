@@ -357,7 +357,7 @@ impl OptimizedProgram {
     }
 }
 
-impl AnalyzableCompilationDomain for Session<'_> {
+impl AnalyzableCompilationDomain for Session {
     type Analysis = CompilationAnalysis;
 
     fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
@@ -369,7 +369,7 @@ impl AnalyzableCompilationDomain for Session<'_> {
     }
 }
 
-impl CompiledProgram<'_> {
+impl CompiledProgram {
     /// Queries PJRT analysis without updating the shared analysis cache.
     pub(super) fn analyze(&self) -> Result<CompilationAnalysis, Error> {
         let executable = self.executable().executable()?;
@@ -535,7 +535,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             |_, _, input| Ok(input),
             Vec::new(),
             ArrayType::scalar(DataType::F32).into(),

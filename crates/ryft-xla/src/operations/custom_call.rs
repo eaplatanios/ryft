@@ -1840,7 +1840,7 @@ mod tests {
         // `CustomCallBatching::BroadcastAll` materializes every operand on the batch axis, so the elementwise handler
         // receives one buffer with a leading batch axis in a single call.
         let broadcast_row_type = row_type.clone();
-        let output: Array<'_> = batch(
+        let output: Array = batch(
             move |row| {
                 let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![broadcast_row_type])
                     .with_batching(CustomCallBatching::BroadcastAll);
@@ -1859,7 +1859,7 @@ mod tests {
         // family.
         for unroll in [CustomCallUnrolling::Disabled, CustomCallUnrolling::Factor(2), CustomCallUnrolling::Full] {
             let sequential_row_type = row_type.clone();
-            let output: Array<'_> = batch(
+            let output: Array = batch(
                 move |row| {
                     let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![sequential_row_type])
                         .with_batching(CustomCallBatching::Sequential { unroll });
@@ -2011,7 +2011,7 @@ mod tests {
         // the cotangent through because d(x + 1)/dx is the identity.
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2])]);
         let function = Composite::from_custom_call(operation.clone()).with_vjp(
-            move |inputs: Vec<DomainTracer<ProjectedContext<Session<'_>, ArrayType>>>| {
+            move |inputs: Vec<DomainTracer<ProjectedContext<Session, ArrayType>>>| {
                 Ok((CustomCall::custom_call(&operation, &inputs)?, ()))
             },
             |(), cotangents| Ok(cotangents),

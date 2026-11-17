@@ -488,12 +488,12 @@ mod tests {
 
         // The compiled `reduce_window` scan reproduces the exact prefix sums of the operand, and its reverse
         // direction the exact suffix sums.
-        let forward: CompiledFunction<'_, ArrayType, ArrayType> =
+        let forward: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = forward.executable().execute(&engine, source()).unwrap();
         assert_eq!(read_f32s(&client, &output), vec![1.0, 3.0, 6.0, 10.0]);
 
-        let reverse: CompiledFunction<'_, ArrayType, ArrayType> =
+        let reverse: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = reverse.executable().execute(&engine, source()).unwrap();
         assert_eq!(read_f32s(&client, &output), vec![10.0, 9.0, 7.0, 4.0]);
@@ -501,14 +501,14 @@ mod tests {
         // Reverse mode differentiation through the compiled scan exercises the transposed direction end to end.
         // Summing every prefix weights element `i` by the number of prefixes that contain it, so the gradient is the
         // reverse scan of ones.
-        let total: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let total: CompiledFunction<ArrayType, ArrayType> = compile(
             |x| x.cumulative_sum(0).unwrap().reduce(&[0], ReductionKind::Sum).unwrap(),
             input_type.clone(),
             &engine,
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<ArrayType, ArrayType> = total.gradient(&engine).unwrap();
         let output = gradient.executable().execute(&engine, source()).unwrap();
         assert_eq!(read_f32s(&client, &output), vec![4.0, 3.0, 2.0, 1.0]);
     }
@@ -674,7 +674,7 @@ mod tests {
 
         // The compiled guarded expansion returns `log(4)` for four equal zeros, and the same value shifted by the
         // maximum for four equal thousands, where an unshifted `sum(exp(x))` would have overflowed `f32` outright.
-        let reduced: CompiledFunction<'_, ArrayType, ArrayType> =
+        let reduced: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = reduced.executable().execute(&engine, source([0.0; 4])).unwrap();
         assert_close(&read_f32s(&client, &output), &[4.0f32.ln()]);
@@ -683,7 +683,7 @@ mod tests {
 
         // The reverse prefix scan folds the pairwise stable `log_add_exp` over each suffix, so position `i` of an
         // operand of zeros holds `log(4 - i)` and the final position holds `log(1) = 0`.
-        let scanned: CompiledFunction<'_, ArrayType, ArrayType> =
+        let scanned: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_log_sum_exp(0).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let output = scanned.executable().execute(&engine, source([0.0; 4])).unwrap();
@@ -823,7 +823,7 @@ mod tests {
             &[4],
             values_to_bytes(&[4f32, 0.25, -1.5, 2.5]).as_slice(),
         );
-        let read = |array: Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
 
         // Dyadic inputs keep every sum and product exact, whatever tree the scan combines them in.
         assert_eq!(read(increasing.cumulative_sum(0).unwrap()), vec![0.5, 1.75, 3.75, 7.5]);
@@ -1160,7 +1160,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         for rows in [2usize, 4] {
             let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();

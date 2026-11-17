@@ -67,17 +67,17 @@ struct State {
     statistics: Arc<Statistics>,
 }
 
-impl<'c> RuntimeProvider<'c> for StateProvider {
+impl RuntimeProvider for StateProvider {
     fn identifier(&self) -> &str {
         self.identifier
     }
 
     fn initialize(
         &self,
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
         target: &Target,
         requirement: &RuntimeRequirement,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+    ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         assert!(target.platform_name().eq_ignore_ascii_case("cpu"));
         assert_eq!(requirement, &RuntimeRequirement::new(self.identifier, 1, Vec::new()).unwrap());
         // Both named types are part of this handler's ABI. Register them before installing the callback, while
@@ -101,8 +101,8 @@ impl<'c> RuntimeProvider<'c> for StateProvider {
     }
 }
 
-impl<'c> RuntimeExtension<'c> for State {
-    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+impl RuntimeExtension for State {
+    fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
         self.statistics.prepared.fetch_add(1, Ordering::SeqCst);
         // The session retains this stable runtime allocation until the whole execution completes, including when
         // public outputs are dropped. The named native type belongs to this `State` representation.
@@ -167,11 +167,12 @@ unsafe extern "C" fn add_states_handler(frame: *mut XLA_FFI_CallFrame) -> *mut X
 }
 
 /// Creates the CPU client and one-device mesh shared by a test's isolated sessions.
-fn client_and_mesh() -> (Client<'static>, DeviceMesh) {
+fn client_and_mesh() -> (&'static Client<'static>, DeviceMesh) {
     let client = load_cpu_plugin()
         .unwrap()
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let client: &'static Client<'static> = Box::leak(Box::new(client));
     let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
     let mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -182,7 +183,7 @@ fn client_and_mesh() -> (Client<'static>, DeviceMesh) {
 }
 
 /// Creates separate providers, optionally violating the distinct native type binding contract.
-fn providers<'c>(left: &Arc<Statistics>, right: &Arc<Statistics>, duplicate_binding: bool) -> RuntimeExtensions<'c> {
+fn providers(left: &Arc<Statistics>, right: &Arc<Statistics>, duplicate_binding: bool) -> RuntimeExtensions {
     RuntimeExtensions::empty()
         .with_provider(Arc::new(StateProvider {
             identifier: LEFT,
@@ -201,10 +202,10 @@ fn providers<'c>(left: &Arc<Statistics>, right: &Arc<Statistics>, duplicate_bind
 }
 
 /// Stages a source custom call using only the downstream public compilation API.
-fn staged<'c>(
+fn staged(
     mesh: DeviceMesh,
     requirements: Vec<RuntimeRequirement>,
-) -> CoreStagedFunction<Session<'c>, ArrayIrType, ArrayIrType> {
+) -> CoreStagedFunction<Session, ArrayIrType, ArrayIrType> {
     let r#type = ArrayType::scalar(DataType::I32);
     let operation =
         with_runtime_requirements(CustomCallOperation::new(TARGET, vec![r#type.clone()]), requirements).unwrap();
@@ -223,7 +224,7 @@ fn requirements() -> Vec<RuntimeRequirement> {
 }
 
 /// Waits for the concrete scalar output, observing callback completion before any lifecycle assertions.
-fn scalar(value: &Value<'_>) -> i32 {
+fn scalar(value: &Value) -> i32 {
     let Value::Array(array) = value else { panic!("expected an array output") };
     let bytes = array.shards()[0].buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
     i32::from_ne_bytes(bytes.as_slice().try_into().unwrap())
@@ -235,7 +236,7 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     let left = Arc::new(Statistics::default());
     let right = Arc::new(Statistics::default());
     let configuration = providers(&left, &right, false);
-    let first = Session::builder().client(&client).runtime_extensions(configuration.clone()).build().unwrap();
+    let first = Session::builder().client(client).runtime_extensions(configuration.clone()).build().unwrap();
     let lowered = staged(mesh.clone(), requirements()).lower(&first).unwrap();
     assert_eq!(lowered.lowered_program().runtime_requirements(), requirements());
     assert_eq!(left.initialized.load(Ordering::SeqCst), 0);
@@ -258,7 +259,7 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     assert_eq!(right.called.load(Ordering::SeqCst), 2);
 
     let bytes = first.serialize_program(compiled.compiled_program()).unwrap().unwrap();
-    let second = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+    let second = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
     assert_eq!(left.initialized.load(Ordering::SeqCst), 1);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 1);
     let restored = second.deserialize_program(&bytes).unwrap().unwrap();
@@ -272,7 +273,7 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     assert_eq!(left.called.load(Ordering::SeqCst), 3);
     assert_eq!(right.called.load(Ordering::SeqCst), 3);
 
-    let missing = Session::builder().client(&client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+    let missing = Session::builder().client(client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
     assert!(matches!(missing.deserialize_program(&bytes),
         Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == LEFT));
 }
@@ -283,12 +284,12 @@ fn test_runtime_extensions_reject_missing_provider_before_compilation_and_cached
     let left = Arc::new(Statistics::default());
     let right = Arc::new(Statistics::default());
     let first = Session::builder()
-        .client(&client)
+        .client(client)
         .runtime_extensions(providers(&left, &right, false))
         .build()
         .unwrap();
     let lowered = staged(mesh.clone(), requirements()).lower(&first).unwrap();
-    let missing = Session::builder().client(&client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+    let missing = Session::builder().client(client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
     assert!(matches!(lowered.compile(&missing),
         Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == LEFT));
     assert_eq!(left.initialized.load(Ordering::SeqCst), 0);
@@ -307,7 +308,7 @@ fn test_runtime_extensions_reject_duplicate_native_binding_before_submission() {
     let left = Arc::new(Statistics::default());
     let right = Arc::new(Statistics::default());
     let session = Session::builder()
-        .client(&client)
+        .client(client)
         .runtime_extensions(providers(&left, &right, true))
         .build()
         .unwrap();
@@ -328,17 +329,17 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
 
     struct FailingProvider;
 
-    impl<'c> RuntimeProvider<'c> for FailingProvider {
+    impl RuntimeProvider for FailingProvider {
         fn identifier(&self) -> &str {
             "ryft.test.runtime_extensions.failure"
         }
 
         fn initialize(
             &self,
-            client: &'c Client<'c>,
+            client: &'static Client<'static>,
             target: &Target,
             requirement: &RuntimeRequirement,
-        ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        ) -> Result<Arc<dyn RuntimeExtension>, Error> {
             let _ = (client, target, requirement);
             Err(Error::custom(ProviderFailure))
         }
@@ -346,7 +347,7 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
 
     let (client, mesh) = client_and_mesh();
     let configuration = RuntimeExtensions::empty().with_provider(Arc::new(FailingProvider)).unwrap();
-    let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+    let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
     let requirement = RuntimeRequirement::new("ryft.test.runtime_extensions.failure", 1, Vec::new()).unwrap();
     let error = staged(mesh, vec![requirement]).lower(&session).unwrap().compile(&session).err().unwrap();
     assert_eq!(error.downcast_custom::<ProviderFailure>(), Some(&ProviderFailure));

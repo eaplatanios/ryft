@@ -111,7 +111,7 @@ impl DevicePutOptions<DevicePutTarget, DevicePutTarget, bool, Option<bool>> {
 /// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft` currently provides
 /// implementations for runtime [`Array`] leaves, primitive scalar host values, and host arrays of the reference backend
 /// ([`ryft_core::Array`]), which are uploaded as dense arrays whatever their host layout is.
-pub trait DevicePutLeaf<'c>: Parameter {
+pub trait DevicePutLeaf: Parameter {
     /// Converts `self` into one runtime [`Array`] using the provided leafwise placement options.
     ///
     /// # Parameters
@@ -124,23 +124,23 @@ pub trait DevicePutLeaf<'c>: Parameter {
     ///   - `may_alias`: Whether the result may share buffers with other arrays. `Some(false)` forbids it.
     fn device_put_leaf(
         self,
-        session: &Session<'c>,
+        session: &Session,
         device: Option<DevicePutTarget>,
         source: Option<DevicePutTarget>,
         donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<Array<'c>, Error>;
+    ) -> Result<Array, Error>;
 }
 
-impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
+impl<T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf for T {
     fn device_put_leaf(
         self,
-        session: &Session<'c>,
+        session: &Session,
         device: Option<DevicePutTarget>,
         source: Option<DevicePutTarget>,
         donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<Array<'c>, Error> {
+    ) -> Result<Array, Error> {
         // A host value has no placement to validate and no device buffers to donate or share.
         let _ = (source, donate, may_alias);
         let client = session.client();
@@ -162,15 +162,15 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
     }
 }
 
-impl<'c> DevicePutLeaf<'c> for Array<'c> {
+impl DevicePutLeaf for Array {
     fn device_put_leaf(
         self,
-        session: &Session<'c>,
+        session: &Session,
         device: Option<DevicePutTarget>,
         source: Option<DevicePutTarget>,
         donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<Array<'c>, Error> {
+    ) -> Result<Array, Error> {
         let current_mesh = self.mesh().clone();
         let current_sharding = self.sharding().clone();
         if let Some(source) = source {
@@ -206,7 +206,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
     }
 }
 
-impl<'c> Session<'c> {
+impl Session {
     /// Places `x` on devices. This is the `ryft` analogue of JAX's
     /// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html).
     ///
@@ -222,7 +222,7 @@ impl<'c> Session<'c> {
     ///   - `x`: Leaf or tree of leaves to place.
     ///   - `options`: Destination, expected source, donation, and aliasing options for the leaves of `x`.
     pub fn device_put<
-        P: DevicePutLeaf<'c>,
+        P: DevicePutLeaf,
         Input: Parameterized<P>,
         DeviceTarget: Parameterized<DevicePutTarget>,
         SourceTarget: Parameterized<DevicePutTarget>,
@@ -232,9 +232,9 @@ impl<'c> Session<'c> {
         &self,
         x: Input,
         options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
-    ) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, Error>
+    ) -> Result<<Input as Parameterized<P>>::To<Array>, Error>
     where
-        <Input as Parameterized<P>>::Family: ParameterizedFamily<Array<'c>>
+        <Input as Parameterized<P>>::Family: ParameterizedFamily<Array>
             + ParameterizedFamily<DevicePutTarget>
             + ParameterizedFamily<bool>
             + ParameterizedFamily<Option<bool>>,
@@ -295,7 +295,7 @@ impl<'c> Session<'c> {
                 may_alias_values.next().unwrap(),
             )?);
         }
-        Input::To::<Array<'c>>::from_parameters(structure, output_parameters).map_err(Into::into)
+        Input::To::<Array>::from_parameters(structure, output_parameters).map_err(Into::into)
     }
 }
 
@@ -412,7 +412,7 @@ mod tests {
     use super::*;
 
     // Returns the `f32` values that the devices of `array` hold, in the device order of its mesh.
-    fn shard_values(array: &Array<'_>) -> Vec<Vec<f32>> {
+    fn shard_values(array: &Array) -> Vec<Vec<f32>> {
         array
             .shards()
             .iter()
@@ -585,7 +585,7 @@ mod tests {
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();
-        let shares_source_buffer = |array: &Array<'_>| {
+        let shares_source_buffer = |array: &Array| {
             array
                 .shards()
                 .iter()

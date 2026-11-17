@@ -4,8 +4,8 @@
 //! [`SessionBuilder`](crate::SessionBuilder) selects one of them. A client that `ryft-xla` creates for a session lives
 //! for the rest of the process, like the backend clients of JAX, and sessions that request the same plugin with equal
 //! client options share it. Sharing matters most on accelerators, where a second client in the same process would
-//! reserve device memory of its own. Programs that must destroy their client, or that need a client that `ryft-xla`
-//! cannot create (e.g., one bound to a [`DistributedRuntime`](crate::DistributedRuntime)), create it themselves and
+//! reserve device memory of its own. Programs that need a client that `ryft-xla` cannot create (e.g., one bound to a
+//! [`DistributedRuntime`](crate::DistributedRuntime)) create it themselves, keep it for the rest of the process, and
 //! pass it to [`SessionBuilder::client`](crate::SessionBuilder::client).
 
 // TODO(eaplatanios): Review this module.
@@ -216,7 +216,7 @@ static PROCESS_CLIENTS: Mutex<Vec<ProcessClient>> = Mutex::new(Vec::new());
 ///
 /// Returns [`Error::Pjrt`] if the plugin cannot be initialized or the client cannot be created. Neither failure is
 /// retained by this function, so a later request attempts to create the client again.
-pub(super) fn process_client(plugin: &Plugin, options: ClientOptions) -> Result<&'static Client<'static>, Error> {
+pub(crate) fn process_client(plugin: &Plugin, options: ClientOptions) -> Result<&'static Client<'static>, Error> {
     let mut clients = PROCESS_CLIENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = clients.iter().find(|existing| existing.plugin == *plugin && existing.options == options) {
         return Ok(existing.client);

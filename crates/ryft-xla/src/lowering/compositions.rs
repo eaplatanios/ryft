@@ -368,8 +368,8 @@ mod tests {
         // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
         // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
         let boundary_type = ArrayType::scalar(DataType::F32);
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| Ok(inputs),
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| Ok(inputs),
             vec![ArrayIrType::from(boundary_type.clone())],
         )
         .unwrap();
@@ -410,8 +410,8 @@ mod tests {
         let composite = CompositeKey::new("downstream.example", 1);
         let mut registry = NamedCompositionFunctionMap::default();
         for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
-            let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-                |inputs: Vec<Tracer<'static>>| Ok(inputs),
+            let (_, program) = DomainTracingContext::<Session>::trace(
+                |inputs: Vec<Tracer>| Ok(inputs),
                 vec![ArrayIrType::from(boundary_type.clone())],
             )
             .unwrap();

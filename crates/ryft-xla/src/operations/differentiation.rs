@@ -173,7 +173,7 @@ mod tests {
         let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.clone() * x.stop_gradient().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -193,7 +193,7 @@ mod tests {
         }
 
         // Lowering preserves every result of one variadic barrier without materializing an MLIR operation.
-        let variadic: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let variadic: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(first, second)| {
                 let context = first.domain();
                 let mut outputs = context.bind(StopGradientOperation::new(), Vec::new(), &[first, second]).unwrap();
@@ -415,15 +415,15 @@ mod tests {
         // the function, it still covers the cotangent that the backward computation receives.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let lower = |optimization_barrier: RematerializationOptimizationBarrier| {
-            let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
+            let function = rematerialize(|x: Tracer| -> Result<Tracer, ProgramError> {
                 let context = x.context();
                 let square =
                     context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
                 Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
             })
             .with_optimization_barrier(optimization_barrier);
-            let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-                |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+            let (_, program) = DomainTracingContext::<Session>::trace(
+                |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
                 ArrayIrType::from(scalar_type.clone()),
             )
             .unwrap();
@@ -496,13 +496,13 @@ mod tests {
         // forward over reverse Hessian-vector product) or in reverse mode (i.e., the gradient of the gradient), keeps
         // differentiated calls, whose recomputations therefore stay behind optimization barriers.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
+        let function = rematerialize(|x: Tracer| -> Result<Tracer, ProgramError> {
             let context = x.context();
             let square = context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
             Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
         });
-        let (_, gradient) = DomainTracingContext::<Session<'static>>::trace(
-            |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+        let (_, gradient) = DomainTracingContext::<Session>::trace(
+            |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
         .unwrap();
@@ -590,14 +590,14 @@ mod tests {
         // It is rounded to `bf16` right after it is computed, so that XLA cannot use a more precise value for the
         // forward computation than the one that the backward computation receives.
         let scalar_type = ArrayType::scalar(DataType::BF16);
-        let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
+        let function = rematerialize(|x: Tracer| -> Result<Tracer, ProgramError> {
             let context = x.context().clone();
             let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?.remove(0);
             Ok(context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[sine.clone(), sine])?.remove(0))
         })
         .with_policy(EverythingSavable);
-        let (_, gradient) = DomainTracingContext::<Session<'static>>::trace(
-            |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+        let (_, gradient) = DomainTracingContext::<Session>::trace(
+            |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
         .unwrap();
@@ -628,7 +628,7 @@ mod tests {
         // Offloading the value tagged `sine` of `x ↦ cos(tag(sin(x), "sine"))` to pinned host memory moves it to the
         // host once it is computed and back to the device right before the backward computation uses it.
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
+        let function = rematerialize(|x: Tracer| -> Result<Tracer, ProgramError> {
             let context = x.context().clone();
             let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?;
             let sine = context.bind(ArrayOperation::Tag(TagOperation::new("sine")), Vec::new(), &sine)?;
@@ -637,8 +637,8 @@ mod tests {
         .with_policy(
             SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["sine"], Memory::Host { pinned: true }).unwrap(),
         );
-        let (_, gradient) = DomainTracingContext::<Session<'static>>::trace(
-            |x: Tracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+        let (_, gradient) = DomainTracingContext::<Session>::trace(
+            |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),
         )
         .unwrap();

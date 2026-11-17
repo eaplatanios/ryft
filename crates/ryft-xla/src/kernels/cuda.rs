@@ -383,7 +383,7 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
 }
 
 /// Returns the built-in CUDA provider without loading a driver or a PJRT plugin.
-pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+pub(super) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(CudaRuntimeProvider)
 }
 
@@ -544,13 +544,13 @@ impl CudaKernelRuntime {
     }
 }
 
-impl<'c> RuntimeExtension<'c> for CudaKernelRuntime {
+impl RuntimeExtension for CudaKernelRuntime {
     fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
         crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
         Ok(())
     }
 
-    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+    fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
         // The session owns this stable instance and retains its invocation lease until the whole launch completes.
         let data = (self as *const Self).cast_mut().cast();
         unsafe { resources.add_ffi_user_data(FfiUserData::new(CUDA_RUNTIME_TYPE_ID, data)) }
@@ -560,17 +560,17 @@ impl<'c> RuntimeExtension<'c> for CudaKernelRuntime {
 /// Lazily initializes CUDA launch support for a selected PJRT client.
 struct CudaRuntimeProvider;
 
-impl<'c> RuntimeProvider<'c> for CudaRuntimeProvider {
+impl RuntimeProvider for CudaRuntimeProvider {
     fn identifier(&self) -> &str {
         CUDA_KERNEL_CUSTOM_CALL_TARGET
     }
 
     fn initialize(
         &self,
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
         target: &Target,
         requirement: &RuntimeRequirement,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+    ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         validate_builtin_requirement(requirement, self.identifier())?;
         if !target.platform_name().eq_ignore_ascii_case("cuda") {
             return Err(Error::custom(KernelEmbeddingError::Invalid {
@@ -697,6 +697,7 @@ mod tests {
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
     use crate::lowering::lower_mlir_module_for_program;
+    use crate::sessions::platforms::process_client;
     use crate::{Constant, ProgramBuilder, RuntimeError, runtime_requirements};
 
     use super::*;
@@ -1171,11 +1172,12 @@ mod tests {
 
     #[test]
     fn test_cuda_runtime_provider_initialize() {
-        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let client =
+            process_client(&load_cpu_plugin().unwrap(), ClientOptions::CPU(CpuClientOptions::default())).unwrap();
         let target = Target::from_client(&client).unwrap();
         let provider = runtime_provider();
         let error = provider
-            .initialize(&client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))
+            .initialize(client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))
             .err()
             .unwrap();
         assert!(
@@ -1183,7 +1185,7 @@ mod tests {
             if message == "cuda artifact calls require a cuda platform")
         );
         let requirement = RuntimeRequirement::new(CUDA_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
-        assert!(matches!(provider.initialize(&client, &target, &requirement),
+        assert!(matches!(provider.initialize(client, &target, &requirement),
             Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
                 if identifier == CUDA_KERNEL_CUSTOM_CALL_TARGET));
     }

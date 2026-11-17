@@ -229,7 +229,7 @@ fn collective_compilation_options(partition_count: usize) -> CompilationOptions 
 ///   - `values`: One flattened local input vector per device.
 ///   - `expected_output_shapes`: Physical output shapes checked against returned PJRT buffers before decoding.
 fn execute_collective_module(
-    client: &Client<'_>,
+    client: &'static Client<'static>,
     device_mesh: DeviceMesh,
     sharding: Sharding,
     module: &str,
@@ -249,7 +249,7 @@ fn execute_collective_module(
 
 /// Executes a lowered collective module with one independently shaped buffer family per logical input.
 fn execute_collective_inputs(
-    client: &Client<'_>,
+    client: &'static Client<'static>,
     device_mesh: DeviceMesh,
     module: &str,
     inputs: &[(Sharding, &[usize], &[u64], &[Vec<f32>])],
@@ -329,9 +329,10 @@ fn execute_collective_inputs(
 
 /// Creates the CPU client, the mesh that maps logical to physical devices, and the sharding shared by collective
 /// emitters.
-fn collective_runtime() -> Result<(Client<'static>, DeviceMesh, Sharding), Box<dyn Error>> {
+fn collective_runtime() -> Result<(&'static Client<'static>, DeviceMesh, Sharding), Box<dyn Error>> {
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))?;
+    let client: &'static Client<'static> = Box::leak(Box::new(client));
     let client_devices = client.addressable_devices()?;
     let devices = client_devices.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
     let mesh = collective_mesh();
@@ -764,7 +765,7 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
             observations.insert(name, values(value));
         }
     }
-    let function = block_scaled_dot::<ProjectedContext<Session<'static>, ArrayType>>(nvfp4)?;
+    let function = block_scaled_dot::<ProjectedContext<Session, ArrayType>>(nvfp4)?;
     let traced: TracedProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
         move |(left, right, seed): (ArrayTracer, ArrayTracer, ArrayTracer)| {
             let (output, pullback) = differentiate_at((left, right))
@@ -831,7 +832,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         ("residual", values(residual)),
         ("rank_four_gqa", values(gqa_output)),
     ]);
-    let attention = dot_product_attention::<ProjectedContext<Session<'static>, ArrayType>>(configuration);
+    let attention = dot_product_attention::<ProjectedContext<Session, ArrayType>>(configuration);
     let traced: TracedProgram<
         (ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType),
         (ArrayType, ArrayType),

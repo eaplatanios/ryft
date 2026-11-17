@@ -306,7 +306,7 @@ mod tests {
         // The user invokes `constrain_sharding` directly inside the staged closure, so it is compiled into the same
         // MLIR program as the rest of the function body. Types record no placement over auto mesh axes,
         // so the input placement is an `input_shardings` override.
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
             move |x| {
                 let constrained = x.constrain_sharding(&target_sharding).unwrap();
                 constrained.sin().unwrap()

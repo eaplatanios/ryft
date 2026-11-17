@@ -60,10 +60,10 @@ const ATTENTION_DIMENSIONS: [usize; 4] = [4, 2048, 32, 128];
 const SMOKE_ATTENTION_DIMENSIONS: [usize; 4] = [1, 16, 2, 8];
 
 /// Staged benchmark workload.
-type BenchmarkStagedFunction<'c> = CoreStagedFunction<Session<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkStagedFunction = CoreStagedFunction<Session, ArrayIrType, ArrayIrType>;
 
 /// Compiled benchmark workload.
-type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Session<'c>, ArrayIrType, ArrayIrType>;
+type BenchmarkCompiledFunction = CoreCompiledFunction<Session, ArrayIrType, ArrayIrType>;
 
 /// Benchmark scenario that `--scenario` selects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -225,7 +225,7 @@ fn dispatcher_statistics(statistics: DispatcherStatistics) -> JsonValue {
 }
 
 /// Returns the counters and durations of the compilation cache of `session` as JSON.
-fn compilation_statistics(session: &Session<'_>) -> JsonValue {
+fn compilation_statistics(session: &Session) -> JsonValue {
     let statistics = session.compilation_cache().statistics();
     json!({
         "memory_hits": statistics.memory_hits,
@@ -254,12 +254,12 @@ fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::
 }
 
 /// Uploads a deterministic input array of type `r#type` with `size` elements to `mesh`.
-fn input_array<'c>(
-    session: &Session<'c>,
+fn input_array(
+    session: &Session,
     mesh: &DeviceMesh,
     r#type: ArrayType,
     size: usize,
-) -> Result<Array<'c>, Box<dyn std::error::Error>> {
+) -> Result<Array, Box<dyn std::error::Error>> {
     let mut bytes = Vec::with_capacity(size * size_of::<f32>());
     for index in 0..size {
         bytes.extend_from_slice(&((index % 1024) as f32 / 1024.0).to_ne_bytes());
@@ -268,11 +268,11 @@ fn input_array<'c>(
 }
 
 /// Stages the workload `sin(x * x + x)` for inputs of type `r#type` over `mesh`.
-fn stage_workload<'c>(
-    session: &Session<'c>,
+fn stage_workload(
+    session: &Session,
     mesh: &DeviceMesh,
     r#type: ArrayType,
-) -> Result<BenchmarkStagedFunction<'c>, Box<dyn std::error::Error>> {
+) -> Result<BenchmarkStagedFunction, Box<dyn std::error::Error>> {
     Ok(session.stage(
         |input| {
             let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
@@ -284,11 +284,11 @@ fn stage_workload<'c>(
 }
 
 /// Executes the compiled workload at `input` and returns its output array.
-fn call_workload<'c>(
-    session: &Session<'c>,
-    compiled: &BenchmarkCompiledFunction<'c>,
-    input: Array<'c>,
-) -> Result<Array<'c>, Box<dyn std::error::Error>> {
+fn call_workload(
+    session: &Session,
+    compiled: &BenchmarkCompiledFunction,
+    input: Array,
+) -> Result<Array, Box<dyn std::error::Error>> {
     match compiled.executable().execute(session, Value::Array(input))? {
         Value::Array(output) => Ok(output),
         Value::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
@@ -300,7 +300,7 @@ fn call_workload<'c>(
 /// session takes to restore it, and returns the measurement and the compilation statistics of the second session as
 /// JSON.
 fn persistent_restore(
-    client: &Client<'_>,
+    client: &'static Client<'static>,
     mesh: &DeviceMesh,
     r#type: &ArrayType,
     directory: &Path,
@@ -337,7 +337,7 @@ fn replicated_f32_type(mesh: &DeviceMesh, shape: &[usize]) -> Result<ArrayType, 
 /// durations of the compilation cache of `session` across them as JSON. The constructed values are dropped outside
 /// the timed region.
 fn repeated_construction<T>(
-    session: &Session<'_>,
+    session: &Session,
     iterations: usize,
     mut construct: impl FnMut() -> Result<T, ryft_xla::Error>,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
@@ -366,15 +366,15 @@ fn repeated_construction<T>(
 /// transform once per specialization, so the retained specialization serves every warm call, which `smoke` asserts
 /// together with the computed gradients.
 fn jit_eager_gradient(
-    client: &Client<'_>,
+    client: &'static Client<'static>,
     mesh: &DeviceMesh,
     iterations: usize,
     smoke: bool,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
     let session = Session::builder().client(client).build()?;
     let r#type = replicated_f32_type(mesh, &[])?;
-    let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
-        |_, input: CompileTracer<'_>| {
+    let function: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> = jit(
+        |_, input: CompileTracer| {
             Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
         },
         &session,
@@ -430,13 +430,13 @@ fn jit_eager_gradient(
 /// total time, the backend compilation time that the shared compilation cache records during it, and the remaining
 /// frontend time. The derived programs of distinct outer functions are distinct compilations that no frontend cache
 /// can remove.
-fn shared_callee_transforms<'c>(
-    session: &Session<'c>,
+fn shared_callee_transforms(
+    session: &Session,
     mesh: &DeviceMesh,
     callee_operations: usize,
 ) -> Result<JsonValue, Box<dyn std::error::Error>> {
     let r#type = replicated_f32_type(mesh, &[])?;
-    let callee: CompiledFunction<'c, ArrayType, ArrayType> = compile(
+    let callee: CompiledFunction<ArrayType, ArrayType> = compile(
         move |x| {
             let mut value = x;
             for index in 0..callee_operations {
@@ -452,7 +452,7 @@ fn shared_callee_transforms<'c>(
     let mut outers = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
     for index in 0..CALLEE_OUTER_SPECIALIZATIONS {
         let callee = callee.clone();
-        let outer: CompiledFunction<'c, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             move |x| {
                 let mut value = callee.call(x).unwrap();
                 for _ in 0..=index {
@@ -516,14 +516,15 @@ fn shared_callee_transforms<'c>(
 fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
+    let client: &'static Client<'static> = Box::leak(Box::new(client));
     let mesh = mesh(&client)?;
 
     let jit_eager_gradient = jit_eager_gradient(&client, &mesh, arguments.iterations, arguments.smoke)?;
 
     // Repeated reverse mode construction of the gradient of `sum(sin(x))` over an `f32[4, 4]` input.
-    let session = Session::builder().client(&client).build()?;
+    let session = Session::builder().client(client).build()?;
     let r#type = replicated_f32_type(&mesh, &[4, 4])?;
-    let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+    let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
         |x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(),
         r#type.clone(),
         &session,
@@ -532,14 +533,14 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let gradient_construction = repeated_construction(&session, arguments.iterations, || compiled.gradient(&session))?;
 
     // Repeated forward mode construction of the JVP of `cos(sin(x))` over an `f32[4, 4]` input.
-    let session = Session::builder().client(&client).build()?;
-    let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+    let session = Session::builder().client(client).build()?;
+    let compiled: CompiledFunction<ArrayType, ArrayType> =
         compile(|x| x.sin().unwrap().cos().unwrap(), r#type, &session, mesh.clone())?;
     let jvp_construction = repeated_construction(&session, arguments.iterations, || compiled.jvp(&session))?;
 
     // Transformations of a short and a long shared callee, whose difference isolates the frontend cost that grows with
     // the callee.
-    let session = Session::builder().client(&client).build()?;
+    let session = Session::builder().client(client).build()?;
     let callee_operation_counts = if arguments.smoke { SMOKE_CALLEE_OPERATION_COUNTS } else { CALLEE_OPERATION_COUNTS };
     let callees = callee_operation_counts
         .into_iter()
@@ -583,7 +584,7 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Returns a client for the platform that `RYFT_BENCHMARK_PLATFORM` selects (i.e., `cpu`, which is the default, or
 /// `cuda-13` with the `cuda-13` feature) and whether that platform is a CUDA GPU.
-fn platform_client() -> Result<(Client<'static>, bool), Box<dyn std::error::Error>> {
+fn platform_client() -> Result<(&'static Client<'static>, bool), Box<dyn std::error::Error>> {
     match env::var("RYFT_BENCHMARK_PLATFORM").as_deref() {
         #[cfg(feature = "cuda-13")]
         Ok("cuda-13") => {
@@ -592,11 +593,11 @@ fn platform_client() -> Result<(Client<'static>, bool), Box<dyn std::error::Erro
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
             };
-            Ok((Box::leak(Box::new(load_cuda_13_plugin()?)).client(ClientOptions::GPU(options))?, true))
+            Ok((Box::leak(Box::new(load_cuda_13_plugin()?.client(ClientOptions::GPU(options))?)), true))
         }
         Ok("cpu") | Err(_) => {
             let options = CpuClientOptions { device_count: Some(1), ..Default::default() };
-            Ok((Box::leak(Box::new(load_cpu_plugin()?)).client(ClientOptions::CPU(options))?, false))
+            Ok((Box::leak(Box::new(load_cpu_plugin()?.client(ClientOptions::CPU(options))?)), false))
         }
         Ok(platform) => Err(format!("unsupported benchmark platform `{platform}`").into()),
     }
@@ -605,20 +606,19 @@ fn platform_client() -> Result<(Client<'static>, bool), Box<dyn std::error::Erro
 /// Runs the `attention` scenario and prints its JSON report.
 fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let (client, cuda) = platform_client()?;
-    let client = Box::leak(Box::new(client));
     let mesh = mesh(client)?;
     let session = Session::builder().client(client).build()?;
     let dimensions @ [batch, sequence, heads, head_dimension] =
         if arguments.smoke { SMOKE_ATTENTION_DIMENSIONS } else { ATTENTION_DIMENSIONS };
     let r#type = ArrayType::new_static(DataType::BF16, dimensions)
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-    let attention = dot_product_attention::<Session<'static>>(
+    let attention = dot_product_attention::<Session>(
         AttentionConfiguration::new().with_scale(1.0 / (head_dimension as f64).sqrt()),
     );
 
     let start = Instant::now();
-    let staged: CoreStagedFunction<Session<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> = session.stage(
-        |inputs: Vec<CompilationTracer<Session<'static>>>| {
+    let staged: CoreStagedFunction<Session, Vec<ArrayIrType>, Vec<ArrayIrType>> = session.stage(
+        |inputs: Vec<CompilationTracer<Session>>| {
             let inputs = AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone());
             vec![attention.call(inputs).unwrap()]
         },
@@ -634,8 +634,7 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
         assert!(fused, "attention must lower to cuDNN's fused attention kernel on CUDA");
     }
     let start = Instant::now();
-    let compiled: CoreCompiledFunction<Session<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> =
-        lowered.compile(&session)?;
+    let compiled: CoreCompiledFunction<Session, Vec<ArrayIrType>, Vec<ArrayIrType>> = lowered.compile(&session)?;
     let compilation_nanoseconds = duration_nanoseconds(start);
 
     // Every input element is the bf16 encoding of one.
@@ -715,9 +714,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
+    let client: &'static Client<'static> = Box::leak(Box::new(client));
     let mesh = mesh(&client)?;
     let r#type = input_type(&mesh, arguments.size)?;
-    let session = Session::builder().client(&client).build()?;
+    let session = Session::builder().client(client).build()?;
     let input = input_array(&session, &mesh, r#type.clone(), arguments.size)?;
     input.block_until_ready()?;
     let start = Instant::now();
@@ -729,7 +729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cold_lowering_nanoseconds = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'_> = lowered.compile(&session)?;
+    let compiled: BenchmarkCompiledFunction = lowered.compile(&session)?;
     let cold_compilation_nanoseconds = duration_nanoseconds(start);
 
     let warmup = call_workload(&session, &compiled, input.clone())?;
@@ -753,8 +753,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         synchronized_samples.push(duration_nanoseconds(start));
     }
 
-    let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-        jit(|(), input: CompileTracer<'_>| Ok((input.clone() * input.clone() + input).sin()?), &session, mesh.clone());
+    let dispatcher: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+        jit(|(), input: CompileTracer| Ok((input.clone() * input.clone() + input).sin()?), &session, mesh.clone());
     dispatcher.execute((), input.clone())?.block_until_ready()?;
     let cold_dispatch_statistics = dispatcher.statistics();
     let mut warm_dispatch_samples = Vec::with_capacity(arguments.iterations);

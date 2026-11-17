@@ -978,7 +978,7 @@ mod tests {
         let vector = |values: &[Complex<f64>]| {
             replicated_array(&session, &mesh, DataType::C128, &[values.len()], values_to_bytes(values).as_slice())
         };
-        let read = |array: Array<'_>| values_from_bytes::<Complex<f64>>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<Complex<f64>>(&array.copy_to_host().unwrap());
 
         let infinite_values = [Complex::new(f64::INFINITY, 1.0), Complex::new(1.0, 1.0)];
         assert_eq!(
@@ -1166,7 +1166,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 3);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
 
@@ -1192,7 +1192,7 @@ mod tests {
         let engine = session_with_client(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
 
@@ -1285,7 +1285,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 0);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             |value| value.reduce(&[0], ReductionKind::Mean).unwrap(),
             input_type.clone(),
             &engine,
@@ -1312,7 +1312,7 @@ mod tests {
             (ReductionKind::LogSumExp, 4096, 0f32, 8.3203125f32),
         ] {
             let input_type = replicated_vector_type(&mesh, count);
-            let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
                 |value| {
                     value
                         .convert_element_type(DataType::F16)
@@ -1395,7 +1395,7 @@ mod tests {
             let r#type = ArrayType::new_static(data_type, [4]).with_sharding(sharding).unwrap();
             Array::from_host_buffer(&session, r#type, device_mesh.clone(), bytes).unwrap()
         };
-        let reduce = |input: &Array<'_>, kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap();
+        let reduce = |input: &Array, kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap();
         let floats = sharded(DataType::F32, values_to_bytes(&[-0f32, -1.0, 0.0, -2.0]));
         assert_eq!(reduce(&floats, ReductionKind::Max), 0f32.to_ne_bytes());
         assert_eq!(reduce(&floats, ReductionKind::Min), (-2f32).to_ne_bytes());
@@ -1428,7 +1428,7 @@ mod tests {
             &[3],
             &values_to_bytes(&[Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)]),
         );
-        let read = |array: Array<'_>| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Max).unwrap()), vec![Complex::new(2.0, 4.0)]);
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Min).unwrap()), vec![Complex::new(1.0, 5.0)]);
         let empty_complex = replicated_array(&session, &mesh, DataType::C64, &[0], &[]);
@@ -1754,7 +1754,7 @@ mod tests {
             let input_type = ArrayType::new_static(DataType::C64, [components.len() / 2])
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
-            let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            let compiled: CompiledFunction<ArrayType, ArrayType> =
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
                 Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&components)).unwrap();
@@ -1851,7 +1851,7 @@ mod tests {
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let softmax =
-            composite(|input: DomainTracer<ProjectedContext<Session<'_>, ArrayType>>| -> Result<_, ProgramError> {
+            composite(|input: DomainTracer<ProjectedContext<Session, ArrayType>>| -> Result<_, ProgramError> {
                 let maxima = input.reduce(&[1], ReductionKind::Max)?.broadcast_like(&input, &[0])?;
                 let exponentials = input.sub(&maxima)?.exp()?;
                 let sums = exponentials.reduce(&[1], ReductionKind::Sum)?.broadcast_like(&exponentials, &[0])?;
@@ -1979,7 +1979,7 @@ mod tests {
         let complex =
             [Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0), Complex::new(0.0, 0.0)];
         let complex = sharded(DataType::C64, &[4], 0, values_to_bytes(&complex));
-        let read = |array: Array<'_>| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Max).unwrap()), vec![Complex::new(2.0, 4.0)]);
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Min).unwrap()), vec![Complex::new(0.0, 0.0)]);
         let factors = [Complex::new(1f32, 1.0), Complex::new(2.0, 0.0), Complex::new(0.0, 1.0), Complex::new(1.0, 0.0)];
@@ -2340,7 +2340,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
@@ -2368,7 +2368,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F16, [65536])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let differentiated = compiled.jvp(&engine).unwrap();

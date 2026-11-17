@@ -670,7 +670,7 @@ mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
         let session = session_with_client(&client);
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
             |(first, second)| first.concatenate_with([&second], 0).unwrap(),
             (input_type.clone(), input_type.clone()),
             &session,

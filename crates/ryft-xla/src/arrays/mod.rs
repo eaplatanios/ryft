@@ -191,10 +191,10 @@ pub enum ArrayError {
 /// their logical `I1` or `U1` type while using one byte per element in this physical representation. This executable
 /// convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer types.
 #[derive(Parameter)]
-pub struct Array<'o> {
+pub struct Array {
     /// Type, shards, and value-local caches of this [`Array`]. They are immutable once constructed and shared by
     /// every clone, so cloning an array costs a few reference-count increments rather than a deep copy.
-    parts: Arc<ArrayParts<'o>>,
+    parts: Arc<ArrayParts>,
 
     /// Whole-execution completion fence for arrays produced by an asynchronous PJRT launch. This is separate from
     /// each shard buffer's ready event because it also retains errors from zero-output effects and other device work
@@ -216,10 +216,10 @@ pub struct Array<'o> {
     /// compilation cache, kernel runtimes, and default compilation options, as well as the effect scope that
     /// receiver-based operations on this array execute with. Explicit sessions select their own scope, while
     /// receiver-based operations use this value's session, so `x + y` and `y + x` may select different scopes.
-    session: Session<'o>,
+    session: Session,
 }
 
-impl<'o> Array<'o> {
+impl Array {
     /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
     /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the
     /// addressable buffers. The provided [`ArrayType`] describes the global logical array. Its
@@ -249,10 +249,10 @@ impl<'o> Array<'o> {
     ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
     ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process.
     pub fn from_addressable_buffers(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         mesh: DeviceMesh,
-        buffers: Vec<Buffer<'o>>,
+        buffers: Vec<Buffer<'static>>,
     ) -> Result<Self, Error> {
         let buffers = buffers.into_iter().map(Arc::new).collect();
         Self::from_addressable_buffers_internal(session, r#type, None, mesh, buffers, true)
@@ -264,11 +264,11 @@ impl<'o> Array<'o> {
     /// [`Self::sharding`] returns `sharding` itself. A sharding of `r#type`, if any, must equal that projection, and
     /// [`ArrayError::PlacementTypeMismatch`] reports one that does not.
     pub fn from_addressable_buffers_with_sharding(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Sharding,
         mesh: DeviceMesh,
-        buffers: Vec<Buffer<'o>>,
+        buffers: Vec<Buffer<'static>>,
     ) -> Result<Self, Error> {
         let buffers = buffers.into_iter().map(Arc::new).collect();
         Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, buffers, true)
@@ -279,11 +279,11 @@ impl<'o> Array<'o> {
     /// buffers back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input
     /// boundaries, and discards canonical zero-space carriers after extracting their placement metadata.
     pub(crate) fn from_canonical_addressable_buffers(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: DeviceMesh,
-        buffers: Vec<Buffer<'o>>,
+        buffers: Vec<Buffer<'static>>,
     ) -> Result<Self, Error> {
         let buffers = buffers.into_iter().map(Arc::new).collect();
         Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, buffers, false)
@@ -293,22 +293,22 @@ impl<'o> Array<'o> {
     /// hold. Sharing is safe because arrays never mutate their buffers and because donation skips arrays whose
     /// buffers are shared (refer to [`Self::has_unique_shard_buffers`]).
     pub(crate) fn from_shared_addressable_buffers(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Sharding,
         mesh: DeviceMesh,
-        buffers: Vec<Arc<Buffer<'o>>>,
+        buffers: Vec<Arc<Buffer<'static>>>,
     ) -> Result<Self, Error> {
         Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, buffers, false)
     }
 
     /// Implements addressable buffer construction with optional validation of private zero-space carrier payloads.
     fn from_addressable_buffers_internal(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: DeviceMesh,
-        buffers: Vec<Arc<Buffer<'o>>>,
+        buffers: Vec<Arc<Buffer<'static>>>,
         validate_zero_carriers: bool,
     ) -> Result<Self, Error> {
         // Normalize the provided `r#type` before deriving shard placement. A single buffer with no sharding metadata
@@ -374,7 +374,7 @@ impl<'o> Array<'o> {
     /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
     /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
     pub(crate) fn from_zero_space(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: DeviceMesh,
@@ -452,7 +452,7 @@ impl<'o> Array<'o> {
     ///   - `mesh`: Destination [`DeviceMesh`] describing the device topology.
     ///   - `buffer`: Dense row-major host bytes for the full logical array.
     pub fn from_host_buffer<B: AsRef<[u8]>>(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffer: B,
@@ -466,7 +466,7 @@ impl<'o> Array<'o> {
     /// returns `sharding` itself. A sharding of `r#type`, if any, must equal that projection, and
     /// [`ArrayError::PlacementTypeMismatch`] reports one that does not.
     pub fn from_host_buffer_with_sharding<B: AsRef<[u8]>>(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Sharding,
         mesh: DeviceMesh,
@@ -477,7 +477,7 @@ impl<'o> Array<'o> {
 
     /// Implements [`Self::from_host_buffer`] and [`Self::from_host_buffer_with_sharding`].
     fn from_host_buffer_internal(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: DeviceMesh,
@@ -682,7 +682,7 @@ impl<'o> Array<'o> {
     /// from a host buffer that has the shape of that shard. `r#type` must have a static shape and a sharding, and an
     /// array of [`DataType::Zero`] has no buffers.
     pub(crate) fn from_constant(
-        session: &Session<'o>,
+        session: &Session,
         r#type: ArrayType,
         mesh: DeviceMesh,
         kind: ConstantKind,
@@ -747,9 +747,9 @@ impl<'o> Array<'o> {
     /// program whose signature Ryft lowered, and skipping the queries keeps each execution free of per-output PJRT
     /// calls. In builds with debug assertions, every buffer is still validated with the same checks.
     pub(crate) fn from_execution_output(
-        session: &Session<'o>,
+        session: &Session,
         layout: &ArrayOutputLayout,
-        buffers: Vec<Buffer<'o>>,
+        buffers: Vec<Buffer<'static>>,
         fence: ExecutionFence,
     ) -> Self {
         #[cfg(debug_assertions)]
@@ -828,7 +828,7 @@ impl<'o> Array<'o> {
     /// Returns an [`Error::Pjrt`] that wraps an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error if
     /// `session` belongs to a different PJRT client than this array. Arrays cannot move between clients because their
     /// addressable shard buffers are owned by the client they were created on.
-    pub fn associate(mut self, session: &Session<'o>) -> Result<Self, Error> {
+    pub fn associate(mut self, session: &Session) -> Result<Self, Error> {
         if !std::ptr::eq(self.client(), session.client()) {
             return Err(PjrtError::invalid_argument(
                 "cannot associate an array with a session of a different PJRT client",
@@ -848,13 +848,13 @@ impl<'o> Array<'o> {
     /// The session is therefore threaded through explicitly at array construction time instead, and
     /// [`Buffer::is_owned_by`] validates that its client owns every addressable shard buffer.
     #[inline]
-    pub fn client(&self) -> &'o Client<'o> {
+    pub fn client(&self) -> &'static Client<'static> {
         self.session.client()
     }
 
     /// Returns the [`Session`] this [`Array`] belongs to.
     #[inline]
-    pub fn session(&self) -> &Session<'o> {
+    pub fn session(&self) -> &Session {
         &self.session
     }
 
@@ -899,27 +899,27 @@ impl<'o> Array<'o> {
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
     #[inline]
-    pub fn shards(&self) -> &[ArrayShard<'o>] {
+    pub fn shards(&self) -> &[ArrayShard] {
         self.parts.shards.as_slice()
     }
 
     /// Returns an [`Iterator`] over the _addressable_ [`ArrayShard`]s of this [`Array`].
     #[inline]
-    pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard<'o>> {
+    pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard> {
         self.parts.shards.iter().filter(|shard| shard.is_addressable())
     }
 
     /// Returns the [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
     /// [`DeviceId`], if such a shard exists.
     #[inline]
-    pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+    pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard> {
         self.parts.shard_index_by_device.get(&device_id).and_then(|index| self.parts.shards.get(*index))
     }
 
     /// Returns the _addressable_ [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
     /// [`DeviceId`], if such a shard exists.
     #[inline]
-    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard> {
         self.device_shard(device_id).filter(|shard| shard.is_addressable())
     }
 
@@ -936,15 +936,12 @@ impl<'o> Array<'o> {
     }
 
     /// Probes the bounded materialization cache that the clones of this array share for one structural `key`.
-    pub(crate) fn probe_bounded_materialization(
-        &self,
-        key: BoundedMaterializationKey,
-    ) -> BoundedMaterializationProbe<'o> {
+    pub(crate) fn probe_bounded_materialization(&self, key: BoundedMaterializationKey) -> BoundedMaterializationProbe {
         self.parts.bounded_materializations.get_or_init(Arc::default).probe(key)
     }
 
     /// Returns the replicated device-resident `i32` scalar for `extent` and whether this call uploaded it.
-    pub(crate) fn logical_extent_scalar(&self, session: &Session<'o>, extent: i32) -> Result<(Array<'o>, bool), Error> {
+    pub(crate) fn logical_extent_scalar(&self, session: &Session, extent: i32) -> Result<(Array, bool), Error> {
         let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
             let entry = scalars.remove(index).unwrap();
@@ -1071,7 +1068,7 @@ impl<'o> Array<'o> {
     }
 
     /// Returns a [`RetainedArray`] that shares the storage of this array without retaining its session or caches.
-    pub(crate) fn retain(&self) -> RetainedArray<'o> {
+    pub(crate) fn retain(&self) -> RetainedArray {
         RetainedArray {
             identity: Arc::downgrade(&self.parts),
             r#type: Arc::clone(&self.parts.r#type),
@@ -1232,7 +1229,7 @@ impl<'o> Array<'o> {
 }
 
 /// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
-pub async fn ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Result<(), Error> {
+pub async fn ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
     for array in values.parameters() {
         array.ready().await?;
     }
@@ -1240,7 +1237,7 @@ pub async fn ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Res
 }
 
 /// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
-pub fn block_until_ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Result<(), Error> {
+pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
     for array in values.parameters() {
         array.block_until_ready()?;
     }
@@ -1248,7 +1245,7 @@ pub fn block_until_ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) 
 }
 
 // TODO(eaplatanios): Review this.
-impl<'o> Clone for Array<'o> {
+impl Clone for Array {
     fn clone(&self) -> Self {
         crate::telemetry::array_constructed();
         Self {
@@ -1261,13 +1258,13 @@ impl<'o> Clone for Array<'o> {
 }
 
 // TODO(eaplatanios): Review this.
-impl<'o> Drop for Array<'o> {
+impl Drop for Array {
     fn drop(&mut self) {
         crate::telemetry::array_dropped();
     }
 }
 
-impl Debug for Array<'_> {
+impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Array")
@@ -1278,7 +1275,7 @@ impl Debug for Array<'_> {
     }
 }
 
-impl Display for Array<'_> {
+impl Display for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "array(type={})", self.parts.r#type)
     }
@@ -1292,7 +1289,7 @@ impl Display for Array<'_> {
 // is the conservative answer that analyses comparing flowing values need and mirrors the `PartialEq` implementation of
 // `Tracer`, which compares staging identity. Element-wise equality would require device-to-host transfers and is
 // deliberately not what this implements.
-impl PartialEq for Array<'_> {
+impl PartialEq for Array {
     fn eq(&self, other: &Self) -> bool {
         let (left, right) = (&self.parts, &other.parts);
         Arc::ptr_eq(left, right)
@@ -1303,7 +1300,7 @@ impl PartialEq for Array<'_> {
     }
 }
 
-impl Typed for Array<'_> {
+impl Typed for Array {
     type Type = ArrayType;
 
     fn r#type(&self) -> Cow<'_, ArrayType> {
@@ -1311,7 +1308,7 @@ impl Typed for Array<'_> {
     }
 }
 
-impl<'o> CoreValue for Array<'o> {
+impl CoreValue for Array {
     // A concrete `Array` binds and executes every operation through its PJRT-backed `Session`. It uses
     // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (e.g., arithmetic, comparison,
     // selection, manipulation, and reductions) bind their operations through `domain()` and execute them eagerly, op by
@@ -1320,7 +1317,7 @@ impl<'o> CoreValue for Array<'o> {
     // `Concretizable<bool>`, `WhilePredicate`, and the foreign `std::ops` sugar) get the direct implementations that
     // follow.
     type Dispatch = ValueDomainDispatch;
-    type Domain = ProjectedContext<Session<'o>, ArrayType>;
+    type Domain = ProjectedContext<Session, ArrayType>;
 
     fn domain(&self) -> Self::Domain {
         // Recovers the eager `Session` this `Array` belongs to, which `Array::session` also returns, and with it
@@ -1336,11 +1333,11 @@ impl<'o> CoreValue for Array<'o> {
 /// fence but neither its [`Session`] nor its value-local caches, because both can transitively retain the session that
 /// retains this storage and would otherwise form a reference cycle. Resolving it through [`Self::to_array`] associates
 /// a fresh [`Array`] with the resolving session.
-pub(crate) struct RetainedArray<'o> {
-    /// Identity of the storage of the [`Array`] that was retained, used to deduplicate repeated retentions of the same
+pub(crate) struct RetainedArray {
+    /// Identity of the storage of the [`Array`] that was retained, which identifies repeated retentions of the same
     /// array. Holding a [`Weak`] reference keeps the allocation and hence its address reserved without keeping the
     /// original storage or its caches alive.
-    identity: Weak<ArrayParts<'o>>,
+    identity: Weak<ArrayParts>,
 
     /// [`ArrayType`] of the retained array.
     r#type: Arc<ArrayType>,
@@ -1349,7 +1346,7 @@ pub(crate) struct RetainedArray<'o> {
     sharding: Arc<Sharding>,
 
     /// [`ArrayShard`]s of the retained array.
-    shards: Vec<ArrayShard<'o>>,
+    shards: Vec<ArrayShard>,
 
     /// Lookup table mapping [`DeviceId`]s to [`ShardIndex`]es of [`Self::shards`].
     shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
@@ -1366,21 +1363,16 @@ pub(crate) struct RetainedArray<'o> {
     send_fence: Option<ExecutionFence>,
 }
 
-impl<'o> RetainedArray<'o> {
-    /// Returns the [`ArrayType`] of the retained array.
+impl RetainedArray {
+    /// Returns the identity of the storage of the [`Array`] that was retained, which is the same for every retention
+    /// of that array and which no other array has for as long as this value exists.
     #[inline]
-    pub(crate) fn r#type(&self) -> &ArrayType {
-        &self.r#type
-    }
-
-    /// Returns `true` if `array` shares the storage of the retained array.
-    #[inline]
-    pub(crate) fn retains(&self, array: &Array<'o>) -> bool {
-        std::ptr::eq(self.identity.as_ptr(), Arc::as_ptr(&array.parts))
+    pub(crate) fn identity(&self) -> usize {
+        self.identity.as_ptr() as usize
     }
 
     /// Returns a new [`Array`] that shares the retained storage and belongs to `session`.
-    pub(crate) fn to_array(&self, session: &Session<'o>) -> Array<'o> {
+    pub(crate) fn to_array(&self, session: &Session) -> Array {
         crate::telemetry::array_constructed();
         Array {
             parts: Arc::new(ArrayParts::new(
@@ -1409,7 +1401,7 @@ impl<'o> RetainedArray<'o> {
 // `std::ops` operator sugar, which the orphan rule requires to be implemented per type. Backend arrays opt into the
 // shared shape-changing collective capabilities through `ShapeChangingCollectiveValue`.
 
-impl Concretizable<bool> for Array<'_> {
+impl Concretizable<bool> for Array {
     fn concretize(&self) -> Result<bool, ProgramError> {
         // Extracts a concrete scalar Rust Boolean by copying the value of a rank-0 Boolean `Array` to the host with
         // `Array::copy_to_host`. Arrays of higher rank or of non-Boolean types error because they cannot collapse to
@@ -1429,7 +1421,7 @@ impl Concretizable<bool> for Array<'_> {
     }
 }
 
-impl Concretizable<i128> for Array<'_> {
+impl Concretizable<i128> for Array {
     fn concretize(&self) -> Result<i128, ProgramError> {
         // Decode through the CPU capability to preserve every signed and unsigned integer value.
         let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
@@ -1441,7 +1433,7 @@ impl Concretizable<i128> for Array<'_> {
 // `WhilePredicate::any_true` reduces the whole Boolean payload with `or` by reading every shard back to the host, and
 // `WhilePredicate::select` broadcasts the predicate against the operands along its leading prefix axes on device
 // before selecting.
-impl WhilePredicate for Array<'_> {
+impl WhilePredicate for Array {
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.data_type().is_boolean() {
             return Err(ProgramError::Concretization {
@@ -1522,7 +1514,7 @@ impl WhilePredicate for Array<'_> {
     }
 }
 
-impl AssertionValue for Array<'_> {
+impl AssertionValue for Array {
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
         ryft_core::Array::new(self.r#type().into_owned(), bytes)?.assertion_observation()
@@ -1534,7 +1526,7 @@ impl AssertionValue for Array<'_> {
     }
 }
 
-impl DimensionSize<ArrayType> for Array<'_> {
+impl DimensionSize<ArrayType> for Array {
     type Extent = usize;
 
     fn dimension_size<AxisValue: Into<ryft_core::Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
@@ -1556,7 +1548,7 @@ impl DimensionSize<ArrayType> for Array<'_> {
     }
 }
 
-impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
+impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
     fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         // Copies this rank-0 integer array to the host and grants its checked value first-class dimension authority.
         let operation = DimensionFromScalarOperation::new(output.into());
@@ -1603,13 +1595,13 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
 }
 
 // Backend arrays opt into the shared homogeneous collective staging rules of `ryft-core`.
-impl ShapeChangingCollectiveValue for Array<'_> {}
+impl ShapeChangingCollectiveValue for Array {}
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values. These per-type implementations provide the ergonomic panicking sugar by delegating to
 // the fallible `ryft` capabilities.
 
-impl std::ops::Neg for Array<'_> {
+impl std::ops::Neg for Array {
     type Output = Self;
 
     fn neg(self) -> Self {
@@ -1617,7 +1609,7 @@ impl std::ops::Neg for Array<'_> {
     }
 }
 
-impl std::ops::Add for Array<'_> {
+impl std::ops::Add for Array {
     type Output = Self;
 
     fn add(self, right: Self) -> Self {
@@ -1625,7 +1617,7 @@ impl std::ops::Add for Array<'_> {
     }
 }
 
-impl std::ops::Sub for Array<'_> {
+impl std::ops::Sub for Array {
     type Output = Self;
 
     fn sub(self, right: Self) -> Self {
@@ -1633,7 +1625,7 @@ impl std::ops::Sub for Array<'_> {
     }
 }
 
-impl std::ops::Mul for Array<'_> {
+impl std::ops::Mul for Array {
     type Output = Self;
 
     fn mul(self, right: Self) -> Self {
@@ -1641,7 +1633,7 @@ impl std::ops::Mul for Array<'_> {
     }
 }
 
-impl std::ops::Div for Array<'_> {
+impl std::ops::Div for Array {
     type Output = Self;
 
     fn div(self, right: Self) -> Self {
@@ -1649,7 +1641,7 @@ impl std::ops::Div for Array<'_> {
     }
 }
 
-impl std::ops::Not for Array<'_> {
+impl std::ops::Not for Array {
     type Output = Self;
 
     fn not(self) -> Self {
@@ -1657,7 +1649,7 @@ impl std::ops::Not for Array<'_> {
     }
 }
 
-impl std::ops::BitAnd for Array<'_> {
+impl std::ops::BitAnd for Array {
     type Output = Self;
 
     fn bitand(self, right: Self) -> Self {
@@ -1665,7 +1657,7 @@ impl std::ops::BitAnd for Array<'_> {
     }
 }
 
-impl std::ops::BitOr for Array<'_> {
+impl std::ops::BitOr for Array {
     type Output = Self;
 
     fn bitor(self, right: Self) -> Self {
@@ -1673,7 +1665,7 @@ impl std::ops::BitOr for Array<'_> {
     }
 }
 
-impl std::ops::BitXor for Array<'_> {
+impl std::ops::BitXor for Array {
     type Output = Self;
 
     fn bitxor(self, right: Self) -> Self {
@@ -1748,19 +1740,19 @@ impl ArrayOutputLayout {
 /// belongs to another process. This lets an [`Array`] describe its full global layout without allocating meaningless
 /// zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s so cloned arrays can share them.
 #[derive(Clone)]
-pub struct ArrayShard<'o> {
+pub struct ArrayShard {
     /// Refer to the documentation of [`Self::descriptor`] for information on this field.
     descriptor: ShardDescriptor,
 
     /// Physical storage state for this shard.
-    storage: ArrayShardStorage<'o>,
+    storage: ArrayShardStorage,
 }
 
-impl<'o> ArrayShard<'o> {
+impl ArrayShard {
     /// Creates a new [`ArrayShard`] described by `descriptor`. `buffer` holds the shard's storage when the shard is
     /// addressable from the current process, and [`None`] creates a metadata-only remote shard.
     #[inline]
-    pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'o>>>) -> Self {
+    pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'static>>>) -> Self {
         let storage = buffer.map_or(ArrayShardStorage::Remote, ArrayShardStorage::Buffer);
         Self { descriptor, storage }
     }
@@ -1781,7 +1773,7 @@ impl<'o> ArrayShard<'o> {
     /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
     /// addressable bufferless [`DataType::Zero`] shard.
     #[inline]
-    pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
+    pub fn buffer(&self) -> Option<&Arc<Buffer<'static>>> {
         match &self.storage {
             ArrayShardStorage::Buffer(buffer) => Some(buffer),
             ArrayShardStorage::Remote | ArrayShardStorage::Zero => None,
@@ -1867,7 +1859,7 @@ impl<'o> ArrayShard<'o> {
     }
 }
 
-impl Debug for ArrayShard<'_> {
+impl Debug for ArrayShard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let device = self.device();
         formatter
@@ -2258,7 +2250,7 @@ impl ConstantKind {
 }
 
 /// Immutable storage of an [`Array`] that its clones share.
-struct ArrayParts<'o> {
+struct ArrayParts {
     /// [`ArrayType`] of the [`Array`], shared with the other arrays produced for the same compiled program output. Its
     /// sharding is [`Self::sharding`] without auto mesh axes, because types never record placement over those axes.
     r#type: Arc<ArrayType>,
@@ -2267,7 +2259,7 @@ struct ArrayParts<'o> {
     sharding: Arc<Sharding>,
 
     /// [`ArrayShard`]s that make up the [`Array`].
-    shards: Vec<ArrayShard<'o>>,
+    shards: Vec<ArrayShard>,
 
     /// Lookup table that maps each [`DeviceId`] to the [`ShardIndex`] of its shard in [`Self::shards`]. It is shared
     /// because it depends only on the placement, so arrays produced by one compiled program share it.
@@ -2277,18 +2269,18 @@ struct ArrayParts<'o> {
     mesh: Arc<DeviceMesh>,
 
     /// Value-local cache of lazily padded device materializations with bound shapes, allocated on first use.
-    bounded_materializations: OnceLock<Arc<BoundedMaterializationCache<'o>>>,
+    bounded_materializations: OnceLock<Arc<BoundedMaterializationCache>>,
 
     /// Value-local LRU of device-resident scalar arguments for bounded logical extents.
-    logical_extent_scalars: Mutex<VecDeque<(i32, Array<'o>)>>,
+    logical_extent_scalars: Mutex<VecDeque<(i32, Array)>>,
 }
 
-impl<'o> ArrayParts<'o> {
+impl ArrayParts {
     /// Creates new [`ArrayParts`] with empty value-local caches.
     fn new(
         r#type: Arc<ArrayType>,
         sharding: Arc<Sharding>,
-        shards: Vec<ArrayShard<'o>>,
+        shards: Vec<ArrayShard>,
         shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
         mesh: Arc<DeviceMesh>,
     ) -> Self {
@@ -2306,7 +2298,7 @@ impl<'o> ArrayParts<'o> {
 
 /// Physical storage state of one [`ArrayShard`].
 #[derive(Clone)]
-enum ArrayShardStorage<'o> {
+enum ArrayShardStorage {
     /// The shard belongs to another process and has no process-local storage.
     Remote,
 
@@ -2314,7 +2306,7 @@ enum ArrayShardStorage<'o> {
     Zero,
 
     /// The shard is process-local and backed by a PJRT buffer.
-    Buffer(Arc<Buffer<'o>>),
+    Buffer(Arc<Buffer<'static>>),
 }
 
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
@@ -2339,8 +2331,8 @@ mod tests {
 
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{
-        assert_send_sync, cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, replicated_array,
-        values_from_bytes, values_to_bytes,
+        assert_send_sync, cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, other_cpu_client,
+        replicated_array, values_from_bytes, values_to_bytes,
     };
     use crate::{Error, FromPjrt, Session, ToPjrt};
 
@@ -2351,12 +2343,12 @@ mod tests {
 
     // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
     // separate values `device_bytes` that the two devices of the client of `session` hold.
-    fn unreduced_scalar<'o>(
-        session: &Session<'o>,
+    fn unreduced_scalar(
+        session: &Session,
         data_type: DataType,
         kind: UnreducedKind,
         device_bytes: [&[u8]; 2],
-    ) -> Array<'o> {
+    ) -> Array {
         let client = session.client();
         let devices = client.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -2385,14 +2377,14 @@ mod tests {
 
     #[test]
     fn test_array_is_send_and_sync() {
-        assert_send_sync::<Array<'static>>();
+        assert_send_sync::<Array>();
     }
 
     #[test]
     fn test_array_reference_is_send_and_sync() {
         // Exact reference clones share immutable handle-local type and identity metadata, so the XLA reference family
         // relies on the array value and that metadata being safe for concurrent access.
-        assert_send_sync::<CoreReference<Array<'static>>>();
+        assert_send_sync::<CoreReference<Array>>();
     }
 
     #[test]
@@ -2783,7 +2775,7 @@ mod tests {
             .with_unreduced_axes(["x"])
             .unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
-        let device_values = |array: &Array<'_>| {
+        let device_values = |array: &Array| {
             array
                 .shards()
                 .iter()
@@ -2793,7 +2785,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let materialize = |array: &Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let materialize = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
 
         let uploaded =
             Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
@@ -3198,7 +3190,7 @@ mod tests {
     #[test]
     fn test_array_associate() {
         let client = cpu_client(1);
-        let other_client = cpu_client(1);
+        let other_client = other_cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let array = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
@@ -3218,7 +3210,7 @@ mod tests {
         let other_session = session_with_client(&client);
         let reassociated = array.associate(&other_session.fork_effect_scope()).unwrap();
         assert!(reassociated.session().is_same_session(&other_session));
-        assert!(std::ptr::eq(reassociated.client(), &client));
+        assert!(std::ptr::eq(reassociated.client(), client));
         assert_eq!(reassociated, original);
 
         // Receiver-based operations on the reassociated array compile and execute in the other session.
@@ -3271,10 +3263,10 @@ mod tests {
         )
         .unwrap();
         let recovered_client = array.client();
-        assert!(std::ptr::eq(recovered_client, &client));
+        assert!(std::ptr::eq(recovered_client, client));
         assert_eq!(recovered_client.process_index().unwrap(), client.process_index().unwrap());
         assert_eq!(recovered_client.addressable_devices().unwrap().len(), client_devices.len());
-        assert!(std::ptr::eq(array.clone().client(), &client));
+        assert!(std::ptr::eq(array.clone().client(), client));
         assert!(array.clone().session().is_same_session(&session));
 
         // Arrays constructed from addressable buffers belong to the provided session, whose client is validated to own
@@ -3296,12 +3288,12 @@ mod tests {
             shard_buffers(),
         )
         .unwrap();
-        assert!(std::ptr::eq(array.client(), &client));
+        assert!(std::ptr::eq(array.client(), client));
         assert!(array.session().is_same_session(&session));
 
         // A session whose client does not own the addressable shard buffers is rejected, even when that client was
         // created from the same plugin with identical options.
-        let other_client = cpu_client(4);
+        let other_client = other_cpu_client(4);
         let other_session = session_with_client(&other_client);
         let error = Array::from_addressable_buffers_with_sharding(
             &other_session,
@@ -3327,7 +3319,7 @@ mod tests {
             Array::from_addressable_buffers_with_sharding(&other_session, array_type, sharding, mesh, Vec::new())
                 .unwrap();
         assert_eq!(array.addressable_shards().count(), 0);
-        assert!(std::ptr::eq(array.client(), &other_client));
+        assert!(std::ptr::eq(array.client(), other_client));
     }
 
     #[test]
@@ -3498,7 +3490,7 @@ mod tests {
 
         // Arrays recover the session they were constructed in, together with its session and client.
         let recovered = CoreValue::domain(&array);
-        assert!(std::ptr::eq(recovered.parent().client(), &client));
+        assert!(std::ptr::eq(recovered.parent().client(), client));
         assert!(recovered.parent().is_same_session(&session));
     }
 
@@ -3738,7 +3730,7 @@ mod tests {
         let client = execution_client();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let read = |array: Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
         let a = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
         let b = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[3f32, 5.]));
         assert_eq!(read(a.clone() + b.clone()), vec![4f32, 7.]);

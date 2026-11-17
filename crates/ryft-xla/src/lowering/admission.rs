@@ -402,6 +402,8 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{
         domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type, session_with_client,
     };
@@ -411,7 +413,7 @@ mod tests {
     use super::*;
 
     /// Reads the first addressable shard as `bfloat16` values converted to `f32`.
-    fn read_bf16s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+    fn read_bf16s(client: &Client<'_>, array: &Array) -> Vec<f32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
             .device_shard(device_id)
@@ -429,7 +431,7 @@ mod tests {
     }
 
     /// Reads the first addressable shard as native-endian signed 32-bit integers.
-    fn read_i32s(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
+    fn read_i32s(client: &Client<'_>, array: &Array) -> Vec<i32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
             .device_shard(device_id)
@@ -600,11 +602,7 @@ mod tests {
         attention_implementation: AttentionImplementation,
     ) -> FlatProgram {
         /// Binds `operation` to `inputs` in the context of `value` and returns its only output.
-        fn bind<O: Into<Operation>>(
-            value: &Tracer<'static>,
-            operation: O,
-            inputs: &[Tracer<'static>],
-        ) -> Tracer<'static> {
+        fn bind<O: Into<Operation>>(value: &Tracer, operation: O, inputs: &[Tracer]) -> Tracer {
             value.domain().bind(operation, Vec::<FlatProgram>::new(), inputs).unwrap().remove(0)
         }
 
@@ -636,11 +634,11 @@ mod tests {
                 CoreDimension::Static(8),
             ]),
         );
-        let attention = differentiable_dot_product_attention::<Session<'static>>(
+        let attention = differentiable_dot_product_attention::<Session>(
             AttentionConfiguration::new().with_scale(1.0).with_implementation(attention_implementation),
         );
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let size = &inputs[0];
                 let dimension =
                     bind(size, DimensionFromScalarOperation::new(extent.clone().into()), std::slice::from_ref(size));
@@ -1270,13 +1268,15 @@ mod tests {
     #[test]
     fn test_cuda_data_derived_padding_disciplines_execute_without_observable_padding() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -1330,13 +1330,15 @@ mod tests {
     #[test]
     fn test_cuda_data_derived_scaled_dot_and_attention_execute_fused_without_observable_padding() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [

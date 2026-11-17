@@ -393,9 +393,9 @@ impl TypedProgram for LoweredProgram {
 /// their outputs. Stateful calls coordinate external references through [`ryft_core::StatefulExecution`], publishing
 /// mutations only after submission and tracking completion of the whole invocation.
 #[derive(Clone)]
-pub struct CompiledProgram<'c> {
+pub struct CompiledProgram {
     /// Loaded PJRT executable, shared by cloned program handles.
-    executable: Arc<LoadedExecutable<'c>>,
+    executable: Arc<LoadedExecutable<'static>>,
 
     /// Logical input types, including captures before public inputs.
     input_types: Arc<[ArrayType]>,
@@ -466,7 +466,7 @@ pub struct CompiledProgram<'c> {
     plan: Arc<ExecutionPlan>,
 }
 
-impl<'c> CompiledProgram<'c> {
+impl CompiledProgram {
     /// Creates the compiled program of `program` from the `executable` that the backend compiled for it. The
     /// invocation contract is shared with `program`.
     ///
@@ -479,7 +479,7 @@ impl<'c> CompiledProgram<'c> {
     ///   - `compilation_duration`: Time that the backend compilation took.
     pub(super) fn new(
         program: &LoweredProgram,
-        executable: LoadedExecutable<'c>,
+        executable: LoadedExecutable<'static>,
         output_shardings: Arc<[Sharding]>,
         plan: ExecutionPlan,
         compilation_duration: Duration,
@@ -540,7 +540,7 @@ impl<'c> CompiledProgram<'c> {
     ///   - `plan`: Execution plan derived from `executable` and the invocation contract.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_persisted_parts(
-        executable: LoadedExecutable<'c>,
+        executable: LoadedExecutable<'static>,
         input_types: Arc<[ArrayType]>,
         output_types: Arc<[ArrayType]>,
         output_count: usize,
@@ -636,7 +636,7 @@ impl<'c> CompiledProgram<'c> {
 
     /// Returns the loaded PJRT executable.
     #[inline]
-    pub fn executable(&self) -> &LoadedExecutable<'c> {
+    pub fn executable(&self) -> &LoadedExecutable<'static> {
         &self.executable
     }
 
@@ -799,7 +799,7 @@ impl<'c> CompiledProgram<'c> {
     }
 }
 
-impl TypedProgram for CompiledProgram<'_> {
+impl TypedProgram for CompiledProgram {
     type Type = ArrayIrType;
 
     // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
@@ -908,8 +908,8 @@ impl InvocationMetadata<'_> {
     }
 }
 
-impl<'o, 'c> From<&'o CompiledProgram<'c>> for InvocationMetadata<'o> {
-    fn from(program: &'o CompiledProgram<'c>) -> Self {
+impl<'o> From<&'o CompiledProgram> for InvocationMetadata<'o> {
+    fn from(program: &'o CompiledProgram) -> Self {
         Self {
             input_types: &program.input_types,
             output_types: &program.output_types,
@@ -976,7 +976,7 @@ mod tests {
                 stage::<_, ArrayType, ArrayType>(|input| input.clone() + input, input_type, Options::new(mesh.clone()))
                     .unwrap()
                     .into_inner();
-            let compiled: CoreCompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            let compiled: CoreCompiledFunction<Session, ArrayIrType, ArrayIrType> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
             compiled
         };

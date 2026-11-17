@@ -50,17 +50,17 @@ use crate::{Array, Session, SessionConstant};
 ///
 /// Two dimensions are equal when their [`DimensionValue`]s are equal, regardless of their sessions.
 #[derive(Clone, Parameter)]
-pub struct Dimension<'c> {
+pub struct Dimension {
     /// Checked host-side dimension.
     value: DimensionValue,
 
     /// [`Session`] in which array results computed from this dimension are materialized.
-    session: Session<'c>,
+    session: Session,
 }
 
-impl<'c> Dimension<'c> {
+impl Dimension {
     /// Creates a new [`Dimension`] that materializes array results derived from `value` in `session`.
-    pub fn new(value: DimensionValue, session: Session<'c>) -> Self {
+    pub fn new(value: DimensionValue, session: Session) -> Self {
         Self { value, session }
     }
 
@@ -70,7 +70,7 @@ impl<'c> Dimension<'c> {
     }
 
     /// Returns the [`Session`] in which array results computed from this dimension are materialized.
-    pub fn session(&self) -> &Session<'c> {
+    pub fn session(&self) -> &Session {
         &self.session
     }
 
@@ -80,32 +80,32 @@ impl<'c> Dimension<'c> {
     }
 }
 
-impl Debug for Dimension<'_> {
+impl Debug for Dimension {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_tuple("Dimension").field(&self.value).finish()
     }
 }
 
-impl Display for Dimension<'_> {
+impl Display for Dimension {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.value, formatter)
     }
 }
 
 // Dimensions compare by value, because the session only selects where derived arrays are materialized.
-impl PartialEq for Dimension<'_> {
+impl PartialEq for Dimension {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
     }
 }
 
-impl Borrow<DimensionValue> for Dimension<'_> {
+impl Borrow<DimensionValue> for Dimension {
     fn borrow(&self) -> &DimensionValue {
         &self.value
     }
 }
 
-impl Typed for Dimension<'_> {
+impl Typed for Dimension {
     type Type = DimensionType;
 
     fn r#type(&self) -> Cow<'_, DimensionType> {
@@ -115,19 +115,19 @@ impl Typed for Dimension<'_> {
 
 // Comparing two dimensions yields a Boolean array, which is materialized in this dimension's session by binding the
 // array IR comparison there. The session decides the predicate on the host from the two extents.
-impl<'c> Compare<Value<'c>, DimensionType> for Dimension<'c> {
-    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Value<'c>, ProgramError> {
+impl Compare<Value, DimensionType> for Dimension {
+    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Value, ProgramError> {
         let inputs = [Value::Dimension(self.clone()), Value::Dimension(other.clone())];
         Ok(self.session.bind(CompareOperation::<ArrayIrType>::new(direction), Vec::new(), &inputs)?.remove(0))
     }
 }
 
-impl<'c> CoreValue for Dimension<'c> {
+impl CoreValue for Dimension {
     // Like `Array`, a dimension dispatches and executes through the rich `Session` that it carries, projected onto
     // the dimension member family. That session evaluates dimension operations on the host and materializes array
     // results (e.g., `dimension_to_scalar`) in its session.
     type Dispatch = ValueDomainDispatch;
-    type Domain = ProjectedContext<Session<'c>, DimensionType>;
+    type Domain = ProjectedContext<Session, DimensionType>;
 
     fn domain(&self) -> Self::Domain {
         ProjectedContext::new(self.session.clone())
@@ -149,56 +149,56 @@ impl<'c> CoreValue for Dimension<'c> {
 /// infallibly. Two references are equal when their handles are equal (i.e., when they name the same allocation and
 /// view), regardless of their sessions.
 #[derive(Clone)]
-pub struct Reference<'c> {
+pub struct Reference {
     /// Shared reference handle (i.e., the allocation, the view path, and the cached reference type).
-    reference: ArrayReference<Array<'c>>,
+    reference: ArrayReference<Array>,
 
     /// [`Session`] that owns the referent of this reference.
-    session: Session<'c>,
+    session: Session,
 }
 
-impl<'c> Reference<'c> {
+impl Reference {
     /// Creates a new [`Reference`] that binds `reference` to `session`.
-    pub fn new(reference: ArrayReference<Array<'c>>, session: Session<'c>) -> Self {
+    pub fn new(reference: ArrayReference<Array>, session: Session) -> Self {
         Self { reference, session }
     }
 
     /// Returns the shared [`ArrayReference`] handle of this reference.
-    pub fn handle(&self) -> &ArrayReference<Array<'c>> {
+    pub fn handle(&self) -> &ArrayReference<Array> {
         &self.reference
     }
 
     /// Returns the [`Session`] that owns the referent of this reference.
-    pub fn session(&self) -> &Session<'c> {
+    pub fn session(&self) -> &Session {
         &self.session
     }
 
     /// Consumes this reference and returns its shared [`ArrayReference`] handle.
-    pub fn into_handle(self) -> ArrayReference<Array<'c>> {
+    pub fn into_handle(self) -> ArrayReference<Array> {
         self.reference
     }
 }
 
-impl Debug for Reference<'_> {
+impl Debug for Reference {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_tuple("Reference").field(&self.reference).finish()
     }
 }
 
-impl Display for Reference<'_> {
+impl Display for Reference {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.reference, formatter)
     }
 }
 
 // References compare by handle identity, like `ArrayReference`.
-impl PartialEq for Reference<'_> {
+impl PartialEq for Reference {
     fn eq(&self, other: &Self) -> bool {
         self.reference == other.reference
     }
 }
 
-impl Typed for Reference<'_> {
+impl Typed for Reference {
     type Type = ReferenceType<ArrayType>;
 
     fn r#type(&self) -> Cow<'_, ReferenceType<ArrayType>> {
@@ -231,24 +231,21 @@ impl Typed for Reference<'_> {
 /// [`PartialEq`] ignores sessions, so arrays compare by the storage identity of [`Array`], dimensions by their
 /// [`DimensionValue`]s, and references by their handles.
 #[derive(Clone, Debug, PartialEq, Parameter)]
-pub enum Value<'c> {
+pub enum Value {
     /// Device-resident [`Array`], which carries its own session.
-    Array(Array<'c>),
+    Array(Array),
 
     /// First-class runtime dimension.
-    Dimension(Dimension<'c>),
+    Dimension(Dimension),
 
     /// Array reference.
-    Reference(Reference<'c>),
+    Reference(Reference),
 }
 
-impl<'c> Value<'c> {
+impl Value {
     /// Converts a session-free [`ArrayIrValue`] over XLA arrays into a [`Value`], binding dimension and reference
     /// members to `session`. Array members keep their own session.
-    pub(crate) fn from_array_ir_value(
-        value: ArrayIrValue<Array<'c>>,
-        session: &Session<'c>,
-    ) -> Result<Self, TypeError> {
+    pub(crate) fn from_array_ir_value(value: ArrayIrValue<Array>, session: &Session) -> Result<Self, TypeError> {
         match value {
             ArrayIrValue::Array(value) => Ok(Self::Array(value)),
             ArrayIrValue::Dimension(value) => Ok(Self::Dimension(Dimension::new(value, session.clone()))),
@@ -257,7 +254,7 @@ impl<'c> Value<'c> {
     }
 
     /// Returns the [`Session`] of this value's member.
-    pub fn session(&self) -> &Session<'c> {
+    pub fn session(&self) -> &Session {
         match self {
             Self::Array(value) => value.session(),
             Self::Dimension(value) => value.session(),
@@ -268,7 +265,7 @@ impl<'c> Value<'c> {
     /// Converts this value into the session-free [`ArrayIrValue`] representation over XLA arrays, which drops the
     /// sessions of dimension and reference members. Used to delegate host-side semantics (e.g., reference handles and
     /// predicates) to the generic [`ArrayIrValue`] implementations in `ryft-core`.
-    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<Array<'c>> {
+    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<Array> {
         match self {
             Self::Array(value) => ArrayIrValue::Array(value),
             Self::Dimension(value) => ArrayIrValue::Dimension(value.into_value()),
@@ -286,7 +283,7 @@ impl<'c> Value<'c> {
     }
 }
 
-impl Display for Value<'_> {
+impl Display for Value {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Array(value) => Display::fmt(value, formatter),
@@ -296,7 +293,7 @@ impl Display for Value<'_> {
     }
 }
 
-impl Typed for Value<'_> {
+impl Typed for Value {
     type Type = ArrayIrType;
 
     fn r#type(&self) -> Cow<'_, ArrayIrType> {
@@ -308,11 +305,11 @@ impl Typed for Value<'_> {
     }
 }
 
-impl<'c> CoreValue for Value<'c> {
+impl CoreValue for Value {
     // Every member carries its `Session`, so array IR values dispatch and execute through it directly. Capability
     // blankets in `ryft-core` bind `Operation`s into this session, and free transform entry points recover it here.
     type Dispatch = ValueDomainDispatch;
-    type Domain = Session<'c>;
+    type Domain = Session;
 
     fn domain(&self) -> Self::Domain {
         // A mesh-less session recovered from an array places the values that it creates without array inputs (e.g., a
@@ -360,18 +357,18 @@ impl<'c> CoreValue for Value<'c> {
     }
 }
 
-impl<'c> ValueProjection<ArrayType> for Value<'c> {
-    type Projected = Array<'c>;
+impl ValueProjection<ArrayType> for Value {
+    type Projected = Array;
     type ProjectedRef<'v>
-        = &'v Array<'c>
+        = &'v Array
     where
         Self: 'v;
 
-    fn from_projected(value: Array<'c>) -> Self {
+    fn from_projected(value: Array) -> Self {
         Self::Array(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v Array<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v Array, TypeError>
     where
         ArrayType: 'v,
     {
@@ -381,7 +378,7 @@ impl<'c> ValueProjection<ArrayType> for Value<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<Array<'c>, TypeError> {
+    fn into_projected(self) -> Result<Array, TypeError> {
         match self {
             Self::Array(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
@@ -389,18 +386,18 @@ impl<'c> ValueProjection<ArrayType> for Value<'c> {
     }
 }
 
-impl<'c> ValueProjection<DimensionType> for Value<'c> {
-    type Projected = Dimension<'c>;
+impl ValueProjection<DimensionType> for Value {
+    type Projected = Dimension;
     type ProjectedRef<'v>
-        = &'v Dimension<'c>
+        = &'v Dimension
     where
         Self: 'v;
 
-    fn from_projected(value: Dimension<'c>) -> Self {
+    fn from_projected(value: Dimension) -> Self {
         Self::Dimension(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v Dimension<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v Dimension, TypeError>
     where
         DimensionType: 'v,
     {
@@ -410,7 +407,7 @@ impl<'c> ValueProjection<DimensionType> for Value<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<Dimension<'c>, TypeError> {
+    fn into_projected(self) -> Result<Dimension, TypeError> {
         match self {
             Self::Dimension(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
@@ -418,18 +415,18 @@ impl<'c> ValueProjection<DimensionType> for Value<'c> {
     }
 }
 
-impl<'c> ValueProjection<ReferenceType<ArrayType>> for Value<'c> {
-    type Projected = Reference<'c>;
+impl ValueProjection<ReferenceType<ArrayType>> for Value {
+    type Projected = Reference;
     type ProjectedRef<'v>
-        = &'v Reference<'c>
+        = &'v Reference
     where
         Self: 'v;
 
-    fn from_projected(value: Reference<'c>) -> Self {
+    fn from_projected(value: Reference) -> Self {
         Self::Reference(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v Reference<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v Reference, TypeError>
     where
         ReferenceType<ArrayType>: 'v,
     {
@@ -439,7 +436,7 @@ impl<'c> ValueProjection<ReferenceType<ArrayType>> for Value<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<Reference<'c>, TypeError> {
+    fn into_projected(self) -> Result<Reference, TypeError> {
         match self {
             Self::Reference(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
@@ -447,20 +444,20 @@ impl<'c> ValueProjection<ReferenceType<ArrayType>> for Value<'c> {
     }
 }
 
-impl<'c> From<Array<'c>> for Value<'c> {
-    fn from(value: Array<'c>) -> Self {
+impl From<Array> for Value {
+    fn from(value: Array) -> Self {
         Self::Array(value)
     }
 }
 
-impl<'c> From<Dimension<'c>> for Value<'c> {
-    fn from(value: Dimension<'c>) -> Self {
+impl From<Dimension> for Value {
+    fn from(value: Dimension) -> Self {
         Self::Dimension(value)
     }
 }
 
-impl<'c> From<Reference<'c>> for Value<'c> {
-    fn from(value: Reference<'c>) -> Self {
+impl From<Reference> for Value {
+    fn from(value: Reference) -> Self {
         Self::Reference(value)
     }
 }
@@ -469,13 +466,13 @@ impl<'c> From<Reference<'c>> for Value<'c> {
 // their member-kind semantics (e.g., which members can act as predicates and how equal dimension carries pass through
 // a batched selection) have a single source of truth.
 
-impl Concretizable<bool> for Value<'_> {
+impl Concretizable<bool> for Value {
     fn concretize(&self) -> Result<bool, ProgramError> {
         self.clone().into_array_ir_value().concretize()
     }
 }
 
-impl WhilePredicate for Value<'_> {
+impl WhilePredicate for Value {
     fn any_true(&self) -> Result<bool, ProgramError> {
         self.clone().into_array_ir_value().any_true()
     }
@@ -489,7 +486,7 @@ impl WhilePredicate for Value<'_> {
     }
 }
 
-impl AssertionValue for Value<'_> {
+impl AssertionValue for Value {
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         self.clone().into_array_ir_value().assertion_observation()
     }
@@ -503,7 +500,7 @@ impl AssertionValue for Value<'_> {
 // concrete backend values. These implementations provide the panicking operator sugar that the array operation
 // bundles require by delegating to the fallible `ryft` capabilities, exactly like those of `Array`.
 
-impl std::ops::Neg for Value<'_> {
+impl std::ops::Neg for Value {
     type Output = Self;
 
     fn neg(self) -> Self {
@@ -511,7 +508,7 @@ impl std::ops::Neg for Value<'_> {
     }
 }
 
-impl std::ops::Add for Value<'_> {
+impl std::ops::Add for Value {
     type Output = Self;
 
     fn add(self, right: Self) -> Self {
@@ -519,7 +516,7 @@ impl std::ops::Add for Value<'_> {
     }
 }
 
-impl std::ops::Sub for Value<'_> {
+impl std::ops::Sub for Value {
     type Output = Self;
 
     fn sub(self, right: Self) -> Self {
@@ -527,7 +524,7 @@ impl std::ops::Sub for Value<'_> {
     }
 }
 
-impl std::ops::Mul for Value<'_> {
+impl std::ops::Mul for Value {
     type Output = Self;
 
     fn mul(self, right: Self) -> Self {
@@ -535,7 +532,7 @@ impl std::ops::Mul for Value<'_> {
     }
 }
 
-impl std::ops::Div for Value<'_> {
+impl std::ops::Div for Value {
     type Output = Self;
 
     fn div(self, right: Self) -> Self {
@@ -544,7 +541,7 @@ impl std::ops::Div for Value<'_> {
 }
 
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table, session constants
-/// refer to arrays that the session retains, and Boolean literals preserve dimension comparison proofs without
+/// refer to arrays that their handles retain, and Boolean literals preserve dimension comparison proofs without
 /// allocating device storage or introducing a capture. Projection onto [`ArrayType`] is the identity and preserves
 /// every representation unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
@@ -552,7 +549,7 @@ pub enum ArrayConstant {
     /// A reference to array data in the enclosing capture table.
     Captured(CaptureReference<ArrayType>),
 
-    /// A handle to array data that the session retains, which [`SessionConstant`] describes.
+    /// A handle that retains array data, which [`SessionConstant`] describes.
     Session(SessionConstant),
 
     /// An immediate scalar Boolean predicate.
@@ -705,7 +702,7 @@ impl AssertionValue for ArrayConstant {
 ///     a manual region's shard-local values.
 ///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
 ///     composition, and assertion folding without requiring a captured device buffer.
-///   - **Session arrays:** a [`SessionConstant`] is a lifetime-free handle to an array that the session retains for a
+///   - **Session arrays:** a [`SessionConstant`] is a handle to an array that is retained for a
 ///     trace whose capture table cannot hold runtime arrays (e.g., the body of a rematerialized function or of a
 ///     composite). Lowering turns it into a hidden executable argument, as it does for a capture.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
@@ -713,7 +710,7 @@ pub enum Constant {
     /// Reference to a value held in the surrounding compiled function's capture table.
     Captured(CaptureReference<ArrayIrType>),
 
-    /// Handle to an array that the session retains.
+    /// Handle that retains an array.
     Session(SessionConstant),
 
     /// Immediate checked host-side first-class dimension extent.
@@ -964,18 +961,18 @@ mod tests {
     }
 
     /// Uploads `values` as an [`Array`] of element type `data_type` and shape `shape` that is replicated over `mesh`.
-    fn array<'c, T: Copy>(
-        session: &Session<'c>,
+    fn array<T: Copy>(
+        session: &Session,
         mesh: &DeviceMesh,
         data_type: DataType,
         values: &[T],
         shape: &[usize],
-    ) -> Array<'c> {
+    ) -> Array {
         replicated_array(session, mesh, data_type, shape, &values_to_bytes(values))
     }
 
     /// Reads the elements of the first addressable shard of the array member of `value`.
-    fn read<T: Copy>(value: &Value<'_>) -> Vec<T> {
+    fn read<T: Copy>(value: &Value) -> Vec<T> {
         let Value::Array(array) = value else { panic!("expected an array value but got `{value}`") };
         let shard = array.addressable_shards().next().unwrap();
         let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
@@ -983,12 +980,12 @@ mod tests {
     }
 
     /// Lifts the static first-class dimension `extent` into `session`.
-    fn dimension<'c>(session: &Session<'c>, extent: usize) -> Value<'c> {
+    fn dimension(session: &Session, extent: usize) -> Value {
         session.lift(Constant::Dimension(DimensionValue::constant(extent).unwrap())).unwrap()
     }
 
     /// Returns whether `left` and `right` share one [`Session`].
-    fn same_session<'c>(left: &Session<'c>, right: &Session<'c>) -> bool {
+    fn same_session(left: &Session, right: &Session) -> bool {
         left.is_same_session(right)
     }
 
@@ -1321,11 +1318,11 @@ mod tests {
         let session = session_with_client(&client);
         let mesh = mesh_on(&client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
-        let value = <Value<'_> as ValueProjection<ArrayType>>::from_projected(array.clone());
-        assert_eq!(<Value<'_> as ValueProjection<ArrayType>>::projected(&value), Ok(&array));
+        let value = <Value as ValueProjection<ArrayType>>::from_projected(array.clone());
+        assert_eq!(<Value as ValueProjection<ArrayType>>::projected(&value), Ok(&array));
         assert_eq!(ValueProjection::<ArrayType>::into_projected(value), Ok(array));
         assert_eq!(
-            <Value<'_> as ValueProjection<ArrayType>>::projected(&dimension(&session, 3)),
+            <Value as ValueProjection<ArrayType>>::projected(&dimension(&session, 3)),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
     }
@@ -1336,12 +1333,12 @@ mod tests {
         let session = session_with_client(&client);
         let mesh = mesh_on(&client, 0);
         let dimension = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
-        let value = <Value<'_> as ValueProjection<DimensionType>>::from_projected(dimension.clone());
-        assert_eq!(<Value<'_> as ValueProjection<DimensionType>>::projected(&value), Ok(&dimension));
+        let value = <Value as ValueProjection<DimensionType>>::from_projected(dimension.clone());
+        assert_eq!(<Value as ValueProjection<DimensionType>>::projected(&value), Ok(&dimension));
         assert_eq!(ValueProjection::<DimensionType>::into_projected(value), Ok(dimension));
         let array = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         assert_eq!(
-            <Value<'_> as ValueProjection<DimensionType>>::projected(&array),
+            <Value as ValueProjection<DimensionType>>::projected(&array),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
     }
@@ -1353,11 +1350,11 @@ mod tests {
         let mesh = mesh_on(&client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let reference = Reference::new(ArrayReference::new(array.clone()), session.clone());
-        let value = <Value<'_> as ValueProjection<ReferenceType<ArrayType>>>::from_projected(reference.clone());
-        assert_eq!(<Value<'_> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value), Ok(&reference));
+        let value = <Value as ValueProjection<ReferenceType<ArrayType>>>::from_projected(reference.clone());
+        assert_eq!(<Value as ValueProjection<ReferenceType<ArrayType>>>::projected(&value), Ok(&reference));
         assert_eq!(ValueProjection::<ReferenceType<ArrayType>>::into_projected(value), Ok(reference));
         assert_eq!(
-            <Value<'_> as ValueProjection<ReferenceType<ArrayType>>>::projected(&Value::Array(array)),
+            <Value as ValueProjection<ReferenceType<ArrayType>>>::projected(&Value::Array(array)),
             Err(TypeError::invalid("expected reference type but got array type")),
         );
     }
@@ -1643,7 +1640,7 @@ mod tests {
         let mesh = mesh_on(&client, 0);
         let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
 
-        let squared: Value<'_> =
+        let squared: Value =
             batch(|x| Ok(x.clone() * x), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(read::<f32>(&squared), vec![1.0, 4.0, 9.0]);
 
@@ -1665,7 +1662,7 @@ mod tests {
         let session = session_with_client(&client);
         let mesh = mesh_on(&client, 0);
         let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
-        let scaled: Value<'_> = batch(
+        let scaled: Value = batch(
             |x| {
                 let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
                 Ok(x * extent)

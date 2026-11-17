@@ -4112,7 +4112,7 @@ mod tests {
         let inputs_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(carry, inputs)| {
                 scan(
                     |_, carry, item| {
@@ -4162,7 +4162,7 @@ mod tests {
         let value = |dimensions: &[usize], values: &[f32]| {
             Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
-        let read = |value: Value<'_>| {
+        let read = |value: Value| {
             let array = program_array(&value);
             (array.shape().dimensions().to_vec(), read_f32s(&client, array))
         };

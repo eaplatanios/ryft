@@ -55,10 +55,10 @@ type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
 type BenchmarkOutput = (ArrayIrType, ArrayIrType);
 
 /// Staged gradient of a benchmarked function.
-type BenchmarkStagedFunction<'c> = CoreStagedFunction<Session<'c>, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkStagedFunction = CoreStagedFunction<Session, BenchmarkInput, BenchmarkOutput>;
 
 /// Compiled gradient of a benchmarked function.
-type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Session<'c>, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkCompiledFunction = CoreCompiledFunction<Session, BenchmarkInput, BenchmarkOutput>;
 
 /// Rematerialization of a layer.
 #[derive(Copy, Clone, Debug)]
@@ -110,7 +110,7 @@ struct Model {
 }
 
 /// Measurements of one compiled gradient.
-struct Measurement<'c> {
+struct Measurement {
     /// Duration of staging the gradient.
     staging: Duration,
 
@@ -136,7 +136,7 @@ struct Measurement<'c> {
     execution: Duration,
 
     /// Computed gradients.
-    gradients: Vec<Array<'c>>,
+    gradients: Vec<Array>,
 }
 
 /// Returns the dot product dimensions of a matrix multiplication.
@@ -146,7 +146,7 @@ fn matrix_multiplication() -> DotDimensionNumbers {
 
 /// Applies one layer, `h ↦ tanh(h · w₁) · w₂`, to the hidden state `h`, tagging its dot products with
 /// [`UP_PROJECTION_NAME`] and [`DOWN_PROJECTION_NAME`] when `tagged` is `true`.
-fn layer<'c>(tagged: bool, hidden: Tracer<'c>, up: Tracer<'c>, down: Tracer<'c>) -> Result<Tracer<'c>, ProgramError> {
+fn layer(tagged: bool, hidden: Tracer, up: Tracer, down: Tracer) -> Result<Tracer, ProgramError> {
     let hidden = ValueProjection::<ArrayType>::into_projected(hidden)?;
     let up = ValueProjection::<ArrayType>::into_projected(up)?;
     let down = ValueProjection::<ArrayType>::into_projected(down)?;
@@ -162,15 +162,15 @@ fn layer<'c>(tagged: bool, hidden: Tracer<'c>, up: Tracer<'c>, down: Tracer<'c>)
 }
 
 /// Applies [`layer`] rematerialized with `policy` and the provided optimization barrier and tagging flags.
-fn rematerialized_layer<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
+fn rematerialized_layer<P: Clone + ResidualPolicy<ArrayIrType>>(
     policy: P,
     optimization_barrier: bool,
     tagged: bool,
-    hidden: Tracer<'c>,
-    up: Tracer<'c>,
-    down: Tracer<'c>,
-) -> Result<Tracer<'c>, ProgramError> {
-    rematerialize(move |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| layer(tagged, hidden, up, down))
+    hidden: Tracer,
+    up: Tracer,
+    down: Tracer,
+) -> Result<Tracer, ProgramError> {
+    rematerialize(move |(hidden, up, down): (Tracer, Tracer, Tracer)| layer(tagged, hidden, up, down))
         .with_policy(policy)
         .with_optimization_barrier(match optimization_barrier {
             true => RematerializationOptimizationBarrier::All,
@@ -180,13 +180,13 @@ fn rematerialized_layer<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
 }
 
 /// Applies [`layer`] with the provided rematerialization and optimization barrier flag.
-fn checkpointed_layer<'c>(
+fn checkpointed_layer(
     checkpointing: Checkpointing,
     optimization_barrier: bool,
-    hidden: Tracer<'c>,
-    up: Tracer<'c>,
-    down: Tracer<'c>,
-) -> Result<Tracer<'c>, ProgramError> {
+    hidden: Tracer,
+    up: Tracer,
+    down: Tracer,
+) -> Result<Tracer, ProgramError> {
     match checkpointing {
         Checkpointing::None => layer(false, hidden, up, down),
         Checkpointing::NothingSavable => {
@@ -206,19 +206,12 @@ fn checkpointed_layer<'c>(
 }
 
 /// Applies [`layer`] nested in `depth` rematerialized calls that save nothing.
-fn nested_layer<'c>(
-    depth: usize,
-    hidden: Tracer<'c>,
-    up: Tracer<'c>,
-    down: Tracer<'c>,
-) -> Result<Tracer<'c>, ProgramError> {
+fn nested_layer(depth: usize, hidden: Tracer, up: Tracer, down: Tracer) -> Result<Tracer, ProgramError> {
     if depth == 0 {
         return layer(false, hidden, up, down);
     }
-    rematerialize(move |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| {
-        nested_layer(depth - 1, hidden, up, down)
-    })
-    .call((hidden, up, down))
+    rematerialize(move |(hidden, up, down): (Tracer, Tracer, Tracer)| nested_layer(depth - 1, hidden, up, down))
+        .call((hidden, up, down))
 }
 
 /// Returns the type of an `f32` array of the provided shape.
@@ -237,7 +230,7 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
 /// Returns an array replicated over `mesh` with deterministic centered values of variance `1 / fan_in`.
 /// Distinct seeds separate inputs and parameter matrices, and the generator continues across stacked layers so that
 /// their weights differ. Reusing the same seed and shape reproduces identical inputs across benchmark variants.
-fn array<'c>(session: &Session<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> Array<'c> {
+fn array(session: &Session, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> Array {
     let size = shape.iter().product::<usize>();
     let scale = (3.0 / fan_in as f32).sqrt();
     let bytes = (0..size)
@@ -256,7 +249,7 @@ fn array<'c>(session: &Session<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: 
 }
 
 /// Returns the values of `array`.
-fn values(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+fn values(client: &Client<'_>, array: &Array) -> Vec<f32> {
     let device = client.addressable_devices().unwrap()[0].id().unwrap();
     let bytes = array.device_shard(device).unwrap().buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
     bytes.as_chunks::<4>().0.iter().map(|bytes| f32::from_ne_bytes(*bytes)).collect()
@@ -264,16 +257,16 @@ fn values(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
 
 /// Stages the gradient of the sum of the outputs of `apply` with respect to the parameters `(w₁, w₂)` of shapes
 /// `up_shape` and `down_shape`, at a hidden state of `model`.
-fn stage_gradient<'c, F>(
-    session: &Session<'c>,
+fn stage_gradient<F>(
+    session: &Session,
     mesh: &DeviceMesh,
     model: Model,
     up_shape: &[usize],
     down_shape: &[usize],
     apply: F,
-) -> BenchmarkStagedFunction<'c>
+) -> BenchmarkStagedFunction
 where
-    F: Fn(Tracer<'c>, Tracer<'c>, Tracer<'c>) -> Result<Tracer<'c>, ProgramError>,
+    F: Fn(Tracer, Tracer, Tracer) -> Result<Tracer, ProgramError>,
 {
     let hidden_type = array_type(&[model.batch_size, model.width]);
     session
@@ -283,8 +276,8 @@ where
                 // and its gradient is discarded.
                 let (_, up, down) = differentiate_at((hidden, up, down))
                     .gradient(|(hidden, up, down)| {
-                        let (_, apply) = DomainTracingContext::<Session<'c>>::trace(
-                            |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| apply(hidden, up, down),
+                        let (_, apply) = DomainTracingContext::<Session>::trace(
+                            |(hidden, up, down): (Tracer, Tracer, Tracer)| apply(hidden, up, down),
                             (
                                 ArrayIrType::from(hidden_type.clone()),
                                 ArrayIrType::from(array_type(up_shape)),
@@ -313,12 +306,12 @@ where
 /// Stages the gradient of a model that scans over its stacked layer parameters, applying each layer with the provided
 /// rematerialization. Rematerialized layers disable their optimization barriers, because the scan already separates
 /// their recomputations from the forward computation.
-fn stage_scanned_gradient<'c>(
-    session: &Session<'c>,
+fn stage_scanned_gradient(
+    session: &Session,
     mesh: &DeviceMesh,
     model: Model,
     checkpointing: Checkpointing,
-) -> BenchmarkStagedFunction<'c> {
+) -> BenchmarkStagedFunction {
     let hidden_type = array_type(&[model.batch_size, model.width]);
     let layer_up_type = array_type(&[model.width, model.expanded_width]);
     let layer_down_type = array_type(&[model.expanded_width, model.width]);
@@ -329,8 +322,8 @@ fn stage_scanned_gradient<'c>(
         &[model.layer_count, model.width, model.expanded_width],
         &[model.layer_count, model.expanded_width, model.width],
         move |hidden, up, down| {
-            let (_, body) = DomainTracingContext::<Session<'c>>::trace(
-                |(_index, hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>, Tracer<'c>)| {
+            let (_, body) = DomainTracingContext::<Session>::trace(
+                |(_index, hidden, up, down): (Tracer, Tracer, Tracer, Tracer)| {
                     checkpointed_layer(checkpointing, false, hidden, up, down)
                 },
                 (
@@ -348,19 +341,19 @@ fn stage_scanned_gradient<'c>(
 }
 
 /// Lowers, compiles, analyzes, and executes `staged` at `inputs`, whose staging took `staging`.
-fn measure<'c>(
-    session: &Session<'c>,
-    staged: BenchmarkStagedFunction<'c>,
+fn measure(
+    session: &Session,
+    staged: BenchmarkStagedFunction,
     staging: Duration,
-    inputs: (Array<'c>, Array<'c>, Array<'c>),
+    inputs: (Array, Array, Array),
     execution_count: usize,
-) -> Measurement<'c> {
+) -> Measurement {
     let start = Instant::now();
     let lowered = staged.lower(session).unwrap();
     let lower = start.elapsed();
     let operation_count = lowered.lowered_program().stable_hlo().matches(" = stablehlo.").count();
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(session).unwrap();
+    let compiled: BenchmarkCompiledFunction = lowered.compile(session).unwrap();
     let compile = start.elapsed();
     let analysis = session.analyze(compiled.executable()).unwrap();
     let memory = analysis.memory();
@@ -484,11 +477,11 @@ fn validate_gradients(
 fn report(
     client: &Client<'_>,
     name: &str,
-    measurement: &Measurement<'_>,
-    reference: &Measurement<'_>,
+    measurement: &Measurement,
+    reference: &Measurement,
     parameter_layer_count: usize,
 ) -> Result<(), ProgramError> {
-    let read = |measurement: &Measurement<'_>| {
+    let read = |measurement: &Measurement| {
         measurement
             .gradients
             .iter()

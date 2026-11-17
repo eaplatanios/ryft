@@ -962,13 +962,13 @@ mod tests {
         fn requires_array_ir_operations<V: ArrayIrOperations>() {}
         fn requires_dimension_operations<V: ryft_core::DimensionOperations>() {}
 
-        requires_array_operations::<Array<'static>>();
+        requires_array_operations::<Array>();
         requires_array_operations::<ArrayTracer>();
-        requires_array_operations::<crate::Value<'static>>();
-        requires_array_ir_operations::<crate::Value<'static>>();
-        requires_dimension_operations::<crate::Dimension<'static>>();
-        requires_array_operations::<Tracer<'static>>();
-        requires_array_ir_operations::<Tracer<'static>>();
+        requires_array_operations::<crate::Value>();
+        requires_array_ir_operations::<crate::Value>();
+        requires_dimension_operations::<crate::Dimension>();
+        requires_array_operations::<Tracer>();
+        requires_array_ir_operations::<Tracer>();
         requires_array_ir_operations::<CoreTracer<TracingContext<Constant, Operation>>>();
     }
 
@@ -1377,16 +1377,14 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let function = rematerialize(move |x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
+        let function = rematerialize(move |x: Tracer| -> Result<Tracer, ProgramError> {
             let context = x.context().clone();
             let called = context.bind(Operation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
             let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
             Ok(outputs.remove(0))
         })
         .with_policy(NothingSavable);
-        let (_, program) =
-            DomainTracingContext::<Session<'static>>::trace(|x: Tracer<'static>| function.call(x), scalar_type)
-                .unwrap();
+        let (_, program) = DomainTracingContext::<Session>::trace(|x: Tracer| function.call(x), scalar_type).unwrap();
         let linearization = program.into_flat_program().linearize().unwrap();
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
@@ -1440,14 +1438,14 @@ mod tests {
         // Refer to `TracingContext::trace_with_named_axes` for the full rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let captured_value = Constant::Captured(CaptureReference::new(0, scalar_type.clone()));
-        let function = rematerialize(move |x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
+        let function = rematerialize(move |x: Tracer| -> Result<Tracer, ProgramError> {
             let context = x.context().clone();
             let reference = context.capture(captured_value.clone())?;
             let captured = StagingContext::constant(&context, reference);
             let mut outputs = context.bind(AddOperation::new(), Vec::new(), &[x, captured])?;
             Ok(outputs.remove(0))
         });
-        let root = DomainTracingContext::<Session<'static>>::new();
+        let root = DomainTracingContext::<Session>::new();
         let input = root.input(scalar_type);
         let result = function.call(input);
         assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));

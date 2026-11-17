@@ -593,6 +593,8 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
+    #[cfg(feature = "cuda-13")]
     use crate::sessions::tests::session_with_client;
     #[cfg(feature = "cuda-13")]
     use crate::tests::{values_from_bytes, values_to_bytes};
@@ -912,13 +914,15 @@ mod tests {
         // `u64`, the rebased metadata of an exchange with a batch dimension, and the rebased metadata of the additive
         // transpose. A single-participant axis exercises all three on one device.
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let execute = |program: String, inputs: Vec<(Vec<u8>, BufferType, Vec<u64>)>| {
@@ -1102,13 +1106,15 @@ mod tests {
     #[test]
     fn test_parallel_ragged_all_to_all_operation_lower_executes_forward_and_overlapping_send_transpose_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let session = session_with_client(&client);
         let client_devices = client.addressable_devices().unwrap();
         if client_devices.len() < 2 {

@@ -89,7 +89,7 @@ mod tests {
         let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
 
         let constructed_baseline = constructed_array_count();
-        let arrays: Vec<Array<'_>> = (0..200)
+        let arrays: Vec<Array> = (0..200)
             .map(|_| {
                 Array::from_addressable_buffers(&session, array_type.clone(), device_mesh.clone(), Vec::new()).unwrap()
             })
@@ -101,7 +101,7 @@ mod tests {
              (after={after_construct}, baseline={constructed_baseline})",
         );
 
-        let clones: Vec<Array<'_>> = arrays.to_vec();
+        let clones: Vec<Array> = arrays.to_vec();
         let after_clone = constructed_array_count();
         assert!(
             after_clone >= after_construct + 200,

@@ -32,7 +32,7 @@ use super::{DifferentialObservation, SCHEMA};
 type CoreTracer = Tracer<TracingContext<CoreArray, ArrayOperation<CoreArray>>>;
 
 /// Tracer over which the bodies of the rematerialized functions staged for XLA are traced.
-type XlaTracer = DomainTracer<Session<'static>>;
+type XlaTracer = DomainTracer<Session>;
 
 /// Stable identifiers and emitters of the rematerialization cases, in registry order.
 pub(super) const CASES: [(&str, fn() -> Result<DifferentialObservation, Box<dyn Error>>); 20] = [

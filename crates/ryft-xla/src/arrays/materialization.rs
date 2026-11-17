@@ -66,23 +66,23 @@ impl BoundedMaterializationKey {
 ///   - *Failed:* The producer was dropped without completing, which removed the flight. The woken waiters race to
 ///     reserve it again, one of them becomes the retry producer, and the rest register again against the new
 ///     generation.
-pub(crate) struct BoundedMaterializationCache<'o> {
+pub(crate) struct BoundedMaterializationCache {
     /// Ready entries and in-flight reservations.
-    state: Mutex<BoundedMaterializationCacheState<'o>>,
+    state: Mutex<BoundedMaterializationCacheState>,
 
     /// Notification for a key becoming ready or a failed reservation becoming retryable.
     ready: Condvar,
 }
 
-impl<'o> Default for BoundedMaterializationCache<'o> {
+impl Default for BoundedMaterializationCache {
     fn default() -> Self {
         Self { state: Mutex::new(BoundedMaterializationCacheState::default()), ready: Condvar::new() }
     }
 }
 
-impl<'o> BoundedMaterializationCache<'o> {
+impl BoundedMaterializationCache {
     /// Looks up `key` without blocking, reserving a missing key for this caller when possible.
-    pub(crate) fn probe(self: &Arc<Self>, key: BoundedMaterializationKey) -> BoundedMaterializationProbe<'o> {
+    pub(crate) fn probe(self: &Arc<Self>, key: BoundedMaterializationKey) -> BoundedMaterializationProbe {
         let mut state = self.state.lock().expect("bounded materialization cache mutex poisoned");
         if let Some(array) = Self::take_ready(&mut state, &key) {
             return BoundedMaterializationProbe::Hit(array);
@@ -111,10 +111,7 @@ impl<'o> BoundedMaterializationCache<'o> {
     }
 
     /// Returns and refreshes a ready entry while holding `state`.
-    fn take_ready(
-        state: &mut BoundedMaterializationCacheState<'o>,
-        key: &BoundedMaterializationKey,
-    ) -> Option<Array<'o>> {
+    fn take_ready(state: &mut BoundedMaterializationCacheState, key: &BoundedMaterializationKey) -> Option<Array> {
         let index = state.ready.iter().position(|entry| &entry.key == key)?;
         let entry = state.ready.remove(index).unwrap();
         let array = entry.array.clone();
@@ -123,7 +120,7 @@ impl<'o> BoundedMaterializationCache<'o> {
     }
 
     /// Reserves a new producer generation for `key` while holding `state`.
-    fn reserve_flight(state: &mut BoundedMaterializationCacheState<'o>, key: BoundedMaterializationKey) -> u64 {
+    fn reserve_flight(state: &mut BoundedMaterializationCacheState, key: BoundedMaterializationKey) -> u64 {
         let generation = state.next_generation;
         state.next_generation = state.next_generation.checked_add(1).unwrap();
         let previous = state
@@ -134,11 +131,7 @@ impl<'o> BoundedMaterializationCache<'o> {
     }
 
     /// Inserts or refreshes one ready entry and evicts the excess least recently used entries.
-    fn insert_ready(
-        state: &mut BoundedMaterializationCacheState<'o>,
-        key: BoundedMaterializationKey,
-        array: Array<'o>,
-    ) {
+    fn insert_ready(state: &mut BoundedMaterializationCacheState, key: BoundedMaterializationKey, array: Array) {
         if let Some(index) = state.ready.iter().position(|entry| entry.key == key) {
             state.ready.remove(index);
         }
@@ -150,21 +143,21 @@ impl<'o> BoundedMaterializationCache<'o> {
 }
 
 /// Result of a non-blocking lookup in a [`BoundedMaterializationCache`].
-pub(crate) enum BoundedMaterializationProbe<'o> {
+pub(crate) enum BoundedMaterializationProbe {
     /// A ready array with the bound shape was found.
-    Hit(Array<'o>),
+    Hit(Array),
 
     /// This caller owns the missing key's single-flight reservation.
-    Produce(BoundedMaterializationProducer<'o>),
+    Produce(BoundedMaterializationProducer),
 
     /// Another caller currently owns the key's single-flight reservation.
-    Wait(BoundedMaterializationWaiter<'o>),
+    Wait(BoundedMaterializationWaiter),
 }
 
 /// Single-flight producer reservation for one bounded materialization.
-pub(crate) struct BoundedMaterializationProducer<'o> {
+pub(crate) struct BoundedMaterializationProducer {
     /// Cache that owns the reservation.
-    cache: Arc<BoundedMaterializationCache<'o>>,
+    cache: Arc<BoundedMaterializationCache>,
 
     /// Reserved structural key.
     key: BoundedMaterializationKey,
@@ -176,12 +169,12 @@ pub(crate) struct BoundedMaterializationProducer<'o> {
     completed: bool,
 }
 
-impl<'o> BoundedMaterializationProducer<'o> {
+impl BoundedMaterializationProducer {
     /// Installs the ready `array`, evicts the least recently used excess entry, and wakes all waiters.
     ///
     /// The caller must establish that every asynchronous operation producing `array` completed successfully before
     /// calling this function. Registered waiters pin this flight result independently of ordinary LRU eviction.
-    pub(crate) fn complete(mut self, array: Array<'o>) -> Array<'o> {
+    pub(crate) fn complete(mut self, array: Array) -> Array {
         let returned = array.clone();
         let mut state = self.cache.state.lock().expect("bounded materialization cache mutex poisoned");
         let flight = state.flights.get_mut(&self.key).filter(|flight| flight.generation == self.generation).unwrap();
@@ -198,7 +191,7 @@ impl<'o> BoundedMaterializationProducer<'o> {
     }
 }
 
-impl Drop for BoundedMaterializationProducer<'_> {
+impl Drop for BoundedMaterializationProducer {
     fn drop(&mut self) {
         if self.completed {
             return;
@@ -219,9 +212,9 @@ impl Drop for BoundedMaterializationProducer<'_> {
 }
 
 /// Wait handle for an identical materialization currently produced by another caller.
-pub(crate) struct BoundedMaterializationWaiter<'o> {
+pub(crate) struct BoundedMaterializationWaiter {
     /// Cache containing the in-flight reservation.
-    cache: Arc<BoundedMaterializationCache<'o>>,
+    cache: Arc<BoundedMaterializationCache>,
 
     /// Structural key being awaited.
     key: BoundedMaterializationKey,
@@ -230,9 +223,9 @@ pub(crate) struct BoundedMaterializationWaiter<'o> {
     generation: Option<u64>,
 }
 
-impl<'o> BoundedMaterializationWaiter<'o> {
+impl BoundedMaterializationWaiter {
     /// Waits for a ready entry, or becomes the retry producer after the previous producer fails.
-    pub(crate) fn resolve(mut self) -> Result<Array<'o>, BoundedMaterializationProducer<'o>> {
+    pub(crate) fn resolve(mut self) -> Result<Array, BoundedMaterializationProducer> {
         let mut state = self.cache.state.lock().expect("bounded materialization cache mutex poisoned");
         loop {
             let registered_generation = self.generation.unwrap();
@@ -275,7 +268,7 @@ impl<'o> BoundedMaterializationWaiter<'o> {
     }
 }
 
-impl Drop for BoundedMaterializationWaiter<'_> {
+impl Drop for BoundedMaterializationWaiter {
     fn drop(&mut self) {
         let Some(generation) = self.generation else {
             return;
@@ -297,18 +290,18 @@ impl Drop for BoundedMaterializationWaiter<'_> {
 }
 
 /// Physical inputs and the deterministic report of the bounded materialization work that produced them.
-pub(crate) struct MaterializedBoundedInputs<'c> {
+pub(crate) struct MaterializedBoundedInputs {
     /// Physical executable inputs, including hidden extent scalars.
-    inputs: Vec<Array<'c>>,
+    inputs: Vec<Array>,
 
     /// Work and transport counts of the materialization that produced [`Self::inputs`].
     #[cfg_attr(not(test), allow(dead_code))]
     report: BoundedInputMaterializationReport,
 }
 
-impl<'c> MaterializedBoundedInputs<'c> {
+impl MaterializedBoundedInputs {
     /// Returns the physical executable inputs, including the hidden extent scalars.
-    pub(crate) fn into_inputs(self) -> Vec<Array<'c>> {
+    pub(crate) fn into_inputs(self) -> Vec<Array> {
         self.inputs
     }
 }
@@ -327,13 +320,13 @@ impl<'c> MaterializedBoundedInputs<'c> {
 /// complete batch succeeds. A cache miss costs O(bound) bytes plus overlap bookkeeping that is linear in the number of
 /// shard segments, while a ready cache hit performs no allocation or transport for padding. A failed asynchronous
 /// upload stores no cache entry, and a later call retries the ordinary path for cache misses.
-pub(crate) fn materialize_bounded_dynamic_inputs<'c>(
-    session: &Session<'c>,
+pub(crate) fn materialize_bounded_dynamic_inputs(
+    session: &Session,
     signature: &ExecutableSignature,
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
-    inputs: Vec<Array<'c>>,
-) -> Result<MaterializedBoundedInputs<'c>, Error> {
+    inputs: Vec<Array>,
+) -> Result<MaterializedBoundedInputs, Error> {
     materialize_bounded_dynamic_inputs_with_readiness(
         session,
         signature,
@@ -357,16 +350,16 @@ enum BoundedMaterializationVersion {
 }
 
 /// One ready cache entry ordered from least to most recently used.
-struct BoundedMaterializationEntry<'o> {
+struct BoundedMaterializationEntry {
     /// Structural materialization identity.
     key: BoundedMaterializationKey,
 
     /// Ready array with the bound shape, which owns its device buffers.
-    array: Array<'o>,
+    array: Array,
 }
 
 /// One generation of single-flight production for a structural materialization key.
-struct BoundedMaterializationFlight<'o> {
+struct BoundedMaterializationFlight {
     /// Monotonic value distinguishing this flight from a failed predecessor for the same key.
     generation: u64,
 
@@ -374,24 +367,24 @@ struct BoundedMaterializationFlight<'o> {
     waiter_count: usize,
 
     /// Completed result pinned until every registered waiter has consumed or abandoned it.
-    result: Option<Array<'o>>,
+    result: Option<Array>,
 }
 
 /// Mutable state protected by [`BoundedMaterializationCache::state`].
 #[derive(Default)]
-struct BoundedMaterializationCacheState<'o> {
+struct BoundedMaterializationCacheState {
     /// Ready entries, ordered from least to most recently used.
-    ready: VecDeque<BoundedMaterializationEntry<'o>>,
+    ready: VecDeque<BoundedMaterializationEntry>,
 
     /// Current production flight for each key, retained after completion only while registered waiters remain.
-    flights: HashMap<BoundedMaterializationKey, BoundedMaterializationFlight<'o>>,
+    flights: HashMap<BoundedMaterializationKey, BoundedMaterializationFlight>,
 
     /// Generation assigned to the next newly reserved flight.
     next_generation: u64,
 }
 
 /// Host copy that has been issued for one bounded input requiring padding.
-struct PendingBoundedInputHostCopy<'c> {
+struct PendingBoundedInputHostCopy {
     /// Logical input index used to recover the runtime array metadata.
     logical_input_index: usize,
 
@@ -411,24 +404,24 @@ struct PendingBoundedInputHostCopy<'c> {
     host_copy: DenseArrayHostCopy,
 
     /// Single-flight reservation that retains success.
-    producer: BoundedMaterializationProducer<'c>,
+    producer: BoundedMaterializationProducer,
 }
 
 /// Upload with the bound shape that was issued for one padded input but not yet published to its cache or executable
 /// slot.
-struct PendingBoundedInputPublication<'c> {
+struct PendingBoundedInputPublication {
     /// Physical executable input slot to populate after readiness succeeds.
     physical_input_index: usize,
 
     /// Uploaded physical array whose asynchronous transfer must become ready before publication.
-    physical: Array<'c>,
+    physical: Array,
 
     /// Single-flight reservation that retains ready success.
-    producer: BoundedMaterializationProducer<'c>,
+    producer: BoundedMaterializationProducer,
 }
 
 /// Cache waiter retained until all producer copies in this call have completed.
-struct WaitingBoundedInputMaterialization<'c> {
+struct WaitingBoundedInputMaterialization {
     /// Logical input index used to retry production if the prior producer fails.
     logical_input_index: usize,
 
@@ -445,7 +438,7 @@ struct WaitingBoundedInputMaterialization<'c> {
     physical_shape: StaticShape,
 
     /// Non-spinning single-flight wait handle.
-    waiter: BoundedMaterializationWaiter<'c>,
+    waiter: BoundedMaterializationWaiter,
 }
 
 /// Deterministic work and transport report for one materialization of bounded inputs.
@@ -500,12 +493,12 @@ impl BoundedInputPacking {
 }
 
 /// Completes one host copy that was already issued and issues its upload with the bound shape without publishing it.
-fn upload_bounded_input_host_copy<'c>(
-    session: &Session<'c>,
-    input: &Array<'c>,
-    pending: PendingBoundedInputHostCopy<'c>,
+fn upload_bounded_input_host_copy(
+    session: &Session,
+    input: &Array,
+    pending: PendingBoundedInputHostCopy,
     report: &mut BoundedInputMaterializationReport,
-) -> Result<PendingBoundedInputPublication<'c>, Error> {
+) -> Result<PendingBoundedInputPublication, Error> {
     report.device_to_host_shard_copies += pending.host_copy.shard_copy_count();
     let (source_bytes, allocated_merge_buffer) = pending.host_copy.finish_with_measurements()?;
     report.host_merge_buffer_allocations += usize::from(allocated_merge_buffer);
@@ -526,10 +519,10 @@ fn upload_bounded_input_host_copy<'c>(
 }
 
 /// Publishes one batch only after every asynchronously uploaded physical array passes `check_readiness`.
-fn publish_bounded_input_uploads<'c>(
-    publications: Vec<PendingBoundedInputPublication<'c>>,
-    physical_inputs: &mut [Array<'c>],
-    check_readiness: &mut impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), Error>,
+fn publish_bounded_input_uploads(
+    publications: Vec<PendingBoundedInputPublication>,
+    physical_inputs: &mut [Array],
+    check_readiness: &mut impl FnMut(&[PendingBoundedInputPublication]) -> Result<(), Error>,
 ) -> Result<(), Error> {
     // Readiness is checked for the complete batch before any producer publishes. An error therefore drops every
     // reservation in the batch, caches no failed upload, and leaves all concurrent host-to-device work issued.
@@ -542,14 +535,14 @@ fn publish_bounded_input_uploads<'c>(
 
 /// Implements [`materialize_bounded_dynamic_inputs`] with an injectable batch readiness check for deterministic failure
 /// tests.
-fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
-    session: &Session<'c>,
+fn materialize_bounded_dynamic_inputs_with_readiness(
+    session: &Session,
     signature: &ExecutableSignature,
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
-    inputs: Vec<Array<'c>>,
-    mut check_readiness: impl FnMut(&[PendingBoundedInputPublication<'c>]) -> Result<(), Error>,
-) -> Result<MaterializedBoundedInputs<'c>, Error> {
+    inputs: Vec<Array>,
+    mut check_readiness: impl FnMut(&[PendingBoundedInputPublication]) -> Result<(), Error>,
+) -> Result<MaterializedBoundedInputs, Error> {
     assert_eq!(declared_types.len(), inputs.len());
     assert_eq!(actual_types.len(), inputs.len());
     let physical_types = signature.physical_input_types(declared_types);

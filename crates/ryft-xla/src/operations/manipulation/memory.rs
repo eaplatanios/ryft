@@ -267,7 +267,7 @@ mod tests {
 
             // A compiled host result must occupy the requested host memory, not just carry host metadata on a device
             // buffer.
-            let to_host: CompiledFunction<'_, ArrayType, ArrayType> =
+            let to_host: CompiledFunction<ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())
                     .unwrap();
             let host = to_host.executable().execute(&engine, source.clone()).unwrap();
@@ -280,7 +280,7 @@ mod tests {
             );
 
             // Host placement survives an identity executable boundary, even without a transfer instruction.
-            let identity: CompiledFunction<'_, ArrayType, ArrayType> =
+            let identity: CompiledFunction<ArrayType, ArrayType> =
                 compile(|input| input, host_type.clone(), &engine, mesh.clone()).unwrap();
             let host = identity.executable().execute(&engine, host).unwrap();
             assert_eq!(host.r#type().as_ref(), &host_type);
@@ -292,7 +292,7 @@ mod tests {
             );
 
             // The host input signature must permit a real host input to return to device memory.
-            let to_device: CompiledFunction<'_, ArrayType, ArrayType> =
+            let to_device: CompiledFunction<ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(Memory::Device).unwrap(), host_type, &engine, mesh.clone())
                     .unwrap();
             let output = to_device.executable().execute(&engine, host).unwrap();
@@ -304,7 +304,7 @@ mod tests {
                 values,
             );
 
-            let round_trip: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            let round_trip: CompiledFunction<ArrayType, ArrayType> = compile(
                 |input| input.transfer_to_memory(memory).unwrap().transfer_to_memory(Memory::Device).unwrap(),
                 input_type.clone(),
                 &engine,

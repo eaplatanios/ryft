@@ -549,7 +549,7 @@ pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result
 }
 
 /// Returns the built-in assertion provider without loading a PJRT plugin.
-pub(crate) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+pub(crate) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(AssertionRuntimeProvider)
 }
 
@@ -700,17 +700,17 @@ enum AssertionBufferMemory {
 /// Built-in platform admission and registration for host runtime assertions.
 struct AssertionRuntimeProvider;
 
-impl<'c> RuntimeProvider<'c> for AssertionRuntimeProvider {
+impl RuntimeProvider for AssertionRuntimeProvider {
     fn identifier(&self) -> &str {
         ASSERT_CUSTOM_CALL_TARGET
     }
 
     fn initialize(
         &self,
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
         target: &Target,
         requirement: &RuntimeRequirement,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+    ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         validate_builtin_requirement(requirement, self.identifier())?;
         let supported = target.platform_name().eq_ignore_ascii_case("cpu")
             || (cfg!(any(feature = "cuda-12", feature = "cuda-13"))
@@ -728,7 +728,7 @@ impl<'c> RuntimeProvider<'c> for AssertionRuntimeProvider {
 /// Assertion callbacks require registration but no per invocation user data.
 struct AssertionRuntime;
 
-impl<'c> RuntimeExtension<'c> for AssertionRuntime {}
+impl RuntimeExtension for AssertionRuntime {}
 
 /// Emits an assertion with a literal message and named observations. Bounded element reports carry logical
 /// extents. Diagnostic buffers retain their element types so unsigned values and floating-point values reach the

@@ -55,11 +55,16 @@ pub(crate) mod tests {
         (|$plugin:ident, $client:ident, $platform:ident| $body:block) => {{
             {
                 let $plugin = $crate::load_cpu_plugin().expect("failed to load the PJRT CPU plugin");
-                let $client = $plugin.client($crate::ClientOptions::CPU($crate::CpuClientOptions {
-                    device_count: Some(8),
-                    ..Default::default()
-                }));
-                let $client = $client.expect("failed to create a PJRT CPU client");
+                // Clients live for the rest of the process and are shared by the tests that request the same options.
+                let $client = ryft_xla::Session::builder()
+                    .plugin($plugin.clone())
+                    .client_options($crate::ClientOptions::CPU($crate::CpuClientOptions {
+                        device_count: Some(8),
+                        ..Default::default()
+                    }))
+                    .build()
+                    .expect("failed to create a PJRT CPU client")
+                    .client();
                 let $platform = $crate::tests::TestPlatform::Cpu;
                 $body
             }
@@ -67,11 +72,16 @@ pub(crate) mod tests {
             #[cfg(feature = "cuda-12")]
             {
                 let $plugin = $crate::load_cuda_12_plugin().expect("failed to load the PJRT CUDA 12 plugin");
-                let $client = $plugin.client($crate::ClientOptions::GPU($crate::GpuClientOptions {
-                    allocator: $crate::GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                    ..Default::default()
-                }));
-                let $client = $client.expect("failed to create a PJRT CUDA 12 client");
+                // Clients live for the rest of the process and are shared by the tests that request the same options.
+                let $client = ryft_xla::Session::builder()
+                    .plugin($plugin.clone())
+                    .client_options($crate::ClientOptions::GPU($crate::GpuClientOptions {
+                        allocator: $crate::GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                        ..Default::default()
+                    }))
+                    .build()
+                    .expect("failed to create a PJRT CUDA 12 client")
+                    .client();
                 let $platform = $crate::tests::TestPlatform::Cuda12;
                 $body
             }
@@ -79,11 +89,16 @@ pub(crate) mod tests {
             #[cfg(feature = "cuda-13")]
             {
                 let $plugin = $crate::load_cuda_13_plugin().expect("failed to load the PJRT CUDA 13 plugin");
-                let $client = $plugin.client($crate::ClientOptions::GPU($crate::GpuClientOptions {
-                    allocator: $crate::GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                    ..Default::default()
-                }));
-                let $client = $client.expect("failed to create a PJRT CUDA 13 client");
+                // Clients live for the rest of the process and are shared by the tests that request the same options.
+                let $client = ryft_xla::Session::builder()
+                    .plugin($plugin.clone())
+                    .client_options($crate::ClientOptions::GPU($crate::GpuClientOptions {
+                        allocator: $crate::GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                        ..Default::default()
+                    }))
+                    .build()
+                    .expect("failed to create a PJRT CUDA 13 client")
+                    .client();
                 let $platform = $crate::tests::TestPlatform::Cuda13;
                 $body
             }

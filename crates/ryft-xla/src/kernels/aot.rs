@@ -160,9 +160,9 @@ impl KernelAotBundle {
     /// compiler and the kernel must have at least one ordinary input. Unsupported source codecs or PJRT serialization
     /// are explicit errors, and no fallback is selected. `maximum_programs` bounds source verification, not native
     /// compilation, so adapter compiler deadlines remain active.
-    pub fn compile<'c>(
+    pub fn compile(
         definition: &KernelDefinition,
-        session: &Session<'c>,
+        session: &Session,
         options: Options,
         maximum_programs: usize,
     ) -> Result<Self, KernelAotError> {
@@ -179,10 +179,8 @@ impl KernelAotBundle {
         let facts = KernelExecutionFacts::from_target(session.target()?, options.mesh())?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<CompilationTracer<Session<'c>>>| {
-                Ok(stage_kernel(inputs[0].context(), definition, &inputs)?)
-            },
+        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<CompilationTracer<Session>>| Ok(stage_kernel(inputs[0].context(), definition, &inputs)?),
             vec![],
             definition.operation().input_types(),
             options,
@@ -316,12 +314,12 @@ impl KernelAotBundle {
     ///
     /// The binding is used only for identity, and its compiler is never called. The mesh must name the intended live
     /// devices in the same order. XLA additionally validates its build identity, flags, platform, and executable ABI.
-    pub fn load<'c>(
+    pub fn load(
         &self,
-        session: &Session<'c>,
+        session: &Session,
         binding: &KernelCompilerBinding,
         mesh: &DeviceMesh,
-    ) -> Result<LoadedKernel<'c>, KernelAotError> {
+    ) -> Result<LoadedKernel, KernelAotError> {
         if binding.configuration() != self.manifest.configuration {
             return Err(Self::invalid("compiler binding configuration mismatch"));
         }
@@ -373,12 +371,12 @@ impl KernelAotBundle {
 
 /// A kernel loaded ahead of time, using the existing XLA session and the fence over the whole execution.
 #[derive(Clone)]
-pub struct LoadedKernel<'c> {
+pub struct LoadedKernel {
     /// Session owning native runtime resources and the ordinary invocation and effect policy.
-    session: Session<'c>,
+    session: Session,
 
     /// Existing PJRT executable and its validated invocation metadata.
-    program: Arc<CompiledProgram<'c>>,
+    program: Arc<CompiledProgram>,
 
     /// Exact identity of the source and the compiler binding, used by distributed preflight.
     identity: Vec<u8>,
@@ -390,9 +388,9 @@ pub struct LoadedKernel<'c> {
     effects: ryft_core::EffectsSummary,
 }
 
-impl<'c> LoadedKernel<'c> {
+impl LoadedKernel {
     /// Borrows the existing session, canonical boundary, and identities for execution coordinated by the host.
-    pub(crate) fn distributed_parts(&self) -> (&Session<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
+    pub(crate) fn distributed_parts(&self) -> (&Session, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
         (&self.session, self.program.input_types(), self.program.mesh(), &self.identity, &self.execution)
     }
 
@@ -411,7 +409,7 @@ impl<'c> LoadedKernel<'c> {
 
     /// Submits ordinary array inputs and returns the existing execution handle that carries the completion.
     /// Pending uploads, input retention, aliases, and device failures use XLA's canonical invocation path.
-    pub fn call(&self, inputs: Vec<Array<'c>>) -> Result<Execution<Vec<Array<'c>>>, KernelAotError> {
+    pub fn call(&self, inputs: Vec<Array>) -> Result<Execution<Vec<Array>>, KernelAotError> {
         Ok(self.session.execute_compiled_async(&self.program, inputs)?)
     }
 }
@@ -495,8 +493,8 @@ pub(crate) mod tests {
 
     /// Compiles a real ordinary CPU executable to isolate the AOT loader's stateless boundary checks.
     /// This fixture does not claim execution of a mock adapter's custom call.
-    pub(crate) fn executable_bundle<'c>(
-        session: &Session<'c>,
+    pub(crate) fn executable_bundle(
+        session: &Session,
         mesh: &DeviceMesh,
         data_type: DataType,
         capture: bool,
@@ -510,8 +508,8 @@ pub(crate) mod tests {
         } else {
             vec![]
         };
-        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, captures: Vec<CompilationTracer<Session<'c>>>, inputs| {
+        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, captures: Vec<CompilationTracer<Session>>, inputs| {
                 // Returning the capture retains a real capture slot without introducing unrelated operations.
                 Ok(if captures.is_empty() { inputs } else { captures })
             },

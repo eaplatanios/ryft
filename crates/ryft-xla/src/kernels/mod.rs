@@ -349,7 +349,7 @@ where
 }
 
 /// Returns available native kernel providers without initializing their drivers.
-pub(crate) fn runtime_providers<'c>() -> Vec<Arc<dyn RuntimeProvider<'c> + 'c>> {
+pub(crate) fn runtime_providers() -> Vec<Arc<dyn RuntimeProvider>> {
     #[cfg(feature = "rocm")]
     {
         vec![cuda::runtime_provider(), rocm::runtime_provider()]

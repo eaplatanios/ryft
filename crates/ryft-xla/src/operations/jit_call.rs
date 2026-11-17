@@ -1354,13 +1354,13 @@ where
 // executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
 // entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
 // through this same session.
-impl<'c> InterpretableOperation<Session<'c>> for JitCallOperation<ArrayIrType> {
-    fn interpret<D: InterpretationDriver<Session<'c>>>(
+impl InterpretableOperation<Session> for JitCallOperation<ArrayIrType> {
+    fn interpret<D: InterpretationDriver<Session>>(
         &self,
-        context: &Session<'c>,
+        context: &Session,
         driver: &D,
-        inputs: &[Value<'c>],
-    ) -> Result<Vec<Value<'c>>, ProgramError> {
+        inputs: &[Value],
+    ) -> Result<Vec<Value>, ProgramError> {
         let callee = driver.region(0)?;
         let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
         driver
@@ -3804,7 +3804,7 @@ mod tests {
         assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &ArrayIrType::Dimension(rows));
 
         // Execute the discharged program on CPU, with the call staged inside one compiled function.
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
+        let compiled: CompiledFunction<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
             crate::compile(
                 |(initial, update, extent)| {
                     let initial = initial.into_value();
@@ -3833,7 +3833,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let read = |array: &Array<'_>| {
+        let read = |array: &Array| {
             array
                 .addressable_shards()
                 .next()
@@ -4180,7 +4180,7 @@ mod tests {
             let bytes = values_to_bytes::<f64>(values);
             Value::Array(Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), bytes).unwrap())
         };
-        let read = |value: &Value<'_>| {
+        let read = |value: &Value| {
             let Value::Array(array) = value else {
                 panic!("expected an array value");
             };
@@ -6548,10 +6548,10 @@ mod tests {
 
         // Inner `jit(sin)` staged as one `jit_call` inside an outer program, so the outer source program holds exactly
         // one `jit_call` instruction for the replay to differentiate.
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let inner_for_outer = inner.clone();
-        let outer: StagedFunction<'_, ArrayType, ArrayType> =
+        let outer: StagedFunction<ArrayType, ArrayType> =
             stage(move |x| inner_for_outer.call(x).unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
         let outer_program = outer.source_program().program();
         assert_eq!(
@@ -6617,7 +6617,7 @@ mod tests {
         // Rewrap the two halves as a compiled `(x, dx) -> (primal, tangent)` function, which exercises the real XLA
         // lowering and execution of both `jit_call` boundaries.
         let (primal_half, tangent_half, residual_count, _) = linearization.into_parts();
-        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let jvp_compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal_input, tangent_input)| {
                 let context = primal_input.value().context().clone();
                 let mut primal_outputs = context

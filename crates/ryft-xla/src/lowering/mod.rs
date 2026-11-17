@@ -2589,7 +2589,7 @@ pub(crate) mod tests {
         Output::Family:
             ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
         F: FnOnce(
-            &ProjectedContext<DomainTracingContext<Session<'static>>, ArrayType>,
+            &ProjectedContext<DomainTracingContext<Session>, ArrayType>,
             Input::To<ArrayTracer>,
         ) -> Result<Output::To<ArrayTracer>, ProgramError>,
     {

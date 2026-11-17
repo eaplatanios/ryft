@@ -381,9 +381,9 @@ fn test_attention_interpretation() {
 
 /// Exports a macro-authored whole-array kernel, reloads it in a fresh session, and awaits its native output.
 #[cfg(any(feature = "mosaic-gpu", feature = "cutile", feature = "triton"))]
-fn execute_aot_case<'c>(
+fn execute_aot_case(
     plugin: &crate::Plugin,
-    client: &'c crate::Client<'c>,
+    client: &'static crate::Client<'static>,
     binding: ryft_xla::kernels::KernelCompilerBinding,
     deployment_binding: ryft_xla::kernels::KernelCompilerBinding,
     backend: &str,
@@ -630,8 +630,8 @@ mod gpu {
     }
 
     /// Compiles and executes the canonical kernel definition through the selected Mosaic adapter and XLA GPU runtime.
-    pub(super) fn execute_case<'c>(
-        client: &'c crate::Client<'c>,
+    pub(super) fn execute_case(
+        client: &'static crate::Client<'static>,
         case: KernelCase,
         options: MosaicOptions,
     ) -> Result<Vec<f32>, Error> {
@@ -651,8 +651,8 @@ mod gpu {
     /// Executes explicit typed source and physical bytes using the selected extension-family binding. More than one
     /// iteration measures cached invocation plus awaited host readback after one warmup; compilation and input upload
     /// are excluded. Benchmarks deliberately include dispatch and transfer costs rather than claiming GPU-only timing.
-    fn execute_definition<'c, Extension>(
-        client: &'c crate::Client<'c>,
+    fn execute_definition<Extension>(
+        client: &'static crate::Client<'static>,
         definition: &KernelDefinition<Extension>,
         input_types: Vec<ArrayType>,
         input_bytes: Vec<Vec<u8>>,
@@ -688,8 +688,8 @@ mod gpu {
         )
         .unwrap();
         let session = Session::builder().client(client).build()?;
-        let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
-            |inputs: Vec<CompileTracer<'_>>| {
+        let compiled: CompiledFunction<Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
+            |inputs: Vec<CompileTracer>| {
                 let values = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 stage_kernel(values[0].context(), definition, &values)
                     .unwrap()
@@ -1343,8 +1343,8 @@ mod cutile {
     }
 
     /// Uses the selected adapter, then disables compilation before manifest and executable restoration.
-    pub(super) fn execute_case<'c>(
-        client: &'c crate::Client<'c>,
+    pub(super) fn execute_case(
+        client: &'static crate::Client<'static>,
         case: KernelCase,
         repeated_input: bool,
     ) -> Result<(), Error> {
@@ -1378,8 +1378,8 @@ mod cutile {
         )
         .unwrap();
         let producer = Session::builder().client(client).build()?;
-        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<ryft_core::CompilationTracer<Session<'c>>>| {
+        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<ryft_core::CompilationTracer<Session>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
             vec![],
@@ -1575,8 +1575,8 @@ mod cutile {
                 let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
                 let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
                 let session = Session::builder().client(&client).build().unwrap();
-                let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
-                    |input: CompileTracer<'_>| {
+                let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+                    |input: CompileTracer| {
                         shard_map(
                             |local: ArrayTracer| {
                                 let local_type = local.r#type().into_owned();
@@ -1726,9 +1726,9 @@ mod tuning {
     use super::*;
 
     /// One immutable workload with ordinary compiled-function ownership; no alternate execution engine is introduced.
-    struct Runner<'c> {
+    struct Runner {
         /// Existing XLA session.
-        session: Session<'c>,
+        session: Session,
 
         /// Fixed independent oracle and canonical input signature.
         case: KernelCase,
@@ -1740,13 +1740,13 @@ mod tuning {
         bindings: Vec<(KernelSchedule, KernelCompilerBinding)>,
 
         /// Prepared ordinary executable, replaced only between candidates.
-        executable: Option<CoreExecutableFunction<Session<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
+        executable: Option<CoreExecutableFunction<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
 
         /// Fixed functional inputs reused across all samples.
-        inputs: Vec<Value<'c>>,
+        inputs: Vec<Value>,
     }
 
-    impl<'c> KernelTuningRunner for Runner<'c> {
+    impl KernelTuningRunner for Runner {
         fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
             for input in &self.inputs {
                 let Value::Array(input) = input else {
@@ -1755,8 +1755,8 @@ mod tuning {
                 input.block_until_ready().map_err(error)?;
             }
             let binding = self.bindings.iter().find(|(candidate, _)| candidate == schedule).unwrap().1.clone();
-            let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-                |_, _, inputs: Vec<CompilationTracer<Session<'c>>>| {
+            let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+                |_, _, inputs: Vec<CompilationTracer<Session>>| {
                     Ok(stage_kernel(inputs[0].context(), &self.case.definition, &inputs)?)
                 },
                 vec![],
@@ -1812,8 +1812,8 @@ mod tuning {
     }
 
     /// Measures two explicit schedule choices through the same real runtime and functional workload.
-    fn measure<'c, Compiler, Embedding>(
-        client: &'c crate::Client<'c>,
+    fn measure<Compiler, Embedding>(
+        client: &'static crate::Client<'static>,
         compiler: Compiler,
         target: Compiler::Target,
         options: Compiler::Options,
@@ -2286,7 +2286,7 @@ mod triton {
     }
 
     /// Compiles the unchanged portable definition, disables its compiler, and executes a fresh-session reload.
-    fn execute_case<'c>(client: &'c crate::Client<'c>, case: KernelCase) {
+    fn execute_case(client: &'static crate::Client<'static>, case: KernelCase) {
         interpret_case(&case);
         let semantic = case.definition.semantic_key().unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -2307,8 +2307,8 @@ mod triton {
         )
         .unwrap();
         let producer = Session::builder().client(client).build().unwrap();
-        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
-            |_, _, inputs: Vec<ryft_core::CompilationTracer<Session<'c>>>| {
+        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+            |_, _, inputs: Vec<ryft_core::CompilationTracer<Session>>| {
                 Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
             },
             vec![],

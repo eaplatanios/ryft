@@ -12,7 +12,7 @@ use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, Constant, FromPjrt, Operation, Options, Reference, Session, Value, compile_statefully};
 
 /// Returns the `f32` contents of the shard of `array` on each device of its mesh, in mesh order.
-fn device_shards(array: &Array<'_>) -> Vec<Vec<f32>> {
+fn device_shards(array: &Array) -> Vec<Vec<f32>> {
     array
         .mesh()
         .devices()
@@ -77,11 +77,12 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
         .unwrap();
+    let client = &*Box::leak(Box::new(client));
     let devices = client.addressable_devices().unwrap();
     let devices = devices.iter().take(2).map(|device| Device::from_pjrt(device).unwrap()).collect();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-    let session = Session::builder().client(&client).build().unwrap();
+    let session = Session::builder().client(client).build().unwrap();
     let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     let item_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
     let boundary =

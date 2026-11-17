@@ -28,8 +28,8 @@ pub(crate) fn trace_scaled_dot_composition(
     input_types: &[ArrayType],
 ) -> Result<FlatProgram, Error> {
     let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
-    let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-        |inputs: Vec<Tracer<'static>>| {
+    let (_, program) = DomainTracingContext::<Session>::trace(
+        |inputs: Vec<Tracer>| {
             let [left, right, left_scale, right_scale] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() });
             };
@@ -1144,8 +1144,8 @@ mod tests {
         {
             let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent)]));
-            let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-                |inputs: Vec<Tracer<'static>>| {
+            let (_, program) = DomainTracingContext::<Session>::trace(
+                |inputs: Vec<Tracer>| {
                     let BlockQuantizedValue { elements, scales, .. } =
                         inputs[0].block_quantize(4, element_type, scale_type)?;
                     // Return ordinary floating-point arrays so that the mixed executable fixture can decode them.
@@ -1196,9 +1196,8 @@ mod tests {
         };
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         let configuration = BlockScaledDotConfiguration::nvfp4_training(dimensions);
-        let function = block_scaled_dot::<ProjectedContext<Session<'_>, ArrayType>>(configuration.clone()).unwrap();
+        let function = block_scaled_dot::<ProjectedContext<Session, ArrayType>>(configuration.clone()).unwrap();
         let compiled: CompiledFunction<
-            '_,
             (ArrayType, ArrayType, ArrayType, ArrayType),
             (ArrayType, ArrayType, ArrayType),
         > = compile(
@@ -1240,7 +1239,7 @@ mod tests {
             )
             .unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let read = |array: &Array<'_>| {
+        let read = |array: &Array| {
             let bytes = array.device_shard(device_id).unwrap().buffer().unwrap().copy_to_host(None).unwrap();
             values_from_bytes::<f32>(bytes.r#await().unwrap().as_slice())
         };

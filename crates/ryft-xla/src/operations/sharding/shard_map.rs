@@ -414,6 +414,7 @@ pub(crate) mod tests {
     use crate::operations::{
         FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
     };
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{read_sharded_f32_array, session_with_client, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
@@ -424,7 +425,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Returns the elements of the buffer that every addressable device holds for `array`, in device order.
-    pub(crate) fn read_device_f32s(array: &Array<'_>) -> Vec<Vec<f32>> {
+    pub(crate) fn read_device_f32s(array: &Array) -> Vec<Vec<f32>> {
         array
             .addressable_shards()
             .map(|shard| {
@@ -449,8 +450,8 @@ pub(crate) mod tests {
     fn bind_doubling_shard_map(x: ArrayTracer, boundary: ShardMapBoundary) -> Result<ArrayTracer, ProgramError> {
         let global_type = boundary.global_input_type(0, &x.r#type())?;
         let local_type = boundary.local_input_type(0, &global_type)?;
-        let (_, body) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, body) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let y = ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
                 Ok(vec![(y.clone() + y).into_value()])
             },
@@ -883,7 +884,7 @@ pub(crate) mod tests {
     /// emulation and through XLA execution on all devices of `client`, which must match the devices of the mesh of
     /// `case`, over the same inputs with integer values, and checks that both produce exactly the same outputs,
     /// including their types.
-    fn assert_shard_map_emulation_matches_execution(client: &Client<'_>, case: ShardMapDifferentialCase) {
+    fn assert_shard_map_emulation_matches_execution(client: &'static Client<'static>, case: ShardMapDifferentialCase) {
         type ArrayMember = <Constant as ValueProjection<ArrayType>>::Projected;
         let emulated_program =
             shard_map_differential_program::<CoreArray, ArrayIrValue<CoreArray>, CoreArrayIrOperation<CoreArray>>(case);
@@ -943,7 +944,10 @@ pub(crate) mod tests {
     /// XLA execution on all devices of `client`, which must match the devices of the mesh of `case`, over the same
     /// inputs and output seeds with integer values, and checks that both produce exactly the same input cotangent,
     /// including its type. The pullback consumes the residuals of the primal program of the same backend.
-    fn assert_shard_map_pullback_emulation_matches_execution(client: &Client<'_>, case: ShardMapDifferentialCase) {
+    fn assert_shard_map_pullback_emulation_matches_execution(
+        client: &'static Client<'static>,
+        case: ShardMapDifferentialCase,
+    ) {
         type ArrayMember = <Constant as ValueProjection<ArrayType>>::Projected;
         let emulated_program =
             shard_map_differential_program::<CoreArray, ArrayIrValue<CoreArray>, CoreArrayIrOperation<CoreArray>>(case);
@@ -1453,10 +1457,12 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .expect("failed to create 4-device CPU client");
-        let session = session_with_client(&client);
+        let client = process_client(
+            &plugin,
+            ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }),
+        )
+        .expect("failed to create 4-device CPU client");
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -1629,8 +1635,8 @@ pub(crate) mod tests {
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         let global_input_type =
             ArrayType::new_static(DataType::F32, [8]).with_sharding(input_sharding.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     Ok,
@@ -1738,8 +1744,8 @@ pub(crate) mod tests {
         let mesh = test_manual_mesh("x", 4);
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let global_type = ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     |input: ArrayTracer| input.parallel_reduce(ReductionKind::Sum, "x"),
@@ -2256,8 +2262,8 @@ pub(crate) mod tests {
         let mesh = test_manual_mesh("x", 2);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     |input: ArrayTracer| input.parallel_broadcast("x", 1),
@@ -2509,8 +2515,8 @@ pub(crate) mod tests {
         let mesh = test_manual_mesh("x", 2);
         let reduced = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [1]).with_sharding(reduced.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     |input: ArrayTracer| Ok(input.clone() + input),
@@ -2675,10 +2681,12 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_renders_and_executes_matmul_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
-            .expect("failed to create 8-device CPU client");
-        let session = session_with_client(&client);
+        let client = process_client(
+            &plugin,
+            ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }),
+        )
+        .expect("failed to create 8-device CPU client");
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
@@ -2840,7 +2848,7 @@ pub(crate) mod tests {
         let replicated = Sharding::replicated(logical_mesh.clone(), 0);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        type BodyTracer = Tracer<'static>;
+        type BodyTracer = Tracer;
         let function = composite(|(_, x): (BodyTracer, BodyTracer)| {
             Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
         })
@@ -2857,8 +2865,8 @@ pub(crate) mod tests {
                 Ok((r, (cosine * cotangent * state).into_value()))
             },
         );
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let (value, gradient) = inputs[0]
                     .domain()
                     .differentiate_at(inputs[0].clone())
@@ -2895,7 +2903,7 @@ pub(crate) mod tests {
         let input =
             Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&inputs).as_slice()).unwrap();
         let outputs = session.execute_program(&compiled, vec![input]).unwrap();
-        let shards = |array: &Array<'_>| {
+        let shards = |array: &Array| {
             array
                 .addressable_shards()
                 .map(|shard| {
@@ -2938,8 +2946,8 @@ pub(crate) mod tests {
         let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let along_x_and_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
         let caller_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x_and_y).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input =
                     ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
                 let output = shard_map(
@@ -3014,8 +3022,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(input_sharding).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let output = batch(
                     |item| {
                         let item = ValueProjection::<ArrayType>::into_projected(item)?;
@@ -3572,7 +3580,7 @@ pub(crate) mod tests {
                     Ok(context
                         .shard_map(
                             |context: &ProjectedContext<
-                                DomainTracingContext<DomainTracingContext<Session<'static>>>,
+                                DomainTracingContext<DomainTracingContext<Session>>,
                                 ArrayType,
                             >,
                              ()| { context.axis_index("x")?.reshape([1]) },
@@ -4839,7 +4847,7 @@ pub(crate) mod tests {
         // shard.
         type BatchedShardMapTracer = ProjectedValue<
             ArrayType,
-            DomainTracer<BatchingContext<DomainTracingContext<Session<'static>>, ArrayIrBatchingPolicy>>,
+            DomainTracer<BatchingContext<DomainTracingContext<Session>, ArrayIrBatchingPolicy>>,
         >;
         let client = cpu_client(4);
         let session = session_with_client(&client);
@@ -4975,7 +4983,7 @@ pub(crate) mod tests {
         // coordinate along `y`, and the result for every item is what the unbatched `shard_map` yields for that item.
         type BatchedShardMapTracer = ProjectedValue<
             ArrayType,
-            DomainTracer<BatchingContext<DomainTracingContext<Session<'static>>, ArrayIrBatchingPolicy>>,
+            DomainTracer<BatchingContext<DomainTracingContext<Session>, ArrayIrBatchingPolicy>>,
         >;
         let client = cpu_client(4);
         let session = session_with_client(&client);
@@ -5389,7 +5397,7 @@ pub(crate) mod tests {
         let input = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
         let summands = shard_map(Ok, input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
         let squares = shard_map(
-            |summand: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(summand.clone() * summand),
+            |summand: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(summand.clone() * summand),
             summands,
             logical_mesh,
             unreduced.clone(),

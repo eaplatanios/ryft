@@ -997,6 +997,8 @@ mod tests {
 
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
+    #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Session, Tracer, to_mlir_module_for_program};
@@ -1007,14 +1009,14 @@ mod tests {
     type StagedProgram = (FlatProgram, Vec<ArrayType>, Vec<ArrayType>);
 
     /// Context whose values are eager XLA [`Array`]s.
-    type ArrayContext<'c> = ProjectedContext<Session<'c>, ArrayType>;
+    type ArrayContext = ProjectedContext<Session, ArrayType>;
 
     /// Context whose values are reference backend arrays.
     type ReferenceContext = EagerContext<CoreArray, ArrayOperation<CoreArray>>;
 
     /// Asserts that `actual` has the shape of `expected` and that their `f32` elements agree up to the rounding of
     /// the exponentials and divisions in the attention bodies.
-    fn assert_matches_reference(actual: &Array<'_>, expected: &CoreArray) {
+    fn assert_matches_reference(actual: &Array, expected: &CoreArray) {
         assert_eq!(actual.r#type().shape(), expected.r#type().shape());
         let actual = values_from_bytes::<f32>(&actual.copy_to_host().unwrap());
         let expected = expected.elements::<f32>().unwrap();
@@ -1038,9 +1040,9 @@ mod tests {
         input_types: Vec<ArrayType>,
         calls: usize,
     ) -> StagedProgram {
-        let attention = dot_product_attention::<Session<'static>>(configuration);
-        let (output_types, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let attention = dot_product_attention::<Session>(configuration);
+        let (output_types, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let mut inputs = AttentionInputs::from_parameters(input_structure, inputs)?;
                 let mut outputs = Vec::new();
                 for _ in 0..calls {
@@ -1069,10 +1071,10 @@ mod tests {
         input_structure: AttentionInputs<Placeholder>,
         input_types: Vec<ArrayType>,
     ) -> StagedProgram {
-        let attention = differentiable_dot_product_attention::<Session<'static>>(configuration);
+        let attention = differentiable_dot_product_attention::<Session>(configuration);
         let input_types = input_types.iter().cloned().chain([input_types[0].clone()]).collect::<Vec<_>>();
-        let (output_types, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (output_types, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let (output_cotangent, inputs) = inputs.split_last().unwrap();
                 let inputs = AttentionInputs::from_parameters(input_structure, inputs.iter().cloned())?;
                 let has_bias = inputs.bias.as_ref().is_some_and(|bias| {
@@ -1484,14 +1486,15 @@ mod tests {
         // An `f32` bias of `1e6` is finite but beyond the range of `f16`, where it would be infinite and turn the
         // softmax of its row into NaNs. The fused kernels receive it saturated at the largest finite `f16` instead,
         // which still attends only to the first key/value position, like the portable body does with the bias itself.
-        let client = load_cuda_13_plugin()
-            .unwrap()
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &load_cuda_13_plugin().unwrap(),
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let halves = |dimensions: &[usize], values: &[f32]| {
@@ -1500,7 +1503,7 @@ mod tests {
         };
         let values = (0..16).map(|index| if index < 8 { 1.0 } else { 2.0 }).collect::<Vec<_>>();
         for implementation in [AttentionImplementation::Fused, AttentionImplementation::Portable] {
-            let function = dot_product_attention::<ArrayContext<'_>>(
+            let function = dot_product_attention::<ArrayContext>(
                 AttentionConfiguration::new().with_implementation(implementation),
             );
             let inputs = AttentionInputs {
@@ -1530,17 +1533,18 @@ mod tests {
         // evaluates the portable body for them. The scores of an empty head dimension are zero, so each query row
         // attends uniformly to the three key/value positions and its residual is `log(3)`, and a query row that has
         // no key/value position to attend to has the residual of an empty sum of exponentials.
-        let client = load_cuda_13_plugin()
-            .unwrap()
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &load_cuda_13_plugin().unwrap(),
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let function = dot_product_attention::<ArrayContext<'_>>(AttentionConfiguration::new());
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         for (query_dimensions, key_value_dimensions, expected_residual) in [
             ([1, 2, 1, 0], [1, 3, 1, 0], [3f32.ln(), 3f32.ln()]),
             ([1, 2, 1, 8], [1, 0, 1, 8], [f32::NEG_INFINITY, f32::NEG_INFINITY]),
@@ -1613,14 +1617,15 @@ mod tests {
         // forward kernels returned it, so their gradients agree with the portable gradients of the reference backend.
         // Probabilities that were reconstructed from a rounded residual would be one instead of one half, which would
         // double the value gradient.
-        let client = load_cuda_13_plugin()
-            .unwrap()
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &load_cuda_13_plugin().unwrap(),
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let reference = |dimensions: &[usize], elements: &[f32]| {
@@ -1640,7 +1645,7 @@ mod tests {
         let configuration = AttentionConfiguration::new().with_scale(1.0);
 
         // Requesting the fused implementation never falls back to the portable body, so this call runs the kernels.
-        let function = differentiable_dot_product_attention::<ArrayContext<'_>>(
+        let function = differentiable_dot_product_attention::<ArrayContext>(
             configuration.with_implementation(AttentionImplementation::Fused),
         );
         let inputs = AttentionInputs::new(device(&query), device(&key), device(&value));
@@ -1777,7 +1782,7 @@ mod tests {
             AttentionConfiguration::new().with_scale(0.5),
             AttentionConfiguration::new().with_scale(0.5).with_causal(true).with_local_window((1, 0)),
         ] {
-            let output = dot_product_attention::<ArrayContext<'_>>(configuration)
+            let output = dot_product_attention::<ArrayContext>(configuration)
                 .call(AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values)))
                 .unwrap();
             let reference_output = dot_product_attention::<ReferenceContext>(configuration)
@@ -1788,7 +1793,7 @@ mod tests {
             // A key that an explicit mesh axis shards along its sequence shards the scores along the dimension over
             // which the softmax reduces its maximum, and that maximum then reduces total order keys for every
             // target. One device is enough to compile them on the execution platform of the test.
-            let output = dot_product_attention::<ArrayContext<'_>>(configuration)
+            let output = dot_product_attention::<ArrayContext>(configuration)
                 .call(AttentionInputs::new(
                     placed(&query_values, None),
                     placed(&key_values, Some(1)),
@@ -1816,7 +1821,7 @@ mod tests {
         };
         let configuration = AttentionConfiguration::new().with_scale(0.5).with_causal(true);
 
-        let function = differentiable_dot_product_attention::<ArrayContext<'_>>(configuration);
+        let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
         let inputs = AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values));
         let context = inputs.query.domain();
         let (loss, gradients) = context
@@ -1892,7 +1897,7 @@ mod tests {
             })
             .unwrap();
 
-        let function = differentiable_dot_product_attention::<ArrayContext<'_>>(AttentionConfiguration::new());
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         for (query_axis, key_axis, value_axis, bias_axis) in [
             (None, None, None, None),
             (Some(1), None, None, None),
@@ -2099,7 +2104,7 @@ mod tests {
         };
         let configuration = AttentionConfiguration::new().with_causal(true).with_local_window((2, 1));
         let (output, residual) =
-            dot_product_attention::<ArrayContext<'_>>(configuration).call_with_residual(device_inputs).unwrap();
+            dot_product_attention::<ArrayContext>(configuration).call_with_residual(device_inputs).unwrap();
         let (reference_output, reference_residual) = dot_product_attention::<ReferenceContext>(configuration)
             .call_with_residual(reference_inputs)
             .unwrap();

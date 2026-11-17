@@ -1886,7 +1886,7 @@ mod tests {
         let value = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
             Value::Array(replicated_array(&session, &mesh, data_type, dimensions, bytes))
         };
-        let read = |value: Value<'_>| {
+        let read = |value: Value| {
             let array = program_array(&value);
             (array.shape().dimensions().to_vec(), read_f32s(&client, array))
         };

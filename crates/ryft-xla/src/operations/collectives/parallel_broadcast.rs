@@ -59,8 +59,8 @@ impl LowerableOperation for ParallelBroadcastOperation {
                     )
                 })
                 .collect::<Vec<_>>();
-            let (_, program) = DomainTracingContext::<Session<'static>>::trace_with_named_axes(
-                |inputs: Vec<Tracer<'static>>| {
+            let (_, program) = DomainTracingContext::<Session>::trace_with_named_axes(
+                |inputs: Vec<Tracer>| {
                     let inputs = inputs
                         .into_iter()
                         .map(ValueProjection::<ArrayType>::into_projected)
@@ -173,8 +173,8 @@ mod tests {
         let mesh = test_manual_mesh("x", 2);
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     |input: ArrayTracer| input.parallel_broadcast("x", 1),
@@ -253,8 +253,8 @@ mod tests {
             ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
             ArrayType::scalar(DataType::F32).with_sharding(replicated.clone()).unwrap(),
         ];
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let value = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let source = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
                 let output = shard_map(
@@ -377,8 +377,8 @@ mod tests {
         .unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
         let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
                     |input: ArrayTracer| input.parallel_broadcast("y", 0),

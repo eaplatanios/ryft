@@ -206,6 +206,7 @@ impl CollectiveCase {
             device_count: Some(self.participants),
             ..Default::default()
         }))?;
+        let client = &*Box::leak(Box::new(client));
         let devices = client
             .addressable_devices()?
             .iter()

@@ -250,12 +250,12 @@ mod tests {
     };
 
     // Uploads one generator state to the device and builds the same state on the reference backend.
-    fn generator_states<'c>(
-        session: &Session<'c>,
+    fn generator_states(
+        session: &Session,
         mesh: &DeviceMesh,
         algorithm: RandomAlgorithm,
         state_values: &[u64],
-    ) -> (Array<'c>, CoreArray) {
+    ) -> (Array, CoreArray) {
         let bytes = values_to_bytes(state_values);
         let state = replicated_array(session, mesh, DataType::U64, &[state_values.len()], bytes.as_slice());
         (state, CoreArray::from_elements(algorithm.state_type(), state_values).unwrap())

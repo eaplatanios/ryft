@@ -20,8 +20,8 @@
 //! settings. [`Target`] describes the client's platform and devices without retaining live device handles.
 //!
 //! Traces whose capture tables hold constants rather than runtime values refer to runtime arrays through
-//! [`SessionConstant`] handles. [`ThroughSession`] imports runtime [`Value`]s into such traces by retaining their
-//! arrays in the session, which keeps each array alive for as long as any handle to it exists.
+//! [`SessionConstant`] handles. [`ThroughSession`] imports runtime [`Value`]s into such traces as handles
+//! that retain their arrays, which keeps each array alive for as long as any handle to it exists.
 //!
 //! # Compilation and Execution
 //!
@@ -69,17 +69,17 @@
 //! identities.
 //!
 //! Array readiness observes completion of the work that produced that array. [`Session::effects_barrier`] observes
-//! previously submitted effects, including work whose outputs were discarded. Call it before dropping the client when
-//! those effects must be observed. Sessions and their values borrow the client and cannot outlive it. Clients that
-//! `ryft-xla` creates for sessions live for the rest of the process.
+//! previously submitted effects, including work whose outputs were discarded. Call it before the process exits when
+//! those effects must be observed. The client of a session lives for the rest of the process, as in JAX, so sessions
+//! and their values carry no lifetime and can be stored and moved across threads freely.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use ryft_core::macros::check_count;
 use ryft_core::{
@@ -148,11 +148,11 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// [`Self::new`] creates a session with the default configuration, which runs on a client that the session creates
 /// for the best available [`Platform`]. [`Self::builder`] returns a [`SessionBuilder`] for everything else.
 /// [`SessionBuilder::platform`], [`SessionBuilder::plugin`], and [`SessionBuilder::client_options`] select and
-/// configure the client that the session creates. Clients that are created this way live for the rest of the process
-/// and are shared by the sessions that request the same configuration, so their sessions can be `Session<'static>`.
-/// [`SessionBuilder::client`] instead takes a client that the caller created and owns, which is the extension point
-/// for clients that `ryft-xla` cannot create and for programs that must destroy their client. [`Self::new_mesh`]
-/// creates device meshes over the devices of the client.
+/// configure the client that the session creates. Clients that are created this way are shared by the sessions that
+/// request the same configuration. [`SessionBuilder::client`] instead takes a client that the caller created, which
+/// is the extension point for clients that `ryft-xla` cannot create. Every client of a session lives for the rest of
+/// the process and is never destroyed, like the backend clients of JAX, which is why sessions and their values carry
+/// no lifetime. [`Self::new_mesh`] creates device meshes over the devices of the client.
 ///
 /// # Shared and Selected State
 ///
@@ -177,7 +177,7 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// Ordered I/O dependencies gate the successor computation's entire launch, including its pure work. The backend
 /// may execute inline or asynchronously. Use unordered printing when debugging code whose throughput matters and
 /// whose ordering does not. [`Self::effects_barrier`] also observes unordered I/O and local assertion failures, so it
-/// is broader than flushing prints. Call it before dropping the client when its effects must be observed. Destruction
+/// is broader than flushing prints. Call it before the process exits when its effects must be observed. Destruction
 /// of the last handle waits for launches borrowing extension resources before releasing those resources. Ordinary
 /// execution adds no implicit destruction barrier, and backend behavior with unfinished device work is specific to
 /// each plugin.
@@ -205,7 +205,7 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// # }
 /// ```
 ///
-/// A session over a client that the caller owns cannot outlive that client.
+/// The client of a session must live for the rest of the process, so a client that is dropped cannot be supplied.
 ///
 /// ```compile_fail
 /// use ryft_xla::Session;
@@ -215,9 +215,9 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 ///     session.effects_barrier().unwrap();
 /// }
 /// ```
-pub struct Session<'c> {
+pub struct Session {
     /// Resources shared by every handle of this session.
-    state: Arc<SessionState<'c>>,
+    state: Arc<SessionState>,
 
     /// Concrete device mesh that eager binds prefer when deriving their execution mesh and that the constant
     /// materialization fast path requires.
@@ -225,10 +225,10 @@ pub struct Session<'c> {
 
     /// Selected ordering and completion scope, which clones of this handle share and which
     /// [`Self::fork_effect_scope`] replaces.
-    effect_scope: Arc<EffectScope<'c>>,
+    effect_scope: Arc<EffectScope>,
 }
 
-impl<'c> Session<'c> {
+impl Session {
     /// Creates an independent session with the default configuration, which runs on a client that the session
     /// creates for the best available [`Platform`] and has an empty in-memory compilation cache, the built-in runtime
     /// extensions, and the default compilation options. This is a shorthand for a [`SessionBuilder`] that is built
@@ -244,7 +244,7 @@ impl<'c> Session<'c> {
     /// Returns a [`SessionBuilder`] with the default configuration, which builds a session on the best available
     /// [`Platform`] with an empty in-memory compilation cache, the built-in runtime extensions, and the default
     /// compilation options.
-    pub fn builder() -> SessionBuilder<'c> {
+    pub fn builder() -> SessionBuilder {
         SessionBuilder {
             client_source: ClientSource::Platform(Platform::Auto),
             client_options: None,
@@ -259,10 +259,10 @@ impl<'c> Session<'c> {
     /// Creates an independent session with a fresh effect scope from its client and the configuration of the
     /// resources that its handles share.
     fn from_parts(
-        client: &'c Client<'c>,
-        cache: CompilationCache<'c, Self>,
+        client: &'static Client<'static>,
+        cache: CompilationCache<'static, Self>,
         eager_dispatch_cache_capacity: usize,
-        extensions: RuntimeExtensions<'c>,
+        extensions: RuntimeExtensions,
         default_compilation_options: CompilationOptions,
     ) -> Self {
         Self {
@@ -273,7 +273,6 @@ impl<'c> Session<'c> {
                 eager_dispatch_cache: SpecializationCache::new(eager_dispatch_cache_capacity),
                 default_compilation_options,
                 runtimes: RuntimeRegistry::new(client, extensions),
-                constants: Mutex::new(Vec::new()),
             }),
             mesh: None,
             effect_scope: Arc::new(EffectScope::default()),
@@ -296,7 +295,7 @@ impl<'c> Session<'c> {
 
     /// Returns the PJRT client of this session.
     #[inline]
-    pub fn client(&self) -> &'c Client<'c> {
+    pub fn client(&self) -> &'static Client<'static> {
         self.state.client
     }
 
@@ -330,7 +329,7 @@ impl<'c> Session<'c> {
 
     /// Returns the compilation cache that all handles of this session share.
     #[inline]
-    pub fn compilation_cache(&self) -> &CompilationCache<'c, Self> {
+    pub fn compilation_cache(&self) -> &CompilationCache<'static, Self> {
         &self.state.cache
     }
 
@@ -343,20 +342,20 @@ impl<'c> Session<'c> {
 
     /// Returns the effect ordering scope that executions through this handle reserve their submissions in.
     #[inline]
-    pub(crate) fn effect_scope(&self) -> &EffectScope<'c> {
+    pub(crate) fn effect_scope(&self) -> &EffectScope {
         &self.effect_scope
     }
 
     /// Returns the runtime extension instances of this session and the launches that still borrow their resources.
     #[inline]
-    pub(crate) fn runtimes(&self) -> &RuntimeRegistry<'c> {
+    pub(crate) fn runtimes(&self) -> &RuntimeRegistry {
         &self.state.runtimes
     }
 
     /// Returns the compiled programs of eager operation applications, keyed ahead of program construction and lowering.
     /// Refer to the documentation of [`EagerDispatchKey`] for information on what the key captures.
     #[inline]
-    fn eager_dispatch_cache(&self) -> &SpecializationCache<EagerDispatchKey, EagerDispatchProgram<'c>> {
+    fn eager_dispatch_cache(&self) -> &SpecializationCache<EagerDispatchKey, EagerDispatchProgram> {
         &self.state.eager_dispatch_cache
     }
 
@@ -408,14 +407,14 @@ impl<'c> Session<'c> {
 
     /// Uploads host bytes into an array that belongs to this session. Refer to the documentation of
     /// [`Array::from_host_buffer`] for more information.
-    pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, mesh: DeviceMesh, buffer: B) -> Result<Array<'c>, Error> {
+    pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, mesh: DeviceMesh, buffer: B) -> Result<Array, Error> {
         Array::from_host_buffer(self, r#type, mesh, buffer)
     }
 
     /// Waits for the previously reserved effects of this handle's scope, including unordered I/O and local
     /// assertions. The backend may execute work inline, and this function waits only for work that is still pending.
     /// Later reservations and other scopes (e.g., those of forked handles) are excluded. Failures are retained until
-    /// explicitly acknowledged. Call this function before client destruction to ensure that effects are observed.
+    /// explicitly acknowledged. Call this function before the process exits to ensure that effects are observed.
     pub fn effects_barrier(&self) -> Result<(), Error> {
         self.effect_scope.barrier()
     }
@@ -427,61 +426,33 @@ impl<'c> Session<'c> {
         self.effect_scope.acknowledge()
     }
 
-    /// Returns a new [`Array`] that belongs to this handle and shares the storage that `constant` refers to.
+    /// Returns a new [`Array`] that belongs to this handle and shares the storage that `constant` retains.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError::Type`] error if `constant` was not retained by this session or is no longer in the
-    /// constant table of this session. Both cases are recognized by the ownership token of `constant`, which only
-    /// the table entry that it was created for shares.
-    pub(crate) fn retained_constant(&self, constant: &SessionConstant) -> Result<Array<'c>, ProgramError> {
-        let constants = self.state.constants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let retained = constants
-            .get(constant.index())
-            .and_then(Option::as_ref)
-            .filter(|retained| std::ptr::eq(retained.owner.as_ptr(), Arc::as_ptr(constant.owner())))
-            .ok_or_else(|| {
-                TypeError::invalid(format!(
-                    "session constant `{constant}` is not in the constant table of this session"
-                ))
-            })?;
-        Ok(retained.storage.to_array(self))
+    /// Returns a [`ProgramError::Type`] error if `constant` retains an array of another PJRT client, whose buffers
+    /// this session cannot use.
+    pub(crate) fn retained_constant(&self, constant: &SessionConstant) -> Result<Array, ProgramError> {
+        if !std::ptr::eq(constant.client, self.client()) {
+            return Err(TypeError::invalid(format!(
+                "session constant `{constant}` retains an array of a different PJRT client than the client of this \
+                 session",
+            ))
+            .into());
+        }
+        Ok(constant.storage.to_array(self))
     }
 
-    /// Retains the storage of `array` and returns a [`SessionConstant`] handle that refers to it. The storage stays
-    /// retained for as long as any handle to it exists, as the ownership section of the [`SessionConstant`]
-    /// documentation describes. Retaining an array whose storage a live handle already refers to returns a handle to
-    /// the same entry, so that repeatedly importing the same captured array (e.g., the weights that a compiled function
-    /// captures) does not grow the table. Entries without handles are reclaimed here, which releases their storage and
-    /// makes their positions reusable.
-    fn retain_constant(&self, array: &Array<'c>) -> SessionConstant {
-        let mut constants = self.state.constants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for constant in constants.iter_mut() {
-            if constant.as_ref().is_some_and(|constant| constant.owner.strong_count() == 0) {
-                *constant = None;
-            }
+    /// Retains the storage of `array` and returns a [`SessionConstant`] handle that owns it. The storage stays
+    /// retained for as long as any handle to it exists. Retaining one array more than once returns equal handles, so
+    /// that repeatedly importing the same captured array (e.g., the weights that a compiled function captures)
+    /// stages the same constant every time.
+    fn retain_constant(&self, array: &Array) -> SessionConstant {
+        SessionConstant {
+            r#type: array.r#type().into_owned(),
+            storage: Arc::new(array.retain()),
+            client: self.client(),
         }
-        let existing = constants.iter().enumerate().find_map(|(index, constant)| {
-            let constant = constant.as_ref().filter(|constant| constant.storage.retains(array))?;
-            Some((index, constant.owner.upgrade()?, constant.storage.r#type().clone()))
-        });
-        if let Some((index, owner, r#type)) = existing {
-            return SessionConstant::new(index, r#type, owner);
-        }
-        let owner = Arc::new(SessionConstantOwner);
-        let constant = RetainedConstant { owner: Arc::downgrade(&owner), storage: array.retain() };
-        let r#type = constant.storage.r#type().clone();
-        let index = match constants.iter().position(Option::is_none) {
-            Some(index) => {
-                constants[index] = Some(constant);
-                index
-            }
-            None => {
-                constants.push(Some(constant));
-                constants.len() - 1
-            }
-        };
-        SessionConstant::new(index, r#type, owner)
     }
 
     /// Executes `operation` eagerly on reference handles on the host if it is a reference operation, and returns
@@ -491,9 +462,9 @@ impl<'c> Session<'c> {
     fn eager_reference_bind(
         &self,
         operation: &Operation,
-        inputs: &[Value<'c>],
-    ) -> Option<Result<Vec<Value<'c>>, ProgramError>> {
-        let context = EagerContext::<ArrayIrValue<Array<'c>>>::new();
+        inputs: &[Value],
+    ) -> Option<Result<Vec<Value>, ProgramError>> {
+        let context = EagerContext::<ArrayIrValue<Array>>::new();
         let inputs = || inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
         let outputs = match operation {
             Operation::ReferenceNew(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
@@ -516,7 +487,7 @@ impl<'c> Session<'c> {
     }
 
     /// Uploads a replicated scalar with the provided host `bytes` and `data_type`, placed through [`Self::eager_mesh`].
-    fn eager_scalar(&self, data_type: DataType, bytes: &[u8]) -> Result<Array<'c>, ProgramError> {
+    fn eager_scalar(&self, data_type: DataType, bytes: &[u8]) -> Result<Array, ProgramError> {
         let output_type = ArrayType::scalar(data_type);
         let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
         let output_type = output_type
@@ -550,8 +521,8 @@ impl<'c> Session<'c> {
         &self,
         operation: Operation,
         regions: AttachedRegions<'_, Constant, Operation>,
-        inputs: &[Value<'c>],
-    ) -> Result<Vec<Value<'c>>, ProgramError> {
+        inputs: &[Value],
+    ) -> Result<Vec<Value>, ProgramError> {
         if let Some(outputs) = self.eager_reference_bind(&operation, inputs) {
             return outputs;
         }
@@ -587,7 +558,7 @@ impl<'c> Session<'c> {
             let inputs = inputs
                 .iter()
                 .map(|input| {
-                    <Value<'c> as ryft_core::ValueProjection<DimensionType>>::projected(input)
+                    <Value as ryft_core::ValueProjection<DimensionType>>::projected(input)
                         .map(|dimension| dimension.value().clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -604,7 +575,7 @@ impl<'c> Session<'c> {
         if let Operation::DimensionSize(operation) = &operation {
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <Value<'c> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             let extent = array.dimension_size(operation.axis())?;
             // Arrays derived from this dimension are placed on the mesh of the array that it was read from.
             let value = DimensionValue::new(operation.output_type().clone(), extent)?;
@@ -613,7 +584,7 @@ impl<'c> Session<'c> {
         if let Operation::DimensionFromScalar(operation) = &operation {
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <Value<'c> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
             let value = array.to_dimension(operation.output_type().to_variable())?;
             return Ok(vec![Value::Dimension(Dimension::new(value, self.with_mesh(array.mesh().clone())))]);
@@ -621,7 +592,7 @@ impl<'c> Session<'c> {
 
         if matches!(&operation, Operation::DimensionToScalar(_)) {
             check_count!("input", inputs, 1, ProgramError);
-            let dimension = <Value<'c> as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
+            let dimension = <Value as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
             let extent = i64::try_from(dimension.value().extent()).unwrap();
             return Ok(vec![Value::Array(self.eager_scalar(DataType::I64, extent.to_ne_bytes().as_slice())?)]);
         }
@@ -780,9 +751,9 @@ impl<'c> Session<'c> {
         &self,
         operation: Operation,
         regions: AttachedRegions<'_, Constant, Operation>,
-        inputs: &[Value<'c>],
-        array_inputs: &[Array<'c>],
-    ) -> Result<EagerDispatchProgram<'c>, ProgramError> {
+        inputs: &[Value],
+        array_inputs: &[Array],
+    ) -> Result<EagerDispatchProgram, ProgramError> {
         // Build the program with a single instruction, attaching the provided region bodies to that instruction.
         let region_input_types = vec![None; regions.region_count()];
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -868,7 +839,7 @@ impl<'c> Session<'c> {
     /// mirroring JAX's incompatible devices diagnostic for compiled computations on the eager path. Every [`Array`]
     /// belongs to a session whose client owns its addressable shard buffers, which is validated at construction, so
     /// client identity is exact and also rejects arrays with the same device IDs that a *different* client owns.
-    fn validate_eager_placement(&self, inputs: &[Array<'c>]) -> Result<(), ProgramError> {
+    fn validate_eager_placement(&self, inputs: &[Array]) -> Result<(), ProgramError> {
         if inputs.is_empty() {
             return Ok(());
         }
@@ -909,7 +880,7 @@ impl<'c> Session<'c> {
     /// Deriving placement from output sharding supports operations without inputs on recovered sessions without a mesh,
     /// including nullary constants synthesized by transforms through [`Zero`], [`One`](ryft_core::One),
     /// [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota).
-    fn eager_mesh(&self, inputs: &[Array<'c>], output_types: &[ArrayType]) -> Result<DeviceMesh, ProgramError> {
+    fn eager_mesh(&self, inputs: &[Array], output_types: &[ArrayType]) -> Result<DeviceMesh, ProgramError> {
         if let Ok(mesh) = self.mesh() {
             return Ok(mesh.clone());
         }
@@ -955,7 +926,7 @@ impl<'c> Session<'c> {
     /// Returns [`ArrayError::MissingMesh`] if this session has no mesh, [`ArrayError::DynamicShape`] if `array_type`
     /// does not have a static shape, and an [`Error`] if `array_type` cannot be replicated over that mesh or the
     /// constant cannot be materialized.
-    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, Error> {
+    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array, Error> {
         let mesh = self.mesh()?;
         if array_type.static_shape().is_none() {
             return Err(ArrayError::DynamicShape { shape: array_type.shape().clone() }.into());
@@ -971,20 +942,20 @@ impl<'c> Session<'c> {
     }
 }
 
-impl<'c> Clone for Session<'c> {
+impl Clone for Session {
     fn clone(&self) -> Self {
         Self { state: Arc::clone(&self.state), mesh: self.mesh.clone(), effect_scope: Arc::clone(&self.effect_scope) }
     }
 }
 
-impl<'c> Domain for Session<'c> {
+impl Domain for Session {
     type Type = ArrayIrType;
-    type Value = Value<'c>;
+    type Value = Value;
     type Constant = Constant;
     type Operation = Operation;
 }
 
-impl NamedAxes for Session<'_> {
+impl NamedAxes for Session {
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         let _ = name;
         None
@@ -995,7 +966,7 @@ impl NamedAxes for Session<'_> {
     }
 }
 
-impl MeshContext for Session<'_> {
+impl MeshContext for Session {
     fn default_mesh(&self) -> Option<LogicalMesh> {
         // A session handle that was given a device mesh through `Session::with_mesh` owns the logical view of that
         // mesh as its default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), as under
@@ -1004,13 +975,13 @@ impl MeshContext for Session<'_> {
     }
 }
 
-impl<'c> Context for Session<'c> {
+impl Context for Session {
     // Immediate dimension extents materialize directly, Boolean literals upload a replicated scalar, and a
-    // `Constant::Session` handle resolves to the array that this session retains for it. A
+    // `Constant::Session` handle resolves to the array that it retains. A
     // `Constant::Captured` payload is a symbolic index into a compiled function's capture table carrying only a type
     // and no data, so there is nothing to materialize without the surrounding capture table and lifting it is always
     // rejected.
-    fn lift(&self, constant: Constant) -> Result<Value<'c>, ProgramError> {
+    fn lift(&self, constant: Constant) -> Result<Value, ProgramError> {
         match constant {
             Constant::Captured(constant) => Err(TypeError::invalid(format!(
                 "xla captured constant `{constant}` requires a captured program capture table"
@@ -1101,8 +1072,8 @@ impl<'c> Context for Session<'c> {
 // mesh, and the compiled eager dispatch path over a derived default mesh otherwise. Dynamic array zeros are
 // intentionally not available through this capability, because it receives only a type and they require explicit
 // first-class extent operands.
-impl<'c> Zero<Value<'c>> for Session<'c> {
-    fn zero(&self, r#type: &ArrayIrType) -> Result<Value<'c>, ProgramError> {
+impl Zero<Value> for Session {
+    fn zero(&self, r#type: &ArrayIrType) -> Result<Value, ProgramError> {
         let mut outputs = self.bind(Operation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -1114,14 +1085,14 @@ impl<'c> Zero<Value<'c>> for Session<'c> {
 // only a type and no data and is always rejected outside a surrounding capture table. The implementation exists
 // because operation families that support interpretation and batching require a `ryft_core::Constant` leaf on their
 // contexts. Programs whose constants were compiled into capture tables never take the captured path.
-impl<'c> CoreConstant<Value<'c>, Constant> for Session<'c> {
-    fn constant(&self, value: Constant) -> Result<Value<'c>, ProgramError> {
+impl CoreConstant<Value, Constant> for Session {
+    fn constant(&self, value: Constant) -> Result<Value, ProgramError> {
         self.lift(value)
     }
 }
 
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
-pub type Tracer<'c> = DomainTracer<Session<'c>>;
+pub type Tracer = DomainTracer<Session>;
 
 /// Invalid configuration of a [`SessionBuilder`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -1143,7 +1114,7 @@ pub enum SessionError {
 /// `ryft-xla` does not know about, and [`Self::client_options`] configures the client that either of them creates.
 /// These clients live for the rest of the process, and sessions that request the same plugin with equal client
 /// options share one client, as the [`platforms`] module documents. [`Self::client`]
-/// instead supplies a client that the caller created and owns. Each of [`Self::platform`], [`Self::plugin`], and
+/// instead supplies a client that the caller created. Each of [`Self::platform`], [`Self::plugin`], and
 /// [`Self::client`] replaces the selection of the others.
 ///
 /// The remaining functions configure the resources that all handles of the session share. The order in which a
@@ -1166,15 +1137,15 @@ pub enum SessionError {
 /// # Ok(())
 /// # }
 /// ```
-pub struct SessionBuilder<'c> {
+pub struct SessionBuilder {
     /// Source of the client of the session.
-    client_source: ClientSource<'c>,
+    client_source: ClientSource,
 
     /// Options of the client that `ryft-xla` creates for the session, if the caller supplied any.
     client_options: Option<ClientOptions>,
 
     /// Compilation cache of the session, before [`Self::disk_cache`] is applied to it.
-    compilation_cache: CompilationCache<'c, Session<'c>>,
+    compilation_cache: CompilationCache<'static, Session>,
 
     /// Persistent tier that replaces the one of [`Self::compilation_cache`], if the caller requested one.
     disk_cache: Option<DiskCacheSource>,
@@ -1183,13 +1154,13 @@ pub struct SessionBuilder<'c> {
     eager_dispatch_cache_capacity: usize,
 
     /// Runtime provider configuration of the session.
-    runtime_extensions: RuntimeExtensions<'c>,
+    runtime_extensions: RuntimeExtensions,
 
     /// Template of the options that the session forwards to [`Client::compile`].
     default_compilation_options: CompilationOptions,
 }
 
-impl<'c> SessionBuilder<'c> {
+impl SessionBuilder {
     /// Requests a client that `ryft-xla` creates for `platform`. An explicit platform never falls back to another
     /// one, so building the session fails if `platform` is unavailable.
     pub fn platform(mut self, platform: Platform) -> Self {
@@ -1213,10 +1184,11 @@ impl<'c> SessionBuilder<'c> {
         self
     }
 
-    /// Supplies a client that the caller created and owns, which the session borrows and never destroys. This is the
-    /// extension point for clients that `ryft-xla` cannot create (e.g., a client of a
-    /// [`DistributedRuntime`](crate::DistributedRuntime)) and for programs that must destroy their client.
-    pub fn client(mut self, client: &'c Client<'c>) -> Self {
+    /// Supplies a client that the caller created, which must live for the rest of the process (e.g., a leaked client
+    /// or one that is stored in a static) and which several sessions may share. This is the extension point for
+    /// clients that `ryft-xla` cannot create (e.g., a client of a [`DistributedRuntime`](crate::DistributedRuntime),
+    /// whose runtime must then live for the rest of the process as well).
+    pub fn client(mut self, client: &'static Client<'static>) -> Self {
         self.client_source = ClientSource::Client(client);
         self
     }
@@ -1224,7 +1196,7 @@ impl<'c> SessionBuilder<'c> {
     /// Supplies the compilation cache of the session in place of the default one, which keeps up to its default
     /// number of compiled programs in memory. Refer to [`CompilationCache`] for information on its tiers, its
     /// artifact exchange, and its event reporting.
-    pub fn compilation_cache(mut self, compilation_cache: CompilationCache<'c, Session<'c>>) -> Self {
+    pub fn compilation_cache(mut self, compilation_cache: CompilationCache<'static, Session>) -> Self {
         self.compilation_cache = compilation_cache;
         self
     }
@@ -1261,7 +1233,7 @@ impl<'c> SessionBuilder<'c> {
     /// Initialized instances belong to the session, even when `runtime_extensions` was cloned from another
     /// configuration. Providers initialize lazily when an executable requires them, so building the session does not
     /// load GPU drivers on their behalf.
-    pub fn runtime_extensions(mut self, runtime_extensions: RuntimeExtensions<'c>) -> Self {
+    pub fn runtime_extensions(mut self, runtime_extensions: RuntimeExtensions) -> Self {
         self.runtime_extensions = runtime_extensions;
         self
     }
@@ -1285,12 +1257,12 @@ impl<'c> SessionBuilder<'c> {
     /// # Errors
     ///
     /// Returns a [`SessionError`] if the requested platform is unavailable in this build or if client options were
-    /// supplied for [`Platform::Auto`] or for a client that the caller owns, [`Error::Pjrt`] if the plugin of the
+    /// supplied for [`Platform::Auto`] or for a client that the caller created, [`Error::Pjrt`] if the plugin of the
     /// session cannot be loaded or initialized or its client cannot be created, and [`Error::Io`] if the disk cache
     /// that the environment configures is invalid. A session that is only given [`Self::client`] and resources that
     /// do not read the environment cannot fail.
-    pub fn build(self) -> Result<Session<'c>, Error> {
-        let client: &'c Client<'c> = match (self.client_source, self.client_options) {
+    pub fn build(self) -> Result<Session, Error> {
+        let client: &'static Client<'static> = match (self.client_source, self.client_options) {
             (ClientSource::Platform(platform), client_options) => platform.client(client_options)?,
             (ClientSource::Plugin(plugin), client_options) => {
                 process_client(&plugin, client_options.unwrap_or_default())?
@@ -1320,73 +1292,68 @@ impl<'c> SessionBuilder<'c> {
     }
 }
 
-/// Handle without a lifetime to an array that a [`Session`] retains on behalf of a trace whose capture table cannot
-/// hold runtime arrays. Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of a
+/// Handle to an array that a [`Session`] retains on behalf of a trace whose capture table cannot hold runtime arrays.
+/// Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of a
 /// [`composite`](ryft_core::composite) and its rules, which are traced over constants alone) still needs to refer to
 /// the runtime arrays that a compiled function it calls has captured. Importing such an array through
-/// [`ThroughSession`] registers it in the session and stages this handle as an immediate constant, which can appear in
-/// any region of any program, including lazily traced derivative rules.
+/// [`ThroughSession`] stages this handle as an immediate constant, which can appear in any region of any program,
+/// including lazily traced derivative rules.
 ///
-/// The handle resolves to the retained array through the session that registered it. An eager session resolves it when
-/// lifting it, and lowering turns every distinct handle of a program into a hidden executable argument that follows the
-/// captures of the program, so that compiled executables depend only on the array's type and never on its data.
+/// An eager session resolves the handle to its array when lifting it, and lowering turns every distinct handle of a
+/// program into a hidden executable argument that follows the captures of the program, so that compiled executables
+/// depend only on the array's type and never on its data.
 ///
 /// # Ownership
 ///
-/// Every handle co-owns its table entry through a shared ownership token, and so the programs, regions, derivative
-/// rules, and caches that hold a handle, or a clone of it, keep the array alive. The session reclaims an entry once no
-/// handle to it remains, and only then may it reuse its position for another array. Handles compare and hash by the
-/// identity of that token and by their type, which therefore identify one array of one session for as long as any
-/// handle exists. The token is needed because a handle has no lifetime, and so it can hold neither its session nor the
-/// retained array, both of which borrow the PJRT client.
-#[derive(Clone, Debug, Parameter)]
+/// A handle owns the storage of its array without the session and the caches of that array, and its clones share
+/// that storage. The programs, regions, derivative rules, and caches that hold a handle therefore keep the array
+/// alive, and the storage is released together with the last handle. Handles compare and hash by the identity of the
+/// array storage that they were created from and by their type, so retaining one array twice yields equal handles.
+/// Any session of the PJRT client that owns the array can resolve a handle.
+#[derive(Clone, Parameter)]
 pub struct SessionConstant {
-    /// Position of the array in the constant table of the session that retains it.
-    index: usize,
-
     /// [`ArrayType`] of the retained array.
     r#type: ArrayType,
 
-    /// Token shared by every handle to the retained array, whose last release lets the session reclaim it.
-    owner: Arc<SessionConstantOwner>,
+    /// Storage of the retained array, shared by the clones of this handle.
+    storage: Arc<RetainedArray>,
+
+    /// PJRT client that owns the buffers of the retained array.
+    client: &'static Client<'static>,
 }
 
 impl SessionConstant {
-    /// Creates a new [`SessionConstant`] for the array at `index` in the constant table of a session, which co-owns
-    /// that entry through `owner`.
-    #[inline]
-    fn new(index: usize, r#type: ArrayType, owner: Arc<SessionConstantOwner>) -> Self {
-        Self { index, r#type, owner }
-    }
-
-    /// Returns the position of the array in the constant table of its session.
-    #[inline]
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Returns the ownership token that this handle shares with every other handle to the same retained array.
-    #[inline]
-    fn owner(&self) -> &Arc<SessionConstantOwner> {
-        &self.owner
-    }
-
     /// Returns this handle with the identities of its type renamed by `renaming`.
     pub(crate) fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        Ok(Self { index: self.index, r#type: self.r#type.rename_identities(renaming)?, owner: Arc::clone(&self.owner) })
+        Ok(Self {
+            r#type: self.r#type.rename_identities(renaming)?,
+            storage: Arc::clone(&self.storage),
+            client: self.client,
+        })
     }
 }
 
-// Handles are identified by their ownership token and their type. Every handle to one retained array shares one token,
-// and tokens of different arrays, including arrays of different sessions, are distinct allocations for as long as
-// their handles exist, so the address of the token identifies the array without a session identifier.
+// The retained storage has no useful `Debug` representation, so handles are described by their type and by the
+// identity of the array storage that they were created from, which is what distinguishes them.
+impl Debug for SessionConstant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionConstant")
+            .field("type", &self.r#type)
+            .field("storage", &self.storage.identity())
+            .finish()
+    }
+}
+
+// Handles are identified by the array storage that they were created from and by their type. The identity of that
+// storage stays reserved for as long as any handle retains it, so equal identities always mean the same array.
 impl PartialEq for SessionConstant {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.owner, &other.owner) && self.r#type == other.r#type
+        self.storage.identity() == other.storage.identity() && self.r#type == other.r#type
     }
 }
 
@@ -1395,7 +1362,7 @@ impl Eq for SessionConstant {}
 impl Hash for SessionConstant {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.owner).hash(state);
+        self.storage.identity().hash(state);
         self.r#type.hash(state);
     }
 }
@@ -1403,7 +1370,7 @@ impl Hash for SessionConstant {
 impl Display for SessionConstant {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "session#{}:{}", self.index, self.r#type)
+        write!(formatter, "session:{}", self.r#type)
     }
 }
 
@@ -1419,36 +1386,35 @@ impl Typed for SessionConstant {
 /// Import path of [`ImportingContext`] through which a trace whose capture table holds constants rather than runtime
 /// values (i.e., one whose [`CapturingContext::Capture`] is [`Constant`], such as the body of a
 /// [`rematerialize`](ryft_core::rematerialize) or [`composite`](ryft_core::composite) call) imports runtime XLA
-/// [`Value`]s. Arrays are retained by their [`Session`], once for each distinct storage, for as long as a handle to
-/// them exists and enter the trace as [`Constant::Session`] handles. Dimensions enter as immediate
+/// [`Value`]s. Arrays enter the trace as [`Constant::Session`] handles, which retain them for as long as a handle
+/// exists and which are equal for one array. Dimensions enter as immediate
 /// [`Constant::Dimension`]s, and references are rejected because their state cannot be shared with a trace that
 /// outlives the current transform.
 pub struct ThroughSession;
 
-impl<'c> ImportingContext<Session<'c>, ThroughSession> for TracingContext<Constant, Operation, Constant> {
+impl ImportingContext<Session, ThroughSession> for TracingContext<Constant, Operation, Constant> {
     #[inline]
-    fn import(&self, value: Value<'c>) -> Result<Self::Value, ProgramError> {
+    fn import(&self, value: Value) -> Result<Self::Value, ProgramError> {
         self.lift(session_constant(value)?)
     }
 }
 
-impl<'c, C: CapturingContext<Capture = Constant>> ImportingContext<Session<'c>, ThroughSession>
-    for NestedTracingContext<C>
+impl<C: CapturingContext<Capture = Constant>> ImportingContext<Session, ThroughSession> for NestedTracingContext<C>
 where
     Self: Context<Constant = Constant>,
 {
     #[inline]
-    fn import(&self, value: Value<'c>) -> Result<Self::Value, ProgramError> {
+    fn import(&self, value: Value) -> Result<Self::Value, ProgramError> {
         self.lift(session_constant(value)?)
     }
 }
 
-/// Resources that all handles of one [`Session`] share. Its caches, runtime instances, and constant table are mutated
-/// through interior mutability, while its configuration is immutable after construction.
-struct SessionState<'c> {
-    /// Client of the session, which outlives cached executables and effect carriers. It is either owned by the caller
-    /// or one of the clients that `ryft-xla` created and that live for the rest of the process.
-    client: &'c Client<'c>,
+/// Resources that all handles of one [`Session`] share. Its caches and runtime instances are mutated through interior
+/// mutability, while its configuration is immutable after construction.
+struct SessionState {
+    /// Client of the session, which lives for the rest of the process. It is either a client that the caller created
+    /// or one of the clients that `ryft-xla` created.
+    client: &'static Client<'static>,
 
     /// Compilation and execution target snapshot of [`Self::client`], read lazily and retained for the lifetime of the
     /// session, including a failed read.
@@ -1456,30 +1422,25 @@ struct SessionState<'c> {
 
     /// Compilation cache of the session, which [`Session::compilation_cache`] exposes. Cached artifacts contain no
     /// runtime execution association.
-    cache: CompilationCache<'c, Session<'c>>,
+    cache: CompilationCache<'static, Session>,
 
     /// Compiled programs of eager operation applications, keyed ahead of program construction and lowering. Refer to
     /// the documentation of [`EagerDispatchKey`] for information on what the key captures.
-    eager_dispatch_cache: SpecializationCache<EagerDispatchKey, EagerDispatchProgram<'c>>,
+    eager_dispatch_cache: SpecializationCache<EagerDispatchKey, EagerDispatchProgram>,
 
     /// Template of the options forwarded to [`Client::compile`], which every compilation of the session starts from.
     /// It is immutable because the eager dispatch cache does not key its entries on it.
     default_compilation_options: CompilationOptions,
 
     /// Runtime extensions associated with the client, and ownership of launches borrowing their resources.
-    runtimes: RuntimeRegistry<'c>,
-
-    /// Arrays that [`SessionConstant`] handles refer to, indexed by [`SessionConstant::index`]. A [`None`] entry was
-    /// reclaimed and may be reused. Refer to [`Session::retain_constant`] for information on how arrays enter and
-    /// leave this table.
-    constants: Mutex<Vec<Option<RetainedConstant<'c>>>>,
+    runtimes: RuntimeRegistry,
 }
 
 /// Compiled program that the eager dispatch cache retains for one [`EagerDispatchKey`].
 #[derive(Clone)]
-struct EagerDispatchProgram<'c> {
+struct EagerDispatchProgram {
     /// Compiled program of the eager application.
-    program: Arc<CompiledProgram<'c>>,
+    program: Arc<CompiledProgram>,
 
     /// [`SessionConstant`]s whose arrays the compiled program receives as hidden arguments ahead of the array inputs
     /// of the application. Their handles are part of the key, through its regions.
@@ -1502,15 +1463,15 @@ enum EagerOutput {
 }
 
 /// Source of the PJRT client of a session that is being built.
-enum ClientSource<'c> {
+enum ClientSource {
     /// Process-wide client that `ryft-xla` creates for a platform.
     Platform(Platform),
 
     /// Process-wide client that `ryft-xla` creates through a plugin that the caller loaded.
     Plugin(Plugin),
 
-    /// Client that the caller created and owns.
-    Client(&'c Client<'c>),
+    /// Client that the caller created.
+    Client(&'static Client<'static>),
 }
 
 /// Persistent tier that a session under construction adds to its compilation cache.
@@ -1520,21 +1481,6 @@ enum DiskCacheSource {
 
     /// Disk cache that the [`DiskCache::ENV_VAR`] environment variable configures, if it is set.
     Environment,
-}
-
-/// Ownership token that every [`SessionConstant`] handle to one retained array shares. The session keeps only a weak
-/// reference to it, so the token is released together with the last handle.
-#[derive(Debug)]
-struct SessionConstantOwner;
-
-/// Entry of the constant table of a [`Session`].
-struct RetainedConstant<'c> {
-    /// Weak reference to the token that every [`SessionConstant`] handle to this entry shares. The entry may be
-    /// reclaimed once the token is released.
-    owner: Weak<SessionConstantOwner>,
-
-    /// Retained storage of the array.
-    storage: RetainedArray<'c>,
 }
 
 /// Converts `value` into the immediate [`Constant`] that a trace capturing constants stages for it.
@@ -1589,9 +1535,12 @@ pub(crate) mod tests {
 
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
+    #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
     use crate::sessions::runtimes::builtin_requirement;
     use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, hash_of, replicated_array, values_from_bytes, values_to_bytes,
+        assert_send_sync, cpu_client, execution_client, hash_of, other_cpu_client, replicated_array, values_from_bytes,
+        values_to_bytes,
     };
     #[cfg(feature = "cuda-13")]
     use crate::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, KernelCompilerBinding, Options, stage_kernel};
@@ -1603,7 +1552,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Creates an independent session over `client` with the default configuration.
-    pub(crate) fn session_with_client<'c>(client: &'c Client<'c>) -> Session<'c> {
+    pub(crate) fn session_with_client(client: &'static Client<'static>) -> Session {
         Session::builder().client(client).build().unwrap()
     }
 
@@ -1643,12 +1592,12 @@ pub(crate) mod tests {
     }
 
     /// Creates an independent session and projects it to ordinary array values.
-    pub(crate) fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<Session<'c>, ArrayType> {
+    pub(crate) fn array_domain(client: &'static Client<'static>) -> ProjectedContext<Session, ArrayType> {
         ProjectedContext::new(session_with_client(client))
     }
 
     /// Borrows the array carried by a test value, requiring the array variant.
-    pub(crate) fn program_array<'o, 'c>(value: &'o Value<'c>) -> &'o Array<'c> {
+    pub(crate) fn program_array<'o>(value: &'o Value) -> &'o Array {
         let Value::Array(array) = value else {
             panic!("expected an array IR value");
         };
@@ -1670,19 +1619,19 @@ pub(crate) mod tests {
     }
 
     /// Uploads a replicated rank-1 `f32` test array.
-    pub(crate) fn f32_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
+    pub(crate) fn f32_vector(session: &Session, mesh: &DeviceMesh, values: &[f32]) -> Array {
         let r#type = replicated_vector_type(mesh, values.len());
         Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
     /// Uploads a replicated `f32` test scalar.
-    pub(crate) fn f32_scalar<'c>(session: &Session<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
+    pub(crate) fn f32_scalar(session: &Session, mesh: &DeviceMesh, value: f32) -> Array {
         let r#type = replicated_scalar_type(mesh, DataType::F32);
         Array::from_host_buffer(session, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
     }
 
     /// Uploads a replicated rank-1 `f64` test array.
-    pub(crate) fn f64_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
+    pub(crate) fn f64_vector(session: &Session, mesh: &DeviceMesh, values: &[f64]) -> Array {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -1690,7 +1639,7 @@ pub(crate) mod tests {
     }
 
     /// Uploads a replicated rank-1 Boolean test array using one byte per element.
-    pub(crate) fn boolean_vector<'c>(session: &Session<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+    pub(crate) fn boolean_vector(session: &Session, mesh: &DeviceMesh, values: &[bool]) -> Array {
         let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -1699,13 +1648,13 @@ pub(crate) mod tests {
     }
 
     /// Uploads a replicated Boolean test scalar using one byte per element.
-    pub(crate) fn boolean_scalar<'c>(session: &Session<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
+    pub(crate) fn boolean_scalar(session: &Session, mesh: &DeviceMesh, value: bool) -> Array {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
         Array::from_host_buffer(session, r#type, mesh.clone(), [u8::from(value)]).unwrap()
     }
 
     /// Reads the first addressable shard as native-endian `f32` values.
-    pub(crate) fn read_f32s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+    pub(crate) fn read_f32s(client: &Client<'_>, array: &Array) -> Vec<f32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
             .device_shard(device_id)
@@ -1720,7 +1669,7 @@ pub(crate) mod tests {
     }
 
     /// Reads every device shard of `array` in mesh device order and concatenates their native-endian `f32` values.
-    pub(crate) fn read_sharded_f32_array(array: &Array<'_>) -> Vec<f32> {
+    pub(crate) fn read_sharded_f32_array(array: &Array) -> Vec<f32> {
         let mut values = Vec::new();
         for device in array.mesh().devices() {
             let shard_bytes = array
@@ -1738,7 +1687,7 @@ pub(crate) mod tests {
     }
 
     /// Reads the first addressable shard as native-endian `f64` values.
-    pub(crate) fn read_f64s(client: &Client<'_>, array: &Array<'_>) -> Vec<f64> {
+    pub(crate) fn read_f64s(client: &Client<'_>, array: &Array) -> Vec<f64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
             .device_shard(device_id)
@@ -1753,7 +1702,7 @@ pub(crate) mod tests {
     }
 
     /// Reads the first addressable shard as native-endian unsigned 64-bit integers.
-    pub(crate) fn read_u64s(client: &Client<'_>, array: &Array<'_>) -> Vec<u64> {
+    pub(crate) fn read_u64s(client: &Client<'_>, array: &Array) -> Vec<u64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
             .device_shard(device_id)
@@ -1768,7 +1717,7 @@ pub(crate) mod tests {
     }
 
     /// Reads the first addressable shard as native-endian signed 64-bit integers.
-    pub(crate) fn read_i64s(client: &Client<'_>, array: &Array<'_>) -> Vec<i64> {
+    pub(crate) fn read_i64s(client: &Client<'_>, array: &Array) -> Vec<i64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
             .device_shard(device_id)
@@ -1783,7 +1732,7 @@ pub(crate) mod tests {
     }
 
     /// Reads the first addressable shard, interpreting each nonzero byte as `true`.
-    pub(crate) fn read_booleans(client: &Client<'_>, array: &Array<'_>) -> Vec<bool> {
+    pub(crate) fn read_booleans(client: &Client<'_>, array: &Array) -> Vec<bool> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         array
             .device_shard(device_id)
@@ -1801,7 +1750,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_session_is_send_and_sync() {
-        assert_send_sync::<Session<'static>>();
+        assert_send_sync::<Session>();
     }
 
     #[test]
@@ -1837,7 +1786,7 @@ pub(crate) mod tests {
     #[test]
     fn test_session_builder() {
         // A builder without any configuration builds what `Session::new` creates.
-        let session: Session<'static> = Session::builder().build().unwrap();
+        let session: Session = Session::builder().build().unwrap();
         assert!(std::ptr::eq(session.client(), Session::new().unwrap().client()));
         assert_eq!(session.default_compilation_options(), &CompilationOptions::default());
         assert!(session.compilation_cache().disk_cache().is_none());
@@ -1880,8 +1829,8 @@ pub(crate) mod tests {
     fn test_session_client() {
         let client = execution_client();
         let session = session_with_client(&client);
-        assert!(std::ptr::eq(session.client(), &client));
-        assert!(std::ptr::eq(session.fork_effect_scope().client(), &client));
+        assert!(std::ptr::eq(session.client(), client));
+        assert!(std::ptr::eq(session.fork_effect_scope().client(), client));
     }
 
     #[test]
@@ -2086,8 +2035,8 @@ pub(crate) mod tests {
     #[test]
     fn test_session_retained_constant() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&array);
 
@@ -2097,51 +2046,43 @@ pub(crate) mod tests {
         assert_eq!(resolved, array);
         assert!(std::ptr::eq(resolved.session().effect_scope(), fork.effect_scope()));
 
-        // Handles resolve only through the session that retains their arrays.
-        let other_session = session_with_client(&client);
+        // Every session of the client that owns the array resolves the handle, and the array outlives its session.
+        let other_session = session_with_client(client);
+        drop((array, resolved, fork, session));
+        let resolved = other_session.retained_constant(&handle).unwrap();
+        assert!(resolved.session().is_same_session(&other_session));
+        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
+
+        // Sessions of another client cannot use the buffers of the array.
+        let foreign_session = session_with_client(other_cpu_client(1));
         assert_eq!(
-            other_session.retained_constant(&handle),
+            foreign_session.retained_constant(&handle),
             Err(TypeError::invalid(format!(
-                "session constant `{handle}` is not in the constant table of this session"
+                "session constant `{handle}` retains an array of a different PJRT client than the client of this \
+                 session",
             ))
             .into()),
-        );
-
-        // Handles whose entries were reclaimed and reused by another array no longer resolve.
-        let stale = SessionConstant::new(0, handle.r#type().into_owned(), Arc::new(SessionConstantOwner));
-        assert_eq!(
-            session.retained_constant(&stale),
-            Err(TypeError::invalid(format!("session constant `{stale}` is not in the constant table of this session"))
-                .into()),
         );
     }
 
     #[test]
     fn test_session_retain_constant() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
-        let array = |value: f32| session.array(ArrayType::scalar(DataType::F32), mesh.clone(), value.to_ne_bytes());
-        let retained_constant_count = || session.state.constants.lock().unwrap().iter().flatten().count();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
+        let array = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
 
-        // Retaining one array twice shares one entry and one ownership token, and the handles keep the array alive
-        // after the array itself is dropped.
-        let first = array(1.0).unwrap();
-        let handle = session.retain_constant(&first);
-        let duplicate = session.retain_constant(&first);
+        // Retaining one array twice yields equal handles, and the handles keep the array alive after the array itself
+        // is dropped.
+        let handle = session.retain_constant(&array);
+        let duplicate = session.retain_constant(&array);
         assert_eq!(duplicate, handle);
-        assert!(Arc::ptr_eq(duplicate.owner(), handle.owner()));
-        drop((first, duplicate));
-        assert_eq!(retained_constant_count(), 1);
-        assert_eq!(session.retained_constant(&handle).unwrap(), session.retained_constant(&handle).unwrap());
+        drop((array, duplicate));
+        let resolved = session.retained_constant(&handle).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
 
-        // Once every handle is released, the next retention reclaims the entry and reuses its position.
-        drop(handle);
-        let second = array(2.0).unwrap();
-        let handle = session.retain_constant(&second);
-        assert_eq!(retained_constant_count(), 1);
-        assert_eq!(handle.index(), 0);
-        assert_eq!(session.retained_constant(&handle).unwrap(), second);
+        // An array that was resolved from a handle has storage of its own, so retaining it yields another handle.
+        assert_ne!(session.retain_constant(&resolved), handle);
     }
 
     #[test]
@@ -2678,7 +2619,7 @@ pub(crate) mod tests {
                     .with_execution_fence(ExecutionFence::new(vec![event])),
             );
             for checked in [true, false] {
-                let wrapped = ArrayIrValue::<Array<'_>>::Dimension(DimensionValue::constant(2).unwrap());
+                let wrapped = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
                 let Value::Array(array) = &witness else { unreachable!() };
                 let witnesses = [ArrayIrValue::Array(array.clone())];
                 let result = if checked {
@@ -2733,11 +2674,11 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = domain_mesh(&client, "x", 2);
         let session = session_with_client(&client);
-        fn negate<'c>(session: &Session<'c>, input: Array<'c>) {
+        fn negate(session: &Session, input: Array) {
             let inputs = [Value::Array(input)];
             session.bind(Operation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
         }
-        let misses = |session: &Session<'_>| session.eager_dispatch_statistics().misses;
+        let misses = |session: &Session| session.eager_dispatch_statistics().misses;
 
         let vector = f32_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         negate(&session, vector.clone());
@@ -2863,7 +2804,7 @@ pub(crate) mod tests {
     #[test]
     fn test_session_bind_dispatch_cache_hits_still_validate_placement() {
         let client = execution_client();
-        let other_client = execution_client();
+        let other_client = other_cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let other_session = session_with_client(&other_client);
@@ -3605,8 +3546,8 @@ pub(crate) mod tests {
         let add = |left, right| {
             shard_map(
                 |(left, right): (
-                    ProjectedValue<ArrayType, DomainTracer<Session<'_>>>,
-                    ProjectedValue<ArrayType, DomainTracer<Session<'_>>>,
+                    ProjectedValue<ArrayType, DomainTracer<Session>>,
+                    ProjectedValue<ArrayType, DomainTracer<Session>>,
                 )| Ok(left + right),
                 (left, right),
                 logical_mesh.clone(),
@@ -3625,8 +3566,8 @@ pub(crate) mod tests {
 
         let inferred = shard_map_with_inferred_input_shardings(
             |(left, right): (
-                ProjectedValue<ArrayType, DomainTracer<Session<'_>>>,
-                ProjectedValue<ArrayType, DomainTracer<Session<'_>>>,
+                ProjectedValue<ArrayType, DomainTracer<Session>>,
+                ProjectedValue<ArrayType, DomainTracer<Session>>,
             )| Ok(left * right),
             (left.clone(), right),
             logical_mesh.clone(),
@@ -3637,7 +3578,7 @@ pub(crate) mod tests {
         assert_eq!(read_device_f32s(&inferred), vec![vec![10.0, 40.0], vec![30.0, 80.0]]);
 
         let doubled = shard_map_along(
-            |x: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(x.clone() + x),
+            |x: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(x.clone() + x),
             left,
             logical_mesh,
             "x",
@@ -3674,9 +3615,9 @@ pub(crate) mod tests {
             Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
                 .unwrap();
         let doubled = shard_map(
-            |x: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| {
+            |x: ProjectedValue<ArrayType, DomainTracer<Session>>| {
                 Ok(shard_map(
-                    |x: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(x.clone() + x),
+                    |x: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(x.clone() + x),
                     x,
                     None,
                     replicated.clone(),
@@ -3693,7 +3634,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![2.0, 4.0], vec![6.0, 8.0], vec![6.0, 8.0]]);
         let missing = shard_map(
-            |x: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(x),
+            |x: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(x),
             input,
             None,
             sharded.clone(),
@@ -3708,7 +3649,7 @@ pub(crate) mod tests {
         let input =
             Array::from_host_buffer(&meshed_session, r#type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let doubled = shard_map(
-            |x: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(x.clone() + x),
+            |x: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(x.clone() + x),
             input,
             None,
             sharded.clone(),
@@ -3763,11 +3704,11 @@ pub(crate) mod tests {
 
         // Eager outputs belong to the client and session of their inputs, so they feed further eager operations that
         // dispatch through the same cache.
-        assert!(std::ptr::eq(first_sum.client(), &client));
+        assert!(std::ptr::eq(first_sum.client(), client));
         assert!(first_sum.session().is_same_session(&session));
         let product = first_sum.mul(&second).unwrap();
         assert_eq!(read_f32s(&client, &product), vec![6.0, 16.0]);
-        assert!(std::ptr::eq(product.client(), &client));
+        assert!(std::ptr::eq(product.client(), client));
         assert!(product.session().is_same_session(&session));
         assert_eq!(session.program_count(), 2);
     }
@@ -3800,8 +3741,8 @@ pub(crate) mod tests {
         measure("eager add (end to end)", &mut || {
             input.add(&input).unwrap();
         });
-        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-            jit(|_, value: CompileTracer<'_>| Ok(value.add(&value)?), &session, mesh.clone());
+        let function: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+            jit(|_, value: CompileTracer| Ok(value.add(&value)?), &session, mesh.clone());
         measure("JIT add (warm dispatch)", &mut || {
             function.execute((), input.clone()).unwrap();
         });
@@ -3913,7 +3854,7 @@ pub(crate) mod tests {
         let session = session_with_client(&client);
         let x = f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]);
         let tangent = f32_vector(&session, &mesh, &[1.0, 1.0, 1.0]);
-        let (value, tangent): (Array<'_>, Array<'_>) = differentiate_at(x).jvp(tangent, |x| x.mul(&x)).unwrap();
+        let (value, tangent): (Array, Array) = differentiate_at(x).jvp(tangent, |x| x.mul(&x)).unwrap();
         assert_eq!(read_f32s(&client, &value), vec![1.0, 4.0, 9.0]);
         assert_eq!(read_f32s(&client, &tangent), vec![2.0, 4.0, 6.0]);
     }
@@ -3931,7 +3872,7 @@ pub(crate) mod tests {
         assert_eq!(read_f32s(&client, &gradient), vec![2.0, 4.0, 6.0]);
 
         // An auxiliary output is evaluated at the primal and returned beside the value without being differentiated.
-        let ((value, auxiliary), gradient): ((Array<'_>, Array<'_>), Array<'_>) = differentiate_at(x)
+        let ((value, auxiliary), gradient): ((Array, Array), Array) = differentiate_at(x)
             .with_auxiliary_output()
             .value_and_gradient(|x| {
                 let auxiliary = x.add(&x).unwrap();
@@ -4198,8 +4139,7 @@ pub(crate) mod tests {
 
         // The free `batch` recovers the session from its array input and squares each batch item through eager
         // dispatch.
-        let output: Array<'_> =
-            batch(|x| Ok(x.clone() * x), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        let output: Array = batch(|x| Ok(x.clone() * x), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(read_f32s(&client, &output), vec![1.0, 4.0, 9.0]);
     }
 
@@ -4219,8 +4159,8 @@ pub(crate) mod tests {
     fn test_session_builder_platform() {
         // Sessions that `ryft-xla` creates clients for can be `'static`, and they share the client of their platform
         // without sharing any session state.
-        let session: Session<'static> = Session::builder().platform(Platform::Cpu).build().unwrap();
-        let other: Session<'static> = Session::builder().platform(Platform::Cpu).build().unwrap();
+        let session: Session = Session::builder().platform(Platform::Cpu).build().unwrap();
+        let other: Session = Session::builder().platform(Platform::Cpu).build().unwrap();
         assert!(session.target().unwrap().platform_name().eq_ignore_ascii_case("cpu"));
         assert!(std::ptr::eq(session.client(), other.client()));
         assert!(!session.is_same_session(&other));
@@ -4279,9 +4219,9 @@ pub(crate) mod tests {
         // A session over a client of the caller borrows it, and the last source that a builder is given wins.
         let client = cpu_client(1);
         let session = Session::builder().platform(Platform::Cpu).client(&client).build().unwrap();
-        assert!(std::ptr::eq(session.client(), &client));
+        assert!(std::ptr::eq(session.client(), client));
         let session = Session::builder().client(&client).platform(Platform::Cpu).build().unwrap();
-        assert!(!std::ptr::eq(session.client(), &client));
+        assert!(!std::ptr::eq(session.client(), client));
     }
 
     #[test]
@@ -4390,19 +4330,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_constant_index() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
-        let first = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
-        let second = session.array(ArrayType::scalar(DataType::F32), mesh, 2f32.to_ne_bytes()).unwrap();
-        let handles = (session.retain_constant(&first), session.retain_constant(&second));
-        assert_eq!((handles.0.index(), handles.1.index()), (0, 1));
-    }
-
-    #[test]
     fn test_session_constant_rename_type_identities() {
-        // Renaming keeps the session, the position, and the ownership token of a handle, and only renames its type.
+        // Renaming keeps the storage of a handle and only renames its type.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
@@ -4410,7 +4339,7 @@ pub(crate) mod tests {
         let handle = session.retain_constant(&array);
         let renamed = handle.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
         assert_eq!(renamed, handle);
-        assert!(Arc::ptr_eq(renamed.owner(), handle.owner()));
+        assert!(Arc::ptr_eq(&renamed.storage, &handle.storage));
     }
 
     #[test]
@@ -4454,7 +4383,7 @@ pub(crate) mod tests {
         let session = session_with_client(&client);
         let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&array);
-        assert_eq!(handle.to_string(), "session#0:f32[][sharding={mesh<['x'=1:auto]>, []}]");
+        assert_eq!(handle.to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
     }
 
     #[test]
@@ -4498,13 +4427,15 @@ pub(crate) mod tests {
     #[test]
     fn test_session_cuda_kernel_execution_and_persistence() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let definition: KernelDefinition =

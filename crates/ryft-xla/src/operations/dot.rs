@@ -2263,7 +2263,7 @@ mod tests {
                 .push(CoreArray::from_elements(ArrayType::new_static(DataType::F32, shape.to_vec()), &values).unwrap());
             inputs.push(replicated_array(&session, &mesh, DataType::F32, shape, &values_to_bytes(&values)));
         }
-        let function = einsum::<ProjectedContext<Session<'_>, ArrayType>>("ij,jk,kl->il").unwrap();
+        let function = einsum::<ProjectedContext<Session, ArrayType>>("ij,jk,kl->il").unwrap();
         let reference_output = CoreArray::einsum("ij,jk,kl->il", reference_inputs.iter()).unwrap();
         let dispatches = || {
             let statistics = session.eager_dispatch_statistics();
@@ -2307,7 +2307,7 @@ mod tests {
     fn test_einsum_composite_lowering_shares_one_function() {
         // Calls of one einsum function with equal input types lower to calls of one shared function, which holds the
         // decomposition once.
-        let function = einsum::<ProjectedContext<Session<'static>, ArrayType>>("ij,jk,kl->il").unwrap();
+        let function = einsum::<ProjectedContext<Session, ArrayType>>("ij,jk,kl->il").unwrap();
         let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
             move |inputs: Vec<ArrayTracer>| {
                 let first = function.call(inputs.clone()).unwrap();

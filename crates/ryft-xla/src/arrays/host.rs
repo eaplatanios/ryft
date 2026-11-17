@@ -131,7 +131,7 @@ impl DenseArrayHostCopy {
     }
 }
 
-impl<'o> Array<'o> {
+impl Array {
     /// Starts copies for the shards of this array that hold its whole value without awaiting them. Those are all the
     /// shards, or only the addressable ones when some shard lives in another process but the addressable ones cover the
     /// array and it has no unreduced axes (e.g., for a replicated array).
@@ -209,7 +209,7 @@ impl<'o> Array<'o> {
         // leading dimension is sharded, or for a replicated array), each is copied directly into that range of one
         // destination.
         if unreduced_axis_indices.is_empty() {
-            let mut tiles = Vec::<(&ArrayShard<'_>, Range<usize>)>::new();
+            let mut tiles = Vec::<(&ArrayShard, Range<usize>)>::new();
             let mut contiguous = true;
             for shard in &shards {
                 if tiles.iter().any(|(tile, _)| tile.slice() == shard.slice()) {
@@ -277,7 +277,7 @@ impl<'o> Array<'o> {
     /// array whose sharding has unreduced axes, whose devices hold separate summands of its value. Materializing such
     /// an array densely would add those summands, and uploading the sum would replace them with a canonical
     /// decomposition of it, which an unchecked `shard_map` body could tell apart, because it observes the summands.
-    pub(crate) fn relayout_through_host(&self, session: &Session<'o>, layout: &Layout) -> Result<Array<'o>, Error> {
+    pub(crate) fn relayout_through_host(&self, session: &Session, layout: &Layout) -> Result<Array, Error> {
         let r#type = self.r#type().into_owned().with_layout(layout.clone());
         let device_layout = layout.to_pjrt()?;
         let buffer_type = Array::physical_buffer_type(self.data_type());

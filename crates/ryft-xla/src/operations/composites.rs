@@ -329,7 +329,7 @@ mod tests {
     use super::*;
 
     // Value that composite rules see when a composite executes through the projection of the eager session onto arrays.
-    type ArrayTracer<'c> = DomainTracer<ProjectedContext<Session<'c>, ArrayType>>;
+    type ArrayTracer = DomainTracer<ProjectedContext<Session, ArrayType>>;
 
     /// Returns a program that applies `calls` named composite calls of `rules` to the same input, each attaching the
     /// interned `body`, and returns their outputs.
@@ -560,8 +560,8 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[0.5f32, 1.0, 1.5]));
         let tangent = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 1.0, 1.0]));
-        let function = composite(|x: ArrayTracer<'_>| Ok(x.clone() * x)).with_batching(
-            |x: ArrayTracer<'_>, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer<'_>>| {
+        let function = composite(|x: ArrayTracer| Ok(x.clone() * x)).with_batching(
+            |x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| {
                 Ok((x.clone() * x.clone() + x.clone() * x, axis))
             },
         );
@@ -570,11 +570,11 @@ mod tests {
         assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![0.25f32, 1.0, 2.25]);
         assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![1f32, 2.0, 3.0]);
 
-        let batched: Array<'_> =
+        let batched: Array =
             batch(|x| function.call(x), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(values_from_bytes::<f32>(&batched.copy_to_host().unwrap()), vec![0.5f32, 2.0, 4.5]);
 
-        let (value, derivative): (Array<'_>, Array<'_>) = batch(
+        let (value, derivative): (Array, Array) = batch(
             |(x, tangent)| Ok(differentiate_at(x).jvp(tangent, |x| function.call(x))?),
             (input, tangent),
             (BatchAxis::new(0), BatchAxis::new(0)),
@@ -595,24 +595,23 @@ mod tests {
         let client = execution_client();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
-        let function = composite(|(x, y): (ArrayTracer<'_>, ArrayTracer<'_>)| Ok(x * y))
-            .with_broadcast_sensitive_batching(
-                |(x, y): (ArrayTracer<'_>, ArrayTracer<'_>),
-                 (x_axis, y_axis): (BatchAxis, BatchAxis),
-                 _: BatchingLevelExtent<ArrayTracer<'_>>| {
-                    let product = x * y;
-                    let scaled = match x_axis.is_replicated() || y_axis.is_replicated() {
-                        true => product.clone() + product.clone() + product,
-                        false => product.clone() + product,
-                    };
-                    Ok((scaled, if x_axis.is_replicated() { y_axis } else { x_axis }))
-                },
-            );
+        let function = composite(|(x, y): (ArrayTracer, ArrayTracer)| Ok(x * y)).with_broadcast_sensitive_batching(
+            |(x, y): (ArrayTracer, ArrayTracer),
+             (x_axis, y_axis): (BatchAxis, BatchAxis),
+             _: BatchingLevelExtent<ArrayTracer>| {
+                let product = x * y;
+                let scaled = match x_axis.is_replicated() || y_axis.is_replicated() {
+                    true => product.clone() + product.clone() + product,
+                    false => product.clone() + product,
+                };
+                Ok((scaled, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            },
+        );
         let x = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 2.0, 3.0]));
         let y = replicated_array(&session, &mesh, DataType::F32, &[], &values_to_bytes(&[4f32]));
         let x_tangent = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 0.5, 0.25]));
         let y_tangent = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[2f32, 3.0, 4.0]));
-        let (value, derivative): (Array<'_>, Array<'_>) = batch(
+        let (value, derivative): (Array, Array) = batch(
             |((x, y), (x_tangent, y_tangent))| {
                 Ok(differentiate_at((x, y)).jvp((x_tangent, y_tangent), |inputs| function.call(inputs))?)
             },

@@ -291,17 +291,16 @@ impl AdaptiveProfileGuidedStatistics {
 /// trace is complete. Concurrent calls copy the currently active executable handle and execute without holding the
 /// state or dispatch locks. Recompilation happens at most once and is terminal. It either installs one compatible
 /// executable or records a permanent failure while continuing to serve the baseline.
-pub struct AdaptiveProfileGuidedFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct AdaptiveProfileGuidedFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// State shared by all clones of this function.
-    inner: Arc<AdaptiveProfileGuidedFunctionInner<'c, In, Out>>,
+    inner: Arc<AdaptiveProfileGuidedFunctionInner<In, Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone
-    for AdaptiveProfileGuidedFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for AdaptiveProfileGuidedFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -312,7 +311,7 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -326,8 +325,8 @@ where
     /// `session` is neither CUDA nor ROCm, when the client has no profiler extension, or when the persistent key of the
     /// profile cannot be computed.
     pub(crate) fn new(
-        session: Session<'c>,
-        baseline: ExecutableFunction<'c, In, Out>,
+        session: Session,
+        baseline: ExecutableFunction<In, Out>,
         lowered_program: LoweredProgram,
         compilation_options: Options,
         options: AdaptiveProfileGuidedOptions,
@@ -390,12 +389,11 @@ where
     }
 
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
-    pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
+    pub fn interpret(&self, inputs: In::To<Array>) -> Result<Out::To<Array>, Error>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::Family: ParameterizedFamily<Array> + ParameterizedFamily<Value>,
+        Out::Family: ParameterizedFamily<Array> + ParameterizedFamily<Value>,
+        Out::To<Array>: Parameterized<Array, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.inner.statistics.executions.fetch_add(1, Ordering::Relaxed);
         let (dispatch, executable) = {
@@ -427,14 +425,13 @@ where
     /// execution are still returned.
     fn profile_baseline(
         &self,
-        executable: ExecutableFunction<'c, In, Out>,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Out::To<Array<'c>>, Error>
+        executable: ExecutableFunction<In, Out>,
+        inputs: In::To<Array>,
+    ) -> Result<Out::To<Array>, Error>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<Value<'c>>,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::Family: ParameterizedFamily<Array> + ParameterizedFamily<Value>,
+        Out::Family: ParameterizedFamily<Array> + ParameterizedFamily<Value>,
+        Out::To<Array>: Parameterized<Array, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let profiler_options = ProfileOptions {
             version: 1,
@@ -514,7 +511,7 @@ where
 
     /// Compiles the baseline lowering with the aggregated `profile` attached and validates the result as a replacement
     /// of the baseline executable.
-    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableFunction<'c, In, Out>, Error> {
+    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableFunction<In, Out>, Error> {
         let profile = FeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let session = &self.inner.session;
@@ -842,19 +839,19 @@ impl AdaptiveProfileGuidedStateMachine {
 /// executes or compiles. A call claims its dispatch and clones the active executable handle under one hold of the
 /// `state` mutex, and the single caller that owns recompilation or restoration replaces the executable and advances
 /// the state under one hold as well. A call therefore always executes the executable that its dispatch names.
-struct AdaptiveProfileGuidedFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+struct AdaptiveProfileGuidedFunctionInner<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Domain that executes and recompiles the function.
-    session: Session<'c>,
+    session: Session,
 
     /// Unprofiled baseline executable, which also defines the invocation contract of every replacement.
-    baseline: ExecutableFunction<'c, In, Out>,
+    baseline: ExecutableFunction<In, Out>,
 
     /// Executable that calls currently dispatch to, which is the baseline until an optimized executable is installed.
-    active: RwLock<ExecutableFunction<'c, In, Out>>,
+    active: RwLock<ExecutableFunction<In, Out>>,
 
     /// Lowering of the baseline, which recompilation reuses with a feedback-directed profile attached.
     lowered_program: LoweredProgram,
@@ -890,8 +887,8 @@ fn validate_adaptive_profile_guided_platform(platform_name: &str) -> Result<(), 
 /// Returns the key under which the aggregated profile of `lowered_program` is persisted, or `None` when the compilation
 /// context of `session` has no disk cache or no persistent key for the program. The key combines the persistent key of
 /// the baseline program with the sampling and aggregation policy of `options`.
-fn adaptive_profile_sidecar_key<'c>(
-    session: &Session<'c>,
+fn adaptive_profile_sidecar_key(
+    session: &Session,
     lowered_program: &LoweredProgram,
     options: AdaptiveProfileGuidedOptions,
 ) -> Result<Option<Vec<u8>>, Error> {

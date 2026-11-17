@@ -359,10 +359,7 @@ mod tests {
 
     /// Uploads complex operands whose lexicographic order is decided by the real components, by the imaginary
     /// components, by signed zeros that compare equal, and by NaN payloads in either component.
-    fn complex_operands<'c>(
-        session: &Session<'c>,
-        mesh: &DeviceMesh,
-    ) -> ([Complex<f32>; 5], [Complex<f32>; 5], Array<'c>, Array<'c>) {
+    fn complex_operands(session: &Session, mesh: &DeviceMesh) -> ([Complex<f32>; 5], [Complex<f32>; 5], Array, Array) {
         let left = [
             Complex::new(1f32, 100.0),
             Complex::new(1.0, 2.0),
@@ -385,7 +382,7 @@ mod tests {
     /// Uploads `f32` operands whose order is decided by their values, by signed zeros that compare equal in both
     /// operand orders and with equal signs, by a NaN payload in the left operand, in the right operand, and in both,
     /// and by equal infinities.
-    fn real_operands<'c>(session: &Session<'c>, mesh: &DeviceMesh) -> (Array<'c>, Array<'c>) {
+    fn real_operands(session: &Session, mesh: &DeviceMesh) -> (Array, Array) {
         let left = [
             1f32,
             3.0,

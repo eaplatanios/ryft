@@ -164,7 +164,7 @@ mod tests {
 
         // Three staged reshards compose inside one closure. Each emits a `sdy.sharding_constraint` op into
         // the same MLIR program. After staging and compilation, the executable runs all three in one PJRT dispatch.
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             move |x| {
                 let a = x.reshard(&constraint_a).unwrap();
                 let b = a.sin().unwrap().reshard(&constraint_b).unwrap();
@@ -220,12 +220,12 @@ mod tests {
 
         // The switch compiles into one program whose values use meshes that differ only in axis types, and executes
         // eagerly as well, both with the values of the JAX oracle `auto_axes(x)`.
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             {
                 let output_sharding = output_sharding.clone();
-                move |input: CompileTracer<'_>| {
+                move |input: CompileTracer| {
                     auto_axes(
-                        |input: CompileTracer<'_>| {
+                        |input: CompileTracer| {
                             let sine = input.sin()?;
                             sine.add(&sine)?.reduce_sum(&[1], None)
                         },
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(read_device_f32s(&output), expected);
 
         let output = auto_axes(
-            |input: Array<'_>| {
+            |input: Array| {
                 let sine = input.sin()?;
                 sine.add(&sine)?.reduce_sum(&[1], None)
             },
@@ -282,13 +282,13 @@ mod tests {
         // or executed eagerly. Its type is replicated, because types record no placement over auto mesh axes, while
         // the compiler chooses its runtime placement over them.
         let expected = vec![1.540_302_3_f32, -1.406_139_4, -0.369_981_4, 1.714_072_5];
-        let read = |array: &Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let read = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             {
                 let input_sharding = input_sharding.clone();
-                move |input: CompileTracer<'_>| {
+                move |input: CompileTracer| {
                     explicit_axes(
-                        |input: CompileTracer<'_>| input.cos()?.reduce_sum(&[1], None),
+                        |input: CompileTracer| input.cos()?.reduce_sum(&[1], None),
                         input,
                         Some(&["x"]),
                         input_sharding,
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
         assert_eq!(read(&output), expected);
         let output =
-            explicit_axes(|input: Array<'_>| input.cos()?.reduce_sum(&[1], None), input, Some(&["x"]), input_sharding)
+            explicit_axes(|input: Array| input.cos()?.reduce_sum(&[1], None), input, Some(&["x"]), input_sharding)
                 .unwrap();
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
         assert_eq!(read(&output), expected);
@@ -331,7 +331,7 @@ mod tests {
         )
         .unwrap();
         let doubled = shard_map(
-            |input: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| Ok(input.clone() + input),
+            |input: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(input.clone() + input),
             input,
             map_mesh,
             map_sharding.clone(),
@@ -340,8 +340,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doubled.r#type().as_ref(), &input_type);
-        let output =
-            auto_axes(|doubled: Array<'_>| doubled.sin(), doubled, Some(&["y"]), input_sharding.clone()).unwrap();
+        let output = auto_axes(|doubled: Array| doubled.sin(), doubled, Some(&["y"]), input_sharding.clone()).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&input_sharding));
 
         // Each device holds the sines of its `2x1` block of the doubled matrix, whose rows its position along `x` and
@@ -378,8 +377,8 @@ mod tests {
         )
         .unwrap();
         let input_sharding = sharding(&logical_mesh, &[Some("x"), None]);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
-            move |input: CompileTracer<'_>| {
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            move |input: CompileTracer| {
                 let gradient = differentiate_at(input.into_value())
                     .gradient(|input| {
                         let input = ValueProjection::<ArrayType>::into_projected(input)?;

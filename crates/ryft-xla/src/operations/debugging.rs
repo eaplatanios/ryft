@@ -131,12 +131,12 @@ pub fn with_captured_prints<R, F: FnOnce() -> R>(body: F) -> (R, Vec<String>) {
 }
 
 /// Returns the built-in print provider without loading a PJRT plugin.
-pub(crate) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+pub(crate) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(PrintRuntimeProvider)
 }
 
 /// Returns the built-in ordered I/O transport provider without performing native initialization.
-pub(crate) fn ordered_io_runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+pub(crate) fn ordered_io_runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(OrderedIoRuntimeProvider)
 }
 
@@ -171,17 +171,17 @@ impl LowerableOperation for PrintOperation<ArrayType> {
 /// Built-in platform admission and registration for printing.
 struct PrintRuntimeProvider;
 
-impl<'c> RuntimeProvider<'c> for PrintRuntimeProvider {
+impl RuntimeProvider for PrintRuntimeProvider {
     fn identifier(&self) -> &str {
         PRINT_CUSTOM_CALL_TARGET
     }
 
     fn initialize(
         &self,
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
         target: &Target,
         requirement: &RuntimeRequirement,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+    ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         let _ = target;
         validate_builtin_requirement(requirement, self.identifier())?;
         ensure_print_handler_registered(client)?;
@@ -192,22 +192,22 @@ impl<'c> RuntimeProvider<'c> for PrintRuntimeProvider {
 /// Printing needs native handler registration but no invocation-owned user data.
 struct PrintRuntime;
 
-impl<'c> RuntimeExtension<'c> for PrintRuntime {}
+impl RuntimeExtension for PrintRuntime {}
 
 /// Verified native ordered I/O token transport admission, independent of print registration.
 struct OrderedIoRuntimeProvider;
 
-impl<'c> RuntimeProvider<'c> for OrderedIoRuntimeProvider {
+impl RuntimeProvider for OrderedIoRuntimeProvider {
     fn identifier(&self) -> &str {
         "ryft.ordered-io"
     }
 
     fn initialize(
         &self,
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
         target: &Target,
         requirement: &RuntimeRequirement,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+    ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         let _ = client;
         validate_builtin_requirement(requirement, self.identifier())?;
         if !["cpu", "cuda"].iter().any(|platform| target.platform_name().eq_ignore_ascii_case(platform)) {
@@ -222,7 +222,7 @@ impl<'c> RuntimeProvider<'c> for OrderedIoRuntimeProvider {
 /// Ordered I/O admission introduces no per invocation user data of its own.
 struct OrderedIoRuntime;
 
-impl<'c> RuntimeExtension<'c> for OrderedIoRuntime {}
+impl RuntimeExtension for OrderedIoRuntime {}
 
 /// Memory location of the value buffer passed to one print callback.
 #[derive(Copy, Clone)]
@@ -563,6 +563,8 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
+    #[cfg(feature = "cuda-13")]
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{array_domain, domain_mesh, f64_vector, read_f64s, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
@@ -573,7 +575,7 @@ mod tests {
 
     /// Eagerly binds one `print` on `client` and verifies that the handler fires once with the device value and that
     /// the payload passes through unchanged.
-    fn assert_eager_bind_executes_print_effect(client: &Client<'_>) {
+    fn assert_eager_bind_executes_print_effect(client: &'static Client<'static>) {
         let mesh = domain_mesh(client, "x", 1);
         let domain = array_domain(client);
         ensure_print_handler_registered(client).unwrap();
@@ -857,7 +859,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             |x| {
                 let x = x.print("x").unwrap();
                 (x.clone() + x).print("doubled").unwrap()
@@ -902,13 +904,15 @@ mod tests {
     #[test]
     fn test_print_operation_lower_executes_eagerly_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
+        let client = process_client(
+            &plugin,
+            ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
         assert_eager_bind_executes_print_effect(&client);
     }
 

@@ -59,13 +59,11 @@
 //! Some bodies are traced over constants alone (i.e., in a `TracingContext<Constant, Operation>`), such as the bodies
 //! of [`rematerialize`](ryft_core::rematerialize) and [`composite`](ryft_core::composite), the custom rules of
 //! composites, and the regions nested in them. Their capture tables cannot hold runtime arrays, so calls in them
-//! import captures through [`ThroughSession`](crate::ThroughSession) instead. The [`Session`] of each such array
-//! retains it for as long as a handle to it exists, and the body stages a [`SessionConstant`](crate::SessionConstant)
-//! handle to it, which has no lifetime and keeps the callee closed. An
-//! eager parent resolves the handle when it lifts it, and lowering passes every distinct handle of a program as a
-//! hidden argument of the entry function after its captures, so the executable depends only on the types of these
-//! arrays. Composite bodies and rules must be `'static`, so they can only call compiled functions of a `'static`
-//! client (i.e., `CompiledFunction<'static, ..>`).
+//! import captures through [`ThroughSession`](crate::ThroughSession) instead. The body stages a
+//! [`SessionConstant`](crate::SessionConstant) handle to each such array, which retains the array for as long as the
+//! handle exists and keeps the callee closed. An eager parent resolves the handle when it lifts it, and lowering passes
+//! every distinct handle of a program as a hidden argument of the entry function after its captures, so the executable
+//! depends only on the types of these arrays.
 //!
 //! A dispatcher retains only executables for its runtime specializations, so [`CompiledFunctionDispatcher::call`]
 //! traces its closure again on demand into a staged specialization, which it retains in a separate cache (refer to
@@ -213,17 +211,17 @@ use crate::{Array, Constant, Error, ExecutionError, Operation, Session, Value};
 /// # Stability
 ///
 /// This alias is experimental while the external reference ABI is evolving.
-pub type StatefulCompileTracer<'c> = CoreTracer<DomainTracingContext<Session<'c>, Value<'c>>>;
+pub type StatefulCompileTracer = CoreTracer<DomainTracingContext<Session, Value>>;
 
 /// Tracer leaf exposed by the public XLA compilation facade over arrays.
-pub type CompileTracer<'c> = ProjectedValue<ArrayType, StatefulCompileTracer<'c>>;
+pub type CompileTracer = ProjectedValue<ArrayType, StatefulCompileTracer>;
 
 /// Heterogeneous XLA runtime value used by the stateful compilation facade.
 ///
 /// # Stability
 ///
 /// This alias is experimental while the external reference ABI is evolving.
-pub type StatefulValue<'c> = Value<'c>;
+pub type StatefulValue = Value;
 
 /// Retained XLA JIT dispatcher over arrays with explicit static parameters on the host.
 ///
@@ -241,7 +239,6 @@ pub type StatefulValue<'c> = Value<'c>;
 /// and calls bring their inputs to the input sharding overrides first, so that calls and executions agree on the
 /// placement of values at the boundary (refer to the [module documentation](crate::compilation::functions)).
 pub struct CompiledFunctionDispatcher<
-    'c,
     F,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
@@ -252,10 +249,10 @@ pub struct CompiledFunctionDispatcher<
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Array IR domain dispatcher hidden behind the public array projection boundary.
-    function: CoreCompiledFunctionDispatcher<Session<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
+    function: CoreCompiledFunctionDispatcher<Session, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
 }
 
-impl<'c, F, Static, In, Out> Clone for CompiledFunctionDispatcher<'c, F, Static, In, Out>
+impl<F, Static, In, Out> Clone for CompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
@@ -263,7 +260,7 @@ where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    CoreCompiledFunctionDispatcher<Session<'c>, Static, ProgramParameters<In>, ProgramParameters<Out>, F>: Clone,
+    CoreCompiledFunctionDispatcher<Session, Static, ProgramParameters<In>, ProgramParameters<Out>, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -271,43 +268,43 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> CompiledFunctionDispatcher<'c, F, Static, In, Out>
+impl<F, Static, In, Out> CompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<Array<'c>>
-        + ParameterizedFamily<StatefulValue<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Array>
+        + ParameterizedFamily<StatefulValue>
+        + ParameterizedFamily<StatefulCompileTracer>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<Array<'c>>
-        + ParameterizedFamily<StatefulValue<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<Array>
+        + ParameterizedFamily<StatefulValue>
+        + ParameterizedFamily<StatefulCompileTracer>,
 {
     /// Executes a specialization with public array inputs, compiling it on a miss and reusing it on warm invocations.
     /// The array IR runtime outputs are projected back to the array representation of the output container family.
-    pub fn execute(&self, static_parameters: Static, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
+    pub fn execute(&self, static_parameters: Static, inputs: In::To<Array>) -> Result<Out::To<Array>, Error>
     where
         F: Fn(
             Static,
-            ProgramParameterValues<In, StatefulCompileTracer<'c>>,
-        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+            ProgramParameterValues<In, StatefulCompileTracer>,
+        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
         ProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = ProgramParameters<In>>,
         ProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = ProgramParameters<Out>>,
-        ProgramParameterValues<In, StatefulValue<'c>>:
-            Parameterized<StatefulValue<'c>, To<ArrayIrType> = ProgramParameters<In>>,
-        ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-                StatefulCompileTracer<'c>,
+        ProgramParameterValues<In, StatefulValue>:
+            Parameterized<StatefulValue, To<ArrayIrType> = ProgramParameters<In>>,
+        ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+                StatefulCompileTracer,
                 To<ArrayIrType> = ProgramParameters<Out>,
                 To<Constant> = ProgramConstants<Out>,
             >,
     {
-        let inputs = lift_values::<In, StatefulValue<'c>>(inputs)?;
-        Ok(project_values::<Out, StatefulValue<'c>>(self.function.execute(static_parameters, inputs)?)?)
+        let inputs = lift_values::<In, StatefulValue>(inputs)?;
+        Ok(project_values::<Out, StatefulValue>(self.function.execute(static_parameters, inputs)?)?)
     }
 
     /// Calls the staged specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` as
@@ -328,12 +325,12 @@ where
     where
         F: Fn(
             Static,
-            ProgramParameterValues<In, StatefulCompileTracer<'c>>,
-        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+            ProgramParameterValues<In, StatefulCompileTracer>,
+        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
-            + ImportingContext<Session<'c>, Path>
+            + ImportingContext<Session, Path>
             + NamedAxes
             + MeshContext,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
@@ -366,10 +363,10 @@ where
     where
         F: Fn(
             Static,
-            ProgramParameterValues<In, StatefulCompileTracer<'c>>,
-        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+            ProgramParameterValues<In, StatefulCompileTracer>,
+        ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
-            + ImportingContext<Session<'c>, Path>
+            + ImportingContext<Session, Path>
             + NamedAxes
             + MeshContext,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
@@ -399,7 +396,7 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> CompiledFunctionDispatcher<'c, F, Static, In, Out>
+impl<F, Static, In, Out> CompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
@@ -421,40 +418,39 @@ where
 ///
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
-pub fn jit_with_options<'c, F, Static, In, Out>(
+pub fn jit_with_options<F, Static, In, Out>(
     function: F,
-    session: &Session<'c>,
+    session: &Session,
     options: Options,
 ) -> CompiledFunctionDispatcher<
-    'c,
     impl Fn(
         Static,
-        ProgramParameterValues<In, StatefulCompileTracer<'c>>,
-    ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+        ProgramParameterValues<In, StatefulCompileTracer>,
+    ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<CompileTracer<'c>>) -> Result<Out::To<CompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<CompileTracer>) -> Result<Out::To<CompileTracer>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>
-        + ParameterizedFamily<CompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>
+        + ParameterizedFamily<CompileTracer>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>
-        + ParameterizedFamily<CompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>
+        + ParameterizedFamily<CompileTracer>,
 {
     // Executable and staged specializations both trace this closure, so both stage the output sharding overrides.
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
     let function = move |static_parameters, inputs| {
-        let outputs = function(static_parameters, project_values::<In, StatefulCompileTracer<'c>>(inputs)?)?;
-        place_outputs(lift_values::<Out, StatefulCompileTracer<'c>>(outputs)?, output_shardings.as_deref())
+        let outputs = function(static_parameters, project_values::<In, StatefulCompileTracer>(inputs)?)?;
+        place_outputs(lift_values::<Out, StatefulCompileTracer>(outputs)?, output_shardings.as_deref())
     };
     CompiledFunctionDispatcher { function: session.jit_with_options(function, options) }
 }
@@ -465,34 +461,33 @@ where
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
 #[inline]
-pub fn jit<'c, F, Static, In, Out>(
+pub fn jit<F, Static, In, Out>(
     function: F,
-    session: &Session<'c>,
+    session: &Session,
     mesh: DeviceMesh,
 ) -> CompiledFunctionDispatcher<
-    'c,
     impl Fn(
         Static,
-        ProgramParameterValues<In, StatefulCompileTracer<'c>>,
-    ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer<'c>>, Error>,
+        ProgramParameterValues<In, StatefulCompileTracer>,
+    ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<CompileTracer<'c>>) -> Result<Out::To<CompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<CompileTracer>) -> Result<Out::To<CompileTracer>, Error>,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>
-        + ParameterizedFamily<CompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>
+        + ParameterizedFamily<CompileTracer>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>
-        + ParameterizedFamily<CompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>
+        + ParameterizedFamily<CompileTracer>,
 {
     jit_with_options(function, session, Options::new(mesh))
 }
@@ -512,7 +507,6 @@ where
 /// This external state surface is experimental. Ordinary [`CompiledFunctionDispatcher`] calls remain the stable
 /// boundary over arrays.
 pub struct StatefulCompiledFunctionDispatcher<
-    'c,
     F,
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
@@ -523,10 +517,10 @@ pub struct StatefulCompiledFunctionDispatcher<
     Out::Family: ParameterizedFamily<Constant>,
 {
     /// Backend-neutral dispatcher retaining heterogeneous runtime values and compiled specializations.
-    function: CoreCompiledFunctionDispatcher<Session<'c>, Static, In, Out, F>,
+    function: CoreCompiledFunctionDispatcher<Session, Static, In, Out, F>,
 }
 
-impl<'c, F, Static, In, Out> Clone for StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
+impl<F, Static, In, Out> Clone for StatefulCompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
@@ -534,7 +528,7 @@ where
     In::Family: ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayIrType>,
     Out::Family: ParameterizedFamily<Constant>,
-    CoreCompiledFunctionDispatcher<Session<'c>, Static, In, Out, F>: Clone,
+    CoreCompiledFunctionDispatcher<Session, Static, In, Out, F>: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -542,28 +536,26 @@ where
     }
 }
 
-impl<'c, F, Static, In, Out> StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
+impl<F, Static, In, Out> StatefulCompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulValue<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    In::To<StatefulValue<'c>>: Parameterized<
-            StatefulValue<'c>,
+    In::Family:
+        ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue> + ParameterizedFamily<StatefulCompileTracer>,
+    In::To<StatefulValue>: Parameterized<
+            StatefulValue,
             Family = In::Family,
             ParameterStructure = In::ParameterStructure,
             To<ArrayIrType> = In,
         >,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulValue<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<StatefulValue<'c>>:
-        Parameterized<StatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
-    Out::To<StatefulCompileTracer<'c>>:
-        Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
+    Out::Family:
+        ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue> + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<StatefulValue>:
+        Parameterized<StatefulValue, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    Out::To<StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
     /// Executes one specialization statefully, compiling it on the first call and reusing it on warm calls.
     ///
@@ -575,10 +567,10 @@ where
     pub fn execute_statefully_and_wait(
         &self,
         static_parameters: Static,
-        inputs: In::To<StatefulValue<'c>>,
-    ) -> Result<Out::To<StatefulValue<'c>>, Error>
+        inputs: In::To<StatefulValue>,
+    ) -> Result<Out::To<StatefulValue>, Error>
     where
-        F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+        F: Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     {
         self.function.execute_statefully_and_wait(static_parameters, inputs)
     }
@@ -593,16 +585,16 @@ where
     pub fn execute_statefully(
         &self,
         static_parameters: Static,
-        inputs: In::To<StatefulValue<'c>>,
-    ) -> StatefulExecution<Out::To<StatefulValue<'c>>, Error>
+        inputs: In::To<StatefulValue>,
+    ) -> StatefulExecution<Out::To<StatefulValue>, Error>
     where
-        F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+        F: Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     {
         self.function.execute_statefully(static_parameters, inputs)
     }
 }
 
-impl<'c, F, Static, In, Out> StatefulCompiledFunctionDispatcher<'c, F, Static, In, Out>
+impl<F, Static, In, Out> StatefulCompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayIrType>,
@@ -626,29 +618,22 @@ where
 /// # Stability
 ///
 /// This external state entry point is experimental.
-pub fn jit_statefully_with_options<'c, F, Static, In, Out>(
+pub fn jit_statefully_with_options<F, Static, In, Out>(
     function: F,
-    session: &Session<'c>,
+    session: &Session,
     options: Options,
 ) -> StatefulCompiledFunctionDispatcher<
-    'c,
-    impl Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+    impl Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<
-            ArrayIrType,
-            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
-        >,
+    In: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
     In::ParameterStructure: Eq + Hash,
-    Out: Parameterized<
-            ArrayIrType,
-            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
-        >,
+    Out: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
 {
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
     let function = move |static_parameters, inputs| {
@@ -667,29 +652,22 @@ where
 ///
 /// This external state entry point is experimental.
 #[inline]
-pub fn jit_statefully<'c, F, Static, In, Out>(
+pub fn jit_statefully<F, Static, In, Out>(
     function: F,
-    session: &Session<'c>,
+    session: &Session,
     mesh: DeviceMesh,
 ) -> StatefulCompiledFunctionDispatcher<
-    'c,
-    impl Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+    impl Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     Static,
     In,
     Out,
 >
 where
-    F: Fn(Static, In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+    F: Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<
-            ArrayIrType,
-            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
-        >,
+    In: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
     In::ParameterStructure: Eq + Hash,
-    Out: Parameterized<
-            ArrayIrType,
-            Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
-        >,
+    Out: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
 {
     jit_statefully_with_options(function, session, Options::new(mesh))
 }
@@ -706,28 +684,28 @@ where
 ///
 /// This external state surface is experimental. Ordinary [`CompiledFunction`] calls remain the stable boundary over
 /// arrays.
-pub struct StatefulCompiledFunction<'c, In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
+pub struct StatefulCompiledFunction<In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
 where
     In::Family: ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<Constant>,
 {
     /// Backend-neutral compiled function retaining the array IR runtime boundary.
-    function: CoreCompiledFunction<Session<'c>, In, Out>,
+    function: CoreCompiledFunction<Session, In, Out>,
 }
 
-impl<'c, In, Out> StatefulCompiledFunction<'c, In, Out>
+impl<In, Out> StatefulCompiledFunction<In, Out>
 where
     In: Parameterized<ArrayIrType>,
     Out: Parameterized<ArrayIrType>,
-    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue<'c>>,
-    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue<'c>>,
-    In::To<StatefulValue<'c>>: Parameterized<StatefulValue<'c>>,
-    Out::To<StatefulValue<'c>>:
-        Parameterized<StatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue>,
+    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue>,
+    In::To<StatefulValue>: Parameterized<StatefulValue>,
+    Out::To<StatefulValue>:
+        Parameterized<StatefulValue, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
 {
     /// Returns the executable handle, which retains only the runtime state of this function.
     #[inline]
-    pub fn executable(&self) -> &CoreExecutableFunction<Session<'c>, In, Out> {
+    pub fn executable(&self) -> &CoreExecutableFunction<Session, In, Out> {
         self.function.executable()
     }
 
@@ -745,9 +723,9 @@ where
     /// [`StatefulCompiledFunctionDispatcher::execute_statefully_and_wait`] for the complete transaction contract.
     pub fn execute_statefully_and_wait(
         &self,
-        session: &Session<'c>,
-        inputs: In::To<StatefulValue<'c>>,
-    ) -> Result<Out::To<StatefulValue<'c>>, Error> {
+        session: &Session,
+        inputs: In::To<StatefulValue>,
+    ) -> Result<Out::To<StatefulValue>, Error> {
         self.function.executable().execute_statefully_and_wait(session, inputs)
     }
 
@@ -757,9 +735,9 @@ where
     /// governs completion and the observation of errors.
     pub fn execute_statefully(
         &self,
-        session: &Session<'c>,
-        inputs: In::To<StatefulValue<'c>>,
-    ) -> StatefulExecution<Out::To<StatefulValue<'c>>, Error> {
+        session: &Session,
+        inputs: In::To<StatefulValue>,
+    ) -> StatefulExecution<Out::To<StatefulValue>, Error> {
         self.function.executable().execute_statefully(session, inputs)
     }
 }
@@ -769,21 +747,21 @@ where
 /// # Stability
 ///
 /// This external state entry point is experimental.
-pub fn compile_statefully<'c, F, In, Out>(
+pub fn compile_statefully<F, In, Out>(
     function: F,
     input_types: In,
-    session: &Session<'c>,
+    session: &Session,
     options: Options,
-) -> Result<StatefulCompiledFunction<'c, In, Out>, Error>
+) -> Result<StatefulCompiledFunction<In, Out>, Error>
 where
-    F: FnOnce(In::To<StatefulCompileTracer<'c>>) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+    F: FnOnce(In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     In: Parameterized<ArrayIrType>,
-    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<StatefulCompileTracer<'c>>:
-        Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
+    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
     compile_statefully_with_captures(move |_, inputs| function(inputs), Vec::new(), input_types, session, options)
 }
@@ -794,29 +772,29 @@ where
 ///
 /// This external state entry point is experimental. A captured reference participates in the same reference
 /// transaction as a public reference input and cannot alias any other capture or public argument in the invocation.
-pub fn compile_statefully_with_captures<'c, F, In, Out>(
+pub fn compile_statefully_with_captures<F, In, Out>(
     function: F,
-    captures: Vec<StatefulValue<'c>>,
+    captures: Vec<StatefulValue>,
     input_types: In,
-    session: &Session<'c>,
+    session: &Session,
     options: Options,
-) -> Result<StatefulCompiledFunction<'c, In, Out>, Error>
+) -> Result<StatefulCompiledFunction<In, Out>, Error>
 where
     F: FnOnce(
-        Vec<StatefulCompileTracer<'c>>,
-        In::To<StatefulCompileTracer<'c>>,
-    ) -> Result<Out::To<StatefulCompileTracer<'c>>, Error>,
+        Vec<StatefulCompileTracer>,
+        In::To<StatefulCompileTracer>,
+    ) -> Result<Out::To<StatefulCompileTracer>, Error>,
     In: Parameterized<ArrayIrType>,
-    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
+    In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out: Parameterized<ArrayIrType>,
-    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<StatefulCompileTracer<'c>>:
-        Parameterized<StatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
+    Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
 {
     let input_types = with_input_shardings(input_types, &options)?;
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
-    let staged = CoreStagedFunction::<Session<'_>, In, Out>::stage(
+    let staged = CoreStagedFunction::<Session, In, Out>::stage(
         |_, capture_tracers, inputs| place_outputs(function(capture_tracers, inputs)?, output_shardings.as_deref()),
         captures,
         input_types,
@@ -836,16 +814,16 @@ where
 /// [`CompiledFunction`] when an executable is needed. Executable cache identity is derived from the complete lowered
 /// computation and the backend state that affects compilation, so equivalent lowerings can share an executable even
 /// when they were produced at different Rust call sites.
-pub struct StagedFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct StagedFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral staged function carrying the source program, captures, structures, and retained options.
-    function: CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -855,7 +833,7 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -865,9 +843,7 @@ where
     /// diagnostics such as printed IR, instruction counts, and graph rendering. Transforms of values instead call this
     /// function through [`Self::call`].
     #[inline]
-    pub fn source_program(
-        &self,
-    ) -> &ClosedProgram<StatefulValue<'c>, Constant, Operation, Vec<Constant>, Vec<Constant>> {
+    pub fn source_program(&self) -> &ClosedProgram<StatefulValue, Constant, Operation, Vec<Constant>, Vec<Constant>> {
         self.function.source_program()
     }
 
@@ -897,7 +873,7 @@ where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
-            + ImportingContext<Session<'c>, Path>,
+            + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
         In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
         Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
@@ -922,8 +898,7 @@ where
         inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
     ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
-            + ImportingContext<Session<'c>, Path>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -935,19 +910,19 @@ where
 
     /// Consumes this facade and returns its array IR staged artifact for verification within the crate.
     #[cfg(test)]
-    pub(crate) fn into_inner(self) -> CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>> {
+    pub(crate) fn into_inner(self) -> CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>> {
         self.function
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
-    From<CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>> for StagedFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+    From<CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>> for StagedFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     #[inline]
-    fn from(function: CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>) -> Self {
+    fn from(function: CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>) -> Self {
         Self { function }
     }
 }
@@ -958,17 +933,17 @@ where
 /// transforms use. It can only execute and inspect its runtime signature, so it cannot be called inside traces or
 /// transforms, which require [`CompiledFunction::call`] and the source program that it carries. Its thread safety is
 /// derived from its backend state, and no unsafe blanket implementation is used.
-pub struct ExecutableFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct ExecutableFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral executable function retaining the compiled program, the captured runtime values, and the
     /// runtime signature.
-    function: CoreExecutableFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: CoreExecutableFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -979,7 +954,7 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1005,27 +980,26 @@ where
     /// Returns an error if the executable belongs to another client, input validation or output reconstruction fails,
     /// or execution reports a failure. Deferred device failures can also surface when an output is awaited.
     #[inline]
-    pub fn execute(&self, session: &Session<'c>, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, Error>
+    pub fn execute(&self, session: &Session, inputs: In::To<Array>) -> Result<Out::To<Array>, Error>
     where
         In: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<Constant>
-                            + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<StatefulValue<'c>>,
+                            + ParameterizedFamily<Array>
+                            + ParameterizedFamily<StatefulValue>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<Constant>
-                            + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<StatefulValue<'c>>,
+                            + ParameterizedFamily<Array>
+                            + ParameterizedFamily<StatefulValue>,
             >,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        Out::To<Array>: Parameterized<Array, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
-        let inputs = lift_values::<In, StatefulValue<'c>>(inputs)?;
-        Ok(project_values::<Out, StatefulValue<'c>>(self.function.execute(session, inputs)?)?)
+        let inputs = lift_values::<In, StatefulValue>(inputs)?;
+        Ok(project_values::<Out, StatefulValue>(self.function.execute(session, inputs)?)?)
     }
 
     /// Submits this function through `session` and returns its structured outputs together with the completion of the
@@ -1040,33 +1014,28 @@ where
     ///
     /// Returns an error if the executable requires stateful invocation, belongs to another client, or fails input
     /// validation, submission, or output reconstruction.
-    pub fn execute_async(
-        &self,
-        session: &Session<'c>,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Execution<Out::To<Array<'c>>>, Error>
+    pub fn execute_async(&self, session: &Session, inputs: In::To<Array>) -> Result<Execution<Out::To<Array>>, Error>
     where
         In: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<Constant>
-                            + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<StatefulValue<'c>>,
+                            + ParameterizedFamily<Array>
+                            + ParameterizedFamily<StatefulValue>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<Constant>
-                            + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<StatefulValue<'c>>,
+                            + ParameterizedFamily<Array>
+                            + ParameterizedFamily<StatefulValue>,
             >,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        Out::To<Array>: Parameterized<Array, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         if self.function.compiled_program().requires_stateful_call() {
             return Err(ExecutionError::StatefulInvocationRequired.into());
         }
-        let flat_inputs = lift_values::<In, StatefulValue<'c>>(inputs)?.into_parameters().collect::<Vec<_>>();
+        let flat_inputs = lift_values::<In, StatefulValue>(inputs)?.into_parameters().collect::<Vec<_>>();
         self.function.validate_input_count(flat_inputs.len())?;
         for (expected, actual) in self.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
             validate_input_type(
@@ -1085,21 +1054,21 @@ where
         let execution = session.execute_compiled_async(self.function.compiled_program(), inputs)?;
         let (flat_outputs, fence) = execution.into_parts();
         validate_runtime_outputs(self.function.compiled_program().output_types(), flat_outputs.as_slice())?;
-        let outputs = ProgramParameterValues::<Out, Value<'c>>::from_parameters(
+        let outputs = ProgramParameterValues::<Out, Value>::from_parameters(
             self.function.output_structure().clone(),
             flat_outputs.into_iter().map(Value::Array),
         )
         .map_err(ProgramError::from)?;
-        Ok(Execution::new(project_values::<Out, StatefulValue<'c>>(outputs)?, fence))
+        Ok(Execution::new(project_values::<Out, StatefulValue>(outputs)?, fence))
     }
 }
 
-impl<'c> Session<'c> {
+impl Session {
     /// Lowers and compiles a staged XLA function using the options that it retained when it was staged.
     pub fn compile_staged_function<In, Out>(
         &self,
-        staged: StagedFunction<'c, In, Out>,
-    ) -> Result<CompiledFunction<'c, In, Out>, Error>
+        staged: StagedFunction<In, Out>,
+    ) -> Result<CompiledFunction<In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
         In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1113,9 +1082,9 @@ impl<'c> Session<'c> {
     /// Replaces an executable program while preserving and validating its runtime signature.
     pub(crate) fn replace_executable_program<In, Out>(
         &self,
-        executable: &ExecutableFunction<'c, In, Out>,
-        program: Arc<CompiledProgram<'c>>,
-    ) -> Result<ExecutableFunction<'c, In, Out>, Error>
+        executable: &ExecutableFunction<In, Out>,
+        program: Arc<CompiledProgram>,
+    ) -> Result<ExecutableFunction<In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
         In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1133,9 +1102,9 @@ impl<'c> Session<'c> {
     /// and then atomically directs subsequent calls to the compatible optimized executable.
     pub fn adaptive_profile_guided_recompilation<In, Out>(
         &self,
-        function: &CompiledFunction<'c, In, Out>,
+        function: &CompiledFunction<In, Out>,
         options: AdaptiveProfileGuidedOptions,
-    ) -> Result<AdaptiveProfileGuidedFunction<'c, In, Out>, Error>
+    ) -> Result<AdaptiveProfileGuidedFunction<In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
         In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1166,21 +1135,21 @@ impl<'c> Session<'c> {
 /// transforms and compilations. [`Self::batch`], [`Self::gradient`], and [`Self::jvp`] compile transformed functions
 /// around such a call, and [`Self::source_program`] exposes the source for program transforms and diagnostics (e.g.,
 /// printed IR, instruction counts, and graph rendering).
-pub struct CompiledFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct CompiledFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
-    function: CoreCompiledFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+    function: CoreCompiledFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>,
 
     /// Derived transformed functions retained by [`Self::gradient`] and [`Self::jvp`]. Shared across clones so a
     /// wrapper's clones reuse one retained derivative per transform.
-    derived: Arc<DerivedFunctions<'c, In, Out>>,
+    derived: Arc<DerivedFunctions<In, Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1190,7 +1159,7 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
@@ -1203,13 +1172,13 @@ where
 
     /// Returns a handle that retains only runtime state and omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable(&self) -> ExecutableFunction<'c, In, Out> {
+    pub fn executable(&self) -> ExecutableFunction<In, Out> {
         ExecutableFunction { function: self.function.executable().clone() }
     }
 
     /// Returns the staged function this executable was compiled from.
     #[inline]
-    pub fn staged(&self) -> StagedFunction<'c, In, Out> {
+    pub fn staged(&self) -> StagedFunction<In, Out> {
         self.function.staged().clone().into()
     }
 
@@ -1218,9 +1187,7 @@ where
     /// as printed IR, instruction counts, and graph rendering. Transforms of values instead call this function through
     /// [`Self::call`].
     #[inline]
-    pub fn source_program(
-        &self,
-    ) -> &ClosedProgram<StatefulValue<'c>, Constant, Operation, Vec<Constant>, Vec<Constant>> {
+    pub fn source_program(&self) -> &ClosedProgram<StatefulValue, Constant, Operation, Vec<Constant>, Vec<Constant>> {
         self.function.source_program()
     }
 
@@ -1243,7 +1210,7 @@ where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
         C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
-            + ImportingContext<Session<'c>, Path>,
+            + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
         In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
         Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
@@ -1265,8 +1232,7 @@ where
         inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
     ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
-            + ImportingContext<Session<'c>, Path>,
+        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -1278,7 +1244,7 @@ where
 
     /// Consumes this transformable handle and returns its executable, which retains only runtime state.
     #[inline]
-    pub fn into_executable(self) -> ExecutableFunction<'c, In, Out> {
+    pub fn into_executable(self) -> ExecutableFunction<In, Out> {
         ExecutableFunction { function: self.function.into_executable() }
     }
 
@@ -1313,12 +1279,12 @@ where
 // Reverse mode differentiation packaged as a function. Mirrors `jax.grad(jax.jit(f))`. The original closure is never
 // traced again. The derived trace calls the retained staged function through `call_flat_in_context`, which binds a
 // `jit_call` boundary that reverse mode differentiation rewrites through its ordinary JVP and transpose rules.
-impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledFunction<'c, In, ArrayType>
+impl<In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledFunction<In, ArrayType>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Debug + Hash + PartialEq,
 {
     /// Returns a new compiled function that computes the reverse mode gradient of `self` with respect to its inputs.
@@ -1344,18 +1310,18 @@ where
     /// last one wins, while the shared [`CompilationCache`](ryft_core::compilation::CompilationCache) still
     /// deduplicates their backend compilation.
     #[track_caller]
-    pub fn gradient(&self, session: &Session<'c>) -> Result<CompiledFunction<'c, In, In>, Error>
+    pub fn gradient(&self, session: &Session) -> Result<CompiledFunction<In, In>, Error>
     where
-        In::Family: ParameterizedFamily<CompileTracer<'c>, To = In::To<CompileTracer<'c>>>,
-        In::To<CompileTracer<'c>>: Parameterized<
-                CompileTracer<'c>,
+        In::Family: ParameterizedFamily<CompileTracer, To = In::To<CompileTracer>>,
+        In::To<CompileTracer>: Parameterized<
+                CompileTracer,
                 Family = In::Family,
                 ParameterStructure = In::ParameterStructure,
                 To<ArrayType> = In,
                 To<Constant> = In::To<Constant>,
             >,
-        ProgramParameterValues<In, StatefulCompileTracer<'c>>: Parameterized<
-                StatefulCompileTracer<'c>,
+        ProgramParameterValues<In, StatefulCompileTracer>: Parameterized<
+                StatefulCompileTracer,
                 To<ArrayIrType> = ProgramParameters<In>,
                 To<Constant> = ProgramConstants<In>,
             >,
@@ -1407,7 +1373,7 @@ where
                     .into_iter()
                     .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
                     .collect::<Result<Vec<_>, _>>()?;
-                In::To::<CompileTracer<'c>>::from_parameters(input_structure, gradients)
+                In::To::<CompileTracer>::from_parameters(input_structure, gradients)
                     .map_err(ProgramError::from)
                     .map_err(Into::into)
             },
@@ -1425,18 +1391,17 @@ where
 // Forward mode differentiation packaged as a function. Mirrors `jax.jvp(jax.jit(f))`. The derived trace calls the
 // retained staged function through `call_flat_in_context`, which binds a `jit_call` boundary that forward mode
 // differentiation rewrites through its ordinary JVP rule.
-impl<'c, In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>>
-    CompiledFunction<'c, In, Out>
+impl<In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Debug + Hash + PartialEq,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<StatefulCompileTracer>,
 {
     /// Returns a new compiled function that computes the forward mode Jacobian-Vector Product (JVP) of `self`. Mirrors
     /// `jax.jvp(f, primals, tangents)` packaged into one compiled function. The returned function takes
@@ -1456,21 +1421,21 @@ where
     /// are interchangeable, the inserts are idempotent and the last one wins, while the shared
     /// [`CompilationCache`](ryft_core::compilation::CompilationCache) still deduplicates their backend compilation.
     #[track_caller]
-    pub fn jvp(&self, session: &Session<'c>) -> Result<CompiledFunction<'c, (In, In), (Out, Out)>, Error>
+    pub fn jvp(&self, session: &Session) -> Result<CompiledFunction<(In, In), (Out, Out)>, Error>
     where
-        In::Family: ParameterizedFamily<CompileTracer<'c>, To = In::To<CompileTracer<'c>>>,
-        In::To<CompileTracer<'c>>:
-            Parameterized<CompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
-        Out::Family: ParameterizedFamily<CompileTracer<'c>, To = Out::To<CompileTracer<'c>>>,
-        Out::To<CompileTracer<'c>>: Parameterized<
-                CompileTracer<'c>,
+        In::Family: ParameterizedFamily<CompileTracer, To = In::To<CompileTracer>>,
+        In::To<CompileTracer>:
+            Parameterized<CompileTracer, Family = In::Family, ParameterStructure = In::ParameterStructure>,
+        Out::Family: ParameterizedFamily<CompileTracer, To = Out::To<CompileTracer>>,
+        Out::To<CompileTracer>: Parameterized<
+                CompileTracer,
                 Family = Out::Family,
                 ParameterStructure = Out::ParameterStructure,
                 To<ArrayType> = Out,
                 To<Constant> = Out::To<Constant>,
             >,
-        ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-                StatefulCompileTracer<'c>,
+        ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+                StatefulCompileTracer,
                 To<ArrayIrType> = ProgramParameters<Out>,
                 To<Constant> = ProgramConstants<Out>,
             >,
@@ -1542,26 +1507,26 @@ where
 // Batching packaged as a function. Mirrors `jax.jit(jax.vmap(f))` for a static batch extent. The derived trace calls
 // the retained staged function through `call_in_context` under `batch`, which rewrites the resulting `jit_call`
 // boundary through its ordinary batching rule.
-impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<'c, In, Out>
+impl<In: Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<BatchAxis>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>
-        + ParameterizedFamily<CompileBatchTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>
+        + ParameterizedFamily<CompileBatchTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<BatchAxis>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>
-        + ParameterizedFamily<CompileBatchTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>
+        + ParameterizedFamily<CompileBatchTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -1590,11 +1555,11 @@ where
     #[track_caller]
     pub fn batch<InputBatchAxes: Parameterized<BatchAxis>, OutputBatchAxes: Parameterized<BatchAxis>>(
         &self,
-        session: &Session<'c>,
+        session: &Session,
         input_batch_axes: InputBatchAxes,
         output_batch_axes: OutputBatchAxes,
         batch_axis: BatchAxisSpecification<usize>,
-    ) -> Result<CompiledFunction<'c, In, Out>, Error> {
+    ) -> Result<CompiledFunction<In, Out>, Error> {
         let extent = *batch_axis.extent().ok_or_else(|| ProgramError::InvalidArgument {
             message: "compiled function batching requires an explicit static batch extent".to_string(),
         })?;
@@ -1651,18 +1616,18 @@ where
                 };
                 let outputs = context
                     .batch(
-                        |inputs: Vec<CompileBatchTracer<'c>>| {
+                        |inputs: Vec<CompileBatchTracer>| {
                             let context = inputs
                                 .first()
                                 .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
                                 .context()
                                 .clone();
-                            let inputs = ProgramParameterValues::<In, CompileBatchTracer<'c>>::from_parameters(
+                            let inputs = ProgramParameterValues::<In, CompileBatchTracer>::from_parameters(
                                 input_structure,
                                 inputs,
                             )?;
-                            let outputs = staged.call_in_context::<CompileBatchTracer<'c>, _, _>(&context, inputs)?;
-                            Ok(outputs.into_parameters().collect::<Vec<CompileBatchTracer<'c>>>())
+                            let outputs = staged.call_in_context::<CompileBatchTracer, _, _>(&context, inputs)?;
+                            Ok(outputs.into_parameters().collect::<Vec<CompileBatchTracer>>())
                         },
                         inputs,
                         input_batch_axes,
@@ -1674,8 +1639,7 @@ where
                     .into_iter()
                     .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Out::To::<CompileTracer<'c>>::from_parameters(output_structure, outputs)
-                    .map_err(ProgramError::from)?)
+                Ok(Out::To::<CompileTracer>::from_parameters(output_structure, outputs).map_err(ProgramError::from)?)
             },
             Vec::new(),
             batched_input_types,
@@ -1696,28 +1660,28 @@ where
 /// compiled and executed against `session`. Its [`CompilationCache`](ryft_core::compilation::CompilationCache)
 /// structurally shares equivalent lowerings even when they originate at different Rust call sites.
 #[track_caller]
-pub fn compile<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn compile<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    session: &Session<'c>,
+    session: &Session,
     mesh: DeviceMesh,
-) -> Result<CompiledFunction<'c, In, Out>, Error>
+) -> Result<CompiledFunction<In, Out>, Error>
 where
-    F: FnOnce(In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
+    F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -1731,29 +1695,29 @@ where
 /// executable arguments and are supplied from the returned [`CompiledFunction`] at execution time, so callers of the
 /// compiled function still pass only `In` inputs.
 #[track_caller]
-pub fn compile_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn compile_with_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<Array>,
     input_types: In,
-    session: &Session<'c>,
+    session: &Session,
     mesh: DeviceMesh,
-) -> Result<CompiledFunction<'c, In, Out>, Error>
+) -> Result<CompiledFunction<In, Out>, Error>
 where
-    F: FnOnce(Vec<CompileTracer<'c>>, In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
+    F: FnOnce(Vec<CompileTracer>, In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -1769,28 +1733,28 @@ where
 
 /// Same as [`compile`] but accepts an explicit [`Options`] payload.
 #[track_caller]
-pub fn compile_with_options<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn compile_with_options<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-    session: &Session<'c>,
+    session: &Session,
     options: Options,
-) -> Result<CompiledFunction<'c, In, Out>, Error>
+) -> Result<CompiledFunction<In, Out>, Error>
 where
-    F: FnOnce(In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
+    F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -1807,27 +1771,27 @@ where
 /// `options` are applied to the abstract input signature before tracing and retained for subsequent lowering and
 /// compilation.
 #[track_caller]
-pub fn stage<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn stage<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
     options: Options,
-) -> Result<StagedFunction<'c, In, Out>, Error>
+) -> Result<StagedFunction<In, Out>, Error>
 where
-    F: FnOnce(In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
+    F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -1841,28 +1805,28 @@ where
 /// [`compile_with_captures`]. Captures are retained on the staged handle, and every [`StagedFunction::call`] imports
 /// them into the calling context as leading inputs of its `jit_call` boundary.
 #[track_caller]
-pub fn stage_with_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+pub fn stage_with_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<Array>,
     input_types: In,
     options: Options,
-) -> Result<StagedFunction<'c, In, Out>, Error>
+) -> Result<StagedFunction<In, Out>, Error>
 where
-    F: FnOnce(Vec<CompileTracer<'c>>, In::To<CompileTracer<'c>>) -> Out::To<CompileTracer<'c>>,
+    F: FnOnce(Vec<CompileTracer>, In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -1883,35 +1847,35 @@ pub fn infer_output_types<F, In: Parameterized<ArrayType>, Out: Parameterized<Ar
     input_types: In,
 ) -> Result<Out, Error>
 where
-    F: FnOnce(In::To<CompileTracer<'static>>) -> Out::To<CompileTracer<'static>>,
+    F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'static>>
-        + ParameterizedFamily<StatefulCompileTracer<'static>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'static>>
-        + ParameterizedFamily<StatefulCompileTracer<'static>>,
-    Out::To<CompileTracer<'static>>: Parameterized<CompileTracer<'static>, To<ArrayType> = Out>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out>,
 {
     let input_structure = input_types.parameter_structure();
     let input_types = ProgramParameters::<In>::from_parameters(
         input_structure,
         input_types.into_parameters().map(ArrayIrType::from),
     )?;
-    let output_types = DomainTracingContext::<Session<'static>, StatefulValue<'static>>::infer_output_type(
+    let output_types = DomainTracingContext::<Session, StatefulValue>::infer_output_type(
         |tracers| {
             let input_structure = tracers.parameter_structure();
             let input_parameters = tracers
                 .into_parameters()
                 .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
                 .collect::<Result<Vec<_>, _>>()?;
-            let tracers = In::To::<CompileTracer<'static>>::from_parameters(input_structure, input_parameters)?;
+            let tracers = In::To::<CompileTracer>::from_parameters(input_structure, input_parameters)?;
             let outputs = function(tracers);
             let output_structure = outputs.parameter_structure();
-            ProgramParameterValues::<Out, StatefulCompileTracer<'static>>::from_parameters(
+            ProgramParameterValues::<Out, StatefulCompileTracer>::from_parameters(
                 output_structure,
                 outputs.into_parameters().map(ProjectedValue::into_value),
             )
@@ -1938,10 +1902,9 @@ type ProgramConstants<P> = ProgramParameterValues<P, Constant>;
 
 /// Retention slots for the derived functions of one [`CompiledFunction`] (i.e., the reverse mode gradient and the
 /// forward mode JVP compiled around a call of its retained source program).
-type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
-    'c,
-    CoreCompiledFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<In>>,
-    CoreCompiledFunction<Session<'c>, ProgramParameters<(In, In)>, ProgramParameters<(Out, Out)>>,
+type DerivedFunctions<In, Out> = DerivedFunctionSlots<
+    CoreCompiledFunction<Session, ProgramParameters<In>, ProgramParameters<In>>,
+    CoreCompiledFunction<Session, ProgramParameters<(In, In)>, ProgramParameters<(Out, Out)>>,
 >;
 
 /// Retention slots, each holding one entry, for functions derived from a [`CompiledFunction`].
@@ -1958,15 +1921,15 @@ type DerivedFunctions<'c, In, Out> = DerivedFunctionSlots<
 /// interchangeable derivations of the same source program, and it is deliberate because waiting single-flight belongs
 /// exclusively to the shared [`CompilationCache`](ryft_core::compilation::CompilationCache), which still
 /// deduplicates the backend compilation those duplicate derivations request.
-struct DerivedFunctionSlots<'c, Gradient, Jvp> {
+struct DerivedFunctionSlots<Gradient, Jvp> {
     /// Retained reverse mode gradient function, if any.
-    gradient: Mutex<Option<(SessionWitness<'c>, Gradient)>>,
+    gradient: Mutex<Option<(SessionWitness, Gradient)>>,
 
     /// Retained forward mode JVP function, if any.
-    jvp: Mutex<Option<(SessionWitness<'c>, Jvp)>>,
+    jvp: Mutex<Option<(SessionWitness, Jvp)>>,
 }
 
-impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
+impl<Gradient, Jvp> DerivedFunctionSlots<Gradient, Jvp> {
     /// Creates empty retention slots.
     fn new() -> Self {
         Self { gradient: Mutex::new(None), jvp: Mutex::new(None) }
@@ -1980,25 +1943,25 @@ impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
 /// context, and one template of compilation options, and have an equal mesh. The witness stores a full session clone,
 /// which both provides those comparisons and keeps the shared state alive so its address can never be reused by a
 /// later allocation.
-struct SessionWitness<'c> {
+struct SessionWitness {
     /// Session handle captured when the retained artifact was produced.
-    session: Session<'c>,
+    session: Session,
 }
 
-impl<'c> SessionWitness<'c> {
+impl SessionWitness {
     /// Captures the identity of `session`.
-    fn new(session: &Session<'c>) -> Self {
+    fn new(session: &Session) -> Self {
         Self { session: session.clone() }
     }
 
     /// Returns whether `session` is interchangeable with the session that produced the retained artifact.
-    fn matches(&self, session: &Session<'c>) -> bool {
+    fn matches(&self, session: &Session) -> bool {
         self.session.is_same_session(session) && self.session.mesh().ok() == session.mesh().ok()
     }
 }
 
 /// Batched tracer of one array IR batching level directly inside an XLA compilation trace.
-type CompileBatchTracer<'c> = BatchingTracer<DomainTracingContext<Session<'c>, Value<'c>>, ArrayIrBatchingPolicy>;
+type CompileBatchTracer = BatchingTracer<DomainTracingContext<Session, Value>, ArrayIrBatchingPolicy>;
 
 /// Projects one tree of array IR values of any context (e.g., runtime [`Value`]s or [`StatefulCompileTracer`]s) to the
 /// tree of their `ArrayType` projections.
@@ -2146,8 +2109,8 @@ where
 /// Calls `function` as a `jit_call` operation in `context` on behalf of [`StagedFunction::call_in_context`] and
 /// [`CompiledFunction::call_in_context`]. Inputs whose type differs from the input type of `function` only in its
 /// sharding are first brought to that type in `context` (refer to `place_inputs`).
-fn call_staged_in_context<'c, In, Out, C, Path>(
-    function: &CoreStagedFunction<Session<'c>, ProgramParameters<In>, ProgramParameters<Out>>,
+fn call_staged_in_context<In, Out, C, Path>(
+    function: &CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>,
     context: &C,
     inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
 ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
@@ -2162,7 +2125,7 @@ where
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<C::Value>
         + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session<'c>, Path>,
+    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
     C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
 {
     let input_structure = inputs.parameter_structure();
@@ -2187,33 +2150,29 @@ where
 ///   - `session`: Domain that lowers and compiles the staged program.
 ///   - `options`: Options retained for lowering and compilation.
 #[track_caller]
-fn compile_with_flat_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+fn compile_with_flat_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<Array>,
     input_types: In,
-    session: &Session<'c>,
+    session: &Session,
     options: Options,
-) -> Result<CompiledFunction<'c, In, Out>, Error>
+) -> Result<CompiledFunction<In, Out>, Error>
 where
-    F: FnOnce(
-        Vec<Constant>,
-        Vec<CompileTracer<'c>>,
-        In::To<CompileTracer<'c>>,
-    ) -> Result<Out::To<CompileTracer<'c>>, Error>,
+    F: FnOnce(Vec<Constant>, Vec<CompileTracer>, In::To<CompileTracer>) -> Result<Out::To<CompileTracer>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -2234,32 +2193,28 @@ where
 ///   - `input_types`: Structured abstract input signature, to which the input sharding overrides of `options` apply.
 ///   - `options`: Options retained for lowering and compilation.
 #[track_caller]
-fn stage_with_flat_captures<'c, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+fn stage_with_flat_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<Array>,
     input_types: In,
     options: Options,
-) -> Result<StagedFunction<'c, In, Out>, Error>
+) -> Result<StagedFunction<In, Out>, Error>
 where
-    F: FnOnce(
-        Vec<Constant>,
-        Vec<CompileTracer<'c>>,
-        In::To<CompileTracer<'c>>,
-    ) -> Result<Out::To<CompileTracer<'c>>, Error>,
+    F: FnOnce(Vec<Constant>, Vec<CompileTracer>, In::To<CompileTracer>) -> Result<Out::To<CompileTracer>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<Constant>
-        + ParameterizedFamily<CompileTracer<'c>>
-        + ParameterizedFamily<StatefulCompileTracer<'c>>,
-    Out::To<CompileTracer<'c>>: Parameterized<CompileTracer<'c>, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer<'c>>: Parameterized<
-            StatefulCompileTracer<'c>,
+        + ParameterizedFamily<CompileTracer>
+        + ParameterizedFamily<StatefulCompileTracer>,
+    Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
+    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
+            StatefulCompileTracer,
             To<ArrayIrType> = ProgramParameters<Out>,
             To<Constant> = ProgramConstants<Out>,
         >,
@@ -2271,20 +2226,20 @@ where
             .map_err(ProgramError::from)?;
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
     let function = move |capture_references,
-                         capture_tracers: Vec<StatefulCompileTracer<'c>>,
-                         inputs: ProgramParameterValues<In, StatefulCompileTracer<'c>>| {
+                         capture_tracers: Vec<StatefulCompileTracer>,
+                         inputs: ProgramParameterValues<In, StatefulCompileTracer>| {
         let capture_tracers = capture_tracers
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let inputs = project_values::<In, StatefulCompileTracer<'c>>(inputs)?;
+        let inputs = project_values::<In, StatefulCompileTracer>(inputs)?;
         let outputs =
-            lift_values::<Out, StatefulCompileTracer<'c>>(function(capture_references, capture_tracers, inputs)?)?;
+            lift_values::<Out, StatefulCompileTracer>(function(capture_references, capture_tracers, inputs)?)?;
         place_outputs(outputs, output_shardings.as_deref())
     };
     let input_types = with_input_shardings(input_types, &options)?;
-    let function = CoreStagedFunction::<Session<'_>, ProgramParameters<In>, ProgramParameters<Out>>::stage(
+    let function = CoreStagedFunction::<Session, ProgramParameters<In>, ProgramParameters<Out>>::stage(
         function,
         captures,
         input_types,
@@ -2326,7 +2281,9 @@ mod tests {
         domain_mesh, read_f32s, read_f64s, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         session_with_client, two_device_mesh,
     };
-    use crate::tests::{assert_send_sync, cpu_client, execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        assert_send_sync, cpu_client, execution_client, other_cpu_client, values_from_bytes, values_to_bytes,
+    };
     use crate::{
         Array, Constant, Error, ExecutionError, JitCallOperation, Operation, RaggedDotLoweringStrategy, Reference,
         Session, ThroughSession, Value,
@@ -2341,8 +2298,8 @@ mod tests {
         reference_type: &ArrayIrType,
         array_type: &ArrayType,
     ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
-        let (_, program) = <Session<'_>>::trace(
-            |(reference, update): (DomainTracer<Session<'_>>, DomainTracer<Session<'_>>)| {
+        let (_, program) = <Session>::trace(
+            |(reference, update): (DomainTracer<Session>, DomainTracer<Session>)| {
                 reference.add_update(&update)?;
                 reference.read()
             },
@@ -2357,8 +2314,8 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
-        let function: CompiledFunctionDispatcher<'_, _, bool, ArrayType, ArrayType> = jit(
-            |apply_sine, input: CompileTracer<'_>| Ok(if apply_sine { input.sin()? } else { input }),
+        let function: CompiledFunctionDispatcher<_, bool, ArrayType, ArrayType> = jit(
+            |apply_sine, input: CompileTracer| Ok(if apply_sine { input.sin()? } else { input }),
             &session,
             mesh.clone(),
         );
@@ -2411,8 +2368,8 @@ mod tests {
 
         // Inputs whose types agree but whose placements over auto mesh axes differ get their own executables, which
         // keep each placement instead of resharding to the other, and the compiler chooses the output placements.
-        let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-            jit_with_options(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, Options::new(mesh.clone()));
+        let dispatcher: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+            jit_with_options(|(), x: CompileTracer| Ok::<_, Error>(x.sin()?), &engine, Options::new(mesh.clone()));
         let sharded_output = dispatcher.execute((), sharded_input.clone()).unwrap();
         let replicated_output = dispatcher.execute((), replicated_input).unwrap();
         let _ = dispatcher.execute((), sharded_input).unwrap();
@@ -2429,11 +2386,11 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
-        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-            jit(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, mesh.clone());
+        let function: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+            jit(|(), x: CompileTracer| Ok::<_, Error>(x.sin()?), &engine, mesh.clone());
 
         // A call traces the closure into the calling trace, and neither lowers, compiles, nor executes it.
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| function.call((), x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let statistics = function.statistics();
@@ -2482,8 +2439,8 @@ mod tests {
                 x.add(&index)?
             }};
         }
-        let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-            jit(|(), x: CompileTracer<'_>| Ok::<_, Error>(plus_axis_index!(x)), &engine, mesh.clone());
+        let dispatcher: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+            jit(|(), x: CompileTracer| Ok::<_, Error>(plus_axis_index!(x)), &engine, mesh.clone());
         let inline = batch_in_parent(
             |x| Ok(differentiate_in_parent_at(x.clone()).jvp(x, |x| Ok(plus_axis_index!(x)))?),
             xs.clone(),
@@ -2521,8 +2478,8 @@ mod tests {
 
         // The closure reads the index along the named batch axis `i` of the level that calls it. The call traces
         // it in that level's scope, and batching the resulting call resolves the axis once per batch item.
-        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
-            |(), x: CompileTracer<'_>| {
+        let function: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> = jit(
+            |(), x: CompileTracer| {
                 let index = x.into_value().context().axis_index("i")?;
                 Ok::<_, Error>(
                     ValueProjection::<ArrayType>::into_projected(index)
@@ -2533,7 +2490,7 @@ mod tests {
             &engine,
             mesh.clone(),
         );
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             |x| {
                 let output = batch(
                     |x| Ok(function.call((), ValueProjection::<ArrayType>::into_projected(x)?).unwrap().into_value()),
@@ -2561,7 +2518,7 @@ mod tests {
 
         // With only replicated inputs and an explicit extent, the call must still be rebatched at the named level,
         // because its callee reads that level by name. Binding the callee unchanged would let `axis_index` escape it.
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             |x| {
                 let x = x.into_value();
                 let extent = x.dimension_size(0).unwrap();
@@ -2592,7 +2549,7 @@ mod tests {
         let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let function = jit_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
-            |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
+            |(), (reference, update): (StatefulCompileTracer, StatefulCompileTracer)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
             },
@@ -2629,7 +2586,7 @@ mod tests {
         let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let function = jit_statefully_with_options::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
-            |(), (reference, update): (StatefulCompileTracer<'_>, StatefulCompileTracer<'_>)| {
+            |(), (reference, update): (StatefulCompileTracer, StatefulCompileTracer)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
             },
@@ -2942,7 +2899,7 @@ mod tests {
                 .unwrap()
         };
         let bind = |reference: &ArrayReference<_>| Value::Reference(Reference::new(reference.clone(), session.clone()));
-        let read = |value: Value<'_>| {
+        let read = |value: Value| {
             let Value::Array(array) = value else { panic!("expected an array output") };
             read_f32s(&client, &array)
         };
@@ -3031,15 +2988,15 @@ mod tests {
 
         // `x ↦ x[1]`, whose accumulating backward rule adds its seed to only the affected entry of the caller buffer.
         // The compiled pullback therefore updates the buffer in place, without a cotangent temporary of full size.
-        type ProgramTracer<'c> = DomainTracer<Session<'c>>;
-        let element = |x: &ProgramTracer<'_>| -> Result<ProgramTracer<'_>, ProgramError> {
+        type ProgramTracer = DomainTracer<Session>;
+        let element = |x: &ProgramTracer| -> Result<ProgramTracer, ProgramError> {
             Ok(ValueProjection::<ArrayType>::into_projected(x.clone())?.slice(&[1], &[2usize], &[1])?.into_value())
         };
-        let function = composite(move |x: ProgramTracer<'_>| element(&x)).with_accumulating_vjp(
-            move |x: ProgramTracer<'_>| Ok((element(&x)?, ())),
+        let function = composite(move |x: ProgramTracer| element(&x)).with_accumulating_vjp(
+            move |x: ProgramTracer| Ok((element(&x)?, ())),
             |context: &mut TranspositionContext<Constant, Operation>,
              (): (),
-             seed: MaybeZero<ProgramTracer<'_>>,
+             seed: MaybeZero<ProgramTracer>,
              accumulator: CotangentAccumulator| {
                 let (MaybeZero::Value(seed), Some(buffer)) = (seed, accumulator.reference(context)?) else {
                     return Err(ProgramError::InvalidArgument { message: "expected a caller buffer".to_string() });
@@ -3141,17 +3098,17 @@ mod tests {
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
-        fn forward<'c>(
+        fn forward(
             _: Vec<Constant>,
-            _: Vec<StatefulCompileTracer<'c>>,
-            input: StatefulCompileTracer<'c>,
-        ) -> Result<StatefulCompileTracer<'c>, Error> {
+            _: Vec<StatefulCompileTracer>,
+            input: StatefulCompileTracer,
+        ) -> Result<StatefulCompileTracer, Error> {
             Ok(input)
         }
 
         // A nested call may return the external reference that it receives, because that reference never crosses the
         // ABI as an output of the enclosing program.
-        let inner = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             reference_type.clone(),
@@ -3183,17 +3140,17 @@ mod tests {
         let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        fn allocate_reference<'c>(
+        fn allocate_reference(
             _: Vec<Constant>,
-            _: Vec<StatefulCompileTracer<'c>>,
-            input: StatefulCompileTracer<'c>,
-        ) -> Result<StatefulCompileTracer<'c>, Error> {
+            _: Vec<StatefulCompileTracer>,
+            input: StatefulCompileTracer,
+        ) -> Result<StatefulCompileTracer, Error> {
             input.reference_new().map_err(Into::into)
         }
 
         // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
         // call is rejected with a diagnostic that names the offending output.
-        let inner = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type.clone()),
@@ -3351,7 +3308,7 @@ mod tests {
             values_to_bytes::<f32>(&[0.25]).as_slice(),
         )
         .unwrap();
-        let inner: StagedFunction<'_, ArrayType, ArrayType> = stage_with_captures(
+        let inner: StagedFunction<ArrayType, ArrayType> = stage_with_captures(
             |captures, x| (x + captures[0].clone()).sin().unwrap(),
             vec![bias],
             input_type.clone(),
@@ -3360,7 +3317,7 @@ mod tests {
         .unwrap();
         assert_eq!(engine.program_count(), 0, "staging the inner function must not compile it");
 
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(engine.program_count(), 1, "only the outer program should be compiled");
         assert_eq!(outer.source_program().captures().len(), 1);
@@ -3391,9 +3348,9 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
-        let inner: StagedFunction<'_, ArrayType, ArrayType> =
+        let inner: StagedFunction<ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             move |x| inner.call(x.clone()).unwrap() + inner.call(x).unwrap(),
             input_type.clone(),
             &engine,
@@ -3425,7 +3382,7 @@ mod tests {
         let capture = Value::Array(
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice()).unwrap(),
         );
-        let inner = CoreStagedFunction::<Session<'_>, (), ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session, (), ArrayIrType>::stage(
             |_, mut captures, ()| Ok(captures.remove(0)),
             vec![capture],
             (),
@@ -3439,11 +3396,11 @@ mod tests {
                 in (%0)"},
         );
 
-        let outer = CoreStagedFunction::<Session<'_>, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
+        let outer = CoreStagedFunction::<Session, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
             |_, _, input| {
                 // No input leaf can recover the enclosing trace when the callee has no public inputs.
                 assert!(matches!(
-                    inner.call::<StatefulCompileTracer<'_>, _>(()),
+                    inner.call::<StatefulCompileTracer, _>(()),
                     Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
                 ));
                 let context = input.context();
@@ -3472,7 +3429,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh.clone()).unwrap();
         assert_eq!(compiled.executable().mesh(), &mesh);
     }
@@ -3484,7 +3441,7 @@ mod tests {
         let session = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 1);
-        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
@@ -3501,18 +3458,18 @@ mod tests {
     #[test]
     fn test_executable_function_execute_rejects_foreign_client() {
         let client = execution_client();
-        let other_client = cpu_client(1);
+        let other_client = other_cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let other_mesh = domain_mesh(&other_client, "x", 1);
         let session = session_with_client(&client);
         let other_session = session_with_client(&other_client);
         let input_type = replicated_vector_type(&mesh, 1);
-        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
         let other_input_type = replicated_vector_type(&other_mesh, 1);
-        let other_executable: ExecutableFunction<'_, ArrayType, ArrayType> =
+        let other_executable: ExecutableFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), other_input_type, &other_session, other_mesh)
                 .unwrap()
                 .into_executable();
@@ -3545,13 +3502,13 @@ mod tests {
 
     #[test]
     fn test_executable_function_execute_across_threads() {
-        assert_send_sync::<ExecutableFunction<'static, ArrayType, ArrayType>>();
+        assert_send_sync::<ExecutableFunction<ArrayType, ArrayType>>();
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 1);
-        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
@@ -3577,7 +3534,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let replicated_input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated).unwrap();
         let options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), replicated_input_type.clone(), &engine, options).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -3629,7 +3586,7 @@ mod tests {
         // A stateful compilation produces an ordinary runtime executable over the same flat signature, so the
         // asynchronous entry point for arrays is reachable and must refuse the holder transaction up front rather
         // than enqueueing an execution whose hidden final state outputs nothing would publish.
-        let executable: ExecutableFunction<'_, ArrayType, ArrayType> =
+        let executable: ExecutableFunction<ArrayType, ArrayType> =
             ExecutableFunction { function: compiled.executable().clone() };
         let input = Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
@@ -3645,7 +3602,7 @@ mod tests {
         let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 1);
-        let compiled: CompiledFunction<'_, ArrayType, ()> =
+        let compiled: CompiledFunction<ArrayType, ()> =
             compile(|_| (), input_type.clone(), &engine, mesh.clone()).unwrap();
         let input =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
@@ -3658,8 +3615,8 @@ mod tests {
 
     #[test]
     fn test_compiled_and_staged_functions_are_send_and_sync() {
-        assert_send_sync::<CompiledFunction<'static, ArrayType, ArrayType>>();
-        assert_send_sync::<StagedFunction<'static, ArrayType, ArrayType>>();
+        assert_send_sync::<CompiledFunction<ArrayType, ArrayType>>();
+        assert_send_sync::<StagedFunction<ArrayType, ArrayType>>();
     }
 
     #[test]
@@ -3673,14 +3630,14 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
-        let staged: StagedFunction<'_, ArrayType, ArrayType> =
+        let staged: StagedFunction<ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
         assert_eq!(engine.program_count(), 0, "staging must not compile a PJRT executable");
 
         let staged_compiled = engine.compile_staged_function(staged).unwrap();
         assert_eq!(engine.program_count(), 1, "compiling the staged handle should build exactly one executable");
 
-        let direct: CompiledFunction<'_, ArrayType, ArrayType> =
+        let direct: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let input_value = 0.5f32;
@@ -3705,7 +3662,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 1);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh).unwrap();
 
         assert!(matches!(
@@ -3735,7 +3692,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        let read = |value: Value<'_>| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+        let read = |value: Value| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
         let (value, gradient) = session
             .differentiate_at(vector(&[1.0, 2.0]))
             .with_captures(vector(&[3.0, 4.0]))
@@ -3756,17 +3713,17 @@ mod tests {
         let array_type = replicated_vector_type(&mesh, 3);
         let values = [0.1f32, 0.2, 0.3];
         let dot = values.iter().map(|value| value * value).sum::<f32>();
-        type ProgramTracer<'c> = DomainTracer<Session<'c>>;
-        fn sine_of_dot(x: ProgramTracer<'_>) -> Result<ProgramTracer<'_>, ProgramError> {
+        type ProgramTracer = DomainTracer<Session>;
+        fn sine_of_dot(x: ProgramTracer) -> Result<ProgramTracer, ProgramError> {
             let x = ValueProjection::<ArrayType>::into_projected(x)?;
             let dot = x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.tag("dot")?;
             Ok(dot.sin()?.into_value())
         }
-        fn value_and_gradient<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
-            session: &Session<'c>,
-            input: Array<'c>,
+        fn value_and_gradient<P: Clone + ResidualPolicy<ArrayIrType>>(
+            session: &Session,
+            input: Array,
             policy: P,
-        ) -> (Value<'c>, Value<'c>) {
+        ) -> (Value, Value) {
             let function = rematerialize(sine_of_dot).with_policy(policy);
             session.differentiate_at(Value::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
         }
@@ -3785,7 +3742,7 @@ mod tests {
             value_and_gradient(&session, input(), offload.unwrap()),
         ] {
             // XLA's elementary functions may differ from the host ones in the last bit.
-            let assert_close = |actual: Value<'_>, expected: Vec<f32>| {
+            let assert_close = |actual: Value, expected: Vec<f32>| {
                 let actual = read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(actual).unwrap());
                 assert!(actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6));
                 assert_eq!(actual.len(), expected.len());
@@ -3804,7 +3761,7 @@ mod tests {
         let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         assert_eq!(
@@ -3822,7 +3779,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh.clone()).unwrap();
         assert_eq!(compiled.mesh(), &mesh);
     }
@@ -3841,12 +3798,12 @@ mod tests {
         let input_type = replicated_vector_type(&mesh, 4);
 
         // Compile the inner function `f = |x| x.sin()`.
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         // Compile the outer function `g = |x| cos(inner(x))` by staging `inner` as one `jit_call` and applying `cos` to
         // its output.
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(
             outer.source_program().program().to_string(),
@@ -3895,7 +3852,7 @@ mod tests {
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -3903,7 +3860,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         assert_eq!(outer.source_program().captures().len(), 1);
@@ -3943,7 +3900,7 @@ mod tests {
             values_to_bytes::<f32>(&[10.0, 10.0, 10.0, 10.0]).as_slice(),
         )
         .unwrap();
-        let left: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let left: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![left_bias],
             input_type.clone(),
@@ -3951,7 +3908,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let right: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let right: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![right_bias],
             input_type.clone(),
@@ -3959,7 +3916,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             move |x| left.call(x.clone()).unwrap() + right.call(x).unwrap(),
             input_type.clone(),
             &engine,
@@ -4006,14 +3963,14 @@ mod tests {
 
         // Executions reshard the replicated input to the override, and calls constrain it to the override in the
         // calling context, eagerly, inside another compilation, and under transforms.
-        let function: CompiledFunction<'_, ArrayType, ArrayType> =
+        let function: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), vector_type.clone(), &engine, options.clone()).unwrap();
         let executed = function.executable().execute(&engine, input.clone()).unwrap();
         assert_eq!(executed.sharding(), &sharded);
         let called = function.call(input.clone()).unwrap();
         assert_eq!(called.r#type(), executed.r#type());
         assert_eq!(read_sharded_f32_array(&called), read_sharded_f32_array(&executed));
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| function.call(x).unwrap(), vector_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(outer.output_types(), function.output_types());
         let outer_output = outer.executable().execute(&engine, input.clone()).unwrap();
@@ -4065,8 +4022,8 @@ mod tests {
         );
 
         // Dispatcher calls constrain their inputs to the input types of their staged specializations alike.
-        let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-            jit_with_options(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, options);
+        let dispatcher: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+            jit_with_options(|(), x: CompileTracer| Ok::<_, Error>(x.sin()?), &engine, options);
         let executed = dispatcher.execute((), input.clone()).unwrap();
         let called = dispatcher.call((), input).unwrap();
         assert_eq!(called.r#type(), executed.r#type());
@@ -4091,26 +4048,26 @@ mod tests {
 
         // The override is staged on the output of the traced function, so calls return the output types that
         // executions return, both eagerly and inside another compilation.
-        let function: CompiledFunction<'_, ArrayType, ArrayType> =
+        let function: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options.clone()).unwrap();
         let executed = function.executable().execute(&engine, input.clone()).unwrap();
         assert_eq!(executed.sharding(), &sharded);
         let called = function.call(input.clone()).unwrap();
         assert_eq!(called.r#type(), executed.r#type());
         assert_eq!(read_sharded_f32_array(&called), read_sharded_f32_array(&executed));
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| function.call(x).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(outer.output_types(), function.output_types());
 
         // Executable and staged specializations of a dispatcher stage the override alike.
-        let dispatcher: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-            jit_with_options(|(), x: CompileTracer<'_>| Ok::<_, Error>(x.sin()?), &engine, options);
+        let dispatcher: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+            jit_with_options(|(), x: CompileTracer| Ok::<_, Error>(x.sin()?), &engine, options);
         let executed = dispatcher.execute((), input.clone()).unwrap();
         assert_eq!(executed.sharding(), &sharded);
         let called = dispatcher.call((), input).unwrap();
         assert_eq!(called.r#type(), executed.r#type());
         assert_eq!(read_sharded_f32_array(&called), read_sharded_f32_array(&executed));
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| dispatcher.call((), x).unwrap(), input_type, &engine, mesh).unwrap();
         assert_eq!(outer.output_types(), std::slice::from_ref(executed.r#type().as_ref()));
     }
@@ -4123,7 +4080,7 @@ mod tests {
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
-        let read = |array: &Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
         let assert_close = |actual: Vec<f32>, expected: Vec<f32>| {
             assert_eq!(actual.len(), expected.len());
             assert!(actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-5));
@@ -4139,7 +4096,7 @@ mod tests {
         let options = Options::new(mesh.clone())
             .with_input_shardings(vec![sharded.clone()])
             .with_output_shardings(vec![sharded.clone()]);
-        let function: CompiledFunction<'_, ArrayType, ArrayType> =
+        let function: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), vector_type.clone(), &engine, options).unwrap();
 
         // Types record no placement over auto mesh axes, so calls and executions return the same replicated output
@@ -4152,7 +4109,7 @@ mod tests {
         assert_eq!(called.r#type(), executed.r#type());
         assert_eq!(called.sharding(), &sharded);
         assert_close(read(&called), values.iter().copied().map(f32::sin).collect());
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| function.call(x).unwrap(), vector_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(outer.output_types(), function.output_types());
 
@@ -4168,14 +4125,14 @@ mod tests {
         assert_eq!(primal.r#type(), executed.r#type());
         assert_eq!(tangent.r#type(), executed.r#type());
         assert_close(read(&tangent), values.iter().map(|value| f32::cos(*value) * value).collect());
-        let total: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let total: CompiledFunction<ArrayType, ArrayType> = compile(
             |x| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum).unwrap(),
             vector_type.clone(),
             &engine,
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<ArrayType, ArrayType> = total.gradient(&engine).unwrap();
         let gradient = gradient.executable().execute(&engine, input.clone()).unwrap();
         assert_eq!(gradient.r#type().as_ref(), &vector_type);
         assert_close(read(&gradient), values.iter().copied().map(f32::cos).collect());
@@ -4214,10 +4171,10 @@ mod tests {
             Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
                 .unwrap()
         };
-        let read = |value: Value<'_>| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+        let read = |value: Value| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
 
         // `f(x) = x * c` captures the runtime array `c`, so every call below also imports a capture into its parent.
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![array(&vector_type, &[2.0, -1.0, 0.5])],
             vector_type.clone(),
@@ -4272,7 +4229,7 @@ mod tests {
 
         // `f(x) = x * c` captures the runtime array `c`. Rematerialized and composite bodies are traced over constants
         // alone, so calling `f` inside them imports `c` as a session constant.
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![array(&[2.0, -1.0, 0.5])],
             vector_type.clone(),
@@ -4289,7 +4246,7 @@ mod tests {
 
         // The pullbacks of both bodies scale the cotangent by `c`, which reaches the outer executable as a hidden
         // argument rather than as a literal.
-        let outer: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
+        let outer: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
             |(x, cotangent)| {
                 let x = x.into_value();
                 let cotangent = cotangent.into_value();
@@ -4317,7 +4274,7 @@ mod tests {
 
         // Eager parents resolve the session constant when lifting it, and eager dispatch passes its array to the
         // executables of the rematerialized and composite applications.
-        let read = |value: Value<'_>| read_f32s(client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+        let read = |value: Value| read_f32s(client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
         assert_eq!(read(rematerialized.call(Value::Array(array(&[1.0, 2.0, 3.0]))).unwrap()), vec![2.0, -2.0, 1.5]);
         assert_eq!(read(composed.call(Value::Array(array(&[1.0, 2.0, 3.0]))).unwrap()), vec![2.0, -2.0, 1.5]);
     }
@@ -4338,7 +4295,7 @@ mod tests {
             )
             .unwrap()
         };
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![array(&[2.0, -1.0, 0.5])],
             vector_type.clone(),
@@ -4376,7 +4333,7 @@ mod tests {
             }
         });
 
-        let outer: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let outer: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(x, tangent)| {
                 let x = x.into_value();
                 let tangent = tangent.into_value();
@@ -4413,7 +4370,7 @@ mod tests {
             Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
                 .unwrap()
         };
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![array(&vector_type, &[2.0, -1.0, 0.5])],
             vector_type.clone(),
@@ -4433,7 +4390,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_f32s(&client, &batched), vec![2.0, -2.0, 1.5, 8.0, -5.0, 3.0]);
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             |xs| {
                 batch_in_parent(
                     |x| function.call(x),
@@ -4468,9 +4425,9 @@ mod tests {
             )
             .unwrap()
         };
-        let read = |array: &Array<'_>| read_f32s(&client, array);
+        let read = |array: &Array| read_f32s(&client, array);
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![array(&[2.0, -1.0, 0.5])],
             vector_type.clone(),
@@ -4536,7 +4493,7 @@ mod tests {
         assert_eq!(read(&jacobian.values()[0]), vec![2.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.5]);
 
         // The same entry point serves the array leaves of an enclosing compilation.
-        let outer: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
+        let outer: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
             |x| {
                 let jacobian = differentiate_in_parent_at(x.clone()).jacobian_reverse(|x| function.call(x)).unwrap();
                 let hessian =
@@ -4560,7 +4517,7 @@ mod tests {
         let engine = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let strategy = RaggedDotLoweringStrategy::Instruction;
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
             |x| x.clone() * x,
             scalar_type,
             &engine,
@@ -4589,9 +4546,9 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
             compile(|(_, live)| live, (dynamic_type, scalar_type.clone()), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
         let concrete_type = ArrayType::new(DataType::F32, Shape::new(vec![3.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4620,7 +4577,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
             |(dead, live)| {
                 let predicate = live.compare(&(-live.clone()), ComparisonDirection::GreaterThan).unwrap();
                 predicate
@@ -4632,7 +4589,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
         assert_eq!(
             gradient.source_program().program().to_string(),
@@ -4726,7 +4683,7 @@ mod tests {
             body.build::<Vec<Constant>, Vec<Constant>>(vec![doubled], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap(),
         );
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
             |(elements, initial)| {
                 let size = DimensionSizeOperation::new(elements.r#type().as_ref(), 0).unwrap();
                 let elements = elements.into_value();
@@ -4750,7 +4707,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compiled.gradient(&engine).unwrap();
         assert_eq!(
             gradient.source_program().program().to_string(),
@@ -4819,11 +4776,11 @@ mod tests {
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_types = (dynamic_type, scalar_type.clone());
-        let inner: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let inner: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compile(|(x, s)| (x.clone() * x, s.clone() * s), input_types.clone(), &engine, mesh.clone()).unwrap();
-        let outer: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let outer: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
             compile(move |inputs| inner.call(inputs).unwrap().1, input_types.clone(), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let gradient: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             outer.gradient(&engine).unwrap();
         assert_eq!(
             gradient.source_program().program().to_string(),
@@ -4890,7 +4847,7 @@ mod tests {
         assert_eq!(read_f32s(&client, &s_gradient_tangent), vec![2.0]);
 
         // Under reverse over reverse mode, the gradient of `∂outer/∂s = 2s` is `(0, 2)`.
-        let s_derivative: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let s_derivative: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
             compile(move |inputs| gradient.call(inputs).unwrap().1, input_types, &engine, mesh.clone()).unwrap();
         let reverse_over_reverse = s_derivative.gradient(&engine).unwrap();
         let (x_second, s_second) = reverse_over_reverse.executable().execute(&engine, (x, s)).unwrap();
@@ -4913,7 +4870,7 @@ mod tests {
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -4921,7 +4878,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = inner.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<ArrayType, ArrayType> = inner.gradient(&engine).unwrap();
 
         assert_eq!(gradient.source_program().captures().len(), 1);
 
@@ -4943,10 +4900,10 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let first: CompiledFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
+        let first: CompiledFunction<ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
         let statistics = engine.compilation_cache().statistics();
         let second = compiled.gradient(&engine).unwrap();
 
@@ -4984,7 +4941,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 2);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type, &session, mesh).unwrap();
         let expected = DifferentiationError::NonScalarGradientOutput {
             output_type: "f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]".to_string(),
@@ -5009,9 +4966,9 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
 
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+        let inner: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let jvp_compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             inner.jvp(&engine).unwrap();
         assert_eq!(
             jvp_compiled.source_program().program().to_string(),
@@ -5099,7 +5056,7 @@ mod tests {
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -5107,7 +5064,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+        let jvp_compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             inner.jvp(&engine).unwrap();
 
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
@@ -5142,7 +5099,7 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let callee: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let callee: CompiledFunction<ArrayType, ArrayType> = compile(
             |x| {
                 let mut value = x;
                 for index in 0..CALLEE_OPERATIONS {
@@ -5155,13 +5112,13 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let outer: CompiledFunction<'_, ArrayType, ArrayType> =
+        let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| callee.call(x).unwrap().sin().unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
 
-        let jvp: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = outer.jvp(&engine).unwrap();
+        let jvp: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = outer.jvp(&engine).unwrap();
         assert_eq!(jvp.output_types(), &[input_type.clone(), input_type.clone()]);
-        let gradient: CompiledFunction<'_, ArrayType, ArrayType> = outer.gradient(&engine).unwrap();
+        let gradient: CompiledFunction<ArrayType, ArrayType> = outer.gradient(&engine).unwrap();
         assert_eq!(gradient.output_types(), std::slice::from_ref(&input_type));
 
         // A reference chain evaluated in `f64` pins the gradient's value. Each step contributes its local derivative
@@ -5193,11 +5150,10 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let first: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
-            compiled.jvp(&engine).unwrap();
+        let first: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compiled.jvp(&engine).unwrap();
         let statistics = engine.compilation_cache().statistics();
         let second = compiled.jvp(&engine).unwrap();
 
@@ -5228,10 +5184,10 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let tangent_type = primal_type.tangent().unwrap();
-        let primal: CompiledFunction<'_, ArrayType, ArrayType> =
+        let primal: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value, primal_type.clone(), &engine, mesh.clone()).unwrap();
-        let jvp: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();
-        let zero_identity: CompiledFunction<'_, ArrayType, ArrayType> =
+        let jvp: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();
+        let zero_identity: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value, tangent_type.clone(), &engine, mesh.clone()).unwrap();
 
         let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
@@ -5259,7 +5215,7 @@ mod tests {
         };
 
         // `f(x, y) = x * y + c` with a captured `c`, so the batched function also inherits a capture.
-        let function: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile_with_captures(
+        let function: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile_with_captures(
             |captures, (x, y)| x * y + captures[0].clone(),
             vec![array(vector_type.clone(), &[10.0, 20.0])],
             (vector_type.clone(), vector_type.clone()),
@@ -5329,7 +5285,7 @@ mod tests {
             values_to_bytes::<f32>(&[0.0, 0.5, 1.0, 1.5, 2.0, 2.5]).as_slice(),
         )
         .unwrap();
-        let function: CompiledFunction<'_, ArrayType, ArrayType> =
+        let function: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), vector_type, &engine, mesh.clone()).unwrap();
 
         // The requested placement splits the batch items across `x`, exactly like uncompiled batching of an input
@@ -5363,7 +5319,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let engine = session_with_client(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let function: CompiledFunction<'_, ArrayType, ArrayType> =
+        let function: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), scalar_type, &engine, mesh).unwrap();
         assert!(matches!(
             function.batch(&engine, BatchAxis::new(0), BatchAxis::new(0), BatchAxisSpecification::named("i")),
@@ -5382,7 +5338,7 @@ mod tests {
         let engine = session_with_client(&client);
 
         let input_type = replicated_vector_type(&mesh, 4);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -5408,7 +5364,7 @@ mod tests {
             .unwrap();
         let value =
             Array::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, exemplar| captures[0].broadcast(exemplar.r#type().into_owned(), &[]).unwrap(),
             vec![value],
             input_type.clone(),
@@ -5436,7 +5392,7 @@ mod tests {
         let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             |input| {
                 let input = input.into_value();
                 let reference = input.reference_new().unwrap();
@@ -5468,7 +5424,7 @@ mod tests {
         // The inner gradient differentiates reference contents at entry, while the outer compiled function returns
         // the scalar objective, the mutated primal state, and an ordinary gradient. Both local references discharge
         // before lowering, so the public executable retains its ordinary array boundary and placement metadata.
-        let compiled: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
             |input| {
                 let reference = input.into_value().reference_new().unwrap();
                 let (value, gradient) = differentiate_at(reference.clone())
@@ -5641,7 +5597,7 @@ mod tests {
                 .unwrap();
             let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
 
-            let compiled: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
+            let compiled: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
                 |input| {
                     let input = input.into_value();
                     let outputs = program.interpret_in_context(input.context(), vec![input.clone()]).unwrap();
@@ -5747,7 +5703,7 @@ mod tests {
             Ok(y.mul(&ValueProjection::<ArrayType>::into_projected(s)?)?.into_value())
         })
         .with_policy(SaveTaggedThroughReshape);
-        let outer: CompiledFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let outer: CompiledFunction<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(x, s, seed)| {
                 let x = x.into_value();
                 let context = x.context().clone();
@@ -5787,7 +5743,7 @@ mod tests {
 
         // The dense builders run directly on array IR values, rather than on their array projections, whose packed
         // replay batches the derivative program in the array IR universe.
-        let function: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
+        let function: CompiledFunction<ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
             |x| {
                 let x = x.into_value();
                 let context = x.context().clone();
@@ -5839,21 +5795,21 @@ mod tests {
         let session = session_with_client(&client);
         let input_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        let forward: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+        let forward: CompiledFunction<ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_forward(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
             &session,
             mesh.clone(),
         )
         .unwrap();
-        let reverse: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+        let reverse: CompiledFunction<ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_reverse(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
             &session,
             mesh.clone(),
         )
         .unwrap();
-        let second: CompiledFunction<'_, ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+        let second: CompiledFunction<ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).hessian(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
             &session,
@@ -5862,7 +5818,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(session.program_count(), 2);
-        let _: CompiledFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+        let _: CompiledFunction<ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_forward(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
             &session,
@@ -5947,14 +5903,14 @@ mod tests {
                 values_to_bytes::<f32>(&[3.0]).as_slice(),
             )
             .unwrap();
-            let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
+            let jacobian: Jacobian<ArrayType, Array, ArrayType, ArrayType> =
                 compiled.executable().execute(&session, input).unwrap();
             assert_eq!(read_f32s(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
         }
 
         let input =
             Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
+        let hessian: Hessian<ArrayType, Array, ArrayType, ArrayType> =
             second.executable().execute(&session, input).unwrap();
         assert_eq!(read_f32s(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
@@ -5970,7 +5926,6 @@ mod tests {
             .unwrap();
 
         let forward: CompiledFunction<
-            '_,
             (ArrayType, ArrayType),
             Jacobian<ArrayType, ArrayType, (ArrayType, ArrayType), ArrayType>,
         > = compile(
@@ -5994,7 +5949,7 @@ mod tests {
         let vector =
             Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
-        let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
+        let jacobian: Jacobian<ArrayType, Array, (ArrayType, ArrayType), ArrayType> =
             forward.executable().execute(&session, (scalar, vector)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
@@ -6013,11 +5968,10 @@ mod tests {
         let session = session_with_client(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
-        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<Session<'_>, ArrayType>>(-1);
+        let soft_target = softmax_cross_entropy_with_target_logits::<ProjectedContext<Session, ArrayType>>(-1);
         // Compile each complete stabilized derivative so optimizer rewrites cannot hide behind eager operation
         // boundaries. Integer labels and teacher logits parameterize their respective losses without differentiation.
         let compiled: CompiledFunction<
-            '_,
             (ArrayType, ArrayType, ArrayType, ArrayType),
             (ArrayType, ArrayType, ArrayType),
         > = compile(
@@ -6086,7 +6040,7 @@ mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let logits_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = compile(
             |(logits, labels)| {
                 let probabilities = logits.softmax(0).unwrap();
                 let (loss, gradient) = differentiate_at(logits)
@@ -6106,7 +6060,7 @@ mod tests {
         let (probabilities, loss, gradient) = compiled.executable().execute(&engine, (logits, labels)).unwrap();
         assert_eq!(probabilities.sharding(), &sharding);
         assert_eq!(gradient.sharding(), &sharding);
-        let read_shards = |array: &Array<'_>| {
+        let read_shards = |array: &Array| {
             let mut observed = Vec::new();
             for device in client.addressable_devices().unwrap().iter().take(2) {
                 let bytes = array
@@ -6153,7 +6107,7 @@ mod tests {
         let logits_type =
             replicated(ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), classes.into()])));
         let labels_type = replicated(ArrayType::new(DataType::I32, Shape::new(vec![batch.into()])));
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(logits, labels)| {
                 let log_probabilities = logits.log_softmax(1).unwrap();
                 let loss = logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap();
@@ -6220,7 +6174,7 @@ mod tests {
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
-        let inner: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let inner: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -6228,7 +6182,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let jvp_compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal, tangent)| {
                 let primal = primal.into_value();
                 let tangent = tangent.into_value();
@@ -6282,7 +6236,7 @@ mod tests {
         let shape = Shape::new(vec![CoreDimension::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharding.clone()).unwrap();
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> =
+        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
             compile(|(a, b)| a + b, (input_type.clone(), input_type.clone()), &engine, mesh.clone()).unwrap();
 
         let a_values = [10.0f32, 20.0, 30.0];
@@ -6313,7 +6267,7 @@ mod tests {
         assert_eq!(engine.program_count(), 0);
         // Equivalent lowerings share one executable, so the second invocation is a cache hit.
         for _ in 0..2 {
-            let _: CompiledFunction<'_, ArrayType, ArrayType> =
+            let _: CompiledFunction<ArrayType, ArrayType> =
                 compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         }
         assert_eq!(engine.program_count(), 1, "an equivalent repeated lowering should hit the cache");
@@ -6328,9 +6282,9 @@ mod tests {
 
         assert_eq!(engine.program_count(), 0);
         // Cache identity is the complete lowering plus options and target, not the Rust source location.
-        let _: CompiledFunction<'_, ArrayType, ArrayType> =
+        let _: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let _: CompiledFunction<'_, ArrayType, ArrayType> =
+        let _: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type, &engine, mesh).unwrap();
         assert_eq!(engine.program_count(), 1);
     }
@@ -6354,7 +6308,7 @@ mod tests {
 
         for batch_size in [32usize, 64usize] {
             let input = HyperparamInput { array: array_type.clone(), batch_size };
-            let _: CompiledFunction<'_, HyperparamInput<ArrayType>, ArrayType> =
+            let _: CompiledFunction<HyperparamInput<ArrayType>, ArrayType> =
                 compile(|input| input.array.sin().unwrap(), input, &engine, mesh.clone()).unwrap();
         }
         assert_eq!(engine.program_count(), 1);
@@ -6372,7 +6326,7 @@ mod tests {
             Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
                 .unwrap()
         };
-        let read = |value: Value<'_>| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+        let read = |value: Value| read_f32s(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
 
         // XLA's elementary functions may differ from the host ones in the last bit.
         let assert_close = |actual: Vec<f32>, expected: Vec<f32>| {
@@ -6391,8 +6345,7 @@ mod tests {
         let gradient = w.iter().map(|w| dot.cos() * w).collect::<Vec<_>>();
         let weights = array(&vector_type, &w);
         let function = rematerialize(|x: Body| {
-            let w =
-                ImportingContext::<Session<'_>, ThroughSession>::import(x.context(), Value::Array(weights.clone()))?;
+            let w = ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(weights.clone()))?;
             let x = ValueProjection::<ArrayType>::into_projected(x)?;
             let w = ValueProjection::<ArrayType>::into_projected(w)?;
             Ok(x.dot(&w, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?.into_value())
@@ -6408,7 +6361,7 @@ mod tests {
         assert_close(read(eager_gradient), gradient.clone());
 
         // A compiled pullback receives the session constant as a hidden argument of its executable.
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+        let compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(x, cotangent)| {
                 let x = x.into_value();
                 let context = x.context().clone();
@@ -6444,7 +6397,7 @@ mod tests {
 
         // `x ↦ sin(x) * x` is linearized inside the compilation, so its residuals are tracers of that trace. Applying
         // the pushforward under a batching level of the same trace imports them as replicated values of that level.
-        let function: CompiledFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+        let function: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
             |(x, tangents)| {
                 let x = x.into_value();
                 let context = x.context().clone();
@@ -6512,7 +6465,7 @@ mod tests {
         )
         .unwrap();
 
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x + captures[0].clone(),
             vec![bias],
             input_type.clone(),
@@ -6551,7 +6504,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let capture = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, _| captures[0].clone(),
             vec![capture],
             input_type.clone(),
@@ -6589,7 +6542,7 @@ mod tests {
 
         // The captured array enters the executable at its runtime placement over the auto mesh axis rather than at
         // the replicated placement of its type, so it needs no gathering and the compiler shards the sum like it.
-        let function: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x.add(&captures[0]).unwrap(),
             vec![captured],
             input_type,
@@ -6610,7 +6563,7 @@ mod tests {
         let engine = session_with_client(&client);
         let input_type = replicated_vector_type(&mesh, 3);
         let options = Options::new(mesh.clone()).with_donate(true);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
 
         let values = [0.0f32, 0.5, 1.0];
@@ -6636,7 +6589,7 @@ mod tests {
         let input_type = replicated_vector_type(&mesh, 2);
         // A tree of three donation flags does not match the one flat input of the function.
         let options = Options::new(mesh.clone()).with_donate((true, false, false));
-        let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
+        let result: Result<CompiledFunction<ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
             result,
@@ -6659,7 +6612,7 @@ mod tests {
             ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), abstract_input_type, &engine, options).unwrap();
 
         // Build the input array under the overridden sharding so it matches the executable's expected layout.
@@ -6703,7 +6656,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // Two shardings for one flat input must fail.
         let options = Options::new(mesh).with_input_shardings(vec![sharding.clone(), sharding]);
-        let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
+        let result: Result<CompiledFunction<ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
             result,
@@ -6724,7 +6677,7 @@ mod tests {
         // Override the output sharding to shard along `x` across both devices, so the partitioner emits a fully
         // sharded output and the sharding metadata of the `Array` matches.
         let options = Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]);
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
 
         // Types record no placement over auto mesh axes, so the staged output type stays replicated while the returned
@@ -6766,7 +6719,7 @@ mod tests {
         let input_type = replicated_vector_type(&mesh, 2);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let options = Options::new(mesh).with_output_shardings(vec![sharding.clone(), sharding]);
-        let result: Result<CompiledFunction<'_, ArrayType, ArrayType>, Error> =
+        let result: Result<CompiledFunction<ArrayType, ArrayType>, Error> =
             compile_with_options(|x| x.sin().unwrap(), input_type, &engine, options);
         assert!(matches!(
             result,
@@ -6786,8 +6739,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
 
         let options = Options::new(mesh).with_input_shardings(vec![sharding.clone()]);
-        let staged: StagedFunction<'_, ArrayType, ArrayType> =
-            stage(|x| x.sin().unwrap(), input_type, options).unwrap();
+        let staged: StagedFunction<ArrayType, ArrayType> = stage(|x| x.sin().unwrap(), input_type, options).unwrap();
         let ArrayIrType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
             panic!("public staged input should remain an array");
         };

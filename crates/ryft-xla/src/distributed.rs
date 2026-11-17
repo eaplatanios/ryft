@@ -66,7 +66,8 @@ const LAUNCH_ID_KEY: &[u8] = b"ryft/distributed-launch/v1/id";
 ///     coordination state for every participant.
 ///
 /// PJRT [`ryft_pjrt::Client`]s minted with [`Self::create_client`] borrow the handle's key-value store, so the handle
-/// must outlive every such client.
+/// must outlive every such client. A [`Session`](crate::Session) requires a client that lives for the rest of the
+/// process, so the handle of a client that a session uses must live for the rest of the process as well.
 #[derive(Clone)]
 pub struct DistributedRuntime {
     state: Arc<DistributedRuntimeState>,
@@ -589,7 +590,7 @@ mod tests {
     }
 
     /// Returns the elements of the buffer of every shard of `array` that the current process addresses, in mesh order.
-    fn read_addressable_f32s(array: &Array<'_>) -> Vec<Vec<f32>> {
+    fn read_addressable_f32s(array: &Array) -> Vec<Vec<f32>> {
         array
             .addressable_shards()
             .map(|shard| {
@@ -603,7 +604,7 @@ mod tests {
     /// that the current process addresses, so that the same checks hold for one process that addresses both devices
     /// and for two processes that address one device each, as JAX's multi-controller model requires. Every process of
     /// a job must call this function, because each scenario executes collectives over both devices.
-    fn check_shard_map_multi_host_scenarios<'c>(client: &'c Client<'c>) {
+    fn check_shard_map_multi_host_scenarios(client: &'static Client<'static>) {
         let process_index = client.process_index().unwrap();
         let devices = client
             .devices()
@@ -669,7 +670,7 @@ mod tests {
             .unwrap();
             assert_eq!(candidates.sharding(), &unreduced);
             shard_map(
-                |candidates: ProjectedValue<ArrayType, DomainTracer<Session<'_>>>| {
+                |candidates: ProjectedValue<ArrayType, DomainTracer<Session>>| {
                     candidates.parallel_reduce(reduction, "x")
                 },
                 candidates,
@@ -778,9 +779,9 @@ mod tests {
     /// this function, because each placement transfers shards between the processes or executes a compiled reshard
     /// over the devices of both.
     #[cfg(feature = "cuda-13")]
-    fn probe_cross_host_placements<'c>(
-        client: &'c Client<'c>,
-        place: impl Fn(Array<'c>, &Session<'c>, DevicePutTarget) -> Result<Array<'c>, Error>,
+    fn probe_cross_host_placements(
+        client: &'static Client<'static>,
+        place: impl Fn(Array, &Session, DevicePutTarget) -> Result<Array, Error>,
     ) {
         let rank = client.process_index().unwrap();
         match client.cross_host_transfers_extension() {
@@ -1227,14 +1228,18 @@ mod tests {
             return;
         };
         let plugin = load_cpu_plugin().unwrap();
-        let runtime = DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap();
-        let client = runtime
-            .create_client(
-                &plugin,
-                ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }),
-            )
-            .unwrap();
-        check_shard_map_multi_host_scenarios(&client);
+        // Sessions need a client that lives for the process, and so does the runtime whose key-value store it borrows.
+        let runtime: &'static DistributedRuntime =
+            Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap()));
+        let client: &'static Client<'static> = Box::leak(Box::new(
+            runtime
+                .create_client(
+                    &plugin,
+                    ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }),
+                )
+                .unwrap(),
+        ));
+        check_shard_map_multi_host_scenarios(client);
     }
 
     /// Joins the two-process CUDA job that [`run_cuda_rank_pair`] launched this process into as rank `process_index`,

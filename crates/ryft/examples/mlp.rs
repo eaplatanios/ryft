@@ -306,12 +306,7 @@ mod xla_backend {
     }
 
     /// Constructs a replicated `f32` array on the selected XLA device.
-    fn array<'c>(
-        session: &Session<'c>,
-        mesh: &DeviceMesh,
-        dimensions: &[usize],
-        values: &[f32],
-    ) -> ExampleResult<Array<'c>> {
+    fn array(session: &Session, mesh: &DeviceMesh, dimensions: &[usize], values: &[f32]) -> ExampleResult<Array> {
         let shape = Shape::new(dimensions.iter().copied().map(Dimension::Static).collect());
         let r#type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
@@ -319,7 +314,7 @@ mod xla_backend {
     }
 
     /// Copies a replicated `f32` XLA array back to the host.
-    fn read_f32s(array: &Array<'_>) -> ExampleResult<Vec<f32>> {
+    fn read_f32s(array: &Array) -> ExampleResult<Vec<f32>> {
         let shard =
             array.addressable_shards().next().ok_or_else(|| "xla result has no addressable shard".to_string())?;
         let bytes = shard
@@ -327,10 +322,7 @@ mod xla_backend {
             .ok_or_else(|| "xla result shard has no materialized buffer".to_string())?
             .copy_to_host(None)?
             .r#await()?;
-        Ok(bytes
-            .as_chunks::<{ size_of::<f32>() }>().0.iter()
-            .map(|bytes| f32::from_ne_bytes(*bytes))
-            .collect())
+        Ok(bytes.as_chunks::<{ size_of::<f32>() }>().0.iter().map(|bytes| f32::from_ne_bytes(*bytes)).collect())
     }
 
     /// Runs MLP training through XLA on the selected PJRT platform, over XLA arrays or, if `array_ir` is set, over

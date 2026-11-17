@@ -33,7 +33,7 @@ use crate::{Constant, Error, Program, Session, Tracer};
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies
 /// traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of type [`ArrayTracer`]) receive the same
 /// values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
-pub type ArrayTracer = ProjectedValue<ArrayType, Tracer<'static>>;
+pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
 
 /// Stages an arbitrary traced XLA function over global array types.
 ///
@@ -88,15 +88,12 @@ where
     Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     Output: Parameterized<ArrayType>,
     Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    F: FnOnce(
-        &DomainTracingContext<Session<'static>>,
-        Input::To<ArrayTracer>,
-    ) -> Result<Output::To<ArrayTracer>, ProgramError>,
+    F: FnOnce(&DomainTracingContext<Session>, Input::To<ArrayTracer>) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {
     let input_structure = global_input_types.parameter_structure();
     let output_structure = RefCell::new(None);
-    let (output_types, program) = DomainTracingContext::<Session<'static>>::trace_with_context_and_named_axes(
-        |context, inputs: Vec<Tracer<'static>>| {
+    let (output_types, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
+        |context, inputs: Vec<Tracer>| {
             let inputs = inputs
                 .into_iter()
                 .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))

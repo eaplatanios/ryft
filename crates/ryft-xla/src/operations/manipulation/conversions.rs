@@ -2012,8 +2012,8 @@ mod tests {
         let sharding = Sharding::replicated(mesh.clone(), 0);
         let scalar = ArrayType::scalar(DataType::F64);
         let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let (_, program) = DomainTracingContext::<Session<'static>>::trace_with_context_and_named_axes(
-            |context, inputs: Vec<Tracer<'static>>| {
+        let (_, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
+            |context, inputs: Vec<Tracer>| {
                 let inputs = inputs
                     .into_iter()
                     .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))

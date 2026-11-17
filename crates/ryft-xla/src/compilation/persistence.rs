@@ -481,7 +481,7 @@ pub(super) fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option
         .collect()
 }
 
-impl CompiledProgram<'_> {
+impl CompiledProgram {
     /// Serializes the executable and its versioned invocation contract, or returns `None` when PJRT does not support
     /// executable serialization. Persistent cache directories must be trusted sources of executable code.
     pub(crate) fn serialize(&self) -> Result<Option<Vec<u8>>, Error> {
@@ -552,14 +552,14 @@ impl CompiledProgram<'_> {
     }
 }
 
-impl<'c> Session<'c> {
+impl Session {
     /// Validates and loads a versioned executable envelope for this session. Unsupported schemas, target
     /// configurations, or PJRT loading return `None`. Malformed supported metadata returns an error.
     ///
     /// The envelope, target, runtime contracts, and signature mapping logical values to physical executable slots are
     /// validated before loading the native PJRT executable bytes. Persistent cache directories must be trusted sources
     /// of executable code.
-    pub(crate) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram<'c>>, Error> {
+    pub(crate) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram>, Error> {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         if bytes.len() < header_size {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
@@ -1578,18 +1578,18 @@ mod tests {
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
-        fn add_capture<'c>(
+        fn add_capture(
             _: Vec<Constant>,
-            captures: Vec<ryft_core::compilation::CompilationTracer<Session<'c>>>,
-            input: ryft_core::compilation::CompilationTracer<Session<'c>>,
-        ) -> Result<ryft_core::compilation::CompilationTracer<Session<'c>>, Error> {
+            captures: Vec<ryft_core::compilation::CompilationTracer<Session>>,
+            input: ryft_core::compilation::CompilationTracer<Session>,
+        ) -> Result<ryft_core::compilation::CompilationTracer<Session>, Error> {
             let capture = ValueProjection::<ArrayType>::into_projected(captures.into_iter().next().unwrap())
                 .map_err(ProgramError::from)?;
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
-        let staged: CoreStagedFunction<Session<'_>, ArrayIrType, ArrayIrType> =
-            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged: CoreStagedFunction<Session, ArrayIrType, ArrayIrType> =
+            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
                 add_capture,
                 vec![Value::Array(capture.clone())],
                 ArrayIrType::Array(input_type.clone()),
@@ -2107,7 +2107,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let first: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let first: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&first_session).unwrap().compile(&first_session).unwrap();
         assert_eq!(first_session.compilation_cache().statistics().compilations, 1);
         drop(first);
@@ -2117,7 +2117,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let _restored: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let _restored: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&second_session).unwrap().compile(&second_session).unwrap();
         let statistics = second_session.compilation_cache().statistics();
         assert_eq!(statistics.persistent_hits, 1);

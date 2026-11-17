@@ -129,9 +129,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
+    let client = &*Box::leak(Box::new(client));
     let device = Device::from_pjrt(&client.addressable_devices()?.remove(0))?;
     let mesh = DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto)?])?, vec![device])?;
-    let session = Session::builder().client(&client).build()?;
+    let session = Session::builder().client(client).build()?;
     let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?;
     let bytes = (0..8).flat_map(|index| (index as f32).to_ne_bytes()).collect::<Vec<_>>();
@@ -200,8 +201,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Warm JIT dispatch of `x + x`.
-    let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-        jit(|_, value: CompileTracer<'_>| Ok(value.add(&value)?), &session, mesh.clone());
+    let function: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+        jit(|_, value: CompileTracer| Ok(value.add(&value)?), &session, mesh.clone());
     if arguments.selects("jit_add") {
         results.insert("jit_add", measure(&arguments, || drop(function.execute((), input.clone()).unwrap())));
     }

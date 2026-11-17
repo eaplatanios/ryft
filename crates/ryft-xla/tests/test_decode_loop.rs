@@ -61,11 +61,13 @@ enum DecodeAttention {
 }
 
 /// Creates a CPU client with `device_count` devices.
-fn cpu_client(device_count: usize) -> Client<'static> {
-    load_cpu_plugin()
-        .unwrap()
-        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() }))
-        .unwrap()
+fn cpu_client(device_count: usize) -> &'static Client<'static> {
+    Box::leak(Box::new(
+        load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() }))
+            .unwrap(),
+    ))
 }
 
 /// Creates a mesh with one auto axis named `axis` of size `axis_size` over the addressable devices of `client`.
@@ -111,7 +113,7 @@ fn values_from_bytes<V: Copy>(bytes: &[u8]) -> Vec<V> {
 }
 
 /// Reads a replicated `f32` array back from the single test device.
-fn read_f32s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+fn read_f32s(client: &Client<'_>, array: &Array) -> Vec<f32> {
     let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
     let bytes = array
         .device_shard(device_id)
@@ -282,12 +284,12 @@ where
 /// Stages the decode loop demo as a `While` operation over the decode state of thirteen values. Both regions are
 /// traced with [`decode_step`] and a `position < steps` condition through the public tracing API, and the staged
 /// loop returns the decoded tokens together with the final key and value caches.
-fn build_decode_loop<'c>(
-    inputs: Vec<CompileTracer<'c>>,
+fn build_decode_loop(
+    inputs: Vec<CompileTracer>,
     configuration: &DecodeConfiguration,
     sampling: DecodeSampling,
     attention: DecodeAttention,
-) -> Vec<CompileTracer<'c>> {
+) -> Vec<CompileTracer> {
     let context = inputs[0].value().context().clone();
     let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayIrType>>();
     let steps = configuration.steps;
@@ -295,8 +297,8 @@ fn build_decode_loop<'c>(
     // The `While` condition and body region programs are staged in the XLA domain universe. Their tracers are
     // `StatefulCompileTracer`s, whose `ArrayType` projections are `CompileTracer`s, so the shared `decode_step`
     // model runs unchanged inside the staged regions and in the eager reference loop.
-    let (_, condition) = DomainTracingContext::<Session<'c>, Value<'c>>::trace(
-        |state: Vec<StatefulCompileTracer<'c>>| {
+    let (_, condition) = DomainTracingContext::<Session, Value>::trace(
+        |state: Vec<StatefulCompileTracer>| {
             let state = state
                 .into_iter()
                 .map(|value| ValueProjection::<ArrayType>::into_projected(value).unwrap())
@@ -308,8 +310,8 @@ fn build_decode_loop<'c>(
         carry_types.clone(),
     )
     .unwrap();
-    let (_, body) = DomainTracingContext::<Session<'c>, Value<'c>>::trace(
-        |state: Vec<StatefulCompileTracer<'c>>| {
+    let (_, body) = DomainTracingContext::<Session, Value>::trace(
+        |state: Vec<StatefulCompileTracer>| {
             let state = state
                 .into_iter()
                 .map(|value| ValueProjection::<ArrayType>::into_projected(value).unwrap())
@@ -470,7 +472,7 @@ fn handle_decode_attention_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(
 }
 
 /// Reads a replicated `i32` array back from the single test device.
-fn read_i32_array(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
+fn read_i32_array(client: &Client<'_>, array: &Array) -> Vec<i32> {
     let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
     let shard_bytes = array
         .device_shard(device_id)
@@ -491,7 +493,7 @@ fn read_i32_array(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
 fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
     let client = cpu_client(1);
     let mesh = domain_mesh(&client, "x", 1);
-    let engine = Session::builder().client(&client).build().unwrap();
+    let engine = Session::builder().client(client).build().unwrap();
     if attention == DecodeAttention::CustomCall {
         ensure_decode_attention_handler_registered(&client).unwrap();
     }
@@ -528,7 +530,7 @@ fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
     ];
     input_types.extend(weight_dimensions.iter().map(|dimensions| replicated(DataType::F32, dimensions)));
 
-    let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile(
+    let compiled: CompiledFunction<Vec<ArrayType>, Vec<ArrayType>> = compile(
         |inputs| build_decode_loop(inputs, &configuration, sampling, attention),
         input_types.clone(),
         &engine,

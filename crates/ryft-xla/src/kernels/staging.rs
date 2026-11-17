@@ -1376,6 +1376,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::session_with_client;
     use crate::{ArrayConstant, FromPjrt, JitCallOperation, Options, ProgramBuilder, Session};
 
@@ -1511,10 +1512,10 @@ pub(crate) mod tests {
     /// Compiles scalar derivative programs through the existing XLA session and waits for concrete results.
     fn execute_derivative(program: &FlatProgram, inputs: &[f32]) -> Vec<f32> {
         /// Keeps the traced input and output value lifetimes tied to the same execution client.
-        fn replay<'c>(
+        fn replay(
             program: &FlatProgram,
-            inputs: Vec<CompilationTracer<Session<'c>>>,
-        ) -> Result<Vec<CompilationTracer<Session<'c>>>, crate::Error> {
+            inputs: Vec<CompilationTracer<Session>>,
+        ) -> Result<Vec<CompilationTracer<Session>>, crate::Error> {
             let context = inputs[0].context().clone();
             Ok(program.interpret_in_context(&context, inputs)?)
         }
@@ -1526,7 +1527,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let session = session_with_client(&client).with_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Session<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
             program.input_types().into_owned(),
@@ -2207,12 +2208,11 @@ pub(crate) mod tests {
     #[test]
     fn test_kernel_execution_facts_from_target() {
         let plugin = ryft_pjrt::load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ryft_pjrt::ClientOptions::CPU(ryft_pjrt::CpuClientOptions {
-                device_count: Some(1),
-                ..Default::default()
-            }))
-            .unwrap();
+        let client = process_client(
+            &plugin,
+            ryft_pjrt::ClientOptions::CPU(ryft_pjrt::CpuClientOptions { device_count: Some(1), ..Default::default() }),
+        )
+        .unwrap();
         let devices = client.addressable_devices().unwrap();
         let mesh = ryft_core::DeviceMesh::new(
             ryft_core::LogicalMesh::new(vec![]).unwrap(),

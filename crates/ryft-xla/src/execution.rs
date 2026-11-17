@@ -264,19 +264,19 @@ impl ExecutionPlan {
 
 /// Physical input buffers of one PJRT execution, grouped by addressable device in the order in which
 /// [`LoadedExecutable::execute`] consumes them.
-pub struct ExecutionArguments<'o> {
+pub struct ExecutionArguments {
     /// Addressable devices in the same order as [`Self::inputs_by_device`].
     addressable_device_ids: Arc<[DeviceId]>,
 
     /// Execution inputs grouped by addressable device.
-    inputs_by_device: Vec<Vec<ExecutionInput<'o>>>,
+    inputs_by_device: Vec<Vec<ExecutionInput<'static>>>,
 }
 
-impl<'o> ExecutionArguments<'o> {
+impl ExecutionArguments {
     /// Creates execution arguments that pass `arrays` to [`ryft_pjrt::LoadedExecutable::execute`] without donating any
     /// of them. The inputs of each device are in `addressable_device_ids` order, and
     /// [`Self::as_execution_device_inputs`] converts the result to the form that PJRT consumes.
-    pub fn from_arrays(arrays: Vec<Array<'o>>, addressable_device_ids: &[DeviceId]) -> Result<Self, Error> {
+    pub fn from_arrays(arrays: Vec<Array>, addressable_device_ids: &[DeviceId]) -> Result<Self, Error> {
         let donation_flags = vec![false; arrays.len()];
         Self::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
     }
@@ -286,7 +286,7 @@ impl<'o> ExecutionArguments<'o> {
     /// shared (e.g., by another clone of the array or by a retained materialization cache). Callers that need to
     /// observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
     pub fn from_arrays_with_donation(
-        arrays: Vec<Array<'o>>,
+        arrays: Vec<Array>,
         addressable_device_ids: Arc<[DeviceId]>,
         donation_flags: &[bool],
     ) -> Result<Self, Error> {
@@ -306,7 +306,7 @@ impl<'o> ExecutionArguments<'o> {
         // looked up by device in constant time, and counting its buffers detects buffers on other devices.
         let mut inputs_by_device = (0..addressable_device_ids.len())
             .map(|_| Vec::with_capacity(arrays.len()))
-            .collect::<Vec<Vec<ExecutionInput<'o>>>>();
+            .collect::<Vec<Vec<ExecutionInput<'static>>>>();
         for (array_index, (array, requested)) in arrays.iter().zip(donation_flags).enumerate() {
             let donatable = *requested && array.has_unique_shard_buffers();
             for (device_inputs, &device_id) in inputs_by_device.iter_mut().zip(addressable_device_ids.iter()) {
@@ -339,18 +339,18 @@ impl<'o> ExecutionArguments<'o> {
     }
 
     /// Returns execution inputs grouped by device.
-    pub fn inputs_by_device(&self) -> &[Vec<ExecutionInput<'o>>] {
+    pub fn inputs_by_device(&self) -> &[Vec<ExecutionInput<'static>>] {
         self.inputs_by_device.as_slice()
     }
 
     /// Creates PJRT [`ExecutionDeviceInputs`] in the same device order as [`Self::addressable_device_ids`].
-    pub fn as_execution_device_inputs<'l>(&'l self) -> Vec<ExecutionDeviceInputs<'o, 'l>> {
+    pub fn as_execution_device_inputs<'l>(&'l self) -> Vec<ExecutionDeviceInputs<'static, 'l>> {
         self.inputs_by_device.iter().map(|inputs| ExecutionDeviceInputs::from(inputs.as_slice())).collect()
     }
 
     /// Appends one non-donatable hidden input per addressable device. The execution boundary validates the device
     /// assignment before calling this function, and hidden tokens never pass through numerical array construction.
-    fn push_input_buffers(&mut self, buffers: Vec<Arc<Buffer<'o>>>) {
+    fn push_input_buffers(&mut self, buffers: Vec<Arc<Buffer<'static>>>) {
         assert_eq!(buffers.len(), self.inputs_by_device.len());
         for (inputs, buffer) in self.inputs_by_device.iter_mut().zip(buffers) {
             inputs.push(ExecutionInput::from(buffer));
@@ -358,7 +358,7 @@ impl<'o> ExecutionArguments<'o> {
     }
 }
 
-impl std::fmt::Debug for ExecutionArguments<'_> {
+impl std::fmt::Debug for ExecutionArguments {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let input_counts = self.inputs_by_device.iter().map(Vec::len).collect::<Vec<_>>();
         formatter
@@ -369,7 +369,7 @@ impl std::fmt::Debug for ExecutionArguments<'_> {
     }
 }
 
-impl<'c> Session<'c> {
+impl Session {
     /// Initializes required extensions on the invoking session before compilation or native loading.
     pub(super) fn ensure_runtime_requirements(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
         if requirements.is_empty() {
@@ -379,7 +379,7 @@ impl<'c> Session<'c> {
     }
 
     /// Validates that this session's PJRT client owns `program`.
-    pub(super) fn validate_program_owner(&self, program: &CompiledProgram<'c>) -> Result<(), Error> {
+    pub(super) fn validate_program_owner(&self, program: &CompiledProgram) -> Result<(), Error> {
         if program.executable().is_owned_by(self.client()) {
             Ok(())
         } else {
@@ -399,9 +399,9 @@ impl<'c> Session<'c> {
     /// dependency.
     pub(crate) fn execute_compiled_async(
         &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Array<'c>>,
-    ) -> Result<Execution<Vec<Array<'c>>>, Error> {
+        program: &CompiledProgram,
+        inputs: Vec<Array>,
+    ) -> Result<Execution<Vec<Array>>, Error> {
         // Public call surfaces screen stateful programs out before reaching this entry point, because only the
         // stateful call path owns holder leases and pending generations. A stateful program arriving here must
         // therefore already carry state values as plain arrays (e.g., as ABI tests do), and its hidden outputs that
@@ -440,9 +440,9 @@ impl<'c> Session<'c> {
     /// effect scope retains effectful completion. Only pure calls without outputs explicitly wait.
     pub(super) fn execute_stateless(
         &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Value<'c>>,
-    ) -> Result<(Vec<Value<'c>>, ExecutionFence), Error> {
+        program: &CompiledProgram,
+        inputs: Vec<Value>,
+    ) -> Result<(Vec<Value>, ExecutionFence), Error> {
         if program.requires_stateful_call() {
             return Err(Error::Execution(ExecutionError::StatefulInvocationRequired));
         }
@@ -473,11 +473,7 @@ impl<'c> Session<'c> {
 
     /// Executes a program with array inputs. Output arrays retain completion, while an execution without outputs or
     /// effects waits here so failures remain observable.
-    pub(crate) fn execute_program(
-        &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Array<'c>>,
-    ) -> Result<Vec<Array<'c>>, Error> {
+    pub(crate) fn execute_program(&self, program: &CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Error> {
         let execution = self.execute_compiled_async(program, inputs)?;
         if execution.output().is_empty() && !program.signature().has_effects() {
             // No output array carries the execution fence out of this call, so an asynchronous execution error would
@@ -492,10 +488,10 @@ impl<'c> Session<'c> {
     /// Materializes and validates physical execution arguments without submitting device work.
     fn prepare_compiled_execution(
         &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Array<'c>>,
+        program: &CompiledProgram,
+        inputs: Vec<Array>,
         donation_overrides: &[(usize, bool)],
-    ) -> Result<PreparedExecution<'c>, Error> {
+    ) -> Result<PreparedExecution, Error> {
         ensure_effect_dispatch_allowed()?;
         self.validate_program_owner(program)?;
         if program.kernel_execution_facts().is_some() {
@@ -654,8 +650,8 @@ impl<'c> Session<'c> {
 
     /// Locks one stateful reference while preserving reference lifecycle errors through [`Error::Core`].
     fn lock_stateful_reference<'g>(
-        reference: &'g ArrayReference<Array<'c>>,
-    ) -> Result<ReadyOrPendingReferenceGuard<'g, Array<'c>>, Error> {
+        reference: &'g ArrayReference<Array>,
+    ) -> Result<ReadyOrPendingReferenceGuard<'g, Array>, Error> {
         reference.lock_storage().map_err(|error| {
             if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
                 Error::from(reference_error)
@@ -670,9 +666,9 @@ impl<'c> Session<'c> {
     /// without waiting for device completion when the logical boundary is static.
     fn execute_stateful_async(
         &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Value<'c>>,
-    ) -> StatefulExecution<Vec<Value<'c>>, Error> {
+        program: &CompiledProgram,
+        inputs: Vec<Value>,
+    ) -> StatefulExecution<Vec<Value>, Error> {
         if let Err(error) = ensure_effect_dispatch_allowed() {
             return StatefulExecution::ready(Err(error));
         }
@@ -725,7 +721,7 @@ impl<'c> Session<'c> {
             let (captures, public_inputs) = inputs.split_at(program.capture_count().min(inputs.len()));
             validate_reference_boundary(public_inputs.iter(), captures.iter()).map_err(ProgramError::from)?;
             let mut bindings =
-                Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states().len());
+                Vec::<(ReferenceId, ArrayReference<Array>)>::with_capacity(program.reference_states().len());
             for &logical_input_index in &reference_state_input_indices {
                 let reference = match inputs.get(logical_input_index) {
                     Some(Value::Reference(reference)) => reference.handle(),
@@ -806,7 +802,7 @@ impl<'c> Session<'c> {
                 let guards = bindings
                     .iter()
                     .map(|(_, reference)| Self::lock_stateful_reference(reference))
-                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, Array<'c>>>, Error>>()?;
+                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, Array>>, Error>>()?;
                 let observations =
                     guards.iter().map(ReadyOrPendingReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
                 let logical_inputs = inputs.as_ref().unwrap();
@@ -839,7 +835,7 @@ impl<'c> Session<'c> {
                 let guards = bindings
                     .iter()
                     .map(|(_, reference)| Self::lock_stateful_reference(reference))
-                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, Array<'c>>>, Error>>()?;
+                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, Array>>, Error>>()?;
                 if !guards.iter().zip(&observations).all(|(guard, observation)| observation.is_current(guard)) {
                     continue;
                 }
@@ -1072,11 +1068,11 @@ impl<'c> Session<'c> {
     ///     run when submission fails.
     fn execute_pjrt_buffers(
         &self,
-        program: &CompiledProgram<'c>,
-        mut arguments: ExecutionArguments<'c>,
+        program: &CompiledProgram,
+        mut arguments: ExecutionArguments,
         array_output_count: usize,
         after_submission: impl FnOnce(&ExecutionFence),
-    ) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, Error> {
+    ) -> Result<Execution<Vec<Vec<Buffer<'static>>>>, Error> {
         ensure_effect_dispatch_allowed()?;
         let addressable_device_count = arguments.addressable_device_ids().len();
         let ordered = program.signature().has_ordered_io();
@@ -1215,9 +1211,9 @@ impl<'c> Session<'c> {
         &self,
         mesh: &DeviceMesh,
         expected_shardings: &[Sharding],
-        inputs: Vec<Array<'c>>,
-    ) -> Result<Vec<Array<'c>>, Error> {
-        let matches = |array: &Array<'c>, expected: &Sharding| array.sharding() == expected && array.mesh() == mesh;
+        inputs: Vec<Array>,
+    ) -> Result<Vec<Array>, Error> {
+        let matches = |array: &Array, expected: &Sharding| array.sharding() == expected && array.mesh() == mesh;
         if inputs.iter().zip(expected_shardings).all(|(array, expected)| matches(array, expected)) {
             return Ok(inputs);
         }
@@ -1245,8 +1241,8 @@ impl<'c> Session<'c> {
     fn materialize_zero_space_carriers(
         &self,
         physical_input_types: &[ArrayType],
-        inputs: Vec<Array<'c>>,
-    ) -> Result<Vec<Array<'c>>, Error> {
+        inputs: Vec<Array>,
+    ) -> Result<Vec<Array>, Error> {
         assert_eq!(physical_input_types.len(), inputs.len());
         physical_input_types
             .iter()
@@ -1266,11 +1262,11 @@ impl<'c> Session<'c> {
     /// Reconstructs selected logical outputs from one submitted execution's physical buffers.
     fn reconstruct_compiled_outputs(
         &self,
-        program: &CompiledProgram<'c>,
-        physical_outputs: &mut [Option<Vec<Buffer<'c>>>],
+        program: &CompiledProgram,
+        physical_outputs: &mut [Option<Vec<Buffer<'static>>>],
         fence: ExecutionFence,
         logical_indices: impl IntoIterator<Item = usize>,
-    ) -> Result<Vec<Array<'c>>, Error> {
+    ) -> Result<Vec<Array>, Error> {
         // Programs with only static outputs build each output directly from its planned layout, without querying the
         // returned buffers or re-deriving their placement.
         if let Some(layouts) = &program.plan().output_layouts {
@@ -1388,12 +1384,12 @@ impl<'c> Session<'c> {
     }
 }
 
-impl<'c> StatefulCompilationDomain for Session<'c> {
+impl StatefulCompilationDomain for Session {
     fn execute_statefully(
         &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Value<'c>>,
-    ) -> StatefulExecution<Vec<Value<'c>>, Self::Error> {
+        program: &CompiledProgram,
+        inputs: Vec<Value>,
+    ) -> StatefulExecution<Vec<Value>, Self::Error> {
         self.execute_stateful_async(program, inputs)
     }
 }
@@ -1429,7 +1425,7 @@ pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> R
 }
 
 /// Validates output arity and refinement of the declared logical output types, including sharding.
-pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), Error> {
+pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array]) -> Result<(), Error> {
     if declared.len() != outputs.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
     }
@@ -1462,9 +1458,9 @@ impl ReferenceCompletionBackend for ReferenceCompletion {
 }
 
 /// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
-struct PreparedExecution<'c> {
+struct PreparedExecution {
     /// Fully materialized physical arrays in executable argument order.
-    inputs: Vec<Array<'c>>,
+    inputs: Vec<Array>,
 
     /// Addressable devices in executable order.
     addressable_device_ids: Arc<[DeviceId]>,
@@ -1479,9 +1475,9 @@ struct PreparedExecution<'c> {
     physical_output_count: usize,
 }
 
-impl<'c> PreparedExecution<'c> {
+impl PreparedExecution {
     /// Consumes the materialized arrays into PJRT arguments grouped by device.
-    fn into_arguments(self) -> Result<(ExecutionArguments<'c>, <ArrayType as Type>::Refinements, usize), Error> {
+    fn into_arguments(self) -> Result<(ExecutionArguments, <ArrayType as Type>::Refinements, usize), Error> {
         let arguments = ExecutionArguments::from_arrays_with_donation(
             self.inputs,
             self.addressable_device_ids,
@@ -1493,10 +1489,10 @@ impl<'c> PreparedExecution<'c> {
 
 /// Validates reconstructed logical outputs against the runtime input refinements.
 fn validate_compiled_output_refinements(
-    program: &CompiledProgram<'_>,
+    program: &CompiledProgram,
     input_refinements: &<ArrayType as Type>::Refinements,
     declared_output_types: &[ArrayType],
-    outputs: &[Array<'_>],
+    outputs: &[Array],
 ) -> Result<(), Error> {
     let mut closed_identities = Vec::new();
     for (_, identity) in
@@ -1539,6 +1535,7 @@ mod tests {
 
     use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
+    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_f32s, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, session_with_client, two_device_mesh,
@@ -1765,7 +1762,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), Some(1));
 
@@ -1836,7 +1833,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
             assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
 
@@ -2037,10 +2034,12 @@ mod tests {
     #[test]
     fn test_execution_arguments_from_arrays_executes_manual_computation_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .expect("failed to create 4-device CPU client");
-        let session = session_with_client(&client);
+        let client = process_client(
+            &plugin,
+            ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }),
+        )
+        .expect("failed to create 4-device CPU client");
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -2222,11 +2221,11 @@ mod tests {
             crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
-        let donated_staged: CoreStagedFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let donated_staged: CoreStagedFunction<Session, ArrayIrType, ArrayIrType> =
             crate::stage::<_, ArrayType, ArrayType>(
                 |input| input,
                 input_type.clone(),
@@ -2244,7 +2243,7 @@ mod tests {
         // Boolean values retain physical `i1` arguments and results while the identity over the zero data type has an
         // empty physical signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
-        let boolean_staged: CoreStagedFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let boolean_staged: CoreStagedFunction<Session, ArrayIrType, ArrayIrType> =
             crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
@@ -2286,7 +2285,7 @@ mod tests {
         let lowered = staged.lower(&session).unwrap();
         assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
         let compiled: ryft_core::compilation::CompiledFunction<
-            Session<'_>,
+            Session,
             (ArrayIrType, ArrayIrType),
             (ArrayIrType, ArrayIrType),
         > = lowered.compile(&session).unwrap();
@@ -2351,7 +2350,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let executable_options =
             compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
@@ -2647,7 +2646,7 @@ mod tests {
         let session = session_with_client(&client).with_mesh(mesh.clone());
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let device_values = |array: &Array<'_>| {
+        let device_values = |array: &Array| {
             array
                 .shards()
                 .iter()

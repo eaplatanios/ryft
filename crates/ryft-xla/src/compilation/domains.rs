@@ -28,10 +28,10 @@ use crate::{Constant, Error, ExecutionError, FlatProgram, OpShardingExtension, O
 
 // TODO(eaplatanios): Review this module.
 
-impl<'c> CompilationDomain for Session<'c> {
+impl CompilationDomain for Session {
     type DispatchKey = DispatchKey;
     type LoweredProgram = LoweredProgram;
-    type CompiledProgram = CompiledProgram<'c>;
+    type CompiledProgram = CompiledProgram;
     type Options = Options;
     type Error = Error;
 
@@ -48,7 +48,7 @@ impl<'c> CompilationDomain for Session<'c> {
 
     // The cached executable depends only on the types of the session constants of `program`, so their arrays are
     // resolved through this session's session for every request, including cache hits, as `SessionConstant` explains.
-    fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram<'c>>, Vec<Value<'c>>), Self::Error> {
+    fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram>, Vec<Value>), Self::Error> {
         let session_arrays = program
             .session_constants()
             .iter()
@@ -64,12 +64,12 @@ impl<'c> CompilationDomain for Session<'c> {
         Ok((compiled, session_arrays))
     }
 
-    fn execute(&self, program: &CompiledProgram<'c>, inputs: Vec<Value<'c>>) -> Result<Vec<Value<'c>>, Self::Error> {
+    fn execute(&self, program: &CompiledProgram, inputs: Vec<Value>) -> Result<Vec<Value>, Self::Error> {
         self.execute_stateless(program, inputs).map(|(outputs, _)| outputs)
     }
 }
 
-impl<'c> Session<'c> {
+impl Session {
     /// Lowers a staged program after validating that its boundary types carry the sharding overrides of its options and
     /// that no reference crosses its output boundary. This function implements
     /// [`CompilationDomain::lower`].
@@ -544,7 +544,7 @@ impl<'c> Session<'c> {
 
     /// Compiles a lowering through this session's client after resolving its runtime requirements, then derives the
     /// reusable execution plan.
-    pub(crate) fn compile_program(&self, program: &LoweredProgram) -> Result<CompiledProgram<'c>, Error> {
+    pub(crate) fn compile_program(&self, program: &LoweredProgram) -> Result<CompiledProgram, Error> {
         self.ensure_runtime_requirements(program.runtime_requirements())?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo().as_bytes().to_vec() };
         let compilation_start = Instant::now();
@@ -567,8 +567,8 @@ impl<'c> Session<'c> {
     /// Validates ownership and the complete invocation contract before replacing a compiled executable.
     pub(crate) fn validate_replacement(
         &self,
-        current: &CompiledProgram<'c>,
-        replacement: &CompiledProgram<'c>,
+        current: &CompiledProgram,
+        replacement: &CompiledProgram,
     ) -> Result<(), Error> {
         self.validate_program_owner(current)?;
         self.validate_program_owner(replacement)?;
@@ -576,7 +576,7 @@ impl<'c> Session<'c> {
     }
 }
 
-impl<'c> CompilationCacheDomain for Session<'c> {
+impl CompilationCacheDomain for Session {
     type CacheKey = CompilationKey;
 
     #[inline]
@@ -752,7 +752,7 @@ fn validate_output_shardings(output_types: &[ArrayIrType], options: &Options) ->
 /// allocation from the forwarded external reference. References returned by nested calls inside a program never cross
 /// that ABI, so only the outputs of the lowered program itself are checked.
 fn validate_reference_outputs(
-    program: &CoreFlatProgram<Session<'_>>,
+    program: &CoreFlatProgram<Session>,
     capture_count: usize,
     output_types: &[ArrayIrType],
 ) -> Result<(), Error> {
@@ -952,7 +952,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
         // Round-trip a small input through the `CompilationDomain` pipeline.
@@ -995,7 +995,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let _: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+            let _: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
                 staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
@@ -1016,15 +1016,15 @@ mod tests {
         // Reference inputs are structurally valid for stateful staging, but input sharding overrides that users provide
         // are not, because holder state derives its effective sharding from the compiled reference ABI. Lowering
         // rejects the overrides for staged functions whose input types did not receive them.
-        fn forward<'c>(
+        fn forward(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Session<'c>>>,
-            input: CompilationTracer<Session<'c>>,
-        ) -> Result<CompilationTracer<Session<'c>>, Error> {
+            _: Vec<CompilationTracer<Session>>,
+            input: CompilationTracer<Session>,
+        ) -> Result<CompilationTracer<Session>, Error> {
             Ok(input)
         }
         assert!(matches!(
-            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(forward,
+            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type.clone(),
                 Options::new(mesh.clone()).with_input_shardings(vec![scalar_sharding.clone()]),
@@ -1037,15 +1037,15 @@ mod tests {
 
         // A reference output with `output_shardings` stages successfully and is rejected when lowered, by the contract
         // of the ABI for reference outputs rather than by the output override, which never runs on a reference type.
-        fn allocate<'c>(
+        fn allocate(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Session<'c>>>,
-            input: CompilationTracer<Session<'c>>,
-        ) -> Result<CompilationTracer<Session<'c>>, Error> {
+            _: Vec<CompilationTracer<Session>>,
+            input: CompilationTracer<Session>,
+        ) -> Result<CompilationTracer<Session>, Error> {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
-            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(allocate,
+            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(allocate,
                 Vec::new(),
                 ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
                 Options::new(mesh.clone()).with_output_shardings(vec![scalar_sharding]),
@@ -1061,7 +1061,7 @@ mod tests {
         // Forwarding an external reference through an output is rejected by the same contract when lowered, because
         // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
-            CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(forward,
+            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(forward,
                 Vec::new(),
                 reference_type,
                 Options::new(mesh.clone()),
@@ -1081,17 +1081,17 @@ mod tests {
         let session = session_with_client(&client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        fn allocate_reference<'c>(
+        fn allocate_reference(
             _: Vec<Constant>,
-            _: Vec<StatefulCompileTracer<'c>>,
-            input: StatefulCompileTracer<'c>,
-        ) -> Result<StatefulCompileTracer<'c>, Error> {
+            _: Vec<StatefulCompileTracer>,
+            input: StatefulCompileTracer,
+        ) -> Result<StatefulCompileTracer, Error> {
             input.reference_new().map_err(Into::into)
         }
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             allocate_reference,
             Vec::new(),
             ArrayIrType::Array(array_type),
@@ -1116,17 +1116,17 @@ mod tests {
         let options = Options::new(mesh.clone())
             .with_input_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
 
-        fn forward<'c>(
+        fn forward(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Session<'c>>>,
-            input: CompilationTracer<Session<'c>>,
-        ) -> Result<CompilationTracer<Session<'c>>, Error> {
+            _: Vec<CompilationTracer<Session>>,
+            input: CompilationTracer<Session>,
+        ) -> Result<CompilationTracer<Session>, Error> {
             Ok(input)
         }
 
         // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
         // did not receive the requested input shardings before staging.
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             scalar_type.clone(),
@@ -1141,13 +1141,9 @@ mod tests {
         ));
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
-            forward,
-            Vec::new(),
-            input_types,
-            options,
-        )
-        .unwrap();
+        let staged =
+            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(forward, Vec::new(), input_types, options)
+                .unwrap();
         staged.lower(&session).unwrap();
     }
 
@@ -1174,19 +1170,19 @@ mod tests {
             Options::new(mesh.clone()).with_output_shardings(vec![sharded])
         };
 
-        fn forward<'c>(
+        fn forward(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Session<'c>>>,
-            input: CompilationTracer<Session<'c>>,
-        ) -> Result<CompilationTracer<Session<'c>>, Error> {
+            _: Vec<CompilationTracer<Session>>,
+            input: CompilationTracer<Session>,
+        ) -> Result<CompilationTracer<Session>, Error> {
             Ok(input)
         }
 
-        fn reshard<'c>(
+        fn reshard(
             _: Vec<Constant>,
-            _: Vec<CompilationTracer<Session<'c>>>,
-            input: CompilationTracer<Session<'c>>,
-        ) -> Result<CompilationTracer<Session<'c>>, Error> {
+            _: Vec<CompilationTracer<Session>>,
+            input: CompilationTracer<Session>,
+        ) -> Result<CompilationTracer<Session>, Error> {
             let mesh = <&ArrayType>::try_from(input.r#type().as_ref()).unwrap().sharding().unwrap().mesh().clone();
             Ok(input.reshard(&Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())?)
         }
@@ -1194,7 +1190,7 @@ mod tests {
         // Lowering checks rather than overwrites the placement that staged types track, so that calls of a staged
         // function return the output types of its executions.
         let mesh_explicit = mesh(MeshAxisType::Explicit);
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1208,7 +1204,7 @@ mod tests {
                               not carry the sharding `{mesh<['x'=2:explicit]>, [{'x'}]}` requested by \
                               `output_shardings`; reshard the outputs to their overrides before staging them",
         ));
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             reshard,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1220,7 +1216,7 @@ mod tests {
         // Staged types cannot record placement over auto mesh axes, so lowering applies it to the executable outputs,
         // whose types keep the staged placement while their runtime placements carry the override.
         let mesh_auto = mesh(MeshAxisType::Auto);
-        let staged = CoreStagedFunction::<Session<'_>, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_auto),
@@ -1789,7 +1785,7 @@ mod tests {
         )
         .unwrap();
         let outputs = session.execute_program(&compiled, vec![initial, update]).unwrap();
-        let shards = |array: &Array<'_>| {
+        let shards = |array: &Array| {
             array
                 .addressable_shards()
                 .map(|shard| {
@@ -2767,7 +2763,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let foreign: ryft_core::compilation::CompiledFunction<Session<'_>, ArrayIrType, ArrayIrType> =
+        let foreign: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 

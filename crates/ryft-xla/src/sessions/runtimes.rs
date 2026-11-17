@@ -284,7 +284,8 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 /// session's providers can therefore register again without bookkeeping that is global to the process, while native
 /// handlers look up their user data with the same constant ID.
 ///
-/// Providers and extensions may borrow the client without requiring a `'static` runtime. For example, a downstream
+/// Providers and extensions own their state, and they may hold the client, which lives for the rest of the process.
+/// For example, a downstream
 /// crate can add a contract that only registers native handlers alongside the built-in providers and annotate its
 /// custom calls with the same requirement.
 ///
@@ -302,9 +303,9 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///
 /// struct Provider;
 /// struct Runtime<'c> { client: &'c Client<'c> }
-/// impl<'c> RuntimeExtension<'c> for Runtime<'c> {}
+/// impl<'c> RuntimeExtension for Runtime<'c> {}
 ///
-/// impl<'c> RuntimeProvider<'c> for Provider {
+/// impl<'c> RuntimeProvider for Provider {
 ///     fn identifier(&self) -> &str { "example.runtime" }
 ///
 ///     fn initialize(
@@ -312,7 +313,7 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///         client: &'c Client<'c>,
 ///         target: &Target,
 ///         requirement: &RuntimeRequirement,
-///     ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+///     ) -> Result<Arc<dyn RuntimeExtension + 'c>, Error> {
 ///         if requirement.abi_version() != 1 {
 ///             return Err(RuntimeError::UnsupportedVersion {
 ///                 identifier: self.identifier().into(), version: requirement.abi_version(),
@@ -323,7 +324,7 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///     }
 /// }
 ///
-/// fn configure<'c>(client: &'c Client<'c>) -> Result<Session<'c>, Error> {
+/// fn configure<'c>(client: &'c Client<'c>) -> Result<Session, Error> {
 ///     let providers = RuntimeExtensions::new().with_provider(Arc::new(Provider))?;
 ///     let requirement = RuntimeRequirement::new("example.runtime", 1, [])?;
 ///     let operation = with_runtime_requirements(CustomCallOperation::new("example.call", vec![]), [requirement])?;
@@ -331,7 +332,7 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///     Session::builder().client(client).runtime_extensions(providers).build()
 /// }
 /// ```
-pub trait RuntimeProvider<'c>: Send + Sync {
+pub trait RuntimeProvider: Send + Sync {
     /// Returns the contract identifier this provider implements.
     fn identifier(&self) -> &str;
 
@@ -340,10 +341,10 @@ pub trait RuntimeProvider<'c>: Send + Sync {
     /// progress.
     fn initialize(
         &self,
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
         target: &Target,
         requirement: &RuntimeRequirement,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error>;
+    ) -> Result<Arc<dyn RuntimeExtension>, Error>;
 }
 
 /// Live extension instance shared by calls through one session.
@@ -351,7 +352,7 @@ pub trait RuntimeProvider<'c>: Send + Sync {
 /// The session keeps its stable allocation alive until all executions borrowing extension data have completed.
 /// Implementations must synchronize native handler access across devices and threads. Extensions that only register
 /// native handlers may use the default preparation behavior, which does not create an execution context. A runtime
-/// borrowing its client cannot escape that client.
+/// cannot borrow a client that does not live for the rest of the process.
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
@@ -359,13 +360,13 @@ pub trait RuntimeProvider<'c>: Send + Sync {
 /// use ryft_xla::sessions::RuntimeExtension;
 ///
 /// struct BorrowedRuntime<'c>(&'c Client<'c>);
-/// impl<'c> RuntimeExtension<'c> for BorrowedRuntime<'c> {}
+/// impl<'c> RuntimeExtension for BorrowedRuntime<'c> {}
 ///
-/// fn escaped<'c>(client: Client<'c>) -> Arc<dyn RuntimeExtension<'c> + 'c> {
+/// fn escaped<'c>(client: Client<'c>) -> Arc<dyn RuntimeExtension + 'c> {
 ///     Arc::new(BorrowedRuntime(&client))
 /// }
 /// ```
-pub trait RuntimeExtension<'c>: Send + Sync {
+pub trait RuntimeExtension: Send + Sync {
     /// Checks the device and participant restrictions of an invocation before native submission.
     fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
         let _ = (client, mesh);
@@ -373,7 +374,7 @@ pub trait RuntimeExtension<'c>: Send + Sync {
     }
 
     /// Attaches invocation data and retains any additional owners needed through completion.
-    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+    fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
         let _ = resources;
         Ok(())
     }
@@ -384,12 +385,12 @@ pub trait RuntimeExtension<'c>: Send + Sync {
 /// Configure [`RuntimeProvider`]s before constructing a [`Session`](crate::Session). Each session initializes its own
 /// instances lazily when a compiled program requires them.
 #[derive(Clone)]
-pub struct RuntimeExtensions<'c> {
+pub struct RuntimeExtensions {
     /// Providers keyed by their public contract identifiers.
-    providers: BTreeMap<String, Arc<dyn RuntimeProvider<'c> + 'c>>,
+    providers: BTreeMap<String, Arc<dyn RuntimeProvider>>,
 }
 
-impl<'c> RuntimeExtensions<'c> {
+impl RuntimeExtensions {
     /// Creates the built-in configuration. Providers are lazy, so this does not load accelerator drivers.
     pub fn new() -> Self {
         let mut configuration = Self::empty();
@@ -409,7 +410,7 @@ impl<'c> RuntimeExtensions<'c> {
     }
 
     /// Adds a provider, rejecting a duplicate identifier.
-    pub fn with_provider(mut self, provider: Arc<dyn RuntimeProvider<'c> + 'c>) -> Result<Self, Error> {
+    pub fn with_provider(mut self, provider: Arc<dyn RuntimeProvider>) -> Result<Self, Error> {
         validate_identifier(provider.identifier())?;
         let identifier = provider.identifier().to_owned();
         if self.providers.contains_key(&identifier) {
@@ -422,7 +423,7 @@ impl<'c> RuntimeExtensions<'c> {
     /// Explicitly replaces a configured provider before session construction. This does not replace an incompatible
     /// native registration that is global to the plugin and does not mutate existing sessions using a cloned
     /// configuration.
-    pub fn with_replaced_provider(mut self, provider: Arc<dyn RuntimeProvider<'c> + 'c>) -> Result<Self, Error> {
+    pub fn with_replaced_provider(mut self, provider: Arc<dyn RuntimeProvider>) -> Result<Self, Error> {
         validate_identifier(provider.identifier())?;
         let identifier = provider.identifier().to_owned();
         if !self.providers.contains_key(&identifier) {
@@ -438,13 +439,13 @@ impl<'c> RuntimeExtensions<'c> {
     }
 }
 
-impl Default for RuntimeExtensions<'_> {
+impl Default for RuntimeExtensions {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Debug for RuntimeExtensions<'_> {
+impl Debug for RuntimeExtensions {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RuntimeExtensions")
@@ -460,9 +461,9 @@ impl Debug for RuntimeExtensions<'_> {
 /// including when outputs are discarded. Extensions contribute to one lazily created execution context. Ordinary
 /// execution and extensions that only register native handlers create no context and introduce no additional
 /// destruction barrier.
-pub struct ExecutionResources<'c> {
+pub struct ExecutionResources {
     /// Client receiving this invocation's context.
-    client: &'c Client<'c>,
+    client: &'static Client<'static>,
 
     /// Native context, allocated only when invocation data is first attached. Fields drop in declaration order, so
     /// this context is destroyed before the retained owners, including when preparation fails.
@@ -472,19 +473,19 @@ pub struct ExecutionResources<'c> {
     user_data: HashSet<FfiTypeId>,
 
     /// Additional owners with the same lifetime as the invoking session's client.
-    retained: Vec<Box<dyn RetainedResource + 'c>>,
+    retained: Vec<Box<dyn RetainedResource>>,
 }
 
-impl<'c> ExecutionResources<'c> {
+impl ExecutionResources {
     /// Returns the client receiving the invocation.
-    pub fn client(&self) -> &'c Client<'c> {
+    pub fn client(&self) -> &'static Client<'static> {
         self.client
     }
 
     /// Retains an owner until the whole execution completes. Use a stable allocation such as `Arc` or `Box` when native
     /// user data points into the retained value, because moving a stack value into this function does not preserve its
     /// address.
-    pub fn retain<T: 'c + Send + Sync>(&mut self, owner: T) {
+    pub fn retain<T: 'static + Send + Sync>(&mut self, owner: T) {
         self.retained.push(Box::new(owner));
     }
 
@@ -521,7 +522,7 @@ impl<'c> ExecutionResources<'c> {
     }
 
     /// Separates native context ownership from the resource lease that the session owns.
-    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources<'c>) {
+    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources) {
         let Self { context, retained, .. } = self;
         let needed = context.is_some() || !retained.is_empty();
         (context, RetainedExecutionResources { needed, _owners: retained })
@@ -529,32 +530,32 @@ impl<'c> ExecutionResources<'c> {
 }
 
 /// Invocation ownership retained by the session only when extensions borrow runtime data.
-pub(crate) struct RetainedExecutionResources<'c> {
+pub(crate) struct RetainedExecutionResources {
     /// Whether the invocation borrowed data, even if its owner is the session's runtime instance itself.
     needed: bool,
 
     /// Additional retained owners, destroyed after the whole execution completes.
-    _owners: Vec<Box<dyn RetainedResource + 'c>>,
+    _owners: Vec<Box<dyn RetainedResource>>,
 }
 
 /// Runtime instances of one session and the ownership of the resources of its pending executions.
-pub(crate) struct RuntimeRegistry<'c> {
+pub(crate) struct RuntimeRegistry {
     /// Externally owned client associated with all initialized instances.
-    client: &'c Client<'c>,
+    client: &'static Client<'static>,
 
     /// Frozen provider configuration, shared by value rather than sharing initialized instances.
-    configuration: RuntimeExtensions<'c>,
+    configuration: RuntimeExtensions,
 
     /// Initialization slots, one for each requirement.
-    instances: Mutex<HashMap<RuntimeRequirement, Arc<RuntimeInitialization<'c>>>>,
+    instances: Mutex<HashMap<RuntimeRequirement, Arc<RuntimeInitialization>>>,
 
     /// Only launches that borrow extension resources, not ordinary PJRT work.
-    pending: Mutex<Vec<PendingExecution<'c>>>,
+    pending: Mutex<Vec<PendingExecution>>,
 }
 
-impl<'c> RuntimeRegistry<'c> {
+impl RuntimeRegistry {
     /// Attaches immutable provider configuration to a new session.
-    pub(super) fn new(client: &'c Client<'c>, configuration: RuntimeExtensions<'c>) -> Self {
+    pub(super) fn new(client: &'static Client<'static>, configuration: RuntimeExtensions) -> Self {
         Self { client, configuration, instances: Mutex::new(HashMap::new()), pending: Mutex::new(Vec::new()) }
     }
 
@@ -572,7 +573,7 @@ impl<'c> RuntimeRegistry<'c> {
         requirements: &[RuntimeRequirement],
         target: &Target,
         mesh: &DeviceMesh,
-    ) -> Result<ExecutionResources<'c>, Error> {
+    ) -> Result<ExecutionResources, Error> {
         let mut resources =
             ExecutionResources { client: self.client, context: None, user_data: HashSet::new(), retained: Vec::new() };
         for requirement in normalize_runtime_requirements(requirements.iter().cloned())? {
@@ -584,7 +585,7 @@ impl<'c> RuntimeRegistry<'c> {
     }
 
     /// Retains successful submission resources before any fallible result reconstruction.
-    pub(crate) fn retain(&self, fence: &ExecutionFence, resources: RetainedExecutionResources<'c>) {
+    pub(crate) fn retain(&self, fence: &ExecutionFence, resources: RetainedExecutionResources) {
         if !resources.needed {
             return;
         }
@@ -611,11 +612,7 @@ impl<'c> RuntimeRegistry<'c> {
     }
 
     /// Initializes outside registry locks and publishes one stable successful instance.
-    fn instance(
-        &self,
-        requirement: &RuntimeRequirement,
-        target: &Target,
-    ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+    fn instance(&self, requirement: &RuntimeRequirement, target: &Target) -> Result<Arc<dyn RuntimeExtension>, Error> {
         let provider = self
             .configuration
             .providers
@@ -683,7 +680,7 @@ impl<'c> RuntimeRegistry<'c> {
     }
 }
 
-impl Drop for RuntimeRegistry<'_> {
+impl Drop for RuntimeRegistry {
     fn drop(&mut self) {
         let pending = std::mem::take(self.pending.get_mut().expect("runtime completion mutex poisoned"));
         // Native handlers may still read the retained resources of pending executions, so each execution must reach a
@@ -733,7 +730,7 @@ trait RetainedResource: Send + Sync {}
 impl<T: Send + Sync> RetainedResource for T {}
 
 /// Initialization state for one session and complete runtime descriptor.
-enum Initialization<'c> {
+enum Initialization {
     /// No successful instance has been published.
     Empty,
 
@@ -741,28 +738,28 @@ enum Initialization<'c> {
     Running(ThreadId),
 
     /// Immutable stable instance shared by later calls.
-    Ready(Arc<dyn RuntimeExtension<'c> + 'c>),
+    Ready(Arc<dyn RuntimeExtension>),
 }
 
 /// Independent synchronization for one runtime, so unrelated initialization does not serialize.
-struct RuntimeInitialization<'c> {
+struct RuntimeInitialization {
     /// Mutable initialization state.
-    state: Mutex<Initialization<'c>>,
+    state: Mutex<Initialization>,
 
     /// Notification after successful initialization or retryable failure.
     ready: Condvar,
 }
 
 /// Resets an unfinished initializer on error or unwind, without poisoning the instance slot.
-struct InitializationGuard<'o, 'c> {
+struct InitializationGuard<'o> {
     /// Slot whose running state must be cleared unless publication succeeds.
-    slot: &'o RuntimeInitialization<'c>,
+    slot: &'o RuntimeInitialization,
 
     /// Whether initialization still needs rollback.
     active: bool,
 }
 
-impl Drop for InitializationGuard<'_, '_> {
+impl Drop for InitializationGuard<'_> {
     fn drop(&mut self) {
         if self.active {
             *self.slot.state.lock().expect("runtime initialization mutex poisoned") = Initialization::Empty;
@@ -772,12 +769,12 @@ impl Drop for InitializationGuard<'_, '_> {
 }
 
 /// One execution that uses extensions and whose resources outlive discarded output handles.
-struct PendingExecution<'c> {
+struct PendingExecution {
     /// Completion of every participating device and native context cleanup.
     fence: ExecutionFence,
 
     /// Borrowed invocation resources retained until the fence is terminal.
-    _resources: RetainedExecutionResources<'c>,
+    _resources: RetainedExecutionResources,
 }
 
 /// Decodes configuration without constructing an oversized byte vector from persisted metadata.
@@ -836,24 +833,24 @@ mod tests {
     use super::*;
 
     /// Factory borrowing test counters, demonstrating a non-`'static` provider configuration.
-    struct CountingProvider<'c> {
+    struct CountingProvider {
         /// Contract identity used by the fixture.
         identifier: &'static str,
 
         /// Number of actual initializer calls.
-        calls: &'c AtomicUsize,
+        calls: &'static AtomicUsize,
 
         /// Whether the next initialization must fail before publishing an instance.
-        fail: &'c AtomicBool,
+        fail: &'static AtomicBool,
 
         /// Optional counter of the resources of each invocation that have been destroyed.
         drops: Option<Arc<AtomicUsize>>,
     }
 
     /// Instance borrowing the client, whose optional resources must be retained through the whole launch.
-    struct CountingRuntime<'c> {
+    struct CountingRuntime {
         /// Borrowed client checked during invocation preparation.
-        client: &'c Client<'c>,
+        client: &'static Client<'static>,
 
         /// Optional counter of the resources of each invocation that have been destroyed.
         drops: Option<Arc<AtomicUsize>>,
@@ -868,17 +865,17 @@ mod tests {
         }
     }
 
-    impl<'c> RuntimeProvider<'c> for CountingProvider<'c> {
+    impl RuntimeProvider for CountingProvider {
         fn identifier(&self) -> &str {
             self.identifier
         }
 
         fn initialize(
             &self,
-            client: &'c Client<'c>,
+            client: &'static Client<'static>,
             target: &Target,
             requirement: &RuntimeRequirement,
-        ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+        ) -> Result<Arc<dyn RuntimeExtension>, Error> {
             let _ = target;
             validate_builtin_requirement(requirement, self.identifier)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -889,8 +886,8 @@ mod tests {
         }
     }
 
-    impl<'c> RuntimeExtension<'c> for CountingRuntime<'c> {
-        fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+    impl RuntimeExtension for CountingRuntime {
+        fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
             assert!(std::ptr::eq(self.client, resources.client()));
             if let Some(drops) = &self.drops {
                 resources.retain(DropCounter(Arc::clone(drops)));
@@ -1050,11 +1047,11 @@ mod tests {
 
     #[test]
     fn test_runtime_extensions_with_provider_and_replacement() {
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let provider = || {
-            Arc::new(CountingProvider { identifier: "test.provider", calls: &calls, fail: &fail, drops: None })
-                as Arc<dyn RuntimeProvider<'_>>
+            Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None })
+                as Arc<dyn RuntimeProvider>
         };
         let configuration = RuntimeExtensions::empty().with_provider(provider()).unwrap();
         assert_eq!(configuration.identifiers().collect::<Vec<_>>(), vec!["test.provider"]);
@@ -1072,15 +1069,10 @@ mod tests {
 
     #[test]
     fn test_runtime_extensions_debug() {
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
-                drops: None,
-            }))
+            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
         assert_eq!(format!("{:?}", RuntimeExtensions::empty()), "RuntimeExtensions { identifiers: [] }");
         assert_eq!(format!("{configuration:?}"), r#"RuntimeExtensions { identifiers: ["test.provider"] }"#);
@@ -1089,15 +1081,10 @@ mod tests {
     #[test]
     fn test_runtime_registry_ensure_initializes_once_per_session_and_retries_failure() {
         let client = execution_client();
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(true);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
         let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
-                drops: None,
-            }))
+            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
         let first = Session::builder().client(&client).runtime_extensions(configuration.clone()).build().unwrap();
         let second = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
@@ -1120,15 +1107,10 @@ mod tests {
     #[test]
     fn test_runtime_registry_ensure_initializes_once_under_concurrent_calls() {
         let client = execution_client();
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
-                drops: None,
-            }))
+            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
         let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
         let target = session.target().unwrap();
@@ -1145,26 +1127,26 @@ mod tests {
     #[test]
     fn test_runtime_registry_ensure_retries_after_recursion_and_unwind() {
         /// Provider that first reenters the session and then panics before succeeding.
-        struct ReentrantProvider<'c> {
+        struct ReentrantProvider {
             /// Association used solely to exercise recursive initialization, which the test clears at its end to
             /// break the ownership cycle between the session and its provider.
-            session: Mutex<Option<Session<'c>>>,
+            session: Mutex<Option<Session>>,
 
             /// Number of attempts, selecting the fixture's successive failure modes.
             calls: AtomicUsize,
         }
 
-        impl<'c> RuntimeProvider<'c> for ReentrantProvider<'c> {
+        impl RuntimeProvider for ReentrantProvider {
             fn identifier(&self) -> &str {
                 "test.recursive"
             }
 
             fn initialize(
                 &self,
-                client: &'c Client<'c>,
+                client: &'static Client<'static>,
                 target: &Target,
                 requirement: &RuntimeRequirement,
-            ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+            ) -> Result<Arc<dyn RuntimeExtension>, Error> {
                 match self.calls.fetch_add(1, Ordering::SeqCst) {
                     0 => {
                         let session = self.session.lock().unwrap().clone().unwrap();
@@ -1198,7 +1180,7 @@ mod tests {
     #[test]
     fn test_runtime_registry_ensure_rejects_concurrent_initialization_cycles() {
         /// Two providers that attempt to initialize each other on separate threads.
-        struct DependentProvider<'c> {
+        struct DependentProvider {
             /// This provider's public contract identifier.
             identifier: &'static str,
 
@@ -1207,7 +1189,7 @@ mod tests {
 
             /// Association permitting reentry, which the test clears at its end to break the ownership cycle
             /// between the session and its providers.
-            session: Mutex<Option<Session<'c>>>,
+            session: Mutex<Option<Session>>,
 
             /// Rendezvous ensuring both outer initializers have started before either reenters.
             started: Arc<std::sync::Barrier>,
@@ -1216,17 +1198,17 @@ mod tests {
             reenter: AtomicBool,
         }
 
-        impl<'c> RuntimeProvider<'c> for DependentProvider<'c> {
+        impl RuntimeProvider for DependentProvider {
             fn identifier(&self) -> &str {
                 self.identifier
             }
 
             fn initialize(
                 &self,
-                client: &'c Client<'c>,
+                client: &'static Client<'static>,
                 target: &Target,
                 requirement: &RuntimeRequirement,
-            ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+            ) -> Result<Arc<dyn RuntimeExtension>, Error> {
                 let _ = requirement;
                 if self.reenter.swap(false, Ordering::SeqCst) {
                     self.started.wait();
@@ -1300,15 +1282,10 @@ mod tests {
     #[test]
     fn test_runtime_registry_prepare_registration_only_creates_no_context_or_retained_launch() {
         let client = execution_client();
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
-                drops: None,
-            }))
+            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
         let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1329,14 +1306,14 @@ mod tests {
     #[test]
     fn test_runtime_registry_retain_releases_completed_resources_without_session_drop() {
         let client = execution_client();
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let drops = Arc::new(AtomicUsize::new(0));
         let configuration = RuntimeExtensions::empty()
             .with_provider(Arc::new(CountingProvider {
                 identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
+                calls,
+                fail,
                 drops: Some(Arc::clone(&drops)),
             }))
             .unwrap();
@@ -1364,14 +1341,14 @@ mod tests {
     #[test]
     fn test_runtime_registry_drop_retains_resources_after_dropped_outputs() {
         let client = execution_client();
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
+        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let drops = Arc::new(AtomicUsize::new(0));
         let configuration = RuntimeExtensions::empty()
             .with_provider(Arc::new(CountingProvider {
                 identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
+                calls,
+                fail,
                 drops: Some(Arc::clone(&drops)),
             }))
             .unwrap();

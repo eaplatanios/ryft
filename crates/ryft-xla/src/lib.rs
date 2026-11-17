@@ -97,7 +97,7 @@ pub use values::{ArrayConstant, Constant, Dimension, Reference, Value};
 pub(crate) mod tests {
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::mem::MaybeUninit;
-    use std::sync::{Once, OnceLock};
+    use std::sync::{Mutex, Once, OnceLock};
 
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
@@ -111,34 +111,51 @@ pub(crate) mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
+    use crate::sessions::platforms::process_client;
     use crate::{Array, FromPjrt, Session};
 
-    /// Creates a CPU client with `device_count` addressable devices, for tests that need a fixed device count or that
-    /// exercise CPU-only behavior. Tests that only need some single device use [`execution_client`] instead.
-    pub(crate) fn cpu_client(device_count: usize) -> Client<'static> {
-        load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() }))
-            .unwrap()
+    /// Returns the process-wide CPU client with `device_count` addressable devices, for tests that need a fixed device
+    /// count or that exercise CPU-only behavior. Tests that only need some single device use [`execution_client`]
+    /// instead. Clients live for the rest of the process, so all tests that request the same device count share one
+    /// client.
+    pub(crate) fn cpu_client(device_count: usize) -> &'static Client<'static> {
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() });
+        process_client(&load_cpu_plugin().unwrap(), options).unwrap()
     }
 
-    /// Creates an execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
+    /// Returns a process-wide CPU client with `device_count` addressable devices that is distinct from every client
+    /// that [`cpu_client`] and [`execution_client`] return, for tests of behavior across two clients. All tests that
+    /// request the same device count share one such client.
+    pub(crate) fn other_cpu_client(device_count: usize) -> &'static Client<'static> {
+        static CLIENTS: Mutex<Vec<(usize, &'static Client<'static>)>> = Mutex::new(Vec::new());
+        let mut clients = CLIENTS.lock().unwrap();
+        if let Some((_, client)) = clients.iter().find(|(count, _)| *count == device_count) {
+            return client;
+        }
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() });
+        let client: &'static Client<'static> = Box::leak(Box::new(load_cpu_plugin().unwrap().client(options).unwrap()));
+        clients.push((device_count, client));
+        client
+    }
+
+    /// Returns the process-wide execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
     ///
     /// The default is `cpu`; `cuda-13` explicitly requires the corresponding feature, plugin, and a CUDA device.
     /// Selection errors fail the test instead of silently falling back to CPU or skipping GPU coverage.
-    pub(crate) fn execution_client() -> Client<'static> {
+    pub(crate) fn execution_client() -> &'static Client<'static> {
         let platform = std::env::var("RYFT_TEST_EXECUTION_PLATFORM").unwrap_or_else(|_| "cpu".to_string());
         let client = match platform.as_str() {
             "cpu" => cpu_client(1),
             #[cfg(feature = "cuda-13")]
-            "cuda-13" => load_cuda_13_plugin()
-                .unwrap()
-                .client(ClientOptions::GPU(GpuClientOptions {
+            "cuda-13" => process_client(
+                &load_cuda_13_plugin().unwrap(),
+                ClientOptions::GPU(GpuClientOptions {
                     platform: Some(GpuPlatform::CUDA),
                     allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                     ..Default::default()
-                }))
-                .unwrap(),
+                }),
+            )
+            .unwrap(),
             _ => panic!("unsupported execution platform `{platform}`; CUDA testing requires `--features cuda-13`"),
         };
         let expected = if platform == "cpu" { "cpu" } else { "cuda" };
@@ -199,13 +216,13 @@ pub(crate) mod tests {
 
     /// Uploads `bytes` as an [`Array`] of element type `data_type` and shape `dimensions` that is replicated over
     /// `mesh`. Read it back with [`Array::copy_to_host`] and [`values_from_bytes`].
-    pub(crate) fn replicated_array<'c>(
-        session: &Session<'c>,
+    pub(crate) fn replicated_array(
+        session: &Session,
         mesh: &DeviceMesh,
         data_type: DataType,
         dimensions: &[usize],
         bytes: &[u8],
-    ) -> Array<'c> {
+    ) -> Array {
         let r#type = ArrayType::new(data_type, StaticShape::new(dimensions.to_vec()).into())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
             .unwrap();

@@ -948,7 +948,7 @@ mod tests {
         let output_type = ArrayType::new_static(DataType::C64, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             |value| value.convert_element_type(DataType::C64).unwrap().broadcast(output_type.clone(), &[1]).unwrap(),
             input_type.clone(),
             &engine,
