@@ -125,41 +125,36 @@ pub use targets::{Target, TargetDevice};
 /// [`SessionBuilder::eager_dispatch_cache_capacity`] overrides.
 const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
-/// [`Client`].
+/// [`Client`]. A session is the handle through which Ryft's XLA backend executes on a client. Every [`Array`] carries
+/// the session that it belongs to, so eager operations and transforms recover their execution context from their
+/// inputs, and first-class dimensions can produce arrays (e.g., when compared or converted to scalars) without an
+/// explicit context. Handles are cheap to clone. Build one session per client and derive every other handle from it
+/// (i.e., through [`Clone`], [`Self::with_mesh`], or [`Self::with_new_effect_scope`]) so that all arrays on that client
+/// share one compilation cache and one set of runtime extensions. Separate sessions remain independent, even on the
+/// same client, so building a second session is an explicit request for an isolated cache and effect ordering. Cached
+/// executables retain neither sessions nor arrays, so the ownership graph has no cycle between caches and sessions.
 ///
-/// A session is the handle through which `ryft-xla` executes on a client. Every [`Array`] carries the session that it
-/// belongs to, so eager operations and transforms recover their execution context from their inputs, and first-class
-/// dimensions can produce arrays (e.g., when compared or converted to scalars) without an explicit context. Handles are
-/// cheap to clone. Build one session per client and derive every other handle from it (i.e., through [`Clone`],
-/// [`Self::with_mesh`], or [`Self::with_new_effect_scope`]) so that all arrays on that client share one compilation
-/// cache and one set of runtime extensions, much like JAX's process-wide caches. Separate sessions remain independent,
-/// even on the same client, so building a second session is an explicit request for an isolated cache and effect
-/// ordering. Cached executables retain neither sessions nor arrays, so the ownership graph has no cycle between caches
-/// and sessions.
-///
-/// The same type covers both staging and concrete execution. Every session is backed by a live PJRT client. Tracing
-/// only uses the session as a type witness and never needs an instance without a client, while compiling ahead of time
+/// The same type covers both staging and eager execution. Every session is backed by a live PJRT client. Tracing only
+/// uses the session as a type witness and never needs an instance without a client, while compiling ahead of time
 /// without devices requires an abstraction of compilation targets rather than a session without a client.
 ///
 /// # Construction
 ///
-/// [`Self::new`] creates a session with the default configuration, which runs on a client that the session creates
-/// for the best available [`Platform`]. [`Self::builder`] returns a [`SessionBuilder`] for everything else.
+/// [`Self::new`] creates a session with the default configuration, which runs on a client that the session
+/// creates for the best available [`Platform`]. [`Self::builder`] returns a [`SessionBuilder`] for everything else.
 /// [`SessionBuilder::platform`], [`SessionBuilder::plugin`], and [`SessionBuilder::client_options`] select and
 /// configure the client that the session creates. Clients that are created this way are shared by the sessions that
 /// request the same configuration. [`SessionBuilder::client`] instead takes a client that the caller created, which
-/// is the extension point for clients that `ryft-xla` cannot create. Every client of a session lives for the rest of
-/// the process and is never destroyed, like the backend clients of JAX, which is why sessions and their values carry
-/// no lifetime. [`Self::new_mesh`] creates device meshes over the devices of the client.
+/// is the extension point for clients that Ryft's XLA backend cannot directly create. Every client of a session lives
+/// for the rest of the process and is never destroyed, which is why sessions and their values carry no lifetime for
+/// their underlying clients. [`Self::new_mesh`] creates device meshes over the devices of the client.
 ///
 /// # Shared and Selected State
 ///
 /// All handles of one session share its compilation cache, its eager dispatch cache, its runtime extensions, its
-/// retained constants, and its default [`CompilationOptions`]. Each handle additionally selects an effect scope and an
-/// optional [`DeviceMesh`]. Clones share their scope, while [`Self::with_new_effect_scope`] starts an independent
+/// retained constants, and its default [`CompilationOptions`]. Each handle additionally selects an effect scope and
+/// an optional [`DeviceMesh`]. Clones share their scope, while [`Self::with_new_effect_scope`] starts an independent
 /// sequence and retains everything else. Cached programs retain no session, so execution always uses the invoking
 /// session's scope, including for cache hits and retained compiled functions.
 ///
@@ -171,31 +166,29 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// configures, which sessions never read otherwise. [`SessionBuilder::compilation_cache`] supplies a whole context
 /// (e.g., one with a bounded in-memory tier or, for multi-process programs, one with an exchange from
 /// [`DistributedRuntime::compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange)).
-/// Refer to [`CompilationCache`] for a configuration example.
+/// Refer to the documentation of [`CompilationCache`] for more information.
 ///
 /// # Effects and Completion
 ///
-/// Ordered I/O dependencies gate the successor computation's entire launch, including its pure work. The backend
-/// may execute inline or asynchronously. Use unordered printing when debugging code whose throughput matters and
-/// whose ordering does not. [`Self::effects_barrier`] also observes unordered I/O and local assertion failures, so it
-/// is broader than flushing prints. Call it before the process exits when its effects must be observed. Destruction
-/// of the last handle waits for launches borrowing extension resources before releasing those resources. Ordinary
-/// execution adds no implicit destruction barrier, and backend behavior with unfinished device work is specific to
-/// each plugin.
+/// Ordered I/O dependencies gate the successor computation's entire launch, including its pure work. The backend may
+/// execute inline or asynchronously. Use unordered printing when debugging code whose throughput matters and whose
+/// ordering does not. [`Self::effects_barrier`] also observes unordered I/O and local assertion failures, so it is
+/// broader than flushing prints. Call it before the process exits when its effects must be observed. Destruction of the
+/// last handle waits for launches borrowing extension resources before releasing those resources. Ordinary execution
+/// adds no implicit destruction barrier, and backend behavior with unfinished device work is specific to each plugin.
 ///
-/// Custom calls and prints declaring [`EffectClass::DeviceOrderedIo`] may
-/// execute separately on each device inside manual computation regions on CPU, while occurrences of
-/// [`EffectClass::OrderedIo`] keep the program on one device. Tokens retain the
-/// dependencies of each device without a device rendezvous across Ryft. The backend can impose additional scheduling
-/// dependencies, including serialization of multi-device launches. Opaque registered handlers must not reenter
-/// dispatch or barriers. Managed print and assertion handlers reject such reentrancy before acquiring scope locks.
+/// Custom calls and prints declaring [`EffectClass::DeviceOrderedIo`] may execute separately on each device inside
+/// manual computation regions on CPU, while occurrences of [`EffectClass::OrderedIo`] keep the program on one device.
+/// Tokens retain the dependencies of each device without a device rendezvous across Ryft. The backend can impose
+/// additional scheduling dependencies, including serialization of multi-device launches. Opaque registered handlers
+/// must not reenter dispatch or barriers. Managed print and assertion handlers reject such reentrancy before acquiring
+/// scope locks.
 ///
 /// # Example
 ///
 /// ```
-/// use ryft_core::{ArrayType, DataType, MeshAxis, MeshAxisType, Print};
-/// use ryft_xla::{Platform, Session};
-///
+/// # use ryft_core::{ArrayType, DataType, MeshAxis, MeshAxisType, Print};
+/// # use ryft_xla::{Platform, Session};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let session = Session::builder().platform(Platform::Cpu).build()?;
 /// let mesh = session.new_mesh([MeshAxis::new("x", 1, MeshAxisType::Auto)?])?;
@@ -206,10 +199,10 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// # }
 /// ```
 ///
-/// The client of a session must live for the rest of the process, so a client that is dropped cannot be supplied.
+/// The client of a session must live for the rest of the process, so a client that is dropped cannot be supplied:
 ///
 /// ```compile_fail
-/// use ryft_xla::Session;
+/// # use ryft_xla::Session;
 /// fn escaped(client: ryft_pjrt::Client<'_>) {
 ///     let session = Session::builder().client(&client).build().unwrap();
 ///     drop(client);
@@ -217,7 +210,7 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// }
 /// ```
 pub struct Session {
-    /// Resources shared by every handle of this session.
+    /// State of this session that contains resources shared by every handle of this session.
     state: Arc<SessionState>,
 
     /// Concrete device mesh that eager binds prefer when deriving their execution mesh and that the constant
@@ -228,6 +221,8 @@ pub struct Session {
     /// [`Self::with_new_effect_scope`] replaces.
     effect_scope: Arc<EffectScope>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Session {
     /// Creates an independent session with the default configuration, which runs on a client that the session
@@ -389,6 +384,8 @@ impl Session {
         Ok(DeviceMesh::new(logical_mesh, devices)?)
     }
 
+    // TODO(eaplatanios): Should this not have a `mesh` argument and have a separate `sharded_array` for one
+    //  with a mesh? Though, wait. `self` already holds a mesh so why does this constructor also take a mesh?
     /// Uploads host bytes into an array that belongs to this session. Refer to the documentation of
     /// [`Array::from_host_buffer`] for more information.
     pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, mesh: DeviceMesh, buffer: B) -> Result<Array, Error> {
