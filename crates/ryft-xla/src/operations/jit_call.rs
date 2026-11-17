@@ -3731,9 +3731,9 @@ mod tests {
         // fresh result identity. Discharge widens the callee with the reference state, which must not leave the
         // call's result metadata pinned to the narrower pre-discharge callee signature.
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(client, "x", 1);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
         let value_type = value_type.unwrap();
         let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
@@ -4143,9 +4143,9 @@ mod tests {
         // immediately, so the output `a + a` is known and concrete, and the residual call keeps only `(a + a) * x`,
         // fed by that known output (JAX's `out_fwd`).
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(client, "x", 1);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
         let r#type = ArrayIrType::Array(array_type.clone());
 
@@ -4683,13 +4683,13 @@ mod tests {
         let direction = vec![0.75f32; 64 * 1024];
         let cotangent = vec![1.5f32; 64 * 1024];
         let evaluate = |linearization: &Linearization<Constant, Operation>| {
-            let mut primal = execute_f32_program(&client, linearization.primal(), inputs.clone());
+            let mut primal = execute_f32_program(client, linearization.primal(), inputs.clone());
             let value = primal.remove(0);
             let tangent_inputs = std::iter::once(direction.clone()).chain(primal.clone()).collect();
-            let tangent = execute_f32_program(&client, linearization.tangent(), tangent_inputs);
+            let tangent = execute_f32_program(client, linearization.tangent(), tangent_inputs);
             let pullback_inputs = std::iter::once(cotangent.clone()).chain(primal).collect();
             let pullback =
-                execute_f32_program(&client, &linearization.pullback().unwrap().into_program(), pullback_inputs);
+                execute_f32_program(client, &linearization.pullback().unwrap().into_program(), pullback_inputs);
             vec![value, tangent[0].clone(), pullback[0].clone()]
         };
         let actual = evaluate(&linearization);
@@ -5019,7 +5019,7 @@ mod tests {
 
         // Rematerialization changes neither the primal value nor the derivatives.
         let client = execution_client();
-        assert_residual_demand_linearizations_match(&client, &repeated(4, Some(policy)), &repeated(4, None), &[0]);
+        assert_residual_demand_linearizations_match(client, &repeated(4, Some(policy)), &repeated(4, None), &[0]);
     }
 
     #[test]
@@ -5104,7 +5104,7 @@ mod tests {
         );
 
         let client = execution_client();
-        assert_residual_demand_linearizations_match(&client, &nested(3, Some(policy)), &nested(3, None), &[0]);
+        assert_residual_demand_linearizations_match(client, &nested(3, Some(policy)), &nested(3, None), &[0]);
     }
 
     #[test]
@@ -5174,7 +5174,7 @@ mod tests {
         );
 
         let client = execution_client();
-        assert_residual_demand_linearizations_match(&client, &repeated(4, Some(policy)), &repeated(4, None), &[0]);
+        assert_residual_demand_linearizations_match(client, &repeated(4, Some(policy)), &repeated(4, None), &[0]);
     }
 
     #[test]
@@ -5347,11 +5347,11 @@ mod tests {
 
         let client = execution_client();
         let inputs = vec![values_to_bytes(&[1.1f32]), values_to_bytes(&[1f32])];
-        let mut primal = execute_array_program(&client, linearization.primal(), inputs);
+        let mut primal = execute_array_program(client, linearization.primal(), inputs);
         let value = values_from_bytes::<f32>(&primal.remove(0));
         let pullback = linearization.pullback().unwrap();
         let pullback_inputs = std::iter::once(values_to_bytes(&[1f32])).chain(primal).collect();
-        let gradient = execute_array_program(&client, pullback.program(), pullback_inputs);
+        let gradient = execute_array_program(client, pullback.program(), pullback_inputs);
         assert_eq!(value, vec![1.2109375f32]);
         assert_eq!(values_from_bytes::<f32>(&gradient[0]), vec![1.2109375f32]);
     }
@@ -5527,7 +5527,7 @@ mod tests {
         for program in [repeated(4), nested(3)] {
             let partition = program.partition(&[true, false]).unwrap();
             let known_inputs = partition.known_input_indices().iter().map(|index| inputs[*index].clone()).collect();
-            let known_outputs = execute_f32_program(&client, partition.known_program(), known_inputs);
+            let known_outputs = execute_f32_program(client, partition.known_program(), known_inputs);
             let known_output_count = partition.outputs().iter().filter(|output| output.is_known()).count();
             let residual_inputs = partition
                 .residual_inputs()
@@ -5540,8 +5540,8 @@ mod tests {
                     ResidualInputSource::ResidualEdge(edge) => known_outputs[known_output_count + edge].clone(),
                 })
                 .collect();
-            let actual = execute_f32_program(&client, partition.residual_program(), residual_inputs);
-            let expected = execute_f32_program(&client, &program, inputs.clone());
+            let actual = execute_f32_program(client, partition.residual_program(), residual_inputs);
+            let expected = execute_f32_program(client, &program, inputs.clone());
             assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
             assert_eq!(actual.len(), expected.len());
             assert!(
@@ -5788,9 +5788,9 @@ mod tests {
         assert!(Arc::ptr_eq(known_callee.interned_callee().unwrap(), cached_callee.interned_callee().unwrap()));
 
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let (known, lines) =
-            with_captured_prints(|| execute_f32_program(&client, warm.known_program(), vec![vec![2.0]]));
+            with_captured_prints(|| execute_f32_program(client, warm.known_program(), vec![vec![2.0]]));
         assert_eq!(lines, vec!["known: f32[] 0x00008040"]);
         let known_output_count = warm.outputs().iter().filter(|output| output.is_known()).count();
         for (unknown, unknown_hex, product_hex) in [(3.0, "00004040", "00004041"), (5.0, "0000a040", "0000a041")] {
@@ -5806,7 +5806,7 @@ mod tests {
                 })
                 .collect();
             let (outputs, lines) =
-                with_captured_prints(|| execute_f32_program(&client, warm.residual_program(), inputs));
+                with_captured_prints(|| execute_f32_program(client, warm.residual_program(), inputs));
             assert_eq!(outputs, vec![vec![unknown * 4.0]]);
             assert_eq!(lines, vec![format!("residual: f32[] 0x{product_hex}")]);
 
@@ -5820,7 +5820,7 @@ mod tests {
                 })
                 .collect();
             let (outputs, lines) =
-                with_captured_prints(|| execute_f32_program(&client, partition.residual_program(), inputs));
+                with_captured_prints(|| execute_f32_program(client, partition.residual_program(), inputs));
             assert_eq!(outputs, vec![vec![unknown * 4.0]]);
             assert_eq!(
                 lines,
@@ -5860,12 +5860,11 @@ mod tests {
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
         assert_eq!(partition.residual_program().output_count(), 0);
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
-        assert_eq!(execute_f32_program(&client, partition.known_program(), vec![vec![2.0]]), vec![vec![4.0]]);
+        ensure_print_handler_registered(client).unwrap();
+        assert_eq!(execute_f32_program(client, partition.known_program(), vec![vec![2.0]]), vec![vec![4.0]]);
         for (unknown, unknown_hex) in [(3.0, "00004040"), (5.0, "0000a040")] {
-            let (outputs, lines) = with_captured_prints(|| {
-                execute_f32_program(&client, partition.residual_program(), vec![vec![unknown]])
-            });
+            let (outputs, lines) =
+                with_captured_prints(|| execute_f32_program(client, partition.residual_program(), vec![vec![unknown]]));
             assert_eq!(outputs, Vec::<Vec<f32>>::new());
             assert_eq!(lines, vec![format!("residual: f32[] 0x{unknown_hex}")]);
         }
@@ -5954,8 +5953,8 @@ mod tests {
         // Neither sharing nor rematerialization changes the primal value or the derivatives, which match those of the
         // same function with every call inlined.
         let client = execution_client();
-        assert_residual_demand_linearizations_match(&client, &repeated(4, None), &inlined(4), &[0, 1]);
-        assert_residual_demand_linearizations_match(&client, &repeated(4, Some(policy)), &inlined(4), &[0, 1]);
+        assert_residual_demand_linearizations_match(client, &repeated(4, None), &inlined(4), &[0, 1]);
+        assert_residual_demand_linearizations_match(client, &repeated(4, Some(policy)), &inlined(4), &[0, 1]);
     }
 
     #[test]
@@ -5986,8 +5985,8 @@ mod tests {
         );
 
         let client = execution_client();
-        assert_residual_demand_linearizations_match(&client, &nested(3, None), &inlined(3), &[0, 1]);
-        assert_residual_demand_linearizations_match(&client, &nested(3, Some(policy)), &inlined(3), &[0, 1]);
+        assert_residual_demand_linearizations_match(client, &nested(3, None), &inlined(3), &[0, 1]);
+        assert_residual_demand_linearizations_match(client, &nested(3, Some(policy)), &inlined(3), &[0, 1]);
     }
 
     #[test]
@@ -6540,8 +6539,8 @@ mod tests {
         // `(sin(x), cos(x) * dx)`, within `1e-5`.
 
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6668,8 +6667,8 @@ mod tests {
             .unwrap();
             let (jvp_primal, jvp_tangent) =
                 jvp_compiled.executable().execute(&engine, (primal_array.clone(), tangent_array.clone())).unwrap();
-            let jvp_primal_value = read_f32s(&client, &jvp_primal)[0];
-            let jvp_tangent_value = read_f32s(&client, &jvp_tangent)[0];
+            let jvp_primal_value = read_f32s(client, &jvp_primal)[0];
+            let jvp_tangent_value = read_f32s(client, &jvp_tangent)[0];
             let expected_primal = primal.sin();
             let expected_tangent = primal.cos() * tangent;
 
@@ -6915,7 +6914,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &pullback,
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
                 &[3],
@@ -6983,7 +6982,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            execute_mixed_program(client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
             vec![MixedValue::Array(vec![2.0], vec![])],
         );
 
@@ -7005,7 +7004,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &transposed,
                 &[MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![5.0], vec![])],
                 &[],
@@ -7080,8 +7079,8 @@ mod tests {
                 in ()"},
         );
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
-        let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
+        ensure_print_handler_registered(client).unwrap();
+        let (outputs, lines) = with_captured_prints(|| execute_mixed_program(client, &pullback, &[], &[]));
         assert_eq!(outputs.unwrap(), Vec::new(),);
         assert_eq!(lines, vec!["backward: 0.0"]);
     }
@@ -7233,7 +7232,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[])
+            execute_mixed_program(execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[])
                 .unwrap(),
             vec![MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![2.0, 2.0, 2.0], vec![3])],
         );
@@ -7330,7 +7329,7 @@ mod tests {
         for (selector, expected) in [(1.0, 3.0), (-1.0, 6.0)] {
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &transposed,
                     &[MixedValue::Array(vec![3.0], vec![]), MixedValue::Array(vec![selector], vec![])],
                     &[],
@@ -7402,7 +7401,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            execute_mixed_program(client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
             vec![MixedValue::Array(vec![4.0], vec![])],
         );
 
@@ -7430,7 +7429,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            execute_mixed_program(client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
             vec![MixedValue::Array(vec![4.0], vec![])],
         );
     }

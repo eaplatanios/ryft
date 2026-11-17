@@ -663,7 +663,7 @@ mod tests {
                 },
             );
             assert_eq!(
-                execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2., 3.], vec![1, 2])], &[1, 2],)
+                execute_mixed_program(client, &program, &[MixedValue::Array(vec![2., 3.], vec![1, 2])], &[1, 2],)
                     .unwrap(),
                 vec![MixedValue::Array(vec![2., 3., 2., 3., 2., 3.], vec![3, 2])],
             );
@@ -891,7 +891,7 @@ mod tests {
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let input = Array::from_host_buffer(
-            &session_with_client(&client),
+            &session_with_client(client),
             input_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -942,8 +942,8 @@ mod tests {
     #[test]
     fn test_broadcast_operation_lower_converted_operand() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
         let input_type = replicated_vector_type(&mesh, 3);
         let output_type = ArrayType::new_static(DataType::C64, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -1078,7 +1078,7 @@ mod tests {
         for extent in [3, 0] {
             let length = extent as usize;
             let outputs = execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[
                     MixedValue::Array(vec![1.0, 2.0], vec![2]),

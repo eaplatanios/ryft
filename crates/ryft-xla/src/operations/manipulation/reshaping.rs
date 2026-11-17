@@ -496,11 +496,11 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = vec![1.0, 2.0, 3.0, 4.0];
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4])], &[2]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4])], &[2]).unwrap(),
             vec![MixedValue::Array(vec![1.0, 2.0], vec![1, 2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4])], &[0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![4])], &[0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![1, 0]), MixedValue::Dimension(0)],
         );
 
@@ -533,11 +533,11 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]).unwrap(),
             vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 1, 3]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0, 1, 3]), MixedValue::Dimension(0)],
         );
     }
@@ -577,12 +577,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=24).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 2, 3])], &[2])
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4, 2, 3])], &[2])
                 .unwrap(),
             vec![MixedValue::Array((1..=12).map(f64::from).collect(), vec![2, 6]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 2, 3])], &[0])
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4, 2, 3])], &[0])
                 .unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0, 6]), MixedValue::Dimension(0)],
         );
@@ -595,7 +595,7 @@ mod tests {
         let program = unproject_plain_program(program);
         let wide_storage = (1..=96).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(wide_storage, vec![2, 3, 4, 2, 2])], &[2])
+            execute_mixed_program(client, &program, &[MixedValue::Array(wide_storage, vec![2, 3, 4, 2, 2])], &[2])
                 .unwrap(),
             vec![
                 MixedValue::Array(
@@ -611,7 +611,7 @@ mod tests {
             plain_reshape_program(Shape::new(vec![6.into(), rows.clone()]), Shape::new(vec![2.into(), 3.into(), rows]));
         let program = unproject_plain_program(program);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![6, 4])], &[2]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![6, 4])], &[2]).unwrap(),
             vec![
                 MixedValue::Array(
                     (0..6).flat_map(|row| [f64::from(4 * row + 1), f64::from(4 * row + 2)]).collect(),
@@ -647,11 +647,11 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = vec![1.0, 2.0, 3.0, 4.0];
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4])], &[2]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4])], &[2]).unwrap(),
             vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4])], &[0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![1, 4])], &[0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)],
         );
 
@@ -681,12 +681,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 1, 3])], &[2])
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4, 1, 3])], &[2])
                 .unwrap(),
             vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 1, 3])], &[0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![4, 1, 3])], &[0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0, 3]), MixedValue::Dimension(0)],
         );
     }
@@ -742,11 +742,11 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]).unwrap(),
             vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 1, 2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![3, 1, 0]), MixedValue::Dimension(0)],
         );
 
@@ -794,12 +794,12 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4, 3])], &[2])
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4, 3])], &[2])
                 .unwrap(),
             vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4, 3])], &[0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![1, 4, 3])], &[0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![3, 0]), MixedValue::Dimension(0)],
         );
     }
@@ -842,7 +842,7 @@ mod tests {
         let program = unproject_plain_program(program);
         let storage = (1..=16).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 4])], &[2, 2])
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage.clone(), vec![4, 4])], &[2, 2])
                 .unwrap(),
             vec![
                 MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 1, 2]),
@@ -851,7 +851,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 4])], &[0, 0]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(storage, vec![4, 4])], &[0, 0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0, 1, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0),],
         );
     }
@@ -1109,7 +1109,7 @@ mod tests {
     #[test]
     fn test_dynamic_reshape_operation_lower_static_input_pullback() {
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         let program = static_input_dynamic_output_reshape_program();
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let tangents = vec![6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
@@ -1118,7 +1118,7 @@ mod tests {
         // runtime element count assertion because the output shape is unproven.
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)],
                 &[],
@@ -1127,7 +1127,7 @@ mod tests {
             vec![MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)],
         );
         let error = execute_mixed_program(
-            &client,
+            client,
             &program,
             &[MixedValue::Array(values, vec![6]), MixedValue::Dimension(3)],
             &[],
@@ -1171,7 +1171,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &pullback,
                 &[MixedValue::Array(tangents.clone(), vec![6]), MixedValue::Dimension(6)],
                 &[6],
@@ -1180,7 +1180,7 @@ mod tests {
             vec![MixedValue::Array(tangents.clone(), vec![6])],
         );
         let error = execute_mixed_program(
-            &client,
+            client,
             &pullback,
             &[MixedValue::Array(tangents, vec![6]), MixedValue::Dimension(3)],
             &[3],
@@ -1194,7 +1194,7 @@ mod tests {
         // Batching threads the batch extent as a leading dimension input, and the forward derivative of the batched
         // program reshapes the tangent alongside the primal. Both outputs report the batch and row extents.
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         let batch = DimensionType::new("batch", DimensionBounds::non_negative(Some(4)).unwrap());
         let (batched, output_axes) = static_input_dynamic_output_reshape_program()
             .batched_with_threaded_extent(
@@ -1211,7 +1211,7 @@ mod tests {
         let tangents = (101..=118).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &jvp,
                 &[
                     MixedValue::Dimension(2),
@@ -1234,7 +1234,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &jvp,
                 &[
                     MixedValue::Dimension(0),
@@ -1317,7 +1317,7 @@ mod tests {
         );
         let values = (1..=12).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[MixedValue::Array(values.clone(), vec![2, 6])], &[])
+            execute_mixed_program(execution_client(), &program, &[MixedValue::Array(values.clone(), vec![2, 6])], &[])
                 .unwrap(),
             vec![MixedValue::Array(values, vec![2, 2, 3])],
         );
@@ -1328,7 +1328,7 @@ mod tests {
         // An unproven mixed reshape stays effectful after batching, so its assertion survives even though the program
         // never uses the reshaped value and the executable still rejects mismatching runtime element counts.
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         let parent = TracingContext::<Constant, Operation>::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), dynamic_dimension("input", Some(5))]));
         let input = parent.input(input_type.clone().into());
@@ -1410,7 +1410,7 @@ mod tests {
         let values = (1..=8).map(f64::from).collect::<Vec<_>>();
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[MixedValue::Array(values.clone(), vec![2, 4]), MixedValue::Dimension(2)],
                 &[2],
@@ -1419,7 +1419,7 @@ mod tests {
             vec![MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 2]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(
-            &client,
+            client,
             &program,
             &[MixedValue::Array(values, vec![2, 4]), MixedValue::Dimension(3)],
             &[2],
@@ -1483,7 +1483,7 @@ mod tests {
     #[test]
     fn test_lower_reshape_element_count_assertion() {
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         for static_output in [false, true] {
             let input_type = ArrayType::new(DataType::I64, Shape::new(vec![dynamic_dimension("input", Some(5))]));
             let size_type = ArrayType::scalar(DataType::I64);

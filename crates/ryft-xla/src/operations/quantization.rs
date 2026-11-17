@@ -707,8 +707,8 @@ mod tests {
         // `f32` product on both backends. Every element, scale, product, and sum is exact, so the comparison is exact
         // whether XLA runs the portable decomposition of the `xla.scaled_dot` composite or a native kernel.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let element_candidates = [0f64, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
         let elements = |seed: usize| {
             let values = (0..32)
@@ -1160,7 +1160,7 @@ mod tests {
                 input.block_quantize(4, element_type, scale_type).unwrap();
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &program,
                     &[MixedValue::Array(vec![3.0, 1.5, 0.5, 6.0, 0.0, 0.0, 0.0, 0.0], vec![8])],
                     &[4],
@@ -1188,7 +1188,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let placed = |data_type: DataType, shape: &[usize]| {
             ArrayType::new_static(data_type, shape.to_vec())
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))

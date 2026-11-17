@@ -603,9 +603,9 @@ mod tests {
     #[test]
     fn test_ensure_print_handler_registered() {
         let client = cpu_client(1);
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         // Registration is idempotent.
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
 
         // The program threads one token chain through three prints of an `f64` vector argument, an `f64` scalar
         // constant, and an `f32` constant that exercises the hexadecimal fallback rendering.
@@ -697,17 +697,17 @@ mod tests {
     #[test]
     fn test_print_runtime_provider_initialize() {
         let client = cpu_client(1);
-        let target = Target::from_client(&client).unwrap();
+        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let requirement = builtin_requirement(PRINT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
-        provider.initialize(&client, &target, &requirement).unwrap();
-        provider.initialize(&client, &target, &requirement).unwrap();
+        provider.initialize(client, &target, &requirement).unwrap();
+        provider.initialize(client, &target, &requirement).unwrap();
 
         let requirement = RuntimeRequirement::new(PRINT_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
         assert!(matches!(
-            provider.initialize(&client, &target, &requirement),
+            provider.initialize(client, &target, &requirement),
             Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
                 if identifier == PRINT_CUSTOM_CALL_TARGET,
         ));
@@ -716,12 +716,12 @@ mod tests {
     #[test]
     fn test_ordered_io_runtime_provider_initialize() {
         let client = cpu_client(1);
-        let target = Target::from_client(&client).unwrap();
+        let target = Target::from_client(client).unwrap();
         let provider = ordered_io_runtime_provider();
-        provider.initialize(&client, &target, &builtin_requirement("ryft.ordered-io")).unwrap();
+        provider.initialize(client, &target, &builtin_requirement("ryft.ordered-io")).unwrap();
         let requirement = RuntimeRequirement::new("ryft.ordered-io", 1, vec![1]).unwrap();
         assert!(matches!(
-            provider.initialize(&client, &target, &requirement),
+            provider.initialize(client, &target, &requirement),
             Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
                 if identifier == "ryft.ordered-io" && reason == "built-in runtime configuration must be empty",
         ));
@@ -847,14 +847,14 @@ mod tests {
     #[test]
     fn test_print_operation_lower_executes_in_order_on_cpu() {
         let client = cpu_client(1);
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![device],
         )
         .unwrap();
-        let engine = session_with_client(&client);
+        let engine = session_with_client(client);
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn test_print_operation_lower_executes_eagerly() {
         let client = execution_client();
-        assert_eager_bind_executes_print_effect(&client);
+        assert_eager_bind_executes_print_effect(client);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -919,9 +919,9 @@ mod tests {
     #[test]
     fn test_print_operation_lower_executes_batched_prints_on_cpu() {
         let client = cpu_client(1);
-        ensure_print_handler_registered(&client).unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        ensure_print_handler_registered(client).unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input = f64_vector(&session, &mesh, &[1.5, 2.5]);
 
         // Eager batching binds one print of the whole batch through the `@ryft.print` host callback.
@@ -929,7 +929,7 @@ mod tests {
             batch(|item| item.print("x"), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap()
         });
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
-        assert_eq!(read_f64s(&client, &output), vec![1.5, 2.5]);
+        assert_eq!(read_f64s(client, &output), vec![1.5, 2.5]);
 
         // Batching under a staging parent keeps the print in the staged program, which prints the whole batch once
         // per execution.
@@ -950,7 +950,7 @@ mod tests {
         let (outputs, lines) = with_captured_prints(|| session.execute_program(&compiled, vec![input]).unwrap());
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
         assert_eq!(outputs.len(), 1);
-        assert_eq!(read_f64s(&client, &outputs[0]), vec![1.5, 2.5]);
+        assert_eq!(read_f64s(client, &outputs[0]), vec![1.5, 2.5]);
     }
 
     #[test]

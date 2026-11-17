@@ -1111,7 +1111,7 @@ mod tests {
     #[test]
     fn test_fill_materializes_scalar_literal_then_broadcasts_over_a_default_mesh() {
         let client = execution_client();
-        let domain = array_domain(&client);
+        let domain = array_domain(client);
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
             let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).with_memory(memory);
@@ -1119,13 +1119,13 @@ mod tests {
 
             assert_eq!(output.r#type().memory(), memory);
             assert_eq!(output.shape(), StaticShape::new(vec![3]));
-            assert_eq!(read_f32s(&client, &output), vec![2.5, 2.5, 2.5]);
+            assert_eq!(read_f32s(client, &output), vec![2.5, 2.5, 2.5]);
         }
 
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
         let value = Complex::new(1.5f64, -2.0f64);
         let output = domain.fill(&r#type, value).unwrap();
-        assert_eq!(read_f32s(&client, &output), vec![1.5, 1.5]);
+        assert_eq!(read_f32s(client, &output), vec![1.5, 1.5]);
 
         // A complex fill value lowers as two real part splats composed through `stablehlo.complex`, and a `c64`
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
@@ -1134,14 +1134,14 @@ mod tests {
         let output = domain.fill(&r#type, value).unwrap();
 
         assert_eq!(output.shape(), StaticShape::new(vec![2]));
-        assert_eq!(read_f32s(&client, &output), vec![1.5, -2.0, 1.5, -2.0]);
+        assert_eq!(read_f32s(client, &output), vec![1.5, -2.0, 1.5, -2.0]);
 
         // Integer literals remain exact through conversion and scalar constant lowering, including values that
         // cannot be represented exactly by the floating-point intermediary used for floating-point constants.
         let r#type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
         let value = u64::MAX - 1;
         let output = domain.fill(&r#type, value).unwrap();
-        assert_eq!(read_u64s(&client, &output), vec![value, value]);
+        assert_eq!(read_u64s(client, &output), vec![value, value]);
     }
 
     #[test]
@@ -1567,7 +1567,7 @@ mod tests {
         for extent in [3, 0] {
             let length = extent as usize;
             assert_eq!(
-                execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(extent)], &[]).unwrap(),
+                execute_mixed_program(execution_client(), &program, &[MixedValue::Dimension(extent)], &[]).unwrap(),
                 vec![
                     MixedValue::Array(vec![0.0; length], vec![length as u64]),
                     MixedValue::Array(vec![1.0; length], vec![length as u64]),
@@ -1748,7 +1748,7 @@ mod tests {
         for extent in [3, 0] {
             let length = extent as usize;
             let outputs = execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[MixedValue::Array(vec![7.0; 8], vec![4, 2])],
                 &[extent],
@@ -1847,7 +1847,7 @@ mod tests {
         );
         // Each dynamic output is followed by its trailing hidden runtime extent.
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            execute_mixed_program(execution_client(), &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
             vec![
                 MixedValue::Array(vec![0.0, 0.0, 0.0], vec![3]),
                 MixedValue::Array(vec![1.0, 1.0, 1.0], vec![3]),
@@ -1906,7 +1906,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[MixedValue::Dimension(3), MixedValue::Dimension(3)],
                 &[],
@@ -1960,7 +1960,7 @@ mod tests {
             "#},
         );
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            execute_mixed_program(execution_client(), &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
             vec![MixedValue::Array(vec![0.0; 9], vec![3, 3]), MixedValue::Dimension(3), MixedValue::Dimension(3)],
         );
     }
@@ -1996,7 +1996,7 @@ mod tests {
             "#},
         );
         assert_eq!(
-            execute_mixed_program(&execution_client(), &program, &[], &[]).unwrap(),
+            execute_mixed_program(execution_client(), &program, &[], &[]).unwrap(),
             vec![MixedValue::Array(vec![0.0; 9], vec![3, 3])],
         );
     }
@@ -2075,16 +2075,16 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
             vec![
                 MixedValue::Array(vec![0.0; 9], vec![3, 3]),
                 MixedValue::Array(vec![1.0; 9], vec![3, 3]),
                 MixedValue::Array(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0], vec![3, 3]),
             ],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
         assert!(error.contains("input dimension `size` expected 3"), "{error}");
     }
 
@@ -2134,12 +2134,12 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2)], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(2)], &[]).unwrap(),
             vec![MixedValue::Array(vec![0.0; 8], vec![2, 2, 2])],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
         assert!(error.contains("input dimension `size` expected 2"), "{error}");
     }
 }

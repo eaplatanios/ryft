@@ -169,8 +169,8 @@ mod tests {
     #[test]
     fn test_stop_gradient_operation_lower_executes_as_the_identity() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<ArrayType, ArrayType> =
@@ -186,7 +186,7 @@ mod tests {
         .unwrap();
         let output = compiled.executable().execute(&engine, source).unwrap();
 
-        let observed = read_f32s(&client, &output);
+        let observed = read_f32s(client, &output);
         for (got, &input) in observed.iter().zip(values.iter()) {
             let expected = input * input;
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
@@ -218,8 +218,8 @@ mod tests {
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
         let (first, second) = variadic.executable().execute(&engine, (first, second)).unwrap();
-        assert_eq!(read_f32s(&client, &first), values);
-        assert_eq!(read_f32s(&client, &second), other_values);
+        assert_eq!(read_f32s(client, &first), values);
+        assert_eq!(read_f32s(client, &second), other_values);
     }
 
     #[test]

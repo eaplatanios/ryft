@@ -556,8 +556,8 @@ mod tests {
         // while batching it, before or after differentiating it, applies the rule, which computes `2x²` so that its use
         // is observable.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[0.5f32, 1.0, 1.5]));
         let tangent = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 1.0, 1.0]));
         let function = composite(|x: ArrayTracer| Ok(x.clone() * x)).with_batching(
@@ -593,8 +593,8 @@ mod tests {
         // tangent is mapped yields the exact tangents `3(ẋy + xẏ)` of each batch item, which requires taking a
         // diagonal on device.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let function = composite(|(x, y): (ArrayTracer, ArrayTracer)| Ok(x * y)).with_broadcast_sensitive_batching(
             |(x, y): (ArrayTracer, ArrayTracer),
              (x_axis, y_axis): (BatchAxis, BatchAxis),

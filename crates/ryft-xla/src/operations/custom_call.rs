@@ -1138,7 +1138,7 @@ mod tests {
             .unwrap();
         let input = MixedValue::Array((1..=8).map(f64::from).collect(), vec![8]);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[input], &[3]).unwrap(),
+            execute_mixed_program(client, &program, &[input], &[3]).unwrap(),
             vec![MixedValue::Array(vec![2.0, 3.0, 4.0], vec![3]), MixedValue::Dimension(3)],
         );
         assert_eq!(OPERAND_LENGTH.load(Ordering::SeqCst), 8);
@@ -1447,7 +1447,7 @@ mod tests {
         // The counting handler writes its results through host pointers, so this test always runs on the CPU client
         // rather than on the configured execution platform, whose result buffers may live in device memory.
         let client = cpu_client(1);
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -1485,12 +1485,12 @@ mod tests {
                     .unwrap();
                 let before = CALLS.load(Ordering::SeqCst);
                 assert_eq!(
-                    execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+                    execute_mixed_program(client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
                     vec![MixedValue::Array(vec![7.0; 9], vec![3, 3])],
                 );
                 assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
                 let error =
-                    execute_mixed_program(&client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
+                    execute_mixed_program(client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
                 assert!(error.contains("input dimension `size` expected 3"), "{error}");
                 assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
             }
@@ -1516,11 +1516,11 @@ mod tests {
         let input = MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
         let before = CALLS.load(Ordering::SeqCst);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[input.clone(), MixedValue::Dimension(3)], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[input.clone(), MixedValue::Dimension(3)], &[]).unwrap(),
             vec![MixedValue::Array(vec![7.0; 4], vec![4]), MixedValue::Array(vec![7.0; 9], vec![3, 3])],
         );
         assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
-        let error = execute_mixed_program(&client, &program, &[input, MixedValue::Dimension(4)], &[])
+        let error = execute_mixed_program(client, &program, &[input, MixedValue::Dimension(4)], &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains("input dimension `size` expected 3"), "{error}");
@@ -1530,9 +1530,9 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_executes_registered_ffi_handler() {
         let client = cpu_client(1);
-        ensure_add_one_handler_registered(&client).unwrap();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        ensure_add_one_handler_registered(client).unwrap();
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Eager dispatch compiles a single `stablehlo.custom_call` that resolves to the registered handler at
         // execution time.
@@ -1633,8 +1633,8 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.0]));
         let operation = CustomCallOperation::new(TARGET, Vec::new())
             .with_attribute("boolean", true)
@@ -1723,8 +1723,8 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let values = values_to_bytes(&[1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
         let row_major_input = replicated_array(&session, &mesh, DataType::F32, &[2, 3], &values);
@@ -1809,8 +1809,8 @@ mod tests {
             })
             .clone()
             .unwrap();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // A call without array inputs binds directly in the eager session and runs a source kernel that only fills its
         // output.
@@ -1825,9 +1825,9 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_executes_batched_ffi_handler() {
         let client = cpu_client(1);
-        ensure_add_one_handler_registered(&client).unwrap();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        ensure_add_one_handler_registered(client).unwrap();
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let row_type = replicated_f32_type(&mesh, &[2]);
         let input = replicated_array(
             &session,
@@ -1881,8 +1881,8 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_inside_manual_region_executes_on_cpu() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
-        ensure_add_one_handler_registered(&client).unwrap();
+        let session = session_with_client(client);
+        ensure_add_one_handler_registered(client).unwrap();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -2001,9 +2001,9 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_executes_under_composite_differentiation() {
         let client = cpu_client(1);
-        ensure_add_one_handler_registered(&client).unwrap();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        ensure_add_one_handler_registered(client).unwrap();
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
 
         // The bare operation rejects differentiation, so a composite supplies its rules. The primal and the forward

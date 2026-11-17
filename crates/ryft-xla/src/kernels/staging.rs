@@ -1526,7 +1526,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
@@ -2219,7 +2219,7 @@ pub(crate) mod tests {
             devices.iter().map(|device| ryft_core::Device::from_pjrt(device.clone()).unwrap()).collect(),
         )
         .unwrap();
-        let facts = KernelExecutionFacts::from_target(&Target::from_client(&client).unwrap(), &mesh).unwrap();
+        let facts = KernelExecutionFacts::from_target(&Target::from_client(client).unwrap(), &mesh).unwrap();
         assert_eq!(facts.platform_name, client.platform_name().unwrap());
         assert_eq!(facts.platform_version, client.platform_version().unwrap());
         assert_eq!(facts.pjrt_version, client.version());

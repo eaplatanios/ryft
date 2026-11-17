@@ -505,7 +505,7 @@ mod tests {
             let left = [minimum, maximum, minimum, maximum, 0, minimum, 0];
             let right = [maximum, minimum, minimum, maximum, minimum, 0, maximum];
             let expected = [minimum, maximum, 0, 0, maximum, minimum, -maximum];
-            assert_eq!(execute_saturating_sub(&client, [data_type; 2], &left, &right, false), expected, "{data_type}");
+            assert_eq!(execute_saturating_sub(client, [data_type; 2], &left, &right, false), expected, "{data_type}");
         }
     }
 
@@ -519,12 +519,12 @@ mod tests {
             let left = [0, maximum, maximum, 0];
             let right = [maximum, 0, maximum, 0];
             assert_eq!(
-                execute_saturating_sub(&client, [data_type; 2], &left, &right, false),
+                execute_saturating_sub(client, [data_type; 2], &left, &right, false),
                 [0, maximum, 0, 0],
                 "{data_type}",
             );
             assert_eq!(
-                execute_saturating_sub(&client, [data_type; 2], &[0, maximum], &[1], true),
+                execute_saturating_sub(client, [data_type; 2], &[0, maximum], &[1], true),
                 [0, (maximum as u64).wrapping_sub(1) as i64],
                 "{data_type}",
             );
@@ -535,12 +535,12 @@ mod tests {
     fn test_saturating_sub_operation_lower_promoted_data_type() {
         let client = execution_client();
         assert_eq!(
-            execute_saturating_sub(&client, [DataType::I8, DataType::U8], &[-128, 127], &[255], true),
+            execute_saturating_sub(client, [DataType::I8, DataType::U8], &[-128, 127], &[255], true),
             [-383, -128],
         );
-        assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I8], &[-1, 0], &[-128], true), [127, 127],);
-        assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I2], &[-1, 0], &[-2], true), [1, 1]);
-        assert_eq!(execute_saturating_sub(&client, [DataType::I2, DataType::I4], &[-2, 1], &[-8], true), [6, 7]);
+        assert_eq!(execute_saturating_sub(client, [DataType::I1, DataType::I8], &[-1, 0], &[-128], true), [127, 127],);
+        assert_eq!(execute_saturating_sub(client, [DataType::I1, DataType::I2], &[-1, 0], &[-2], true), [1, 1]);
+        assert_eq!(execute_saturating_sub(client, [DataType::I2, DataType::I4], &[-2, 1], &[-8], true), [6, 7]);
     }
 
     #[test]
@@ -704,8 +704,8 @@ mod tests {
     #[test]
     fn test_abs_operation_lower_differentiation_at_zero() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The JVP of `abs` uses its explicit origin convention after XLA compiles the comparison and selection that
         // define it, rather than exposing the NaN of the undefined `0 / 0` formula. The real rule picks the right
@@ -753,8 +753,8 @@ mod tests {
     #[test]
     fn test_normalize_arithmetic_inputs_signed_one_bit_promotion() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let signed = replicated_array(&session, &mesh, DataType::I1, &[2], &[1, 0]);
         let two = replicated_array(&session, &mesh, DataType::I8, &[], &[2]);
 
@@ -797,8 +797,8 @@ mod tests {
     #[test]
     fn test_lower_arithmetic_output_one_bit() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let cpu = client.platform_name().unwrap().eq_ignore_ascii_case("cpu");
 
         // One-bit arithmetic wraps modulo two, whereas StableHLO predicate addition would perform Boolean OR. Negation

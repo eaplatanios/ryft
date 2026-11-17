@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn test_parallel_permute_operation_lower() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 

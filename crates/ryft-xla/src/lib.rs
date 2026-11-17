@@ -95,9 +95,10 @@ pub use values::{ArrayConstant, Constant, Dimension, Reference, Value};
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::RefCell;
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::mem::MaybeUninit;
-    use std::sync::{Mutex, Once, OnceLock};
+    use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
@@ -111,16 +112,51 @@ pub(crate) mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
+    #[cfg(feature = "cuda-13")]
     use crate::sessions::platforms::process_client;
     use crate::{Array, FromPjrt, Session};
 
-    /// Returns the process-wide CPU client with `device_count` addressable devices, for tests that need a fixed device
-    /// count or that exercise CPU-only behavior. Tests that only need some single device use [`execution_client`]
-    /// instead. Clients live for the rest of the process, so all tests that request the same device count share one
-    /// client.
+    /// Returns a CPU client with `device_count` addressable devices, for tests that need a fixed device count or that
+    /// exercise CPU-only behavior. Tests that only need some single device use [`execution_client`] instead.
+    ///
+    /// Clients live for the rest of the process and are pooled. A thread keeps the client of each device count that
+    /// it requests until it exits, and so repeated calls in one test return the same client while concurrently running
+    /// tests never share one. That matters because the CPU plugin executes a small program inline only when its
+    /// inputs are already available, and transfers that other tests queue on a shared client would delay them.
     pub(crate) fn cpu_client(device_count: usize) -> &'static Client<'static> {
-        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() });
-        process_client(&load_cpu_plugin().unwrap(), options).unwrap()
+        /// Clients that no thread currently holds, with their device counts.
+        static IDLE_CLIENTS: Mutex<Vec<(usize, &'static Client<'static>)>> = Mutex::new(Vec::new());
+
+        /// Clients that the current thread holds, which return to [`IDLE_CLIENTS`] when the thread exits.
+        struct HeldClients(Vec<(usize, &'static Client<'static>)>);
+
+        impl Drop for HeldClients {
+            fn drop(&mut self) {
+                IDLE_CLIENTS.lock().unwrap_or_else(PoisonError::into_inner).append(&mut self.0);
+            }
+        }
+
+        thread_local! {
+            static HELD_CLIENTS: RefCell<HeldClients> = const { RefCell::new(HeldClients(Vec::new())) };
+        }
+
+        HELD_CLIENTS.with(|held| {
+            let held = &mut held.borrow_mut().0;
+            if let Some((_, client)) = held.iter().find(|(count, _)| *count == device_count) {
+                return *client;
+            }
+            let idle = {
+                let mut idle = IDLE_CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+                idle.iter().position(|(count, _)| *count == device_count).map(|index| idle.swap_remove(index).1)
+            };
+            let client = idle.unwrap_or_else(|| {
+                let options =
+                    ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() });
+                Box::leak(Box::new(load_cpu_plugin().unwrap().client(options).unwrap()))
+            });
+            held.push((device_count, client));
+            client
+        })
     }
 
     /// Returns a process-wide CPU client with `device_count` addressable devices that is distinct from every client
@@ -138,7 +174,8 @@ pub(crate) mod tests {
         client
     }
 
-    /// Returns the process-wide execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
+    /// Returns the execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`, which is a [`cpu_client`] with one
+    /// device or the process-wide CUDA client.
     ///
     /// The default is `cpu`; `cuda-13` explicitly requires the corresponding feature, plugin, and a CUDA device.
     /// Selection errors fail the test instead of silently falling back to CPU or skipping GPU coverage.

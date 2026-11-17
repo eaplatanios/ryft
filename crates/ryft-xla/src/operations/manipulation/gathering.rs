@@ -708,8 +708,8 @@ mod tests {
     #[test]
     fn test_gather_operation_lower_fill_differentiation() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[3], &values_to_bytes(&[10f32, 20.0, 30.0]));
         let indices = replicated_array(&session, &mesh, DataType::I32, &[4, 1], &values_to_bytes(&[-1i32, 1, 1, 3]));
         let options = GatherOptions::default()
@@ -736,8 +736,8 @@ mod tests {
         // A diagonal is a slice of its two axes followed by one gather over iota indices, which lowers and executes
         // like the reference backend, including for offsets, axes with different extents, and empty diagonals.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let values = (0..18).map(|value| value as f32).collect::<Vec<_>>();
         let reference =
             CoreArray::from_elements(ArrayType::new_static(DataType::F32, [3, 2, 3]), values.as_slice()).unwrap();
@@ -829,8 +829,8 @@ mod tests {
         // on the test execution client at empty and nonempty mapped extents, through both the primal and its
         // pullback.
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, CoreDimension::Static(1)]));
@@ -934,9 +934,9 @@ mod tests {
                 assert_eq!(output.mesh(), &mesh);
             }
             assert_eq!(outputs[0].shape().as_slice(), output_type.static_shape().unwrap().as_slice());
-            assert_eq!(read_f64s(&client, &outputs[0]), expected, "n={size}");
+            assert_eq!(read_f64s(client, &outputs[0]), expected, "n={size}");
             assert_eq!(outputs[1].shape().as_slice(), &[size, 4]);
-            assert_eq!(read_f64s(&client, &outputs[1]), gradient, "pullback, n={size}");
+            assert_eq!(read_f64s(client, &outputs[1]), gradient, "pullback, n={size}");
         }
     }
 }

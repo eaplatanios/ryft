@@ -533,8 +533,8 @@ mod tests {
     #[test]
     fn test_session_analyze_preserves_cached_errors() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
             |_, _, input| Ok(input),
             Vec::new(),

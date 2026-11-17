@@ -229,8 +229,8 @@ mod tests {
     #[test]
     fn test_conjugate_operation_lower_differentiation() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let z = Complex::new(0.7f32, -0.3);
         let input = replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[z]));
 

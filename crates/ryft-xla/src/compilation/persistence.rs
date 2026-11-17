@@ -1566,8 +1566,8 @@ mod tests {
     #[test]
     fn test_compiled_program_serialize() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -1696,7 +1696,7 @@ mod tests {
             ));
         }
         let outputs = session.execute(&restored, vec![Value::Array(capture), Value::Array(input)]).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(read_f32s(client, program_array(&outputs[0])), vec![11.0, 22.0, 33.0, 44.0]);
 
         let analysis = restored.analyze().unwrap();
         assert_eq!(restored.analyze().unwrap(), analysis);
@@ -1714,7 +1714,7 @@ mod tests {
             vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = ProgramBuilder::new();
@@ -1750,8 +1750,8 @@ mod tests {
         let outputs = session
             .execute_program(&restored, vec![f32_scalar(&session, &mesh, 1.0), f32_scalar(&session, &mesh, 2.0)])
             .unwrap();
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
-        assert_eq!(read_f32s(&client, &outputs[1]), vec![3.0]);
+        assert_eq!(read_f32s(client, &outputs[0]), vec![5.0]);
+        assert_eq!(read_f32s(client, &outputs[1]), vec![3.0]);
 
         let (_, executable) = decode_envelope(&bytes);
         let corrupt = |metadata: PersistentExecutableMetadata| encode_envelope(&metadata, executable);
@@ -1943,8 +1943,8 @@ mod tests {
     #[test]
     fn test_compiled_program_serialize_round_trips_bounded_dynamic_read_only_reference_state() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1977,7 +1977,7 @@ mod tests {
         let holder = ArrayReference::new(array);
         let reference = Value::Reference(crate::Reference::new(holder, session.clone()));
         let outputs = session.execute_statefully(&restored, vec![reference]).r#await().unwrap();
-        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![1.0, 2.0, 3.0]);
+        assert_eq!(read_f32s(client, program_array(&outputs[0])), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1994,7 +1994,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
@@ -2046,8 +2046,8 @@ mod tests {
     #[test]
     fn test_session_deserialize_compiled_program_requires_runtime_contracts_for_effect_metadata() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let mut builder = ProgramBuilder::new();
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
@@ -2092,14 +2092,14 @@ mod tests {
     #[test]
     fn test_session_deserialize_compiled_program_restores_into_a_fresh_compilation_cache() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(client, "x", 1);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let directory = tempdir().unwrap();
 
         let disk_cache = || DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
-        let first_session = Session::builder().client(&client).disk_cache(disk_cache()).build().unwrap();
+        let first_session = Session::builder().client(client).disk_cache(disk_cache()).build().unwrap();
         let staged = crate::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
@@ -2113,7 +2113,7 @@ mod tests {
         drop(first);
         drop(first_session);
 
-        let second_session = Session::builder().client(&client).disk_cache(disk_cache()).build().unwrap();
+        let second_session = Session::builder().client(client).disk_cache(disk_cache()).build().unwrap();
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
@@ -2127,7 +2127,7 @@ mod tests {
     #[test]
     fn test_session_deserialize_compiled_program_rejects_malformed_and_incompatible_metadata() {
         let client = cpu_client(1);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
 
         assert!(matches!(
             session.deserialize_program(b"truncated"),

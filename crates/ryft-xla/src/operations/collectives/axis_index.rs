@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn test_axis_index_operation_lower() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 

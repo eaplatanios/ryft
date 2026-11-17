@@ -488,7 +488,7 @@ pub(crate) mod tests {
         inputs: &[(&[u64], [&[f32]; N])],
     ) -> Vec<Vec<f32>> {
         let client = cpu_client(N);
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(N))
             .unwrap();
@@ -2844,7 +2844,7 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let replicated = Sharding::replicated(logical_mesh.clone(), 0);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
@@ -2942,7 +2942,7 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let along_x_and_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
         let caller_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x_and_y).unwrap();
@@ -3014,7 +3014,7 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let input_sharding = Sharding::new(
             logical_mesh.clone(),
@@ -3091,14 +3091,14 @@ pub(crate) mod tests {
         // write-back (e.g., reads of a replicated reference at indices that vary across devices and invariant mutations
         // of a replicated reference).
         let client = cpu_client(2);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::IdentityAndSum);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::AxisIndex);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::AllGather);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::AllToAll);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Permute);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Reference);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::VaryingIndexReference);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::ReplicatedReference);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::IdentityAndSum);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::AxisIndex);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::AllGather);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::AllToAll);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::Permute);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::Reference);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::VaryingIndexReference);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::ReplicatedReference);
     }
 
     #[test]
@@ -3108,11 +3108,11 @@ pub(crate) mod tests {
         // replicated cotangent reference, both in the emulation and in XLA's manual computation. The pullbacks of an
         // update of a sharded reference and of an invariant mutation of a replicated reference agree as well.
         let client = cpu_client(2);
-        assert_shard_map_pullback_emulation_matches_execution(&client, ShardMapDifferentialCase::Reference);
+        assert_shard_map_pullback_emulation_matches_execution(client, ShardMapDifferentialCase::Reference);
         let case = ShardMapDifferentialCase::VaryingIndexReference;
-        assert_shard_map_pullback_emulation_matches_execution(&client, case);
+        assert_shard_map_pullback_emulation_matches_execution(client, case);
         let case = ShardMapDifferentialCase::ReplicatedReference;
-        assert_shard_map_pullback_emulation_matches_execution(&client, case);
+        assert_shard_map_pullback_emulation_matches_execution(client, case);
     }
 
     #[test]
@@ -3120,15 +3120,15 @@ pub(crate) mod tests {
         // A nested map whose inner body sums across the enclosing manual axis runs on all four devices of a 2×2 mesh,
         // both in the emulation and in XLA's nested manual computations.
         let client = cpu_client(4);
-        assert_shard_map_emulation_matches_execution(&client, ShardMapDifferentialCase::Nested);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::Nested);
     }
 
     #[test]
     fn test_shard_map_operation_lower_with_references_jvp_preserves_nonlinear_residuals_on_each_device() {
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
         let inputs = program.input_types().into_owned();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
@@ -3171,9 +3171,9 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_with_references_pullback_sums_replicated_reference_contributions() {
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
         let mut input_types = program.input_types().into_owned();
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
@@ -3234,9 +3234,9 @@ pub(crate) mod tests {
         // The output seed `[1, 2]` reaches the replicated reference's cotangent destination `[5, 7]` exactly once,
         // without any normalization by the size of the manual axis or duplication of the destination per device.
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let sharding = Sharding::replicated(logical_mesh.clone(), 1);
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
@@ -3301,8 +3301,8 @@ pub(crate) mod tests {
         // Every device receives the whole reduced referent `[1, 2]`, doubles it, and writes back its copy, so both
         // devices hold `[2, 4]` afterwards.
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
-        let session = session_with_client(&client);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
+        let session = session_with_client(client);
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
         let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
@@ -3334,8 +3334,8 @@ pub(crate) mod tests {
         // final state. The gradient reference is unreduced, so each device doubles its own summand in place. The
         // logical destination `[5, 7]`, uploaded as the summands `[5, 7]` and `[0, 0]`, becomes `[10, 14]`.
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
-        let session = session_with_client(&client);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
+        let session = session_with_client(client);
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let cotangent_type =
@@ -3372,9 +3372,9 @@ pub(crate) mod tests {
         // device adds its shard of the update into the shard of the referent it owns and reads that shard back, so the
         // output and the committed global referent both carry every device's write in mesh order.
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
@@ -3469,9 +3469,9 @@ pub(crate) mod tests {
         // Every device sees the whole referent and adds it to the shard of the value input it owns, while the referent
         // itself is left untouched on every device.
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
@@ -3648,7 +3648,7 @@ pub(crate) mod tests {
     fn test_shard_map_operation_lower_executes_checked_variation_gradients_on_cpu() {
         for device_count in [1, 2] {
             let client = cpu_client(device_count);
-            let session = session_with_client(&client);
+            let session = session_with_client(client);
             let client_devices = client.addressable_devices().unwrap();
             assert_eq!(client_devices.len(), device_count);
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3964,7 +3964,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_nested_variation_gradients_on_cpu() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -4099,7 +4099,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_mixed_variation_gradients_on_cpu() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -4234,7 +4234,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_gather_gradient_with_varying_indices_on_cpu() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4402,7 +4402,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_sort_jvp_with_varying_keys_on_cpu() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4558,7 +4558,7 @@ pub(crate) mod tests {
         type AttentionDomain = EagerContext<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4679,7 +4679,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_lower_executes_varying_while_predicate_gradient_on_cpu() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4850,7 +4850,7 @@ pub(crate) mod tests {
             DomainTracer<BatchingContext<DomainTracingContext<Session>, ArrayIrBatchingPolicy>>,
         >;
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4986,7 +4986,7 @@ pub(crate) mod tests {
             DomainTracer<BatchingContext<DomainTracingContext<Session>, ArrayIrBatchingPolicy>>,
         >;
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -5199,7 +5199,7 @@ pub(crate) mod tests {
             .unwrap();
         let module = lower_replicated_shard_map_body(program, 2).unwrap();
         let client = cpu_client(2);
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let options = test_spmd_compilation_options(2);
         let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options).unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
@@ -5382,7 +5382,7 @@ pub(crate) mod tests {
         // and the second map squares each summand of that unreduced input. The devices return `[1]` and `[4]`, whose
         // sum `5` host materialization recovers.
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let logical_mesh = test_manual_mesh("x", 2);
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
@@ -5427,7 +5427,7 @@ pub(crate) mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let replicated = Sharding::replicated(map_mesh.clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(
@@ -5495,7 +5495,7 @@ pub(crate) mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let replicated = Sharding::replicated(map_mesh.clone(), 0);
         let input_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -5552,7 +5552,7 @@ pub(crate) mod tests {
         // declares one mesh, which assigns device ids to coordinates, while `axis_index` computes coordinates from the
         // axis order of the mesh of its own map, so maps over meshes with other axis orders must not share a module.
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let mesh = test_logical_mesh_2x2();
         let reordered_mesh = LogicalMesh::new(vec![
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -5646,7 +5646,7 @@ pub(crate) mod tests {
         // result tiled like the output of the map, and every device returns one element instead of both. The first
         // output has no placement and the second one is replicated explicitly.
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh = || {
             let devices = client.addressable_devices().unwrap();

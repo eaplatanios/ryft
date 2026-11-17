@@ -973,8 +973,8 @@ mod tests {
         // imaginary component as `0 · ∞ = NaN`, and a lone signed zero is returned exactly. Reductions and scans share
         // the combiner.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let vector = |values: &[Complex<f64>]| {
             replicated_array(&session, &mesh, DataType::C128, &[values.len()], values_to_bytes(values).as_slice())
         };
@@ -1051,8 +1051,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Dyadic inputs keep every floating-point result exact, including the division by the count of `Mean`.
         let input =
@@ -1163,8 +1163,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower_product_with_zero_factors() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
         let input_type = replicated_vector_type(&mesh, 3);
         let compiled: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -1179,17 +1179,17 @@ mod tests {
             let input =
                 Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
             let output = compiled.executable().execute(&engine, input.clone()).unwrap();
-            assert_eq!(read_f32s(&client, &output), vec![expected]);
+            assert_eq!(read_f32s(client, &output), vec![expected]);
             let output = gradient.executable().execute(&engine, input).unwrap();
-            assert_eq!(read_f32s(&client, &output), expected_gradient);
+            assert_eq!(read_f32s(client, &output), expected_gradient);
         }
     }
 
     #[test]
     fn test_reduce_operation_lower_product_sharded_gradient() {
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = session_with_client(&client);
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let engine = session_with_client(client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> =
@@ -1282,8 +1282,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower_empty_mean() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
         let input_type = replicated_vector_type(&mesh, 0);
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             |value| value.reduce(&[0], ReductionKind::Mean).unwrap(),
@@ -1294,14 +1294,14 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&engine, input_type, mesh, []).unwrap();
         let output = compiled.executable().execute(&engine, input).unwrap();
-        assert!(read_f32s(&client, &output)[0].is_nan());
+        assert!(read_f32s(client, &output)[0].is_nan());
     }
 
     #[test]
     fn test_reduce_operation_lower_narrow_floating_point_accumulation() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
 
         // Product retains the small growth of each factor, and the larger mean also needs a widened divisor.
         for (kind, count, input, expected) in [
@@ -1331,15 +1331,15 @@ mod tests {
                 Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
-            assert_eq!(read_f32s(&client, &output), vec![expected]);
+            assert_eq!(read_f32s(client, &output), vec![expected]);
         }
     }
 
     #[test]
     fn test_reduce_operation_lower_extrema() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Boolean extrema use the `false` and `true` identities, including when the reduced axis is empty.
         let empty_booleans = replicated_array(&session, &mesh, DataType::Boolean, &[0], &[]);
@@ -1740,8 +1740,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower_complex_executes() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
         // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
         // to compare the imaginary component against the identity rather than deciding on the real component.
         for (kind, components, expected) in [
@@ -1759,7 +1759,7 @@ mod tests {
             let input =
                 Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&components)).unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
-            assert_eq!(read_f32s(&client, &output), expected);
+            assert_eq!(read_f32s(client, &output), expected);
         }
     }
 
@@ -1848,8 +1848,8 @@ mod tests {
         // without them. The composite stages the softmax as one program, which the eager operations of the other
         // tests never do, and its rows are the softmax of the logarithms of `1`, `2`, and `5` in two orders.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let softmax =
             composite(|input: DomainTracer<ProjectedContext<Session, ArrayType>>| -> Result<_, ProgramError> {
                 let maxima = input.reduce(&[1], ReductionKind::Max)?.broadcast_like(&input, &[0])?;
@@ -1894,9 +1894,9 @@ mod tests {
         // they recognize. Floating-point extrema over two devices still propagate NaNs and order negative zero below
         // positive zero, wherever the shards hold them.
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(&client, "x", 2).devices().to_vec()).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(client, "x", 2).devices().to_vec()).unwrap();
         let sharded = |data_type: DataType, dimensions: &[usize], axis: usize, bytes: Vec<u8>| {
             let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
             placements[axis] = ShardingDimension::sharded(["x"]);
@@ -2335,8 +2335,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower_log_sum_exp_gradient() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
         let input_type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2350,12 +2350,12 @@ mod tests {
             Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
-        assert_eq!(read_f32s(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
+        assert_eq!(read_f32s(client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled guard for finite shifts must retain the undefined weight at an infinite input.
         let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
-        let values = read_f32s(&client, &output.convert_element_type(DataType::F32).unwrap());
+        let values = read_f32s(client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
         assert_eq!(values[1], 0.);
     }
@@ -2363,8 +2363,8 @@ mod tests {
     #[test]
     fn test_reduce_operation_lower_log_sum_exp_narrow_jvp() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = session_with_client(client);
         let input_type = ArrayType::new_static(DataType::F16, [65536])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2376,7 +2376,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
         let (_, tangent) = differentiated.executable().execute(&engine, (input.clone(), input)).unwrap();
-        assert_eq!(read_f32s(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
+        assert_eq!(read_f32s(client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }
 
     #[test]
@@ -2546,8 +2546,8 @@ mod tests {
     #[test]
     fn test_lower_log_sum_exp_to_mlir_complex() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
         // zero exponential. XLA's complex exponential and logarithm round differently from the host's.
@@ -2592,8 +2592,8 @@ mod tests {
         // Narrow floating-point inputs compare in `f32`, signed one-bit inputs compare in a signed byte carrier, and
         // the expected indices are the ones that JAX's `lax.argmax` and `lax.argmin` return.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let cases = [
             (
                 DataType::BF16,
@@ -2664,8 +2664,8 @@ mod tests {
         // An axis that contains a NaN of either sign reports its first NaN, and ties between signed zeros select the
         // lowest index, as `jnp.argmax` and `jnp.argmin` do.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         for (values, expected_argmax, expected_argmin) in [
             (vec![1f32, f32::NAN, 3.0], 1i32, 1i32),
             (vec![1f32, -f32::NAN, f32::NAN], 1, 1),

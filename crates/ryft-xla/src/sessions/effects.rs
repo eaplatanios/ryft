@@ -59,8 +59,9 @@ impl EffectCompletion {
 /// Ordering and completion scope that every handle of a session selects, separate from numerical values and
 /// compilation artifacts.
 ///
-/// Cloned sessions share their selected scope, while forking a session starts an independent sequence. Submissions
-/// reserve positions before dispatch so ordered work observes its predecessors even when launches complete
+/// Cloned sessions share their selected scope, while
+/// [`Session::with_new_effect_scope`](crate::Session::with_new_effect_scope) starts an independent sequence.
+/// Submissions reserve positions before dispatch so ordered work observes its predecessors even when launches complete
 /// asynchronously. [`Self::barrier`] waits for earlier reservations and reports failures in submission order.
 /// [`Self::acknowledge`] permits recovery only after affected work has completed and its failures have been observed.
 #[derive(Default)]
@@ -373,7 +374,7 @@ struct EffectScopeState {
     /// Failures reported by completed barriers.
     observed: HashSet<u64>,
 
-    /// Ordered device assignment selected by the chain. Changing it requires an explicit scope fork.
+    /// Ordered device assignment selected by the chain. Changing it requires a new scope.
     device: Option<Vec<DeviceId>>,
 }
 
@@ -713,7 +714,7 @@ mod tests {
     #[test]
     fn test_ensure_effect_dispatch_allowed_rejects_managed_callback_reentrancy() {
         let client = execution_client();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let scope = EffectScope::default();
         let guard = EffectCallbackGuard::enter();
         let reason = "execution and effect barriers cannot be entered from a managed callback";
@@ -756,7 +757,7 @@ mod tests {
     #[test]
     fn test_session_array_ordered_effects() {
         let client = cpu_client(1);
-        assert_session_array_ordered_effects(&client, true);
+        assert_session_array_ordered_effects(client, true);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -781,7 +782,7 @@ mod tests {
     #[test]
     fn test_session_effect_metadata_reload_and_unordered_completion() {
         let client = cpu_client(1);
-        assert_domain_effect_metadata_reload_and_unordered_completion(&client, true);
+        assert_domain_effect_metadata_reload_and_unordered_completion(client, true);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -813,8 +814,8 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = session_with_client(&client);
-        ensure_print_handler_registered(&client).unwrap();
+        let session = session_with_client(client);
+        ensure_print_handler_registered(client).unwrap();
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![2])))
             .with_sharding(
                 Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Sharded(vec!["x".to_string()])])

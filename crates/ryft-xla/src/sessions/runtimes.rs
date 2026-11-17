@@ -302,18 +302,18 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 /// use ryft_xla::{Error, RuntimeError, Session, Target};
 ///
 /// struct Provider;
-/// struct Runtime<'c> { client: &'c Client<'c> }
-/// impl<'c> RuntimeExtension for Runtime<'c> {}
+/// struct Runtime { client: &'static Client<'static> }
+/// impl RuntimeExtension for Runtime {}
 ///
-/// impl<'c> RuntimeProvider for Provider {
+/// impl RuntimeProvider for Provider {
 ///     fn identifier(&self) -> &str { "example.runtime" }
 ///
 ///     fn initialize(
 ///         &self,
-///         client: &'c Client<'c>,
+///         client: &'static Client<'static>,
 ///         target: &Target,
 ///         requirement: &RuntimeRequirement,
-///     ) -> Result<Arc<dyn RuntimeExtension + 'c>, Error> {
+///     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
 ///         if requirement.abi_version() != 1 {
 ///             return Err(RuntimeError::UnsupportedVersion {
 ///                 identifier: self.identifier().into(), version: requirement.abi_version(),
@@ -324,7 +324,7 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///     }
 /// }
 ///
-/// fn configure<'c>(client: &'c Client<'c>) -> Result<Session, Error> {
+/// fn configure(client: &'static Client<'static>) -> Result<Session, Error> {
 ///     let providers = RuntimeExtensions::new().with_provider(Arc::new(Provider))?;
 ///     let requirement = RuntimeRequirement::new("example.runtime", 1, [])?;
 ///     let operation = with_runtime_requirements(CustomCallOperation::new("example.call", vec![]), [requirement])?;
@@ -1086,8 +1086,8 @@ mod tests {
         let configuration = RuntimeExtensions::empty()
             .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
-        let first = Session::builder().client(&client).runtime_extensions(configuration.clone()).build().unwrap();
-        let second = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+        let first = Session::builder().client(client).runtime_extensions(configuration.clone()).build().unwrap();
+        let second = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
         let requirement = builtin_requirement("test.provider");
         assert_eq!(
             first
@@ -1112,7 +1112,7 @@ mod tests {
         let configuration = RuntimeExtensions::empty()
             .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
-        let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
         let target = session.target().unwrap();
         std::thread::scope(|threads| {
             for _ in 0..8 {
@@ -1162,7 +1162,7 @@ mod tests {
         let client = execution_client();
         let provider = Arc::new(ReentrantProvider { session: Mutex::new(None), calls: AtomicUsize::new(0) });
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
-        let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
         *provider.session.lock().unwrap() = Some(session.clone());
         let requirement = builtin_requirement("test.recursive");
         let ensure = || session.runtimes().ensure(std::slice::from_ref(&requirement), session.target().unwrap());
@@ -1240,7 +1240,7 @@ mod tests {
             .unwrap()
             .with_provider(right.clone())
             .unwrap();
-        let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
         *left.session.lock().unwrap() = Some(session.clone());
         *right.session.lock().unwrap() = Some(session.clone());
         std::thread::scope(|threads| {
@@ -1271,8 +1271,7 @@ mod tests {
     #[test]
     fn test_runtime_registry_ensure_rejects_missing_provider_before_initialization() {
         let client = execution_client();
-        let session =
-            Session::builder().client(&client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+        let session = Session::builder().client(client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
         assert!(matches!(
             session.runtimes().ensure(&[builtin_requirement("test.missing")], session.target().unwrap()),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing",
@@ -1287,8 +1286,8 @@ mod tests {
         let configuration = RuntimeExtensions::empty()
             .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
             .unwrap();
-        let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
         for requirements in [Vec::new(), vec![builtin_requirement("test.provider")]] {
             let resources = session.runtimes().prepare(&requirements, session.target().unwrap(), &mesh).unwrap();
             let (context, lease) = resources.into_parts();
@@ -1317,10 +1316,10 @@ mod tests {
                 drops: Some(Arc::clone(&drops)),
             }))
             .unwrap();
-        let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
         let resources = session
             .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
+            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(client, "x", 1))
             .unwrap();
         let (_, lease) = resources.into_parts();
         let (event, promise) = client.event(()).unwrap();
@@ -1330,7 +1329,7 @@ mod tests {
         fence.block_until_ready().unwrap();
         let resources = session
             .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
+            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(client, "x", 1))
             .unwrap();
         let (_, lease) = resources.into_parts();
         session.runtimes().retain(&fence, lease);
@@ -1352,10 +1351,10 @@ mod tests {
                 drops: Some(Arc::clone(&drops)),
             }))
             .unwrap();
-        let session = Session::builder().client(&client).runtime_extensions(configuration).build().unwrap();
+        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
         let resources = session
             .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
+            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(client, "x", 1))
             .unwrap();
         let (_, lease) = resources.into_parts();
         let (first, first_promise) = client.event(()).unwrap();

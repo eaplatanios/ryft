@@ -1174,7 +1174,7 @@ mod tests {
     fn test_cuda_runtime_provider_initialize() {
         let client =
             process_client(&load_cpu_plugin().unwrap(), ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let target = Target::from_client(&client).unwrap();
+        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let error = provider
             .initialize(client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))

@@ -61,7 +61,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &unproject_plain_program(program),
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
                 &[],
@@ -84,12 +84,12 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[2])
+            execute_mixed_program(client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[2])
                 .unwrap(),
             vec![MixedValue::Array(vec![2.0, 1.0], vec![2]), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[0])
+            execute_mixed_program(client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[0])
                 .unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)],
         );

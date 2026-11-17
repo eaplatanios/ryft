@@ -295,8 +295,8 @@ mod tests {
         // axis. The propagation hint is staged into the trace and lowers to `sdy.sharding_constraint`, and the output
         // array carries the sharding derived from its input on each device.
         let client = cpu_client(2);
-        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = session_with_client(&client);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let engine = session_with_client(client);
 
         let shape = Shape::new(vec![CoreDimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();

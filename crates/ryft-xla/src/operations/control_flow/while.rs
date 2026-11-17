@@ -886,7 +886,7 @@ mod tests {
         let client = execution_client();
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[
                     MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
@@ -898,7 +898,7 @@ mod tests {
             vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3]),],
         );
         let error = execute_mixed_program(
-            &client,
+            client,
             &program,
             &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]), MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3])],
             &[2],
@@ -964,7 +964,7 @@ mod tests {
         let second = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[MixedValue::Array(first.to_vec(), vec![4, 4]), MixedValue::Array(second.to_vec(), vec![4, 3])],
                 &[2, 3, 2],
@@ -1111,14 +1111,14 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         for (input, expected, expected_lines) in [
             (-1.0, -1.0, vec!["condition: -1.0"]),
             (1.0, 0.0, vec!["condition: 1.0", "body: 0.0", "condition: 0.0"]),
             (5.0, 3.0, vec!["condition: 5.0", "body: 4.0", "condition: 4.0", "body: 3.0"]),
         ] {
             let (outputs, lines) = with_captured_prints(|| {
-                execute_mixed_program(&client, &program, &[MixedValue::Array(vec![input], vec![])], &[])
+                execute_mixed_program(client, &program, &[MixedValue::Array(vec![input], vec![])], &[])
             });
             assert_eq!(outputs.unwrap(), vec![MixedValue::Array(vec![expected], vec![])], "input {input}",);
             assert_eq!(lines, expected_lines, "input {input}");
@@ -1199,7 +1199,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[MixedValue::Array(vec![3.0, 1.0, 2.0], vec![3])],
                 &[]
@@ -1611,7 +1611,7 @@ mod tests {
         // Three iterations negate the vector three times.
         assert_eq!(
             execute_on_two_devices(
-                &client,
+                client,
                 &mesh,
                 &module,
                 &[(&scalar_type, None, &[0.0]), (&scalar_type, None, &[3.0]), (&vector_type, None, &values)],
@@ -1625,14 +1625,14 @@ mod tests {
         // Batching over eager array IR values threads the batch extent through the loop state, so the batched loop that
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let value = |dimensions: &[usize], values: &[f32]| {
             Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
         let read = |value: Value| {
             let array = program_array(&value);
-            (array.shape().dimensions().to_vec(), read_f32s(&client, array))
+            (array.shape().dimensions().to_vec(), read_f32s(client, array))
         };
         let (state, limit) = batch(
             |(state, limit)| {

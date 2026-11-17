@@ -876,8 +876,8 @@ mod tests {
     #[test]
     fn test_log_operation_lower_f8e8m0fnu() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The logarithm of one in a format with only exponent bits is an unrepresentable zero and converts to NaN.
         let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
@@ -1002,8 +1002,8 @@ mod tests {
     #[test]
     fn test_logistic_operation_lower_saturated() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The derivative `logistic(x) · logistic(-x)` evaluates both sign branches of the lowering, so neither
         // saturated tail may overflow its exponential. XLA can flush subnormal results, so these tails stay above
@@ -1049,8 +1049,8 @@ mod tests {
     #[test]
     fn test_lower_log_add_exp_to_mlir() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Narrow formats evaluate the whole composition in `f32` and round only the final output, here for an
         // format with only exponent bits and for a half precision format.
@@ -1101,8 +1101,8 @@ mod tests {
     #[test]
     fn test_lower_log_add_exp_to_mlir_complex() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let c128_vector = |value: Complex<f64>| {
             replicated_array(&session, &mesh, DataType::C128, &[1], values_to_bytes(&[value]).as_slice())
         };
@@ -1152,8 +1152,8 @@ mod tests {
     #[test]
     fn test_lower_complex_exp_m1_to_mlir() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Tiny arguments keep both tiny components, and the real component keeps the `cos - 1` cancellation through
         // `-2 sin²(imaginary / 2)`. The imaginary component keeps its tail after the real component has rounded to -1.
@@ -1175,8 +1175,8 @@ mod tests {
     #[test]
     fn test_lower_complex_ln_1p_to_mlir() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // An input near zero keeps both tiny components, and inputs on the negative real branch cut keep their side.
         let input = replicated_array(

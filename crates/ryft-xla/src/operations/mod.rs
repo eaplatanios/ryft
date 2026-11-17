@@ -1807,8 +1807,8 @@ mod tests {
     #[test]
     fn test_elementwise_lowering_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let left_values = [0.5f32, 1.25, 2.0, 3.75];
         let right_values = [4.0f32, 0.25, -1.5, 2.5];
         let left = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&left_values));
@@ -1900,8 +1900,8 @@ mod tests {
     #[test]
     fn test_lower_accuracy_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let values = [0.5f32, -1.0, 2.0];
         let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
         let reference = CoreArray::vector(values.to_vec()).unwrap();

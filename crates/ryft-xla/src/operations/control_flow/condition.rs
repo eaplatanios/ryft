@@ -876,7 +876,7 @@ mod tests {
         for (predicate, expected) in [(true, "true backward: 7.0"), (false, "false backward: 7.0")] {
             assert_eq!(
                 execute_module_without_outputs(
-                    &client,
+                    client,
                     &module,
                     &[(&7f64.to_ne_bytes(), BufferType::F64), (&[u8::from(predicate)], BufferType::Predicate)],
                 ),
@@ -949,7 +949,7 @@ mod tests {
         for (predicate, expected) in [(true, "true: 7.0"), (false, "false: 7.0")] {
             assert_eq!(
                 execute_module_without_outputs(
-                    &client,
+                    client,
                     &module,
                     &[(&[u8::from(predicate)], BufferType::Predicate), (&7f64.to_ne_bytes(), BufferType::F64)],
                 ),
@@ -1000,7 +1000,7 @@ mod tests {
         assert_eq!(program.output_types(), vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]);
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[
                     MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
@@ -1019,7 +1019,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         let mut builder = ArrayIrProgramBuilder::new();
         builder.add_input(extent_type.clone().into());
         let input = builder.add_input(dynamic_type.clone().into());
@@ -1057,7 +1057,7 @@ mod tests {
             let expected = if predicate_value { vec![1.0, 2.0, 3.0] } else { vec![0.0; 3] };
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &program,
                     &[MixedValue::Dimension(3), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
                     &[],
@@ -1069,7 +1069,7 @@ mod tests {
             // Lowering retypes each branch input independently, so only the entry guard rejects a dimension that
             // disagrees with the static array extent, before either branch runs.
             let error = execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[MixedValue::Dimension(4), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
                 &[],
@@ -1236,7 +1236,7 @@ mod tests {
             for extent in [0, 1, 8] {
                 assert_eq!(
                     execute_mixed_program(
-                        &client,
+                        client,
                         &program,
                         &[
                             MixedValue::Array(vec![selector], vec![]),
@@ -1351,7 +1351,7 @@ mod tests {
         for (selector, extent, value) in [(1.0, 3, 7.0), (-1.0, 5, -7.0)] {
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &program,
                     &[
                         MixedValue::Array(vec![selector], vec![]),
@@ -1461,10 +1461,10 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
             vec![MixedValue::Array(vec![2.0], vec![])],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Array(vec![-2.0], vec![])], &[])
+        let error = execute_mixed_program(client, &program, &[MixedValue::Array(vec![-2.0], vec![])], &[])
             .unwrap_err()
             .to_string();
         // The runtime appends its own context to the assertion message.
@@ -1599,10 +1599,10 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let (outputs, lines) = with_captured_prints(|| {
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[MixedValue::Array(vec![0.0], vec![]), MixedValue::Array(vec![3.0], vec![])],
                 &[],
@@ -1733,10 +1733,10 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let (outputs, lines) = with_captured_prints(|| {
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[MixedValue::Array(vec![0.0], vec![]), MixedValue::Array(vec![1.0, -2.0, 3.0], vec![3])],
                 &[],
@@ -1819,7 +1819,7 @@ mod tests {
         for (selector, expected) in [(1.0, vec![-1.0, -2.0, -3.0]), (-1.0, vec![2.0, 4.0, 6.0])] {
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &batched,
                     &[
                         MixedValue::Dimension(3),
@@ -1861,7 +1861,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &batched,
                 &[
                     MixedValue::Dimension(3),
@@ -1881,14 +1881,14 @@ mod tests {
         // a standalone program whose results must all be arrays. Neither predicate kind may therefore return the batch
         // extent that array IR batching threads through the batched branches.
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let value = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
             Value::Array(replicated_array(&session, &mesh, data_type, dimensions, bytes))
         };
         let read = |value: Value| {
             let array = program_array(&value);
-            (array.shape().dimensions().to_vec(), read_f32s(&client, array))
+            (array.shape().dimensions().to_vec(), read_f32s(client, array))
         };
         let inputs = value(DataType::F32, &[3], values_to_bytes(&[1f32, 2.0, 3.0]).as_slice());
 
@@ -2105,7 +2105,7 @@ mod tests {
         {
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &program,
                     &[
                         MixedValue::Array(vec![selector], vec![]),
@@ -2209,7 +2209,7 @@ mod tests {
         ] {
             assert_eq!(
                 execute_on_two_devices(
-                    &client,
+                    client,
                     &mesh,
                     &module,
                     &[(&selector_type, None, &[selector]), (&vector_type, None, &values)],

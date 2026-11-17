@@ -379,7 +379,7 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
         .map(|device| (0..4).map(|offset| (device * 4 + offset) as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let outputs = execute_collective_module(
-        &client,
+        client,
         device_mesh,
         sharding,
         stablehlo.as_str(),
@@ -428,7 +428,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
         .map(|device| (0..2).map(|offset| (device * 2 + offset) as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let outputs = execute_collective_module(
-        &client,
+        client,
         device_mesh,
         sharding,
         stablehlo.as_str(),
@@ -499,7 +499,7 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
         .map(|device| (0..8).map(|offset| (device * 8 + offset) as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let outputs = execute_collective_module(
-        &client,
+        client,
         device_mesh,
         sharding,
         stablehlo.as_str(),
@@ -965,7 +965,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let outputs = execute_collective_inputs(
-        &client,
+        client,
         device_mesh,
         stablehlo.as_str(),
         &[

@@ -492,10 +492,10 @@ fn read_i32_array(client: &Client<'_>, array: &Array) -> Vec<i32> {
 /// caches within floating-point tolerance.
 fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
     let client = cpu_client(1);
-    let mesh = domain_mesh(&client, "x", 1);
+    let mesh = domain_mesh(client, "x", 1);
     let engine = Session::builder().client(client).build().unwrap();
     if attention == DecodeAttention::CustomCall {
-        ensure_decode_attention_handler_registered(&client).unwrap();
+        ensure_decode_attention_handler_registered(client).unwrap();
     }
 
     let configuration = DecodeConfiguration { vocabulary: 16, dimension: 8, steps: 6, top_k: 4 };
@@ -553,9 +553,9 @@ fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
         .extend(weights.iter().enumerate().map(|(index, values)| device_input(index + 6, values_to_bytes(values))));
     let outputs = compiled.executable().execute(&engine, device_inputs).unwrap();
     assert_eq!(outputs.len(), 3);
-    let device_tokens = read_i32_array(&client, &outputs[0]);
-    let device_cache_keys = read_f32s(&client, &outputs[1]);
-    let device_cache_values = read_f32s(&client, &outputs[2]);
+    let device_tokens = read_i32_array(client, &outputs[0]);
+    let device_cache_keys = read_f32s(client, &outputs[1]);
+    let device_cache_values = read_f32s(client, &outputs[2]);
 
     let mut reference_state = vec![
         CoreArray::from_elements(ArrayType::new_static(DataType::I32, []), &[0i32]).unwrap(),

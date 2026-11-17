@@ -945,7 +945,7 @@ fn test_mosaic_gpu_vector_add_on_cuda_pjrt() {
     test_for_each_platform!(|_plugin, client, platform| {
         if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
             tested_cuda = true;
-            run_slice_on_cuda(&client, &vector_add_slice());
+            run_slice_on_cuda(client, &vector_add_slice());
         }
     });
     assert!(tested_cuda, "Mosaic GPU seam probe requires `ryft-experimental` to be built with a `cuda-*` feature");
@@ -960,7 +960,7 @@ fn test_mosaic_gpu_tiled_matmul_on_cuda_pjrt() {
     test_for_each_platform!(|_plugin, client, platform| {
         if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
             tested_cuda = true;
-            run_slice_on_cuda(&client, &tiled_matmul_slice());
+            run_slice_on_cuda(client, &tiled_matmul_slice());
         }
     });
     assert!(tested_cuda, "Mosaic GPU seam probe requires `ryft-experimental` to be built with a `cuda-*` feature");
@@ -1026,7 +1026,7 @@ fn test_mosaic_gpu_repeated_compilation_on_cuda_pjrt() {
             for _ in 0..8 {
                 let (program, _) = slice_program(&slice, device_compute_capability(&device));
                 let executable = client.compile(&program, &test_compilation_options()).unwrap();
-                execute_slice(&client, &executable, &device, &slice);
+                execute_slice(client, &executable, &device, &slice);
             }
         }
     });

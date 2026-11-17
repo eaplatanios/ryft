@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn test_compare_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let left = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 5.0, 3.0, 8.0]));
         let right = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[4f32, 2.0, 3.0, 9.0]));
         assert_eq!(
@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn test_compare_operation_lower_one_bit_integers() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Every pair of bits is compared in every direction. I1 interprets the set bit as -1, while U1 and Boolean
         // interpret it as +1.
@@ -231,8 +231,8 @@ mod tests {
     #[test]
     fn test_compare_operation_lower_executes_per_element() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let values = f32_vector(&session, &mesh, &[1., -2., 3., -4.]);
         let limits = f32_vector(&session, &mesh, &[0., 0., 0., 0.]);
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(

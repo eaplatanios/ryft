@@ -645,8 +645,8 @@ mod tests {
     #[test]
     fn test_atan2_operation_lower_complex_differentiation() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let y = Complex::new(0.7f32, -0.2);
         let x = Complex::new(-0.3f32, 0.4);
         let y_array = replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[y]));
@@ -688,8 +688,8 @@ mod tests {
     #[test]
     fn test_tanh_operation_lower_complex_large_real() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         // Real parts large enough to overflow the intermediate exponentials saturate to `±1 + 0i` without NaN.
         let input = replicated_array(
             &session,
@@ -711,8 +711,8 @@ mod tests {
     #[test]
     fn test_lower_complex_sine_or_cosine_large_imaginary() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Hyperbolic factors need not overflow with their exponential intermediates, and a small real factor can keep
         // one component finite beyond the range of the hyperbolic factor itself. The finite components near overflow

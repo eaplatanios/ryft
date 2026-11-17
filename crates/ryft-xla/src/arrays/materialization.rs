@@ -808,8 +808,8 @@ mod tests {
     #[test]
     fn test_materialize_bounded_dynamic_inputs() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -917,8 +917,8 @@ mod tests {
     #[test]
     fn test_materialize_bounded_dynamic_inputs_independent_misses_share_one_issue_phase() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -1001,7 +1001,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -1058,7 +1058,7 @@ mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let sharding = Sharding::replicated(logical_mesh, 1).with_unreduced_axes(["x"]).unwrap();
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -1094,8 +1094,8 @@ mod tests {
     #[test]
     fn test_materialize_bounded_dynamic_inputs_concurrent_calls_are_single_flight() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -1151,8 +1151,8 @@ mod tests {
     #[test]
     fn test_materialize_bounded_dynamic_inputs_skips_padding_for_zero_space_inputs() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let declared_type = ArrayType::new(
             DataType::Zero,
@@ -1186,8 +1186,8 @@ mod tests {
     #[test]
     fn test_materialize_bounded_dynamic_inputs_with_readiness_failed_batch_is_not_published_and_retries() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),

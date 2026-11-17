@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn test_target_from_client() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let target = session.target().unwrap();
         assert!(std::ptr::eq(target, session.clone().target().unwrap()));
         assert_eq!(target.platform_name(), client.platform_name().unwrap());
@@ -314,7 +314,7 @@ mod tests {
         }
 
         // Lowering over a mesh of the captured devices records the target facts.
-        let mesh = domain_mesh(&client, "x", 2);
+        let mesh = domain_mesh(client, "x", 2);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(replicated_vector_type(&mesh, 2)));
         let output = builder

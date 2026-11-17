@@ -258,7 +258,7 @@ mod tests {
         // Scalar branches inherit both logical extents from a matrix condition, and a scalar condition inherits
         // them from a matrix branch. Capacity padding must not appear in either selected result.
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2, 2]).unwrap(),
             vec![
                 MixedValue::Array(vec![5., -7., -7., 5.], vec![2, 2]),
                 MixedValue::Array(vec![1., -8., -9., 4.], vec![2, 2]),
@@ -269,7 +269,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[0, 2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[0, 2]).unwrap(),
             vec![
                 MixedValue::Array(Vec::new(), vec![0, 2]),
                 MixedValue::Array(Vec::new(), vec![0, 2]),
@@ -313,7 +313,7 @@ mod tests {
         // No input has the output shape. The row extent comes from the condition and the column extent from
         // the true branch. Both stretched inputs must broadcast their bounded storage before restoring sizes.
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2, 3]).unwrap(),
             vec![
                 MixedValue::Array(vec![10., 20., 30., -7., -7., -7.], vec![2, 3]),
                 MixedValue::Dimension(2),
@@ -321,7 +321,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 0]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2, 0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![2, 0]), MixedValue::Dimension(2), MixedValue::Dimension(0),],
         );
     }
@@ -329,8 +329,8 @@ mod tests {
     #[test]
     fn test_select_operation_lower_promotes_signed_one_bit_branches() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let condition = replicated_array(&session, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
         let signed = replicated_array(&session, &mesh, DataType::I1, &[4], &[1, 1, 0, 0]);
         let wide = replicated_array(&session, &mesh, DataType::I32, &[4], &values_to_bytes(&[2i32, 3, 4, 5]));

@@ -413,7 +413,7 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
         // The bits are deterministic for the fixed all-zero generator state.
         let bits = vec![
             1797259609.0,
@@ -427,10 +427,10 @@ mod tests {
             1447157908.0,
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(3)], &[]).unwrap(),
             vec![MixedValue::Array(bits.clone(), vec![3, 3]), MixedValue::Array(bits, vec![3, 3])],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &[MixedValue::Dimension(4)], &[]).unwrap_err().to_string();
         assert!(error.contains("input dimension `size` expected 3"), "{error}");
     }
 
@@ -497,8 +497,8 @@ mod tests {
         // first even-sized axis of the output, or else its first largest axis, and advances the counter by the size
         // of the resulting half shape, which the last group covers at several shapes and every narrow width.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         for (algorithm, state_values, outputs) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, 7], vec![(DataType::U32, vec![5]), (DataType::U64, vec![3])]),
             (RandomAlgorithm::Philox, vec![42u64, 7, 9], vec![(DataType::U32, vec![5]), (DataType::U64, vec![3])]),
@@ -542,8 +542,8 @@ mod tests {
         // Empty outputs preserve the state, and counter advancement wraps at the counter width of the algorithm while
         // the bits stay byte-identical with the reference backend for every output width.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         for (algorithm, state_values) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, u64::MAX - 1]),
             (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, 7]),
@@ -589,8 +589,8 @@ mod tests {
     #[test]
     fn test_split_rng_key_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let (device_advanced_state, device_keys) = state.split_rng_key(2).unwrap();
         let (reference_advanced_state, reference_keys) = reference_state.split_rng_key(2).unwrap();
@@ -606,8 +606,8 @@ mod tests {
         // Every step of the composition is exact arithmetic over byte-identical ThreeFry bits, so the samples keep
         // their exact encodings on both backends, including the narrow floating-point types.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for data_type in [DataType::F32, DataType::BF16, DataType::F16] {
             let sample_type = ArrayType::new_static(data_type, [8]);
@@ -628,8 +628,8 @@ mod tests {
         // The Box-Muller transform goes through transcendental functions, whose last bits may differ between the
         // backends. Complex samples consist of two independently drawn components.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for (data_type, component_count, tolerance) in
             [(DataType::F32, 8, 1e-5f64), (DataType::C64, 16, 1e-5), (DataType::C128, 16, 1e-12)]
@@ -670,8 +670,8 @@ mod tests {
     #[test]
     fn test_random_categorical_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let logit_values = [0f32, 10.0, -3.0, 2.0];
         let logits = replicated_array(&session, &mesh, DataType::F32, &[4], values_to_bytes(&logit_values).as_slice());
@@ -690,8 +690,8 @@ mod tests {
         // High-precision sampling never selects a category masked with `-inf` and advances the same state on both
         // backends.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         for (algorithm, state_values) in
             [(RandomAlgorithm::ThreeFry, vec![11u64, 3]), (RandomAlgorithm::Philox, vec![11u64, 3, 0])]
         {
@@ -869,7 +869,7 @@ mod tests {
             advanced_state.unwrap().elements::<u64>().unwrap().into_iter().map(|value| value as f64).collect();
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[MixedValue::Array(values, vec![4, 8]), MixedValue::Array(odd_values, vec![3, 5])],
                 &[],

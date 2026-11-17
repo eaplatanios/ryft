@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn test_constructed_array_count_and_dropped_array_count() {
         let client = execution_client();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();

@@ -1204,8 +1204,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input =
             replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
         let output = input.convert_element_type(DataType::F8E4M3FN).unwrap();
@@ -1215,8 +1215,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_integer_rounding() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Integer precision above a BF16 rounding midpoint must survive the conversion.
         let midpoint = (1u64 << 60) + (1u64 << 52);
@@ -1243,8 +1243,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_f64_rounding() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         // Converting `f64` to a narrower float rounds once, so values just below, at, and just above a rounding
         // midpoint land on the correct neighbor for both signs, at normal and subnormal midpoints alike.
         for (data_type, midpoint, expected) in [
@@ -1286,8 +1286,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_finite_formats() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Formats without infinities or NaNs saturate infinities and finite overflow, and NaNs select the positive
         // maximum. Unsigned F8E8M0FNU has a NaN but no zero or sign, so zeros, negative values, infinities, and NaNs
@@ -1317,8 +1317,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_fp6_to_f32() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let encodings = (0u8..64).collect::<Vec<_>>();
         // Every FP6 encoding is finite. Exact F32 bytes distinguish both zeros and cover the boundary between
         // subnormal and normal values and the largest exponent, which must not be mistaken for an infinity or NaN.
@@ -1348,8 +1348,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_complex_to_boolean() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         // Purely imaginary values and NaNs in either component are nonzero, whereas signed zeros are false.
         let components = [0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
         let input = replicated_array(&session, &mesh, DataType::C64, &[6], &values_to_bytes(&components));
@@ -1360,8 +1360,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_sub_byte_integers() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The same physical bit represents -1 for I1 and +1 for U1 and Boolean.
         for (data_type, expected) in
@@ -1431,8 +1431,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_bitcast_preserves_dynamic_prefix_extents() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
@@ -1491,10 +1491,10 @@ mod tests {
                 session.execute_program(&compiled, vec![f32_vector(&session, &mesh, &vec![1.0; count])]).unwrap();
             assert_eq!(outputs[0].shape(), StaticShape::new(vec![count, 2]));
             assert_eq!(outputs[1].shape(), StaticShape::new(vec![count]));
-            assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0; count]);
+            assert_eq!(read_f32s(client, &outputs[1]), vec![1.0; count]);
             assert_eq!(outputs[2].shape(), StaticShape::new(vec![count, 32]));
             assert_eq!(outputs[3].shape(), StaticShape::new(vec![count]));
-            assert_eq!(read_f32s(&client, &outputs[3]), vec![1.0; count]);
+            assert_eq!(read_f32s(client, &outputs[3]), vec![1.0; count]);
             let bytes = outputs[0]
                 .addressable_shards()
                 .next()
@@ -1535,8 +1535,8 @@ mod tests {
     #[test]
     fn test_reduce_precision_operation_lower_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Each case lists element encodings covering ties, rounding carries into the exponent, overflow, underflow,
         // subnormals, signed zeros, infinities, and NaN payloads, along with the simulated formats to reduce them to.
@@ -1649,10 +1649,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                execute_mixed_program(&client, &program, std::slice::from_ref(&symbolic_input), &[2]).unwrap(),
+                execute_mixed_program(client, &program, std::slice::from_ref(&symbolic_input), &[2]).unwrap(),
                 vec![MixedValue::Array(vec![1.0, 2.0], vec![2])],
             );
-            let result = execute_mixed_program(&client, &program, std::slice::from_ref(&symbolic_input), &[3]);
+            let result = execute_mixed_program(client, &program, std::slice::from_ref(&symbolic_input), &[3]);
             if checked {
                 let error = result.unwrap_err().to_string();
                 assert_eq!(
@@ -1675,10 +1675,10 @@ mod tests {
         .unwrap();
         let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 5.0, 0.0], vec![4])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2]).unwrap(),
             vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[3]).unwrap_err().to_string();
         assert_eq!(error, "assertion failed: input dimension `n` must have one extent in `cast`; expected=2, actual=3");
     }
 
@@ -1704,10 +1704,10 @@ mod tests {
             .unwrap();
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2)], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(2)], &[]).unwrap(),
             vec![MixedValue::Dimension(2)],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `n` must have the declared extent in `cast`; expected=2, actual=3",
@@ -1725,7 +1725,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program.to_flat_program(),
                 &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]),],
                 &[2]
@@ -1976,7 +1976,7 @@ mod tests {
                     .unwrap();
                 for extent in [2, 3] {
                     let result = execute_mixed_program(
-                        &client,
+                        client,
                         &program,
                         &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
                         &[extent],
@@ -2040,10 +2040,10 @@ mod tests {
         .unwrap();
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
             vec![MixedValue::Array(vec![2.0], vec![])],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Array(vec![3.0], vec![])], &[])
+        let error = execute_mixed_program(client, &program, &[MixedValue::Array(vec![3.0], vec![])], &[])
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -2099,11 +2099,11 @@ mod tests {
         let primal = MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]);
         let tangent = MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4]);
         assert_eq!(
-            execute_mixed_program(&client, &jvp, &[primal, tangent], &[2, 2]).unwrap(),
+            execute_mixed_program(client, &jvp, &[primal, tangent], &[2, 2]).unwrap(),
             vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0], vec![2])],
         );
         let wrong = MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]);
-        let error = execute_mixed_program(&client, &jvp, &[wrong.clone(), wrong], &[3, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &jvp, &[wrong.clone(), wrong], &[3, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `n` must have the declared extent in `cast`; expected=2, actual=3",
@@ -2122,7 +2122,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &pullback,
                 &[MixedValue::Array(vec![5.0, 6.0], vec![2]), MixedValue::Dimension(2)],
                 &[],
@@ -2157,10 +2157,10 @@ mod tests {
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2]).unwrap(),
             vec![MixedValue::Array(vec![4.0, 6.0], vec![2])],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `n` must have one extent at the entry of `region`; expected=2, actual=3",
@@ -2187,7 +2187,7 @@ mod tests {
             [MixedValue::Array(vec![1.0, 1.0], vec![2]), MixedValue::Array(vec![10.0, 20.0, 0.0, 0.0], vec![4])];
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &jvp,
                 &[inputs[0].clone(), inputs[1].clone(), tangents[0].clone(), tangents[1].clone()],
                 &[2, 2],
@@ -2208,7 +2208,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &pullback,
                 &[MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
                 &[],
@@ -2252,21 +2252,21 @@ mod tests {
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            execute_mixed_program(client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
             vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)],
         );
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 0]).unwrap(),
+            execute_mixed_program(client, &program, std::slice::from_ref(&input), &[0, 0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![0, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0)],
         );
-        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
+        let error = execute_mixed_program(client, &program, std::slice::from_ref(&input), &[2, 3])
             .unwrap_err()
             .to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
         );
-        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 3])
+        let error = execute_mixed_program(client, &program, std::slice::from_ref(&input), &[0, 3])
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -2290,7 +2290,7 @@ mod tests {
         );
         let inputs = [input.clone(), input];
         assert_eq!(
-            execute_mixed_program(&client, &differentiated, &inputs, &[2, 2, 2, 2]).unwrap(),
+            execute_mixed_program(client, &differentiated, &inputs, &[2, 2, 2, 2]).unwrap(),
             vec![
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
@@ -2300,7 +2300,7 @@ mod tests {
                 MixedValue::Dimension(2),
             ],
         );
-        let error = execute_mixed_program(&client, &differentiated, &inputs, &[2, 3, 2, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &differentiated, &inputs, &[2, 3, 2, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
@@ -2320,7 +2320,7 @@ mod tests {
             .0;
         let inputs = [MixedValue::Dimension(2), MixedValue::Array(vec![1f64; 48], vec![3, 4, 4])];
         assert_eq!(
-            execute_mixed_program(&client, &batched, &inputs, &[2, 2, 2]).unwrap(),
+            execute_mixed_program(client, &batched, &inputs, &[2, 2, 2]).unwrap(),
             vec![
                 MixedValue::Dimension(2),
                 MixedValue::Array(vec![1f64; 8], vec![2, 2, 2]),
@@ -2329,13 +2329,13 @@ mod tests {
                 MixedValue::Dimension(2),
             ],
         );
-        let error = execute_mixed_program(&client, &batched, &inputs, &[2, 2, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &batched, &inputs, &[2, 2, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
         );
         let inputs = [MixedValue::Dimension(0), inputs[1].clone()];
-        let error = execute_mixed_program(&client, &batched, &inputs, &[0, 2, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &batched, &inputs, &[0, 2, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
@@ -2365,11 +2365,8 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
-        assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
-            Vec::new(),
-        );
-        let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
+        assert_eq!(execute_mixed_program(client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(), Vec::new(),);
+        let error = execute_mixed_program(client, &program, &[input], &[2, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
@@ -2703,10 +2700,10 @@ mod tests {
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            execute_mixed_program(client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
             vec![MixedValue::Array(vec![1f64; 4], vec![2, 2])],
         );
-        let error = execute_mixed_program(&client, &program, &[input], &[3, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &[input], &[3, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `n` must have the declared extent in `cast`; expected=2, actual=3",
@@ -2861,11 +2858,11 @@ mod tests {
             assert_eq!(module, expected_module);
             let input = MixedValue::Array(vec![1.0; 16], vec![4, 4]);
             assert_eq!(
-                execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), input.clone()], &[2, 2]).unwrap(),
+                execute_mixed_program(client, &program, &[MixedValue::Dimension(2), input.clone()], &[2, 2]).unwrap(),
                 vec![MixedValue::Array(vec![1.0; 4], vec![2, 2]), MixedValue::Dimension(2)],
             );
             if witness_type != b {
-                let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3), input], &[2, 2])
+                let error = execute_mixed_program(client, &program, &[MixedValue::Dimension(3), input], &[2, 2])
                     .unwrap_err()
                     .to_string();
                 assert_eq!(
@@ -2899,10 +2896,10 @@ mod tests {
         let client = execution_client();
         let input = MixedValue::Array(vec![1f64; 16], vec![4, 4]);
         assert_eq!(
-            execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
+            execute_mixed_program(client, &program, std::slice::from_ref(&input), &[2, 2]).unwrap(),
             vec![MixedValue::Array(vec![1f64; 4], vec![2, 2]), MixedValue::Dimension(2), MixedValue::Dimension(2)],
         );
-        let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
+        let error = execute_mixed_program(client, &program, std::slice::from_ref(&input), &[2, 3])
             .unwrap_err()
             .to_string();
         assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
@@ -2919,7 +2916,7 @@ mod tests {
                 in (%2, %3)"},
         );
         assert_eq!(
-            execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]).unwrap(),
+            execute_mixed_program(client, &differentiated, &[input.clone(), input.clone()], &[2, 2, 2, 2]).unwrap(),
             vec![
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
                 MixedValue::Array(vec![1f64; 4], vec![2, 2]),
@@ -2929,7 +2926,7 @@ mod tests {
                 MixedValue::Dimension(2),
             ],
         );
-        let error = execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 3, 2, 3])
+        let error = execute_mixed_program(client, &differentiated, &[input.clone(), input.clone()], &[2, 3, 2, 3])
             .unwrap_err()
             .to_string();
         assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
@@ -2949,7 +2946,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap(),
+            execute_mixed_program(client, &program, &[input], &[2, 3]).unwrap(),
             vec![MixedValue::Array(vec![1f64; 6], vec![2, 3]), MixedValue::Dimension(2), MixedValue::Dimension(3)],
         );
     }
@@ -2981,15 +2978,15 @@ mod tests {
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 4], vec![4])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[3, 3]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[3, 3]).unwrap(),
             vec![MixedValue::Array(vec![1f64; 9], vec![3, 3]), MixedValue::Dimension(3)],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[4, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[4, 3]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `b` must have the declared extent in `cast`; expected=3, actual=4",
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
         assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
 
         // The tangent cast is witnessed by the extent of `b`, which its output type no longer carries, read from the
@@ -3080,10 +3077,10 @@ mod tests {
         let client = execution_client();
         let inputs = [MixedValue::Array(vec![1f64; 12], vec![4, 3]), MixedValue::Array(vec![1f64; 3], vec![3])];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[3]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[3]).unwrap(),
             vec![MixedValue::Array(vec![1f64; 9], vec![3, 3])],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[4]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[4]).unwrap_err().to_string();
         assert_eq!(
             error,
             "assertion failed: input dimension `b` must have the declared extent in `cast`; expected=3, actual=4",
@@ -3236,10 +3233,10 @@ mod tests {
             MixedValue::Array(vec![0.0; 12], vec![4, 3]),
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2]).unwrap(),
             vec![MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]), MixedValue::Dimension(2)],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[3]).unwrap_err().to_string();
         assert_eq!(error, "assertion failed: input dimension `n` must have one extent in `cast`; expected=2, actual=3");
     }
 
@@ -3358,7 +3355,7 @@ mod tests {
         );
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![4, 3])],
                 &[2],
@@ -3450,8 +3447,8 @@ mod tests {
     #[allow(deprecated)] // Inspect the actual buffer, independently of the declared array type.
     fn test_cast_operation_lower_preserves_layouts() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let values = vec![1f64, 2., 3., 4., 5., 6.];
@@ -3472,9 +3469,9 @@ mod tests {
             );
             // The next executable must consume the actual column-major buffer and return dense logical values.
             let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
-            assert_eq!(read_f64s(&client, &consumed), values);
+            assert_eq!(read_f64s(client, &consumed), values);
             assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
-            let destination_mesh = domain_mesh(&client, "destination", 1);
+            let destination_mesh = domain_mesh(client, "destination", 1);
             let moved = output
                 .to_placement(
                     &session,
@@ -3504,9 +3501,9 @@ mod tests {
             )
             .unwrap();
             let doubled = consumer.executable().execute(&session, opaque).unwrap();
-            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            assert_eq!(read_f64s(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
             let doubled = consumer.executable().execute(&session, output).unwrap();
-            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            assert_eq!(read_f64s(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
         }
 
         // A tuple mixes an erased zero, a constrained result and an unconstrained result. The dynamic case also
@@ -3550,7 +3547,7 @@ mod tests {
                     Ok(layout.to_pjrt().unwrap())
                 );
                 assert_eq!(values_from_bytes::<f64>(&outputs[1].copy_to_host().unwrap()), values);
-                assert_eq!(read_f64s(&client, &outputs[2]), values);
+                assert_eq!(read_f64s(client, &outputs[2]), values);
                 assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
             }
         }
@@ -3560,8 +3557,8 @@ mod tests {
     #[allow(deprecated)] // Verify actual result storage alongside the hidden extent and effect-token ABI.
     fn test_cast_operation_lower_preserves_dynamic_row_major_layout_with_ordered_io() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
@@ -3632,7 +3629,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F64, [4, 3])
             .with_sharding(
                 Sharding::new(
@@ -3752,7 +3749,7 @@ mod tests {
             .unwrap();
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0], vec![2])], &[],).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Array(vec![1.0, 2.0], vec![2])], &[],).unwrap(),
             vec![MixedValue::Array(vec![1.0, 2.0], vec![2])],
         );
     }
@@ -4189,7 +4186,7 @@ mod tests {
         let (program, _, _, _, _) = program_and_types(mesh);
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                execution_client(),
                 &program,
                 &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4])],
                 &[2],
@@ -4258,7 +4255,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 execute_mixed_program(
-                    &client,
+                    client,
                     &program,
                     &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7]),],
                     &[2, 2]
@@ -4268,7 +4265,7 @@ mod tests {
             );
             if program.instructions()[0].operation().effects().classes().contains(EffectClass::OrderedAssertion) {
                 let error = execute_mixed_program(
-                    &client,
+                    client,
                     &program,
                     &[MixedValue::Array(vec![1.0; 4], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7])],
                     &[2, 3],
@@ -4359,10 +4356,10 @@ mod tests {
                 MixedValue::Array(vec![0.0; 4], vec![4]),
             ];
             assert_eq!(
-                execute_mixed_program(&client, &program, &inputs, &[3, 3]).unwrap(),
+                execute_mixed_program(client, &program, &inputs, &[3, 3]).unwrap(),
                 vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
             );
-            let result = execute_mixed_program(&client, &program, &inputs, &[3, 2]);
+            let result = execute_mixed_program(client, &program, &inputs, &[3, 2]);
             if checked {
                 let error = result.unwrap_err().to_string();
                 assert_eq!(
@@ -4520,8 +4517,8 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, -0.0]));
         let integers = input.bitcast_element_type(DataType::I32).unwrap();
         assert_eq!(values_from_bytes::<i32>(&integers.copy_to_host().unwrap()), vec![0x3f800000, i32::MIN]);
@@ -4539,8 +4536,8 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir_one_bit() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         // One-bit targets split a byte into eight elements ordered from the least significant bit.
         let input = replicated_array(&session, &mesh, DataType::U8, &[], &[0xab]);
         for data_type in [DataType::I1, DataType::U1] {
@@ -4560,8 +4557,8 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir_fp6() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let encodings = (0u8..64).collect::<Vec<_>>();
         for (data_type, other_data_type) in
             [(DataType::F6E2M3FN, DataType::F6E3M2FN), (DataType::F6E3M2FN, DataType::F6E2M3FN)]

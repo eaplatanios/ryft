@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_parallel_all_to_all_operation_lower() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_parallel_all_to_all_operation_lower_untiled_exchanges_rank() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(

@@ -1246,38 +1246,42 @@ mod tests {
     /// runs `check` with a client whose two global devices are the ranks' shares of CUDA device 0, and then shuts the
     /// job down in order.
     #[cfg(feature = "cuda-13")]
-    fn run_as_cuda_rank(process_index: usize, check: impl FnOnce(&Client<'_>)) {
+    fn run_as_cuda_rank(process_index: usize, check: impl FnOnce(&'static Client<'static>)) {
         let address = std::env::var(MULTI_HOST_TEST_ADDRESS).unwrap();
         let timeout = Duration::from_secs(60);
         let plugin = load_cuda_13_plugin().unwrap();
-        let runtime = DistributedRuntime::initialize_with_options(
-            &plugin,
-            &address,
-            process_index as u32,
-            DistributedRuntimeServiceOptions {
-                num_nodes: 2,
-                heartbeat_timeout: timeout,
-                cluster_register_timeout: timeout,
-                shutdown_timeout: timeout,
-            },
-            DistributedRuntimeClientOptions {
-                node_id: process_index as u32,
-                rpc_timeout: timeout,
-                initialization_timeout: timeout,
-                shutdown_timeout: timeout,
-                heartbeat_timeout: timeout,
-                missed_heartbeat_callback: Some(Box::new(|error| {
-                    if let Some(error) = error {
-                        eprintln!("distributed heartbeat failed: {error}");
-                    }
-                })),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // Sessions need a client that lives for the rest of the process, and so does the runtime whose key-value store
+        // the client borrows, so neither is ever dropped.
+        let runtime: &'static DistributedRuntime = Box::leak(Box::new(
+            DistributedRuntime::initialize_with_options(
+                &plugin,
+                &address,
+                process_index as u32,
+                DistributedRuntimeServiceOptions {
+                    num_nodes: 2,
+                    heartbeat_timeout: timeout,
+                    cluster_register_timeout: timeout,
+                    shutdown_timeout: timeout,
+                },
+                DistributedRuntimeClientOptions {
+                    node_id: process_index as u32,
+                    rpc_timeout: timeout,
+                    initialization_timeout: timeout,
+                    shutdown_timeout: timeout,
+                    heartbeat_timeout: timeout,
+                    missed_heartbeat_callback: Some(Box::new(|error| {
+                        if let Some(error) = error {
+                            eprintln!("distributed heartbeat failed: {error}");
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ));
 
-        // The client borrows the runtime's key-value store, so every array, executable, and the client are dropped
-        // before the coordination client shuts down, while rank zero keeps the coordination service alive.
+        // Every array and executable of `check` is dropped before the coordination client shuts down, while rank zero
+        // keeps the coordination service alive.
         {
             let client = runtime
                 .create_client(
@@ -1297,7 +1301,8 @@ mod tests {
             assert_eq!(client.process_index().unwrap(), process_index);
             assert_eq!(client.devices().unwrap().len(), 2);
             assert_eq!(client.addressable_devices().unwrap().len(), 1);
-            check(&client);
+            let client: &'static Client<'static> = Box::leak(Box::new(client));
+            check(client);
         }
         let completed = |rank: usize| format!("ryft/test/cuda-ranks/completed/{rank}");
         runtime.key_value_store().put(completed(process_index).as_bytes(), b"ready").unwrap();

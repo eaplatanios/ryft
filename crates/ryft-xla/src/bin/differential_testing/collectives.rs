@@ -241,7 +241,7 @@ impl CollectiveCase {
         if output_count == 2 {
             inputs.push((seed_sharding, seed_global_shape.as_slice(), seed_local_shape.as_slice(), seeds.as_slice()));
         }
-        let outputs = execute_collective_inputs(&client, device_mesh, &stablehlo, &inputs, &expected_output_shapes)?;
+        let outputs = execute_collective_inputs(client, device_mesh, &stablehlo, &inputs, &expected_output_shapes)?;
         let mut observations = BTreeMap::from([("primal", outputs.iter().map(|device| device[0].clone()).collect())]);
         if output_count == 2 {
             let name = if self.transform == "jvp" { "tangent" } else { "cotangent" };

@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn test_concatenate_operation_lower_refined_result_extents() {
         let client = execution_client();
-        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         // The actual sum is three, while the input allocation bounds sum to eight. Both tighter and wider declared
         // output bounds must preserve the logical concatenation, including a fully static result refinement.
         for data_type in [DataType::I64, DataType::C64] {
@@ -669,7 +669,7 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
             |(first, second)| first.concatenate_with([&second], 0).unwrap(),
             (input_type.clone(), input_type.clone()),

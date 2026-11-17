@@ -517,9 +517,9 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let client: &'static Client<'static> = Box::leak(Box::new(client));
-    let mesh = mesh(&client)?;
+    let mesh = mesh(client)?;
 
-    let jit_eager_gradient = jit_eager_gradient(&client, &mesh, arguments.iterations, arguments.smoke)?;
+    let jit_eager_gradient = jit_eager_gradient(client, &mesh, arguments.iterations, arguments.smoke)?;
 
     // Repeated reverse mode construction of the gradient of `sum(sin(x))` over an `f32[4, 4]` input.
     let session = Session::builder().client(client).build()?;
@@ -715,7 +715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let client: &'static Client<'static> = Box::leak(Box::new(client));
-    let mesh = mesh(&client)?;
+    let mesh = mesh(client)?;
     let r#type = input_type(&mesh, arguments.size)?;
     let session = Session::builder().client(client).build()?;
     let input = input_array(&session, &mesh, r#type.clone(), arguments.size)?;
@@ -780,7 +780,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let persistent = match &arguments.cache_directory {
-        Some(directory) => persistent_restore(&client, &mesh, &r#type, directory)?,
+        Some(directory) => persistent_restore(client, &mesh, &r#type, directory)?,
         None => json!({"requested": false}),
     };
     if arguments.smoke && arguments.cache_directory.is_some() {

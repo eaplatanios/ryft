@@ -89,8 +89,8 @@ mod tests {
     #[test]
     fn test_erf_operation_lower_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The grid covers every approximation regime of the reference implementation on both signs (i.e., the series
         // near zero, the primary interval, the interval around one, and both tails of the complementary function),
@@ -125,8 +125,8 @@ mod tests {
     #[test]
     fn test_erf_operation_lower_f8e8m0fnu_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Cover every encoding of the format with only exponent bits, including the smallest input that the lowering
         // raises and NaN.

@@ -1755,8 +1755,8 @@ mod tests {
     #[test]
     fn test_portable_attention_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
         let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();
@@ -1808,8 +1808,8 @@ mod tests {
     fn test_portable_attention_backward_matches_reference_backend() {
         // Distinct query, key, and value inputs make a mix-up between their cotangents visible.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let query_values = [0.25f32, -0.5, 0.75, 1.0];
         let key_values = [-0.75f32, 0.5, 1.25, -0.25];
         let value_values = [1.5f32, -1.0, 0.5, 2.0];
@@ -1857,9 +1857,9 @@ mod tests {
         // the reference backend over inputs without a sharding. A key that is sharded along its sequence shards the
         // scores along the dimension over which the softmax reduces its maximum.
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(&client, "x", 2).devices().to_vec()).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(client, "x", 2).devices().to_vec()).unwrap();
         let values = |start: f32, count: usize| (0..count).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
         let placed = |dimensions: &[usize], axis: Option<usize>, start: f32| {
             let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
@@ -2061,8 +2061,8 @@ mod tests {
         // A broadcast rank-0 bias, an arbitrary mask, independent length vectors, the default scale, an asymmetric
         // window, and the residual all agree with the reference backend.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
         let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();

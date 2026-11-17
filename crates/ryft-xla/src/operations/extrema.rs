@@ -415,8 +415,8 @@ mod tests {
     #[test]
     fn test_max_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Boolean maxima are disjunctions.
         let booleans = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
@@ -447,8 +447,8 @@ mod tests {
     #[test]
     fn test_max_operation_lower_complex() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
         // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
@@ -480,8 +480,8 @@ mod tests {
     #[test]
     fn test_min_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Boolean minima are conjunctions.
         let booleans = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
@@ -511,8 +511,8 @@ mod tests {
     #[test]
     fn test_min_operation_lower_complex() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
         // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
@@ -559,7 +559,7 @@ mod tests {
         // The fourth element is padding. Both selection and tie weights must preserve the runtime extent.
         assert_eq!(
             execute_mixed_program(
-                &client,
+                client,
                 &program,
                 &[
                     MixedValue::Array(vec![1.0, 3.0, 2.0, 0.0], vec![4]),
@@ -586,8 +586,8 @@ mod tests {
     #[test]
     fn test_clamp_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Floating-point values below, inside, and above the interval keep their exact bytes, NaN inputs propagate,
         // and crossed bounds produce the upper bound.

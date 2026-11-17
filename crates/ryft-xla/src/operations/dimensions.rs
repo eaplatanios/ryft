@@ -488,8 +488,8 @@ mod tests {
     #[test]
     fn test_dimension_from_scalar_operation_lower_reports_bounds_failures() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
 
@@ -517,7 +517,7 @@ mod tests {
         let valid =
             Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
         let valid = session.execute_program(&compiled, vec![valid]).unwrap();
-        assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
+        assert_eq!(read_i64s(client, &valid[0]), vec![4]);
 
         let invalid = Array::from_host_buffer(&session, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
         let error = session.execute_program(&compiled, vec![invalid]).unwrap_err();
@@ -743,17 +743,13 @@ mod tests {
         );
         let client = execution_client();
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), MixedValue::Dimension(5)], &[])
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(2), MixedValue::Dimension(5)], &[])
                 .unwrap(),
             vec![MixedValue::Dimension(0)],
         );
         assert_eq!(
-            execute_mixed_program(
-                &client,
-                &program,
-                &[MixedValue::Dimension(i64::MAX), MixedValue::Dimension(0)],
-                &[],
-            ).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(i64::MAX), MixedValue::Dimension(0)], &[],)
+                .unwrap(),
             vec![MixedValue::Dimension(i64::MAX)],
         );
     }
@@ -849,8 +845,8 @@ mod tests {
     #[test]
     fn test_lower_dimension_arithmetic_preserves_checked_diagnostics() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -895,7 +891,7 @@ mod tests {
 
             let output =
                 session.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
-            assert_eq!(read_i64s(&client, &output[0]), vec![expected_output]);
+            assert_eq!(read_i64s(client, &output[0]), vec![expected_output]);
             let error = session
                 .execute_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
                 .unwrap_err();

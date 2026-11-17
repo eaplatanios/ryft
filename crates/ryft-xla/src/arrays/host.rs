@@ -624,8 +624,8 @@ mod tests {
     #[test]
     fn test_array_begin_copy_to_host_preserves_producer_errors_for_empty_arrays() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         for data_type in [DataType::F32, DataType::Zero] {
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
@@ -645,7 +645,7 @@ mod tests {
         // Sharding its columns makes the tiles non-contiguous, so every shard is copied into its own buffer and merged,
         // and a replicated array needs a single copy.
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),

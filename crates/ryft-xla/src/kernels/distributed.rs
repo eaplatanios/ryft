@@ -1172,7 +1172,7 @@ mod tests {
             devices,
         )
         .unwrap();
-        validate_kernel_participants(&client, &mesh).unwrap();
+        validate_kernel_participants(client, &mesh).unwrap();
     }
 
     #[test]
@@ -1191,7 +1191,7 @@ mod tests {
             devices,
         )
         .unwrap();
-        validate_kernel_participants(&client, &mesh).unwrap();
+        validate_kernel_participants(client, &mesh).unwrap();
     }
 
     #[test]
@@ -1205,7 +1205,7 @@ mod tests {
         .unwrap();
         let expected =
             "cross-process kernel execution requires a qualified collective ordering and completion contract";
-        assert!(matches!(validate_kernel_participants(&client, &mesh),
+        assert!(matches!(validate_kernel_participants(client, &mesh),
             Err(KernelEmbeddingError::Invalid { message }) if message == expected));
     }
 
@@ -1218,7 +1218,7 @@ mod tests {
         )
         .unwrap();
         let expected = "kernel execution requires every mesh device to be addressable by the submitting client";
-        assert!(matches!(validate_kernel_participants(&client, &mesh),
+        assert!(matches!(validate_kernel_participants(client, &mesh),
             Err(KernelEmbeddingError::Invalid { message }) if message == expected));
     }
 }

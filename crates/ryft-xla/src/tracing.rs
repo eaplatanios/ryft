@@ -536,7 +536,7 @@ mod tests {
             )
             .unwrap();
         let client = cpu_client(2);
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let executable = client
             .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();

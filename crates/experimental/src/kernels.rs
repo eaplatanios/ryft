@@ -605,14 +605,14 @@ mod gpu {
             if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
                 let binding = KernelCompilerBinding::new(
                     Compiler,
-                    device_target(&client),
+                    device_target(client),
                     MosaicOptions::default(),
                     KernelSchedule::default(),
                     MosaicGpuEmbedding,
                     1024,
                 )
                 .unwrap();
-                execute_aot_case(&_plugin, &client, binding.clone(), binding, "mosaic");
+                execute_aot_case(&_plugin, client, binding.clone(), binding, "mosaic");
                 executed = true;
             }
         });
@@ -757,7 +757,7 @@ mod gpu {
                 };
                 interpret_case(&case);
                 let expected = case.expected.clone();
-                assert_eq!(execute_case(&client, case, MosaicOptions::default()).unwrap(), expected, "{name}");
+                assert_eq!(execute_case(client, case, MosaicOptions::default()).unwrap(), expected, "{name}");
             }
         });
     }
@@ -939,11 +939,11 @@ mod gpu {
                         input_bytes.push(0.5f32.to_ne_bytes().to_vec());
                     }
                     let result = execute_definition(
-                        &client,
+                        client,
                         &definition,
                         input_types,
                         input_bytes,
-                        device_target(&client),
+                        device_target(client),
                         MosaicOptions::default(),
                         1,
                     );
@@ -979,7 +979,7 @@ mod gpu {
                 let case = async_copy_case(&[128]);
                 interpret_case(&case);
                 let expected = case.expected.clone();
-                assert_eq!(execute_case(&client, case, MosaicOptions::default().with_tma(true)).unwrap(), expected);
+                assert_eq!(execute_case(client, case, MosaicOptions::default().with_tma(true)).unwrap(), expected);
             }
         });
     }
@@ -1000,11 +1000,11 @@ mod gpu {
                         .map(|values| values.iter().flat_map(|value| value.to_ne_bytes()).collect())
                         .collect();
                     let result = execute_definition(
-                        &client,
+                        client,
                         &case.definition,
                         case.input_types,
                         bytes,
-                        device_target(&client),
+                        device_target(client),
                         MosaicOptions::default().with_tma(tma),
                         32,
                     )
@@ -1053,9 +1053,9 @@ mod gpu {
                 let bytes = input.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
                 let expected = input.iter().map(|value| value + 2.0).collect::<Vec<_>>();
                 for blocks in [1, 2] {
-                    let target = device_target(&client).with_blocks_per_cluster(blocks).unwrap();
+                    let target = device_target(client).with_blocks_per_cluster(blocks).unwrap();
                     let actual = execute_definition(
-                        &client,
+                        client,
                         &definition,
                         vec![r#type.clone()],
                         vec![bytes.clone()],
@@ -1073,11 +1073,11 @@ mod gpu {
                     .map(|values| values.iter().flat_map(|value| value.to_ne_bytes()).collect())
                     .collect();
                 let actual = execute_definition(
-                    &client,
+                    client,
                     &case.definition,
                     case.input_types,
                     bytes,
-                    device_target(&client).with_blocks_per_cluster(2).unwrap(),
+                    device_target(client).with_blocks_per_cluster(2).unwrap(),
                     MosaicOptions::default(),
                     1,
                 )
@@ -1116,7 +1116,7 @@ mod gpu {
                 for case in generated_vector_cases() {
                     let expected = case.expected.clone();
                     let name = case.name;
-                    let actual = execute_case(&client, case, MosaicOptions::default()).unwrap();
+                    let actual = execute_case(client, case, MosaicOptions::default()).unwrap();
                     assert_eq!(actual, expected, "{name}");
                 }
                 executed = true;
@@ -1160,7 +1160,7 @@ mod gpu {
             if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
                 let case = attention_case();
                 let expected = case.expected.clone();
-                let actual = execute_case(&client, case, MosaicOptions::default()).unwrap();
+                let actual = execute_case(client, case, MosaicOptions::default()).unwrap();
                 check_attention(&actual, &expected);
             }
         });
@@ -1247,7 +1247,7 @@ mod gpu {
                     inputs: vec![vec![1.0]],
                     expected: vec![],
                 };
-                let error = execute_case(&client, case, MosaicOptions::default()).unwrap_err().to_string();
+                let error = execute_case(client, case, MosaicOptions::default()).unwrap_err().to_string();
                 assert!(
                     error.contains("CUDA_ERROR_LAUNCH_FAILED") || error.contains("CUDA_ERROR_ILLEGAL_INSTRUCTION"),
                     "{error}",
@@ -1303,7 +1303,7 @@ mod cutile {
                     1024,
                 )
                 .unwrap();
-                execute_aot_case(&_plugin, &client, binding.clone(), binding, "cutile");
+                execute_aot_case(&_plugin, client, binding.clone(), binding, "cutile");
                 executed = true;
             }
         });
@@ -1479,7 +1479,7 @@ mod cutile {
                     case.inputs[1] = case.inputs[0].clone();
                     case.expected = case.inputs[0].iter().map(|value| value * 2.0).collect();
                 }
-                execute_case(&client, case, repeated_input).unwrap();
+                execute_case(client, case, repeated_input).unwrap();
                 executed = true;
             }
         });
@@ -1496,7 +1496,7 @@ mod cutile {
         test_for_each_platform!(|_plugin, client, platform| {
             if matches!(platform, TestPlatform::Cuda13) {
                 for case in generated_vector_cases() {
-                    execute_case(&client, case, false).unwrap();
+                    execute_case(client, case, false).unwrap();
                 }
                 executed = true;
             }
@@ -1574,7 +1574,7 @@ mod cutile {
                     Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
                 let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
                 let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
-                let session = Session::builder().client(&client).build().unwrap();
+                let session = Session::builder().client(client).build().unwrap();
                 let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
                     |input: CompileTracer| {
                         shard_map(
@@ -1674,7 +1674,7 @@ mod cutile {
                 })
                 .unwrap();
                 let error = execute_case(
-                    &client,
+                    client,
                     KernelCase {
                         name: "assertion_failure",
                         definition,
@@ -1712,7 +1712,7 @@ mod tuning {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, CompilationTracer, Device, DeviceMesh, ExecutableFunction as CoreExecutableFunction, LogicalMesh,
-        MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction, StatefulCompilationDomain, StatefulExecution,
+        MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction, StatefulExecution,
     };
     use ryft_kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{
@@ -1916,7 +1916,7 @@ mod tuning {
                 let (major, minor) = capability.split_once('.').unwrap();
                 let compiler = ryft_triton::kernels::Compiler::new();
                 measure(
-                    &client,
+                    client,
                     compiler,
                     ryft_triton::kernels::Target::Cuda { major: major.parse().unwrap(), minor: minor.parse().unwrap() },
                     ryft_triton::kernels::Options::default(),
@@ -1944,7 +1944,7 @@ mod tuning {
                 };
                 let (major, minor) = capability.split_once('.').unwrap();
                 measure(
-                    &client,
+                    client,
                     ryft_mosaic::kernels::gpu::Compiler,
                     ryft_mosaic::kernels::gpu::Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
                     ryft_mosaic::kernels::gpu::Options::default(),
@@ -1977,7 +1977,7 @@ mod tuning {
                 ))
                 .with_cancellation(cancellation.clone());
                 measure(
-                    &client,
+                    client,
                     compiler,
                     ryft_cuda::kernels::cutile::Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
                     ryft_cuda::kernels::cutile::Options::default(),
@@ -2230,7 +2230,7 @@ mod stress {
                     #[cfg(feature = "mosaic-gpu")]
                     {
                         let actual = super::gpu::execute_case(
-                            &client,
+                            client,
                             descriptor.kernel(),
                             ryft_mosaic::kernels::gpu::Options::default(),
                         )
@@ -2242,7 +2242,7 @@ mod stress {
                 }
                 if backend == "cutile" || backend == "both" {
                     #[cfg(feature = "cutile")]
-                    super::cutile::execute_case(&client, descriptor.kernel(), false).unwrap();
+                    super::cutile::execute_case(client, descriptor.kernel(), false).unwrap();
                     #[cfg(not(feature = "cutile"))]
                     panic!("compiler stress requires the `cutile` feature");
                 }
@@ -2440,7 +2440,7 @@ mod triton {
                     .filter(|case| case.name != "async_copy")
                     .chain([precision_case(), batched_case()])
                 {
-                    execute_case(&client, case);
+                    execute_case(client, case);
                 }
                 executed = true;
             }
@@ -2457,7 +2457,7 @@ mod triton {
         test_for_each_platform!(|_plugin, client, platform| {
             if matches!(platform, TestPlatform::Cuda13) {
                 let compiler = Compiler::new();
-                let target = device_target(&client);
+                let target = device_target(client);
                 let options = TritonOptions::default();
                 let schedule = KernelSchedule::default();
                 let configuration = compiler.configuration_key(&target, &options, &schedule).unwrap();
@@ -2474,7 +2474,7 @@ mod triton {
                 let deployment_binding =
                     KernelCompilerBinding::new(deployment, target, options, schedule, TritonEmbedding, 1024).unwrap();
                 assert_eq!(binding.configuration(), deployment_binding.configuration());
-                execute_aot_case(&_plugin, &client, binding, deployment_binding, "triton");
+                execute_aot_case(&_plugin, client, binding, deployment_binding, "triton");
                 executed = true;
             }
         });

@@ -66,8 +66,8 @@ mod tests {
     #[test]
     fn test_floor_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
         assert_eq!(
             values_from_bytes::<u32>(&input.floor().unwrap().copy_to_host().unwrap()),
@@ -83,8 +83,8 @@ mod tests {
     #[test]
     fn test_ceil_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
         assert_eq!(
             values_from_bytes::<u32>(&input.ceil().unwrap().copy_to_host().unwrap()),
@@ -99,8 +99,8 @@ mod tests {
     #[test]
     fn test_round_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
         assert_eq!(
             values_from_bytes::<u32>(&input.round().unwrap().copy_to_host().unwrap()),

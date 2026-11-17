@@ -965,8 +965,8 @@ mod tests {
     #[test]
     fn test_compiled_program_matches_stateless_signature() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let compile = |upper: usize| {
             let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(upper)).unwrap());
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn test_invocation_metadata_incompatible_field() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(client, "x", 1);
         let other_mesh = device_mesh_2x2();
         let signature = ExecutableSignature::new(&[], &[]);
         let other_signature = ExecutableSignature::new(&[ArrayType::scalar(DataType::F32)], &[]);
@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn test_invocation_metadata_validate_replacement() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
+        let mesh = domain_mesh(client, "x", 1);
         let signature = ExecutableSignature::new(&[], &[]);
         let current = InvocationMetadata {
             input_types: &[],

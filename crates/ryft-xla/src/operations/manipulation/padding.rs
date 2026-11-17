@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn test_lower_pad_to_mlir_execution() {
         let client = execution_client();
-        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         // Exact bits survive interior insertion, cropping by negative edges, empty inputs, and changes to allocation
         // bounds. Static result refinements still check the actual runtime input extent.
         for data_type in [DataType::I64, DataType::C64] {

@@ -418,8 +418,8 @@ mod tests {
         // The canonical ordering ties signed zeros and all NaNs, while the total ordering separates them, so both the
         // sorted keys (compared bit for bit) and the payloads expose any disagreement in tie handling.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let key_values = [3f32, f32::NAN, 1.0, 3.0, -f32::NAN, -0.0, 0.0, 2.0];
         let payload_values = [10f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
         let keys = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&key_values));
@@ -474,8 +474,8 @@ mod tests {
     fn test_lower_sort_to_mlir_top_k() {
         // Ties select the lowest index, so both threes appear before the two and index 0 precedes index 2.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input =
             replicated_array(&session, &mesh, DataType::F32, &[6], &values_to_bytes(&[3f32, 1.0, 3.0, -0.0, 0.0, 2.0]));
         let (values, indices) = input.top_k(3, 0).unwrap();
@@ -488,8 +488,8 @@ mod tests {
         // Duplicates in the `i32` primary key fall through to the `f32` secondary key, full ties keep their original
         // order because the sort is stable, and the passenger co-permutes.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let primary = replicated_array(&session, &mesh, DataType::I32, &[6], &values_to_bytes(&[2i32, 1, 2, 1, 2, 1]));
         let secondary = replicated_array(
             &session,
@@ -538,8 +538,8 @@ mod tests {
         // Canonical complex keys order lexicographically by their canonicalized real and imaginary parts, so that
         // real parts that are signed zeros tie and NaN parts order last, as in JAX's `lax.sort`.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let keys = replicated_array(
             &session,
             &mesh,

@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower_untiled_inserts_rank() {
         let client = cpu_client(2);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_operation_lower_executes_invariant_gradient_on_cpu() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -520,7 +520,7 @@ mod tests {
             )
             .unwrap();
         // Recovering the dimension residual in the tangent body checks its bounds with a runtime assertion.
-        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         let executable = client
             .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
             .unwrap();

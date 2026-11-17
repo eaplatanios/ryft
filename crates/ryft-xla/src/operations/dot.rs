@@ -848,8 +848,8 @@ mod tests {
         // The operands stay `f8e4m3fn` on device and the contraction accumulates at `f32`. Every value is exactly
         // representable in `f8e4m3fn` and every product and sum is exact in `f32`, so both backends are exact.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let operand_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let reference_left = CoreArray::from_elements(
             operand_type.clone(),
@@ -881,8 +881,8 @@ mod tests {
     #[test]
     fn test_dot_operation_lower_with_narrower_accumulation_type_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The three terms `2⁻¹²` sum to three quarters of the distance from `1` to the next `f16` value, so a sum
         // that accumulates at `f32` and rounds once is `1 + 2⁻¹⁰`.
@@ -902,8 +902,8 @@ mod tests {
     #[test]
     fn test_dot_operation_lower_with_distinct_f8_inputs_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // Two distinct 8-bit input types stay as they are on device and the contraction accumulates at the requested
         // type. Every value is exactly representable, so `[0.5, 1.0] · [2.0, 4.0] = 5` on both backends.
@@ -1073,8 +1073,8 @@ mod tests {
     #[test]
     fn test_dot_operation_lower_with_precision_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
 
         // The `bf16` preset rounds its `f64` inputs to `bf16`, where `1 + 2⁻¹⁰` becomes `1`, accumulates at `f32`,
         // and converts the result to the `f64` output type. Every remaining value is exact, so both backends are.
@@ -1444,8 +1444,8 @@ mod tests {
     #[test]
     fn test_ragged_dot_operation_lower_strategy() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let left_type = ArrayType::new_static(DataType::F32, [5, 2]);
         let right_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
         let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
@@ -2039,8 +2039,8 @@ mod tests {
         // are compared as values, because a dot without contracting dimensions keeps the sign of a zero product on
         // XLA, while the reference kernel adds every product to a positive zero.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let cases: &[(&str, &[&[usize]])] = &[
             ("ij,jk->ik", &[&[2, 3], &[3, 4]]),
             ("ijk,kl->jil", &[&[2, 3, 4], &[4, 2]]),
@@ -2216,8 +2216,8 @@ mod tests {
         // axes to auto axes, like in JAX. The contracted axes of the first two inputs below are sharded alike over
         // two devices, which explicit placement of their contraction rejects as ambiguous.
         let client = cpu_client(2);
-        let session = session_with_client(&client);
-        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
+        let session = session_with_client(client);
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.logical_mesh().clone(), dimensions);
         let shardings = [
             sharding(vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap(),
@@ -2251,8 +2251,8 @@ mod tests {
         // An einsum function with multiple steps executes each call as one eager dispatch of its whole body, where
         // the capability dispatches every step separately. Both agree with the reference backend.
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let shapes: [&[usize]; 3] = [&[2, 3], &[3, 4], &[4, 2]];
         let mut inputs = Vec::new();
         let mut reference_inputs = Vec::new();

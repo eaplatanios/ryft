@@ -1750,14 +1750,14 @@ mod tests {
         );
 
         let client = execution_client();
-        ensure_assertion_handler_registered(&client).unwrap();
-        ensure_print_handler_registered(&client).unwrap();
+        ensure_assertion_handler_registered(client).unwrap();
+        ensure_print_handler_registered(client).unwrap();
         let values = MixedValue::Array(vec![1.0, 2.0], vec![2]);
         assert_eq!(
-            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), values.clone()], &[]).unwrap(),
+            execute_mixed_program(client, &program, &[MixedValue::Dimension(2), values.clone()], &[]).unwrap(),
             vec![values.clone()],
         );
-        let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(5), values], &[])
+        let error = execute_mixed_program(client, &program, &[MixedValue::Dimension(5), values], &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
@@ -1800,10 +1800,10 @@ mod tests {
             MixedValue::Array(vec![5.0, 6.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![8]),
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2, 2]).unwrap(),
             vec![MixedValue::Array(vec![9.0, 12.0], vec![2]), MixedValue::Dimension(2)],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
     }
 
@@ -1836,10 +1836,10 @@ mod tests {
             MixedValue::Array(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], vec![8]),
         ];
         assert_eq!(
-            execute_mixed_program(&client, &program, &inputs, &[2, 2]).unwrap(),
+            execute_mixed_program(client, &program, &inputs, &[2, 2]).unwrap(),
             vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
         );
-        let error = execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
+        let error = execute_mixed_program(client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
         assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
     }
 
@@ -2049,10 +2049,10 @@ mod tests {
                 MixedValue::Array(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 0.0, 0.0], vec![8]),
             ];
             assert_eq!(
-                execute_mixed_program(&client, program, &inputs, &[2, 2]).unwrap(),
+                execute_mixed_program(client, program, &inputs, &[2, 2]).unwrap(),
                 vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
             );
-            let error = execute_mixed_program(&client, program, &inputs, &[2, 6]).unwrap_err().to_string();
+            let error = execute_mixed_program(client, program, &inputs, &[2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
 
             // The tangent cast has its own data input. The converted primal proof must remain a dependency even
@@ -2244,7 +2244,7 @@ mod tests {
             assert_eq!(tangent_module, expected_tangent_module);
             let inputs = [inputs[0].clone(), inputs[1].clone(), inputs[0].clone(), inputs[1].clone()];
             assert_eq!(
-                execute_mixed_program(&client, &jvp, &inputs, &[2, 2, 2, 2]).unwrap(),
+                execute_mixed_program(client, &jvp, &inputs, &[2, 2, 2, 2]).unwrap(),
                 vec![
                     MixedValue::Array(vec![4.0, 6.0], vec![2]),
                     MixedValue::Array(vec![4.0, 6.0], vec![2]),
@@ -2252,7 +2252,7 @@ mod tests {
                     MixedValue::Dimension(2),
                 ],
             );
-            let error = execute_mixed_program(&client, &jvp, &inputs, &[2, 6, 2, 6]).unwrap_err().to_string();
+            let error = execute_mixed_program(client, &jvp, &inputs, &[2, 6, 2, 6]).unwrap_err().to_string();
             assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
         }
     }
@@ -2260,17 +2260,17 @@ mod tests {
     #[test]
     fn test_assertion_runtime_provider_initialize() {
         let client = execution_client();
-        let target = Target::from_client(&client).unwrap();
+        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let requirement = builtin_requirement(ASSERT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
-        provider.initialize(&client, &target, &requirement).unwrap();
-        provider.initialize(&client, &target, &requirement).unwrap();
+        provider.initialize(client, &target, &requirement).unwrap();
+        provider.initialize(client, &target, &requirement).unwrap();
 
         let requirement = RuntimeRequirement::new(ASSERT_CUSTOM_CALL_TARGET, 1, vec![1]).unwrap();
         assert!(matches!(
-            provider.initialize(&client, &target, &requirement),
+            provider.initialize(client, &target, &requirement),
             Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
                 if identifier == ASSERT_CUSTOM_CALL_TARGET && reason == "built-in runtime configuration must be empty",
         ));
@@ -2486,9 +2486,9 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_does_not_merge_ordered_io_chains() {
         let client = cpu_client(1);
-        ensure_print_handler_registered(&client).unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        ensure_print_handler_registered(client).unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2541,20 +2541,20 @@ mod tests {
 
         let (output, lines) = with_captured_prints(|| {
             let output = session.execute_program(&compiled, vec![input(3), input(4)]).unwrap();
-            assert_eq!(read_i64s(&client, &output[0]), vec![4]);
+            assert_eq!(read_i64s(client, &output[0]), vec![4]);
             output
         });
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("left: "), "{:?}", lines);
         assert!(lines[1].starts_with("right: "), "{:?}", lines);
-        assert_eq!(read_i64s(&client, &output[0]), vec![4]);
+        assert_eq!(read_i64s(client, &output[0]), vec![4]);
     }
 
     #[test]
     fn test_assert_operation_lower_reports_the_first_failure() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let first_type = DimensionType::new("first", bounds);
@@ -2635,8 +2635,8 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_preserves_diagnostics() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2770,8 +2770,8 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_reports_bounded_element_failures() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         for mode in [0, 1, 2] {
             let predicates = boolean_vector(&session, &mesh, &[true, false, false, false]);
             let observations = f32_vector(&session, &mesh, &[10., 20., 30., 40.]);
@@ -2838,8 +2838,8 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_reports_bounded_sub_byte_observations() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         for (data_type, values) in [
             (DataType::I1, [0., -1., 0., -1.]),
             (DataType::U1, [0., 1., 0., 1.]),
@@ -2891,8 +2891,8 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_reports_scalar_observations() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
         for observations in [
             vec![],
@@ -2991,8 +2991,8 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_reports_dynamically_batched_failures() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
@@ -3092,8 +3092,8 @@ mod tests {
     #[test]
     fn test_assert_operation_lower_reports_dynamically_batched_replicated_failures() {
         let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let context = TracingContext::<Constant, Operation>::new();

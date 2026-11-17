@@ -975,8 +975,8 @@ mod tests {
     #[test]
     fn test_scatter_operation_lower_complex_max() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         // Complex extrema compare `(real, imaginary)` lexicographically, so the update `1 + 9i` replaces `1 + 5i`.
         let input = replicated_array(
             &session,
@@ -1012,8 +1012,8 @@ mod tests {
         // both the primal and its pullback.
         type DynamicPolicy = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
         let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_mesh(mesh.clone());
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client).with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let staged_types = vec![
             ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)])),
@@ -1121,7 +1121,7 @@ mod tests {
             assert_eq!(outputs[0].shape().as_slice(), &[size, 4], "n={size}");
             assert_eq!(outputs[1].shape().as_slice(), &[size, 4], "n={size}");
             assert_eq!(outputs[2].shape().as_slice(), &[size, 1], "n={size}");
-            outputs.iter().map(|output| read_f64s(&client, output)).collect::<Vec<_>>()
+            outputs.iter().map(|output| read_f64s(client, output)).collect::<Vec<_>>()
         };
         let all_indices = [1i32, 3, 0, 2, 3];
 
@@ -1239,8 +1239,8 @@ mod tests {
     #[test]
     fn test_scatter_operation_lower_differentiation_duplicate_overwrite() {
         let client = execution_client();
-        let session = session_with_client(&client);
-        let mesh = domain_mesh(&client, "x", 1);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[2f32, 5.0]));
         let indices = replicated_array(&session, &mesh, DataType::I32, &[2, 1], &values_to_bytes(&[0i32, 0]));
         let updates = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[7f32, 8.0]));

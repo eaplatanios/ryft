@@ -63,10 +63,10 @@
 //!
 //! # Effects and Completion
 //!
-//! Cloned sessions share effect ordering. [`Session::fork_effect_scope`] starts an independent sequence while retaining
-//! the shared resources of the session. Cached programs contain no session or effect scope, so execution uses the
-//! invoking session's scope. Mutable references also retain their own coordination across calls, based on their
-//! identities.
+//! Cloned sessions share effect ordering. [`Session::with_new_effect_scope`] starts an independent sequence while
+//! retaining the shared resources of the session. Cached programs contain no session or effect scope, so execution
+//! uses the invoking session's scope. Mutable references also retain their own coordination across calls, based on
+//! their identities.
 //!
 //! Array readiness observes completion of the work that produced that array. [`Session::effects_barrier`] observes
 //! previously submitted effects, including work whose outputs were discarded. Call it before the process exits when
@@ -121,11 +121,11 @@ pub use runtimes::{
 };
 pub use targets::{Target, TargetDevice};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Default maximum number of compiled operation applications retained in a session's eager dispatch cache, which
 /// [`SessionBuilder::eager_dispatch_cache_capacity`] overrides.
 const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs against a live PJRT
 /// [`Client`].
@@ -133,11 +133,12 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// A session is the handle through which `ryft-xla` executes on a client. Every [`Array`] carries the session that it
 /// belongs to, so eager operations and transforms recover their execution context from their inputs, and first-class
 /// dimensions can produce arrays (e.g., when compared or converted to scalars) without an explicit context. Handles are
-/// cheap to clone. Build one session per client and derive every other handle from it (i.e., through [`Clone`] or
-/// [`Self::fork_effect_scope`]) so that all arrays on that client share one compilation cache and one set of runtime
-/// extensions, much like JAX's process-wide caches. Separate sessions remain independent, even on the same client, so
-/// building a second session is an explicit request for an isolated cache and effect ordering. Cached
-/// executables retain neither sessions nor arrays, so the ownership graph has no cycle between caches and sessions.
+/// cheap to clone. Build one session per client and derive every other handle from it (i.e., through [`Clone`],
+/// [`Self::with_mesh`], or [`Self::with_new_effect_scope`]) so that all arrays on that client share one compilation
+/// cache and one set of runtime extensions, much like JAX's process-wide caches. Separate sessions remain independent,
+/// even on the same client, so building a second session is an explicit request for an isolated cache and effect
+/// ordering. Cached executables retain neither sessions nor arrays, so the ownership graph has no cycle between caches
+/// and sessions.
 ///
 /// The same type covers both staging and concrete execution. Every session is backed by a live PJRT client. Tracing
 /// only uses the session as a type witness and never needs an instance without a client, while compiling ahead of time
@@ -158,9 +159,9 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 ///
 /// All handles of one session share its compilation cache, its eager dispatch cache, its runtime extensions, its
 /// retained constants, and its default [`CompilationOptions`]. Each handle additionally selects an effect scope and an
-/// optional [`DeviceMesh`]. Clones share their scope, while [`Self::fork_effect_scope`] starts an independent sequence
-/// and retains everything else. Cached programs retain no session, so execution always uses the invoking session's
-/// scope, including for cache hits and retained compiled functions.
+/// optional [`DeviceMesh`]. Clones share their scope, while [`Self::with_new_effect_scope`] starts an independent
+/// sequence and retains everything else. Cached programs retain no session, so execution always uses the invoking
+/// session's scope, including for cache hits and retained compiled functions.
 ///
 /// # Compilation Caching
 ///
@@ -224,7 +225,7 @@ pub struct Session {
     mesh: Option<DeviceMesh>,
 
     /// Selected ordering and completion scope, which clones of this handle share and which
-    /// [`Self::fork_effect_scope`] replaces.
+    /// [`Self::with_new_effect_scope`] replaces.
     effect_scope: Arc<EffectScope>,
 }
 
@@ -256,40 +257,23 @@ impl Session {
         }
     }
 
-    /// Creates an independent session with a fresh effect scope from its client and the configuration of the
-    /// resources that its handles share.
-    fn from_parts(
-        client: &'static Client<'static>,
-        cache: CompilationCache<'static, Self>,
-        eager_dispatch_cache_capacity: usize,
-        extensions: RuntimeExtensions,
-        default_compilation_options: CompilationOptions,
-    ) -> Self {
-        Self {
-            state: Arc::new(SessionState {
-                client,
-                target: OnceLock::new(),
-                cache,
-                eager_dispatch_cache: SpecializationCache::new(eager_dispatch_cache_capacity),
-                default_compilation_options,
-                runtimes: RuntimeRegistry::new(client, extensions),
-            }),
-            mesh: None,
-            effect_scope: Arc::new(EffectScope::default()),
-        }
-    }
-
-    /// Returns a handle of this session that places eager outputs on `mesh` when they would otherwise have no mesh.
-    /// Used to keep arrays derived from a first-class dimension on the mesh of the array that the dimension was read
-    /// from, and by unit tests of this crate that exercise the [`Self::constant`] materialization helper.
-    pub(crate) fn with_mesh(&self, mesh: DeviceMesh) -> Self {
+    /// Returns a handle of this session whose default mesh is `mesh`, as under JAX's `jax.set_mesh`. Eager values that
+    /// are created from no array inputs (e.g., constants and zeros) are placed on it, and it is the
+    /// [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g., `shard_map(.., None, ..)`).
+    /// The handle shares the resources and the effect scope of this session.
+    pub fn with_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
     }
 
-    /// Forks ordering and completion state while retaining the resources that all handles of this session share and
-    /// the mesh of this handle. Use forks at independent task boundaries. References retain their own coordination,
-    /// based on their identities.
-    pub fn fork_effect_scope(&self) -> Self {
+    /// Returns a handle of this session with a new and empty effect scope, which shares the resources of this session
+    /// and keeps the mesh of this handle.
+    ///
+    /// Handles that share a scope run their ordered effects (e.g., prints) one after another in submission order, a
+    /// failed ordered effect blocks further ones until it is observed and acknowledged, and a scope stays on the
+    /// devices that its first ordered effect ran on. A new scope lifts all three for independent work, such as
+    /// another thread or request, or work on other devices. References retain their own coordination, based on their
+    /// identities.
+    pub fn with_new_effect_scope(&self) -> Self {
         Self { effect_scope: Arc::new(EffectScope::default()), ..self.clone() }
     }
 
@@ -411,10 +395,11 @@ impl Session {
         Array::from_host_buffer(self, r#type, mesh, buffer)
     }
 
-    /// Waits for the previously reserved effects of this handle's scope, including unordered I/O and local
-    /// assertions. The backend may execute work inline, and this function waits only for work that is still pending.
-    /// Later reservations and other scopes (e.g., those of forked handles) are excluded. Failures are retained until
-    /// explicitly acknowledged. Call this function before the process exits to ensure that effects are observed.
+    /// Waits for the previously reserved effects of this handle's scope, including unordered I/O and local assertions.
+    /// The backend may execute work inline, and this function waits only for work that is still pending. Later
+    /// reservations and other scopes (e.g., those of [`Self::with_new_effect_scope`] handles) are excluded. Failures
+    /// are retained until explicitly acknowledged. Call this function before the process exits to ensure that effects
+    /// are observed.
     pub fn effects_barrier(&self) -> Result<(), Error> {
         self.effect_scope.barrier()
     }
@@ -1282,13 +1267,18 @@ impl SessionBuilder {
             Some(DiskCacheSource::Explicit(disk_cache)) => self.compilation_cache.with_disk_cache(disk_cache),
             Some(DiskCacheSource::Environment) => self.compilation_cache.with_disk_cache_from_env()?,
         };
-        Ok(Session::from_parts(
-            client,
-            compilation_cache,
-            self.eager_dispatch_cache_capacity,
-            self.runtime_extensions,
-            self.default_compilation_options,
-        ))
+        Ok(Session {
+            state: Arc::new(SessionState {
+                client,
+                target: OnceLock::new(),
+                cache: compilation_cache,
+                eager_dispatch_cache: SpecializationCache::new(self.eager_dispatch_cache_capacity),
+                default_compilation_options: self.default_compilation_options,
+                runtimes: RuntimeRegistry::new(client, self.runtime_extensions),
+            }),
+            mesh: None,
+            effect_scope: Arc::new(EffectScope::default()),
+        })
     }
 }
 
@@ -1809,16 +1799,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_fork_effect_scope() {
+    fn test_session_with_new_effect_scope() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client).with_mesh(mesh.clone());
-        let fork = session.fork_effect_scope();
+        let fork = session.with_new_effect_scope();
         assert!(fork.is_same_session(&session));
         assert!(!std::ptr::eq(fork.effect_scope(), session.effect_scope()));
         assert_eq!(fork.mesh().unwrap(), &mesh);
 
-        // A barrier of the fork does not wait for effects that are pending in the scope that it was forked from.
+        // A barrier of the new scope does not wait for effects that are pending in the scope of the original handle.
         let pending = session.effect_scope().reserve(None).unwrap();
         fork.effects_barrier().unwrap();
         drop(pending);
@@ -1830,7 +1820,7 @@ pub(crate) mod tests {
         let client = execution_client();
         let session = session_with_client(client);
         assert!(std::ptr::eq(session.client(), client));
-        assert!(std::ptr::eq(session.fork_effect_scope().client(), client));
+        assert!(std::ptr::eq(session.with_new_effect_scope().client(), client));
     }
 
     #[test]
@@ -1842,7 +1832,7 @@ pub(crate) mod tests {
         assert_eq!(target.devices().len(), 2);
 
         // The target is read once and shared by all handles of the session.
-        assert!(std::ptr::eq(session.fork_effect_scope().target().unwrap(), target));
+        assert!(std::ptr::eq(session.with_new_effect_scope().target().unwrap(), target));
     }
 
     #[test]
@@ -1869,7 +1859,7 @@ pub(crate) mod tests {
 
         // Every handle of a session returns the template that the session was built with.
         assert_eq!(session.default_compilation_options(), &compilation_options);
-        assert_eq!(session.fork_effect_scope().default_compilation_options(), &compilation_options);
+        assert_eq!(session.with_new_effect_scope().default_compilation_options(), &compilation_options);
         assert_eq!(session.with_mesh(mesh).default_compilation_options(), &compilation_options);
     }
 
@@ -1878,7 +1868,7 @@ pub(crate) mod tests {
         let client = execution_client();
         let session = session_with_client(client);
         assert!(std::ptr::eq(session.clone().compilation_cache(), session.compilation_cache()));
-        assert!(std::ptr::eq(session.fork_effect_scope().compilation_cache(), session.compilation_cache()));
+        assert!(std::ptr::eq(session.with_new_effect_scope().compilation_cache(), session.compilation_cache()));
         assert!(!std::ptr::eq(session_with_client(client).compilation_cache(), session.compilation_cache()));
     }
 
@@ -1889,7 +1879,7 @@ pub(crate) mod tests {
         let session = session_with_client(client);
         assert!(session.is_same_session(&session));
         assert!(session.is_same_session(&session.clone()));
-        assert!(session.is_same_session(&session.fork_effect_scope()));
+        assert!(session.is_same_session(&session.with_new_effect_scope()));
         assert!(session.is_same_session(&session.with_mesh(mesh)));
         assert!(!session.is_same_session(&session_with_client(client)));
     }
@@ -2041,7 +2031,7 @@ pub(crate) mod tests {
         let handle = session.retain_constant(&array);
 
         // The resolved array shares the retained storage and belongs to the resolving handle.
-        let fork = session.fork_effect_scope();
+        let fork = session.with_new_effect_scope();
         let resolved = fork.retained_constant(&handle).unwrap();
         assert_eq!(resolved, array);
         assert!(std::ptr::eq(resolved.session().effect_scope(), fork.effect_scope()));
@@ -2517,7 +2507,7 @@ pub(crate) mod tests {
     fn test_session_bind_executes_dimension_cast() {
         let client = execution_client();
         let session = session_with_client(client);
-        let selected = session.fork_effect_scope();
+        let selected = session.with_new_effect_scope();
         let value = Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), session.clone()));
         let output_type = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(2)));
         for checked in [true, false] {

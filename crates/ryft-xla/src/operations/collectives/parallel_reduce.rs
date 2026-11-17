@@ -239,7 +239,7 @@ pub(crate) mod tests {
         shards: [Vec<u8>; 4],
     ) -> Vec<Vec<u8>> {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -302,7 +302,7 @@ pub(crate) mod tests {
     #[test]
     fn test_parallel_reduce_operation_lower() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -500,7 +500,7 @@ pub(crate) mod tests {
     #[test]
     fn test_parallel_reduce_operation_lower_executes_log_sum_exp_gradient_on_cpu() {
         let client = cpu_client(4);
-        let session = session_with_client(&client);
+        let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
