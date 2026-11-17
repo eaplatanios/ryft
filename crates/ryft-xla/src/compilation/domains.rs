@@ -10,11 +10,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
-    ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, DispatchInputs,
+    ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DispatchInputs,
     ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, Parameterized, ProgramError,
     ReferenceDischargeResult, Sharding, ShardingDimension, StagedProgram, Type, TypeError, Typed, TypedProgram,
 };
-use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, OpShardingType};
+use ryft_pjrt::protos::{
+    CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
+};
 use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
 use crate::compilation::CompilationError;
@@ -445,7 +447,7 @@ impl Session {
         }
         let compilation_options = jit_compilation_options(
             options.compilation_options().unwrap_or_else(|| self.default_compilation_options()),
-            options.mesh().devices().len(),
+            options.mesh().devices(),
             use_shardy_partitioner,
             options.feedback_directed_profile(),
         );
@@ -689,9 +691,14 @@ pub fn with_input_shardings<In: Parameterized<ArrayIrType>>(input_types: In, opt
 /// Overlays the selected multi-device execution mode on the base [`CompilationOptions`] template. Static programs
 /// use Shardy SPMD partitioning, while bounded dynamic programs use one fully replicated executable replica per
 /// device because Shardy does not yet accept dynamic tensors.
+///
+/// The executable is pinned to `devices`, which are the devices of the mesh that the program is compiled for, in
+/// mesh order, as JAX pins its executables to the devices of their shardings. Without an explicit assignment, PJRT
+/// assigns the first devices of the client, irrespective of the devices that the mesh names. Portable executables
+/// are the exception, because they are compiled for no particular device and PJRT rejects an assignment for them.
 pub(crate) fn jit_compilation_options(
     base: &CompilationOptions,
-    device_count: usize,
+    devices: &[Device],
     use_shardy_partitioner: bool,
     feedback_directed_profile: Option<&FeedbackDirectedProfile>,
 ) -> CompilationOptions {
@@ -700,10 +707,26 @@ pub(crate) fn jit_compilation_options(
     if executable_options.device_ordinal == 0 {
         executable_options.device_ordinal = -1;
     }
+    let device_count = devices.len();
     executable_options.replica_count = if use_shardy_partitioner { 1 } else { device_count as i64 };
     executable_options.partition_count = if use_shardy_partitioner { device_count as i64 } else { 1 };
     executable_options.use_spmd_partitioning = use_shardy_partitioner;
     executable_options.use_shardy_partitioner = use_shardy_partitioner;
+    if !options.compile_portable_executable {
+        // Each computation lists the device of every one of its replicas. Shardy runs one replica of one computation
+        // per device, while the replica path runs one computation with one replica per device.
+        let device_ids = devices.iter().map(|device| device.id() as i64);
+        let computation_devices = if use_shardy_partitioner {
+            device_ids.map(|id| ComputationDeviceAssignment { replica_device_ids: vec![id] }).collect()
+        } else {
+            vec![ComputationDeviceAssignment { replica_device_ids: device_ids.collect() }]
+        };
+        executable_options.device_assignment = Some(DeviceAssignment {
+            replica_count: executable_options.replica_count as i32,
+            computation_count: executable_options.partition_count as i32,
+            computation_devices,
+        });
+    }
     if let Some(profile) = feedback_directed_profile {
         executable_options.fdo_profile = profile.bytes().to_vec();
         options.profile_version = profile.version();
@@ -914,16 +937,16 @@ mod tests {
         AddOperation, Array as CoreArray, ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex,
         ArraySliceAxis, ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
         CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain, CompilationTracer,
-        ConditionOperation, ConstantOperation, CotangentDestinationKind, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation,
-        DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable,
-        DynamicBroadcastOperation, DynamicReshapeOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation,
-        NegOperation, OneOperation, Operation as CoreOperation, Placeholder, ProgramError, Provenance, ProvenanceScope,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshard, ScanOperation, Shape,
-        ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation,
-        StagedFunction as CoreStagedFunction, WhileOperation,
+        ConditionOperation, ConstantOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation, DataType,
+        Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
+        DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue,
+        DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, MulOperation, NegOperation, OneOperation, Operation as CoreOperation, Placeholder, ProgramError,
+        Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
+        Reshard, ScanOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin,
+        SliceOperation, StagedFunction as CoreStagedFunction, WhileOperation,
     };
     use ryft_pjrt::protos::Precision;
 
@@ -1259,6 +1282,53 @@ mod tests {
     }
 
     #[test]
+    fn test_session_lower_program_pins_the_executable_to_the_mesh_devices() {
+        // The mesh lists the devices of the client in reverse order, so its first shard lives on the second device.
+        let client = cpu_client(2);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, devices.clone()).unwrap();
+        let session = session_with_client(client);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let operation = CumulativeOperation::new(0, CumulativeKind::Sum);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]);
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+
+        // The executable runs its partitions on the devices of the mesh, in mesh order.
+        let assignment = compiled.executable().device_assignment().unwrap();
+        assert_eq!((assignment.replica_count(), assignment.computation_count()), (1, 2));
+        assert_eq!(
+            vec![assignment.device_id(0, 0).unwrap(), assignment.device_id(0, 1).unwrap()],
+            devices.iter().map(Device::id).collect::<Vec<_>>(),
+        );
+
+        // A prefix sum depends on the order of the shards, so it is only correct when each partition runs on the
+        // device that holds its shard.
+        let input = Array::from_host_buffer_with_sharding(
+            &session,
+            input_type,
+            sharding,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1.0, 3.0, 6.0, 10.0]);
+    }
+
+    #[test]
     fn test_session_lower_program_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
@@ -1508,10 +1578,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let shardy_lowered = lowered
-            .clone()
-            .with_stable_hlo(annotated.into_parts().0)
-            .with_compilation_options(jit_compilation_options(session.default_compilation_options(), 4, true, None));
+        let shardy_lowered = lowered.clone().with_stable_hlo(annotated.into_parts().0).with_compilation_options(
+            jit_compilation_options(session.default_compilation_options(), mesh.devices(), true, None),
+        );
         let Err(error) = session.compile_program(&shardy_lowered) else {
             panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
         };
@@ -2810,5 +2879,56 @@ mod tests {
             ),
         ));
         assert_eq!(required_consumer.compilation_cache().statistics().compilations, 0);
+    }
+    #[test]
+    fn test_jit_compilation_options() {
+        let devices = [Device::new(3, 0), Device::new(1, 0)];
+        let base =
+            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
+
+        // Static programs compile as one replica that Shardy partitions over the devices, in the provided order.
+        let options = jit_compilation_options(&base, &devices, true, None);
+        assert_eq!(options.matrix_unit_operand_precision, Precision::Highest as i32);
+        assert_eq!(
+            options.executable_build_options,
+            Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 2,
+                use_spmd_partitioning: true,
+                use_shardy_partitioner: true,
+                device_assignment: Some(DeviceAssignment {
+                    replica_count: 1,
+                    computation_count: 2,
+                    computation_devices: vec![
+                        ComputationDeviceAssignment { replica_device_ids: vec![3] },
+                        ComputationDeviceAssignment { replica_device_ids: vec![1] },
+                    ],
+                }),
+                ..Default::default()
+            }),
+        );
+
+        // Bounded dynamic programs compile as one computation with one replica per device.
+        let options = jit_compilation_options(&base, &devices, false, None);
+        assert_eq!(
+            options.executable_build_options,
+            Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 2,
+                partition_count: 1,
+                device_assignment: Some(DeviceAssignment {
+                    replica_count: 2,
+                    computation_count: 1,
+                    computation_devices: vec![ComputationDeviceAssignment { replica_device_ids: vec![3, 1] }],
+                }),
+                ..Default::default()
+            }),
+        );
+
+        // Portable executables are compiled for no particular device, so they are not pinned.
+        let portable = CompilationOptions { compile_portable_executable: true, ..Default::default() };
+        let options = jit_compilation_options(&portable, &devices[..1], true, None);
+        assert_eq!(options.executable_build_options.unwrap().device_assignment, None);
     }
 }

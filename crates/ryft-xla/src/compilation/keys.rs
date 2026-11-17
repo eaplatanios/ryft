@@ -166,10 +166,10 @@ pub(crate) struct EagerDispatchKey {
     /// Inputs of the application, in order.
     inputs: Arc<[EagerDispatchInput]>,
 
-    /// Mesh that eager lowering compiles against when it is not derived from the operation alone. It is the session
-    /// mesh if the session has one, and otherwise the mesh of the first array input. It is [`None`] only for an
-    /// operation without inputs in a session without a mesh, whose mesh is then determined by the operation and the
-    /// session's client.
+    /// Mesh that eager lowering compiles against when it is not derived from the operation alone. It is the mesh of
+    /// the first array input if there is one, and otherwise the mesh of the session, if it has one. It is [`None`]
+    /// only for an operation without array inputs in a session without a mesh, whose mesh is then determined by the
+    /// operation and the session's client.
     mesh: Option<DeviceMesh>,
 }
 

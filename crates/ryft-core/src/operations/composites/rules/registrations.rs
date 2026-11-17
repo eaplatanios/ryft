@@ -78,6 +78,40 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleCaches<V, O> {
     }
 }
 
+// SAFETY: These caches are built only from `SpecializationCache`, `Mutex`, `LruCache`, `Arc`, erased `Send + Sync`
+// conversions, and keys made of `V::Type` values and plain bookkeeping, so they are thread-safe exactly when the
+// programs, specializations, and registrations that they retain are. Apart from the caches of the definitions that
+// those programs call, which are thread-safe by these same implementations, those retain exactly the leaf data that
+// the `RegionTransformCache` implementations name: constants of type `V`, types `V::Type`, type identities
+// `<V::Type as Type>::Identity`, and operations `O`. The rules of the definitions are `Send + Sync` trait objects.
+// The unit test `test_custom_rule_caches_are_send_and_sync` proves for generic `V` and `O` that these leaf bounds make
+// every field `Send` and `Sync`, and destructures the caches exhaustively, so a new field or a future non-thread-safe
+// type anywhere in that structure fails to compile there instead of silently becoming unsound here.
+//
+// The structural derivation that these implementations replace is correct but too deep to remain usable. A composite
+// call refers to its definition and to these caches, the caches retain programs, and the programs contain operations
+// of the family, whose composite calls close the cycle, which takes dozens of nested types per round trip. Operation
+// families that contain other families (e.g., array IR operations, which contain array operations) repeat it once per
+// family. Monomorphizing a closure that captures a definition into an `Arc<dyn Fn(..) + Send + Sync>` rule (e.g., the
+// batching rule of an attention definition) proves that the closure is `Send` and `Sync` at the concrete family, which
+// exceeded the default recursion limit (E0275) whenever a downstream crate built (rather than only checked) such code.
+// Like those of `RegionTransformCache`, the bounds name only leaves, which closes the cycle at `O` within a few steps.
+unsafe impl<V, O> Send for CustomRuleCaches<V, O>
+where
+    V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,
+    O: Send + Sync,
+{
+}
+
+// SAFETY: Refer to the safety argument of the `Send` implementation above. Sharing these caches across threads shares
+// the same `Mutex`-guarded state that sending them does, so the same bounds are required and sufficient.
+unsafe impl<V, O> Sync for CustomRuleCaches<V, O>
+where
+    V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,
+    O: Send + Sync,
+{
+}
+
 /// Handle to a registered [`CustomRuleDefinition`], which owns the definition's specialization caches. Calls are staged
 /// with a [`CustomRuleReference`] obtained from [`Self::reference`], and the specializations that their derivative
 /// requests produce are cached for as long as some handle to the registration is alive. Once every handle is dropped,
@@ -490,6 +524,42 @@ mod tests {
             active_input_indices: vec![0],
             output_tangent_mask: vec![true],
         }
+    }
+
+    #[test]
+    fn test_custom_rule_caches_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>(_value: &T) {}
+
+        // Type-checking this generic body proves the safety argument of the handwritten `Send` and `Sync`
+        // implementations for `CustomRuleCaches`: every field is thread-safe whenever the leaf data of the
+        // retained programs is. The exhaustive pattern makes a new field fail to compile here until it is covered.
+        fn assert_fields_are_send_and_sync<
+            V: Send + Sync + Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Parameter,
+            O: Send + Sync,
+        >(
+            caches: &CustomRuleCaches<V, O>,
+        ) {
+            let CustomRuleCaches {
+                body_specializations,
+                jvp_specializations,
+                forward_specializations,
+                backward_specializations,
+                batching_rule_specializations,
+                derived_registrations,
+                converted_specializations,
+            } = caches;
+            assert_send_sync(body_specializations);
+            assert_send_sync(jvp_specializations);
+            assert_send_sync(forward_specializations);
+            assert_send_sync(backward_specializations);
+            assert_send_sync(batching_rule_specializations);
+            assert_send_sync(derived_registrations);
+            assert_send_sync(converted_specializations);
+        }
+
+        let caches = CustomRuleCaches::<Array, ArrayOperation<Array>>::new();
+        assert_fields_are_send_and_sync(&caches);
+        assert_send_sync(&caches);
     }
 
     #[test]

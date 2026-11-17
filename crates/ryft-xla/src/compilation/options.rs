@@ -284,10 +284,11 @@ impl Options {
     ///
     /// The supplied options replace the template of the session as a whole and are not merged with it. Lowering still
     /// overlays the settings that it derives for the program (i.e., the replica and partition counts, the partitioner
-    /// selection, and the profile of [`Self::with_feedback_directed_profile`]). Use this function for settings of one
-    /// program signature (e.g., argument layouts and the result layout) and for compiler settings of one function
-    /// (e.g., environment option overrides). The options are part of every cache key of the compilation, and two
-    /// [`Options`] are equal only if their compilation options have the same canonical encoding.
+    /// selection, the assignment of the program to the devices of [`Self::mesh`], and the profile of
+    /// [`Self::with_feedback_directed_profile`]). Use this function for settings of one program signature (e.g.,
+    /// argument layouts and the result layout) and for compiler settings of one function (e.g., environment option
+    /// overrides). The options are part of every cache key of the compilation, and two [`Options`] are equal only if
+    /// their compilation options have the same canonical encoding.
     #[inline]
     pub fn with_compilation_options(mut self, compilation_options: CompilationOptions) -> Self {
         self.compilation_options = Some(CompilationOptionsOverride::new(compilation_options));
@@ -413,7 +414,7 @@ mod tests {
     use std::io::ErrorKind;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::ShardingDimension;
+    use ryft_core::{Device, ShardingDimension};
     use ryft_pjrt::protos::{OptionOverride, Precision};
 
     use crate::compilation::domains::jit_compilation_options;
@@ -446,8 +447,9 @@ mod tests {
         assert_eq!(restored, profile);
         assert_eq!(restored.digest(), profile.digest());
 
-        let baseline = jit_compilation_options(&CompilationOptions::default(), 2, true, None);
-        let profiled = jit_compilation_options(&CompilationOptions::default(), 2, true, Some(&profile));
+        let devices = [Device::new(0, 0), Device::new(1, 0)];
+        let baseline = jit_compilation_options(&CompilationOptions::default(), &devices, true, None);
+        let profiled = jit_compilation_options(&CompilationOptions::default(), &devices, true, Some(&profile));
         assert_eq!(baseline.executable_build_options.unwrap().fdo_profile, Vec::<u8>::new());
         assert_eq!(profiled.executable_build_options.unwrap().fdo_profile, vec![1, 2, 3, 4]);
         assert_eq!(profiled.profile_version, 7);

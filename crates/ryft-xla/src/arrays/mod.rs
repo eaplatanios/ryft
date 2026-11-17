@@ -3191,9 +3191,8 @@ mod tests {
     fn test_array_associate() {
         let client = cpu_client(1);
         let other_client = other_cpu_client(1);
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
+        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
         let original = array.clone();
 
         // Associating with a handle of the same session that has a new effect scope switches the effect scope while
@@ -3226,7 +3225,7 @@ mod tests {
         // Association rejects a session of a different client, even when no numerical buffer could establish
         // ownership (e.g., for bufferless zero-space arrays).
         let other_client_session = session_with_client(other_client);
-        for array in [original, session.array(ArrayType::scalar(DataType::Zero), mesh, []).unwrap()] {
+        for array in [original, session.array(ArrayType::scalar(DataType::Zero), []).unwrap()] {
             assert!(matches!(
                 array.associate(&other_client_session),
                 Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))

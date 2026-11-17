@@ -187,12 +187,11 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// # Example
 ///
 /// ```
-/// # use ryft_core::{ArrayType, DataType, MeshAxis, MeshAxisType, Print};
+/// # use ryft_core::{ArrayType, DataType, Print};
 /// # use ryft_xla::{Platform, Session};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let session = Session::builder().platform(Platform::Cpu).build()?;
-/// let mesh = session.new_mesh([MeshAxis::new("x", 1, MeshAxisType::Auto)?])?;
-/// let value = session.array(ArrayType::scalar(DataType::F64), mesh, 1.0f64.to_ne_bytes())?;
+/// let value = session.array(ArrayType::scalar(DataType::F64), 1.0f64.to_ne_bytes())?;
 /// value.print("value");
 /// session.effects_barrier()?;
 /// # Ok(())
@@ -213,7 +212,7 @@ pub struct Session {
     /// State of this session that contains resources shared by every handle of this session.
     state: Arc<SessionState>,
 
-    /// Concrete device mesh that eager binds prefer when deriving their execution mesh and that the constant
+    /// Default device mesh of this handle, which eager binds without array inputs execute on and which the constant
     /// materialization fast path requires.
     mesh: Option<DeviceMesh>,
 
@@ -253,9 +252,9 @@ impl Session {
     }
 
     /// Returns a handle of this session whose default mesh is `mesh`, as under JAX's `jax.set_mesh`. Eager values that
-    /// are created from no array inputs (e.g., constants and zeros) are placed on it, and it is the
-    /// [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g., `shard_map(.., None, ..)`).
-    /// The handle shares the resources and the effect scope of this session.
+    /// are created from no array inputs (e.g., arrays uploaded through [`Self::array`], constants, and zeros) are
+    /// placed on it, and it is the [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g.,
+    /// `shard_map(.., None, ..)`). The handle shares the resources and the effect scope of this session.
     pub fn with_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
     }
@@ -292,8 +291,9 @@ impl Session {
             .map_err(Clone::clone)
     }
 
-    /// Returns the [`DeviceMesh`] that this handle resolves shard placement against, or [`ArrayError::MissingMesh`]
-    /// when the handle has no mesh. Eager binds derive their mesh from the inputs in that case.
+    /// Returns the default [`DeviceMesh`] of this handle, or [`ArrayError::MissingMesh`] when the handle has no mesh.
+    /// Eager binds execute on the mesh of their array inputs and only use this mesh when they have none. Refer to
+    /// [`Self::with_mesh`] for more information.
     #[inline]
     pub fn mesh(&self) -> Result<&DeviceMesh, Error> {
         self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
@@ -384,11 +384,23 @@ impl Session {
         Ok(DeviceMesh::new(logical_mesh, devices)?)
     }
 
-    // TODO(eaplatanios): Should this not have a `mesh` argument and have a separate `sharded_array` for one
-    //  with a mesh? Though, wait. `self` already holds a mesh so why does this constructor also take a mesh?
-    /// Uploads host bytes into an array that belongs to this session. Refer to the documentation of
-    /// [`Array::from_host_buffer`] for more information.
-    pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, mesh: DeviceMesh, buffer: B) -> Result<Array, Error> {
+    /// Uploads the dense row-major host bytes in `buffer` into a new [`Array`] of type `r#type` that belongs to this
+    /// session. Refer to the documentation of [`Array::from_host_buffer`] for information on how the bytes are
+    /// distributed over the devices.
+    ///
+    /// The array is placed like every other eager value that is created from no array inputs (e.g., constants and
+    /// zeros). It lives on the mesh of this handle, if the handle has one, so `session.with_mesh(mesh).array(..)`
+    /// uploads to a specific mesh. Otherwise, a sharding of `r#type` supplies a logical mesh that is laid over the
+    /// addressable devices of the client, in the order in which the client reports them. A type without a sharding
+    /// is placed on the first addressable device alone, on a mesh with the single axis `x`. In all cases, a type
+    /// without a sharding is replicated over the resulting mesh.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::InvalidArgument`] if the addressable devices of the client cannot be queried or are
+    /// fewer than the mesh of `r#type` requires, and the errors of [`Array::from_host_buffer`] otherwise.
+    pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, buffer: B) -> Result<Array, Error> {
+        let mesh = self.eager_mesh(&[], std::slice::from_ref(&r#type))?;
         Array::from_host_buffer(self, r#type, mesh, buffer)
     }
 
@@ -671,7 +683,7 @@ impl Session {
             &operation,
             region_keys.as_slice(),
             inputs,
-            self.mesh().ok().or_else(|| array_inputs.first().map(Array::mesh)),
+            array_inputs.first().map(Array::mesh).or_else(|| self.mesh().ok()),
         );
         let compiled = match self.eager_dispatch_cache().get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
@@ -854,20 +866,21 @@ impl Session {
         Ok(())
     }
 
-    /// Returns the concrete [`DeviceMesh`] for eager execution, preferring the session's mesh and then the first
-    /// input's mesh. Without either, the first sharded output supplies a logical mesh, which is assembled over the
-    /// client's addressable devices in enumeration order. If no output supplies a mesh, the client's first addressable
-    /// device forms a mesh with a single device.
+    /// Returns the concrete [`DeviceMesh`] for eager execution, preferring the first input's mesh and then the default
+    /// mesh of this handle, so that an operation executes where its inputs live, as operations on committed arrays do
+    /// under JAX's `jax.set_mesh`. Without either, the first sharded output supplies a logical mesh, which is
+    /// assembled over the client's addressable devices in enumeration order. If no output supplies a mesh, the
+    /// client's first addressable device forms a mesh with a single device.
     ///
     /// Deriving placement from output sharding supports operations without inputs on recovered sessions without a mesh,
     /// including nullary constants synthesized by transforms through [`Zero`], [`One`](ryft_core::One),
     /// [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota).
     fn eager_mesh(&self, inputs: &[Array], output_types: &[ArrayType]) -> Result<DeviceMesh, ProgramError> {
-        if let Ok(mesh) = self.mesh() {
-            return Ok(mesh.clone());
-        }
         if let Some(input) = inputs.first() {
             return Ok(input.mesh().clone());
+        }
+        if let Ok(mesh) = self.mesh() {
+            return Ok(mesh.clone());
         }
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
         let devices = self.client().addressable_devices().map_err(|error| invalid_argument(error.to_string()))?;
@@ -879,7 +892,7 @@ impl Session {
             let device_count = logical_mesh.device_count();
             if devices.len() < device_count {
                 return Err(invalid_argument(format!(
-                    "eager xla execution of an input-free operation sharded over mesh {logical_mesh:?} requires \
+                    "eager xla placement of a value without array inputs over mesh {logical_mesh:?} requires \
                      {device_count} addressable device(s) but the client only has {}",
                     devices.len(),
                 )));
@@ -1226,9 +1239,10 @@ impl SessionBuilder {
     /// `default_compilation_options`, unless its [`Options`] supply their own through
     /// [`Options::with_compilation_options`](crate::Options::with_compilation_options). Lowering then overlays the
     /// settings that it derives for each program (i.e., the replica and partition counts, the partitioner selection,
-    /// and the feedback-directed profile of its options). The template therefore suits settings that hold for every
-    /// program of the session (e.g., operand precisions and environment option overrides) rather than settings of one
-    /// program signature (e.g., argument layouts). It is immutable once the session is built.
+    /// the assignment of the program to the devices of its mesh, and the feedback-directed profile of its options).
+    /// The template therefore suits settings that hold for every program of the session (e.g., operand precisions and
+    /// environment option overrides) rather than settings of one program signature (e.g., argument layouts). It is
+    /// immutable once the session is built.
     pub fn default_compilation_options(mut self, default_compilation_options: CompilationOptions) -> Self {
         self.default_compilation_options = default_compilation_options;
         self
@@ -1963,14 +1977,45 @@ pub(crate) mod tests {
     #[test]
     fn test_session_array() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let r#type = replicated_vector_type(&mesh, 2);
-        let array = session.array(r#type.clone(), mesh.clone(), values_to_bytes::<f32>(&[1.0, 2.0])).unwrap();
-        assert_eq!(array.r#type().into_owned(), r#type);
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let bytes = values_to_bytes::<f32>(&[1.0, 2.0]);
+
+        // With neither a handle mesh nor a sharding, the array is replicated over the first addressable device.
+        let mesh = domain_mesh(client, "x", 1);
+        let array = session.array(r#type.clone(), bytes.as_slice()).unwrap();
+        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
         assert_eq!(array.mesh(), &mesh);
         assert!(array.session().is_same_session(&session));
         assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+
+        // Without a handle mesh, a sharding supplies the logical mesh, which is laid over the addressable devices.
+        let mesh = domain_mesh(client, "y", 1);
+        let array = session.array(replicated_vector_type(&mesh, 2), bytes.as_slice()).unwrap();
+        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
+        assert_eq!(array.mesh(), &mesh);
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+
+        // A handle with a mesh uploads to that mesh.
+        let mesh = domain_mesh(client, "z", 1);
+        let array = session.with_mesh(mesh.clone()).array(r#type.clone(), bytes.as_slice()).unwrap();
+        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
+        assert_eq!(array.mesh(), &mesh);
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+
+        // A sharding over more devices than the client has cannot be placed.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let r#type = r#type.with_sharding(Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
+        assert!(matches!(
+            session.array(r#type, bytes.as_slice()),
+            Err(Error::Core(error))
+                if *error == CoreError::Program(ProgramError::InvalidArgument {
+                    message: format!(
+                        "eager xla placement of a value without array inputs over mesh {logical_mesh:?} requires 2 \
+                         addressable device(s) but the client only has 1",
+                    ),
+                }),
+        ));
     }
 
     #[test]
@@ -2022,9 +2067,8 @@ pub(crate) mod tests {
     #[test]
     fn test_session_retained_constant() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&array);
 
         // The resolved array shares the retained storage and belongs to the resolving handle.
@@ -2055,9 +2099,8 @@ pub(crate) mod tests {
     #[test]
     fn test_session_retain_constant() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
+        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
 
         // Retaining one array twice yields equal handles, and the handles keep the array alive after the array itself
         // is dropped.
@@ -2840,6 +2883,46 @@ pub(crate) mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(client, &outputs[0]), vec![-1.0, 2.0, -3.5, 0.0]);
+    }
+
+    #[test]
+    fn test_session_bind_executes_on_the_mesh_of_its_inputs() {
+        // An operation executes on the mesh of its array inputs, even when the handle has another default mesh.
+        let client = execution_client();
+        let default_mesh = domain_mesh(client, "x", 1);
+        let input_mesh = domain_mesh(client, "y", 1);
+        let domain = ProjectedContext::<Session, ArrayType>::new(session_with_client(client).with_mesh(default_mesh));
+        let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
+        let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().into_owned(), replicated_vector_type(&input_mesh, 2));
+        assert_eq!(outputs[0].mesh(), &input_mesh);
+        assert_eq!(read_f32s(client, &outputs[0]), vec![-1.0, 2.0]);
+
+        // The same holds for an input on fewer devices than the default mesh of the handle spans.
+        let client = cpu_client(2);
+        let default_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let input_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![default_mesh.devices()[0]],
+        )
+        .unwrap();
+        let domain = ProjectedContext::<Session, ArrayType>::new(session_with_client(client).with_mesh(default_mesh));
+        let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
+        let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].mesh(), &input_mesh);
+        assert_eq!(read_f32s(client, &outputs[0]), vec![-1.0, 2.0]);
+
+        // An input on a device other than the first one of the client stays on that device.
+        let input_mesh =
+            DeviceMesh::new(input_mesh.logical_mesh().clone(), vec![domain.parent().mesh().unwrap().devices()[1]])
+                .unwrap();
+        let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
+        let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].mesh(), &input_mesh);
+        assert_eq!(read_sharded_f32_array(&outputs[0]), vec![-1.0, 2.0]);
     }
 
     #[test]
@@ -4319,9 +4402,8 @@ pub(crate) mod tests {
     fn test_session_constant_rename_type_identities() {
         // Renaming keeps the storage of a handle and only renames its type.
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&array);
         let renamed = handle.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
         assert_eq!(renamed, handle);
@@ -4331,12 +4413,11 @@ pub(crate) mod tests {
     #[test]
     fn test_session_constant_eq() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let other_session = session_with_client(client);
-        let first = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
-        let second = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 2f32.to_ne_bytes()).unwrap();
-        let other = other_session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let first = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let second = session.array(ArrayType::scalar(DataType::F32), 2f32.to_ne_bytes()).unwrap();
+        let other = other_session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&first);
 
         // Handles are equal when they refer to the same retained array of the same session with the same type.
@@ -4349,10 +4430,9 @@ pub(crate) mod tests {
     #[test]
     fn test_session_constant_hash() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let first = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
-        let second = session.array(ArrayType::scalar(DataType::F32), mesh, 2f32.to_ne_bytes()).unwrap();
+        let first = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let second = session.array(ArrayType::scalar(DataType::F32), 2f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&first);
         let other = session.retain_constant(&second);
         assert_eq!(hash_of(&handle), hash_of(&session.retain_constant(&first)));
@@ -4365,9 +4445,8 @@ pub(crate) mod tests {
     #[test]
     fn test_session_constant_display() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
         let handle = session.retain_constant(&array);
         assert_eq!(handle.to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
     }
@@ -4377,18 +4456,15 @@ pub(crate) mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session
-            .array(replicated_scalar_type(&mesh, DataType::F32), mesh.clone(), 1f32.to_ne_bytes())
-            .unwrap();
+        let array = session.array(replicated_scalar_type(&mesh, DataType::F32), 1f32.to_ne_bytes()).unwrap();
         assert_eq!(session.retain_constant(&array).r#type().into_owned(), replicated_scalar_type(&mesh, DataType::F32));
     }
 
     #[test]
     fn test_session_constant() {
         let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), mesh, 1f32.to_ne_bytes()).unwrap();
+        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
 
         // Arrays are retained by their session and become handles to their retained storage.
         let Ok(Constant::Session(handle)) = session_constant(Value::Array(array.clone())) else {
@@ -4559,7 +4635,7 @@ pub(crate) mod tests {
         assert!(lowered.kernel_execution_facts().is_some());
         assert!(!lowered.signature().has_effects());
         let compiled = session.compile_program(&lowered).unwrap();
-        let input = session.array(scalar, mesh, 42i32.to_ne_bytes()).unwrap();
+        let input = session.array(scalar, 42i32.to_ne_bytes()).unwrap();
         let outputs = session.execute_program(&compiled, vec![input.clone()]).unwrap();
         let bytes = compiled.serialize().unwrap().unwrap();
         let restored_session = session_with_client(&client);

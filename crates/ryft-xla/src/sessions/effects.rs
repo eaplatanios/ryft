@@ -414,8 +414,8 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
-        let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
-        let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
+        let first = session.array(r#type.clone(), 1.0f64.to_ne_bytes()).unwrap();
+        let second = session.array(r#type, 2.0f64.to_ne_bytes()).unwrap();
         // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
         let manager = hold_predecessor.then(|| {
             let manager = client
