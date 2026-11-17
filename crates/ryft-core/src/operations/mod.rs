@@ -194,7 +194,10 @@ pub use sharding::{
     ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapValueKind, ShardingOperations,
     auto_axes, explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
 };
-pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};
+pub use softmax::{
+    SOFTMAX_COMPOSITE_NAME, SOFTMAX_COMPOSITE_VERSION, Softmax, SoftmaxComposite, SoftmaxCrossEntropyWithTargetLogits,
+    softmax, softmax_cross_entropy_with_target_logits,
+};
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};

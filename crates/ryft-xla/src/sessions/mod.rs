@@ -327,7 +327,7 @@ impl Session {
     /// default mesh. Eager binds execute on the mesh of their array inputs and only use this mesh when they have none.
     /// Refer to [`Self::with_mesh`] for more information.
     #[inline]
-    pub fn mesh(&self) -> Result<&DeviceMesh, Error> {
+    pub fn device_mesh(&self) -> Result<&DeviceMesh, Error> {
         self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
     }
 
@@ -373,6 +373,7 @@ impl Session {
     /// Returns [`Error::Pjrt`] if the devices of the client cannot be queried, and a
     /// [`ShardingError`](ryft_core::ShardingError) if `axes` do not form a valid mesh or require more devices than
     /// the client has.
+    #[inline]
     pub fn new_mesh<A: IntoIterator<Item = MeshAxis>>(&self, axes: A) -> Result<DeviceMesh, Error> {
         let logical_mesh = LogicalMesh::new(axes.into_iter().collect())?;
         let devices = self

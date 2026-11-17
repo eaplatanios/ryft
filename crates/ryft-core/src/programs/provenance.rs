@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -149,23 +150,41 @@ impl Provenance {
     ///   - nested fused origins are flattened,
     ///   - structurally duplicate origins are removed while preserving first-occurrence order, and
     ///   - zero remaining origins return [`unknown`](Self::unknown) and one remaining origin is returned directly.
+    ///
+    /// The cost is linear in the number of provided origins, so fusing many origins at once stays cheap.
     pub fn fused<O: IntoIterator<Item = Provenance>>(origins: O) -> Self {
+        /// Number of retained origins up to which duplicates are found by scanning them. Most fused provenances
+        /// merge a handful of origins, for which a scan is cheaper than hashing every origin.
+        const SCAN_LIMIT: usize = 16;
+
+        // Beyond the scan limit, an index of the retained origins takes over. Scanning alone would compare every
+        // pair of origins, which is quadratic in their number.
         let mut normalized = Vec::<Provenance>::new();
+        let mut index = HashSet::<Provenance>::new();
+        let mut retain = |origin: &Provenance| {
+            let is_new = if normalized.len() < SCAN_LIMIT {
+                !normalized.contains(origin)
+            } else {
+                if index.is_empty() {
+                    index.extend(normalized.iter().cloned());
+                }
+                index.insert(origin.clone())
+            };
+            if is_new {
+                normalized.push(origin.clone());
+            }
+        };
+
         for origin in origins {
             match origin.0.as_deref() {
                 // Fused nodes are normalized at construction, so their constituents are never unknown and never
                 // themselves fused, and flattening one level is sufficient.
-                Some(ProvenanceNode::Fused { origins }) => {
-                    for origin in origins.iter() {
-                        if !normalized.contains(origin) {
-                            normalized.push(origin.clone());
-                        }
-                    }
-                }
-                Some(_) if !normalized.contains(&origin) => normalized.push(origin),
-                _ => {}
+                Some(ProvenanceNode::Fused { origins }) => origins.iter().for_each(&mut retain),
+                Some(_) => retain(&origin),
+                None => {}
             }
         }
+
         match normalized.len() {
             0 => Self::unknown(),
             1 => normalized.pop().unwrap(),
@@ -382,8 +401,6 @@ impl Drop for ProvenanceRestorationGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -469,6 +486,34 @@ mod tests {
             Provenance::fused([Provenance::fused([a.clone(), b.clone()]), b.clone()]),
             Provenance::fused([a.clone(), b.clone()]),
         );
+    }
+
+    #[test]
+    fn test_provenance_fused_normalization_of_many_origins() {
+        // Enough distinct origins to go past the point where duplicates stop being found by scanning.
+        let scope =
+            |index: usize| Provenance::scope(ProvenanceScope::new(format!("scope_{index}")), Provenance::unknown());
+        let distinct = (0..40).map(scope).collect::<Vec<_>>();
+
+        // Duplicates are removed in first-occurrence order, whether they repeat an origin retained before or after
+        // that point, and unknown origins are still discarded.
+        let fused = Provenance::fused(distinct.iter().cloned().chain([
+            scope(3),
+            Provenance::unknown(),
+            scope(30),
+            scope(40),
+            scope(40),
+        ]));
+        let expected = distinct.iter().cloned().chain([scope(40)]).collect::<Vec<_>>();
+        assert_eq!(fused.as_fused(), Some(expected.as_slice()));
+
+        // Nested fused origins are flattened against the same retained origins.
+        let nested = Provenance::fused([
+            Provenance::fused(distinct[..30].iter().cloned()),
+            Provenance::fused(distinct[20..].iter().cloned()),
+            scope(40),
+        ]);
+        assert_eq!(nested, fused);
     }
 
     #[test]

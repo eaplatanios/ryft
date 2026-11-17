@@ -68,7 +68,9 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
-use crate::operations::composites::{CompositeCallContext, JvpComposite, composite};
+use crate::operations::composites::builders::{Composite, CompositeCallContext, JvpComposite, composite};
+use crate::operations::composites::configurations::JvpFromPrimal;
+use crate::operations::composites::rules::definitions::{CompositeAttribute, CompositeKey};
 use crate::operations::constants::fill_like::FillLike;
 use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -410,6 +412,113 @@ impl<
         cross_entropy_loss_with_integer_labels(&log_probabilities, &labels, Some(&mask), flattened.axis)?
             .convert_element_type(self.r#type().data_type())
     }
+}
+
+/// Name of the [`CompositeKey`]s of the named composites that [`softmax`] creates.
+pub const SOFTMAX_COMPOSITE_NAME: &str = "ryft.softmax";
+
+/// Version of the [`CompositeKey`]s of the named composites that [`softmax`] creates. It changes whenever the
+/// computation that a released key describes changes.
+pub const SOFTMAX_COMPOSITE_VERSION: u32 = 1;
+
+/// Softmax function created by [`softmax`], which calls [`Softmax::softmax`] along fixed class axes as one named
+/// composite. The body of the composite is the decomposition of [`Softmax::softmax`] itself, so calls compute the same
+/// probabilities and derivatives, including the documented treatment of ties, saturated rows, non-finite rows, and
+/// narrow formats. The two forms differ only in how their operations reach a backend:
+///
+///   - A staged program holds one `composite` instruction for each call, and the calls with equal input types share
+///     one body. A backend lowers the body, sharing one function between repeated calls.
+///   - A backend that executes eagerly (e.g., the eager XLA backend) runs a whole call as one compiled unit, where the
+///     capability dispatches each of the roughly twenty operations of its decomposition separately.
+///   - Differentiation and batching are derived from the body, so no rule is written by hand. Forward and reverse mode
+///     differentiate the body in the caller, and batching batches the body structurally.
+///
+/// Prefer this function where dispatch overhead matters, which mainly means eager execution, and the capability
+/// elsewhere. Inside a program that is compiled as a whole (e.g., under `jit`), a call lowers to its body and gains
+/// little. The capability needs no state and applies to every value that implements it (e.g., array IR values),
+/// whereas this function is created for one domain and must be held, because its composite owns the definition and
+/// the traced bodies of its calls. For the same reason, the capability cannot route its calls through a composite,
+/// since a blanket capability implementation has nowhere to keep one. A new function traces its body again and shares
+/// no compiled unit with another one, so create it once and reuse it.
+pub struct SoftmaxComposite<D: Domain<Type = ArrayType>>
+where
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+{
+    /// Named composite whose body applies [`Softmax::softmax`] along the class axes of this function.
+    composite: Composite<D::Constant, D::Operation, DomainTracer<D>, DomainTracer<D>, JvpFromPrimal>,
+}
+
+impl<D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>> SoftmaxComposite<D>
+where
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+{
+    /// Returns the class probabilities of `logits` along the class axes of this function, exactly as
+    /// [`Softmax::softmax`] computes them. The output has the shape and element type of `logits`.
+    ///
+    /// The domain of `logits` supplies the call context, so this function can be reused with eager and transformed
+    /// values that share its constant and operation types.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] under the same conditions as [`Softmax::softmax`], which the output type rule of the
+    /// composite checks before the call is staged, or when staging or executing the call fails.
+    #[inline]
+    pub fn call<
+        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
+        V: Value<Type = ArrayType, Domain = C>,
+    >(
+        &self,
+        logits: V,
+    ) -> Result<V, ProgramError> {
+        self.composite.call(logits)
+    }
+}
+
+/// Creates a softmax function along `axes` for the values of the domain `D`, which calls [`Softmax::softmax`] as one
+/// named composite. `axes` accepts one axis or a list of axes, and negative axes count from the end of each input.
+/// Refer to [`SoftmaxComposite`] for what the returned function does and for when to prefer it over the [`Softmax`]
+/// capability. The [`CompositeKey`] of the composite has the name [`SOFTMAX_COMPOSITE_NAME`] and the version
+/// [`SOFTMAX_COMPOSITE_VERSION`], and its `axes` attribute lists the class axes as provided, which together
+/// with the input types determines the computation.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayOperation, EagerContext, Reduce, Softmax, differentiate_at, softmax};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let function = softmax::<EagerContext<Array, ArrayOperation<Array>>>(-1);
+/// let logits = Array::vector(vec![9.0f32, -9.0, -9.0])?;
+/// assert_eq!(function.call(logits.clone())?, logits.softmax(-1)?);
+///
+/// // Derivatives are those of the capability, because they are derived from the same decomposition.
+/// let gradient = differentiate_at(logits.clone()).gradient(|logits| function.call(logits)?.reduce_max(&[0]))?;
+/// let expected = differentiate_at(logits).gradient(|logits| logits.softmax(-1)?.reduce_max(&[0]))?;
+/// assert_eq!(gradient, expected);
+/// # Ok(())
+/// # }
+/// ```
+pub fn softmax<D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>>(
+    axes: impl Into<Axes>,
+) -> SoftmaxComposite<D>
+where
+    DomainTracer<D>: Softmax,
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
+{
+    let axes = axes.into();
+    let key = CompositeKey::new(SOFTMAX_COMPOSITE_NAME, SOFTMAX_COMPOSITE_VERSION).with_attribute(
+        "axes",
+        CompositeAttribute::Sequence(axes.iter().map(|axis| CompositeAttribute::Integer(axis.value())).collect()),
+    );
+    let body_axes = axes.clone();
+    let composite = composite(move |logits: DomainTracer<D>| logits.softmax(&body_axes))
+        .with_named_composite(key, move |logits_type: ArrayType| {
+            // The body widens and narrows the element type of its input without changing its shape or placement,
+            // so validated logits keep their type.
+            validate_normalization("softmax", &logits_type, axes.clone())?;
+            Ok(logits_type)
+        })
+        .with_jvp_from_primal();
+    SoftmaxComposite { composite }
 }
 
 /// Cross-entropy function created by [`softmax_cross_entropy_with_target_logits`]. Target logits parameterize a
@@ -1004,6 +1113,12 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         (mesh, varying, invariant)
+    }
+
+    /// Returns the type and the logical bytes of `array`, which identify it bit for bit, unlike its [`PartialEq`]
+    /// implementation, under which NaNs compare unequal.
+    fn bits(array: &Array) -> (ArrayType, Vec<u8>) {
+        (array.r#type().into_owned(), array.logical_bytes())
     }
 
     #[test]
@@ -3494,6 +3609,192 @@ mod tests {
             },),
             Ok((Array::scalar(0.0f64).unwrap(), Array::vector(vec![0.0f64; 3]).unwrap())),
         );
+    }
+
+    #[test]
+    fn test_softmax_composite_call() {
+        // Calls compute what the capability computes bit for bit, including rows with NaN, with positive infinity,
+        // with only excluded classes, with ties, with one excluded class, and with a saturated maximum.
+        let function = softmax::<ArrayContext>(-1);
+        let (nan, infinity) = (f32::NAN, f32::INFINITY);
+        let logits = Array::matrix(
+            6,
+            3,
+            vec![
+                nan, 0.0, 1.0, infinity, 0.0, 1.0, -infinity, -infinity, -infinity, 0.0, 0.0, 0.0, -infinity, 0.0, 1.0,
+                9.0, -9.0, -9.0,
+            ],
+        )
+        .unwrap();
+        let output = function.call(logits.clone()).unwrap();
+        assert_eq!(bits(&output), bits(&logits.softmax(-1).unwrap()));
+        let output = output.elements::<f32>().unwrap();
+        assert!(output[..9].iter().all(|probability| probability.is_nan()));
+        assert_eq!(output[12], 0.0);
+        assert_eq!(output[15], (-(2.0 * (-18.0f64).exp()).ln_1p()).exp() as f32);
+
+        // The same function serves inputs of other types, including narrow, singleton, empty, and varying inputs.
+        let narrow = Array::vector(vec![f16::from_f32(4.0), f16::from_f32(-4.0)]).unwrap();
+        assert_eq!(function.call(narrow.clone()), narrow.softmax(-1));
+        assert_eq!(function.call(Array::vector(vec![1.0f32]).unwrap()), Ok(Array::vector(vec![1.0f32]).unwrap()));
+        let empty = Array::matrix(0, 2, Vec::<f32>::new()).unwrap();
+        assert_eq!(function.call(empty.clone()), Ok(empty));
+        let (_, varying, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
+        let input = Array::from_elements(varying.clone(), &[0.0f32, 0.0]).unwrap();
+        assert_eq!(function.call(input), Ok(Array::from_elements(varying, &[0.5f32, 0.5]).unwrap()));
+
+        // Several class axes normalize jointly, as in the capability.
+        let values = (0..12).map(|index| (index as f64) * 0.3 - 1.0).collect::<Vec<_>>();
+        let input = Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3, 2]), &values).unwrap();
+        assert_eq!(softmax::<ArrayContext>([0, 2]).call(input.clone()), input.softmax([0, 2]));
+    }
+
+    #[test]
+    fn test_softmax_composite_call_validation() {
+        // The output type rule of the composite rejects the inputs that the capability rejects, with its diagnostics.
+        let function = softmax::<ArrayContext>(0);
+        assert_eq!(
+            function.call(Array::vector(vec![1i32]).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires real floating-point logits"))),
+        );
+        assert_eq!(
+            function.call(Array::vector(Vec::<f32>::new()).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a non-empty class axis"))),
+        );
+        assert_eq!(
+            softmax::<ArrayContext>(1).call(Array::vector(vec![1.0f32]).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid("`softmax` axis 1 is out of bounds for rank 1"))),
+        );
+        assert_eq!(
+            softmax::<ArrayContext>([0, 0]).call(Array::matrix(2, 2, vec![0.0f32; 4]).unwrap()),
+            Err(ProgramError::Type(TypeError::invalid("`softmax` axes contain duplicate axis 0"))),
+        );
+        let (mesh, _, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
+        let reduced = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), reduced).map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid("`softmax` does not support unreduced or reduced inputs"))),
+        );
+    }
+
+    #[test]
+    fn test_softmax_composite_call_staging() {
+        // Each call stages one named composite whose body is the decomposition of the capability, and calls with
+        // equal input types share one body.
+        let function = softmax::<ArrayContext>(0);
+        let (_, program) = ArrayContext::trace(
+            |input: DomainTracer<ArrayContext>| function.call(function.call(input)?),
+            ArrayType::new_static(DataType::F32, [2]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = composite [key=\"ryft.softmax.v1 {axes = [0]}\"] %0 [
+                    primal=^0={
+                        lambda %0:f32[2] .
+                        let %1:i64[] = argmax [axis=0, index_data_type=i64] %0
+                            %2:i64[2] = iota [type=i64[2], dimension=0]
+                            %3:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %1
+                            %4:bool[2] = compare [direction=Equal] %2 %3
+                            %5:f32[2] = zero [type=f32[2]]
+                            %6:f32[2] = select %4 %0 %5
+                            %7:f32[] = reduce [kind=sum, axes=[0]] %6
+                            %8:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %7
+                            %9:f32[2] = sub %0 %8
+                            %10:f32[2] = select %4 %5 %9
+                            %11:f32[2] = exp %10
+                            %12:f32[2] = select %4 %5 %11
+                            %13:f32[] = reduce [kind=sum, axes=[0]] %12
+                            %14:f32[] = ln_1p %13
+                            %15:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %14
+                            %16:f32[2] = sub %10 %15
+                            %17:f32[2] = sub %8 %8
+                            %18:bool[2] = compare [direction=Equal] %17 %5
+                            %19:f32[] = constant [value=NaN]
+                            %20:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %19
+                            %21:f32[2] = select %18 %16 %20
+                            %22:f32[2] = exp %21
+                        in (%22)
+                    },
+                ]
+                    %2:f32[2] = composite [key=\"ryft.softmax.v1 {axes = [0]}\"] %1 [
+                        primal=^0,
+                    ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let input = Array::vector(vec![1.0f32, -2.0]).unwrap();
+        assert_eq!(program.interpret(input.clone()), input.softmax(0).unwrap().softmax(0));
+
+        // Dynamic extents pass through the body, whose output type is that of its input.
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), 3.into()]));
+        let function = softmax::<ArrayContext>(1);
+        let (output_type, program) = ArrayContext::trace(|input| function.call(input), r#type.clone()).unwrap();
+        assert_eq!(output_type, r#type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            "}
+            .trim_end()
+        );
+        let input = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, -1.0, 0.0, 4.0]).unwrap();
+        assert_eq!(program.interpret(input.clone()), input.softmax(1));
+    }
+
+    #[test]
+    fn test_softmax_composite_call_batching() {
+        // Batching batches the body structurally, so every batch item is normalized like the capability does it.
+        let function = softmax::<ArrayContext>(0);
+        let input = Array::matrix(2, 3, vec![0.0f64, 0.0, 0.0, 9.0, -9.0, f64::NEG_INFINITY]).unwrap();
+        let output =
+            batch(|input| function.call(input), input.clone(), BatchAxis::new(0), BatchAxis::new(0), 2).unwrap();
+        assert_eq!(output, input.softmax(1).unwrap());
+    }
+
+    #[test]
+    fn test_softmax_composite_call_differentiation() {
+        check_gradient!(
+            |input, weights| softmax::<ArrayContext>(0).call(input)?.mul(&weights)?.reduce_sum(&[0], None),
+            at = Array::vector(vec![-0.2f64, 0.5, 1.2]).unwrap(),
+            with = Array::vector(vec![0.3f64, -1.0, 2.0]).unwrap(),
+            step = 1e-5,
+            tolerance = 1e-8,
+        );
+
+        // Forward mode keeps the full derivative of the selected maximum at ties, exactly like the capability.
+        let function = softmax::<ArrayContext>(0);
+        let input = Array::vector(vec![0.0f64, 0.0, 0.0]).unwrap();
+        let tangent = Array::vector(vec![1.0f64, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            differentiate_at(input.clone()).jvp(tangent.clone(), |input| function.call(input)).unwrap(),
+            differentiate_at(input).jvp(tangent, |input| input.softmax(0)).unwrap(),
+        );
+
+        // Reverse mode keeps the small gradient of a saturated maximum, exactly like the capability, and so do the
+        // zero derivatives of a row that contains NaN.
+        let cotangent = Array::vector(vec![1.0f32, 0.0, 0.0]).unwrap();
+        for input in [vec![9.0f32, -9.0, -9.0], vec![f32::NAN, 0.0, 1.0]] {
+            let input = Array::vector(input).unwrap();
+            let (output, pullback) = differentiate_at(input.clone()).vjp(|input| function.call(input)).unwrap();
+            let (expected_output, expected_pullback) = differentiate_at(input).vjp(|input| input.softmax(0)).unwrap();
+            assert_eq!(bits(&output), bits(&expected_output));
+            assert_eq!(
+                bits(&pullback.apply_materialized(cotangent.clone()).unwrap()),
+                bits(&expected_pullback.apply_materialized(cotangent.clone()).unwrap()),
+            );
+        }
+        let (_, pullback) = differentiate_at(Array::vector(vec![9.0f32, -9.0, -9.0]).unwrap())
+            .vjp(|input| function.call(input))
+            .unwrap();
+        let gradient = pullback.apply_materialized(cotangent).unwrap().elements::<f32>().unwrap();
+        assert!(gradient[0] > 0.0);
+        assert_eq!(gradient[0], -(gradient[1] + gradient[2]));
     }
 
     #[test]
