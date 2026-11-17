@@ -985,7 +985,7 @@ mod tests {
         // that is later loaded for it, and their boundaries still match. A boundary with another bound does not. The
         // second compilation reuses the executable of the first and keeps its own boundary types.
         let (first, second, other) = (compile(8), compile(8), compile(9));
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
         let (first, second, other) = (first.compiled_program(), second.compiled_program(), other.compiled_program());
         assert_ne!(first.input_types(), second.input_types());
         assert!(first.matches_stateless_signature(first.input_types(), first.output_types()));

@@ -3315,11 +3315,11 @@ mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        assert_eq!(engine.program_count(), 0, "staging the inner function must not compile it");
+        assert_eq!(engine.cached_program_count(), 0, "staging the inner function must not compile it");
 
         let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        assert_eq!(engine.program_count(), 1, "only the outer program should be compiled");
+        assert_eq!(engine.cached_program_count(), 1, "only the outer program should be compiled");
         assert_eq!(outer.source_program().captures().len(), 1);
 
         let input_value = 0.5f32;
@@ -3632,10 +3632,10 @@ mod tests {
 
         let staged: StagedFunction<ArrayType, ArrayType> =
             stage(|x| x.sin().unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
-        assert_eq!(engine.program_count(), 0, "staging must not compile a PJRT executable");
+        assert_eq!(engine.cached_program_count(), 0, "staging must not compile a PJRT executable");
 
         let staged_compiled = engine.compile_staged_function(staged).unwrap();
-        assert_eq!(engine.program_count(), 1, "compiling the staged handle should build exactly one executable");
+        assert_eq!(engine.cached_program_count(), 1, "compiling the staged handle should build exactly one executable");
 
         let direct: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -5817,7 +5817,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
         let _: CompiledFunction<ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| input.domain().differentiate_at(input).jacobian_forward(|value| Mul::mul(&value, &value)).unwrap(),
             input_type.clone(),
@@ -5825,7 +5825,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        assert_eq!(session.program_count(), 2, "an equivalent dense transform should reuse its enclosing compilation");
+        assert_eq!(session.cached_program_count(), 2, "an equivalent dense transform should reuse its enclosing compilation");
 
         assert_eq!(
             forward.source_program().program().to_string(),
@@ -6264,13 +6264,13 @@ mod tests {
         let engine = session_with_client(client);
         let input_type = replicated_vector_type(&mesh, 4);
 
-        assert_eq!(engine.program_count(), 0);
+        assert_eq!(engine.cached_program_count(), 0);
         // Equivalent lowerings share one executable, so the second invocation is a cache hit.
         for _ in 0..2 {
             let _: CompiledFunction<ArrayType, ArrayType> =
                 compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         }
-        assert_eq!(engine.program_count(), 1, "an equivalent repeated lowering should hit the cache");
+        assert_eq!(engine.cached_program_count(), 1, "an equivalent repeated lowering should hit the cache");
     }
 
     #[test]
@@ -6280,13 +6280,13 @@ mod tests {
         let engine = session_with_client(client);
         let input_type = replicated_vector_type(&mesh, 4);
 
-        assert_eq!(engine.program_count(), 0);
+        assert_eq!(engine.cached_program_count(), 0);
         // Cache identity is the complete lowering plus options and target, not the Rust source location.
         let _: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let _: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type, &engine, mesh).unwrap();
-        assert_eq!(engine.program_count(), 1);
+        assert_eq!(engine.cached_program_count(), 1);
     }
 
     #[test]
@@ -6311,7 +6311,7 @@ mod tests {
             let _: CompiledFunction<HyperparamInput<ArrayType>, ArrayType> =
                 compile(|input| input.array.sin().unwrap(), input, &engine, mesh.clone()).unwrap();
         }
-        assert_eq!(engine.program_count(), 1);
+        assert_eq!(engine.cached_program_count(), 1);
     }
 
     #[test]
@@ -6744,7 +6744,7 @@ mod tests {
             panic!("public staged input should remain an array");
         };
         assert_eq!(staged_input_type.sharding(), Some(&sharding));
-        assert_eq!(engine.program_count(), 0, "staging must not build an executable");
+        assert_eq!(engine.cached_program_count(), 0, "staging must not build an executable");
     }
 
     #[test]
@@ -6758,6 +6758,6 @@ mod tests {
         assert_eq!(output_type.data_type(), DataType::F32);
         assert_eq!(output_type.shape(), input_type.shape());
         // `infer_output_types` must not have populated the compile cache.
-        assert_eq!(engine.program_count(), 0);
+        assert_eq!(engine.cached_program_count(), 0);
     }
 }

@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(statistics.lowerings, 1);
         assert_eq!(statistics.compilation_requests, 1);
         assert_eq!(function.executable_specialization_count(), 1);
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -1086,7 +1086,7 @@ mod tests {
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         for size in [4usize, 7] {
             let input_type = replicated_vector_type(&mesh, size);
@@ -1108,7 +1108,7 @@ mod tests {
                 output.block_until_ready().unwrap();
                 assert_eq!(output.shape().as_slice(), &[size]);
                 assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
-                assert_eq!(session.program_count(), 1, "executing a loaded executable must not trigger recompilation");
+                assert_eq!(session.cached_program_count(), 1, "executing a loaded executable must not trigger recompilation");
             }
         }
 
@@ -1233,7 +1233,7 @@ mod tests {
         assert_eq!(statistics.lowerings, 2);
         assert_eq!(statistics.compilation_requests, 2);
         assert_eq!(function.executable_specialization_count(), 2);
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
     }
 
     #[test]

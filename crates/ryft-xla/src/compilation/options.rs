@@ -130,9 +130,8 @@ impl Hash for CompilationOptionsOverride {
 /// donation flags for each input, backend lowering choices, and policies of retained dispatch.
 ///
 /// These settings supplement the PJRT options that the session supplies through
-/// [`Session::default_compilation_options`](crate::Session::default_compilation_options), which
-/// [`Self::with_compilation_options`] replaces for one compilation. Settings that affect compilation participate in
-/// its cache identity.
+/// [`Session::compilation_options`](crate::Session::compilation_options), which [`Self::with_compilation_options`]
+/// replaces for one compilation. Settings that affect compilation participate in its cache identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Explicit compiler and typed embedding used to select retained portable kernel calls.
@@ -279,8 +278,8 @@ impl Options {
     }
 
     /// Supplies the PJRT [`CompilationOptions`] that this compilation starts from, in place of the template of its
-    /// session (i.e., [`Session::default_compilation_options`](crate::Session::default_compilation_options)). This
-    /// plays the role of the `compiler_options` argument of `jax.jit`.
+    /// session (i.e., [`Session::compilation_options`](crate::Session::compilation_options)). This plays the role of
+    /// the `compiler_options` argument of `jax.jit`.
     ///
     /// The supplied options replace the template of the session as a whole and are not merged with it. Lowering still
     /// overlays the settings that it derives for the program (i.e., the replica and partition counts, the partitioner

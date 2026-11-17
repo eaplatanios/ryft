@@ -1509,7 +1509,7 @@ mod tests {
         assert_eq!(resharded.addressable_shards().count(), 4);
         assert_eq!(shard_values(&resharded), vec![values.to_vec(); 4]);
         // The exact shard path satisfies this request without compiling any SPMD program.
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
     }
 
     #[test]
@@ -1780,14 +1780,14 @@ mod tests {
         let target_mesh = four_device_mesh_x(client);
         let target_sharding =
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
         let _ = source_array
             .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding })
             .unwrap();
 
         // A sharded source on another mesh compiles two executables, which are an all-gather on the source mesh and a
         // reshard from the replicated sharding to the requested sharding on the destination mesh.
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
     }
 
     #[test]
@@ -1807,16 +1807,16 @@ mod tests {
 
         let sharded_target =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
         let first = source_array
             .clone()
             .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() })
             .unwrap();
-        let after_first = session.program_count();
+        let after_first = session.cached_program_count();
         let second = source_array
             .to_placement(&session, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target })
             .unwrap();
-        let after_second = session.program_count();
+        let after_second = session.cached_program_count();
 
         assert_eq!(first.addressable_shards().count(), 4);
         assert_eq!(second.addressable_shards().count(), 4);
@@ -1862,7 +1862,7 @@ mod tests {
 
         eprintln!("cold reshard (trace+lower+compile+execute): {cold_elapsed:?}");
         eprintln!("warm reshard (structural cache hit + execute, no trace/lower): {warm_elapsed:?}");
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
     }
 
     #[test]
@@ -1985,7 +1985,7 @@ mod tests {
         assert_eq!(shard_values(&resharded), vec![vec![40.0], vec![41.0], vec![42.0], vec![43.0]]);
 
         // No executable was compiled, because the host fallback bypasses the compilation cache.
-        assert_eq!(session.program_count(), 0, "host fallback should not populate the executable cache");
+        assert_eq!(session.cached_program_count(), 0, "host fallback should not populate the executable cache");
     }
 
     #[test]
@@ -2095,7 +2095,7 @@ mod tests {
         assert_eq!(output.sharding(), &reduced);
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(shared_buffers(&source, &output), vec![true; 4]);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         // On another device mesh, the shard on a device of the source shares its buffer and the others are copies.
         let single_device_mesh = DeviceMesh::new(
@@ -2120,14 +2120,14 @@ mod tests {
             vec![false, true, false, false],
         );
         assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]; 4]);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         // A sharding with other shards needs a compiled program.
         let sharded = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
         let resharded = output.clone().reshard_on_devices(&session, &mesh, &sharded, false).unwrap();
         assert_eq!(resharded.sharding(), &sharded);
         assert_eq!(shard_values(&resharded), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         // There is no host fallback, so a destination that a compiled program cannot serve is an error.
         let manual_mesh = DeviceMesh::new(

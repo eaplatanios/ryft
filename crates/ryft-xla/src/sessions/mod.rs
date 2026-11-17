@@ -230,11 +230,11 @@ impl Session {
         SessionBuilder {
             client_source: ClientSource::Platform(Platform::Auto),
             client_options: None,
+            compilation_options: CompilationOptions::default(),
             compilation_cache: CompilationCache::new(),
             disk_cache: None,
             eager_dispatch_cache_capacity: DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY,
             runtime_extensions: RuntimeExtensions::new(),
-            default_compilation_options: CompilationOptions::default(),
         }
     }
 
@@ -271,20 +271,50 @@ impl Session {
         Self { effect_scope: Arc::new(EffectScope::default()), ..self.clone() }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the PJRT client of this session.
+    /// Returns the PJRT [`Client`] of this [`Session`].
     #[inline]
     pub fn client(&self) -> &'static Client<'static> {
         self.state.client
     }
 
-    /// Returns the [`Target`] of this session's client, reading it from the client on first use.
+    /// Returns the default [`CompilationOptions`] that every compilation of this [`Session`] forwards to
+    /// [`Client::compile`]. Every compilation of the session, including those of eager operations, starts with these
+    /// options, unless its [`Options`] supply their own using [`Options::with_compilation_options`]. Lowering then
+    /// overlays the settings that it derives for each program (i.e., the replica and partition counts, the partitioner
+    /// selection, the assignment of the program to the devices of its mesh, and the feedback-directed profile of its
+    /// options). The default options therefore suit settings that hold for every program of the session (e.g., operand
+    /// precisions and environment option overrides) rather than settings of one specific program signature (e.g., input
+    /// layouts).
+    #[inline]
+    pub fn compilation_options(&self) -> &CompilationOptions {
+        &self.state.compilation_options
+    }
+
+    /// Returns the [`CompilationCache`] that all handles of this [`Session`] share.
+    #[inline]
+    pub fn compilation_cache(&self) -> &CompilationCache<'static, Self> {
+        &self.state.compilation_cache
+    }
+
+    /// Returns the number of compiled programs currently cached in the in-memory tier.
+    #[inline]
+    pub fn cached_program_count(&self) -> usize {
+        self.state.compilation_cache.program_count()
+    }
+
+    /// Returns the [`RuntimeRegistry`] of this [`Session`].
+    #[inline]
+    pub(crate) fn runtimes(&self) -> &RuntimeRegistry {
+        &self.state.runtimes
+    }
+
+    /// Returns the [`Target`] of this [`Session`]'s [`Client`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Pjrt`] if querying the platform, plugin, or device facts from the client failed. The
-    /// failure is retained, so every later call returns the same error.
+    /// Returns [`Error::Pjrt`] if querying the platform, plugin, or device facts from the client failed.
+    /// The failure is retained, so every later call returns the same error.
+    #[inline]
     pub fn target(&self) -> Result<&Target, Error> {
         self.state
             .target
@@ -293,77 +323,46 @@ impl Session {
             .map_err(Clone::clone)
     }
 
-    /// Returns the default [`DeviceMesh`] of this handle, or [`ArrayError::MissingMesh`] when the handle has no mesh.
-    /// Eager binds execute on the mesh of their array inputs and only use this mesh when they have none. Refer to
-    /// [`Self::with_mesh`] for more information.
+    /// Returns the default [`DeviceMesh`] of this [`Session`], or [`ArrayError::MissingMesh`] if this session has no
+    /// default mesh. Eager binds execute on the mesh of their array inputs and only use this mesh when they have none.
+    /// Refer to [`Self::with_mesh`] for more information.
     #[inline]
     pub fn mesh(&self) -> Result<&DeviceMesh, Error> {
         self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
     }
 
-    /// Returns the template of the options that every compilation of this session forwards to [`Client::compile`].
-    /// Refer to [`SessionBuilder::default_compilation_options`] for more information.
-    #[inline]
-    pub fn default_compilation_options(&self) -> &CompilationOptions {
-        &self.state.default_compilation_options
-    }
-
-    /// Returns the compilation cache that all handles of this session share.
-    #[inline]
-    pub fn compilation_cache(&self) -> &CompilationCache<'static, Self> {
-        &self.state.cache
-    }
-
-    /// Returns whether `other` is a handle of the same session as this one (i.e., whether the two share their
-    /// compilation cache, runtime extensions, and retained constants), irrespective of their meshes and effect scopes.
-    #[inline]
-    pub(crate) fn is_same_session(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
-    }
-
-    /// Returns the effect ordering scope that executions through this handle reserve their submissions in.
+    /// Returns the [`EffectScope`] that executions through this [`Session`] reserve their submissions in.
     #[inline]
     pub(crate) fn effect_scope(&self) -> &EffectScope {
         &self.effect_scope
     }
 
-    /// Returns the runtime extension instances of this session and the launches that still borrow their resources.
+    /// Returns whether `other` is a handle of the same underlying [`Session`] as this one (i.e., whether the two share
+    /// their compilation cache, runtime extensions, and retained constants), irrespective of their meshes and effect
+    /// scopes.
     #[inline]
-    pub(crate) fn runtimes(&self) -> &RuntimeRegistry {
-        &self.state.runtimes
+    pub(crate) fn is_same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
-    /// Returns the compiled programs of eager operation applications, keyed ahead of program construction and lowering.
-    /// Refer to the documentation of [`EagerDispatchKey`] for information on what the key captures.
-    #[inline]
-    fn eager_dispatch_cache(&self) -> &SpecializationCache<EagerDispatchKey, EagerDispatchProgram> {
-        &self.state.eager_dispatch_cache
-    }
-
-    /// Returns the number of compiled programs currently cached in the in-memory tier.
-    #[inline]
-    pub fn program_count(&self) -> usize {
-        self.compilation_cache().program_count()
-    }
-
-    /// Returns a snapshot of the activity of this session's eager dispatch cache, which maps eager operation
+    /// Returns a snapshot of the activity of this [`Session`]'s eager dispatch cache, which maps eager operation
     /// applications directly to compiled programs, ahead of program construction and lowering.
     #[inline]
     pub fn eager_dispatch_statistics(&self) -> SpecializationCacheStatistics {
         self.state.eager_dispatch_cache.statistics()
     }
 
-    /// Removes every entry from the in-memory compilation cache and the eager dispatch cache of this session.
-    /// Mirrors JAX's `clear_caches()`, which also clears the eager dispatch cache of each primitive.
-    ///
-    /// Eager dispatch cache hits do not re-read the `XLA_FLAGS` environment variable, although the miss path still
-    /// records it in the compilation key, so call this function after changing it if the change must apply to eager
-    /// operations that already ran. XLA itself reads the variable when it initializes its debug options.
+    /// Removes every entry from the in-memory compilation cache and the eager dispatch cache of this [`Session`]. Eager
+    /// dispatch cache hits do not re-read the `XLA_FLAGS` environment variable, although the miss path still records it
+    /// in the compilation key, so call this function after changing it if the change must apply to eager operations
+    /// that already ran. XLA itself reads the variable when it initializes its debug options.
     #[inline]
     pub fn clear_cache(&self) {
         self.compilation_cache().clear_cache();
         self.state.eager_dispatch_cache.clear();
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Creates a [`DeviceMesh`] with the provided `axes` over the devices of this session's client, like
     /// `jax.make_mesh`. The mesh takes as many devices as its axes require, in the order in which the client reports
@@ -687,7 +686,7 @@ impl Session {
             inputs,
             array_inputs.first().map(Array::mesh).or_else(|| self.mesh().ok()),
         );
-        let compiled = match self.eager_dispatch_cache().get(&query as &dyn EagerDispatchKeyView) {
+        let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
                 self.validate_eager_placement(array_inputs.as_slice())?;
                 compiled
@@ -698,7 +697,8 @@ impl Session {
                 let key_mesh = query.mesh().cloned();
                 let key = EagerDispatchKey::new(operation.clone(), region_keys.into(), key_inputs, key_mesh);
                 let entry = self
-                    .eager_dispatch_cache()
+                    .state
+                    .eager_dispatch_cache
                     .try_entry(key)
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 match entry {
@@ -719,7 +719,7 @@ impl Session {
         // Execution produces outputs that belong to this session, so chained eager operations and transforms over them
         // keep executing in the same session and effect scope. Arrays of session constants precede the inputs.
         let mut arguments = compiled
-            .session_constants
+            .constants
             .iter()
             .map(|constant| self.retained_constant(constant))
             .collect::<Result<Vec<_>, _>>()?;
@@ -828,7 +828,7 @@ impl Session {
             .compilation_cache()
             .compile(self, &lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(EagerDispatchProgram { program, session_constants: Arc::clone(lowered.session_constants()), outputs })
+        Ok(EagerDispatchProgram { program, constants: Arc::clone(lowered.session_constants()), outputs })
     }
 
     /// Validates that every input lives on this session's PJRT client and that all inputs share one device placement,
@@ -1141,6 +1141,9 @@ pub struct SessionBuilder {
     /// Options of the client that `ryft-xla` creates for the session, if the caller supplied any.
     client_options: Option<ClientOptions>,
 
+    /// Template of the options that the session forwards to [`Client::compile`].
+    compilation_options: CompilationOptions,
+
     /// Compilation cache of the session, before [`Self::disk_cache`] is applied to it.
     compilation_cache: CompilationCache<'static, Session>,
 
@@ -1152,9 +1155,6 @@ pub struct SessionBuilder {
 
     /// Runtime provider configuration of the session.
     runtime_extensions: RuntimeExtensions,
-
-    /// Template of the options that the session forwards to [`Client::compile`].
-    default_compilation_options: CompilationOptions,
 }
 
 impl SessionBuilder {
@@ -1187,6 +1187,13 @@ impl SessionBuilder {
     /// whose runtime must then live for the rest of the process as well).
     pub fn client(mut self, client: &'static Client<'static>) -> Self {
         self.client_source = ClientSource::Client(client);
+        self
+    }
+
+    /// Supplies the template of the options that the session forwards to [`Client::compile`].
+    /// Refer to [`Session::compilation_options`] for more information.
+    pub fn compilation_options(mut self, compilation_options: CompilationOptions) -> Self {
+        self.compilation_options = compilation_options;
         self
     }
 
@@ -1235,21 +1242,6 @@ impl SessionBuilder {
         self
     }
 
-    /// Supplies the template of the options that the session forwards to [`Client::compile`].
-    ///
-    /// Every compilation of the session, including those of eager operations, starts from
-    /// `default_compilation_options`, unless its [`Options`] supply their own through
-    /// [`Options::with_compilation_options`](crate::Options::with_compilation_options). Lowering then overlays the
-    /// settings that it derives for each program (i.e., the replica and partition counts, the partitioner selection,
-    /// the assignment of the program to the devices of its mesh, and the feedback-directed profile of its options).
-    /// The template therefore suits settings that hold for every program of the session (e.g., operand precisions and
-    /// environment option overrides) rather than settings of one program signature (e.g., argument layouts). It is
-    /// immutable once the session is built.
-    pub fn default_compilation_options(mut self, default_compilation_options: CompilationOptions) -> Self {
-        self.default_compilation_options = default_compilation_options;
-        self
-    }
-
     /// Builds an independent session with a fresh effect scope.
     ///
     /// # Errors
@@ -1284,9 +1276,9 @@ impl SessionBuilder {
             state: Arc::new(SessionState {
                 client,
                 target: OnceLock::new(),
-                cache: compilation_cache,
+                compilation_options: self.compilation_options,
+                compilation_cache,
                 eager_dispatch_cache: SpecializationCache::new(self.eager_dispatch_cache_capacity),
-                default_compilation_options: self.default_compilation_options,
                 runtimes: RuntimeRegistry::new(client, self.runtime_extensions),
             }),
             mesh: None,
@@ -1423,17 +1415,17 @@ struct SessionState {
     /// session, including a failed read.
     target: OnceLock<Result<Target, Error>>,
 
+    /// Template of the options forwarded to [`Client::compile`], which every compilation of the session starts from.
+    /// It is immutable because the eager dispatch cache does not key its entries on it.
+    compilation_options: CompilationOptions,
+
     /// Compilation cache of the session, which [`Session::compilation_cache`] exposes. Cached artifacts contain no
     /// runtime execution association.
-    cache: CompilationCache<'static, Session>,
+    compilation_cache: CompilationCache<'static, Session>,
 
     /// Compiled programs of eager operation applications, keyed ahead of program construction and lowering. Refer to
     /// the documentation of [`EagerDispatchKey`] for information on what the key captures.
     eager_dispatch_cache: SpecializationCache<EagerDispatchKey, EagerDispatchProgram>,
-
-    /// Template of the options forwarded to [`Client::compile`], which every compilation of the session starts from.
-    /// It is immutable because the eager dispatch cache does not key its entries on it.
-    default_compilation_options: CompilationOptions,
 
     /// Runtime extensions associated with the client, and ownership of launches borrowing their resources.
     runtimes: RuntimeRegistry,
@@ -1447,7 +1439,7 @@ struct EagerDispatchProgram {
 
     /// [`SessionConstant`]s whose arrays the compiled program receives as hidden arguments ahead of the array inputs
     /// of the application. Their handles are part of the key, through its regions.
-    session_constants: Arc<[SessionConstant]>,
+    constants: Arc<[SessionConstant]>,
 
     /// Outputs of the application, in order. The compiled program returns the [`EagerOutput::Array`] outputs, in order.
     outputs: Arc<[EagerOutput]>,
@@ -1791,9 +1783,9 @@ pub(crate) mod tests {
         // A builder without any configuration builds what `Session::new` creates.
         let session: Session = Session::builder().build().unwrap();
         assert!(std::ptr::eq(session.client(), Session::new().unwrap().client()));
-        assert_eq!(session.default_compilation_options(), &CompilationOptions::default());
+        assert_eq!(session.compilation_options(), &CompilationOptions::default());
         assert!(session.compilation_cache().disk_cache().is_none());
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
         assert!(matches!(session.mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
     }
 
@@ -1858,22 +1850,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_default_compilation_options() {
+    fn test_session_compilation_options() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let compilation_options =
             CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
-        let session = Session::builder()
-            .client(client)
-            .default_compilation_options(compilation_options.clone())
-            .build()
-            .unwrap();
-        assert_eq!(session_with_client(client).default_compilation_options(), &CompilationOptions::default());
+        let session =
+            Session::builder().client(client).compilation_options(compilation_options.clone()).build().unwrap();
+        assert_eq!(session_with_client(client).compilation_options(), &CompilationOptions::default());
 
         // Every handle of a session returns the template that the session was built with.
-        assert_eq!(session.default_compilation_options(), &compilation_options);
-        assert_eq!(session.with_new_effect_scope().default_compilation_options(), &compilation_options);
-        assert_eq!(session.with_mesh(mesh).default_compilation_options(), &compilation_options);
+        assert_eq!(session.compilation_options(), &compilation_options);
+        assert_eq!(session.with_new_effect_scope().compilation_options(), &compilation_options);
+        assert_eq!(session.with_mesh(mesh).compilation_options(), &compilation_options);
     }
 
     #[test]
@@ -1903,15 +1892,15 @@ pub(crate) mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
         Neg::neg(&vector).unwrap();
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         // Repeating an eager operation compiles nothing, while an input of another type compiles another program.
         Neg::neg(&vector).unwrap();
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
     }
 
     #[test]
@@ -1935,14 +1924,14 @@ pub(crate) mod tests {
         let session = session_with_client(client);
         let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
         Neg::neg(&vector).unwrap();
-        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 1));
+        assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (1, 1));
 
         // Clearing empties both the eager dispatch cache and the compilation cache, so the same operation misses again.
         session.clear_cache();
-        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (0, 0));
+        assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (0, 0));
         Neg::neg(&vector).unwrap();
         assert_eq!(session.eager_dispatch_statistics().misses, 2);
-        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 1));
+        assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (1, 1));
     }
 
     #[test]
@@ -2234,7 +2223,7 @@ pub(crate) mod tests {
         assert_eq!(program_array(&predicate).data_type(), DataType::Boolean);
         assert_eq!(program_array(&predicate).shape(), StaticShape::new(Vec::new()));
         assert_eq!(read_booleans(client, program_array(&predicate)), vec![true]);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         // A captured constant carries only a type, so it cannot be lifted without its capture table.
         let capture = CaptureReference::new(0, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
@@ -2449,7 +2438,7 @@ pub(crate) mod tests {
             panic!("dimension arithmetic must produce a dimension value");
         };
         assert_eq!(output.value().extent(), 5);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         let scalar = session
             .bind(DimensionToScalarOperation, Vec::new(), &[Value::Dimension(output.clone())])
@@ -2459,7 +2448,7 @@ pub(crate) mod tests {
             panic!("dimension_to_scalar must produce an array");
         };
         assert_eq!(read_i64s(client, &scalar), vec![5]);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         let from_scalar = session
             .bind(
@@ -2473,7 +2462,7 @@ pub(crate) mod tests {
             panic!("dimension_from_scalar must produce a dimension value");
         };
         assert_eq!(from_scalar.value().extent(), 5);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
     }
 
     #[test]
@@ -2495,7 +2484,7 @@ pub(crate) mod tests {
             panic!("dimension_size must produce a dimension value");
         };
         assert_eq!(extent.value().extent(), 6);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         let two = DimensionValue::constant(2).unwrap();
         let division = DimensionDivOperation::new(extent.r#type().as_ref(), two.r#type().as_ref()).unwrap();
@@ -2511,7 +2500,7 @@ pub(crate) mod tests {
             panic!("dimension division must produce a dimension value");
         };
         assert_eq!(three.value().extent(), 3);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         let reshape_inputs = [
             Value::Array(input),
@@ -2520,7 +2509,7 @@ pub(crate) mod tests {
         ];
         let reshaped = session.bind(DynamicReshapeOperation::new(), Vec::new(), &reshape_inputs).unwrap().remove(0);
         assert_eq!(program_array(&reshaped).shape().as_slice(), &[2, 3]);
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         let four = DimensionValue::constant(4).unwrap();
         let broadcast_inputs = [
@@ -2535,14 +2524,14 @@ pub(crate) mod tests {
             .remove(0);
         assert_eq!(program_array(&broadcast).shape().as_slice(), &[4, 2, 3]);
         assert_eq!(read_f32s(client, program_array(&broadcast)), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0].repeat(4));
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
 
         let repeated = session
             .bind(DynamicBroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs)
             .unwrap()
             .remove(0);
         assert_eq!(program_array(&repeated).shape().as_slice(), &[4, 2, 3]);
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
     }
 
     #[test]
@@ -2572,7 +2561,7 @@ pub(crate) mod tests {
             assert_eq!(outputs, vec![value.clone()]);
             assert!(std::ptr::eq(outputs[0].session().effect_scope(), selected.effect_scope()));
         }
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
     }
 
     #[test]
@@ -2631,7 +2620,7 @@ pub(crate) mod tests {
                 "operation `cast` declares no region slots but 1 regions were attached".to_owned(),
             )),
         );
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
     }
 
     #[test]
@@ -2675,7 +2664,7 @@ pub(crate) mod tests {
                 assert_eq!(result, Err(ProgramError::InvalidArgument { message: "cast witness failed".to_owned() }),);
             }
         }
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
     }
 
     #[test]
@@ -3160,7 +3149,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(read_f32s(client, program_array(&false_outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(session.program_count(), 1, "both predicate values must share one compiled executable");
+        assert_eq!(session.cached_program_count(), 1, "both predicate values must share one compiled executable");
     }
 
     #[test]
@@ -3255,7 +3244,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(read_f32s(client, program_array(&false_outputs[0])), vec![-2.0; 3]);
-        assert_eq!(session.program_count(), 1, "both branch selections must share one compiled executable");
+        assert_eq!(session.cached_program_count(), 1, "both branch selections must share one compiled executable");
     }
 
     #[test]
@@ -3520,12 +3509,12 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch cache hit.
         let second = session.bind(operation, AttachedRegions::Callees(&[callee]), &[Value::Array(input)]).unwrap();
         assert_eq!(read_f32s(client, program_array(&second[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(session.program_count(), 1, "a repeated eager `jit_call` must be a compilation cache hit");
+        assert_eq!(session.cached_program_count(), 1, "a repeated eager `jit_call` must be a compilation cache hit");
     }
 
     #[test]
@@ -3632,9 +3621,9 @@ pub(crate) mod tests {
         let sum = add(left.clone(), right.clone());
         assert_eq!(sum.r#type().sharding(), Some(&sharded));
         assert_eq!(read_device_f32s(&sum), vec![vec![11.0, 22.0], vec![13.0, 24.0]]);
-        let program_count = session.program_count();
+        let program_count = session.cached_program_count();
         assert_eq!(read_device_f32s(&add(left.clone(), right.clone())), vec![vec![11.0, 22.0], vec![13.0, 24.0]]);
-        assert_eq!(session.program_count(), program_count);
+        assert_eq!(session.cached_program_count(), program_count);
 
         let inferred = shard_map_with_inferred_input_shardings(
             |(left, right): (
@@ -3737,22 +3726,26 @@ pub(crate) mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let domain = array_domain(client);
-        assert_eq!(domain.parent().program_count(), 0);
+        assert_eq!(domain.parent().cached_program_count(), 0);
 
         let left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
         let right = f32_vector(domain.parent(), &mesh, &[3.0, 4.0]);
         let first = domain.bind(AddOperation::new(), Vec::new(), &[left.clone(), right.clone()]).unwrap();
-        assert_eq!(domain.parent().program_count(), 1);
+        assert_eq!(domain.parent().cached_program_count(), 1);
 
         let second = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
-        assert_eq!(domain.parent().program_count(), 1, "a repeated eager operation must be a compilation cache hit");
+        assert_eq!(
+            domain.parent().cached_program_count(),
+            1,
+            "a repeated eager operation must be a compilation cache hit"
+        );
         assert_eq!(read_f32s(client, &first[0]), read_f32s(client, &second[0]));
 
         // A different input signature compiles and caches a distinct executable.
         let wider_left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0, 3.0]);
         let wider_right = f32_vector(domain.parent(), &mesh, &[4.0, 5.0, 6.0]);
         domain.bind(AddOperation::new(), Vec::new(), &[wider_left, wider_right]).unwrap();
-        assert_eq!(domain.parent().program_count(), 2);
+        assert_eq!(domain.parent().cached_program_count(), 2);
     }
 
     #[test]
@@ -3782,7 +3775,7 @@ pub(crate) mod tests {
         assert_eq!(read_f32s(client, &product), vec![6.0, 16.0]);
         assert!(std::ptr::eq(product.client(), client));
         assert!(product.session().is_same_session(&session));
-        assert_eq!(session.program_count(), 2);
+        assert_eq!(session.cached_program_count(), 2);
     }
 
     // Measures eager dispatch overhead. Compares repeated eager `add` calls against a warm JIT dispatcher over the same
@@ -3915,7 +3908,7 @@ pub(crate) mod tests {
         {
             let zero = session.zero(&r#type).unwrap();
             assert_eq!(read_f32s(client, program_array(&zero)), vec![0.0, 0.0]);
-            assert_eq!(session.program_count(), program_count);
+            assert_eq!(session.cached_program_count(), program_count);
         }
     }
 
@@ -4297,6 +4290,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_builder_compilation_options() {
+        let client = execution_client();
+        let compilation_options = CompilationOptions { compile_portable_executable: true, ..Default::default() };
+        let session =
+            Session::builder().client(client).compilation_options(compilation_options.clone()).build().unwrap();
+        assert_eq!(session.compilation_options(), &compilation_options);
+    }
+
+    #[test]
     fn test_session_builder_compilation_cache() {
         // The session compiles through the supplied context, whose in-memory tier here retains a single program.
         let client = execution_client();
@@ -4308,7 +4310,7 @@ pub(crate) mod tests {
             .unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0])).unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
         assert_eq!(session.compilation_cache().statistics().compilations, 2);
     }
 
@@ -4358,7 +4360,7 @@ pub(crate) mod tests {
         let session = Session::builder().client(client).eager_dispatch_cache_capacity(1).build().unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0])).unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
-        assert_eq!((session.eager_dispatch_cache().len(), session.program_count()), (1, 2));
+        assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (1, 2));
     }
 
     #[test]
@@ -4377,18 +4379,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_builder_default_compilation_options() {
-        let client = execution_client();
-        let compilation_options = CompilationOptions { compile_portable_executable: true, ..Default::default() };
-        let session = Session::builder()
-            .client(client)
-            .default_compilation_options(compilation_options.clone())
-            .build()
-            .unwrap();
-        assert_eq!(session.default_compilation_options(), &compilation_options);
-    }
-
-    #[test]
     fn test_session_builder_build() {
         // Every build creates an independent session with a fresh effect scope and empty caches, even on one client.
         let client = execution_client();
@@ -4397,7 +4387,7 @@ pub(crate) mod tests {
         assert!(std::ptr::eq(session.client(), other.client()));
         assert!(!session.is_same_session(&other));
         assert!(!std::ptr::eq(session.effect_scope(), other.effect_scope()));
-        assert_eq!((session.program_count(), session.eager_dispatch_cache().len()), (0, 0));
+        assert_eq!((session.cached_program_count(), session.state.eager_dispatch_cache.len()), (0, 0));
     }
 
     #[test]

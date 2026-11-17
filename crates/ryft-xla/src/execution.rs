@@ -2382,7 +2382,7 @@ mod tests {
             assert_eq!(output.shape().as_slice(), shape.as_slice());
             assert_eq!(read_f32s(client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
         }
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
         // requested placement to replication. Types record no placement over auto mesh axes, so that placement is an
@@ -2686,13 +2686,13 @@ mod tests {
             single_device_input.shards()[0].buffer().unwrap(),
         ));
         assert_eq!(device_values(&inputs[1]), vec![vec![1., 2., 3., 4.]; 4]);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(session.cached_program_count(), 0);
 
         // An input whose shards have to be sliced goes through a compiled reshard.
         let inputs = session.reshard_inputs_if_needed(&mesh, std::slice::from_ref(&sharded), vec![input]).unwrap();
         assert_eq!(inputs[0].sharding(), &sharded);
         assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
 
         // An input with the expected sharding on a mesh that lists the devices in another order holds each slice on
         // another device, so its shards are moved to the devices that the program expects them on.
@@ -2712,7 +2712,7 @@ mod tests {
             .unwrap();
         assert_eq!(inputs[0].mesh(), &mesh);
         assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(session.program_count(), 1);
+        assert_eq!(session.cached_program_count(), 1);
     }
 
     #[test]

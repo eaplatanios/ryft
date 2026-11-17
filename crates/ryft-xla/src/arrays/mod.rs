@@ -3215,8 +3215,8 @@ mod tests {
         // Receiver-based operations on the reassociated array compile and execute in the other session.
         let negated = Neg::neg(&reassociated).unwrap();
         assert_eq!(values_from_bytes::<f32>(&negated.copy_to_host().unwrap()), vec![-1f32]);
-        assert_eq!(other_session.program_count(), 1);
-        assert_eq!(session.program_count(), 0);
+        assert_eq!(other_session.cached_program_count(), 1);
+        assert_eq!(session.cached_program_count(), 0);
 
         // Re-association never affects the clones that existed beforehand, which keep their original session.
         assert!(original.session().is_same_session(&session));

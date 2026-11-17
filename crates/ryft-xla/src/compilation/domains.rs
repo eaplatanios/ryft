@@ -446,7 +446,7 @@ impl Session {
             }));
         }
         let compilation_options = jit_compilation_options(
-            options.compilation_options().unwrap_or_else(|| self.default_compilation_options()),
+            options.compilation_options().unwrap_or_else(|| self.compilation_options()),
             options.mesh().devices(),
             use_shardy_partitioner,
             options.feedback_directed_profile(),
@@ -1009,7 +1009,7 @@ mod tests {
         }
 
         // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
-        let program_count_before = engine.program_count();
+        let program_count_before = engine.cached_program_count();
         for _ in 0..3 {
             let staged = crate::stage::<_, ArrayType, ArrayType>(
                 |x| x.sin().unwrap(),
@@ -1022,7 +1022,7 @@ mod tests {
                 staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
-            engine.program_count(),
+            engine.cached_program_count(),
             program_count_before,
             "equivalent repeat compilations should reuse the existing cache entry",
         );
@@ -1258,13 +1258,9 @@ mod tests {
     fn test_session_lower_program_compilation_options() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let default_compilation_options =
+        let compilation_options =
             CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
-        let session = Session::builder()
-            .client(client)
-            .default_compilation_options(default_compilation_options)
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).compilation_options(compilation_options).build().unwrap();
         let program = external_reference_read_program(replicated_vector_type(&mesh, 2));
 
         // Lowering starts from the template of the session and overlays the settings that it derives for the program.
@@ -1579,7 +1575,7 @@ mod tests {
         )
         .unwrap();
         let shardy_lowered = lowered.clone().with_stable_hlo(annotated.into_parts().0).with_compilation_options(
-            jit_compilation_options(session.default_compilation_options(), mesh.devices(), true, None),
+            jit_compilation_options(session.compilation_options(), mesh.devices(), true, None),
         );
         let Err(error) = session.compile_program(&shardy_lowered) else {
             panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");

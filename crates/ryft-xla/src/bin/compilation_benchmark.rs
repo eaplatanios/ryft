@@ -357,7 +357,7 @@ fn repeated_construction<T>(
         "cold_ns": cold_nanoseconds,
         "warm": distribution(&warm_samples),
         "compilation_cache": compilation_statistics(session),
-        "retained_programs": session.program_count(),
+        "retained_programs": session.cached_program_count(),
     }))
 }
 
@@ -412,7 +412,7 @@ fn jit_eager_gradient(
             "after_warm_calls": dispatcher_statistics(statistics),
         },
         "compilation_cache": compilation_statistics(&session),
-        "retained_programs": session.program_count(),
+        "retained_programs": session.cached_program_count(),
     }))
 }
 
@@ -575,7 +575,7 @@ fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
             "callees": callees,
             "frontend_growth": { "jvp": growth("jvp"), "gradient": growth("gradient") },
             "compilation_cache": compilation_statistics(&session),
-            "retained_programs": session.program_count(),
+            "retained_programs": session.cached_program_count(),
         },
     });
     println!("{}", serde_json::to_string_pretty(&report)?);

@@ -177,7 +177,7 @@ mod tests {
         .unwrap();
 
         // One compile means one cache entry for the whole pipeline.
-        assert_eq!(engine.program_count(), 1, "three staged reshards should compile into one program");
+        assert_eq!(engine.cached_program_count(), 1, "three staged reshards should compile into one program");
 
         let values = [0.1f32, 0.2, 0.3, 0.4];
         let source =

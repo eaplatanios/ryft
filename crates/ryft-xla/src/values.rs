@@ -1043,13 +1043,13 @@ mod tests {
         let session = session_with_client(client);
         let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
         let three = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
-        let program_count = session.program_count();
+        let program_count = session.cached_program_count();
         let less_than = two.compare(&three, ComparisonDirection::LessThan).unwrap();
         assert_eq!(read::<u8>(&less_than), vec![1]);
         assert!(same_session(less_than.session(), &session));
         assert_eq!(read::<u8>(&two.compare(&three, ComparisonDirection::Equal).unwrap()), vec![0]);
         assert_eq!(read::<u8>(&three.compare(&three, ComparisonDirection::GreaterThanOrEqual).unwrap()), vec![1]);
-        assert_eq!(session.program_count(), program_count);
+        assert_eq!(session.cached_program_count(), program_count);
     }
 
     #[test]
@@ -1060,11 +1060,11 @@ mod tests {
         let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
         let three = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
         assert!(same_session(two.domain().parent(), &session));
-        let program_count = session.program_count();
+        let program_count = session.cached_program_count();
         let five = two.add(&three).unwrap();
         assert_eq!(five.value().extent(), 5);
         assert!(same_session(five.session(), &session));
-        assert_eq!(session.program_count(), program_count);
+        assert_eq!(session.cached_program_count(), program_count);
     }
 
     #[test]
@@ -1479,11 +1479,11 @@ mod tests {
         let session = session_with_client(client);
         let mesh = mesh_on(client, 0);
         let (two, three) = (dimension(&session, 2), dimension(&session, 3));
-        let program_count = session.program_count();
+        let program_count = session.cached_program_count();
         assert_eq!(read::<u8>(&two.less_than(&three).unwrap()), vec![1]);
         assert_eq!(read::<u8>(&two.equal(&three).unwrap()), vec![0]);
         assert_eq!(read::<u8>(&three.greater_than_or_equal(&three).unwrap()), vec![1]);
-        assert_eq!(session.program_count(), program_count);
+        assert_eq!(session.cached_program_count(), program_count);
 
         // A dimension cannot be compared with an array.
         let scalar = Value::Array(array(&session, &mesh, DataType::I64, &[2i64], &[]));
@@ -1504,7 +1504,7 @@ mod tests {
         let session = session_with_client(client);
         let mesh = mesh_on(client, 0);
         let (two, three) = (dimension(&session, 2), dimension(&session, 3));
-        let program_count = session.program_count();
+        let program_count = session.cached_program_count();
         assert_eq!(two.add(&three), Ok(dimension(&session, 5)));
         assert_eq!(three.sub(&two), Ok(dimension(&session, 1)));
         assert_eq!(two.saturating_sub(&three), Ok(dimension(&session, 0)));
@@ -1514,7 +1514,7 @@ mod tests {
         assert_eq!(two.pow(&three), Ok(dimension(&session, 8)));
         assert_eq!(two.min(&three), Ok(dimension(&session, 2)));
         assert_eq!(two.max(&three), Ok(dimension(&session, 3)));
-        assert_eq!(session.program_count(), program_count);
+        assert_eq!(session.cached_program_count(), program_count);
 
         // A dimension paired with an array uses the array members, which rejects the dimension.
         let scalar = Value::Array(array(&session, &mesh, DataType::I64, &[2i64], &[]));
@@ -1528,14 +1528,14 @@ mod tests {
     fn test_value_dimension_to_scalar() {
         let client = execution_client();
         let session = session_with_client(client);
-        let program_count = session.program_count();
+        let program_count = session.cached_program_count();
         let scalar = dimension(&session, 2).to_scalar().unwrap();
         assert!(matches!(
             scalar.r#type().as_ref(),
             ArrayIrType::Array(r#type) if r#type.data_type() == DataType::I64 && r#type.rank() == 0,
         ));
         assert_eq!(read::<i64>(&scalar), vec![2]);
-        assert_eq!(session.program_count(), program_count);
+        assert_eq!(session.cached_program_count(), program_count);
     }
 
     #[test]

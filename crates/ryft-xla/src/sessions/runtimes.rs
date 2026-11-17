@@ -538,7 +538,29 @@ pub(crate) struct RetainedExecutionResources {
     _owners: Vec<Box<dyn RetainedResource>>,
 }
 
-/// Runtime instances of one session and the ownership of the resources of its pending executions.
+/// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
+/// executions.
+///
+/// A runtime extension is the native support that a compiled program needs beyond what the PJRT plugin provides,
+/// such as the host callback behind `print` (i.e., the `ryft.print` extension) or the launcher of precompiled CUDA
+/// kernels (i.e., the `ryft.kernel.cuda` extension). A program names the extensions that it needs as
+/// [`RuntimeRequirement`]s, and the [`RuntimeProvider`]s in the [`RuntimeExtensions`] of a session know how to create
+/// the matching [`RuntimeExtension`] instances. The [module documentation](self) describes these parts in more
+/// detail. A registry ties them to one session, in three steps that follow the life of an execution.
+///
+///   - **Initialization:** [`Self::ensure`] creates the instance of each requirement on first use and shares it with
+///     later calls. For example, lowering a program that prints attaches the `ryft.print` requirement to it. Before
+///     the session first compiles, loads, or executes such a program, the registry asks the print provider to
+///     initialize, which registers the native print handler with the client. Later programs that print reuse that
+///     instance.
+///   - **Preparation:** Before each native submission, [`Self::prepare`] lets every required instance validate the
+///     invocation and attach its data to one [`ExecutionResources`]. The print extension attaches nothing, while the
+///     CUDA kernel extension attaches a pointer to itself, which its native handler reads while it launches kernels.
+///   - **Retention:** [`Self::retain`] keeps those resources alive until the execution completes, even when its
+///     outputs are dropped. Dropping the registry waits for the executions that still borrow resources.
+///
+/// Instances belong to one session and are never shared between sessions. Compiled programs retain only their
+/// requirements, so a cached program can run in any session whose providers satisfy them.
 pub(crate) struct RuntimeRegistry {
     /// Externally owned client associated with all initialized instances.
     client: &'static Client<'static>,
