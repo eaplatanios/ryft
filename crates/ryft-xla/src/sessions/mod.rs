@@ -221,24 +221,11 @@ pub struct Session {
     effect_scope: Arc<EffectScope>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Session {
-    /// Creates an independent session with the default configuration, which runs on a client that the session
-    /// creates for the best available [`Platform`] and has an empty in-memory compilation cache, the built-in runtime
-    /// extensions, and the default compilation options. This is a shorthand for a [`SessionBuilder`] that is built
-    /// without any configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Pjrt`] if no client can be created, which requires even the built-in CPU plugin to fail.
-    pub fn new() -> Result<Self, Error> {
-        Self::builder().build()
-    }
-
-    /// Returns a [`SessionBuilder`] with the default configuration, which builds a session on the best available
-    /// [`Platform`] with an empty in-memory compilation cache, the built-in runtime extensions, and the default
-    /// compilation options.
+    /// Returns a [`SessionBuilder`] with the default configuration, which, by default, builds a session on the best
+    /// available [`Platform`], with an empty in-memory compilation cache, the built-in runtime extensions, and the
+    /// default compilation options.
+    #[inline]
     pub fn builder() -> SessionBuilder {
         SessionBuilder {
             client_source: ClientSource::Platform(Platform::Auto),
@@ -251,25 +238,40 @@ impl Session {
         }
     }
 
-    /// Returns a handle of this session whose default mesh is `mesh`, as under JAX's `jax.set_mesh`. Eager values that
-    /// are created from no array inputs (e.g., arrays uploaded through [`Self::array`], constants, and zeros) are
-    /// placed on it, and it is the [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g.,
-    /// `shard_map(.., None, ..)`). The handle shares the resources and the effect scope of this session.
+    /// Creates a new independent [`Session`] with the default configuration, which runs on a client that the session
+    /// creates for the best available [`Platform`] and has an empty in-memory compilation cache, the built-in runtime
+    /// extensions, and the default compilation options. This is a shorthand for a [`SessionBuilder`] that is built
+    /// without any configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if no client can be created, which requires even the built-in CPU plugin to fail.
+    #[inline]
+    pub fn new() -> Result<Self, Error> {
+        Self::builder().build()
+    }
+
+    /// Returns a handle of this session whose default mesh is `mesh`. Eager values that are created from no array
+    /// inputs (e.g., arrays uploaded through [`Self::array`], constants, and zeros) are placed on it, and it is the
+    /// [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g., `shard_map(.., None, ..)`).
+    /// The handle shares the resources and the effect scope of this session.
+    #[inline]
     pub fn with_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
     }
 
     /// Returns a handle of this session with a new and empty effect scope, which shares the resources of this session
-    /// and keeps the mesh of this handle.
-    ///
-    /// Handles that share a scope run their ordered effects (e.g., prints) one after another in submission order, a
-    /// failed ordered effect blocks further ones until it is observed and acknowledged, and a scope stays on the
-    /// devices that its first ordered effect ran on. A new scope lifts all three for independent work, such as
-    /// another thread or request, or work on other devices. References retain their own coordination, based on their
-    /// identities.
+    /// and keeps the mesh of this handle. Handles that share a scope run their ordered effects (e.g., prints) one after
+    /// another in submission order, a failed ordered effect blocks further ones until it is observed and acknowledged,
+    /// and a scope stays on the devices that its first ordered effect ran on. A new scope lifts all three for
+    /// independent work, such as another thread or request, or work on other devices. References retain their
+    /// own coordination, based on their identities.
+    #[inline]
     pub fn with_new_effect_scope(&self) -> Self {
         Self { effect_scope: Arc::new(EffectScope::default()), ..self.clone() }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the PJRT client of this session.
     #[inline]
