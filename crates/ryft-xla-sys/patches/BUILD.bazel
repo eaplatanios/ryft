@@ -1,5 +1,6 @@
 exports_files([
     "jax-mosaic-c-api-visibility.patch",
+    "jax-mosaic-gpu-mbarrier-serde.patch",
     "jax-mosaic-gpu-runtime-symbols.patch",
     "xla-cpu-exp-nan.patch",
     "xla-embedded-constants-target.patch",

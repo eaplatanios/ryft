@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Native builds use Bazel 8.8.2, CCCL 3.4.0, and XLA's pinned ROCm 10.1 development distribution. The pinned Triton
   sources require C++20, so Linux builds use the glibc 2.31 sysroot with GCC 10's standard library.
 - Limited CUDA Triton output to PTX 9.0 for the qualified CUDA 13.0 assembler.
+- Backported the JAX Mosaic GPU serde upgrade for the NVVM barrier's optional multicast mask to keep existing
+  serialized kernels loadable with the new LLVM pin.
 - Updated the ROCm plugin feature, artifact names, environment variables and path accessor to ROCm 10.
 - Removed the obsolete `enable_libnvjitlink_support` Bazel flag following XLA's unconditional nvJitLink support.
 - Removed the CUDA 12 `sm_50` target because the pinned Eigen headers require compute capability 6.0 or newer.

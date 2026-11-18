@@ -528,41 +528,42 @@ impl Debug for RuntimeExtensions {
     }
 }
 
-/// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
-/// executions. The registry manages the session lifecycle described by [`RuntimeExtensions`]:
-///
-///   - **Initialization:** [`Self::ensure`] creates the instance of each requirement on first use and shares it with
-///     later calls. For example, lowering a program that prints attaches the `ryft.print` requirement to it. Before
-///     the session first compiles, loads, or executes such a program, the registry asks the print provider to
-///     initialize, which registers the native print handler with the client. Later programs that print reuse
-///     that instance.
-///   - **Preparation:** Before each native submission, [`Self::prepare`] lets every required instance validate the
-///     invocation and attach its data to one [`ExecutionResources`]. The print extension attaches nothing, while the
-///     CUDA kernel extension attaches a pointer to itself, which its native handler reads while it launches kernels.
-///   - **Retention:** [`Self::retain`] keeps those resources alive until the execution completes, even when its
-///     outputs are dropped. Dropping the registry waits for the executions that still borrow resources.
+/// Resolves [`RuntimeRequirement`]s for one [`Session`](crate::Session) and keeps its extension resources alive through
+/// native execution. The registry uses [`RuntimeExtensions`] to look up providers and caches the [`RuntimeExtension`]
+/// instances they initialize. It gathers invocation resources before submission and tracks the resulting fences so
+/// native handlers can use those resources even if the caller drops the outputs.
 pub(crate) struct RuntimeRegistry {
-    // TODO(eaplatanios): Review from here onwards.
-    /// Externally owned client associated with all initialized instances.
+    /// PJRT [`Client`] borrowed for the life of the process and passed to each [`RuntimeProvider::initialize`] call.
     client: &'static Client<'static>,
 
-    /// Frozen provider configuration, shared by value rather than sharing initialized instances.
-    configuration: RuntimeExtensions,
+    /// [`RuntimeExtensions`] supplied when the session was built. Its providers stay fixed for this registry.
+    extensions: RuntimeExtensions,
 
-    /// Initialization slots, one for each requirement.
+    /// One slot per [`RuntimeRequirement`], including its ABI version. Each slot coordinates initialization and holds
+    /// the instance once it is ready.
     instances: Mutex<HashMap<RuntimeRequirement, Arc<RuntimeInitialization>>>,
 
-    /// Only launches that borrow extension resources, not ordinary PJRT work.
+    /// Fences and retained resources for submissions with an execution context or additional invocation resources.
     pending: Mutex<Vec<PendingExecution>>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl RuntimeRegistry {
-    /// Attaches immutable provider configuration to a new session.
-    pub(super) fn new(client: &'static Client<'static>, configuration: RuntimeExtensions) -> Self {
-        Self { client, configuration, instances: Mutex::new(HashMap::new()), pending: Mutex::new(Vec::new()) }
+    /// Creates a [`RuntimeRegistry`] for `client` using the providers in `extensions`. Each registry initializes its
+    /// own instances on demand, even when several registries share the same providers.
+    pub(crate) fn new(client: &'static Client<'static>, extensions: RuntimeExtensions) -> Self {
+        Self { client, extensions, instances: Mutex::new(HashMap::new()), pending: Mutex::new(Vec::new()) }
     }
 
-    /// Initializes all required providers before native compilation or loading.
+    /// Makes the required [`RuntimeExtension`] instances available before the [`Session`](crate::Session) compiles
+    /// or loads an executable. Duplicate requirements share one instance. For example, the first program that needs
+    /// `ryft.print` causes the provider to register its native handler, and later programs reuse the initialized
+    /// extension.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from normalizing `requirements` or resolving an extension through [`Self::instance`].
     pub(crate) fn ensure(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
         for requirement in normalize_runtime_requirements(requirements.iter().cloned())? {
             self.instance(&requirement)?;
@@ -570,7 +571,16 @@ impl RuntimeRegistry {
         Ok(())
     }
 
-    /// Validates the selected invocation and composes all requested extension state into at most one context.
+    /// Prepares a shared [`ExecutionResources`] for a native invocation. For each distinct requirement, it resolves
+    /// an instance, validates the invocation's `mesh`, and lets the instance attach data or retain resources. The
+    /// instances share one execution context, created when the first instance attaches Foreign Function Interface (FFI)
+    /// user data. For example, the CUDA extension attaches a pointer to its runtime instance for the native handler to
+    /// use during execution.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from normalizing the requirements, resolving an instance, validating the mesh, or preparing
+    /// resources.
     pub(crate) fn prepare(
         &self,
         requirements: &[RuntimeRequirement],
@@ -586,11 +596,16 @@ impl RuntimeRegistry {
         Ok(resources)
     }
 
-    /// Tracks successful submissions that need retention before any fallible result reconstruction.
+    /// Retains invocation resources after a successful submission. Call this before reconstructing results so that the
+    /// resources outlive native execution even if reconstruction fails. [`ExecutionResources::into_parts`] supplies
+    /// [`Some`] when the invocation has resources or an execution context. The context can borrow from an extension
+    /// instance, so it needs tracking even without additional resources. [`None`] skips tracking. When given [`Some`],
+    /// this function also polls the tracked [`ExecutionFence`]s and releases resources for completed submissions.
     pub(crate) fn retain(&self, fence: &ExecutionFence, resources: Option<RetainedExecutionResources>) {
         let Some(resources) = resources else {
             return;
         };
+
         let mut completed = Vec::new();
         {
             let mut pending = self.pending.lock().expect("runtime completion mutex poisoned");
@@ -608,15 +623,24 @@ impl RuntimeRegistry {
                 completed.push(PendingExecution { fence: fence.clone(), _resources: resources });
             }
         }
+
         // Completed executions no longer need their resources. They are dropped after the pending lock is released,
         // so destructors of retained resources never run while that lock is held.
         drop(completed);
     }
 
-    /// Initializes outside registry locks and publishes one stable successful instance.
+    /// Returns the cached instance for `requirement` or initializes it through the matching [`RuntimeProvider`]. The
+    /// provider runs outside the registry and slot locks. If it returns an error or panics, the slot becomes available
+    /// for a later attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::MissingProvider`] if the session has no matching provider and propagates any error from
+    /// initialization. To prevent deadlocks, a thread already initializing an extension in this registry receives
+    /// [`RuntimeError::RecursiveInitialization`] if resolving the requirement would make it wait for an initializer.
     fn instance(&self, requirement: &RuntimeRequirement) -> Result<Arc<dyn RuntimeExtension>, Error> {
         let provider = self
-            .configuration
+            .extensions
             .providers
             .get(requirement.identifier())
             .ok_or_else(|| RuntimeError::MissingProvider { identifier: requirement.identifier.clone() })?;
@@ -683,10 +707,9 @@ impl RuntimeRegistry {
 }
 
 impl Drop for RuntimeRegistry {
+    /// Waits for tracked submissions to finish before dropping their resources and the initialized extensions.
     fn drop(&mut self) {
         let pending = std::mem::take(self.pending.get_mut().expect("runtime completion mutex poisoned"));
-        // Native handlers may still read the retained resources of pending executions, so each execution must reach a
-        // terminal state before its resources are destroyed.
         for execution in pending {
             // Failure is terminal too, and its diagnostics remain in the caller's fence and in effect and reference
             // state.
