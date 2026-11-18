@@ -90,4 +90,28 @@ fn nested_slice(
     output.store(head.slice([0..1]).load());
 }
 
+#[kernel(crate = "ryft_kernels")]
+fn raw_shadowing(
+    #[input(data_type = I32, rank = 1)] first: &Array,
+    #[input(data_type = I32, rank = 1)] second: &Array,
+    #[output(data_type = I32, shape = [1])] output: &mut Array,
+) {
+    let source = first;
+    let element = source.slice([0..1]);
+    let r#source = second;
+    output.store(element.load());
+}
+
+#[kernel(crate = "ryft_kernels")]
+fn raw_shadowed(
+    #[input(data_type = I32, rank = 1)] first: &Array,
+    #[input(data_type = I32, rank = 1)] second: &Array,
+    #[output(data_type = I32, shape = [1])] output: &mut Array,
+) {
+    let r#source = first;
+    let element = r#source.slice([0..1]);
+    let source = second;
+    output.store(element.load());
+}
+
 fn main() {}

@@ -46,6 +46,15 @@ MlirStringRef getEnumAttributeValue(MlirAttribute attribute) {
 
 }  // namespace
 
+bool mlirTypeIsATritonTtPackedFloat4E2M1Type(MlirType type) {
+  return type.ptr != nullptr && llvm::isa<mlir::triton::PackedFloat4E2M1Type>(unwrap(type));
+}
+
+MlirType mlirTritonTtPackedFloat4E2M1TypeGet(MlirContext context) {
+  if (context.ptr == nullptr) return {nullptr};
+  return wrap(mlir::triton::PackedFloat4E2M1Type::get(unwrap(context)));
+}
+
 bool mlirTypeIsATritonTtPointerType(MlirType type) {
   return type.ptr != nullptr && llvm::isa<mlir::triton::PointerType>(unwrap(type));
 }

@@ -12,6 +12,13 @@
 //! lowers the kernel again with the current Rust lowering, which includes its admission policy, and accepts the
 //! manifest only when that lowering succeeds and emits source with the recorded digest. An artifact therefore stays
 //! eligible only while the current lowering would produce it, so changing the lowering needs no revision constant.
+//!
+//! A runtime-only record (e.g., an XLA ahead-of-time bundle or a persisted tuning measurement) carries no kernel to
+//! lower again. Its compatibility therefore rests on the compiler configuration, which records the digests of the
+//! bundled exporter and of the Rust sources of this adapter. Any edit to those sources, including a formatting edit,
+//! changes the configuration and conservatively invalidates such records. Manifest restoration requires the Rust
+//! source digest in the recorded configuration but does not compare it, because the source digest already decides
+//! eligibility exactly.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -565,6 +572,11 @@ struct Configuration {
     maximum_scratch_bytes: Option<usize>,
     /// Exact bundled exporter identity.
     worker_sha256: String,
+
+    /// Identity of the Rust lowering and admission policy, computed by [`lowering_sha256`] over every Rust source
+    /// file of this adapter. Formatting, documentation, and test edits to those files also change it, which
+    /// conservatively invalidates records of an unchanged lowering. A record without it is malformed.
+    lowering_sha256: String,
 }
 
 impl Configuration {
@@ -607,6 +619,24 @@ fn launch_grid(kernel: &VerifiedKernel<'_, NoKernelExtension>) -> Result<[u32; 3
         }
     }
     Ok([parallel.max(1) as u32, 1, 1])
+}
+
+/// Returns the hexadecimal SHA-256 digest of the Rust sources that generate and admit cuTile source, namely
+/// `cutile/mod.rs`, `cutile/lowering.rs`, and `cutile/compiler.rs` in this order, each preceded by its byte length.
+///
+/// Compiler configurations record it, so that runtime-only records of a different lowering or admission policy
+/// never match the current compiler, without a revision constant that must be changed by hand. The digest covers
+/// whole files, so formatting, documentation, and test edits also change it, which is the conservative direction. It
+/// covers neither dependencies such as `ryft-core` and `ryft-kernels` nor the bundled exporter, which the
+/// configuration identifies separately.
+#[cfg(any(test, feature = "cutile-compiler"))]
+fn lowering_sha256() -> String {
+    let mut hash = Sha256::new();
+    for source in [include_str!("mod.rs"), include_str!("lowering.rs"), include_str!("compiler.rs")] {
+        hash.update((source.len() as u64).to_le_bytes());
+        hash.update(source);
+    }
+    hex::encode(hash.finalize())
 }
 
 #[cfg(test)]
@@ -685,6 +715,7 @@ mod tests {
             buffering_depth: None,
             maximum_scratch_bytes: None,
             worker_sha256: hex::encode(Sha256::digest(include_bytes!("export.py"))),
+            lowering_sha256: lowering_sha256(),
         };
         Manifest {
             schema: 1,

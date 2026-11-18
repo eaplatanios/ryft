@@ -1,5 +1,6 @@
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
+use syn::ext::IdentExt;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
@@ -137,8 +138,11 @@ impl KernelCodeGenerator {
     /// pub fn copy<__KernelValue: ryft::kernels::KernelCall>(
     ///     input: &__KernelValue,
     /// ) -> ::core::result::Result<__KernelValue, core::programs::ProgramError> {
-    ///     let __kernel_input_type = core::programs::Typed::r#type(input);
-    ///     let __kernel_definition = copy::definition(__kernel_input_type.as_ref())
+    ///     let __kernel_input_type = core::programs::Typed::r#type(input)
+    ///         .into_owned()
+    ///         .with_sharding(::core::option::Option::<core::arrays::Sharding>::None)
+    ///         .map_err(core::programs::TypeError::from)?;
+    ///     let __kernel_definition = copy::definition(&__kernel_input_type)
     ///         .map_err(core::programs::ProgramError::custom)?;
     ///     let mut __kernel_outputs = <__KernelValue as ryft::kernels::KernelCall>::call_kernel(
     ///         &__kernel_definition,
@@ -234,13 +238,13 @@ impl KernelCodeGenerator {
                     let Some(name) = axis.path.get_ident().cloned() else {
                         return Err(axis.error("kernel grid axes require a name"));
                     };
-                    if name.to_string().starts_with(RESERVED_PREFIX) {
+                    if is_reserved(&name) {
                         return Err(syn::Error::new_spanned(
                             &name,
                             "kernel grid axis names cannot use the reserved `__kernel_` prefix",
                         ));
                     }
-                    if axes.iter().any(|existing| existing.name == name) {
+                    if axes.iter().any(|existing| same_name(&existing.name, &name)) {
                         return Err(syn::Error::new_spanned(&name, "kernel grid axis names must be unique"));
                     }
                     let extent = axis.value()?.parse::<syn::Expr>()?;
@@ -317,7 +321,7 @@ impl KernelCodeGenerator {
                 return Err(syn::Error::new_spanned(argument, "kernel functions cannot take `self`"));
             };
             let parameter = Self::extract_parameter(argument)?;
-            if parameters.iter().any(|existing| existing.name == parameter.name) {
+            if parameters.iter().any(|existing| same_name(&existing.name, &parameter.name)) {
                 return Err(syn::Error::new_spanned(&parameter.name, "kernel parameter names must be unique"));
             }
             parameters.push(parameter);
@@ -338,10 +342,7 @@ impl KernelCodeGenerator {
         let syn::Pat::Ident(pattern) = argument.pat.as_ref() else {
             return Err(syn::Error::new_spanned(&argument.pat, "kernel parameters require a name"));
         };
-        if pattern.by_ref.is_some()
-            || pattern.subpat.is_some()
-            || pattern.ident.to_string().starts_with(RESERVED_PREFIX)
-        {
+        if pattern.by_ref.is_some() || pattern.subpat.is_some() || is_reserved(&pattern.ident) {
             return Err(syn::Error::new_spanned(
                 pattern,
                 "kernel parameter names cannot use the reserved `__kernel_` prefix or subpatterns",
@@ -542,7 +543,7 @@ impl KernelCodeGenerator {
     /// argument, other results, `prefetch` parameters, or input windows.
     fn validate_grid(grid: Option<&[GridAxis]>, parameters: &[Parameter]) -> syn::Result<()> {
         for axis in grid.unwrap_or_default() {
-            if parameters.iter().any(|parameter| parameter.name == axis.name) {
+            if parameters.iter().any(|parameter| same_name(&parameter.name, &axis.name)) {
                 return Err(syn::Error::new_spanned(
                     &axis.name,
                     "kernel grid axis names cannot collide with parameter names",
@@ -599,7 +600,7 @@ impl KernelCodeGenerator {
 
     /// Returns the reference [`Parameter`] named `name`, if there is one.
     fn reference(&self, name: &syn::Ident) -> Option<&Parameter> {
-        self.references().find(|parameter| &parameter.name == name)
+        self.references().find(|parameter| same_name(&parameter.name, name))
     }
 
     /// Returns the output [`Parameter`] whose window is tiled through the `tile` shorthand, if there is one.
@@ -609,10 +610,12 @@ impl KernelCodeGenerator {
 
     /// Generates the functional callable of the kernel, which keeps the name, visibility, and attributes of the kernel
     /// function, takes the kernel arguments as values of any `KernelCall` type, builds the kernel definition for their
-    /// types, and invokes or stages it through `KernelCall::call_kernel`. The call receives the `input` and `inout`
-    /// arguments in declaration order followed by the `prefetch` arguments. The callable returns its one result
-    /// directly and several results as a tuple, in the declaration order of the `output` and `inout` parameters. It
-    /// allows the Clippy lint that passing a single cloned argument triggers.
+    /// types without their shardings, and invokes or stages it through `KernelCall::call_kernel`. Kernel parameter
+    /// types are physical because a kernel runs on one device, so the placement of the arguments belongs to the call,
+    /// which receives the `input` and `inout` arguments in declaration order followed by the `prefetch` arguments,
+    /// each with its own sharding. The callable returns its one result directly and several results as a tuple, in
+    /// the declaration order of the `output` and `inout` parameters. It allows the Clippy lint that passing a single
+    /// cloned argument triggers.
     fn generate_callable(&self, function: &syn::ItemFn) -> TokenStream {
         let Self { kernels, core, .. } = self;
         // The lint attribute of the generated function goes below its documentation and above its other attributes.
@@ -643,8 +646,13 @@ impl KernelCodeGenerator {
             #visibility fn #name<__KernelValue: #kernels::KernelCall>(#(#arguments: &__KernelValue),*)
                 -> ::core::result::Result<#result, #core::programs::ProgramError>
             {
-                #(let #types = #core::programs::Typed::r#type(#arguments);)*
-                let __kernel_definition = #name::definition(#(#types.as_ref()),*)
+                #(
+                    let #types = #core::programs::Typed::r#type(#arguments)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<#core::arrays::Sharding>::None)
+                        .map_err(#core::programs::TypeError::from)?;
+                )*
+                let __kernel_definition = #name::definition(#(&#types),*)
                     .map_err(#core::programs::ProgramError::custom)?;
                 let mut __kernel_outputs = <__KernelValue as #kernels::KernelCall>::call_kernel(
                     &__kernel_definition,
@@ -806,7 +814,8 @@ impl KernelCodeGenerator {
             let inputs = self.arguments().map(|parameter| &parameter.name);
             let output_type = r#type(output);
             // The output keeps its declared position among the references, which the body binds in declaration order.
-            let output_index = self.references().position(|parameter| parameter.name == output.name).unwrap();
+            let output_index =
+                self.references().position(|parameter| same_name(&parameter.name, &output.name)).unwrap();
             let tile = self.generate_shape(tile, false)?;
             let boundary = boundary.generate(kernels);
             return Ok(quote!(
@@ -840,7 +849,7 @@ impl KernelCodeGenerator {
             .map(|GridAxis { name, extent, sequential }| {
                 let extent = self.generate_shape(extent, false)?;
                 let execution = if *sequential { quote!(Sequential) } else { quote!(Parallel) };
-                let name = name.to_string();
+                let name = name.unraw().to_string();
                 Ok(quote! {
                     #kernels::GridDimension::new(
                         #core::arrays::Dimension::Static(#extent),
@@ -911,10 +920,10 @@ impl KernelCodeGenerator {
                 let Some(name) = identifier(expression) else {
                     return Err(syn::Error::new_spanned(expression, "unsupported kernel mapping expression"));
                 };
-                if let Some(axis) = self.axes().iter().position(|axis| axis.name == name) {
+                if let Some(axis) = self.axes().iter().position(|axis| same_name(&axis.name, &name)) {
                     return Ok(quote!(#kernels::MappingExpression::GridCoordinate(#axis)));
                 }
-                if let Some(prefetch) = self.prefetches().position(|parameter| parameter.name == name) {
+                if let Some(prefetch) = self.prefetches().position(|parameter| same_name(&parameter.name, &name)) {
                     return Ok(quote!(#kernels::MappingExpression::Prefetch(#prefetch)));
                 }
                 Err(syn::Error::new_spanned(
@@ -1027,7 +1036,7 @@ impl KernelCodeGenerator {
         let Some(name) = identifier(&call.receiver) else {
             return Err(syn::Error::new_spanned(&call.receiver, "shape metadata requires an input name"));
         };
-        let Some(argument) = self.arguments().find(|parameter| parameter.name == name) else {
+        let Some(argument) = self.arguments().find(|parameter| same_name(&parameter.name, &name)) else {
             return Err(syn::Error::new_spanned(&call.receiver, "unknown shape metadata input"));
         };
         let ShapeAnnotation::Rank(rank) = argument.shape else { unreachable!() };
@@ -1113,7 +1122,7 @@ impl KernelCodeGenerator {
         };
         if scope.region
             || identifier(&call.receiver)
-                .is_none_or(|receiver| self.tiled_output().is_none_or(|output| receiver != output.name))
+                .is_none_or(|receiver| self.tiled_output().is_none_or(|output| !same_name(&receiver, &output.name)))
             || call.method != "tile_index"
             || !call.args.is_empty()
             || call.turbofish.is_some()
@@ -1168,7 +1177,7 @@ impl KernelCodeGenerator {
                 let mut view = self.extract_slice_view(call, scope)?;
                 let name = scope.validate_new_name(pattern, "slices", false)?.clone();
                 let mut declaration = TokenStream::new();
-                if scope.bindings.iter().any(|binding| binding.name == view.source && binding.mutable) {
+                if scope.bindings.iter().any(|binding| same_name(&binding.name, &view.source) && binding.mutable) {
                     let source = std::mem::replace(&mut view.source, format_ident!("__kernel_{}_source", name));
                     let binding = &view.source;
                     declaration = quote!(let #binding = #source.clone(););
@@ -1195,7 +1204,9 @@ impl KernelCodeGenerator {
             return Err(syn::Error::new_spanned(padding, "padding requires a tile view"));
         };
         let input = identifier(&tiles.receiver).and_then(|name| {
-            self.parameters.iter().find(|parameter| parameter.access == Access::Input && parameter.name == name)
+            self.parameters
+                .iter()
+                .find(|parameter| parameter.access == Access::Input && same_name(&parameter.name, &name))
         });
         let Some(input) = input.filter(|_| {
             tiles.method == "tiles"
@@ -1226,8 +1237,8 @@ impl KernelCodeGenerator {
             return Err(syn::Error::new_spanned(call, "kernel slices cannot be sliced again"));
         }
         let source = identifier(&call.receiver).filter(|name| {
-            !name.to_string().starts_with(RESERVED_PREFIX)
-                && scope.bindings.iter().any(|binding| &binding.name == name)
+            !is_reserved(name)
+                && scope.bindings.iter().any(|binding| same_name(&binding.name, name))
                 && call.args.len() == 1
                 && call.turbofish.is_none()
         });
@@ -1406,7 +1417,7 @@ impl KernelCodeGenerator {
         match expression {
             syn::Expr::Path(path) if path.qself.is_none() && path.path.get_ident().is_some() => {
                 let name = path.path.get_ident().unwrap();
-                if name.to_string().starts_with(RESERVED_PREFIX) {
+                if is_reserved(name) {
                     return Err(syn::Error::new_spanned(name, "kernel bodies cannot use reserved `__kernel_` names"));
                 }
                 if scope.tile(name).is_some() {
@@ -1813,7 +1824,7 @@ impl KernelCodeGenerator {
             _ => return Err(syn::Error::new_spanned(binary.op, "unsupported kernel comparison operator")),
         };
         let is_axis = |expression: &syn::Expr| {
-            identifier(expression).is_some_and(|name| self.axes().iter().any(|axis| axis.name == name))
+            identifier(expression).is_some_and(|name| self.axes().iter().any(|axis| same_name(&axis.name, &name)))
         };
         let constant = |expression: &syn::Expr| match ungroup(expression) {
             syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(constant), .. }) => Some(constant.base10_parse::<usize>()),
@@ -2100,12 +2111,12 @@ impl Scope {
 
     /// Returns the [`TileView`] named `name` in this [`Scope`], if there is one.
     fn tile(&self, name: &syn::Ident) -> Option<&TileView> {
-        self.tiles.iter().find(|tile| &tile.name == name)
+        self.tiles.iter().find(|tile| same_name(&tile.name, name))
     }
 
     /// Returns the [`SliceView`] named `name` in this [`Scope`], if there is one.
     fn slice(&self, name: &syn::Ident) -> Option<&SliceView> {
-        self.slices.iter().find(|(slice, _)| slice == name).map(|(_, view)| view)
+        self.slices.iter().find(|(slice, _)| same_name(slice, name)).map(|(_, view)| view)
     }
 
     /// Validates that `pattern` declares a new name in this [`Scope`] and returns that name. New names cannot use the
@@ -2119,7 +2130,7 @@ impl Scope {
         mutable: bool,
     ) -> syn::Result<&'p syn::Ident> {
         let name = &pattern.ident;
-        if pattern.by_ref.is_some() || pattern.subpat.is_some() || name.to_string().starts_with(RESERVED_PREFIX) {
+        if pattern.by_ref.is_some() || pattern.subpat.is_some() || is_reserved(name) {
             return Err(syn::Error::new_spanned(
                 pattern,
                 format!("kernel {kind} cannot use the reserved `__kernel_` prefix, `ref`, or subpatterns"),
@@ -2128,7 +2139,7 @@ impl Scope {
         if !mutable && pattern.mutability.is_some() {
             return Err(syn::Error::new_spanned(pattern, format!("kernel {kind} cannot be mutable")));
         }
-        if self.bindings.iter().any(|binding| &binding.name == name)
+        if self.bindings.iter().any(|binding| same_name(&binding.name, name))
             || self.tile(name).is_some()
             || self.slice(name).is_some()
         {
@@ -2250,6 +2261,18 @@ fn identifier(expression: &syn::Expr) -> Option<syn::Ident> {
         syn::Expr::Path(syn::ExprPath { qself: None, path, .. }) => path.get_ident().cloned(),
         _ => None,
     }
+}
+
+/// Returns `true` if `left` and `right` are the same name. Rust treats the raw spelling of an identifier (e.g.,
+/// `r#source`) as the same name as its ordinary spelling, so every comparison of binding, parameter, and grid axis
+/// names goes through this function rather than comparing spellings.
+fn same_name(left: &syn::Ident, right: &syn::Ident) -> bool {
+    left.unraw() == right.unraw()
+}
+
+/// Returns `true` if `name` uses the reserved prefix of generated identifiers, in either spelling (see [`same_name`]).
+fn is_reserved(name: &syn::Ident) -> bool {
+    name.unraw().to_string().starts_with(RESERVED_PREFIX)
 }
 
 #[cfg(test)]
@@ -2413,8 +2436,11 @@ mod tests {
                 pub fn copy<__KernelValue: kernels::KernelCall>(input: &__KernelValue)
                     -> ::core::result::Result<__KernelValue, kernels::__private::core::programs::ProgramError>
                 {
-                    let __kernel_input_type = kernels::__private::core::programs::Typed::r#type(input);
-                    let __kernel_definition = copy::definition(__kernel_input_type.as_ref())
+                    let __kernel_input_type = kernels::__private::core::programs::Typed::r#type(input)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<kernels::__private::core::arrays::Sharding>::None)
+                        .map_err(kernels::__private::core::programs::TypeError::from)?;
+                    let __kernel_definition = copy::definition(&__kernel_input_type)
                         .map_err(kernels::__private::core::programs::ProgramError::custom)?;
                     let mut __kernel_outputs = <__KernelValue as kernels::KernelCall>::call_kernel(
                         &__kernel_definition,
@@ -2918,13 +2944,16 @@ mod tests {
                 pub fn gather<__KernelValue: kernels::KernelCall>(left: &__KernelValue, indices: &__KernelValue)
                     -> ::core::result::Result<__KernelValue, kernels::__private::core::programs::ProgramError>
                 {
-                    let __kernel_left_type = kernels::__private::core::programs::Typed::r#type(left);
-                    let __kernel_indices_type = kernels::__private::core::programs::Typed::r#type(indices);
-                    let __kernel_definition = gather::definition(
-                        __kernel_left_type.as_ref(),
-                        __kernel_indices_type.as_ref()
-                    )
-                    .map_err(kernels::__private::core::programs::ProgramError::custom)?;
+                    let __kernel_left_type = kernels::__private::core::programs::Typed::r#type(left)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<kernels::__private::core::arrays::Sharding>::None)
+                        .map_err(kernels::__private::core::programs::TypeError::from)?;
+                    let __kernel_indices_type = kernels::__private::core::programs::Typed::r#type(indices)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<kernels::__private::core::arrays::Sharding>::None)
+                        .map_err(kernels::__private::core::programs::TypeError::from)?;
+                    let __kernel_definition = gather::definition(&__kernel_left_type, &__kernel_indices_type)
+                        .map_err(kernels::__private::core::programs::ProgramError::custom)?;
                     let mut __kernel_outputs = <__KernelValue as kernels::KernelCall>::call_kernel(
                         &__kernel_definition,
                         &[left.clone(), indices.clone()],
@@ -2956,13 +2985,22 @@ mod tests {
                     (__KernelValue, __KernelValue),
                     kernels::__private::core::programs::ProgramError
                 > {
-                    let __kernel_left_type = kernels::__private::core::programs::Typed::r#type(left);
-                    let __kernel_offset_type = kernels::__private::core::programs::Typed::r#type(offset);
-                    let __kernel_state_type = kernels::__private::core::programs::Typed::r#type(state);
+                    let __kernel_left_type = kernels::__private::core::programs::Typed::r#type(left)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<kernels::__private::core::arrays::Sharding>::None)
+                        .map_err(kernels::__private::core::programs::TypeError::from)?;
+                    let __kernel_offset_type = kernels::__private::core::programs::Typed::r#type(offset)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<kernels::__private::core::arrays::Sharding>::None)
+                        .map_err(kernels::__private::core::programs::TypeError::from)?;
+                    let __kernel_state_type = kernels::__private::core::programs::Typed::r#type(state)
+                        .into_owned()
+                        .with_sharding(::core::option::Option::<kernels::__private::core::arrays::Sharding>::None)
+                        .map_err(kernels::__private::core::programs::TypeError::from)?;
                     let __kernel_definition = update::definition(
-                        __kernel_left_type.as_ref(),
-                        __kernel_offset_type.as_ref(),
-                        __kernel_state_type.as_ref()
+                        &__kernel_left_type,
+                        &__kernel_offset_type,
+                        &__kernel_state_type
                     )
                     .map_err(kernels::__private::core::programs::ProgramError::custom)?;
                     let mut __kernel_outputs = <__KernelValue as kernels::KernelCall>::call_kernel(
@@ -4434,6 +4472,7 @@ mod tests {
             .slices
             .push((format_ident!("head"), SliceView { source: format_ident!("left"), ranges: vec![] }));
         assert_eq!(scope.slice(&format_ident!("head")).unwrap().source, "left");
+        assert_eq!(scope.slice(&format_ident!("r#head")).unwrap().source, "left");
         assert!(scope.slice(&format_ident!("left")).is_none());
     }
 
@@ -4463,6 +4502,23 @@ mod tests {
         assert_eq!(
             scope.validate_new_name(&pattern(quote!(head)), "locals", true).unwrap_err().to_string(),
             "kernel locals cannot shadow an existing binding",
+        );
+
+        // Raw spellings name the same bindings and the same reserved names as ordinary spellings.
+        assert_eq!(
+            scope.validate_new_name(&pattern(quote!(r#accumulator)), "locals", true).unwrap_err().to_string(),
+            "kernel locals cannot shadow an existing binding",
+        );
+        assert_eq!(
+            scope.validate_new_name(&pattern(quote!(r#head)), "locals", true).unwrap_err().to_string(),
+            "kernel locals cannot shadow an existing binding",
+        );
+        assert_eq!(
+            scope
+                .validate_new_name(&pattern(quote!(r#__kernel_values)), "locals", true)
+                .unwrap_err()
+                .to_string(),
+            "kernel locals cannot use the reserved `__kernel_` prefix, `ref`, or subpatterns",
         );
     }
 
@@ -4528,5 +4584,20 @@ mod tests {
         assert_eq!(identifier(&invisible_group(quote!(left))).unwrap(), "left");
         assert_eq!(identifier(&parse_quote!(self::left)), None);
         assert_eq!(identifier(&parse_quote!(left.load())), None);
+    }
+
+    #[test]
+    fn test_same_name() {
+        assert!(same_name(&format_ident!("source"), &format_ident!("source")));
+        assert!(same_name(&format_ident!("source"), &format_ident!("r#source")));
+        assert!(same_name(&format_ident!("r#source"), &format_ident!("source")));
+        assert!(!same_name(&format_ident!("source"), &format_ident!("r#target")));
+    }
+
+    #[test]
+    fn test_is_reserved() {
+        assert!(is_reserved(&format_ident!("__kernel_values")));
+        assert!(is_reserved(&format_ident!("r#__kernel_values")));
+        assert!(!is_reserved(&format_ident!("r#kernel_values")));
     }
 }

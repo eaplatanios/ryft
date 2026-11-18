@@ -137,6 +137,101 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "cuda-13")]
+    mod barrier_execution {
+        use std::num::NonZeroUsize;
+
+        use pretty_assertions::assert_eq;
+
+        use ryft_core::{ArrayIrType, ArrayType, CompilationTracer, DataType, StagedFunction};
+        use ryft_kernels::{KernelSchedule, kernel};
+        use ryft_triton::kernels::{Compiler, Options as TritonOptions, Target};
+
+        use crate::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
+        use crate::sessions::tests::domain_mesh;
+        use crate::tests::execution_client;
+        use crate::{Options, Session, Value};
+
+        /// Writes a workgroup tile and copies a slice whose elements are assigned to different lanes.
+        #[kernel(crate = "ryft_kernels", requires = input.shape()[0] == 256)]
+        fn read_written_slice(
+            #[input(data_type = F32, rank = 1)] input: &ryft_core::Array,
+            #[output(data_type = F32, shape = [256])] intermediate: &mut ryft_core::Array,
+            #[output(data_type = F32, shape = [128])] output: &mut ryft_core::Array,
+        ) {
+            intermediate.store(input.load());
+            output.store(intermediate.slice([64..192]).load());
+        }
+
+        #[test]
+        fn test_triton_embedding_executes_read_written_slice() {
+            if std::env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1")
+                || std::env::var("RYFT_TEST_EXECUTION_PLATFORM").ok().as_deref() != Some("cuda-13")
+            {
+                return;
+            }
+            let client = execution_client();
+            let device = client.addressable_devices().unwrap().remove(0);
+            let ryft_pjrt::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+                panic!("missing CUDA compute capability")
+            };
+            let (major, minor) = capability.split_once('.').unwrap();
+            let target = Target::Cuda { major: major.parse().unwrap(), minor: minor.parse().unwrap() };
+            let mesh = domain_mesh(client, "device", 1);
+            let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+            let r#type = ArrayType::new_static(DataType::F32, [256]);
+            let definition = read_written_slice::definition(&r#type).unwrap();
+            let values = (0..256).map(|value| value as f32).collect::<Vec<_>>();
+            let input = session
+                .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
+                .unwrap();
+
+            for stages in [1, 2, 3] {
+                let schedule = KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(stages).unwrap());
+                let binding = KernelCompilerBinding::new(
+                    Compiler::new(),
+                    target.clone(),
+                    TritonOptions::default(),
+                    schedule,
+                    TritonEmbedding,
+                    1024,
+                )
+                .unwrap();
+                let staged = StagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+                    |_, _, inputs: Vec<CompilationTracer<Session>>| {
+                        Ok(stage_kernel(inputs[0].context(), &definition, &inputs)?)
+                    },
+                    vec![],
+                    vec![ArrayIrType::Array(r#type.clone())],
+                    Options::new(mesh.clone()).with_kernel_compiler(binding),
+                )
+                .unwrap();
+                let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
+                let outputs = compiled.executable().execute(&session, vec![Value::Array(input.clone())]).unwrap();
+                let [Value::Array(intermediate), Value::Array(output)] = outputs.as_slice() else {
+                    panic!("expected two array outputs")
+                };
+                let read_values = |array: &crate::Array| {
+                    let bytes = array
+                        .device_shard(device.id().unwrap())
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .copy_to_host(None)
+                        .unwrap()
+                        .r#await()
+                        .unwrap();
+                    bytes
+                        .chunks_exact(size_of::<f32>())
+                        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(read_values(intermediate), values);
+                assert_eq!(read_values(output), values[64..192]);
+            }
+        }
+    }
+
     /// Recorded schema 1 configuration of the subprocess compiler at `7197043f1`, including its protocol and
     /// executable hash. The linked compiler reuses schema 1 for a different record until the first release.
     fn historical_configuration() -> Vec<u8> {

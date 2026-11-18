@@ -16,8 +16,8 @@ use crate::lowering::types::{lower_physical_storage, lower_tensor_type, lower_un
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
-    Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
-    RUNTIME_REQUIREMENTS_ATTRIBUTE, runtime_requirements,
+    CustomCallOperationExtension, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
+    MemberLowerableOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE,
 };
 
 impl LowerableOperation for CustomCallOperation {
@@ -28,7 +28,7 @@ impl LowerableOperation for CustomCallOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        for requirement in runtime_requirements(self)? {
+        for requirement in self.runtime_requirements()? {
             lowerer.require_runtime(requirement)?;
         }
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
@@ -53,7 +53,7 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        for requirement in runtime_requirements(self)? {
+        for requirement in self.runtime_requirements()? {
             lowerer.require_runtime(requirement)?;
         }
         let context = lowerer.context();
@@ -572,7 +572,6 @@ mod tests {
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError, RuntimeError,
         RuntimeRequirement, Session, TracedProgram, Value, to_mlir_module_for_program, trace,
-        with_runtime_requirements,
     };
 
     use super::*;
@@ -853,29 +852,25 @@ mod tests {
     #[test]
     fn test_custom_call_runtime_metadata_is_consumed_without_changing_native_attributes() {
         let array_type = test_matrix_type(2, 3);
-        let first = RuntimeRequirement::new("test.first", 2, vec![7, 8]).unwrap();
-        let second = RuntimeRequirement::new("test.second", 1, Vec::new()).unwrap();
+        let first = RuntimeRequirement::new("test.first", 2).unwrap();
+        let second = RuntimeRequirement::new("test.second", 1).unwrap();
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
-        let operation = with_runtime_requirements(
-            CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
-                .with_attribute("scale", 2i64)
-                .with_attribute(
-                    "nested",
-                    CustomCallAttribute::Dictionary(vec![(
-                        RUNTIME_REQUIREMENTS_ATTRIBUTE.to_string(),
-                        "foreign-metadata".into(),
-                    )]),
-                ),
-            [second.clone(), first.clone(), first.clone()],
-        )
-        .unwrap();
+        let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
+            .with_attribute("scale", 2i64)
+            .with_attribute(
+                "nested",
+                CustomCallAttribute::Dictionary(vec![(
+                    RUNTIME_REQUIREMENTS_ATTRIBUTE.to_string(),
+                    "foreign-metadata".into(),
+                )]),
+            )
+            .with_runtime_requirements([second.clone(), first.clone(), first.clone()])
+            .unwrap();
         let intermediate = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-        let operation = with_runtime_requirements(
-            CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
-            [second.clone()],
-        )
-        .unwrap();
+        let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
+            .with_runtime_requirements([second.clone()])
+            .unwrap();
         let output = builder.add_instruction(operation, Vec::new(), vec![intermediate], None).unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -919,11 +914,9 @@ mod tests {
         let mut builder = ArrayIrProgramBuilder::new();
         let mut output = builder.add_input(array_type.clone().into());
         for version in [1, 2] {
-            let operation = with_runtime_requirements(
-                CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
-                [RuntimeRequirement::new("test.runtime", version, Vec::new()).unwrap()],
-            )
-            .unwrap();
+            let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
+                .with_runtime_requirements([RuntimeRequirement::new("test.runtime", version).unwrap()])
+                .unwrap();
             output = builder.add_instruction(operation, Vec::new(), vec![output], None).unwrap()[0];
         }
         let program = builder

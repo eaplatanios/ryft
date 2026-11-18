@@ -20,7 +20,7 @@ use crate::sessions::effects::EffectCallbackGuard;
 use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension, RuntimeProvider,
-    RuntimeRequirement, Target,
+    RuntimeRequirement,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -179,10 +179,8 @@ impl RuntimeProvider for PrintRuntimeProvider {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        let _ = target;
         validate_builtin_requirement(requirement, self.identifier())?;
         ensure_print_handler_registered(client)?;
         Ok(Arc::new(PrintRuntime))
@@ -205,15 +203,12 @@ impl RuntimeProvider for OrderedIoRuntimeProvider {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        let _ = client;
         validate_builtin_requirement(requirement, self.identifier())?;
-        if !["cpu", "cuda"].iter().any(|platform| target.platform_name().eq_ignore_ascii_case(platform)) {
-            return Err(
-                ExecutionError::UnsupportedEffectPlatform { platform: target.platform_name().to_owned() }.into()
-            );
+        let platform_name = client.platform_name()?;
+        if !["cpu", "cuda"].iter().any(|platform| platform_name.eq_ignore_ascii_case(platform)) {
+            return Err(ExecutionError::UnsupportedEffectPlatform { platform: platform_name.into_owned() }.into());
         }
         Ok(Arc::new(OrderedIoRuntime))
     }
@@ -697,17 +692,16 @@ mod tests {
     #[test]
     fn test_print_runtime_provider_initialize() {
         let client = cpu_client(1);
-        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let requirement = builtin_requirement(PRINT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
-        provider.initialize(client, &target, &requirement).unwrap();
-        provider.initialize(client, &target, &requirement).unwrap();
+        provider.initialize(client, &requirement).unwrap();
+        provider.initialize(client, &requirement).unwrap();
 
-        let requirement = RuntimeRequirement::new(PRINT_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
+        let requirement = RuntimeRequirement::new(PRINT_CUSTOM_CALL_TARGET, 2).unwrap();
         assert!(matches!(
-            provider.initialize(client, &target, &requirement),
+            provider.initialize(client, &requirement),
             Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
                 if identifier == PRINT_CUSTOM_CALL_TARGET,
         ));
@@ -716,15 +710,8 @@ mod tests {
     #[test]
     fn test_ordered_io_runtime_provider_initialize() {
         let client = cpu_client(1);
-        let target = Target::from_client(client).unwrap();
         let provider = ordered_io_runtime_provider();
-        provider.initialize(client, &target, &builtin_requirement("ryft.ordered-io")).unwrap();
-        let requirement = RuntimeRequirement::new("ryft.ordered-io", 1, vec![1]).unwrap();
-        assert!(matches!(
-            provider.initialize(client, &target, &requirement),
-            Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
-                if identifier == "ryft.ordered-io" && reason == "built-in runtime configuration must be empty",
-        ));
+        provider.initialize(client, &builtin_requirement("ryft.ordered-io")).unwrap();
     }
 
     #[test]

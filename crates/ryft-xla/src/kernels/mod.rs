@@ -339,18 +339,83 @@ where
         &self.custom_call
     }
 
-    /// Binds the selected call through ordinary staging or an existing compilation domain after exact input checking.
-    /// External reference state arguments are absent, and all operands and outputs are ordinary array values.
+    /// Binds the selected call through ordinary staging or an existing compilation domain after checking the inputs
+    /// against the kernel signature. The inputs may be placed, like those of the kernel call that this call replaces
+    /// (refer to [`KernelCallOperation`](ryft_kernels::KernelCallOperation)), and the results have the types that the
+    /// kernel call infers for them. External reference state arguments are absent, and all operands and outputs are
+    /// ordinary array values.
     pub fn bind<C>(&self, context: &C, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
     where
         C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>,
     {
         let actual = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        if actual != self.definition.operation().input_types() {
-            return Err(TypeError::invalid("compiled kernel input types do not match its logical signature").into());
-        }
-        context.bind(self.custom_call.clone(), Vec::new(), inputs)
+        let custom_call = placed_custom_call(self.definition.operation(), &self.custom_call, &actual)?;
+        context.bind(custom_call, Vec::new(), inputs)
     }
+}
+
+/// Returns the physical `custom_call` that a compiler embedding selected for the kernel call `operation`, declared for
+/// a call on inputs of `input_types`, which may be placed.
+///
+/// The result of a read-write parameter is the storage of its input, and a custom call requires an aliased result to
+/// have exactly the type of the input that it aliases. A kernel call types that result accordingly, so the returned
+/// call declares every aliased result with the type of its input. Every other result keeps its physical declaration,
+/// from which a custom call infers the same type as the kernel call. The returned call is checked by inferring its
+/// results on `input_types` and comparing them with those of the kernel call, so a selected call always has the
+/// result types of the call that it replaces.
+///
+/// # Errors
+///
+/// Returns the [`TypeError`] of [`KernelCallOperation::output_types_for`](ryft_kernels::KernelCallOperation) for
+/// inputs that the kernel call rejects, and a [`TypeError`] when the custom call infers other result types than the
+/// kernel call.
+pub(crate) fn placed_custom_call(
+    operation: &ryft_kernels::KernelCallOperation,
+    custom_call: &CustomCallOperation,
+    input_types: &[ArrayIrType],
+) -> Result<CustomCallOperation, TypeError> {
+    let logical = operation.output_types_for(input_types)?;
+    let mut output_types = custom_call.output_types().to_vec();
+    for alias in custom_call.input_output_aliases() {
+        if let (Some(output), Some(ArrayIrType::Array(r#type))) =
+            (output_types.get_mut(alias.output_index()), logical.get(alias.output_index()))
+        {
+            // The physical layout of the declaration belongs to the embedding and is kept.
+            *output = r#type.clone().with_layout(output.layout().cloned());
+        }
+    }
+    let placed = if output_types == custom_call.output_types() {
+        custom_call.clone()
+    } else {
+        let mut placed = CustomCallOperation::new(custom_call.target_name(), output_types)
+            .with_input_layouts(custom_call.input_layouts().iter().cloned())
+            .with_batching(custom_call.batching());
+        for (name, value) in custom_call.attributes() {
+            placed = placed.with_attribute(name.clone(), value.clone());
+        }
+        for alias in custom_call.input_output_aliases() {
+            placed = placed.with_input_output_alias(alias.input_index(), alias.output_index())?;
+        }
+        match custom_call.effect_class() {
+            Some(effect_class) => placed.with_effect_class(effect_class),
+            None => placed,
+        }
+    };
+    let array_types = |types: &[ArrayIrType]| {
+        types
+            .iter()
+            .filter_map(|r#type| match r#type {
+                ArrayIrType::Array(r#type) => Some(r#type.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    if CoreOperation::infer_output_types(&placed, &array_types(input_types), &[])? != array_types(&logical) {
+        return Err(TypeError::invalid(
+            "selected kernel custom call does not have the result types of the kernel call that it replaces",
+        ));
+    }
+    Ok(placed)
 }
 
 /// Returns available native kernel providers without initializing their drivers.
@@ -402,37 +467,51 @@ pub(crate) fn dense_memory_layouts(
 
 /// Requires the array inputs of a kernel call to be manual shards that are already local, because adapter selection
 /// never synthesizes partitioning or a collective. The parameter types of a kernel are physical, so `inputs` are the
-/// types of the values that the call receives.
+/// types of the values that the call receives. Every diagnostic names the input and what keeps it from being local.
 pub(crate) fn validate_kernel_sharding(
     inputs: &[ArrayType],
     bound_axes: &BTreeMap<String, MeshAxis>,
 ) -> Result<(), KernelEmbeddingError> {
+    let invalid = |message: String| KernelEmbeddingError::Invalid { message };
     for (index, input) in inputs.iter().enumerate() {
         let Some(sharding) = input.sharding() else { continue };
-        let invalid = || KernelEmbeddingError::Invalid {
-            message: format!(
-                "kernel input {index} requires a local shard with all partitioned axes bound by `shard_map`"
-            ),
-        };
         if !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty() {
-            return Err(invalid());
+            return Err(invalid(format!(
+                "kernel input {index} carries a pending reduction, which a kernel cannot complete"
+            )));
         }
         let mut axes = sharding.varying_manual_axes().clone();
         for dimension in sharding.dimensions() {
             match dimension {
                 ShardingDimension::Replicated => {}
                 ShardingDimension::Sharded(names) => axes.extend(names.iter().cloned()),
-                ShardingDimension::Unconstrained => return Err(invalid()),
+                ShardingDimension::Unconstrained => {
+                    return Err(invalid(format!(
+                        "kernel input {index} has an unconstrained dimension placement, so it is not known to be a \
+                         local shard"
+                    )));
+                }
             }
         }
-        if axes.iter().any(|axis| {
+        if let Some(axis) = axes.iter().find(|axis| {
             sharding.mesh().axis_type(axis) != Some(MeshAxisType::Manual)
-                || sharding.mesh().axis_index(axis).map(|index| &sharding.mesh().axes()[index]) != bound_axes.get(axis)
+                || sharding.mesh().axis_index(axis).map(|index| &sharding.mesh().axes()[index]) != bound_axes.get(*axis)
         }) {
-            return Err(invalid());
+            return Err(invalid(unbound_kernel_axis_message(index, axis)));
         }
     }
     Ok(())
+}
+
+/// Returns the diagnostic for kernel input `index` that is placed on or varies along the mesh axis `axis`, which no
+/// enclosing manual region binds. One device cannot run a kernel on such an input, because it holds only a part of
+/// it.
+pub(crate) fn unbound_kernel_axis_message(index: usize, axis: &str) -> String {
+    format!(
+        "kernel input {index} is placed on or varies along mesh axis `{axis}`, which no enclosing `shard_map` binds, \
+         so one device holds only a part of it. Replicate the input along `{axis}` before the call, or apply the \
+         kernel inside a `shard_map` over `{axis}`"
+    )
 }
 
 #[cfg(test)]
@@ -962,8 +1041,34 @@ pub(crate) mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            ProgramError::Type(TypeError::invalid("compiled kernel input types do not match its logical signature")),
+            ProgramError::Type(TypeError::invalid("`kernel_call` input types do not match its logical signature")),
         );
+
+        // A placed input binds too. The result aliases the input, so the custom call declares it with the type of the
+        // input, whether that is replicated on a mesh or a local shard that varies along a manual axis, and the
+        // traced program is well typed only if the call accepts its own alias.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh, 0);
+        for sharding in [replicated.clone(), replicated.with_varying_manual_axes(["device"]).unwrap()] {
+            let placed = ArrayIrType::Array(ArrayType::scalar(DataType::I32).with_sharding(sharding).unwrap());
+            let (output_types, program) = TracingContext::<Constant, Operation>::trace(
+                |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                    compiled.bind(inputs[0].context(), &inputs)
+                },
+                vec![placed.clone()],
+            )
+            .unwrap();
+            assert_eq!(output_types, vec![placed.clone()]);
+            let Operation::CustomCall(custom_call) = program.instructions()[0].operation() else {
+                panic!("expected a custom call");
+            };
+            let ArrayIrType::Array(placed) = placed else { unreachable!() };
+            assert_eq!(custom_call.output_types(), std::slice::from_ref(&placed));
+            assert_eq!(
+                CoreOperation::infer_output_types(custom_call, std::slice::from_ref(&placed), &[]),
+                Ok(vec![placed]),
+            );
+        }
     }
 
     #[test]
@@ -1048,28 +1153,41 @@ pub(crate) mod tests {
         validate_kernel_sharding(std::slice::from_ref(&local), &bound).unwrap();
         assert!(matches!(
             validate_kernel_sharding(std::slice::from_ref(&local), &BTreeMap::new()),
-            Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`",
+            Err(KernelEmbeddingError::Invalid { message }) if message == unbound_kernel_axis_message(0, "device"),
         ));
         let mismatched =
             BTreeMap::from([("device".to_owned(), MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap())]);
         assert!(matches!(
             validate_kernel_sharding(&[local], &mismatched),
-            Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`",
+            Err(KernelEmbeddingError::Invalid { message }) if message == unbound_kernel_axis_message(0, "device"),
         ));
         let replicated = ArrayType::new_static(DataType::F32, [8])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
         validate_kernel_sharding(&[replicated], &BTreeMap::new()).unwrap();
         let unconstrained = ArrayType::new_static(DataType::F32, [8])
-            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::Unconstrained]).unwrap())
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::Unconstrained]).unwrap())
             .unwrap();
         assert!(matches!(
             validate_kernel_sharding(&[unconstrained], &bound),
             Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`",
+                if message == "kernel input 0 has an unconstrained dimension placement, so it is not known to be a \
+                               local shard",
         ));
+        let pending = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["device"]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            validate_kernel_sharding(&[pending], &bound),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "kernel input 0 carries a pending reduction, which a kernel cannot complete",
+        ));
+        assert_eq!(
+            unbound_kernel_axis_message(0, "device"),
+            "kernel input 0 is placed on or varies along mesh axis `device`, which no enclosing `shard_map` binds, so \
+             one device holds only a part of it. Replicate the input along `device` before the call, or apply the \
+             kernel inside a `shard_map` over `device`",
+        );
         // Types cannot record placement over auto mesh axes, so no kernel parameter is partitioned over one.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let automatic = Sharding::new(mesh, vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap();

@@ -22,6 +22,9 @@ pub enum MlirTritonTtEnumAttribute {
 unsafe extern "C" {
     pub fn mlirGetDialectHandle__tt__() -> MlirDialectHandle;
 
+    pub fn mlirTypeIsATritonTtPackedFloat4E2M1Type(r#type: MlirType) -> bool;
+    pub fn mlirTritonTtPackedFloat4E2M1TypeGet(context: MlirContext) -> MlirType;
+
     pub fn mlirTypeIsATritonTtPointerType(r#type: MlirType) -> bool;
     pub fn mlirTritonTtPointerTypeGet(pointee_type: MlirType, address_space: i32) -> MlirType;
     pub fn mlirTritonTtPointerTypeGetPointeeType(r#type: MlirType) -> MlirType;

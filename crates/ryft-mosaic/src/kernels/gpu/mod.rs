@@ -311,6 +311,10 @@ impl CompiledKernel {
 }
 
 /// Stateless compiler for admitted portable kernels and exact Mosaic GPU extensions.
+///
+/// The configuration key identifies the pinned native sources, the target, the options, the schedule, and a SHA-256
+/// digest of every Rust source file of this adapter. Any edit to those files, including a formatting, documentation,
+/// or test edit, therefore changes the key and conservatively invalidates ahead-of-time bundles and tuning records.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Compiler;
 
@@ -350,8 +354,11 @@ impl<Extension: KernelExtension + Into<GpuOperation>> KernelCompiler<Extension> 
         options: &Options,
         schedule: &KernelSchedule,
     ) -> Result<Vec<u8>, KernelCompilationError<Error>> {
+        // The lowering digest identifies the Rust lowering and admission policy, so that ahead-of-time bundles and
+        // tuning records of a different lowering never match this key.
         Ok(format!(
-            "mosaic gpu 2; xla {}; jax {}; serde {}; resource {}; {target:?}; {options:?}; {schedule:?}",
+            "mosaic gpu 2; lowering {}; xla {}; jax {}; serde {}; resource {}; {target:?}; {options:?}; {schedule:?}",
+            lowering_sha256(),
             ryft_xla_sys::XLA_COMMIT,
             ryft_xla_sys::JAX_COMMIT,
             ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_SERDE_VERSION,
@@ -401,6 +408,38 @@ fn classify(error: Error) -> KernelCompilationError<Error> {
     }
 }
 
+/// Returns the hexadecimal SHA-256 digest of every Rust source file of this adapter, in a fixed order and each
+/// preceded by its byte length. These files (i.e., `gpu/mod.rs`, `gpu/lowering.rs`, every file of `gpu/lowering/`,
+/// `gpu/operations.rs`, `gpu/synchronization.rs`, and `gpu/tmem.rs`) determine the emitted module and its admission.
+///
+/// The compiler configuration key includes it, so that runtime-only records of a different lowering or admission
+/// policy (e.g., XLA ahead-of-time bundles and persisted tuning measurements) never match the current compiler,
+/// without a revision constant that must be changed by hand. The digest covers whole files, so formatting,
+/// documentation, and test edits also change it, which is the conservative direction. It does not cover dependencies
+/// such as `ryft-core`, `ryft-kernels`, and `ryft-mlir`.
+fn lowering_sha256() -> String {
+    let mut hash = Sha256::new();
+    for source in [
+        include_str!("mod.rs"),
+        include_str!("lowering.rs"),
+        include_str!("lowering/arrays.rs"),
+        include_str!("lowering/dimensions.rs"),
+        include_str!("lowering/memory.rs"),
+        include_str!("lowering/mma.rs"),
+        include_str!("lowering/module.rs"),
+        include_str!("lowering/nvfp4.rs"),
+        include_str!("lowering/tmem.rs"),
+        include_str!("lowering/validation.rs"),
+        include_str!("operations.rs"),
+        include_str!("synchronization.rs"),
+        include_str!("tmem.rs"),
+    ] {
+        hash.update((source.len() as u64).to_le_bytes());
+        hash.update(source);
+    }
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -408,7 +447,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, Context as CoreContext, DataType, DimensionBounds,
-        DimensionFromScalarOperation, DimensionVariable, ReferenceRead, ReferenceWrite, SqrtOperation,
+        DimensionFromScalarOperation, DimensionVariable, Memory, ReferenceRead, ReferenceWrite, SqrtOperation,
     };
     use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_version;
@@ -416,11 +455,11 @@ mod tests {
 
     use super::*;
 
-    /// Scalar read/write source exercising the actual functional alias and native duplicate-buffer contract.
-    fn scalar_definition() -> KernelDefinition {
+    /// Read/write source of `r#type` exercising the actual functional alias and native duplicate-buffer contract.
+    fn copy_definition(r#type: ArrayType) -> KernelDefinition {
         let operation = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),
-            vec![whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite).unwrap()],
+            vec![whole_array_parameter(r#type, KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
         KernelDefinition::trace(operation, |(references, _)| {
@@ -428,6 +467,11 @@ mod tests {
             Ok(())
         })
         .unwrap()
+    }
+
+    /// Scalar I32 read/write source exercising the actual functional alias and native duplicate-buffer contract.
+    fn scalar_definition() -> KernelDefinition {
+        copy_definition(ArrayType::scalar(DataType::I32))
     }
 
     /// Valid kernel that takes the square root of a scalar, which has no baseline scalar lowering.
@@ -592,6 +636,33 @@ mod tests {
     }
 
     #[test]
+    fn test_compiler_admit_unsupported_arrays() {
+        // Well formed arrays that this adapter does not implement are unsupported, so that an adapter selector can
+        // try its next adapter, while a malformed request remains invalid.
+        let target = Target::new(9, 0).unwrap();
+        let (options, schedule) = (Options::default(), KernelSchedule::default());
+        let definition = copy_definition(ArrayType::scalar(DataType::I16));
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(matches!(Compiler.admit(&verified, &target, &options, &schedule),
+            Err(KernelCompilationError::Unsupported { owner, operation: "array", requested, capability })
+                if owner == "ryft_mosaic::kernels::gpu"
+                    && requested == "supports only boolean, u8, f8e4m3fn, f8e8m0fnu, i32, u32, i64, u64, f16, bf16, \
+                                     f32, and f64 array elements"
+                    && capability == "Mosaic GPU lowering"));
+        let definition = copy_definition(ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: false }));
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(matches!(Compiler.admit(&verified, &target, &options, &schedule),
+            Err(KernelCompilationError::Unsupported { owner, operation: "array", requested, capability })
+                if owner == "ryft_mosaic::kernels::gpu"
+                    && requested == "requires device-resident arrays"
+                    && capability == "Mosaic GPU lowering"));
+        let definition = scalar_definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let (blackwell, wgmma) = (Target::new(12, 1).unwrap(), Options::default().with_mma(Mma::Wgmma));
+        assert_invalid_wgmma(Compiler.admit(&verified, &blackwell, &wgmma, &schedule));
+    }
+
+    #[test]
     fn test_compiler_configuration_key() {
         let target = Target::new(9, 0).unwrap();
         let options = Options::default();
@@ -650,6 +721,45 @@ mod tests {
                 &schedule
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compiler_configuration_key_lowering() {
+        // The key identifies every Rust source file of this adapter, in this order, so that an executable or tuning
+        // record of a different lowering or admission policy never matches it.
+        let mut hash = Sha256::new();
+        for source in [
+            include_str!("mod.rs"),
+            include_str!("lowering.rs"),
+            include_str!("lowering/arrays.rs"),
+            include_str!("lowering/dimensions.rs"),
+            include_str!("lowering/memory.rs"),
+            include_str!("lowering/mma.rs"),
+            include_str!("lowering/module.rs"),
+            include_str!("lowering/nvfp4.rs"),
+            include_str!("lowering/tmem.rs"),
+            include_str!("lowering/validation.rs"),
+            include_str!("operations.rs"),
+            include_str!("synchronization.rs"),
+            include_str!("tmem.rs"),
+        ] {
+            hash.update((source.len() as u64).to_le_bytes());
+            hash.update(source);
+        }
+        let (target, options, schedule) = (Target::new(9, 0).unwrap(), Options::default(), KernelSchedule::default());
+        let key = <Compiler as KernelCompiler>::configuration_key(&Compiler, &target, &options, &schedule).unwrap();
+        assert_eq!(
+            String::from_utf8(key).unwrap(),
+            format!(
+                "mosaic gpu 2; lowering {}; xla {}; jax {}; serde {}; resource {}; {target:?}; {options:?}; \
+                 {schedule:?}",
+                hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                ryft_xla_sys::XLA_COMMIT,
+                ryft_xla_sys::JAX_COMMIT,
+                MOSAIC_GPU_SERDE_VERSION,
+                ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_RESOURCE_SCHEMA_VERSION,
+            ),
         );
     }
 

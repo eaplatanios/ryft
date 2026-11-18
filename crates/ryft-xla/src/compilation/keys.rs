@@ -792,8 +792,8 @@ mod tests {
     };
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
-        Array, Constant, Dimension, Error, Operation, ProgramBuilder, RuntimeRequirement, Session, Value,
-        with_runtime_requirements,
+        Array, Constant, CustomCallOperationExtension, Dimension, Error, Operation, ProgramBuilder, RuntimeRequirement,
+        Session, Value,
     };
 
     use super::*;
@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lowered_program_compilation_key_includes_runtime_abi_and_configuration() {
+    fn test_lowered_program_compilation_key_includes_runtime_requirements() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client).with_device_mesh(mesh.clone());
@@ -859,29 +859,26 @@ mod tests {
         let lower = |requirements| {
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(array_type.clone().into());
-            let operation = with_runtime_requirements(
-                CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()]),
-                requirements,
-            )
-            .unwrap();
+            let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
+                .with_runtime_requirements(requirements)
+                .unwrap();
             let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap()
         };
-        let requirement =
-            |version, configuration| RuntimeRequirement::new("test.runtime", version, configuration).unwrap();
-        let first = lower(vec![requirement(1, vec![7])]);
-        let duplicate = lower(vec![requirement(1, vec![7]), requirement(1, vec![7])]);
-        let changed_abi = lower(vec![requirement(2, vec![7])]);
-        let changed_configuration = lower(vec![requirement(1, vec![8])]);
+        let requirement = RuntimeRequirement::new("test.runtime", 1).unwrap();
+        let first = lower(vec![requirement.clone()]);
+        let duplicate = lower(vec![requirement.clone(), requirement]);
+        let changed_abi = lower(vec![RuntimeRequirement::new("test.runtime", 2).unwrap()]);
+        let changed_identifier = lower(vec![RuntimeRequirement::new("test.other", 1).unwrap()]);
 
         assert_eq!(first.stable_hlo(), changed_abi.stable_hlo());
-        assert_eq!(first.stable_hlo(), changed_configuration.stable_hlo());
+        assert_eq!(first.stable_hlo(), changed_identifier.stable_hlo());
         assert_eq!(session.compilation_key(&first).unwrap(), session.compilation_key(&duplicate).unwrap());
         assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_abi).unwrap());
-        assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_configuration).unwrap());
+        assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_identifier).unwrap());
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::sessions::effects::EffectCallbackGuard;
 use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
-    RuntimeProvider, RuntimeRequirement, Target,
+    RuntimeProvider, RuntimeRequirement,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -708,17 +708,14 @@ impl RuntimeProvider for AssertionRuntimeProvider {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         validate_builtin_requirement(requirement, self.identifier())?;
-        let supported = target.platform_name().eq_ignore_ascii_case("cpu")
-            || (cfg!(any(feature = "cuda-12", feature = "cuda-13"))
-                && target.platform_name().eq_ignore_ascii_case("cuda"));
+        let platform_name = client.platform_name()?;
+        let supported = platform_name.eq_ignore_ascii_case("cpu")
+            || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
         if !supported {
-            return Err(
-                ExecutionError::UnsupportedAssertionPlatform { platform: target.platform_name().to_owned() }.into()
-            );
+            return Err(ExecutionError::UnsupportedAssertionPlatform { platform: platform_name.into_owned() }.into());
         }
         ensure_assertion_handler_registered(client)?;
         Ok(Arc::new(AssertionRuntime))
@@ -1665,7 +1662,7 @@ mod tests {
         boolean_vector, domain_mesh, f32_vector, read_i64s, replicated_scalar_type, session_with_client,
     };
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, Options, RuntimeError, to_mlir_module_for_program};
+    use crate::{Array, Constant, Options, to_mlir_module_for_program};
 
     use super::*;
 
@@ -2260,20 +2257,12 @@ mod tests {
     #[test]
     fn test_assertion_runtime_provider_initialize() {
         let client = execution_client();
-        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let requirement = builtin_requirement(ASSERT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
-        provider.initialize(client, &target, &requirement).unwrap();
-        provider.initialize(client, &target, &requirement).unwrap();
-
-        let requirement = RuntimeRequirement::new(ASSERT_CUSTOM_CALL_TARGET, 1, vec![1]).unwrap();
-        assert!(matches!(
-            provider.initialize(client, &target, &requirement),
-            Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
-                if identifier == ASSERT_CUSTOM_CALL_TARGET && reason == "built-in runtime configuration must be empty",
-        ));
+        provider.initialize(client, &requirement).unwrap();
+        provider.initialize(client, &requirement).unwrap();
     }
 
     #[test]

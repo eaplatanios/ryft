@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
 use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
-    Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, Target, ToPjrt,
-    named_ffi_type_id, with_runtime_requirements,
+    CustomCallOperationExtension, Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement,
+    ToPjrt,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -39,7 +39,7 @@ pub const CUDA_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.cuda";
 const CUDA_RUNTIME_TYPE_NAME: &str = "ryft.kernel.cuda.runtime";
 
 /// Explicit native type ID registered under [`CUDA_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
-const CUDA_RUNTIME_TYPE_ID: FfiTypeId = named_ffi_type_id(CUDA_RUNTIME_TYPE_NAME);
+const CUDA_RUNTIME_TYPE_ID: FfiTypeId = FfiTypeId::from_name(CUDA_RUNTIME_TYPE_NAME);
 
 impl From<ryft_cuda::Error> for Error {
     fn from(error: ryft_cuda::Error) -> Self {
@@ -375,7 +375,8 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
             operation = operation.with_input_output_alias(input, output)?;
         }
         if self.target_name == CUDA_KERNEL_CUSTOM_CALL_TARGET {
-            operation = with_runtime_requirements(operation, [builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)])
+            operation = operation
+                .with_runtime_requirements([builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)])
                 .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
         }
         Ok(operation)
@@ -514,6 +515,9 @@ impl CudaEnvelope {
 /// execution fences before dropping this object, so cached modules are released while the externally borrowed PJRT
 /// client is alive.
 struct CudaKernelRuntime {
+    /// PJRT client against which this runtime validates invocation meshes.
+    client: &'static Client<'static>,
+
     /// Existing driver owner, including its canonical bounded module cache and cleanup reporting.
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     launcher: CudaKernelLauncher,
@@ -521,7 +525,7 @@ struct CudaKernelRuntime {
 
 impl CudaKernelRuntime {
     /// Loads the driver and idempotently registers the shared handler for this CUDA plugin.
-    fn new(client: &Client<'_>) -> Result<Self, Error> {
+    fn new(client: &'static Client<'static>) -> Result<Self, Error> {
         #[cfg(not(any(feature = "cuda-12", feature = "cuda-13")))]
         {
             let _ = client;
@@ -540,14 +544,14 @@ impl CudaKernelRuntime {
                 FfiHandler::from(cuda_kernel_handler as XLA_FFI_Handler),
                 FfiHandlerTraits::NONE,
             )?;
-            Ok(Self { launcher })
+            Ok(Self { client, launcher })
         }
     }
 }
 
 impl RuntimeExtension for CudaKernelRuntime {
-    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
-        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
+    fn validate(&self, mesh: &DeviceMesh) -> Result<(), Error> {
+        crate::kernels::distributed::validate_kernel_participants(self.client, mesh)?;
         Ok(())
     }
 
@@ -569,11 +573,10 @@ impl RuntimeProvider for CudaRuntimeProvider {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         validate_builtin_requirement(requirement, self.identifier())?;
-        if !target.platform_name().eq_ignore_ascii_case("cuda") {
+        if !client.platform_name()?.eq_ignore_ascii_case("cuda") {
             return Err(Error::custom(KernelEmbeddingError::Invalid {
                 message: "cuda artifact calls require a cuda platform".to_owned(),
             }));
@@ -697,7 +700,7 @@ mod tests {
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::{Constant, Platform, ProgramBuilder, RuntimeError, runtime_requirements};
+    use crate::{Constant, Platform, ProgramBuilder, RuntimeError};
 
     use super::*;
 
@@ -826,7 +829,7 @@ mod tests {
         let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
         let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
         let compiled = CompiledKernel::from_output(&verified, b"ready configuration", &artifact, &embedding).unwrap();
-        assert!(runtime_requirements(compiled.custom_call()).unwrap().is_empty());
+        assert!(compiled.custom_call().runtime_requirements().unwrap().is_empty());
         let (decoded_embedding, decoded) =
             CudaKernelEmbedding::from_custom_call(&verified, compiled.custom_call()).unwrap();
         assert_eq!(decoded_embedding, embedding);
@@ -1194,18 +1197,14 @@ mod tests {
     #[test]
     fn test_cuda_runtime_provider_initialize() {
         let client = Platform::Cpu.client(None).unwrap();
-        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
-        let error = provider
-            .initialize(client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))
-            .err()
-            .unwrap();
+        let error = provider.initialize(client, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)).err().unwrap();
         assert!(
             matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
             if message == "cuda artifact calls require a cuda platform")
         );
-        let requirement = RuntimeRequirement::new(CUDA_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
-        assert!(matches!(provider.initialize(client, &target, &requirement),
+        let requirement = RuntimeRequirement::new(CUDA_KERNEL_CUSTOM_CALL_TARGET, 2).unwrap();
+        assert!(matches!(provider.initialize(client, &requirement),
             Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
                 if identifier == CUDA_KERNEL_CUSTOM_CALL_TARGET));
     }

@@ -14,8 +14,8 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
-    Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
-    RuntimeRequirement, Session, Target, Value, named_ffi_type_id, with_runtime_requirements,
+    CustomCallOperationExtension, Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension,
+    RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, Value,
 };
 
 /// Native target that consumes both independently installed states.
@@ -75,16 +75,15 @@ impl RuntimeProvider for StateProvider {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        assert!(target.platform_name().eq_ignore_ascii_case("cpu"));
-        assert_eq!(requirement, &RuntimeRequirement::new(self.identifier, 1, Vec::new()).unwrap());
+        assert!(client.platform_name()?.eq_ignore_ascii_case("cpu"));
+        assert_eq!(requirement, &RuntimeRequirement::new(self.identifier, 1).unwrap());
         // Both named types are part of this handler's ABI. Register them before installing the callback, while
         // keeping their live state in independently initialized providers and session-owned allocations.
         // Repeating these registrations for every session is idempotent because the IDs are explicit.
         for name in [LEFT, RIGHT] {
-            client.register_ffi_type(name, named_ffi_type_id(name), FfiTypeInformation::new(None))?;
+            client.register_ffi_type(name, FfiTypeId::from_name(name), FfiTypeInformation::new(None))?;
         }
         client.register_ffi_handler(
             TARGET,
@@ -94,7 +93,7 @@ impl RuntimeProvider for StateProvider {
         )?;
         let generation = self.statistics.initialized.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(Arc::new(State {
-            type_id: named_ffi_type_id(self.type_name),
+            type_id: FfiTypeId::from_name(self.type_name),
             value: self.weight * generation as i32,
             statistics: Arc::clone(&self.statistics),
         }))
@@ -118,7 +117,7 @@ fn add_states(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
     let context = frame.context()?;
     let mut increment = 0;
     for name in [LEFT, RIGHT] {
-        let data = context.user_data(named_ffi_type_id(name))?.data;
+        let data = context.user_data(FfiTypeId::from_name(name))?.data;
         if data.is_null() {
             return Err(FfiError::invalid_argument("missing runtime state"));
         }
@@ -207,8 +206,9 @@ fn staged(
     requirements: Vec<RuntimeRequirement>,
 ) -> CoreStagedFunction<Session, ArrayIrType, ArrayIrType> {
     let r#type = ArrayType::scalar(DataType::I32);
-    let operation =
-        with_runtime_requirements(CustomCallOperation::new(TARGET, vec![r#type.clone()]), requirements).unwrap();
+    let operation = CustomCallOperation::new(TARGET, vec![r#type.clone()])
+        .with_runtime_requirements(requirements)
+        .unwrap();
     CoreStagedFunction::stage(
         move |_, _, input| Ok(CustomCall::custom_call(&operation, [&input])?.remove(0)),
         Vec::new(),
@@ -220,7 +220,7 @@ fn staged(
 
 /// Returns the canonical source declarations required by the combined callback.
 fn requirements() -> Vec<RuntimeRequirement> {
-    vec![RuntimeRequirement::new(LEFT, 1, Vec::new()).unwrap(), RuntimeRequirement::new(RIGHT, 1, Vec::new()).unwrap()]
+    vec![RuntimeRequirement::new(LEFT, 1).unwrap(), RuntimeRequirement::new(RIGHT, 1).unwrap()]
 }
 
 /// Waits for the concrete scalar output, observing callback completion before any lifecycle assertions.
@@ -314,7 +314,7 @@ fn test_runtime_extensions_reject_duplicate_native_binding_before_submission() {
         .unwrap();
     let compiled = staged(mesh.clone(), requirements()).lower(&session).unwrap().compile(&session).unwrap();
     let input = session.array(ArrayType::scalar(DataType::I32), 7i32.to_ne_bytes()).unwrap();
-    let type_id = named_ffi_type_id(LEFT);
+    let type_id = FfiTypeId::from_name(LEFT);
     assert!(matches!(compiled.executable().execute(&session, Value::Array(input)),
         Err(Error::Runtime(RuntimeError::DuplicateUserData { type_id: actual })) if actual == i64::from(type_id)));
     assert_eq!(left.called.load(Ordering::SeqCst), 0);
@@ -337,10 +337,9 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
         fn initialize(
             &self,
             client: &'static Client<'static>,
-            target: &Target,
             requirement: &RuntimeRequirement,
         ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-            let _ = (client, target, requirement);
+            let _ = (client, requirement);
             Err(Error::custom(ProviderFailure))
         }
     }
@@ -348,7 +347,7 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
     let (client, mesh) = client_and_mesh();
     let configuration = RuntimeExtensions::empty().with_provider(Arc::new(FailingProvider)).unwrap();
     let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-    let requirement = RuntimeRequirement::new("ryft.test.runtime_extensions.failure", 1, Vec::new()).unwrap();
+    let requirement = RuntimeRequirement::new("ryft.test.runtime_extensions.failure", 1).unwrap();
     let error = staged(mesh, vec![requirement]).lower(&session).unwrap().compile(&session).err().unwrap();
     assert_eq!(error.downcast_custom::<ProviderFailure>(), Some(&ProviderFailure));
     assert_eq!(error.to_string(), "downstream provider is unavailable");

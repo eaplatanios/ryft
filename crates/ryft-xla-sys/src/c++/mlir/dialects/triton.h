@@ -29,6 +29,9 @@ enum MlirTritonTtEnumAttribute {
   MLIR_TRITON_TT_ENUM_ATTRIBUTE_SCALE_DOT_ELEM_TYPE = 11,
 };
 
+RYFT_XLA_SYS_EXPORT bool mlirTypeIsATritonTtPackedFloat4E2M1Type(MlirType type);
+RYFT_XLA_SYS_EXPORT MlirType mlirTritonTtPackedFloat4E2M1TypeGet(MlirContext context);
+
 RYFT_XLA_SYS_EXPORT bool mlirTypeIsATritonTtPointerType(MlirType type);
 RYFT_XLA_SYS_EXPORT MlirType mlirTritonTtPointerTypeGet(MlirType pointeeType, int32_t addressSpace);
 RYFT_XLA_SYS_EXPORT MlirType mlirTritonTtPointerTypeGetPointeeType(MlirType type);

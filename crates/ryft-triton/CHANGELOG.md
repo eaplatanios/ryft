@@ -5,6 +5,8 @@
 ### Added
 
 - Direct typed Triton lowering and native compiler invocation for portable Ryft kernels.
+- Insert a workgroup barrier when reading a slice after a whole write to the same write-only window in a straight-line
+  parallel grid.
 
 ### Changed
 

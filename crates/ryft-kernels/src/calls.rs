@@ -339,12 +339,14 @@ pub const KERNEL_KEY_VERSION: u32 = 1;
 ///
 /// The parameter and scalar prefetch types are physical and have no sharding, because a kernel runs on one device.
 /// Placement belongs to the call. An input may have a sharding that places it over a mesh and that records manual
-/// variation, as long as it carries no pending reduction and every such input uses the same mesh. The results have the
-/// declared types. A kernel cannot be assumed to produce the same result on every device, so when an input varies
-/// along manual axes, every result varies along them too and is placed replicated on the mesh of the inputs, which is
-/// also how a custom call types its results. No result keeps the dimension placement of an input, including the
-/// result of a read-write parameter. Whether a placed input is the local shard that one device can run the kernel on
-/// is decided where a kernel is compiled for a backend and not here.
+/// variation, as long as it carries no pending reduction and every such input uses the same mesh. A kernel cannot be
+/// assumed to produce the same result on every device, so when an input varies along manual axes, every result varies
+/// along them too. A write-only result has its declared type, placed replicated on the mesh of the inputs when it
+/// varies, which is how a custom call types a result without a declared sharding. The result of a read-write
+/// parameter is the storage of its input and has exactly the type of that input, which is what the alias of a custom
+/// call requires, so that input must itself vary along every manual axis along which another input varies. Whether a
+/// placed input is the local shard that one device can run the kernel on is decided where a kernel is compiled for a
+/// backend and not here.
 ///
 /// The call declares an [`EffectClass::OrderedAssertion`] of its own exactly when one of the following may fail:
 ///
@@ -567,13 +569,15 @@ impl KernelCallOperation {
     }
 
     /// Returns the result types of this call for the provided actual `input_types`, which may be placed (refer to the
-    /// type documentation). They are the declared result types, replicated on the mesh of the inputs and varying along
-    /// each manual axis along which an input varies when there is such an axis.
+    /// type documentation). The result of a read-write parameter has the type of its input. A write-only result has
+    /// its declared type, replicated on the mesh of the inputs and varying along each manual axis along which an input
+    /// varies when there is such an axis.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] when an input is not its declared array type up to its sharding, when an input carries
-    /// a pending reduction, or when placed inputs use different meshes.
+    /// a pending reduction, when placed inputs use different meshes, or when the input of a read-write parameter does
+    /// not vary along a manual axis along which another input varies.
     pub fn output_types_for(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError> {
         let mismatch = || {
             TypeError::invalid(format!("`{KERNEL_CALL_OPERATION_NAME}` input types do not match its logical signature"))
@@ -609,20 +613,44 @@ impl KernelCallOperation {
             mesh = Some(sharding.mesh());
             varying_axes.extend(sharding.varying_manual_axes().iter().cloned());
         }
-        let Some(mesh) = mesh.filter(|_| !varying_axes.is_empty()) else {
-            return Ok(self.output_types());
-        };
-        self.parameters
-            .iter()
-            .filter(|parameter| parameter.access != KernelParameterAccess::ReadOnly)
-            .map(|parameter| {
-                let sharding = Sharding::replicated(mesh.clone(), parameter.r#type.rank())
-                    .with_varying_manual_axes(varying_axes.clone())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                let r#type = parameter.r#type.clone().with_sharding(sharding);
-                Ok(ArrayIrType::Array(r#type.map_err(|error| TypeError::invalid(error.to_string()))?))
-            })
-            .collect()
+        let mut inputs = input_types.iter();
+        let mut outputs = Vec::new();
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            match parameter.access {
+                KernelParameterAccess::ReadOnly => {
+                    inputs.next();
+                }
+                KernelParameterAccess::ReadWrite => {
+                    // The result is the storage of the input, so it has the type of the input. The body may store a
+                    // value that differs on each device into that storage, which the input must therefore admit.
+                    let Some(ArrayIrType::Array(input)) = inputs.next() else { return Err(mismatch()) };
+                    let varies = |axis: &String| {
+                        input.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis))
+                    };
+                    if let Some(axis) = varying_axes.iter().find(|axis| !varies(axis)) {
+                        return Err(TypeError::invalid(format!(
+                            "`{KERNEL_CALL_OPERATION_NAME}` read-write parameter {index} receives `{input}`, which \
+                             does not vary along manual axis `{axis}` like another input, so its result could not \
+                             hold a value that differs on each device",
+                        )));
+                    }
+                    outputs.push(ArrayIrType::Array(input.clone()));
+                }
+                KernelParameterAccess::WriteOnly => {
+                    let sharding = mesh
+                        .filter(|_| !varying_axes.is_empty())
+                        .map(|mesh| {
+                            Sharding::replicated(mesh.clone(), parameter.r#type.rank())
+                                .with_varying_manual_axes(varying_axes.clone())
+                        })
+                        .transpose()
+                        .map_err(|error| TypeError::invalid(error.to_string()))?;
+                    let r#type = parameter.r#type.clone().with_sharding(sharding);
+                    outputs.push(ArrayIrType::Array(r#type.map_err(|error| TypeError::invalid(error.to_string()))?));
+                }
+            }
+        }
+        Ok(outputs)
     }
 
     /// Returns `(output, input)` alias candidates for read-write parameters, which are local to this operation. The
@@ -1971,23 +1999,36 @@ mod tests {
         let unplaced = ArrayIrType::Array(scalar.clone());
         assert_eq!(operation.output_types_for(&[unplaced.clone(), unplaced.clone()]), Ok(operation.output_types()));
 
-        // A placement alone does not reach the results, including the result of the read-write parameter that
-        // receives the placed input.
+        // The result of the read-write parameter is the storage of its input and has the type of that input, placement
+        // included. A placement alone does not reach the write-only result.
         assert_eq!(
             operation.output_types_for(&[unplaced.clone(), placed(replicated.clone())]),
+            Ok(vec![unplaced.clone(), placed(replicated.clone())]),
+        );
+        assert_eq!(
+            operation.output_types_for(&[placed(replicated.clone()), unplaced.clone()]),
             Ok(operation.output_types()),
         );
 
-        // Every result varies along the manual axes along which an input varies, including the results of parameters
-        // whose own inputs do not.
+        // Every result varies along the manual axes along which an input varies. The write-only result is replicated on
+        // the mesh of the inputs, and the read-write input must already vary, since its storage receives the result.
         assert_eq!(
-            operation.output_types_for(&[placed(varying.clone()), unplaced.clone()]),
+            operation.output_types_for(&[placed(varying.clone()), placed(varying.clone())]),
             Ok(vec![placed(varying.clone()), placed(varying.clone())]),
         );
         assert_eq!(
-            operation.output_types_for(&[placed(varying.clone()), placed(replicated.clone())]),
+            operation.output_types_for(&[unplaced.clone(), placed(varying.clone())]),
             Ok(vec![placed(varying.clone()), placed(varying.clone())]),
         );
+        for input in [unplaced.clone(), placed(replicated.clone())] {
+            assert_eq!(
+                operation.output_types_for(&[placed(varying.clone()), input.clone()]),
+                Err(TypeError::invalid(format!(
+                    "`kernel_call` read-write parameter 2 receives `{input}`, which does not vary along manual axis \
+                     `x` like another input, so its result could not hold a value that differs on each device",
+                ))),
+            );
+        }
 
         // Only the sharding of an input is free, a pending reduction is not a placement, and placed inputs share one
         // mesh.

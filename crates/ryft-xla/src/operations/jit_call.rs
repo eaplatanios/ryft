@@ -2331,8 +2331,8 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, read_f32s, session_with_client};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Options, StagedFunction, ToPjrt, Value, compile, stage,
-        to_mlir_module_for_program, with_runtime_requirements,
+        Array, ArrayConstant, CompiledFunction, Constant, CustomCallOperationExtension, Options, StagedFunction,
+        ToPjrt, Value, compile, stage, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -2785,11 +2785,9 @@ mod tests {
         let callee = |identifier| {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(array_type.clone().into());
-            let operation = with_runtime_requirements(
-                CustomCallOperation::new(identifier, vec![array_type.clone()]),
-                [builtin_requirement(identifier)],
-            )
-            .unwrap();
+            let operation = CustomCallOperation::new(identifier, vec![array_type.clone()])
+                .with_runtime_requirements([builtin_requirement(identifier)])
+                .unwrap();
             let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
             Arc::new(
                 builder

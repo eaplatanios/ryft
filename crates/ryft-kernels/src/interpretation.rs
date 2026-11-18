@@ -123,7 +123,7 @@ use ryft_core::{
     ArraySliceAxis, ArrayType, AttachedRegions, Context, DataType, DimensionValue, Domain, EagerContext,
     EagerInterpretationDriver, InstructionId, InterpretableOperation, InterpretationDriver, Operation, ProgramError,
     Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, ReferenceWriteOperation,
-    RegionDriver, RegionInterpreter, RegionRef, TypeError, Typed, TypedProgram, ValueResolution,
+    RegionArena, RegionDriver, RegionInterpreter, RegionRef, TypeError, Typed, TypedProgram, ValueResolution,
     validated_reference_access_descriptors,
 };
 use thiserror::Error;
@@ -637,15 +637,28 @@ impl KernelCallOperation {
             let specialized = definition.specialize_prefetch(&prefetched).map_err(ProgramError::custom)?;
             let regions = AttachedRegions::from(vec![specialized.body().clone()]);
             let driver = EagerInterpretationDriver::new(&regions);
-            return specialized.operation().interpret_with_budget(
-                context,
-                &driver,
-                &inputs[..ordinary_count],
-                maximum_programs,
-                maximum_steps,
-                trace,
-                order,
-            );
+            // The specialized call types its results from the ordinary inputs alone, so the results take the types
+            // inferred from all inputs, which also vary along the manual axes along which only a prefetch varies.
+            return specialized
+                .operation()
+                .interpret_with_budget(
+                    context,
+                    &driver,
+                    &inputs[..ordinary_count],
+                    maximum_programs,
+                    maximum_steps,
+                    trace,
+                    order,
+                )?
+                .into_iter()
+                .zip(&output_types)
+                .map(|(value, r#type)| {
+                    let (ArrayIrValue::Array(array), ArrayIrType::Array(r#type)) = (value, r#type) else {
+                        unreachable!("kernel results are arrays");
+                    };
+                    Self::with_sharding_of(array, r#type).map(ArrayIrValue::Array)
+                })
+                .collect();
         }
         let extents = self
             .grid()
@@ -780,6 +793,7 @@ impl KernelCallOperation {
                 eager: *context,
                 validity,
                 references: references.clone(),
+                arena: body.arena(),
                 instruction: Rc::new(Cell::new(None)),
                 coordinate,
                 maximum_steps,
@@ -847,7 +861,7 @@ impl KernelCallOperation {
 
     /// Returns `array` with the sharding of `type` over the same storage, which moves no data, because a host array
     /// stores the same bytes under every placement.
-    fn with_sharding_of(array: Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
+    pub(super) fn with_sharding_of(array: Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
         if array.r#type().sharding() == r#type.sharding() {
             return Ok(array);
         }
@@ -901,8 +915,15 @@ struct QualifiedKernelContext<Extension: Operation<Type = ArrayIrType>> {
     /// Validated summary of the attached body, which classifies every swap as a store or an exchange.
     references: Rc<KernelReferenceSummary>,
 
+    /// Arena of the attached body, whose instruction identities are the only ones that [`Self::references`]
+    /// classifies. A region that a rule creates belongs to another arena, whose numerical instruction identities may
+    /// coincide with those of the body. The body stays borrowed for the whole invocation, so no other live arena shares
+    /// its address.
+    arena: *const RegionArena<ArrayIrValue<Array>, KernelOperation<Extension>>,
+
     /// Body instruction whose replay step is in progress. The first swap bound during that step takes it to look up
-    /// the validated lowering, so a swap that a rule binds on its own behalf never inherits a store lowering.
+    /// the validated lowering, so a swap that a rule binds on its own behalf never inherits a store lowering. It is
+    /// [`None`] while an instruction of another arena replays, so such a swap always exchanges.
     instruction: Rc<Cell<Option<InstructionId>>>,
 
     /// Logical program being replayed for diagnostics.
@@ -1031,9 +1052,9 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
         Ok(pending_copies.remove(&token.id()))
     }
 
-    /// Replays `region` one instruction at a time, recording each instruction so that [`Context::bind`] can apply
-    /// its validated swap lowering. The enclosing instruction is restored afterwards, because a nested region runs
-    /// within the step of the instruction that attaches it.
+    /// Replays `region` one instruction at a time, recording each instruction of the attached body arena so that
+    /// [`Context::bind`] can apply its validated swap lowering. The enclosing instruction is restored afterwards,
+    /// because a nested region runs within the step of the instruction that attaches it.
     fn replay_region(
         &self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
@@ -1048,9 +1069,10 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
             >,
     {
         let enclosing = self.instruction.get();
+        let verified = std::ptr::eq(region.arena(), self.arena);
         let mut interpreter = RegionInterpreter::new(self.clone(), region, inputs)?;
         for index in 0..region.instructions().len() {
-            self.instruction.set(Some(InstructionId::new(region.id(), index)));
+            self.instruction.set(verified.then(|| InstructionId::new(region.id(), index)));
             interpreter = interpreter.step()?;
         }
         self.instruction.set(enclosing);
@@ -1457,11 +1479,12 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, CompareOperation,
         ComparisonDirection, ConditionOperation, Dimension, DimensionAddOperation, DimensionBounds,
-        DimensionMulOperation, DimensionToScalarOperation, DimensionType, DotOperation, Layout, Memory, NotOperation,
-        Placeholder, ProgramBuilder, ReduceOperation, ReductionKind, ReferenceAccessDescriptor,
-        ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceRoot,
-        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, RegionInterface, ScaledDotOperation,
-        StridedLayout, TracingContext, WhileOperation,
+        DimensionMulOperation, DimensionToScalarOperation, DimensionType, DotOperation, Layout, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, NotOperation, Placeholder, ProgramBuilder, ReduceOperation, ReductionKind,
+        ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceRoot, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+        ReferenceWriteOperation, RegionInterface, ScaledDotOperation, Sharding, StridedLayout, TracingContext,
+        WhileOperation,
     };
 
     use crate::authoring::{MappingExpression, ParameterWindow, mapped_call, whole_array_parameter};
@@ -3481,6 +3504,141 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_with_trace_rule_region_swaps() {
+        // Swaps 7 into a private reference that contains 99 inside a condition region that its rule creates, and
+        // returns the old value. That region belongs to another arena than the body, but it shares the numerical
+        // instruction identity of the first body instruction, so a dead swap there must not lower this live swap.
+        #[derive(Clone, Debug)]
+        struct PrivateSwapExtension;
+
+        impl Operation for PrivateSwapExtension {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "test_private_swap"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))])
+            }
+        }
+
+        impl ReferenceAccessOperation for PrivateSwapExtension {
+            type Transform = ArrayReferenceTransform;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<ArrayReferenceTransform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "test extension has no reference accesses".to_owned(),
+                })
+            }
+        }
+
+        impl KernelExtension for PrivateSwapExtension {
+            fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+                Ok(KernelExtensionMemory::Synchronous)
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<PrivateSwapExtension>>>
+            for PrivateSwapExtension
+        {
+            fn interpret<
+                D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<PrivateSwapExtension>>>,
+            >(
+                &self,
+                context: &EagerContext<ArrayIrValue<Array>, KernelOperation<PrivateSwapExtension>>,
+                driver: &D,
+                _inputs: &[ArrayIrValue<Array>],
+            ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+                let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<PrivateSwapExtension>>::new();
+                let reference =
+                    branch.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32))));
+                let value = branch.add_constant(ArrayIrValue::Array(Array::scalar(7i32)?));
+                let old = branch
+                    .add_instruction(ReferenceSwapOperation::new(), vec![], vec![reference, value], None)?
+                    .to_vec();
+                let branch = branch.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    old,
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )?;
+                let inputs = [
+                    ArrayIrValue::Array(Array::scalar(true)?),
+                    ArrayIrValue::Reference(ArrayReference::new(Array::scalar(99i32)?)),
+                ];
+                let condition = KernelOperation::Portable(ArrayIrOperation::Condition(ConditionOperation::new()));
+                driver.bind(context, condition, AttachedRegions::from(vec![branch.clone(), branch]), &inputs)
+            }
+        }
+
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        for dead_swap in [false, true] {
+            let definition =
+                KernelDefinition::<PrivateSwapExtension>::trace(call.clone(), |(references, _coordinates)| {
+                    let context = references[0].context();
+                    let value = context.lift(ArrayIrValue::Array(Array::scalar(5i32)?))?;
+                    if dead_swap {
+                        context.bind(ReferenceSwapOperation::new(), vec![], &[references[0].clone(), value])?;
+                    } else {
+                        references[0].write(&value)?;
+                    }
+                    let old = context.bind(KernelOperation::Extension(PrivateSwapExtension), vec![], &[])?.remove(0);
+                    references[1].write(&old)
+                })
+                .unwrap();
+            let expected = vec![Array::scalar(5i32).unwrap(), Array::scalar(99i32).unwrap()];
+            assert_eq!(definition.interpret(vec![], 1), Ok(expected.clone()));
+            let mut trace = Vec::new();
+            assert_eq!(
+                definition.interpret_with_trace(vec![], &KernelDebugOptions::default(), &mut trace),
+                Ok(expected),
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .map(|entry| {
+                        let modes = entry.accesses().iter().map(KernelTraceAccess::mode).collect::<Vec<_>>();
+                        (entry.operation(), modes)
+                    })
+                    .collect::<Vec<_>>(),
+                vec![
+                    (if dead_swap { "reference_swap" } else { "reference_write" }, vec![ReferenceAccessMode::Write]),
+                    ("test_private_swap", vec![]),
+                    ("condition", vec![]),
+                    ("reference_swap", vec![ReferenceAccessMode::ReadWrite]),
+                    ("reference_write", vec![ReferenceAccessMode::Write]),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn test_kernel_call_operation_interpret() {
         let definition = definition(true, true);
         let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
@@ -3509,12 +3667,69 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_call_operation_interpret_prefetch_placement() {
+        // Copies a scalar prefetch into a write-only result. Only the prefetch varies along the manual axis `x`, so the
+        // call types its result as varying along `x`, although specialization binds the physical prefetch value.
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
+        let mapping = BlockMapping::new(
+            mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
+            vec![],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let call = KernelCallOperation::new_with_prefetch(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly, mapping)
+                    .unwrap(),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace_with_prefetch(call, |(references, _, values)| references[0].write(&values[0]))
+                .unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap();
+        let input_type = ArrayType::scalar(DataType::I32).with_sharding(Some(sharding)).unwrap();
+        let bytes = Array::scalar(3i32).unwrap().logical_bytes();
+        let input = ArrayIrValue::Array(Array::from_logical_bytes(input_type.clone(), &bytes).unwrap());
+        let output_types = definition.operation().output_types_for(&[ArrayIrType::Array(input_type.clone())]).unwrap();
+        let [ArrayIrType::Array(output_type)] = output_types.as_slice() else { unreachable!() };
+        assert!(output_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains("x")));
+        let expected = vec![ArrayIrValue::Array(Array::from_logical_bytes(output_type.clone(), &bytes).unwrap())];
+
+        // Eager replay of the call.
+        let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
+        assert_eq!(
+            context
+                .bind(definition.operation().clone(), vec![definition.body().clone()], std::slice::from_ref(&input),),
+            Ok(expected.clone()),
+        );
+
+        // Replay of an enclosing program, which checks the result against the type that the call inferred.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let argument = builder.add_input(ArrayIrType::Array(input_type));
+        let region = builder.import_region(definition.body().entry_region_ref());
+        let outputs = builder
+            .add_instruction(KernelOperation::Call(definition.operation().clone()), vec![region], vec![argument], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.interpret(vec![input]), Ok(expected));
+    }
+
+    #[test]
     fn test_qualified_kernel_context_bind_async_completion() {
         // Construct the private context directly to verify the runtime defense independently of static rejection.
         let context = QualifiedKernelContext::<NoKernelExtension> {
             eager: EagerContext::new(),
             validity: BTreeMap::new(),
             references: Rc::new(definition(false, false).references().clone()),
+            arena: std::ptr::null(),
             instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 10,
@@ -3551,6 +3766,7 @@ mod tests {
             eager: EagerContext::new(),
             validity: BTreeMap::new(),
             references: Rc::new(definition(false, false).references().clone()),
+            arena: std::ptr::null(),
             instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 10,
@@ -3596,6 +3812,7 @@ mod tests {
             eager: EagerContext::new(),
             validity: BTreeMap::new(),
             references: Rc::new(definition(false, false).references().clone()),
+            arena: std::ptr::null(),
             instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 100,
@@ -3671,6 +3888,7 @@ mod tests {
             eager: EagerContext::new(),
             validity: BTreeMap::from([(reference.id(), validity)]),
             references: Rc::new(definition(false, false).references().clone()),
+            arena: std::ptr::null(),
             instruction: Rc::new(Cell::new(None)),
             coordinate: vec![],
             maximum_steps: 10,

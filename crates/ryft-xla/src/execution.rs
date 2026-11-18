@@ -377,10 +377,7 @@ impl std::fmt::Debug for ExecutionArguments {
 impl Session {
     /// Initializes required extensions on the invoking session before compilation or native loading.
     pub(super) fn ensure_runtime_requirements(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
-        if requirements.is_empty() {
-            return Ok(());
-        }
-        self.runtimes().ensure(requirements, self.target()?)
+        self.runtimes().ensure(requirements)
     }
 
     /// Validates that this session's PJRT client owns `program`.
@@ -1138,7 +1135,7 @@ impl Session {
                 "injected failure before execution submission".to_string(),
             )));
         }
-        let resources = self.runtimes().prepare(program.runtime_requirements(), self.target()?, program.mesh())?;
+        let resources = self.runtimes().prepare(program.runtime_requirements(), program.mesh())?;
         let (context, retained_resources) = resources.into_parts();
         // These leases stay in this stack frame on every error path. PJRT destroys the context before returning an
         // error, and if submission succeeded it first waits for every device, so the leases outlive all native use.

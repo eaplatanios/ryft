@@ -71,3 +71,15 @@ error: kernel slices cannot be sliced again
    |
 90 |     output.store(head.slice([0..1]).load());
    |                  ^^^^^^^^^^^^^^^^^^
+
+error: kernel locals cannot shadow an existing binding
+   --> tests/kernels/error_bodies.rs:101:9
+    |
+101 |     let r#source = second;
+    |         ^^^^^^^^
+
+error: kernel locals cannot shadow an existing binding
+   --> tests/kernels/error_bodies.rs:113:9
+    |
+113 |     let source = second;
+    |         ^^^^^^

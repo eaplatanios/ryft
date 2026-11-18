@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the `transform` dialect.
 - Added support for the `ub` dialect.
 - Added support for the `vector` dialect.
-- Added support for the Triton `tt` dialect.
+- Added support for the Triton `tt` and `ttg` dialects.
 - Added support for the Mosaic GPU dialect.
 - Added support for the Mosaic TPU dialect.
 - Added support for the `erf` operation from the `chlo` dialect.

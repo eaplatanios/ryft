@@ -29,11 +29,12 @@ The lowerer supports masked loads/stores, indexed and tiled references, arithmet
 broadcasting, transpose, power-of-two reshape, FP32 sum reduction, IEEE FP32 matrix multiplication, static parallel
 grids and bounded control flow. Physical power-of-two padding is masked before reductions and contractions.
 
-Zero-element physical parameters, read-write aliases, unspecialized scalar prefetch, sequential grid axes, dynamic
-array extents, unsupported sharding,
-atomics, barriers, asynchronous copies, scratch-memory operations, block-scaled dot and backend extensions are
-rejected. CUDA retains checked-dimension assertions; AMD assertion hostcalls are rejected because their runtime
-service has not been qualified. Batched indexed references use the existing portable transform. Custom derivative,
+In a straight-line parallel grid, the lowerer can read a slice after a whole write to the same write-only window.
+It inserts a workgroup barrier that orders global reads and writes. Other access patterns still follow the promotion
+and admission rules in the lowerer. Zero-element physical parameters, unspecialized scalar prefetch, dynamic array
+extents, unsupported sharding, asynchronous copies, scratch-memory operations, block-scaled dot and backend extensions
+are rejected. CUDA retains checked-dimension assertions. AMD assertion hostcalls remain outside the qualified runtime
+contract. Batched indexed references use the existing portable transform. Custom derivative,
 rematerialization, tuning and distributed composition remain subject to the same canonical verification and target
 admission; selecting Triton does not add a new transform policy or silently select another backend.
 

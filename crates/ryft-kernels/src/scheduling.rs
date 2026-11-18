@@ -62,7 +62,7 @@ use ryft_core::{
 };
 use thiserror::Error;
 
-use crate::calls::KernelDefinition;
+use crate::calls::{KernelCallOperation, KernelDefinition};
 use crate::grids::{Grid, GridExecution};
 use crate::initialization::{KernelInitializationError, validated_kernel_references};
 use crate::interpretation::{KernelDebugOptions, KernelTraceEntry};
@@ -170,18 +170,37 @@ where
         options: &KernelDebugOptions,
         maximum_interleavings: usize,
     ) -> Result<Vec<KernelInterleaving>, ProgramError> {
-        self.operation().infer_output_types(
+        let output_types = self.operation().infer_output_types(
             &inputs.iter().map(|input| ArrayIrType::Array(input.r#type().into_owned())).collect::<Vec<_>>(),
             std::slice::from_ref(self.body().entry_region_ref().interface()),
         )?;
         let prefetch_count = self.operation().prefetch_types().len();
         if prefetch_count != 0 {
-            let prefetched = inputs.split_off(inputs.len() - prefetch_count);
-            return self.specialize_prefetch(&prefetched).map_err(ProgramError::custom)?.interpret_interleavings(
-                inputs,
-                options,
-                maximum_interleavings,
-            );
+            // Specialization binds the physical prefetch values, as in ordinary interpretation. The specialized call
+            // types its results from the ordinary inputs alone, so the results take the types inferred from all inputs.
+            let prefetched = inputs
+                .split_off(inputs.len() - prefetch_count)
+                .into_iter()
+                .zip(self.operation().prefetch_types())
+                .map(|(array, r#type)| KernelCallOperation::with_sharding_of(array, r#type))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut interleavings = self
+                .specialize_prefetch(&prefetched)
+                .map_err(ProgramError::custom)?
+                .interpret_interleavings(inputs, options, maximum_interleavings)?;
+            for interleaving in &mut interleavings {
+                if let Ok(results) = &mut interleaving.result {
+                    *results = std::mem::take(results)
+                        .into_iter()
+                        .zip(&output_types)
+                        .map(|(array, r#type)| {
+                            let ArrayIrType::Array(r#type) = r#type else { unreachable!("kernel results are arrays") };
+                            KernelCallOperation::with_sharding_of(array, r#type)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+            }
+            return Ok(interleavings);
         }
         if self
             .body()
@@ -354,8 +373,12 @@ impl Grid {
 /// instruction without attached regions binds no other operation, so its cost is exactly one step, and an extension
 /// operation costs its [`KernelExtension::replay_cost`], which must bound its failing bindings as well. An order that
 /// fails stops early, so it takes fewer steps. Extensions of unknown cost are not admitted, because their rules may
-/// bind further operations whose number is unknown before they run.
+/// bind further operations whose number is unknown before they run. A grid without points takes no steps, whatever
+/// the costs of its instructions.
 fn replay_steps(costs: impl IntoIterator<Item = usize>, points: usize) -> Result<usize, KernelSchedulingError> {
+    if points == 0 {
+        return Ok(0);
+    }
     costs
         .into_iter()
         .try_fold(1usize, |steps, cost| steps.checked_add(cost))
@@ -371,10 +394,10 @@ mod tests {
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType,
         AttachedRegions, CompareOperation, ComparisonDirection, ConditionOperation, Context, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, InterpretationDriver, Placeholder, ProgramBuilder, Provenance,
-        ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAtomicAddUpdate,
-        ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceWrite, RegionInterface, SelectOperation,
-        SubOperation, TypeError,
+        DimensionBounds, DimensionType, DimensionValue, InterpretationDriver, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, ProgramBuilder, Provenance, ReferenceAccessDescriptor, ReferenceAccessOperation,
+        ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceWrite, RegionInterface,
+        SelectOperation, Sharding, SubOperation, TypeError,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -823,6 +846,142 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_interleavings_empty_grid() {
+        // Declares the conservative replay cost `usize::MAX` and is never bound, because the grid has no points.
+        #[derive(Clone, Debug)]
+        struct UnboundedExtension;
+
+        impl Operation for UnboundedExtension {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "test_unbounded"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(vec![])
+            }
+        }
+
+        impl ReferenceAccessOperation for UnboundedExtension {
+            type Transform = ArrayReferenceTransform;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<ArrayReferenceTransform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "test extension has no reference accesses".to_owned(),
+                })
+            }
+        }
+
+        impl KernelExtension for UnboundedExtension {
+            fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+                Ok(KernelExtensionMemory::Synchronous)
+            }
+
+            fn replay_cost(&self) -> Option<usize> {
+                Some(usize::MAX)
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<UnboundedExtension>>>
+            for UnboundedExtension
+        {
+            fn interpret<
+                D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<UnboundedExtension>>>,
+            >(
+                &self,
+                _context: &EagerContext<ArrayIrValue<Array>, KernelOperation<UnboundedExtension>>,
+                _driver: &D,
+                _inputs: &[ArrayIrValue<Array>],
+            ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+                Err(ProgramError::UnsupportedOperation { message: "unbounded extension is never bound".to_owned() })
+            }
+        }
+
+        let call = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(0), GridExecution::Parallel)]).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<UnboundedExtension>>::new();
+        builder.add_input(call.coordinate_types()[0].clone().into());
+        builder
+            .add_instruction(KernelOperation::Extension(UnboundedExtension), vec![], vec![], None)
+            .unwrap();
+        let definition =
+            KernelDefinition::new(call, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
+        let options = KernelDebugOptions::default().with_maximum_steps(0);
+        let mut trace = Vec::new();
+        assert_eq!(definition.interpret_with_trace(vec![], &options, &mut trace), Ok(vec![]));
+        assert_eq!(trace, Vec::<KernelTraceEntry>::new());
+        let interleavings = definition.interpret_interleavings(vec![], &options, 1).unwrap();
+        assert_eq!(interleavings.len(), 1);
+        assert_eq!(interleavings[0].result(), &Ok(vec![]));
+        assert_eq!(interleavings[0].trace(), &[]);
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_interleavings_prefetch_placement() {
+        // Copies a scalar prefetch into a write-only result. Ordinary interpretation accepts a prefetch that is placed
+        // on a mesh, so exploration does as well, and its results take the types that the call infers from all of its
+        // inputs (e.g., a result that varies along `x` when only the prefetch varies along `x`).
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
+        let mapping = BlockMapping::new(
+            mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
+            vec![],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let call = KernelCallOperation::new_with_prefetch(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly, mapping)
+                    .unwrap(),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace_with_prefetch(call, |(references, _, values)| references[0].write(&values[0]))
+                .unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh, 0);
+        let bytes = Array::scalar(3i32).unwrap().logical_bytes();
+        let options = KernelDebugOptions::default();
+        for sharding in [replicated.clone(), replicated.with_varying_manual_axes(["x"]).unwrap()] {
+            let input_type = ArrayType::scalar(DataType::I32).with_sharding(Some(sharding)).unwrap();
+            let input = Array::from_logical_bytes(input_type.clone(), &bytes).unwrap();
+            let output_types = definition.operation().output_types_for(&[ArrayIrType::Array(input_type)]).unwrap();
+            let [ArrayIrType::Array(output_type)] = output_types.as_slice() else { unreachable!() };
+            let expected = vec![Array::from_logical_bytes(output_type.clone(), &bytes).unwrap()];
+            assert_eq!(definition.interpret(vec![input.clone()], 1), Ok(expected.clone()));
+            let interleavings = definition.interpret_interleavings(vec![input], &options, 1).unwrap();
+            assert_eq!(interleavings.len(), 1);
+            assert_eq!(interleavings[0].result(), &Ok(expected));
+        }
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_interleavings_element_atomics() {
         // Both programs select the whole vector, and their atomic updates index the same single element of it.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -975,7 +1134,7 @@ mod tests {
         assert_eq!(replay_steps([usize::MAX - 1], 1), Ok(usize::MAX));
         assert_eq!(replay_steps([1], usize::MAX), Err(KernelSchedulingError::StepCountOverflow));
         assert_eq!(replay_steps([usize::MAX], 1), Err(KernelSchedulingError::StepCountOverflow));
-        assert_eq!(replay_steps([usize::MAX], 0), Err(KernelSchedulingError::StepCountOverflow));
-        assert_eq!(replay_steps([usize::MAX - 1, 1], 0), Err(KernelSchedulingError::StepCountOverflow));
+        assert_eq!(replay_steps([usize::MAX], 0), Ok(0));
+        assert_eq!(replay_steps([usize::MAX - 1, 1], 0), Ok(0));
     }
 }

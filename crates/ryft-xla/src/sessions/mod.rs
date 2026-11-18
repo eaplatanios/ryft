@@ -4406,10 +4406,10 @@ pub(crate) mod tests {
         let client = execution_client();
         let requirement = builtin_requirement("ryft.ordered-io");
         let session = session_with_client(client);
-        session.runtimes().ensure(std::slice::from_ref(&requirement), session.target().unwrap()).unwrap();
+        session.runtimes().ensure(std::slice::from_ref(&requirement)).unwrap();
         let session = Session::builder().client(client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
         assert!(matches!(
-            session.runtimes().ensure(&[requirement], session.target().unwrap()),
+            session.runtimes().ensure(&[requirement]),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "ryft.ordered-io",
         ));
     }

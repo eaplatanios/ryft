@@ -10,9 +10,9 @@ use pretty_assertions::assert_eq;
 use core_alias::{
     Abs, AddOperation, Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, Ceil,
     ComparisonDirection, Condition, Context, ConvertElementType, Cos, DataType, Erf, Exp, ExpM1, Floor, Ln1p, Log,
-    LogAddExp, Logistic, Max, Min, Neg, NestedTracingContext, Pow, ProjectedValue, Reduce, ReductionKind,
-    ReferenceAtomicAddUpdate, ReferenceRead, ReferenceWrite, Rem, Round, Rsqrt, Sign, Sin, Sqrt, Tan, Tanh, Tracer,
-    TracingContext, TypeError,
+    LogAddExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, Neg, NestedTracingContext, Pow, ProjectedValue,
+    Reduce, ReductionKind, ReferenceAtomicAddUpdate, ReferenceRead, ReferenceWrite, Rem, Round, Rsqrt, Sharding, Sign,
+    Sin, Sqrt, Tan, Tanh, Tracer, TracingContext, TypeError,
 };
 use kernels_alias::{
     BoundaryPolicy, Grid, GridDimension, GridExecution, KernelDefinition, KernelError, KernelOperation,
@@ -433,6 +433,35 @@ fn rebound_slice_condition(
     output.slice([0..1]).store(inside);
     output.slice([1..2]).store(element.load());
     output.slice([2..3]).store(source.slice([1..2]).load());
+}
+
+/// Loads the first element of `first` through a slice of a local that is declared with a raw identifier and sliced
+/// through its ordinary spelling, and through a slice of a mutable local that is declared with an ordinary identifier,
+/// sliced through its raw spelling, and rebound to `second` through its raw spelling after the slice is declared,
+/// followed by the first element of `second` through the rebound local.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn raw_identifier_slices(
+    #[input(data_type = I32, rank = 1)] first: &Array,
+    #[input(data_type = I32, rank = 1)] second: &Array,
+    #[output(data_type = I32, shape = [3])] output: &mut Array,
+) {
+    let r#source = first;
+    let element = source.slice([0..1]);
+    let mut target = first;
+    let saved = r#target.slice([0..1]);
+    r#target = second;
+    output.slice([0..1]).store(element.load());
+    output.slice([1..2]).store(saved.load());
+    output.slice([2..3]).store(target.slice([0..1]).load());
+}
+
+/// Copies a vector.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn copy(
+    #[input(data_type = I32, rank = 1)] input: &Array,
+    #[output(data_type = I32, shape = [input.shape()[0]])] output: &mut Array,
+) {
+    output.store(input.load());
 }
 
 /// Combines constant vectors of 3 elements.
@@ -1277,6 +1306,29 @@ fn test_kernel_slices_rebound_source() {
         rebound_slice_condition(&Array::scalar(false).unwrap(), &first, &second),
         Ok(Array::vector(vec![9i32, 8, 9]).unwrap()),
     );
+
+    // Raw and ordinary spellings of an identifier name the same binding, so both reach the declared source, and
+    // shadowing a binding through the other spelling is rejected like any other shadowing.
+    let first = Array::vector(vec![8i32]).unwrap();
+    let second = Array::vector(vec![9i32]).unwrap();
+    assert_eq!(raw_identifier_slices(&first, &second), Ok(Array::vector(vec![8i32, 8, 9]).unwrap()));
+}
+
+#[test]
+fn test_kernel_callable_placed_inputs() {
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+    let r#type = ArrayType::new_static(DataType::I32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+    let placed = Array::from_elements(r#type, &[3i32, 5]).unwrap();
+    let unplaced = Array::vector(vec![3i32, 5]).unwrap();
+
+    // The definition is built for the physical parameter types, and the call receives the placed argument, so the
+    // callable returns what calling the physical definition with that argument returns.
+    let definition = copy::definition(&ArrayType::new_static(DataType::I32, [2])).unwrap();
+    assert_eq!(definition.interpret(vec![placed.clone()], 16), Ok(vec![unplaced.clone()]));
+    assert_eq!(copy(&placed), Ok(unplaced.clone()));
+
+    // Unplaced calls are unchanged.
+    assert_eq!(copy(&unplaced), Ok(unplaced.clone()));
 }
 
 #[test]

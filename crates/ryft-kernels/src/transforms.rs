@@ -12,10 +12,10 @@
 //! batch coordinate along that dimension. The body keeps its instructions and attached regions. Every reference
 //! access of a mapped parameter receives a leading static index into its size one window, so the body reaches the
 //! original referents through folded access paths, and all other instructions are copied unchanged. Unmapped
-//! read-only parameters remain shared by all batch items. The batch dimension of a sharded parameter is placed as the
-//! packed inputs place their batch axes (refer to [`KernelDefinition::batched_inputs`]), so the batched call accepts
-//! the packed inputs unchanged and its results carry the same placement. A batch placement on mesh axes is rejected,
-//! because the window of one batch item cannot keep it.
+//! read-only parameters remain shared by all batch items. Parameter types are physical, so the batch dimension has no
+//! placement, and the batched call accepts the packed inputs however their batch axes are placed (refer to
+//! [`KernelCallOperation`]). The result of a read-write parameter has the type of its packed input, and a write-only
+//! result has no placement.
 //!
 //! Batching rejects the inputs for which this rewrite is not sound, with a [`KernelTransformError::Unsupported`]
 //! that names the rejected contract.
@@ -248,8 +248,8 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
     ///
     /// The packed inputs may be placed. Their unbatched types must be the declared input types up to their shardings,
     /// and the batched call accepts the packed inputs as they are, because the parameter types of a kernel are
-    /// physical and placement belongs to the call. The results are typed by the batched call, so they have no
-    /// placement of their own.
+    /// physical and placement belongs to the call. The results are typed by the batched call. A read-write result
+    /// has the type of its packed input, and a write-only result has no placement.
     ///
     /// # Errors
     ///
@@ -700,7 +700,8 @@ mod tests {
     #[test]
     fn test_kernel_definition_batched_inputs_placed() {
         // The kernel is physical, and the packed inputs are placed over a mesh in three different ways. The batched
-        // call accepts them as they are, and its results have no placement.
+        // call accepts them as they are. The read-write result is the storage of its packed input and keeps that
+        // type, and the write-only result has no placement.
         let definition = copy_definition();
         let item = sharded_type(&[2], vec![ShardingDimension::sharded(["y"])]);
         let shared = Array::from_elements(item, &[5.0f32, 6.0]).unwrap();
@@ -710,7 +711,7 @@ mod tests {
             let accumulator_type =
                 sharded_type(&[2, 2], vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded([axis])]);
             let input = Array::from_elements(input_type, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
-            let accumulator = Array::from_elements(accumulator_type, &[0.0f32; 4]).unwrap();
+            let accumulator = Array::from_elements(accumulator_type.clone(), &[0.0f32; 4]).unwrap();
             let inputs = [
                 ArrayIrBatch::new(ArrayIrValue::Array(input.clone()), Some(0)).unwrap(),
                 ArrayIrBatch::new(ArrayIrValue::Array(shared.clone()), None).unwrap(),
@@ -733,8 +734,8 @@ mod tests {
             );
 
             // The host interpreter executes the placed arrays as ordinary host arrays.
-            let copied = Array::from_elements(matrix.clone(), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
-            let accumulated = Array::from_elements(matrix, &[5.0f32, 5.0, 6.0, 6.0]).unwrap();
+            let copied = Array::from_elements(matrix, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+            let accumulated = Array::from_elements(accumulator_type, &[5.0f32, 5.0, 6.0, 6.0]).unwrap();
             let outputs = batched.interpret(vec![input.clone(), shared.clone(), accumulator], 4).unwrap();
             assert_eq!(outputs, vec![copied.clone(), accumulated.clone()]);
 

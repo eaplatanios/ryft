@@ -504,15 +504,20 @@ fn checked_work(work: usize, additional: usize, maximum: usize) -> Result<usize,
 }
 
 /// Checks native layouts and representability without constructing MLIR.
+///
+/// A well formed array that this adapter does not implement (i.e., one with a dynamic shape, host memory, a sharding,
+/// an unsupported element type, or a layout other than untiled dense row-major) is [`Error::Unsupported`], so that an
+/// adapter selector can try another adapter. An array beyond the native index limits is [`Error::Invalid`].
 pub(super) fn checked_array(r#type: &ArrayType) -> Result<(), Error> {
+    let unsupported = |reason: &str| Error::Unsupported { operation: "array", reason: reason.to_owned() };
     let Some(shape) = r#type.static_shape() else {
-        return Err(Error::Invalid { message: "mosaic GPU requires static array shapes".to_owned() });
+        return Err(unsupported("requires static array shapes"));
     };
     if r#type.memory() != Memory::Device {
-        return Err(Error::Invalid { message: "mosaic GPU requires device-resident arrays".to_owned() });
+        return Err(unsupported("requires device-resident arrays"));
     }
     if r#type.sharding().is_some() {
-        return Err(Error::Invalid { message: "mosaic GPU requires unsharded kernel-local array types".to_owned() });
+        return Err(unsupported("requires unsharded kernel-local array types"));
     }
     if !matches!(
         r#type.data_type(),
@@ -529,10 +534,10 @@ pub(super) fn checked_array(r#type: &ArrayType) -> Result<(), Error> {
             | DataType::F32
             | DataType::F64
     ) {
-        return Err(Error::Invalid {
-            message: "mosaic GPU supports only boolean, u8, f8e4m3fn, f8e8m0fnu, i32, u32, i64, u64, f16, bf16, f32, and f64 array elements"
-                .to_owned(),
-        });
+        return Err(unsupported(
+            "supports only boolean, u8, f8e4m3fn, f8e8m0fnu, i32, u32, i64, u64, f16, bf16, f32, and f64 array \
+             elements",
+        ));
     }
     if shape.dimensions().iter().any(|extent| *extent > i32::MAX as usize) {
         return Err(Error::Invalid { message: "array extent exceeds the native signed index range".to_owned() });
@@ -542,7 +547,7 @@ pub(super) fn checked_array(r#type: &ArrayType) -> Result<(), Error> {
             if layout.tiles().is_empty()
                 && layout.minor_to_major().iter().copied().eq((0..r#type.rank()).rev()));
         if !valid {
-            return Err(Error::Invalid { message: "mosaic GPU requires untiled dense row-major arrays".to_owned() });
+            return Err(unsupported("requires untiled dense row-major arrays"));
         }
     }
     let addressing = ArrayAddressing::new(r#type.clone())?;
@@ -922,10 +927,14 @@ mod tests {
         let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
         checked_array(&matrix).unwrap();
         let column_major = matrix.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        assert!(matches!(checked_array(&column_major), Err(Error::Invalid { message })
-            if message == "mosaic GPU requires untiled dense row-major arrays"));
+        assert!(matches!(checked_array(&column_major), Err(Error::Unsupported { operation: "array", reason })
+            if reason == "requires untiled dense row-major arrays"));
         assert!(matches!(checked_array(&matrix.with_memory(Memory::Host { pinned: false })),
-            Err(Error::Invalid { message }) if message == "mosaic GPU requires device-resident arrays"));
+            Err(Error::Unsupported { operation: "array", reason }) if reason == "requires device-resident arrays"));
+        assert!(matches!(checked_array(&ArrayType::scalar(DataType::I16)),
+            Err(Error::Unsupported { operation: "array", reason })
+                if reason == "supports only boolean, u8, f8e4m3fn, f8e8m0fnu, i32, u32, i64, u64, f16, bf16, f32, \
+                              and f64 array elements"));
         assert!(matches!(checked_array(&ArrayType::new_static(DataType::F32, [i32::MAX as usize, 2])),
             Err(Error::Invalid { message }) if message == "array storage exceeds native index limits"));
     }

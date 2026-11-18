@@ -137,6 +137,7 @@ HEADERS = [
     "src/c++/mlir/dialects/sparse_tensor.h",
     "src/c++/mlir/dialects/transform.h",
     "src/c++/mlir/dialects/triton.h",
+    "src/c++/mlir/dialects/triton_gpu.h",
     "src/c++/mlir/dialects/ub.h",
     "src/c++/profiler.h",
     "src/c++/triton_compiler.h",

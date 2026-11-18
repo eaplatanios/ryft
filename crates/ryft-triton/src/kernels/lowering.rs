@@ -78,8 +78,10 @@
 //! one thread stores it (i.e., `emitRedundantThreadPredicate` in the store lowering), and the membar analysis inserts
 //! barriers for shared memory only. A load that follows a store of the same element may therefore run in another
 //! thread before that store, and two stores of one element in different threads may land in either order. Only a
-//! `ttg.barrier` with global address spaces (i.e., what `tl.debug_barrier` emits) would order them, and `ryft-mlir`
-//! does not expose the TritonGPU dialect. The software pipeliner adds a hazard of its own. Under the default two
+//! `ttg.barrier` with global address spaces (i.e., what `tl.debug_barrier` emits) would order them. The lowerer
+//! inserts one for a whole write followed by a sliced read of the same write-only window in a straight-line
+//! parallel grid. Every thread reaches that barrier and the verifier proves that different workgroups have disjoint
+//! mutable windows. The software pipeliner adds a hazard of its own. Under the default two
 //! pipeline stages, it issues the loads that feed a dot in an innermost `scf.for` one iteration early, without any
 //! alias analysis against the stores of the loop, and it never pipelines `scf.while`.
 //!
@@ -125,7 +127,7 @@ use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayType, Atom, AtomId, ComparisonDirection, DOT_OPERATION_NAME, DataType,
     Dimension, DimensionOperation, DimensionValue, DotAlgorithm, DotAlgorithmPreset, DotDimensionNumbers,
-    DotInputPrecision, DotOperation, DotPrecision, InstructionId, Layout, MAX_DIMENSION_EXTENT, Memory,
+    DotInputPrecision, DotOperation, DotPrecision, EffectClass, InstructionId, Layout, MAX_DIMENSION_EXTENT, Memory,
     Operation as CoreOperation, ReductionKind, ReferenceAccess, ReferenceAccessMode, ReferenceAccessOperation,
     ReferenceRoot, RegionRef, Typed, infer_reference_view_type, validated_reference_access_descriptors,
 };
@@ -134,7 +136,7 @@ use ryft_kernels::{
     KernelParameterAccess, KernelReferenceSummary, KernelSchedule, KernelSwapLowering, TILE_LOAD_OPERATION_NAME,
     TileLoadOperation, VerifiedKernel,
 };
-use ryft_mlir::dialects::triton::tt;
+use ryft_mlir::dialects::triton::{tt, ttg};
 use ryft_mlir::dialects::{arith, scf};
 use ryft_mlir::{
     Block, Context, DetachedBlock, DetachedOp, DialectHandle, Module, Operation, Size, Type, TypeRef,
@@ -223,6 +225,16 @@ struct Promotion {
     axis: usize,
 }
 
+/// Memory-ordering decisions for one verified kernel body.
+#[derive(Default)]
+struct MemoryOrdering {
+    /// Windows that live in SSA values.
+    promotions: Vec<Promotion>,
+
+    /// Entry-region reads that must follow a workgroup barrier.
+    barriers_before: HashSet<InstructionId>,
+}
+
 /// Current SSA value of the window of a promoted parameter.
 #[derive(Copy, Clone)]
 struct PromotedWindow<'c, 't> {
@@ -250,6 +262,9 @@ struct Lowering<'c, 't> {
     /// Promoted windows that [`validate_memory_ordering`] admitted.
     promotions: Vec<Promotion>,
 
+    /// Instructions that require a workgroup barrier before their memory access.
+    barriers_before: HashSet<InstructionId>,
+
     /// Promoted windows whose scope encloses the current point of construction, in the order in which they started.
     windows: Vec<PromotedWindow<'c, 't>>,
 }
@@ -262,11 +277,17 @@ pub(super) fn lower<'c, 't>(
     _schedule: &KernelSchedule,
 ) -> Result<Lowered<'c, 't>, Error> {
     let call = kernel.definition().operation();
-    let promotions = validate_memory_ordering(kernel)?;
+    let MemoryOrdering { promotions, barriers_before } = validate_memory_ordering(kernel)?;
     if !call.prefetch_types().is_empty() {
         return Err(unsupported("kernel_call", "scalar prefetch must be specialized before Triton compilation"));
     }
     context.load_dialect(DialectHandle::triton_tt()?)?;
+    if !barriers_before.is_empty() {
+        context.load_dialect(
+            DialectHandle::triton_ttg()
+                .map_err(|_| unsupported("reference_read", "the linked native archive lacks TritonGPU barriers"))?,
+        )?;
+    }
     context.load_dialect(DialectHandle::arith()?)?;
     context.load_dialect(DialectHandle::scf()?)?;
     let location = context.unknown_location();
@@ -277,6 +298,7 @@ pub(super) fn lower<'c, 't>(
         remaining: options.maximum_instructions(),
         maximum_tile_elements: options.maximum_tile_elements(),
         promotions,
+        barriers_before,
         windows: Vec::new(),
     };
     lowering.charge(call.parameters().len() + call.grid().dimensions().len())?;
@@ -1033,8 +1055,16 @@ impl<'c, 't> Lowering<'c, 't> {
         // loaded value or memory effect. Atom and binding identities are local to this region, and the complete
         // ordered path is part of the key; separate region invocations construct independent caches and native SSA.
         let mut views = HashMap::<_, Reference<'c, 't>>::new();
-        for instruction in region.instructions() {
+        for (index, instruction) in region.instructions().iter().enumerate() {
             self.charge(1)?;
+            if self.barriers_before.contains(&InstructionId::new(region.id(), index)) {
+                self.charge(1)?;
+                block.append_operation(ttg::barrier(
+                    ttg::BarrierAddressSpaces::GLOBAL_READ | ttg::BarrierAddressSpaces::GLOBAL_WRITE,
+                    ttg::BarrierScope::Cta,
+                    self.location,
+                )?)?;
+            }
             let mut inputs =
                 instruction.inputs().iter().map(|id| values[id.index()].clone().unwrap()).collect::<Vec<_>>();
             let operation = instruction.operation();
@@ -1630,7 +1660,7 @@ impl<'c, 't> Lowering<'c, 't> {
 
 /// Rejects every body whose memory accesses need ordering between the threads of one program and returns the windows
 /// that the lowering promotes to SSA values instead, which the module documentation describes.
-fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion>, Error> {
+fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<MemoryOrdering, Error> {
     let call = kernel.definition().operation();
     let body = kernel.definition().body().entry_region_ref();
     let references = kernel.definition().references();
@@ -1639,7 +1669,7 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion
     // A grid with a zero extent runs the body at no grid point, and the single program that its launch still runs
     // masks every memory access by its inactive grid point, so no access needs ordering and nothing is promoted.
     if call.grid().dimensions().iter().any(|dimension| matches!(dimension.extent(), Dimension::Static(0))) {
-        return Ok(Vec::new());
+        return Ok(MemoryOrdering::default());
     }
 
     // Direct accesses by instruction, in program order within each region, together with the roots of the body that
@@ -1663,7 +1693,11 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion
         Ok(body.with_id(instruction.region())?.instructions()[instruction.index()].operation().name())
     };
 
-    let mut promotions = Vec::new();
+    let mut ordering = MemoryOrdering::default();
+    let straight_line_parallel =
+        !kernel.definition().body().effects().classes().contains(EffectClass::OrderedAssertion)
+            && call.grid().dimensions().iter().all(|dimension| dimension.execution() == GridExecution::Parallel)
+            && body.instructions().iter().all(|instruction| instruction.regions().is_empty());
     let mut read_write = HashSet::new();
     for (index, (parameter, summary)) in call.parameters().iter().zip(references.parameters()).enumerate() {
         let Some(summary) = summary else { continue };
@@ -1698,6 +1732,31 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion
         }
         if read_write_parameter && let Some(name) = partial {
             return Err(unsupported(name, "read-write parameters must be accessed through their whole window"));
+        }
+
+        // A straight-line workgroup executes both accesses. An assertion could end a thread before the barrier.
+        if straight_line_parallel
+            && !read_write_parameter
+            && let [(write, write_access), (read, read_access)] = parameter_accesses.as_slice()
+            && write.region() == body.id()
+            && read.region() == body.id()
+            && write.index() < read.index()
+            && matches!(
+                body.instructions()[write.index()].operation(),
+                KernelOperation::Portable(ArrayIrOperation::ReferenceWrite(_))
+            )
+            && matches!(
+                body.instructions()[read.index()].operation(),
+                KernelOperation::Portable(ArrayIrOperation::ReferenceRead(_))
+            )
+            && references.path(*write, write_access.input_index()).is_some_and(|path| path.is_root())
+            && references.path(*read, read_access.input_index()).is_some_and(|path| {
+                let mut transforms = path.transforms();
+                matches!(transforms.next(), Some(ArrayReferenceTransform::Slice { .. })) && transforms.next().is_none()
+            })
+        {
+            ordering.barriers_before.insert(*read);
+            continue;
         }
 
         // The first reason, if any, why accessing the window through memory would need ordering.
@@ -1772,7 +1831,7 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion
                         axis = position + 1;
                     }
                 }
-                promotions.push(Promotion { parameter: index, axis });
+                ordering.promotions.push(Promotion { parameter: index, axis });
             }
         }
         if read_write_parameter {
@@ -1780,7 +1839,7 @@ fn validate_memory_ordering(kernel: &VerifiedKernel<'_>) -> Result<Vec<Promotion
         }
     }
     validate_read_write_values(body, None, &accesses, references, &read_write)?;
-    Ok(promotions)
+    Ok(ordering)
 }
 
 /// Rejects every value read from a read-write parameter in `region` that may reach memory other than elementwise
@@ -2018,11 +2077,13 @@ fn unsupported(operation: &'static str, reason: &str) -> Error {
 
 /// Rejects `accesses` whose correctness depends on ordering between the threads of one program.
 fn unordered(operation: &'static str, accesses: &str) -> Error {
-    unsupported(operation, &format!("{accesses} need a CTA barrier, which ryft-mlir does not expose"))
+    unsupported(operation, &format!("{accesses} need a CTA barrier outside the supported access pattern"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
@@ -2031,11 +2092,13 @@ mod tests {
         ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, TypeError,
     };
     use ryft_kernels::{
-        Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess, MappingExpression,
-        ParameterWindow, compare, kernel, mapped_call, masked_load, masked_load_or, masked_store, masked_swap,
-        whole_array_parameter, window_mask,
+        Grid, GridDimension, KernelCallOperation, KernelCompiler, KernelDefinition, KernelParameterAccess,
+        MappingExpression, ParameterWindow, compare, kernel, mapped_call, masked_load, masked_load_or, masked_store,
+        masked_swap, whole_array_parameter, window_mask,
     };
     use ryft_mlir::{OpRef, Region, WalkOrder, WalkResult};
+
+    use crate::kernels::{Artifact, Compiler, Target};
 
     use super::*;
 
@@ -2085,6 +2148,7 @@ mod tests {
             remaining: 100,
             maximum_tile_elements: 1024,
             promotions: Vec::new(),
+            barriers_before: HashSet::new(),
             windows: Vec::new(),
         };
         let arguments = types
@@ -2304,6 +2368,17 @@ mod tests {
     ) {
         output.store(input.load());
         output.slice([0..1]).store(input.slice([0..1]).load() + input.slice([0..1]).load());
+    }
+
+    /// Reads half of a write-only window after initializing the whole window.
+    #[kernel(crate = "ryft_kernels", requires = input.shape()[0] == 256)]
+    fn read_written_slice(
+        #[input(data_type = F32, rank = 1)] input: &Array,
+        #[output(data_type = F32, shape = [256])] intermediate: &mut Array,
+        #[output(data_type = F32, shape = [128])] output: &mut Array,
+    ) {
+        intermediate.store(input.load());
+        output.store(intermediate.slice([64..192]).load());
     }
 
     /// Reads `values` before a loop that stores twice that value into `values` in every iteration.
@@ -4370,9 +4445,54 @@ mod tests {
             rejection(&definition),
             (
                 "reference_write",
-                "repeated writes of one window need a CTA barrier, which ryft-mlir does not expose".to_owned(),
+                "repeated writes of one window need a CTA barrier outside the supported access pattern".to_owned(),
             ),
         );
+    }
+
+    #[test]
+    fn test_lower_read_written_slice() {
+        let definition = read_written_slice::definition(&ArrayType::new_static(DataType::F32, [256])).unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let ordering = validate_memory_ordering(&verified).unwrap();
+        assert!(ordering.promotions.is_empty());
+        assert_eq!(ordering.barriers_before.len(), 1);
+
+        let context = Context::new();
+        let lowered = lower(&context, &verified, &Options::default(), &KernelSchedule::default());
+        if DialectHandle::triton_ttg().is_err() {
+            assert!(matches!(lowered, Err(Error::Unsupported { operation: "reference_read", reason })
+                if reason == "the linked native archive lacks TritonGPU barriers"));
+            return;
+        }
+        let module = lowered.unwrap().module.to_string();
+        assert_eq!(module.matches("ttg.barrier").count(), 1);
+        assert!(module.find("tt.store").unwrap() < module.find("ttg.barrier").unwrap());
+        assert!(module.find("ttg.barrier").unwrap() < module.rfind("tt.load").unwrap());
+    }
+
+    #[test]
+    fn test_lower_read_written_slice_native() {
+        if std::env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let definition = read_written_slice::definition(&ArrayType::new_static(DataType::F32, [256])).unwrap();
+        let kernel = VerifiedKernel::new(&definition, 1).unwrap();
+        let compiler = Compiler::new();
+        let options = Options::default();
+        for stages in [1, 2, 3] {
+            let schedule = KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(stages).unwrap());
+            let cuda = compiler.compile(&kernel, &Target::Cuda { major: 12, minor: 1 }, &options, &schedule).unwrap();
+            let Artifact::Cuda(artifact) = cuda.artifact() else { panic!("expected a CUDA artifact") };
+            let ptx = std::str::from_utf8(artifact.bytes()).unwrap();
+            assert!(ptx.contains("bar.sync") || ptx.contains("barrier.sync"));
+
+            let rocm = compiler
+                .compile(&kernel, &Target::Rocm { architecture: "gfx942".into() }, &options, &schedule)
+                .unwrap();
+            let Artifact::Rocm(artifact) = rocm.artifact() else { panic!("expected a ROCm artifact") };
+            assert_eq!(artifact.parameter_count(), 3);
+        }
     }
 
     #[test]
@@ -4384,7 +4504,7 @@ mod tests {
             rejection(&definition),
             (
                 "kernel_call",
-                "windows that repeat along a sequential grid axis need a CTA barrier, which ryft-mlir does not expose"
+                "windows that repeat along a sequential grid axis need a CTA barrier outside the supported access pattern"
                     .to_owned(),
             ),
         );
@@ -4440,7 +4560,7 @@ mod tests {
             rejection(&definition),
             (
                 "kernel_call",
-                "atomic and other accesses of one parameter need a CTA barrier, which ryft-mlir does not expose"
+                "atomic and other accesses of one parameter need a CTA barrier outside the supported access pattern"
                     .to_owned(),
             ),
         );
@@ -5435,6 +5555,7 @@ mod tests {
                 remaining: 100,
                 maximum_tile_elements: 1024,
                 promotions: Vec::new(),
+                barriers_before: HashSet::new(),
                 windows: Vec::new(),
             };
             let mut block = context.block_with_no_arguments();
@@ -5457,6 +5578,7 @@ mod tests {
             remaining: 100,
             maximum_tile_elements: 1024,
             promotions: Vec::new(),
+            barriers_before: HashSet::new(),
             windows: Vec::new(),
         };
         let mut block = context.block_with_no_arguments();
@@ -5749,6 +5871,7 @@ mod tests {
             remaining: 100,
             maximum_tile_elements: 1024,
             promotions: Vec::new(),
+            barriers_before: HashSet::new(),
             windows: Vec::new(),
         };
         let mut block = context.block_with_no_arguments();
@@ -5806,6 +5929,7 @@ mod tests {
             remaining: 100,
             maximum_tile_elements: 1024,
             promotions: Vec::new(),
+            barriers_before: HashSet::new(),
             windows: Vec::new(),
         };
         assert_eq!(lowering.physical(&[0, 3]).unwrap(), vec![1, 4]);
@@ -5827,6 +5951,7 @@ mod tests {
             remaining: 2,
             maximum_tile_elements: 1024,
             promotions: Vec::new(),
+            barriers_before: HashSet::new(),
             windows: Vec::new(),
         };
         lowering.charge(2).unwrap();

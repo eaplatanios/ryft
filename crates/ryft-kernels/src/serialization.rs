@@ -77,10 +77,11 @@
 //! reduced axes), the requested output shardings of reduce, dot, reshape, broadcast, gather, and scatter, sharding
 //! changes and constraints, dropout, and guards have exact structural key-only records, and named composites are keyed
 //! by their exact composite keys. A sharding keeps its mesh axis names, because shardings and collectives refer to mesh
-//! axes by name. The local identities of a guard are numbered in the identity table of the document, like all other
-//! identities. The retained rule state of named composites and the remaining operations are transitionally keyed by
-//! their [`Debug`](std::fmt::Debug) renderings, after renaming the nominal identities of the document to canonical
-//! names. Each such fallback is marked with a `TODO` that names what the wire form must cover to replace it.
+//! axes by name. The declared identities of a guard are local to it, so they are numbered in an identity table of the
+//! guard, while its retained identities are numbered in the identity table of the document. The retained rule state
+//! of named composites and the remaining operations are transitionally keyed by their [`Debug`](std::fmt::Debug)
+//! renderings, after renaming the nominal identities of the document to canonical names. Each such fallback is marked
+//! with a `TODO` that names what the wire form must cover to replace it.
 //!
 //! # Untrusted Input
 //!
@@ -1168,6 +1169,12 @@ enum WireOperation {
 
         /// Required handling of a tile that crosses the array boundary.
         boundary_policy: WireBoundaryPolicy,
+
+        /// Whether the load keeps its runtime window check (refer to
+        /// [`TileLoadOperation::requires_runtime_assertion`]). A load without the check is rebuilt from its input
+        /// types, which must prove every window valid.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        requires_runtime_assertion: bool,
     },
 
     /// [`ScratchOperation`].
@@ -2406,7 +2413,10 @@ struct WireGuard {
     /// Name of the guarded boundary, which compiled checks may report.
     boundary: String,
 
-    /// Declared input types, whose guard-local identities refer to the identity table of the document.
+    /// Identity table local to the guard, in registration order, which holds exactly its declared identities.
+    variables: Vec<WireVariable>,
+
+    /// Declared input types, whose identities refer to the identity table of the guard.
     declared_types: Vec<WireType>,
 
     /// Index of each retained identity in the identity table of the document, in retention order.
@@ -2996,8 +3006,10 @@ impl Encoder {
         })
     }
 
-    /// Encodes a shape without converting the nominal identities of its dimensions to diagnostic text.
+    /// Encodes a shape without converting the nominal identities of its dimensions to diagnostic text. Transport mode
+    /// applies the record budget to its dimensions, which the reader applies to every shape.
     fn shape(&mut self, shape: &Shape) -> Result<Vec<WireDimension>, KernelSerializationError> {
+        self.validate_records(shape.dimensions().len())?;
         shape.dimensions().iter().map(|dimension| self.dimension(dimension)).collect()
     }
 
@@ -3184,6 +3196,7 @@ impl Encoder {
             KernelOperation::TileLoad(operation) => WireOperation::TileLoad {
                 block_shape: operation.block_shape().to_vec(),
                 boundary_policy: operation.boundary_policy().into(),
+                requires_runtime_assertion: operation.requires_runtime_assertion(),
             },
             KernelOperation::AsyncCopy(_) => WireOperation::AsyncCopy,
             KernelOperation::Wait(_) => WireOperation::Wait,
@@ -3832,9 +3845,10 @@ impl Encoder {
 
     /// Encodes a guard of either family through the exact key-only record that `record` constructs in key mode, and
     /// rejects it in transport mode. `declared_type` encodes one declared type of the family. The declared identities
-    /// of a guard are local to it and its renaming leaves them unchanged, so the record numbers them in the identity
-    /// table of the document, like those of atom types, which preserves the relationships that they express without
-    /// depending on their names.
+    /// of a guard are local to it and its renaming leaves them unchanged, so the record numbers them in an identity
+    /// table of its own, which preserves the relationships that they express without depending on their names or on
+    /// whether other guards declare the same identities. Its retained identities belong to the surrounding program, so
+    /// the record numbers them in the identity table of the document.
     fn guard<T: Type<Identity = DimensionVariable>>(
         &mut self,
         portable: &ArrayIrOperation<Array>,
@@ -3857,13 +3871,21 @@ impl Encoder {
                 portable.name(),
             )));
         }
+        // The declared identities are numbered in a table of their own, which the document table is swapped out for
+        // while the declared types are encoded and restored before any error is returned.
+        let variables = std::mem::take(&mut self.variables);
+        let identities = std::mem::take(&mut self.identities);
+        let declared_types = operation
+            .declared_types()
+            .iter()
+            .map(|r#type| declared_type(self, r#type))
+            .collect::<Result<Vec<_>, _>>();
+        let declared_variables = std::mem::replace(&mut self.variables, variables);
+        self.identities = identities;
         Ok(WireOperation::KeyOnly(record(WireGuard {
             boundary: operation.boundary().to_owned(),
-            declared_types: operation
-                .declared_types()
-                .iter()
-                .map(|r#type| declared_type(self, r#type))
-                .collect::<Result<_, _>>()?,
+            variables: declared_variables,
+            declared_types: declared_types?,
             retained_identities: operation
                 .retained_identities()
                 .iter()
@@ -4106,7 +4128,9 @@ impl Decoder {
             )
             .into(),
             WireOperation::DimensionToScalar => ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation).into(),
-            WireOperation::TileLoad { block_shape, boundary_policy } => {
+            // The load is decoded with its runtime window check. The instruction decoder removes the check of a record
+            // without it once the reference transforms of the load are attached, because the proof depends on them.
+            WireOperation::TileLoad { block_shape, boundary_policy, requires_runtime_assertion: _ } => {
                 TileLoadOperation::new(block_shape, boundary_policy.into()).map_err(ProgramError::from)?.into()
             }
             WireOperation::Scratch { referent, alignment } => {
@@ -4443,6 +4467,10 @@ impl Decoder {
                 .map(|instruction| {
                     let input_types =
                         instruction.inputs.iter().map(|&index| atoms[index].r#type().into_owned()).collect::<Vec<_>>();
+                    let unchecked_tile_load = matches!(
+                        instruction.operation,
+                        WireOperation::TileLoad { requires_runtime_assertion: false, .. },
+                    );
                     let mut operation = self.operation(instruction.operation, &input_types)?;
                     let mut accesses =
                         operation.effects().reference_accesses().map(|(input, _)| input).collect::<Vec<_>>();
@@ -4466,6 +4494,16 @@ impl Decoder {
                             error => error.into(),
                         }
                     })?;
+                    if unchecked_tile_load && let KernelOperation::TileLoad(load) = operation {
+                        let load = load.with_input_types(&input_types).map_err(ProgramError::from)?;
+                        if load.requires_runtime_assertion() {
+                            return Err(invalid(
+                                "`tile_load` record without a runtime window check has input types that do not prove \
+                                 its windows valid",
+                            ));
+                        }
+                        operation = KernelOperation::TileLoad(load);
+                    }
                     Ok(Instruction::new(
                         project(operation)?,
                         instruction.inputs.into_iter().map(AtomId::new).collect(),
@@ -5079,6 +5117,29 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_to_source_shape_records() {
+        // Builds a kernel whose body creates an unused zero of `rank` axes with extent one, which needs only the
+        // storage of one element whatever its rank.
+        let definition = |rank: usize| {
+            let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let r#type = ArrayType::new_static(DataType::F32, vec![1; rank]);
+            let operation = ArrayIrOperation::Array(ArrayOperation::Zero(ZeroOperation::new(r#type)));
+            builder.add_instruction(operation, vec![], vec![], None).unwrap();
+            KernelDefinition::new(call, builder.build(vec![], Vec::<Placeholder>::new(), vec![]).unwrap()).unwrap()
+        };
+
+        // The writer accepts every shape that the reader accepts and rejects every other one.
+        let largest = definition(MAXIMUM_RECORDS);
+        let decoded = KernelDefinition::from_source(largest.to_source().unwrap()).unwrap();
+        assert_eq!(decoded.semantic_key(), largest.semantic_key());
+        assert_eq!(
+            definition(MAXIMUM_RECORDS + 1).to_source().map(|_| ()),
+            Err(KernelSerializationError::Unsupported { feature: format!("record count exceeding {MAXIMUM_RECORDS}") }),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_from_source() {
         let definition = literal_definition(Array::scalar(-0.0f32).unwrap());
         let decoded = KernelDefinition::from_source(definition.to_source().unwrap()).unwrap();
@@ -5230,6 +5291,80 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_source_tile_load_window_checks() {
+        // Builds a kernel that loads the tile of extent one at the constant start 3 of its `f32[4]` input. The start
+        // type proves the window valid, so the refined load has no runtime window check, while the load as constructed
+        // keeps one.
+        let definition = |refined: bool| {
+            let vector = ArrayType::new_static(DataType::F32, [4]);
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![
+                    whole_array_parameter(vector, KernelParameterAccess::ReadOnly).unwrap(),
+                    whole_array_parameter(ArrayType::new_static(DataType::F32, [1]), KernelParameterAccess::WriteOnly)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            let input_types = call.body_input_types();
+            let start = DimensionValue::constant(3).unwrap();
+            let mut operation = TileLoadOperation::new(vec![1], BoundaryPolicy::InBounds).unwrap();
+            if refined {
+                operation = operation
+                    .with_input_types(&[
+                        input_types[0].clone(),
+                        ArrayIrType::Dimension(start.r#type().into_owned()),
+                        ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                    ])
+                    .unwrap();
+            }
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let start = builder.add_constant(ArrayIrValue::Dimension(start));
+            let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+            let tile = builder.add_instruction(operation, vec![], vec![inputs[0], start, other], None).unwrap()[0];
+            builder
+                .add_instruction(
+                    ArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new()),
+                    vec![],
+                    vec![inputs[1], tile],
+                    None,
+                )
+                .unwrap();
+            KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
+        };
+        let asserts =
+            |definition: &KernelDefinition| definition.effects().classes().contains(EffectClass::OrderedAssertion);
+
+        // A source round trip keeps the window check of each load exactly, and with it the effects of the kernel. The
+        // two loads differ in their effects, so they have different keys.
+        let (refined, conservative) = (definition(true), definition(false));
+        assert!(!asserts(&refined));
+        assert!(asserts(&conservative));
+        assert_ne!(refined.semantic_key().unwrap(), conservative.semantic_key().unwrap());
+        for definition in [&refined, &conservative] {
+            let restored = KernelDefinition::from_source(definition.to_source().unwrap()).unwrap();
+            assert_eq!(asserts(&restored), asserts(definition));
+            assert_eq!(restored.semantic_key().unwrap(), definition.semantic_key().unwrap());
+        }
+
+        // A record without the check is accepted only when its input types prove every window valid. Moving the start
+        // of the refined load to 4 leaves a window that exceeds the source.
+        let mut value = serde_json::to_value(refined.to_source().unwrap()).unwrap();
+        let text = serde_json::to_string(&value).unwrap();
+        assert_eq!(text.matches(r#"{"Dimension":{"extent":3}}"#).count(), 1);
+        value = serde_json::from_str(&text.replace(r#"{"extent":3}"#, r#"{"extent":4}"#)).unwrap();
+        assert_eq!(
+            KernelDefinition::from_source(serde_json::from_value(value).unwrap()).err(),
+            Some(KernelSerializationError::Invalid {
+                message: "`tile_load` record without a runtime window check has input types that do not prove its \
+                          windows valid"
+                    .to_owned(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_semantic_key_guard_identities() {
         // Builds a kernel over a 2×2 grid whose body guards its two coordinates with declared dimensions named
         // `names`, which are one shared identity when `shared` is set and two independent identities otherwise.
@@ -5270,6 +5405,48 @@ mod tests {
         assert_ne!(key(["extent", "extent"], true), key(["extent", "extent"], false));
         assert_eq!(key(["extent", "extent"], true), key(["rows", "columns"], true));
         assert_eq!(key(["extent", "extent"], false), key(["rows", "columns"], false));
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_guard_identity_scopes() {
+        // Builds a kernel over a 2×2 grid whose body holds two guards that each require its two coordinates to be
+        // equal, where the second guard declares the identity of the first one when `reused` is set and an independent
+        // identity with the same name and bounds otherwise. Each guard retains the identity of the coordinate that
+        // `retained` selects.
+        let key = |reused: bool, retained: [usize; 2]| {
+            let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel); 2]).unwrap();
+            let call = KernelCallOperation::new(grid, vec![]).unwrap();
+            let coordinates = call
+                .coordinate_types()
+                .iter()
+                .map(|r#type| match r#type.dimension() {
+                    Dimension::Dynamic(variable) => variable.clone(),
+                    Dimension::Static(_) => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let bounds = DimensionBounds::unbounded();
+            let first = DimensionType::new("extent", bounds);
+            let second = if reused { first.clone() } else { DimensionType::new("extent", bounds) };
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let inputs =
+                call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            for (declared, retained) in [first, second].into_iter().zip(retained) {
+                let declared_types = vec![ArrayIrType::Dimension(declared.clone()), ArrayIrType::Dimension(declared)];
+                let guard = GuardOperation::new("coordinates", declared_types)
+                    .with_retained_identities(vec![coordinates[retained].clone()]);
+                builder.add_instruction(ArrayIrOperation::Guard(guard), vec![], inputs.clone(), None).unwrap();
+            }
+            let body = builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
+            KernelDefinition::new(call, body).unwrap().semantic_key().unwrap()
+        };
+
+        // The declared identities of each guard are local to it, so equal guards share a key whether or not they
+        // declare the same identity.
+        assert_eq!(key(true, [0, 0]), key(false, [0, 0]));
+
+        // The retained identities of the guards belong to the whole document, so retaining the same coordinate in
+        // both guards differs from retaining a different coordinate in each.
+        assert_ne!(key(false, [0, 0]), key(false, [0, 1]));
     }
 
     #[test]

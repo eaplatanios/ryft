@@ -331,13 +331,14 @@ pub trait RuntimeProvider: Send + Sync {
 /// ```
 pub trait RuntimeExtension: Send + Sync {
     /// Checks device and participant restrictions for the invocation's mesh before native submission.
+    /// Extensions that need live device information can retain the client they received during initialization.
     #[inline]
-    fn validate(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
-        let _ = (client, mesh);
+    fn validate(&self, mesh: &DeviceMesh) -> Result<(), Error> {
+        let _ = mesh;
         Ok(())
     }
 
-    /// Attaches invocation data before native submission and retains any additional owners needed through completion.
+    /// Attaches invocation data before native submission and retains any additional resources needed through completion.
     /// The session calls this method on each required extension with the same [`ExecutionResources`] for the
     /// invocation.
     #[inline]
@@ -347,29 +348,27 @@ pub trait RuntimeExtension: Send + Sync {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Invocation data and owners prepared before one native submission.
-///
-/// Retain stable allocations such as `Arc<T>` before attaching pointers into them. On preparation failure, the context
-/// is destroyed before retained owners. After submission, the session retains owners through the joined fence,
-/// including when outputs are discarded. Extensions contribute to one lazily created execution context. Ordinary
-/// execution and extensions that only register native handlers create no context and introduce no additional
-/// destruction barrier.
+/// Invocation data and retained resources for one native submission. Retain stable allocations such as `Arc<T>`
+/// before attaching pointers into them. If preparation fails, the context is destroyed before the retained resources.
+/// After submission, the session keeps the resources alive through the joined execution fence, including when callers
+/// discard the outputs. Extensions share one execution context, created on the first native user data attachment.
+/// Ordinary execution and extensions that only register native handlers need no extra destruction barrier.
 pub struct ExecutionResources {
     /// Client receiving this invocation's context.
     client: &'static Client<'static>,
 
-    /// Native context, allocated only when invocation data is first attached. Fields drop in declaration order, so
-    /// this context is destroyed before the retained owners, including when preparation fails.
+    /// [`ExecutionContext`], allocated only when invocation data is first attached. Fields drop in declaration order,
+    /// so this context is destroyed before the retained resources, including when preparation fails.
     context: Option<ExecutionContext>,
 
-    /// Type identifiers already installed in this invocation.
+    /// Type identifiers installed for this invocation.
     user_data: HashSet<FfiTypeId>,
 
-    /// Additional owners with the same lifetime as the invoking session's client.
+    /// Additional resources held through execution.
     retained: Vec<Box<dyn RetainedResource>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ExecutionResources {
     /// Returns the client receiving the invocation.
@@ -377,11 +376,10 @@ impl ExecutionResources {
         self.client
     }
 
-    /// Retains an owner until the whole execution completes. Use a stable allocation such as `Arc` or `Box` when native
-    /// user data points into the retained value, because moving a stack value into this function does not preserve its
-    /// address.
-    pub fn retain<T: 'static + Send + Sync>(&mut self, owner: T) {
-        self.retained.push(Box::new(owner));
+    /// Retains a resource until the whole execution completes. When native user data points into the resource, use an
+    /// allocation such as `Arc` or `Box` to keep the pointee's address stable when moving the resource into this method.
+    pub fn retain<T: 'static + Send + Sync>(&mut self, resource: T) {
+        self.retained.push(Box::new(resource));
     }
 
     /// Adds one borrowed native user data binding to this invocation, creating the context lazily.
@@ -392,10 +390,10 @@ impl ExecutionResources {
     /// # Safety
     ///
     /// Neither the pointer nor its pointee is checked. The pointer must point to a value of the type registered under
-    /// its native type ID and remain stable until completion. Its owner must be this session's runtime instance or be
-    /// retained through [`Self::retain`]. Native handlers may access it concurrently on several devices, so the pointee
-    /// must support those accesses. The function is public so that third-party FFI integrations can attach their own
-    /// data, and its `unsafe` boundary keeps native pointer insertion explicit.
+    /// its native type ID and remain stable until completion. The session's runtime instance or a resource held
+    /// through [`Self::retain`] must keep the pointee alive. Native handlers may access it concurrently on several
+    /// devices, so the pointee must support those accesses. The function is public so that third-party FFI integrations
+    /// can attach their own data, and its `unsafe` boundary keeps native pointer insertion explicit.
     ///
     /// # Errors
     ///
@@ -416,11 +414,11 @@ impl ExecutionResources {
         Ok(())
     }
 
-    /// Separates native context ownership from the resource lease that the session owns.
+    /// Separates the native execution context from the resources the session must retain.
     pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources) {
         let Self { context, retained, .. } = self;
         let needed = context.is_some() || !retained.is_empty();
-        (context, RetainedExecutionResources { needed, _owners: retained })
+        (context, RetainedExecutionResources { needed, _resources: retained })
     }
 }
 
@@ -499,13 +497,13 @@ impl Debug for RuntimeExtensions {
     }
 }
 
-/// Invocation ownership retained by the session only when extensions borrow runtime data.
+/// Invocation resources retained by the session through execution.
 pub(crate) struct RetainedExecutionResources {
-    /// Whether the invocation borrowed data, even if its owner is the session's runtime instance itself.
+    /// Whether the invocation has an execution context or additional resources to retain.
     needed: bool,
 
-    /// Additional retained owners, destroyed after the whole execution completes.
-    _owners: Vec<Box<dyn RetainedResource>>,
+    /// Additional resources destroyed after the whole execution completes.
+    _resources: Vec<Box<dyn RetainedResource>>,
 }
 
 /// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
@@ -569,7 +567,7 @@ impl RuntimeRegistry {
             ExecutionResources { client: self.client, context: None, user_data: HashSet::new(), retained: Vec::new() };
         for requirement in normalize_runtime_requirements(requirements.iter().cloned())? {
             let runtime = self.instance(&requirement)?;
-            runtime.validate(self.client, mesh)?;
+            runtime.validate(mesh)?;
             runtime.prepare(&mut resources)?;
         }
         Ok(resources)
@@ -598,7 +596,7 @@ impl RuntimeRegistry {
             }
         }
         // Completed executions no longer need their resources. They are dropped after the pending lock is released,
-        // so destructors of retained owners never run while that lock is held.
+        // so destructors of retained resources never run while that lock is held.
         drop(completed);
     }
 
@@ -845,7 +843,7 @@ mod tests {
 
     impl RuntimeExtension for RegistrationOnlyRuntime {}
 
-    /// Resource that counts how many owners the registry has released.
+    /// Resource that increments a counter when the registry releases it.
     struct DropCounter(Arc<AtomicUsize>);
 
     impl Drop for DropCounter {
@@ -1369,7 +1367,7 @@ mod tests {
         let requirements = [builtin_requirement("test.provider")];
         let (context, retained) = registry.prepare(&requirements, &mesh).unwrap().into_parts();
 
-        // A registration-only extension still initializes, but its invocation needs no context or owners.
+        // A registration-only extension still initializes, but its invocation needs no context or retained resources.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(context.is_none());
         assert!(!retained.needed);
@@ -1377,10 +1375,10 @@ mod tests {
 
     #[test]
     fn test_runtime_registry_prepare_validates_invocation_mesh() {
-        /// Provider and extension that reject the invocation mesh before preparing launch resources.
-        struct MeshCheckingRuntime;
+        /// Provider for the runtime that checks the invocation's mesh.
+        struct MeshCheckingProvider;
 
-        impl RuntimeProvider for MeshCheckingRuntime {
+        impl RuntimeProvider for MeshCheckingProvider {
             fn identifier(&self) -> &str {
                 "test.mesh"
             }
@@ -1390,14 +1388,20 @@ mod tests {
                 client: &'static Client<'static>,
                 requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-                let _ = (client, requirement);
-                Ok(Arc::new(Self))
+                let _ = requirement;
+                Ok(Arc::new(MeshCheckingRuntime { client }))
             }
         }
 
+        /// Extension that rejects the invocation mesh before preparing launch resources.
+        struct MeshCheckingRuntime {
+            /// Client that initialized the runtime.
+            client: &'static Client<'static>,
+        }
+
         impl RuntimeExtension for MeshCheckingRuntime {
-            fn validate(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
-                assert_eq!(mesh, &domain_mesh(client, "invocation", 1));
+            fn validate(&self, mesh: &DeviceMesh) -> Result<(), Error> {
+                assert_eq!(mesh, &domain_mesh(self.client, "invocation", 1));
                 Err(Error::custom(std::io::Error::other("fixture rejected the invocation mesh")))
             }
 
@@ -1408,7 +1412,7 @@ mod tests {
         }
 
         let client = execution_client();
-        let configuration = RuntimeExtensions::empty().with_provider(Arc::new(MeshCheckingRuntime)).unwrap();
+        let configuration = RuntimeExtensions::empty().with_provider(Arc::new(MeshCheckingProvider)).unwrap();
         let registry = RuntimeRegistry::new(client, configuration);
         let mesh = domain_mesh(client, "invocation", 1);
         assert!(matches!(
@@ -1436,7 +1440,7 @@ mod tests {
         assert_eq!(pending_before_completion, 1);
         assert_eq!(drops_before_completion, 0);
 
-        // Retaining a new submission releases completed owners, including the new ones if its fence is ready.
+        // Retaining a new submission releases completed resources, including the new ones if its fence is ready.
         let mut resources = prepare_without_requirements(&registry);
         resources.retain(DropCounter(Arc::clone(&drops)));
         let (_, retained) = resources.into_parts();

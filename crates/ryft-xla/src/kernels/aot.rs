@@ -476,7 +476,7 @@ pub(crate) mod tests {
     }
 
     /// Makes adversarial envelope metadata internally checksummed so structural validation is exercised.
-    fn refresh_checksum(bytes: &mut [u8]) {
+    pub(crate) fn refresh_checksum(bytes: &mut [u8]) {
         let mut hash = Sha256::new();
         hash.update(&bytes[8..32]);
         hash.update(&bytes[64..]);

@@ -62,12 +62,14 @@
 //!   - **Scratch allocations.** A [`ScratchOperation`](crate::memory::ScratchOperation) allocation starts empty.
 //!   - **Extensions.** An extension operation declares its timing through [`KernelExtension::memory_semantics`],
 //!     which must agree with its canonical reference effects, and otherwise it fails with
-//!     [`KernelInitializationError::InvalidExtension`]. This agreement is structural, so it is checked once for every
-//!     extension of the body, including for an empty launch and in branches that no analysis reaches. Synchronous
-//!     operations access memory like portable operations, and allocations start empty. Asynchronous operations reserve
-//!     their accesses like asynchronous copies until a wait consumes their completion allocation, and commits must read
-//!     a pending completion of the same region. Releases retire an allocation of the current region that is neither a
-//!     pending completion nor reserved by one. Extensions with attached regions are rejected.
+//!     [`KernelInitializationError::InvalidExtension`]. The completion input of a commit or a wait must reference a
+//!     scalar token, and otherwise it fails with [`KernelInitializationError::InvalidCopyToken`]. These checks are
+//!     structural, so they run once for every extension of the body (and once for a region that is attached in several
+//!     places), including for an empty launch and in branches that no analysis reaches. Synchronous operations access
+//!     memory like portable operations, and allocations start empty. Asynchronous operations reserve their accesses
+//!     like asynchronous copies until a wait consumes their completion allocation, and commits must read a pending
+//!     completion of the same region. Releases retire an allocation of the current region that is neither a pending
+//!     completion nor reserved by one. Extensions with attached regions are rejected.
 //!   - **Completion protocols.** Every pending token carries the completion protocol of the operation that produced
 //!     it, which is the portable protocol for an async copy and [`KernelExtension::completion_protocol`] for an
 //!     asynchronous extension. A commit or a wait must follow that protocol, and a protocol that requires a commit
@@ -132,7 +134,7 @@ use ryft_core::{
     Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformPath, ArraySliceAxis, ArrayType, Atom, AtomId, ComparisonDirection, DataType, Dimension,
     DimensionValue, InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceRoot,
-    ReferenceType, ReferenceViewOverlap, RegionRef, Typed, TypedProgram, ValueId,
+    ReferenceType, ReferenceViewOverlap, RegionId, RegionRef, Typed, TypedProgram, ValueId,
 };
 use thiserror::Error;
 
@@ -1259,24 +1261,34 @@ struct PendingCopy {
 /// Validates the structural memory declarations of every extension operation in `region` and in its attached regions
 /// with [`validate_extension_declarations`]. These declarations do not depend on the grid point or on which
 /// instructions an analysis case reaches, so they are validated once, including for an empty launch and inside a branch
-/// that no analysis case takes.
+/// that no analysis case takes. A region that is attached in several places is also validated once.
 fn validate_extensions<Extension: KernelExtension>(
     region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
 ) -> Result<(), KernelInitializationError> {
-    for (index, instruction) in region.instructions().iter().enumerate() {
-        if let KernelOperation::Extension(operation) = instruction.operation() {
-            validate_extension_declarations(region, InstructionId::new(region.id(), index), operation)?;
+    fn visit<Extension: KernelExtension>(
+        region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
+        visited: &mut BTreeSet<RegionId>,
+    ) -> Result<(), KernelInitializationError> {
+        for (index, instruction) in region.instructions().iter().enumerate() {
+            if let KernelOperation::Extension(operation) = instruction.operation() {
+                validate_extension_declarations(region, InstructionId::new(region.id(), index), operation)?;
+            }
+            for &nested in instruction.regions() {
+                if visited.insert(nested) {
+                    visit(region.with_id(nested).unwrap(), visited)?;
+                }
+            }
         }
-        for &nested in instruction.regions() {
-            validate_extensions(region.with_id(nested).unwrap())?;
-        }
+        Ok(())
     }
-    Ok(())
+    visit(region, &mut BTreeSet::from([region.id()]))
 }
 
-/// Validates that the extension `operation` at instruction `id` of `region` has no attached regions and that its
+/// Validates that the extension `operation` at instruction `id` of `region` has no attached regions, that its
 /// [`KernelExtension::memory_semantics`] agree with its canonical reference effects, its reference output aliases, and
-/// the types of its declared allocation, and returns those semantics with its declared accesses in declaration order.
+/// the types of its declared allocation, and that the completion input of a commit or a wait references a scalar token
+/// (and otherwise fails with [`KernelInitializationError::InvalidCopyToken`]), and returns those semantics with its
+/// declared accesses in declaration order.
 fn validate_extension_declarations<Extension: KernelExtension>(
     region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
     id: InstructionId,
@@ -1307,6 +1319,14 @@ fn validate_extension_declarations<Extension: KernelExtension>(
         .collect::<Vec<_>>();
     let aliases = (0..instruction.outputs().len())
         .any(|output_index| operation.reference_output_identity_input(output_index).is_some());
+    let validate_completion_input = |input: AtomId| {
+        let token = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
+        if region.atoms()[input.index()].r#type().as_ref() == &token {
+            Ok(())
+        } else {
+            Err(KernelInitializationError::InvalidCopyToken { value: ValueId::new(region.id(), input) })
+        }
+    };
     match semantics {
         KernelExtensionMemory::Synchronous => {
             if !allocations.is_empty() || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume) {
@@ -1343,14 +1363,18 @@ fn validate_extension_declarations<Extension: KernelExtension>(
             if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Read)] || aliases {
                 return Err(invalid("commit must read exactly its declared completion reference"));
             }
-            instruction.inputs().get(input_index).ok_or_else(|| invalid("completion input is absent"))?;
+            let input = instruction.inputs().get(input_index).ok_or_else(|| invalid("completion input is absent"))?;
+            validate_completion_input(*input)?;
         }
         KernelExtensionMemory::Wait { completion_input_index: input_index }
         | KernelExtensionMemory::Release { input_index } => {
             if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Consume)] || aliases {
                 return Err(invalid("wait or release must consume exactly its declared reference"));
             }
-            instruction.inputs().get(input_index).ok_or_else(|| invalid("consumed input is absent"))?;
+            let input = instruction.inputs().get(input_index).ok_or_else(|| invalid("consumed input is absent"))?;
+            if matches!(semantics, KernelExtensionMemory::Wait { .. }) {
+                validate_completion_input(*input)?;
+            }
         }
     }
     Ok((semantics, accesses))
@@ -1427,13 +1451,16 @@ fn repeated_axes(extents: &[usize], axes: &[Option<usize>]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayReferenceTransformIndex, CompareOperation, ConditionOperation, DimensionAddOperation, DimensionBounds,
         DimensionMulOperation, DimensionType, EagerContext, FlatProgram, NotOperation, Placeholder, ProgramBuilder,
-        ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceAtomicAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceViewAnalysisError, ReferenceWriteOperation, RegionId, WhileOperation,
+        ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAnalysisError,
+        ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceViewAnalysisError, ReferenceWriteOperation, RegionId, RegionInterface,
+        TypeError, WhileOperation,
     };
 
     use crate::calls::{KernelDefinition, KernelParameter};
@@ -1448,6 +1475,61 @@ mod tests {
     use crate::validation::KernelValidationError;
 
     use super::*;
+
+    /// Number of evaluations of the memory semantics of [`CountingExtension`]. Only one test uses that extension.
+    static COUNTED_SEMANTICS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Synchronous extension without inputs, outputs, or effects whose memory semantics count their evaluations in
+    /// [`COUNTED_SEMANTICS`], so that a test can count the structural validations of one extension instruction.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct CountingExtension;
+
+    impl Operation for CountingExtension {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "test_counting"
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ArrayIrType],
+            _region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            Ok(vec![])
+        }
+    }
+
+    impl ReferenceAccessOperation for CountingExtension {
+        type Transform = ArrayReferenceTransform;
+
+        fn base_input_count(&self) -> usize {
+            0
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            _input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+            None
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            _input_index: usize,
+            _transforms: Vec<ArrayReferenceTransform>,
+        ) -> Result<Self, ProgramError> {
+            let message = "counting extension has no reference accesses".to_owned();
+            Err(ProgramError::UnsupportedOperation { message })
+        }
+    }
+
+    impl KernelExtension for CountingExtension {
+        fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+            COUNTED_SEMANTICS.fetch_add(1, Ordering::Relaxed);
+            Ok(KernelExtensionMemory::Synchronous)
+        }
+    }
 
     /// Builds one static write-only vector parameter whose blocks advance by their logical size.
     fn call(extent: usize, block: usize, programs: usize) -> KernelCallOperation {
@@ -3151,6 +3233,68 @@ mod tests {
                     message: "synchronous operations cannot allocate or consume references".to_owned(),
                 }),
             );
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_extension_classification_shared_regions() {
+        // Nests eight conditions around one extension, where each condition attaches the region of the next one as
+        // both of its branches. The extension is reachable along 256 paths, but its declarations are validated once.
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(0), GridExecution::Parallel)]);
+        let call = KernelCallOperation::new(grid.unwrap(), vec![]).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<CountingExtension>>::new();
+        builder
+            .add_instruction(KernelOperation::Extension(CountingExtension), vec![], vec![], None)
+            .unwrap();
+        let mut body =
+            builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![], vec![]).unwrap();
+        for level in 0..8 {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<CountingExtension>>::new();
+            if level == 7 {
+                builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+            }
+            let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+            let branch = builder.import_region(body.entry_region_ref());
+            builder
+                .add_instruction(
+                    ArrayIrOperation::Condition(ConditionOperation::new()),
+                    vec![branch, branch],
+                    vec![predicate],
+                    None,
+                )
+                .unwrap();
+            let inputs = if level == 7 { vec![Placeholder] } else { vec![] };
+            body = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], inputs, vec![]).unwrap();
+        }
+        COUNTED_SEMANTICS.store(0, Ordering::Relaxed);
+        assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 1), Ok(()));
+        assert_eq!(COUNTED_SEMANTICS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_extension_classification_completion_tokens() {
+        // Commits and waits on an `i32` scratch allocation. A completion input must reference a scalar token, which is
+        // structural, so the body is rejected for an empty grid exactly as for a grid with one point.
+        for completion in [TestExtension::Commit { strict: false }, TestExtension::Wait { strict: false }] {
+            for programs in [1, 0] {
+                let grid = Grid::new(vec![GridDimension::new(Dimension::Static(programs), GridExecution::Parallel)]);
+                let call = KernelCallOperation::new(grid.unwrap(), vec![]).unwrap();
+                let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+                builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+                let scratch = ScratchOperation::new(ArrayType::scalar(DataType::I32), 4).unwrap();
+                let scratch =
+                    builder.add_instruction(KernelOperation::Scratch(scratch), vec![], vec![], None).unwrap()[0];
+                let operation = KernelOperation::Extension(completion.clone());
+                builder.add_instruction(operation, vec![], vec![scratch], None).unwrap();
+                let body = builder
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
+                    .unwrap();
+                let region = body.entry_region_ref().id();
+                assert_eq!(
+                    validate_kernel_initialization(body.entry_region_ref(), &call, 1),
+                    Err(KernelInitializationError::InvalidCopyToken { value: ValueId::new(region, scratch) }),
+                );
+            }
         }
     }
 

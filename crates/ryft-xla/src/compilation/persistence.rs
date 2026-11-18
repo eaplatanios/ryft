@@ -730,10 +730,7 @@ impl Session {
         {
             if required && !runtime_requirements.contains(&builtin_requirement(identifier)) {
                 return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                    reason: format!(
-                        "effect metadata requires runtime extension `{identifier}` with ABI version 1 and empty \
-                         configuration",
-                    ),
+                    reason: format!("effect metadata requires runtime extension `{identifier}` with ABI version 1"),
                 }));
             }
         }
@@ -1464,13 +1461,19 @@ mod tests {
 
     use super::*;
 
-    /// Splits a serialized executable envelope into its metadata record and its native executable bytes.
-    fn decode_envelope(bytes: &[u8]) -> (PersistentExecutableMetadata, &[u8]) {
+    /// Splits a serialized executable envelope into its encoded metadata and its native executable bytes.
+    fn envelope_sections(bytes: &[u8]) -> (&[u8], &[u8]) {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         let metadata_size =
             u64::from_le_bytes(bytes[PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap());
         let metadata_end = header_size + metadata_size as usize;
-        (serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap(), &bytes[metadata_end..])
+        (&bytes[header_size..metadata_end], &bytes[metadata_end..])
+    }
+
+    /// Decodes the metadata of a serialized executable envelope.
+    fn decode_envelope(bytes: &[u8]) -> (PersistentExecutableMetadata, &[u8]) {
+        let (metadata, executable) = envelope_sections(bytes);
+        (serde_json::from_slice(metadata).unwrap(), executable)
     }
 
     /// Encodes a serialized executable envelope from a metadata record and native executable bytes.
@@ -2063,26 +2066,37 @@ mod tests {
         let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
         let bytes = session.serialize_program(&compiled).unwrap().unwrap();
-        let (baseline, executable) = decode_envelope(&bytes);
+        let (metadata, executable) = envelope_sections(&bytes);
+        let baseline: PersistentExecutableMetadata = serde_json::from_slice(metadata).unwrap();
         assert!(baseline.requires_assertion_handler);
         assert!(baseline.ordered_io);
-        assert!(session.deserialize_program(&bytes).unwrap().is_some());
+        let restored = session.deserialize_program(&bytes).unwrap().unwrap();
+        assert_eq!(restored.runtime_requirements(), baseline.runtime_requirements);
 
+        // Only the identifier and ABI version of each requirement are written into the envelope.
+        let metadata: serde_json::Value = serde_json::from_slice(metadata).unwrap();
+        assert_eq!(
+            metadata["runtime_requirements"],
+            serde_json::json!([
+                {"identifier": "ryft.assert", "abi_version": 1},
+                {"identifier": "ryft.ordered-io", "abi_version": 1},
+                {"identifier": "ryft.print", "abi_version": 1},
+            ]),
+        );
+
+        // The effect ABI requires a compatible runtime contract for each declared handler.
         for identifier in ["ryft.assert", "ryft.ordered-io"] {
-            for replacement in [None, Some((2, Vec::new())), Some((1, vec![1]))] {
+            for replacement in [None, Some(2)] {
                 let mut metadata = decode_envelope(&bytes).0;
                 metadata.runtime_requirements.retain(|requirement| requirement.identifier() != identifier);
-                if let Some((version, configuration)) = replacement {
-                    metadata
-                        .runtime_requirements
-                        .push(RuntimeRequirement::new(identifier, version, configuration).unwrap());
+                if let Some(version) = replacement {
+                    metadata.runtime_requirements.push(RuntimeRequirement::new(identifier, version).unwrap());
                 }
                 assert!(matches!(
                     session.deserialize_program(&encode_envelope(&metadata, executable)),
                     Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
                         if reason == format!(
-                            "effect metadata requires runtime extension `{identifier}` with ABI version 1 and empty \
-                             configuration",
+                            "effect metadata requires runtime extension `{identifier}` with ABI version 1",
                         ),
                 ));
             }

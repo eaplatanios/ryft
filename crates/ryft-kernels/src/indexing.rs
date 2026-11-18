@@ -23,7 +23,9 @@
 //! [`BoundaryPolicy::Masked`], the window is clipped to the source view, and the result elements beyond its edge
 //! contain the exact encoding of the padding value, even when the clipped window is empty. Under either policy, only
 //! the valid clipped reference view is constructed and read, so no out-of-bounds reference is ever created or accessed,
-//! and a window limit beyond the canonical dimension width fails. Initialization validation conservatively requires the
+//! and a window limit beyond the canonical dimension width fails. Such a failure is observable even when the tile is
+//! unused, so the operation declares an ordered assertion unless [`TileLoadOperation::with_input_types`] proves from
+//! the bounds of the start types that every window is valid. Initialization validation conservatively requires the
 //! entire source view to be initialized, because the selected window is dynamic.
 //!
 //! # Authoring
@@ -34,7 +36,8 @@
 //! selects a tile that lies entirely beyond the source and contains only the padding value, so that function first
 //! clamps every index whose type does not bound it by that number. It then converts integer scalar tile indices into
 //! checked dimension values, which rejects negative indices, multiplies each tile index by the tile extent to obtain
-//! an element start, and stages a tile load with [`BoundaryPolicy::Masked`] and the declared padding value.
+//! an element start, and stages a tile load with [`BoundaryPolicy::Masked`] and the declared padding value. The clamp
+//! bounds the element starts, so the staged load of an ordinary tiled kernel is proved free of the window check.
 //!
 //! # Advanced Indexing
 //!
@@ -64,10 +67,11 @@ use std::sync::LazyLock;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, EagerContext, EffectClasses,
-    Effects, InterpretableOperation, InterpretationDriver, MAX_DIMENSION_EXTENT, Operation, OperationFormatter, Pad,
-    PadOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
-    ReferenceEffect, ReferenceTransform, RegionInterface, TypeError, Typed, infer_reference_view_type,
+    Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, EagerContext, EffectClass,
+    EffectClasses, Effects, InterpretableOperation, InterpretationDriver, MAX_DIMENSION_EXTENT, Operation,
+    OperationFormatter, Pad, PadOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, RegionInterface, TypeError, Typed,
+    infer_reference_view_type,
 };
 
 use crate::mappings::BoundaryPolicy;
@@ -82,7 +86,8 @@ pub const TILE_LOAD_OPERATION_NAME: &str = "tile_load";
 /// apply before the tile window. Under [`BoundaryPolicy::Masked`], the operation reads only a valid clipped reference
 /// view, and every other result element contains the exact encoding of the padding value. No out-of-bounds reference is
 /// constructed or accessed. Initialization validation conservatively requires the entire source view to be initialized,
-/// because the selection is dynamic.
+/// because the selection is dynamic. The operation declares an ordered assertion for its window check unless
+/// [`TileLoadOperation::with_input_types`] proves that check unnecessary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLoadOperation {
     /// Static logical shape of each result tile.
@@ -93,23 +98,54 @@ pub struct TileLoadOperation {
 
     /// Ordered selections applied to the source before selecting the tile window.
     transforms: Vec<ArrayReferenceTransform>,
+
+    /// Whether execution must check the window of each axis. Initialized conservatively to `true` and refined by
+    /// [`TileLoadOperation::with_input_types`].
+    requires_runtime_assertion: bool,
 }
 
 impl TileLoadOperation {
-    /// Declares a tile shape and boundary policy, checking each extent against the canonical dimension width.
+    /// Declares a tile shape and boundary policy, checking each extent against the canonical dimension width. The
+    /// operation initially retains a runtime window check. Use [`TileLoadOperation::with_input_types`] to remove it
+    /// when the input types prove that every window is valid.
     pub fn new(block_shape: Vec<usize>, boundary_policy: BoundaryPolicy) -> Result<Self, TypeError> {
         if block_shape.iter().any(|&extent| extent > MAX_DIMENSION_EXTENT) {
             return Err(TypeError::invalid(format!(
                 "`{TILE_LOAD_OPERATION_NAME}` block shape exceeds the canonical dimension width",
             )));
         }
-        Ok(Self { block_shape, boundary_policy, transforms: Vec::new() })
+        Ok(Self { block_shape, boundary_policy, transforms: Vec::new(), requires_runtime_assertion: true })
     }
 
     /// Replaces the source selections applied before the tile window.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
+    }
+
+    /// Returns this [`TileLoadOperation`] with its runtime window check requirement recomputed from the provided input
+    /// types, after validating the complete input signature.
+    ///
+    /// The window of an axis is proved valid when the largest start that its dimension type admits plus the tile
+    /// extent fits [`MAX_DIMENSION_EXTENT`] and, under [`BoundaryPolicy::InBounds`], also the extent of the source view
+    /// along that axis. When every axis is proved, the returned operation is free of [`EffectClass::OrderedAssertion`].
+    /// Otherwise, it retains that effect, because its execution can fail. For example, a masked tile of extent 2
+    /// whose start has type `dimension<i * 2 ∈ [0, 3)>` is proved for every source, while an in-bounds tile of extent
+    /// 1 at the constant start 4 of an `f32[4]` source is not.
+    ///
+    /// An operation without the check rejects subsequent type inference requests that would require it, rather than
+    /// silently changing its effects. Calling this function again recomputes the requirement for a different
+    /// signature and can restore the check.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`TypeError`] of type inference when `input_types` is not a valid input signature.
+    pub fn with_input_types(mut self, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
+        self.requires_runtime_assertion = true;
+        self.infer_output_types(input_types, &[])?;
+        let source = self.source_type(input_types)?;
+        self.requires_runtime_assertion = !self.has_valid_windows(&input_types[1..self.block_shape.len() + 1], &source);
+        Ok(self)
     }
 
     /// Returns the fixed result shape.
@@ -125,6 +161,43 @@ impl TileLoadOperation {
     /// Returns the boundary contract applied before reference access.
     pub fn boundary_policy(&self) -> BoundaryPolicy {
         self.boundary_policy
+    }
+
+    /// Returns whether execution must check that the window of each axis fits the canonical dimension width and,
+    /// under [`BoundaryPolicy::InBounds`], lies inside the source view.
+    ///
+    /// When `true`, the operation carries [`EffectClass::OrderedAssertion`], so a failing check is observable even
+    /// when the loaded tile is unused. This is the conservative initial state, not a claim that a window is invalid.
+    /// [`Self::with_input_types`] sets the flag to `false` when the input types prove every window valid.
+    pub fn requires_runtime_assertion(&self) -> bool {
+        self.requires_runtime_assertion
+    }
+
+    /// Returns the type of the source view that the transforms select, for a validated input signature.
+    fn source_type(&self, input_types: &[ArrayIrType]) -> Result<ArrayType, TypeError> {
+        let ArrayIrType::Reference(reference) = &input_types[0] else {
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` first input must be an array reference",
+            )));
+        };
+        infer_reference_view_type(
+            reference.referent(),
+            &self.transforms,
+            &input_types[self.block_shape.len() + 2..].iter().collect::<Vec<_>>(),
+            ReferenceAccessMode::Read,
+        )
+    }
+
+    /// Returns whether the dimension types `starts` prove that the window of every axis is valid in the static
+    /// `source` view, using only their bounds. Refer to [`Self::with_input_types`] for the rule.
+    fn has_valid_windows(&self, starts: &[ArrayIrType], source: &ArrayType) -> bool {
+        let shape = source.static_shape().unwrap();
+        starts.iter().zip(&self.block_shape).zip(shape.dimensions()).all(|((start, &block), &extent)| {
+            let ArrayIrType::Dimension(start) = start else { unreachable!() };
+            start.maximum_extent().and_then(|maximum| maximum.checked_add(block)).is_some_and(|limit| {
+                limit <= MAX_DIMENSION_EXTENT && (self.boundary_policy == BoundaryPolicy::Masked || limit <= extent)
+            })
+        })
     }
 }
 
@@ -150,17 +223,7 @@ impl Operation for TileLoadOperation {
         let binding_count = self.transforms.iter().map(|transform| transform.binding_count()).sum::<usize>();
         check_count!("input", input_types, rank + 2 + binding_count, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        let ArrayIrType::Reference(reference) = &input_types[0] else {
-            return Err(TypeError::invalid(format!(
-                "`{TILE_LOAD_OPERATION_NAME}` first input must be an array reference",
-            )));
-        };
-        let source = infer_reference_view_type(
-            reference.referent(),
-            &self.transforms,
-            &input_types[rank + 2..].iter().collect::<Vec<_>>(),
-            ReferenceAccessMode::Read,
-        )?;
+        let source = self.source_type(input_types)?;
         if source.rank() != rank || source.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
                 "`{TILE_LOAD_OPERATION_NAME}` source requires a static shape with the block rank",
@@ -176,6 +239,12 @@ impl Operation for TileLoadOperation {
                 "`{TILE_LOAD_OPERATION_NAME}` padding value must be a scalar array",
             )));
         };
+        if !self.requires_runtime_assertion && !self.has_valid_windows(&input_types[1..rank + 1], &source) {
+            return Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` was constructed without a runtime window check but these input types \
+                 require one",
+            )));
+        }
         // Infer through an empty valid slice and canonical padding, so the rules for distributed axes and padding
         // values remain owned by the existing operations. Clear the physical layout for the declared dense result
         // contract.
@@ -192,14 +261,14 @@ impl Operation for TileLoadOperation {
     }
 
     fn effects(&self) -> Cow<'_, Effects> {
-        static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
-            Effects::new(
-                EffectClasses::NONE,
-                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-            )
-            .unwrap()
+        // A failing window check is observable even when the loaded tile is unused, so it is an ordered assertion.
+        static EFFECTS: LazyLock<[Effects; 2]> = LazyLock::new(|| {
+            [EffectClasses::NONE, EffectClasses::single(EffectClass::OrderedAssertion)].map(|classes| {
+                Effects::new(classes, vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }])
+                    .unwrap()
+            })
         });
-        Cow::Borrowed(&EFFECTS)
+        Cow::Borrowed(&EFFECTS[usize::from(self.requires_runtime_assertion)])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -208,6 +277,9 @@ impl Operation for TileLoadOperation {
             operation.field("boundary", format_args!("{:?}", self.boundary_policy))?;
             if !self.transforms.is_empty() {
                 operation.list("transforms", &self.transforms)?;
+            }
+            if self.requires_runtime_assertion {
+                operation.field("requires_runtime_assertion", true)?;
             }
             Ok(())
         })
@@ -302,8 +374,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex,
-        BroadcastOperation, ConcatenateOperation, Context, DataType, DimensionValue, DotOperation,
-        GatherDimensionNumbers, GatherMode, GatherOperation, InstructionId, Placeholder, ProgramBuilder,
+        BroadcastOperation, ConcatenateOperation, Context, DataType, DimensionBounds, DimensionType, DimensionValue,
+        DotOperation, GatherDimensionNumbers, GatherMode, GatherOperation, InstructionId, Placeholder, ProgramBuilder,
         ReferenceReadOperation, ReferenceRoot, ReferenceType, ReferenceWriteOperation, ScatterDimensionNumbers,
         ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation, check_operation_type_inference,
     };
@@ -446,13 +518,58 @@ mod tests {
         KernelDefinition::new(call, body)
     }
 
+    /// Builds a kernel without a grid that loads one tile of extent `block` of its `f32[4]` input under `boundary` at
+    /// the constant start `start` and writes that tile to its output. When `refined` is set, the tile load is refined
+    /// with [`TileLoadOperation::with_input_types`], and otherwise it keeps its conservative window check.
+    fn tile_load_definition(block: usize, boundary: BoundaryPolicy, start: usize, refined: bool) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [4]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [block]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let input_types = call.body_input_types();
+        let start = DimensionValue::constant(start).unwrap();
+        let mut operation = TileLoadOperation::new(vec![block], boundary).unwrap();
+        if refined {
+            operation = operation
+                .with_input_types(&[
+                    input_types[0].clone(),
+                    ArrayIrType::Dimension(start.r#type().into_owned()),
+                    ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ])
+                .unwrap();
+        }
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let start = builder.add_constant(ArrayIrValue::Dimension(start));
+        let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+        let tile = builder.add_instruction(operation, vec![], vec![inputs[0], start, other], None).unwrap()[0];
+        builder
+            .add_instruction(
+                ArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new()),
+                vec![],
+                vec![inputs[1], tile],
+                None,
+            )
+            .unwrap();
+        KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
+    }
+
     #[test]
     fn test_tile_load_operation_new() {
         let operation = TileLoadOperation::new(vec![2, 3], BoundaryPolicy::Masked).unwrap();
         assert_eq!(operation.block_shape(), &[2, 3]);
         assert_eq!(operation.boundary_policy(), BoundaryPolicy::Masked);
         assert_eq!(operation.name(), TILE_LOAD_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), "tile_load [block_shape=[2, 3], boundary=Masked]");
+        assert_eq!(
+            format!("{operation}"),
+            "tile_load [block_shape=[2, 3], boundary=Masked, requires_runtime_assertion=true]",
+        );
         assert_eq!(
             TileLoadOperation::new(vec![MAX_DIMENSION_EXTENT + 1], BoundaryPolicy::Masked),
             Err(TypeError::invalid(format!(
@@ -467,6 +584,48 @@ mod tests {
         let operation =
             TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().with_transforms(transforms.clone());
         assert_eq!(operation.transforms(), transforms);
+    }
+
+    #[test]
+    fn test_tile_load_operation_with_input_types() {
+        let source = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4])));
+        let padding = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let start = |upper: Option<usize>| {
+            ArrayIrType::Dimension(DimensionType::new("start", DimensionBounds::non_negative(upper).unwrap()))
+        };
+        let refine = |boundary: BoundaryPolicy, start: ArrayIrType| {
+            TileLoadOperation::new(vec![2], boundary)
+                .unwrap()
+                .with_input_types(&[source.clone(), start, padding.clone()])
+                .map(|operation| operation.requires_runtime_assertion())
+        };
+        assert!(TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().requires_runtime_assertion());
+
+        // The largest start plus the tile extent must fit the canonical dimension width, and an in-bounds window must
+        // also fit the source view.
+        assert_eq!(refine(BoundaryPolicy::Masked, start(Some(3))), Ok(false));
+        assert_eq!(refine(BoundaryPolicy::Masked, start(Some(MAX_DIMENSION_EXTENT - 1))), Ok(false));
+        assert_eq!(refine(BoundaryPolicy::Masked, start(Some(MAX_DIMENSION_EXTENT))), Ok(true));
+        assert_eq!(refine(BoundaryPolicy::Masked, start(None)), Ok(true));
+        assert_eq!(refine(BoundaryPolicy::InBounds, start(Some(3))), Ok(false));
+        assert_eq!(refine(BoundaryPolicy::InBounds, start(Some(4))), Ok(true));
+        assert_eq!(
+            refine(BoundaryPolicy::Masked, padding.clone()),
+            Err(TypeError::invalid(format!("`{TILE_LOAD_OPERATION_NAME}` starts must be canonical dimensions"))),
+        );
+
+        // An operation without the check rejects input types that require it rather than silently dropping its effect.
+        let proved = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked)
+            .unwrap()
+            .with_input_types(&[source.clone(), start(Some(3)), padding.clone()])
+            .unwrap();
+        assert_eq!(
+            proved.infer_output_types(&[source, start(None), padding], &[]),
+            Err(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` was constructed without a runtime window check but these input types \
+                 require one",
+            ))),
+        );
     }
 
     #[test]
@@ -530,8 +689,20 @@ mod tests {
 
     #[test]
     fn test_tile_load_operation_effects() {
+        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
         assert_eq!(
-            TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().effects().as_ref(),
+            operation.effects().as_ref(),
+            &Effects::new(
+                EffectClasses::single(EffectClass::OrderedAssertion),
+                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+            )
+            .unwrap(),
+        );
+        let source = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        let start = ArrayIrType::Dimension(DimensionValue::constant(1).unwrap().r#type().into_owned());
+        let padding = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        assert_eq!(
+            operation.with_input_types(&[source, start, padding]).unwrap().effects().as_ref(),
             &Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
@@ -541,15 +712,53 @@ mod tests {
     }
 
     #[test]
+    fn test_tile_load_operation_effects_failing_windows() {
+        // An in-bounds window at offset 4 of an `f32[4]` source and a masked window whose limit exceeds the canonical
+        // dimension width both fail on the host, so the kernel that contains them must declare an ordered assertion.
+        // Refinement keeps the check, because the start types do not prove these windows valid.
+        let source = Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap();
+        for refined in [false, true] {
+            let in_bounds = tile_load_definition(1, BoundaryPolicy::InBounds, 4, refined);
+            assert_eq!(
+                in_bounds.interpret(vec![source.clone()], 1),
+                Err(ProgramError::Type(TypeError::invalid(format!(
+                    "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+                )))),
+            );
+            assert!(in_bounds.effects().classes().contains(EffectClass::OrderedAssertion));
+            let masked = tile_load_definition(1, BoundaryPolicy::Masked, MAX_DIMENSION_EXTENT, refined);
+            assert_eq!(
+                masked.interpret(vec![source.clone()], 1),
+                Err(ProgramError::Type(TypeError::invalid(format!(
+                    "`{TILE_LOAD_OPERATION_NAME}` window limit exceeds the canonical dimension width",
+                )))),
+            );
+            assert!(masked.effects().classes().contains(EffectClass::OrderedAssertion));
+        }
+
+        // A refined in-bounds window at the last valid offset is proved valid and keeps the kernel free of assertions.
+        let safe = tile_load_definition(1, BoundaryPolicy::InBounds, 3, true);
+        assert_eq!(safe.interpret(vec![source], 1), Ok(vec![Array::vector(vec![4f32]).unwrap()]));
+        assert!(!safe.effects().classes().contains(EffectClass::OrderedAssertion));
+    }
+
+    #[test]
     fn test_tile_load_operation_render() {
+        // Only an operation that retains its window check renders the flag.
         let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
-        assert_eq!(operation.to_string(), "tile_load [block_shape=[2], boundary=Masked]");
+        assert_eq!(
+            operation.to_string(),
+            "tile_load [block_shape=[2], boundary=Masked, requires_runtime_assertion=true]",
+        );
+        let source = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])));
+        let start = ArrayIrType::Dimension(DimensionValue::constant(1).unwrap().r#type().into_owned());
+        let padding = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let operation = operation.with_transforms(vec![ArrayReferenceTransform::Index {
             axis: 0,
             index: ArrayReferenceTransformIndex::Static(1),
         }]);
         assert_eq!(
-            operation.to_string(),
+            operation.clone().with_input_types(&[source, start, padding]).unwrap().to_string(),
             "tile_load [block_shape=[2], boundary=Masked, transforms=[index(axis=0, index=1)]]",
         );
 
@@ -565,6 +774,7 @@ mod tests {
                     block_shape=[2],
                     boundary=Masked,
                     transforms=[index(axis=0, index=dynamic), slice(axes=[1:4])],
+                    requires_runtime_assertion=true,
                 ]"},
         );
     }

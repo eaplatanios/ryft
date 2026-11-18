@@ -31,8 +31,14 @@
 //! ordering covers every pair of parameters. Each scatter writes distinct affine indices, so no scatter overlaps
 //! itself. This relies on the token ordering pass of the front end, which its documentation does not state as a
 //! contract. That pass was read from the main branch of the cuTile sources at commit `98cd15e`, while the pinned
-//! release is 1.5.0, so it has not been confirmed against the pinned front end, and no generated source has been
-//! compiled or run.
+//! release is 1.5.0.
+//!
+//! Generated source has been compiled with the pinned toolchain (i.e., `cuda-tile==1.5.0`) and run on one NVIDIA GB10
+//! on 2026-11-17, where the 10 cuTile device tests of `ryft-experimental` passed. They include a matmul compared with
+//! an independently computed numerical oracle, an aliased update, a batched vector add, and the reload of an
+//! ahead-of-time bundle. That run used a single device, so it does not establish batching across several devices.
+//! Nor does it establish that the token dependencies of the pinned front end order every pair of overlapping writes
+//! as described above.
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,

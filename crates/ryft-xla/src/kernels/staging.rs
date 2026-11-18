@@ -12,14 +12,14 @@ use ryft_core::{
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     Domain as CoreDomain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
     InterpretationDriver, LogicalMesh, MaybeZero, MeshAxisType, MeshContext, Operation as CoreOperation,
-    OperationBoundaryPruning,
-    OperationFoldOutput, OperationProvider, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program as CoreProgram,
-    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, ShardMapBoundary, ShardMapOperation, Sharding,
-    ShardingDimension, Tracer as CoreTracer, TracingContext, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value as CoreValue,
+    OperationBoundaryPruning, OperationFoldOutput, OperationProvider, OutputRegionProvenance, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder,
+    Program as CoreProgram, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
+    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Tracer as CoreTracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
+    TypedProgram, Value as CoreValue,
 };
 use ryft_kernels::{
     KernelCallOperation, KernelCompiler, KernelCompletionProtocol, KernelDefinition,
@@ -28,7 +28,10 @@ use ryft_kernels::{
 };
 use ryft_mlir::ValueRef;
 
-use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
+use crate::kernels::{
+    CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, placed_custom_call, unbound_kernel_axis_message,
+    validate_kernel_sharding,
+};
 use crate::{
     Constant, Error, FlatProgram, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation,
     Target,
@@ -566,9 +569,10 @@ where
         // is batched per device inside a `shard_map` over those axes. Scalar prefetched inputs are not parameters and
         // must be specialized before batching, which the ordinary path reports.
         if call.prefetch_types().is_empty()
-            && let Some((mesh, axes)) = unbound_batch_placement(inputs, &context.parent().manual_axes())?
+            && let bound_axes = context.parent().manual_axes()
+            && let Some((mesh, axes)) = unbound_batch_placement(inputs, &bound_axes)?
         {
-            return batch_in_shard_map(context.parent(), &definition, inputs, &mesh, axes);
+            return batch_in_shard_map(context.parent(), &definition, inputs, &mesh, axes, &bound_axes);
         }
         let (definition, axes) = definition
             .batched_inputs(inputs, ryft_kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
@@ -648,17 +652,31 @@ fn unbound_batch_placement<V: CoreValue<Type = ArrayIrType>>(
 /// shardings of the map place the batch axis of every result on those axes. The results are typed over `mesh`, which
 /// types the axes either as manual or, for a caller in JAX's explicit sharding mode, as explicit (refer to
 /// [`ShardMapBoundary::caller_mesh`]).
+///
+/// An input that is also placed on a mesh axis outside of `axes` that no enclosing manual region binds (i.e., none of
+/// `bound_axes`) is rejected, because one device would hold only a part of it.
 fn batch_in_shard_map<C>(
     context: &C,
     definition: &KernelDefinition<KernelExtension>,
     inputs: &[ArrayIrBatch<C::Value>],
     mesh: &LogicalMesh,
     axes: Vec<String>,
+    bound_axes: &[(String, ryft_core::NamedAxis)],
 ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
 {
     let unsupported = |message: String| BatchingError::UnsupportedOperation { message };
+
+    // The map transfers nothing and converts nothing, so the packed inputs must already be the declared inputs of the
+    // kernel up to their batch axes and their shardings, as on the ordinary path.
+    let unbatched_types = inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>();
+    if definition.operation().output_types_for(&unbatched_types).is_err() {
+        return Err(ProgramError::custom(ryft_kernels::KernelTransformError::Unsupported {
+            message: "batched input types differ from the kernel signature".to_owned(),
+        })
+        .into());
+    }
     let explicit_count = axes.iter().filter(|axis| mesh.axis_type(axis) == Some(MeshAxisType::Explicit)).count();
     if explicit_count != 0 && explicit_count != axes.len() {
         return Err(unsupported(format!(
@@ -671,11 +689,25 @@ where
     // The placement of every input over the mesh of the map, and the batch axis of every parameter.
     let mut input_types = Vec::with_capacity(inputs.len());
     let mut input_shardings = Vec::with_capacity(inputs.len());
-    for input in inputs {
+    for (index, input) in inputs.iter().enumerate() {
         let r#type = input.value().r#type();
         let ArrayIrType::Array(r#type) = r#type.as_ref() else {
             return Err(unsupported("kernel batching accepts only ordinary array inputs".to_owned()));
         };
+
+        // The map makes only the axes of the batch manual. An input that is also placed on another axis that no
+        // enclosing manual region binds would reach the kernel split across devices, and gathering it is a choice
+        // with a communication cost that belongs to the caller.
+        if let Some(axis) = r#type.sharding().and_then(|sharding| {
+            sharding.dimensions().iter().find_map(|dimension| match dimension {
+                ShardingDimension::Sharded(names) => names
+                    .iter()
+                    .find(|name| !axes.contains(name) && !bound_axes.iter().any(|(bound, _)| bound == *name)),
+                _ => None,
+            })
+        }) {
+            return Err(unsupported(unbound_kernel_axis_message(index, axis)));
+        }
         input_shardings.push(match r#type.sharding() {
             Some(sharding) => {
                 Sharding::new(map_mesh.clone(), sharding.dimensions().to_vec()).map_err(ProgramError::custom)?
@@ -715,10 +747,14 @@ where
     let boundary =
         ShardMapBoundary::new(map_mesh, input_shardings, output_shardings, axes).map_err(ProgramError::custom)?;
     let boundary = if explicit_count != 0 { boundary.with_explicit_caller_axes() } else { boundary };
+    // The local shard of an input keeps the memory of that input, which is the memory that the kernel declares.
     let local_input_types = input_types
         .iter()
         .enumerate()
-        .map(|(index, r#type)| boundary.local_input_type(index, &boundary.global_input_type(index, r#type)?))
+        .map(|(index, r#type)| {
+            let local = boundary.local_input_type(index, &boundary.global_input_type(index, r#type)?)?;
+            Ok::<_, ryft_core::ShardMapError>(local.with_memory(r#type.memory()))
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(ProgramError::custom)?;
     let local_batch_size = inputs
@@ -828,7 +864,8 @@ where
 /// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
 /// active tangents and returns primal results followed by their tangents, as checked by a [`CompositeOperation`]
 /// with a JVP rule region. The supplied rule owns derivative semantics, and the mutable kernel body is never
-/// implicitly differentiated.
+/// implicitly differentiated. The primal applies the kernel to inputs of the types of `inputs`, which may be placed
+/// (refer to [`KernelCallOperation`]), so the rule region must be staged for those types.
 pub fn stage_kernel_with_jvp<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
@@ -841,7 +878,7 @@ where
 {
     context.bind(
         CompositeOperation::<Constant, Operation>::from_rule_regions(CompositeJvpRule::Explicit, false),
-        vec![kernel_primal(definition)?, jvp.clone()],
+        vec![kernel_program(definition, input_types(inputs))?, jvp.clone()],
         inputs,
     )
 }
@@ -864,7 +901,7 @@ where
 {
     context.bind(
         CompositeOperation::<Constant, Operation>::from_rule_regions(CompositeJvpRule::Absent, true),
-        vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
+        vec![kernel_program(definition, input_types(inputs))?, forward.clone(), backward.clone()],
         inputs,
     )
 }
@@ -887,18 +924,19 @@ where
     S: CustomRuleSource<Constant, Operation>,
     Operation: From<CompositeOperation<Constant, Operation, S>>,
 {
-    context.bind(CompositeOperation::new(rules), vec![kernel_primal(definition)?], inputs)
+    context.bind(CompositeOperation::new(rules), vec![kernel_program(definition, input_types(inputs))?], inputs)
 }
 
-/// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the
-/// native kernel primal. This is an AD contract, not recovery from compiler errors, so the caller guarantees
-/// equivalence for every admitted input. Complete input and output types must agree. The fallback cannot contain
-/// references or effects, and the native call cannot have observable effects beyond its confined local reference
-/// state, which [`KernelDefinition::effects`] summarizes together with the assertions of its mappings and scalar
-/// prefetch conversions. State that the body declares explicitly (e.g., through an external call) is observable and
-/// is rejected, as it is at the compiled embedding boundary. Existing canonical JVP construction derives the fallback rule, so reverse mode uses the same
-/// primitive transpose machinery and rematerialization can recompute only the explicitly selected pure derivative
-/// computation.
+/// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the native
+/// kernel primal. This is an AD contract, not recovery from compiler errors, so the caller guarantees equivalence for
+/// every admitted input. Complete input and output types must agree with the declared signature, and for placed inputs
+/// the fallback is staged again over their types and must give the results of the call. The fallback cannot contain
+/// references or effects, and the native call cannot have observable effects beyond its confined local reference state,
+/// which [`KernelDefinition::effects`] summarizes together with the assertions of its mappings and scalar prefetch
+/// conversions. State that the body declares explicitly (e.g., through an external call) is observable and is rejected,
+/// as it is at the compiled embedding boundary. Existing canonical JVP construction derives the fallback rule, so
+/// reverse mode uses the same primitive transpose machinery and rematerialization can recompute only the explicitly
+/// selected pure derivative computation.
 pub fn stage_kernel_with_fallback<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
@@ -909,13 +947,35 @@ where
     C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
     Extension: PortableKernelExtension + Into<KernelExtension>,
 {
+    let signature =
+        || ProgramError::Type(TypeError::invalid("pure kernel fallback must preserve the complete signature"));
     if fallback.input_types() != definition.operation().input_types()
         || fallback.output_types() != definition.operation().output_types()
     {
-        return Err(ProgramError::Type(TypeError::invalid(
-            "pure kernel fallback must preserve the complete signature",
-        )));
+        return Err(signature());
     }
+
+    // The fallback is declared over the physical signature. For placed inputs it is staged again over their types, so
+    // that it and its derivative rule have the interface of this call, and it must then give the results the types
+    // that the kernel call gives them.
+    let actual_types = input_types(inputs);
+    let restaged;
+    let fallback = if actual_types == definition.operation().input_types() {
+        fallback
+    } else {
+        let (output_types, program) = TracingContext::<Constant, Operation>::trace(
+            |values: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                let context = values[0].context().clone();
+                fallback.interpret_in_context(&context, values)
+            },
+            actual_types.clone(),
+        )?;
+        if output_types != definition.operation().output_types_for(&actual_types)? {
+            return Err(signature());
+        }
+        restaged = program.into_flat_program();
+        &restaged
+    };
     // Only the private reference state of the body may be dropped with the primal. State that the body declares
     // explicitly (e.g., an external call) is observable, like every other effect class.
     let effects = definition.effects();
@@ -1376,7 +1436,18 @@ pub(crate) fn select_kernels(
                             })
                             .collect::<Vec<_>>();
                         validate_kernel_sharding(&input_types, bound_axes)?;
+
+                        // The compiler sees the physical kernel. The custom call that replaces the kernel call is
+                        // declared for the placement of the values that the call receives and must give its results
+                        // the types that the kernel call gave them, since the instruction keeps its result atoms.
                         let compiled = binding.compile(&definition, &facts)?;
+                        let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
+                        let compiled = placed_custom_call(
+                            operation,
+                            &compiled,
+                            &instruction.inputs().iter().map(atom_type).collect::<Vec<_>>(),
+                        )
+                        .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
                         selected = true;
                         return Ok(Instruction::new(
                             compiled.into(),
@@ -1484,15 +1555,14 @@ fn stage_body<Extension: PortableKernelExtension + Into<KernelExtension>>(
     )
 }
 
-/// Builds the ordinary functional primal region shared by canonical composite carriers.
-fn kernel_primal<Extension: PortableKernelExtension + Into<KernelExtension>>(
-    definition: &KernelDefinition<Extension>,
-) -> Result<FlatProgram, ProgramError> {
-    kernel_program(definition, definition.operation().input_types())
+/// Returns the types of `inputs`, which are the types that a kernel call on them is staged for.
+fn input_types<V: CoreValue<Type = ArrayIrType>>(inputs: &[V]) -> Vec<ArrayIrType> {
+    inputs.iter().map(|input| input.r#type().into_owned()).collect()
 }
 
-/// Builds a program that applies `definition` to inputs of `input_types`, which are its declared input types up to
-/// their shardings (e.g., the local shards of a manual region).
+/// Builds the ordinary functional primal region shared by canonical composite carriers, which applies `definition` to
+/// inputs of `input_types`. These are its declared input types up to their shardings (e.g., the local shards of a
+/// manual region).
 fn kernel_program<Extension: PortableKernelExtension + Into<KernelExtension>>(
     definition: &KernelDefinition<Extension>,
     input_types: Vec<ArrayIrType>,
@@ -1608,8 +1678,8 @@ pub(crate) mod tests {
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, KernelCompilationError, KernelCompiler, KernelParameter,
-        KernelParameterAccess, KernelSchedule, MappingExpression, ParameterWindow, VerifiedKernel, mapped_call,
-        whole_array_parameter,
+        KernelParameterAccess, KernelSchedule, MappingExpression, ParameterWindow, TileLoadOperation, VerifiedKernel,
+        mapped_call, whole_array_parameter,
     };
     #[cfg(feature = "mosaic-gpu")]
     use ryft_mosaic::kernels::gpu::{
@@ -1750,6 +1820,11 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap()
+    }
+
+    /// Builds the primal program of `definition` over its declared input types.
+    fn kernel_primal(definition: &KernelDefinition) -> Result<FlatProgram, ProgramError> {
+        kernel_program(definition, definition.operation().input_types())
     }
 
     /// Compiles scalar derivative programs through the existing XLA session and waits for concrete results.
@@ -2189,10 +2264,32 @@ pub(crate) mod tests {
         sharding: Sharding,
         bound_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
+        let packed = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(sharding).unwrap();
+        batch_packed(definition, packed, bound_axes)
+    }
+
+    /// Batches `definition` like [`batch_sharded`] over a packed input in `memory`, in a trace without enclosing
+    /// manual regions.
+    fn batch_sharded_with_memory(
+        definition: &KernelDefinition,
+        sharding: Sharding,
+        memory: Memory,
+    ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
+        let packed = ArrayType::new_static(DataType::F32, [3, 4]).with_memory(memory).with_sharding(sharding).unwrap();
+        batch_packed(definition, packed, Vec::new())
+    }
+
+    /// Batches `definition` along axis 1 of one input of type `packed` in a fresh trace whose enclosing manual regions
+    /// bind `bound_axes`. Returns the staged program together with the batch axis of every result, or the batching
+    /// error.
+    fn batch_packed(
+        definition: &KernelDefinition,
+        packed: ArrayType,
+        bound_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
         let callees = [Arc::new(stage_body(definition).unwrap())];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
-        let packed = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(sharding).unwrap();
         let mut result = None;
         let (_, program) = TracingContext::<Constant, Operation>::trace_with_named_axes(
             |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
@@ -2448,8 +2545,24 @@ pub(crate) mod tests {
 
         // A global batch is wrapped in a `shard_map` over the axes that it is placed on, including when an enclosing
         // manual region binds another axis.
-        assert!(matches!(batch(sharded(mesh(MeshAxisType::Manual), &["x", "y"]), &[], true), Ok(Operation::ShardMap(_))));
+        assert!(matches!(
+            batch(sharded(mesh(MeshAxisType::Manual), &["x", "y"]), &[], true),
+            Ok(Operation::ShardMap(_))
+        ));
         assert!(matches!(batch(sharded(mesh(MeshAxisType::Manual), &["x"]), &["y"], true), Ok(Operation::ShardMap(_))));
+
+        // The item dimension is placed on `y`, which the map over the batch axis `x` does not make manual. One device
+        // would hold only a part of each item, unless an enclosing manual region binds `y`.
+        let split = Sharding::new(
+            mesh(MeshAxisType::Manual),
+            vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        assert!(matches!(
+            batch(split.clone(), &[], true),
+            Err(BatchingError::UnsupportedOperation { message }) if message == unbound_kernel_axis_message(0, "y"),
+        ));
+        assert!(matches!(batch(split, &["y"], true), Ok(Operation::ShardMap(_))));
 
         // A placement of which an enclosing manual region binds only a part, or that mixes explicit and manual axes,
         // is neither.
@@ -2548,6 +2661,42 @@ pub(crate) mod tests {
             }
             Err(error) => panic!("Triton admission rejected the local kernel: {error}"),
         }
+    }
+
+    #[test]
+    fn test_kernel_operation_batch_sharded_memory() {
+        // The kernel declares pinned host memory. The packed input must have that memory, and the local kernel of
+        // each device keeps it.
+        let memory = Memory::Host { pinned: true };
+        let definition = |memory: Memory| {
+            let item = ArrayType::new_static(DataType::F32, [3]).with_memory(memory);
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![whole_array_parameter(item, KernelParameterAccess::ReadWrite).unwrap()],
+            )
+            .unwrap();
+            let definition: KernelDefinition =
+                KernelDefinition::trace(call, |(references, _)| references[0].write(&references[0].read()?)).unwrap();
+            definition
+        };
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap();
+        let (program, _) = batch_sharded_with_memory(&definition(memory), sharding.clone(), memory).unwrap();
+        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
+        let Operation::Kernel(KernelOperation(PortableKernelOperation::Call(call))) =
+            body.instructions()[0].operation()
+        else {
+            panic!("expected a kernel call in the body of the staged `shard_map`");
+        };
+        assert_eq!(call.parameters()[0].r#type().memory(), memory);
+
+        // A packed input in another memory than the kernel declares is not an input of that kernel.
+        let error = batch_sharded_with_memory(&definition(Memory::Device), sharding, memory).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "kernel transform is unsupported: batched input types differ from the kernel signature",
+        );
     }
 
     #[test]
@@ -2998,6 +3147,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_stage_kernel_with_fallback_placed_inputs() {
+        // The input is replicated on a mesh. Ordinary staging accepts it, and so does the fallback staging, which
+        // stages the fallback and its derivative rule for the placed type. The result has the type of the input.
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(scalar);
+        let fallback = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let placed = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let placed = ArrayIrType::Array(placed);
+        for stage in [true, false] {
+            let (output_types, program) = TracingContext::<Constant, Operation>::trace(
+                |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                    if stage {
+                        stage_kernel(inputs[0].context(), &definition, &inputs)
+                    } else {
+                        stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
+                    }
+                },
+                vec![placed.clone()],
+            )
+            .unwrap();
+            assert_eq!(output_types, vec![placed.clone()]);
+            assert_eq!(program.instructions().len(), 1);
+        }
+    }
+
+    #[test]
     fn test_stage_kernel_with_fallback_rejects_changed_signature() {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
@@ -3097,6 +3277,57 @@ pub(crate) mod tests {
                 message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn test_stage_kernel_with_fallback_rejects_fallible_tile_loads() {
+        // The body loads the tile of extent one at start 4 of its `f32[4]` parameter, which lies beyond the parameter
+        // and fails when the kernel runs. An identity fallback would drop that failure under differentiation. A load
+        // at start 3 is proved valid and leaves the kernel free of observable effects.
+        let stage = |start: usize| {
+            let vector = ArrayType::new_static(DataType::F32, [4]);
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![whole_array_parameter(vector.clone(), KernelParameterAccess::ReadWrite).unwrap()],
+            )
+            .unwrap();
+            let input_types = call.body_input_types();
+            let start = DimensionValue::constant(start).unwrap();
+            let operation = TileLoadOperation::new(vec![1], BoundaryPolicy::InBounds)
+                .unwrap()
+                .with_input_types(&[
+                    input_types[0].clone(),
+                    ArrayIrType::Dimension(start.r#type().into_owned()),
+                    ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ])
+                .unwrap();
+            let mut body = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
+            let reference = body.add_input(input_types[0].clone());
+            let start = body.add_constant(ArrayIrValue::Dimension(start));
+            let other = body.add_constant(ArrayIrValue::Array(CoreArray::scalar(-1f32).unwrap()));
+            body.add_instruction(operation, vec![], vec![reference, start, other], None).unwrap();
+            let definition: KernelDefinition =
+                KernelDefinition::new(call, body.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
+            let mut fallback = ProgramBuilder::new();
+            let input = fallback.add_input(ArrayIrType::Array(vector.clone()));
+            let fallback = fallback
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            TracingContext::<Constant, Operation>::trace(
+                |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                    stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
+                },
+                vec![ArrayIrType::Array(vector)],
+            )
+            .map(|_| ())
+        };
+        assert_eq!(
+            stage(4),
+            Err(ProgramError::UnsupportedOperation {
+                message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
+            }),
+        );
+        assert_eq!(stage(3), Ok(()));
     }
 
     #[test]
@@ -3628,7 +3859,7 @@ pub(crate) mod tests {
                 ] %0 [
                     body={
                         lambda %0:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] .
-                        let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{}], varying_manual={'device'}}] = custom_call [
+                        let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] = custom_call [
                             target=ryft.test.aot,
                             ryft.kernel.schema=1,
                             ryft.kernel.semantic=\"f7cc50a3ef48ecb6d57641d539824244179a0ebd191571eaeb72fbbecf87a870\",
@@ -3642,9 +3873,10 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
-        assert!(matches!(select_kernels(&body, Some(&binding), facts),
-            Err(KernelEmbeddingError::Invalid { message }) if message ==
-                "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`"));
+        assert!(matches!(
+            select_kernels(&body, Some(&binding), facts),
+            Err(KernelEmbeddingError::Invalid { message }) if message == unbound_kernel_axis_message(0, "device"),
+        ));
 
         // An independently built equal program selects the same keyed custom call, so it reuses the same entry.
         let (_, again) = build(None);

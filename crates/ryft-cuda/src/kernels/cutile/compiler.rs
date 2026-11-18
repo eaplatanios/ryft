@@ -1,7 +1,9 @@
 //! Bounded AOT tool invocation and strict producer-manifest validation.
 //!
 //! The exporter records the toolchain, ABI, and cubin. The adapter adds the digest of the source that it generated,
-//! which [`CompiledKernel::from_manifest`] compares against the current lowering on every restoration.
+//! which [`CompiledKernel::from_manifest`] compares against the current lowering on every restoration. The compiler
+//! configuration key identifies the exporter and the Rust sources of this adapter, so that runtime-only records of a
+//! different lowering or admission policy never match it.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -17,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::kernels::cutile::{
     COMPILER_SCHEMA_VERSION, CUDA_TILE_VERSION, CompiledKernel, Configuration, Error, NVCC_VERSION, NVVM_VERSION,
-    Options, Parameter, TILEIRAS_VERSION, Target, Versions, lowering,
+    Options, Parameter, TILEIRAS_VERSION, Target, Versions, lowering, lowering_sha256,
 };
 
 /// Compiler installation and optional cancellation signal. Neither owns any CUDA runtime resource.
@@ -97,7 +99,8 @@ impl Compiler {
         Ok(versions)
     }
 
-    /// Encodes semantic compiler identity, excluding deadlines and cancellation policy.
+    /// Encodes semantic compiler identity, including the exporter and Rust lowering source digests and excluding
+    /// deadlines and cancellation policy.
     fn key(&self, target: &Target, schedule: &KernelSchedule) -> Result<Vec<u8>, Error> {
         if !self.python.is_absolute() {
             return Err(Error::Invalid { message: "Python executable must be an absolute path".into() });
@@ -115,6 +118,7 @@ impl Compiler {
             buffering_depth: schedule.buffering_depth().map(|value| value.get()),
             maximum_scratch_bytes: schedule.maximum_scratch_bytes(),
             worker_sha256: hex::encode(Sha256::digest(include_bytes!("export.py"))),
+            lowering_sha256: lowering_sha256(),
         })?)
     }
 
@@ -327,6 +331,8 @@ mod tests {
         let target = Target::new(12, 1).unwrap();
         let schedule = KernelSchedule::default();
         let key = compiler.configuration_key(&target, &Options::default(), &schedule).unwrap();
+        let configuration = serde_json::from_slice::<serde_json::Value>(&key).unwrap();
+        assert_eq!(configuration["lowering_sha256"], serde_json::Value::from(lowering_sha256()));
         let short = Options::default().with_timeouts(Duration::from_millis(1), Duration::from_millis(2)).unwrap();
         assert_eq!(compiler.configuration_key(&target, &short, &schedule).unwrap(), key);
         assert_ne!(compiler.configuration_key(&Target::new(12, 0).unwrap(), &short, &schedule).unwrap(), key);

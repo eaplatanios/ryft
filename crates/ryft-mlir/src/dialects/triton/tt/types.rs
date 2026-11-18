@@ -1,15 +1,46 @@
 use ryft_xla_sys::bindings::MlirType;
 use ryft_xla_sys::mlir::dialects::triton::tt::{
-    mlirTritonTtPointerTypeGet, mlirTritonTtPointerTypeGetAddressSpace, mlirTritonTtPointerTypeGetPointeeType,
-    mlirTritonTtTensorDescTypeGet, mlirTritonTtTensorDescTypeGetBlockType, mlirTritonTtTensorDescTypeGetDimSize,
-    mlirTritonTtTensorDescTypeGetElementType, mlirTritonTtTensorDescTypeGetNumDims,
-    mlirTritonTtTensorDescTypeGetSharedLayout, mlirTypeIsATritonTtPointerType, mlirTypeIsATritonTtTensorDescType,
+    mlirTritonTtPackedFloat4E2M1TypeGet, mlirTritonTtPointerTypeGet, mlirTritonTtPointerTypeGetAddressSpace,
+    mlirTritonTtPointerTypeGetPointeeType, mlirTritonTtTensorDescTypeGet, mlirTritonTtTensorDescTypeGetBlockType,
+    mlirTritonTtTensorDescTypeGetDimSize, mlirTritonTtTensorDescTypeGetElementType,
+    mlirTritonTtTensorDescTypeGetNumDims, mlirTritonTtTensorDescTypeGetSharedLayout,
+    mlirTypeIsATritonTtPackedFloat4E2M1Type, mlirTypeIsATritonTtPointerType, mlirTypeIsATritonTtTensorDescType,
 };
 
 use crate::{
     Attribute, AttributeRef, Context, DialectHandle, Error, Size, TensorTypeRef, Type, TypeRef,
     mlir_subtype_trait_impls,
 };
+
+/// Triton type containing two E2M1 floating-point values in one byte. The low nibble holds the first value.
+#[derive(Copy, Clone)]
+pub struct PackedFloat4E2M1TypeRef<'c, 't> {
+    /// Handle that represents this type in the MLIR C API.
+    handle: MlirType,
+
+    /// Context that owns the type.
+    context: &'c Context<'t>,
+}
+
+impl<'c, 't> Type<'c, 't> for PackedFloat4E2M1TypeRef<'c, 't> {
+    unsafe fn from_c_api(handle: MlirType, context: &'c Context<'t>) -> Result<Self, Error> {
+        if unsafe { mlirTypeIsATritonTtPackedFloat4E2M1Type(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected an MLIR `!tt.fp4e2m1x2` type"))
+        }
+    }
+
+    unsafe fn to_c_api(&self) -> MlirType {
+        self.handle
+    }
+
+    fn context(&self) -> &'c Context<'t> {
+        self.context
+    }
+}
+
+mlir_subtype_trait_impls!(PackedFloat4E2M1TypeRef<'c, 't> as Type, mlir_type = Type);
 
 /// Triton `tt` pointer [`Type`]. Pointer types represent addresses in a Triton address space and may point only to
 /// scalar element types.
@@ -131,6 +162,14 @@ impl<'c, 't> Type<'c, 't> for TensorDescTypeRef<'c, 't> {
 mlir_subtype_trait_impls!(TensorDescTypeRef<'c, 't> as Type, mlir_type = Type);
 
 impl<'t> Context<'t> {
+    /// Creates the Triton type for a pair of packed E2M1 floating-point values.
+    pub fn triton_tt_packed_float4_e2m1_type(&self) -> Result<PackedFloat4E2M1TypeRef<'_, 't>, Error> {
+        self.load_dialect(DialectHandle::triton_tt()?)?;
+        unsafe {
+            PackedFloat4E2M1TypeRef::from_c_api(mlirTritonTtPackedFloat4E2M1TypeGet(*self.handle.borrow_mut()), self)
+        }
+    }
+
     /// Creates a new Triton `tt` [`PointerTypeRef`] owned by this [`Context`].
     /// The address space must be `0` (tensor descriptor), `1` (global), or `4` (constant).
     pub fn triton_tt_pointer_type<'c, T: Type<'c, 't>>(
@@ -177,6 +216,15 @@ mod tests {
     use crate::types::tests::{test_type_casting, test_type_display_and_debug};
 
     use super::*;
+
+    #[test]
+    fn test_packed_float4_e2m1_type() {
+        let context = Context::new();
+        let packed = context.triton_tt_packed_float4_e2m1_type().unwrap();
+        assert_eq!(packed.dialect().unwrap().namespace().unwrap(), "tt");
+        assert_eq!(packed, context.triton_tt_packed_float4_e2m1_type().unwrap());
+        test_type_display_and_debug(packed, "!tt.fp4e2m1x2");
+    }
 
     #[test]
     fn test_pointer_type() {

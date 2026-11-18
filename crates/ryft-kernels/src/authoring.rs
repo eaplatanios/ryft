@@ -449,13 +449,19 @@ pub fn tiled_call(
 ///
 /// Every nonnegative tile index is accepted, whether it is a dimension (e.g., a grid coordinate) or an integer scalar
 /// array (e.g., a loop index), and a tile that lies entirely beyond `source` contains only `other`. Every index at or
-/// beyond the number of tiles that cover an axis selects such a tile, so an index that its type does not bound by
-/// that number is first clamped to it, with a [`DimensionMinOperation`] for a dimension and with a
-/// [`CompareOperation`] and a [`SelectOperation`] for a scalar. Every tile of a physically empty `source` contains only
-/// `other`, so its indices are clamped to zero. The clamp preserves the result, keeps the multiplication by the tile
-/// extent from overflowing, and bounds the element starts so that the window limit provably fits the canonical
-/// dimension width. Scalar indices then enter the dimension universe through a checked
-/// [`DimensionFromScalarOperation`], which rejects negative values.
+/// beyond the number of tiles that cover an axis selects such a tile, so an index that its type does not bound by that
+/// number is first clamped to it, with a [`DimensionMinOperation`] for a dimension and with a [`CompareOperation`] and
+/// a [`SelectOperation`] for a scalar. Every tile of a physically empty `source` contains only `other`, and a tile
+/// without elements is empty at every index, so the indices of both are clamped to zero. The padding value `other`
+/// takes the memory placement of `source`. The clamp preserves the result. It also keeps the multiplication by the tile
+/// extent from overflowing and bounds the element starts so that the window limit provably fits the canonical dimension
+/// width, whenever the limit of the first tile beyond `source` (i.e., its start plus the tile extent) fits that width.
+/// It does not for a source that is not empty and reaches within one tile of that width, which no backend can
+/// materialize, or for a tile that is longer than half that width. In those cases the multiplication or the tile load
+/// keeps its runtime check, which reports an index that the clamp could not bound. Scalar indices then enter the
+/// dimension universe through a checked [`DimensionFromScalarOperation`], which rejects negative values. The tile load
+/// is refined with [`TileLoadOperation::with_input_types`], so it declares no ordered assertion whenever the bounded
+/// element starts prove its windows valid.
 pub fn tile_load<T: ArrayElement, C>(
     context: &C,
     source: &C::Value,
@@ -478,14 +484,13 @@ where
         return Err(TypeError::invalid("kernel tile indices and block shape must match the source rank").into());
     }
     let mut inputs = vec![source.clone()];
-    let empty = shape.dimensions().contains(&0);
+    let empty = shape.dimensions().contains(&0) || block_shape.contains(&0);
     for (axis, index) in indices.iter().enumerate() {
-        // Every index at or beyond `limit` selects a tile that lies entirely beyond the source. A zero tile extent
-        // selects an empty window at every index, and every tile of a physically empty source contains only `other`,
-        // so both clamp every index to zero. The latter also keeps the start of the first tile beyond a source axis
-        // whose extent is near the canonical dimension width from exceeding that width.
-        let limit =
-            if block_shape[axis] == 0 || empty { 0 } else { shape.dimensions()[axis].div_ceil(block_shape[axis]) };
+        // Every index at or beyond `limit` selects a tile that lies entirely beyond the source. A tile without elements
+        // is empty at every index, and every tile of a physically empty source contains only `other`, so both clamp
+        // every index along every axis to zero. This also keeps the start of the first tile beyond a source axis whose
+        // extent is near the canonical dimension width, or of a very long tile axis, from exceeding that width.
+        let limit = if empty { 0 } else { shape.dimensions()[axis].div_ceil(block_shape[axis]) };
         let dimension = match index.r#type().as_ref() {
             ArrayIrType::Dimension(r#type) if r#type.maximum_extent().is_some_and(|maximum| maximum <= limit) => {
                 index.clone()
@@ -540,10 +545,13 @@ where
         let scale = context.lift(ArrayIrValue::Dimension(scale_value))?;
         inputs.push(context.bind(ArrayIrOperation::from(operation), vec![], &[dimension, scale])?.remove(0));
     }
-    inputs.push(context.lift(ArrayIrValue::Array(Array::scalar(other)?))?);
-    Ok(context
-        .bind(TileLoadOperation::new(block_shape, BoundaryPolicy::Masked)?, vec![], &inputs)?
-        .remove(0))
+    // The padding value takes the memory placement of the source, which the type rule of the tile load requires.
+    let other = Array::scalar(other)?;
+    let other_type = other.r#type().into_owned().with_memory(reference.referent().memory());
+    inputs.push(context.lift(ArrayIrValue::Array(Array::from_logical_bytes(other_type, &other.logical_bytes())?))?);
+    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let operation = TileLoadOperation::new(block_shape, BoundaryPolicy::Masked)?.with_input_types(&input_types)?;
+    Ok(context.bind(operation, vec![], &inputs)?.remove(0))
 }
 
 /// Stores a complete tile into a private mapped output window through a [`ReferenceWriteOperation`]. Every private
@@ -1817,6 +1825,49 @@ mod tests {
     }
 
     #[test]
+    fn test_tile_load_index_widest_source() {
+        // The first tile beyond a source of the widest extent starts past the canonical dimension width, so the clamp
+        // cannot map every large index to a padded tile. The multiplication then keeps its runtime check, which reports
+        // such an index. No backend can materialize a source this wide unless it is empty.
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let column = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(0)?))?;
+                Ok(vec![tile_load(context, &inputs[0], vec![2, 1], &[inputs[1].clone(), column], -1i32)?])
+            },
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(
+                    DataType::I32,
+                    [MAX_DIMENSION_EXTENT, 1],
+                ))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<i32[9223372036854775807, 1]>, %1:i64[] .
+                let %2:dimension<0> = const 0
+                    %3:i64[] = const 4611686018427387904
+                    %4:bool[] = compare [direction=LessThan] %1 %3
+                    %5:i64[] = select %4 %1 %3
+                    %6:dimension<tile_index_0 ∈ [0, 4611686018427387905)> = \
+                        dimension_from_scalar [bounds=[0, 4611686018427387905)] %5
+                    %7:dimension<2> = const 2
+                    %8:dimension<tile_index_0 * 2 ∈ [0, 9223372036854775808)> = \
+                        dimension_mul [requires_runtime_assertion=true] %6 %7
+                    %9:dimension<1> = const 1
+                    %10:i32[] = const -1
+                    %11:i32[2, 1] = \
+                        tile_load [block_shape=[2, 1], boundary=Masked, requires_runtime_assertion=true] %0 %8 %2 %10
+                in (%11)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_tile_load_index_placement() {
         // The clamp limit of a scalar index takes the placement of that index, so a host-pinned index traces and loads.
         let index_type = ArrayType::scalar(DataType::I64).with_memory(Memory::Host { pinned: true });
@@ -1842,6 +1893,51 @@ mod tests {
             Ok(vec![ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[0i32, 1, 11, 12]).unwrap(),
             )]),
+        );
+    }
+
+    #[test]
+    fn test_tile_load_index_empty_tile() {
+        // A tile without elements is empty at every index, so even an index whose tile would start beyond the
+        // canonical dimension width loads the empty tile.
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let row = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(1)?))?;
+                let column = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(0)?))?;
+                Ok(vec![tile_load(context, &inputs[0], vec![1 << 62, 0], &[row, column], -1i32)?])
+            },
+            vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, [1, 1])))],
+        )
+        .unwrap();
+        // The result is compared through its type and bytes, because formatting the debug view of an array with an
+        // axis this long does not finish.
+        let source = ArrayReference::new(Array::matrix(1, 1, vec![7i32]).unwrap());
+        let tile = program.interpret(vec![ArrayIrValue::Reference(source)]).map(|mut values| {
+            let ArrayIrValue::Array(tile) = values.remove(0) else { unreachable!() };
+            (tile.r#type().into_owned(), tile.logical_bytes())
+        });
+        assert_eq!(tile, Ok((ArrayType::new_static(DataType::I32, [1 << 62, 0]), vec![])));
+    }
+
+    #[test]
+    fn test_tile_load_pinned_host_source() {
+        // The padding value takes the memory placement of the source, so a tile of a pinned host source loads.
+        let source_type = ArrayType::new_static(DataType::I32, [3]).with_memory(Memory::Host { pinned: true });
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let index = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(0)?))?;
+                Ok(vec![tile_load(context, &inputs[0], vec![4], &[index], -1i32)?])
+            },
+            vec![ArrayIrType::Reference(ReferenceType::new(source_type.clone()))],
+        )
+        .unwrap();
+        let source = Array::from_elements(source_type, &[3i32, 5, 7]).unwrap();
+        let tile_type = ArrayType::new_static(DataType::I32, [4]).with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Reference(ArrayReference::new(source))]),
+            Ok(vec![ArrayIrValue::Array(Array::from_elements(tile_type, &[3i32, 5, 7, -1]).unwrap())]),
         );
     }
 

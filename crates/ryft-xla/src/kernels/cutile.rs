@@ -98,10 +98,32 @@ impl KernelTarget for Target {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(feature = "cutile-compiler")]
+    use std::path::PathBuf;
 
     use pretty_assertions::assert_eq;
+    #[cfg(feature = "cutile-compiler")]
+    use ryft_core::{DataType, Device, DeviceMesh, LogicalMesh};
+    #[cfg(feature = "cutile-compiler")]
+    use ryft_cuda::kernels::cutile::{Compiler, Error, NVCC_VERSION, NVVM_VERSION, Options};
+    #[cfg(feature = "cutile-compiler")]
+    use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule};
+    #[cfg(feature = "cutile-compiler")]
+    use serde::Serialize;
 
+    #[cfg(feature = "cutile-compiler")]
+    use crate::FromPjrt;
+    #[cfg(feature = "cutile-compiler")]
+    use crate::kernels::aot::tests::{executable_bundle, refresh_checksum};
+    #[cfg(feature = "cutile-compiler")]
+    use crate::kernels::aot::{KernelAotBundle, KernelAotError};
+    #[cfg(feature = "cutile-compiler")]
+    use crate::kernels::staging::KernelCompilerBinding;
     use crate::kernels::staging::KernelDeviceFacts;
+    #[cfg(feature = "cutile-compiler")]
+    use crate::sessions::tests::session_with_client;
+    #[cfg(feature = "cutile-compiler")]
+    use crate::tests::execution_client;
 
     use super::*;
 
@@ -132,6 +154,147 @@ mod tests {
                 "tileiras 13.3.36; cutile_python_v2; cuda envelope 1; static i32 shapes and strides",
             )
         );
+    }
+
+    #[cfg(feature = "cutile-compiler")]
+    #[test]
+    fn test_kernel_aot_bundle_load_cu_tile_historical_lowering() {
+        /// Configuration record of earlier revisions, in their field order, which identifies the bundled exporter
+        /// but not the Rust lowering that generated the cuTile source.
+        #[derive(Serialize)]
+        struct HistoricalConfiguration {
+            schema: u32,
+            cuda_tile: &'static str,
+            tileiras: &'static str,
+            nvcc: &'static str,
+            nvvm: &'static str,
+            target: Target,
+            python: PathBuf,
+            pipeline_stages: Option<usize>,
+            buffering_depth: Option<usize>,
+            maximum_scratch_bytes: Option<usize>,
+            worker_sha256: String,
+        }
+
+        /// Stands in for the producer of a recorded configuration, by reporting that configuration as its key.
+        struct RecordedProducer(Vec<u8>);
+
+        impl KernelCompiler for RecordedProducer {
+            type Target = Target;
+            type Options = Options;
+            type Output = CompiledKernel;
+            type Error = Error;
+
+            fn admit(
+                &self,
+                kernel: &VerifiedKernel<'_>,
+                target: &Target,
+                options: &Options,
+                schedule: &KernelSchedule,
+            ) -> Result<(), KernelCompilationError<Error>> {
+                let _ = (kernel, target, options, schedule);
+                panic!("configuration identity checks must not invoke compiler admission")
+            }
+
+            fn configuration_key(
+                &self,
+                target: &Target,
+                options: &Options,
+                schedule: &KernelSchedule,
+            ) -> Result<Vec<u8>, KernelCompilationError<Error>> {
+                let _ = (target, options, schedule);
+                Ok(self.0.clone())
+            }
+
+            fn compile(
+                &self,
+                kernel: &VerifiedKernel<'_>,
+                target: &Target,
+                options: &Options,
+                schedule: &KernelSchedule,
+            ) -> Result<CompiledKernel, KernelCompilationError<Error>> {
+                let _ = (kernel, target, options, schedule);
+                panic!("configuration identity checks must not invoke the compiler")
+            }
+        }
+
+        let client = execution_client();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![]).unwrap(),
+            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
+        )
+        .unwrap();
+        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let target = Target::new(12, 1).unwrap();
+        let python = PathBuf::from("/explicit/python");
+        let compiler = Compiler::new(python.clone());
+        let current = compiler.configuration_key(&target, &Options::default(), &KernelSchedule::default()).unwrap();
+        let worker = serde_json::from_slice::<serde_json::Value>(&current).unwrap()["worker_sha256"].clone();
+
+        // An earlier revision lowered an unsharded 32×32 `BF16_BF16_F32` dot to the default `ct.mma`, which the
+        // current lowering rejects. It recorded this configuration for the same exporter, target, and schedule.
+        let historical = serde_json::to_vec(&HistoricalConfiguration {
+            schema: 1,
+            cuda_tile: CUDA_TILE_VERSION,
+            tileiras: TILEIRAS_VERSION,
+            nvcc: NVCC_VERSION,
+            nvvm: NVVM_VERSION,
+            target: target.clone(),
+            python,
+            pipeline_stages: None,
+            buffering_depth: None,
+            maximum_scratch_bytes: None,
+            worker_sha256: worker.as_str().unwrap().to_owned(),
+        })
+        .unwrap();
+
+        // The current record differs from it only by its last field, which identifies the Rust lowering.
+        let lowering = serde_json::from_slice::<serde_json::Value>(&current).unwrap()["lowering_sha256"].clone();
+        let mut expected = historical[..historical.len() - 1].to_vec();
+        expected.extend_from_slice(format!(",\"lowering_sha256\":{lowering}}}").as_bytes());
+        assert_eq!(current, expected);
+        let historical = KernelCompilerBinding::new(
+            RecordedProducer(historical),
+            target.clone(),
+            Options::default(),
+            KernelSchedule::default(),
+            CuTileEmbedding,
+            1,
+        )
+        .unwrap();
+        let fresh = KernelCompilerBinding::new(
+            compiler,
+            target,
+            Options::default(),
+            KernelSchedule::default(),
+            CuTileEmbedding,
+            1,
+        )
+        .unwrap();
+
+        // A bundle of the historical producer is well formed and loads with the historical binding.
+        let bundle = executable_bundle(&session, &mesh, DataType::I32, false, &historical);
+        let mut bytes = bundle.to_bytes().unwrap();
+        KernelAotBundle::from_bytes(&bytes, 1).unwrap().load(&session, &historical, &mesh).unwrap();
+
+        // The current binding rejects that bundle before it deserializes the executable, which is replaced here by
+        // bytes that no executable decoder accepts. The executable is the last section of the envelope.
+        let length = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        bytes.truncate(bytes.len() - length);
+        bytes.extend_from_slice(b"transport-only executable bytes");
+        bytes[24..32].copy_from_slice(&(b"transport-only executable bytes".len() as u64).to_le_bytes());
+        refresh_checksum(&mut bytes);
+        assert!(matches!(
+            KernelAotBundle::from_bytes(&bytes, 1).unwrap().load(&session, &fresh, &mesh),
+            Err(KernelAotError::Invalid { message }) if message == "compiler binding configuration mismatch",
+        ));
+
+        // A bundle of the current producer loads with the current binding.
+        let bundle = executable_bundle(&session, &mesh, DataType::I32, false, &fresh);
+        KernelAotBundle::from_bytes(&bundle.to_bytes().unwrap(), 1)
+            .unwrap()
+            .load(&session, &fresh, &mesh)
+            .unwrap();
     }
 
     #[test]

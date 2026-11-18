@@ -23,8 +23,8 @@ use crate::kernels::{
 };
 use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
-    Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement, Target, ToPjrt,
-    named_ffi_type_id, with_runtime_requirements,
+    CustomCallOperationExtension, Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement,
+    ToPjrt,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -33,7 +33,7 @@ use crate::{
 const ROCM_RUNTIME_TYPE_NAME: &str = "ryft.kernel.rocm.runtime";
 
 /// Explicit native type ID registered under [`ROCM_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
-const ROCM_RUNTIME_TYPE_ID: FfiTypeId = named_ffi_type_id(ROCM_RUNTIME_TYPE_NAME);
+const ROCM_RUNTIME_TYPE_ID: FfiTypeId = FfiTypeId::from_name(ROCM_RUNTIME_TYPE_NAME);
 
 impl From<ryft_rocm::Error> for Error {
     fn from(error: ryft_rocm::Error) -> Self {
@@ -204,7 +204,8 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<RocmKer
             .with_attribute("ryft.rocm.payload", payload)
             .with_attribute("ryft.rocm.row_major", true);
         if self.target_name == ROCM_KERNEL_CUSTOM_CALL_TARGET {
-            return with_runtime_requirements(operation, [builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)])
+            return operation
+                .with_runtime_requirements([builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)])
                 .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() });
         }
         Ok(operation)
@@ -316,13 +317,16 @@ impl RocmEnvelope {
 
 /// Stable session allocation borrowed by XLA until all fences over whole executions complete.
 struct RocmKernelRuntime {
+    /// PJRT client against which this runtime validates invocation meshes.
+    client: &'static Client<'static>,
+
     /// Concrete bounded HIP module owner.
     launcher: RocmKernelLauncher,
 }
 
 impl RocmKernelRuntime {
     /// Creates the HIP owner and idempotently registers the concrete ROCm handler.
-    fn new(client: &Client<'_>) -> Result<Self, Error> {
+    fn new(client: &'static Client<'static>) -> Result<Self, Error> {
         let launcher = RocmKernelLauncher::new()?;
         client.register_ffi_type(ROCM_RUNTIME_TYPE_NAME, ROCM_RUNTIME_TYPE_ID, FfiTypeInformation::new(None))?;
         client.register_ffi_handler(
@@ -331,13 +335,13 @@ impl RocmKernelRuntime {
             FfiHandler::from(rocm_kernel_handler as XLA_FFI_Handler),
             FfiHandlerTraits::NONE,
         )?;
-        Ok(Self { launcher })
+        Ok(Self { client, launcher })
     }
 }
 
 impl RuntimeExtension for RocmKernelRuntime {
-    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
-        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
+    fn validate(&self, mesh: &DeviceMesh) -> Result<(), Error> {
+        crate::kernels::distributed::validate_kernel_participants(self.client, mesh)?;
         Ok(())
     }
 
@@ -359,11 +363,10 @@ impl RuntimeProvider for RocmRuntimeProvider {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
         validate_builtin_requirement(requirement, self.identifier())?;
-        if !target.platform_name().eq_ignore_ascii_case("rocm") {
+        if !client.platform_name()?.eq_ignore_ascii_case("rocm") {
             return Err(Error::custom(KernelEmbeddingError::Invalid {
                 message: "rocm artifact calls require a rocm platform".to_owned(),
             }));
@@ -473,7 +476,7 @@ mod tests {
     };
     use ryft_kernels::{KernelDefinition, KernelOperation, kernel};
 
-    use crate::{Platform, RuntimeError, runtime_requirements};
+    use crate::{Platform, RuntimeError};
 
     use super::*;
 
@@ -559,7 +562,7 @@ mod tests {
             .unwrap();
         assert_eq!(operation.target_name(), ROCM_KERNEL_CUSTOM_CALL_TARGET);
         assert_eq!(
-            runtime_requirements(&operation).unwrap(),
+            operation.runtime_requirements().unwrap(),
             vec![builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)]
         );
         assert_eq!(operation.output_types(), &[r#type]);
@@ -643,18 +646,14 @@ mod tests {
     #[test]
     fn test_rocm_runtime_provider_initialize() {
         let client = Platform::Cpu.client(None).unwrap();
-        let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
-        let error = provider
-            .initialize(client, &target, &builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET))
-            .err()
-            .unwrap();
+        let error = provider.initialize(client, &builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)).err().unwrap();
         assert!(
             matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
             if message == "rocm artifact calls require a rocm platform")
         );
-        let requirement = RuntimeRequirement::new(ROCM_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
-        assert!(matches!(provider.initialize(client, &target, &requirement),
+        let requirement = RuntimeRequirement::new(ROCM_KERNEL_CUSTOM_CALL_TARGET, 2).unwrap();
+        assert!(matches!(provider.initialize(client, &requirement),
             Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
                 if identifier == ROCM_KERNEL_CUSTOM_CALL_TARGET));
     }

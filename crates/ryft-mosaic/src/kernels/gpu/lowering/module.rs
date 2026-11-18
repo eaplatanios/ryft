@@ -627,8 +627,11 @@ mod tests {
         assert_eq!(memref_type(&context, &row_major, false).unwrap().to_string(), "memref<6xf32>");
         let strided =
             ArrayType::new_static(DataType::F32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
-        assert!(matches!(memref_type(&context, &strided, false), Err(Error::Invalid { message })
-            if message == "mosaic GPU requires untiled dense row-major arrays"));
+        assert!(matches!(
+            memref_type(&context, &strided, false),
+            Err(Error::Unsupported { operation: "array", reason })
+                if reason == "requires untiled dense row-major arrays",
+        ));
     }
 
     #[test]

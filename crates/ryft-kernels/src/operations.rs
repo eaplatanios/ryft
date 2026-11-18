@@ -363,7 +363,7 @@ where
             // The inputs are validated against the original call signature first, because the trailing scalar prefetch
             // values are split off by position.
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            call.infer_output_types(&input_types, &driver.region_interfaces())?;
+            let output_types = call.infer_output_types(&input_types, &driver.region_interfaces())?;
 
             // Only concrete scalar prefetch values specialize the call. Ordinary data inputs remain residual, even when
             // known, because static transforms must never execute the mutations of a kernel. Specialization executes
@@ -381,14 +381,31 @@ where
                     })
                     .collect::<Option<Vec<_>>>();
                 if let Some(values) = values {
+                    // The signature check above admits a prefetched value whose type is its physical prefetch type up
+                    // to a sharding, so the value specializes the call as an element of that physical type.
+                    let values = values
+                        .iter()
+                        .zip(call.prefetch_types())
+                        .map(|(value, r#type)| Array::from_logical_bytes(r#type.clone(), &value.logical_bytes()))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let definition = KernelDefinition::new(call.clone(), driver.region(0)?.to_program())
                         .and_then(|definition| definition.specialize_prefetch(&values))
                         .map_err(ProgramError::custom)?;
-                    return context.residualize(
-                        Self::Call(definition.operation().clone()),
-                        vec![definition.body().clone()],
-                        &inputs[..remaining],
-                    );
+
+                    // The placement of a prefetched value can contribute to the placement of the results (e.g., a
+                    // variation along a manual mesh axis), which the specialized call no longer receives. The original
+                    // call then remains residual, so that its results keep the types inferred from all of its inputs.
+                    if definition
+                        .operation()
+                        .output_types_for(&input_types[..remaining])
+                        .is_ok_and(|specialized| specialized == output_types)
+                    {
+                        return context.residualize(
+                            Self::Call(definition.operation().clone()),
+                            vec![definition.body().clone()],
+                            &inputs[..remaining],
+                        );
+                    }
                 }
             }
             context.residualize(self.clone(), regions, inputs)
@@ -576,11 +593,11 @@ pub(crate) mod tests {
     use ryft_core::{
         AddOperation, ArrayReference, ArrayReferenceTransformIndex, AssertOperation, AssertionError, AttachedRegions,
         Condition, DataType, Dimension, DimensionBounds, DimensionError, DimensionMulOperation, DimensionVariable,
-        EagerContext, EffectClasses, Effects, EmptyRegionDriver, ErasedOperation, NegOperation, OperationFoldOutput,
-        OperationPayloadProjection, PartialEvaluation, PartialEvaluationOutput, PartialValue, PartitionedProgram,
-        Placeholder, ProgramBuilder, ReferenceAccessMode, ReferenceEffect, ReferenceRead, ReferenceSwap, ReferenceType,
-        ReferenceWrite, RegionDataFlow, RegionDriver, RegionRef, ScanOperation, Shape, SubOperation, TagOperation,
-        Tracer, TracingContext, TypeIdentityRenaming,
+        EagerContext, EffectClasses, Effects, EmptyRegionDriver, ErasedOperation, LogicalMesh, MeshAxis, MeshAxisType,
+        NegOperation, OperationFoldOutput, OperationPayloadProjection, PartialEvaluation, PartialEvaluationOutput,
+        PartialValue, PartitionedProgram, Placeholder, ProgramBuilder, ReferenceAccessMode, ReferenceEffect,
+        ReferenceRead, ReferenceSwap, ReferenceType, ReferenceWrite, RegionDataFlow, RegionDriver, RegionRef,
+        ScanOperation, Shape, Sharding, SubOperation, TagOperation, Tracer, TracingContext, TypeIdentityRenaming,
     };
 
     use crate::authoring::{MappingExpression, ParameterWindow, mapped_call};
@@ -1661,6 +1678,112 @@ pub(crate) mod tests {
         assert_eq!(evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&two)), Ok(expected.clone()));
         let evaluation = evaluate(&[None, None], &[data_type, prefetch_type]).unwrap();
         assert_eq!(evaluation.interpret(&EagerContext::new(), &[data, two]), Ok(expected));
+    }
+
+    #[test]
+    fn test_kernel_operation_partial_evaluation_prefetch_placement() {
+        // A call that copies its scalar prefetch into its write-only result.
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
+        let mapping = BlockMapping::new(
+            mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
+            vec![],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let call = KernelCallOperation::new_with_prefetch(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly, mapping)
+                    .unwrap(),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace_with_prefetch(call, |(references, _, values)| references[0].write(&values[0]))
+                .unwrap();
+        let program = |input_type: ArrayType| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = builder.add_input(ArrayIrType::Array(input_type));
+            let region = builder.import_region(definition.body().entry_region_ref());
+            let outputs = builder
+                .add_instruction(KernelOperation::Call(definition.operation().clone()), vec![region], vec![input], None)
+                .unwrap()
+                .to_vec();
+            let structure = vec![Placeholder];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, structure.clone(), structure)
+                .unwrap()
+        };
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let bytes = Array::scalar(3i32).unwrap().logical_bytes();
+        let placed = |sharding: Sharding| {
+            let r#type = ArrayType::scalar(DataType::I32).with_sharding(Some(sharding)).unwrap();
+            (r#type.clone(), ArrayIrValue::Array(Array::from_logical_bytes(r#type, &bytes).unwrap()))
+        };
+
+        // A merely replicated prefetch value specializes like its physical value, and the result keeps the type that
+        // the original call infers from it.
+        let (replicated_type, replicated) = placed(Sharding::replicated(mesh.clone(), 0));
+        let replicated_program = program(replicated_type);
+        let expected = replicated_program.interpret(vec![replicated.clone()]).unwrap();
+        assert_eq!(expected, vec![ArrayIrValue::Array(Array::scalar(3i32).unwrap())]);
+        let evaluation = replicated_program.partially_evaluate(&[PartialValue::Known(replicated)]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda  .
+                let %0:i32[] = kernel_call [
+                    grid=[],
+                    parameter_0=write-only i32[] [] InBounds,
+                    mapping_0={
+                        lambda  .
+                        let %0:dimension<3> = const 3
+                        in ()
+                    },
+                ] [
+                    body={
+                        lambda %0:ref<i32[]> .
+                        let %1:i32[] = const 3
+                            () = reference_write %0 %1
+                        in ()
+                    },
+                ]
+                in (%0)"},
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(expected));
+
+        // A prefetch value that varies along `x` makes the result vary along `x`, which the specialized call could not
+        // express, so the original call remains residual with its prefetched operand.
+        let (varying_type, varying) = placed(Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap());
+        let varying_program = program(varying_type);
+        let expected = varying_program.interpret(vec![varying.clone()]).unwrap();
+        let evaluation = varying_program.partially_evaluate(&[PartialValue::Known(varying)]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                let %1:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = kernel_call [
+                    grid=[],
+                    prefetch_0=i32[],
+                    identities=[0],
+                    identity_0_bounds=[0, 4),
+                    parameter_0=write-only i32[] [] InBounds,
+                    mapping_0={
+                        lambda %0:dimension<offset ∈ [0, 4)> .
+                        in ()
+                    },
+                ] %0 [
+                    body={
+                        lambda %0:ref<i32[]>, %1:i32[] .
+                        let () = reference_write %0 %1
+                        in ()
+                    },
+                ]
+                in (%1)"},
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(expected));
     }
 
     #[test]
