@@ -40,6 +40,7 @@ http_archive(
     patch_args = ["-p1"],
     patches = [
         "//patches:jax-mosaic-c-api-visibility.patch",
+        "//patches:jax-mosaic-gpu-mbarrier-serde.patch",
         "//patches:jax-mosaic-gpu-runtime-symbols.patch",
     ],
     sha256 = JAX_SHA256,

@@ -1,0 +1,12 @@
+diff --git a/jaxlib/mosaic/gpu/serde.cc b/jaxlib/mosaic/gpu/serde.cc
+--- a/jaxlib/mosaic/gpu/serde.cc
++++ b/jaxlib/mosaic/gpu/serde.cc
+@@ -339,7 +339,7 @@ LogicalResult nvvm_mbarrier_arrive_expect_tx_shared_upgrade(Operation* op,
+     b.setInsertionPointAfter(op);
+     auto new_op = mlir::NVVM::MBarrierArriveExpectTxOp::create(
+         b, op->getResultTypes(), op->getOperand(0), op->getOperand(1),
+-        mlir::NVVM::MemScopeKind::CTA,
++        /*multicastMask=*/mlir::Value{}, mlir::NVVM::MemScopeKind::CTA,
+         /*relaxed=*/false,
+         op->getNumOperands() < 3 ? mlir::Value{} : op->getOperand(2));
+     op->replaceAllUsesWith(new_op);
