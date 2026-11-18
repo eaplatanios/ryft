@@ -330,8 +330,6 @@ impl EffectCompletion {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Host publication state for a submission's per-device ordered I/O token buffers.
 #[derive(Clone, Default)]
 enum EffectTokenPublication {
@@ -342,7 +340,7 @@ enum EffectTokenPublication {
     /// The submission published its token buffers, a result without tokens, or a failure at the execution boundary.
     Published(Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>),
 
-    /// The reservation was cancelled, so successors follow its predecessor's publication.
+    /// The reservation was canceled, so successors follow its predecessor's publication.
     Forward(Option<Arc<EffectSubmission>>),
 }
 
@@ -357,7 +355,7 @@ struct EffectSubmission {
     /// State without buffers that the completion observer retains.
     completion: Arc<EffectCompletion>,
 
-    /// Token publication or forwarding link for a cancelled reservation.
+    /// Token publication or forwarding link for a canceled reservation.
     publication: Mutex<EffectTokenPublication>,
 
     /// Wakes successors when this submission publishes a result or forwards its predecessor.
@@ -365,20 +363,6 @@ struct EffectSubmission {
 }
 
 impl EffectSubmission {
-    /// Waits for token publication on the host and follows cancelled reservations iteratively. The returned buffers
-    /// may still be pending on their devices.
-    fn wait_for_tokens(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
-        let mut publication = self.wait_for_publication();
-        loop {
-            match publication {
-                EffectTokenPublication::Pending => unreachable!("publication waits for a terminal host state"),
-                EffectTokenPublication::Published(result) => return result,
-                EffectTokenPublication::Forward(None) => return Ok(None),
-                EffectTokenPublication::Forward(Some(predecessor)) => publication = predecessor.wait_for_publication(),
-            }
-        }
-    }
-
     /// Publishes this submission's token result or failure after execution handoff and wakes its successors.
     fn publish(&self, tokens: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>) {
         *self.publication.lock().expect("effect publication mutex poisoned") =
@@ -395,12 +379,26 @@ impl EffectSubmission {
         }
         publication.clone()
     }
+
+    /// Waits for token publication on the host and follows canceled reservations iteratively. The returned buffers
+    /// may still be pending on their devices.
+    fn wait_for_tokens(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
+        let mut publication = self.wait_for_publication();
+        loop {
+            match publication {
+                EffectTokenPublication::Pending => unreachable!("publication waits for a terminal host state"),
+                EffectTokenPublication::Published(result) => return result,
+                EffectTokenPublication::Forward(None) => return Ok(None),
+                EffectTokenPublication::Forward(Some(predecessor)) => publication = predecessor.wait_for_publication(),
+            }
+        }
+    }
 }
 
 impl Drop for EffectSubmission {
     fn drop(&mut self) {
-        // Cancelled reservations can form a long forwarding chain. Detach uniquely owned links before dropping
-        // each node so scope teardown does not consume one stack frame per cancelled submission.
+        // Canceled reservations can form a long forwarding chain. Detach uniquely owned links before dropping
+        // each node so scope teardown does not consume one stack frame per canceled submission.
         let mut publication = std::mem::take(self.publication.get_mut().expect("effect publication mutex poisoned"));
         while let EffectTokenPublication::Forward(Some(predecessor)) = publication {
             match Arc::try_unwrap(predecessor) {
@@ -422,6 +420,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
         ArrayType, CustomCallOperation, DataType, Device, DeviceMesh, EffectClass, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, Print, PrintOperation, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Typed,
@@ -429,13 +428,14 @@ mod tests {
     use ryft_pjrt::{Buffer, BufferSpecification, BufferType, Client, EventPromise, ExecutionFence};
 
     use crate::sessions::tests::{f64_vector, session_with_client, two_device_mesh};
-    #[cfg(feature = "cuda-13")]
-    use crate::tests::cuda_client;
     use crate::tests::{cpu_client, values_to_bytes};
     use crate::{
         Array, Constant, Error, ExecutionError, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
         ensure_print_handler_registered, with_captured_prints,
     };
+
+    #[cfg(feature = "cuda-13")]
+    use crate::tests::cuda_client;
 
     use super::{
         EFFECT_CALLBACK_DEPTH, EffectCallbackGuard, EffectScope, EffectSubmission, EffectTokenPublication,
@@ -482,15 +482,16 @@ mod tests {
     /// Submits two prints through one session on one device of `client` and checks that they print in submission order.
     /// With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token
     /// (i.e., a token buffer whose transfer from the host has not happened yet) and must stay pending until it is
-    /// released.
-    /// That fixture only works on plugins that submit executables without waiting for unrecorded input definition
-    /// events on the host, such as the CPU plugin. The CUDA plugin blocks the submitting thread until every input event
-    /// is recorded, so there the chain is proven through submission order and barrier completion alone.
+    /// released. That fixture only works on plugins that submit executables without waiting for unrecorded input
+    /// definition events on the host, such as the CPU plugin. The CUDA plugin blocks the submitting thread until
+    /// every input event is recorded, so there the chain is proven through submission order and barrier completion
+    /// alone.
     fn assert_session_array_ordered_effects(client: &'static Client<'static>, hold_predecessor: bool) {
         let mesh = single_device_mesh(client);
         let session = session_with_client(client);
         let first = f64_vector(&session, &mesh, &[1.0]);
         let second = f64_vector(&session, &mesh, &[2.0]);
+
         // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
         let manager = hold_predecessor.then(|| {
             let manager = client
@@ -506,6 +507,7 @@ mod tests {
             );
             manager
         });
+
         let (readiness, lines) = with_captured_prints(|| {
             let readiness = thread::scope(|threads| {
                 let (sender, receiver) = channel();
@@ -524,8 +526,8 @@ mod tests {
                     sender.send(readiness).unwrap();
                 });
 
-                let readiness = receiver.recv_timeout(CALLBACK_TIMEOUT);
                 // Release the token even if dispatch blocked on it, so the worker can finish.
+                let readiness = receiver.recv_timeout(CALLBACK_TIMEOUT);
                 if let Some(manager) = manager {
                     manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
                 }
@@ -534,6 +536,7 @@ mod tests {
             session.effects_barrier().unwrap();
             readiness
         });
+
         assert_eq!(readiness, Ok(hold_predecessor.then_some((false, false))));
         assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
     }
@@ -570,8 +573,10 @@ mod tests {
             assert_eq!(state.submissions.len(), 1);
             assert!(!state.submissions[0].ordered);
             assert_eq!(state.tail.as_ref().unwrap().identity, ordered_identity);
+
             // Release the scope mutex before the barrier takes its snapshot.
             drop(state);
+
             session.effects_barrier().unwrap();
         });
 
@@ -618,7 +623,6 @@ mod tests {
         let completed = scope.reserve(None).unwrap();
         completed.publish(Ok(None), &ExecutionFence::new(Vec::new()));
         let pending = scope.reserve(None).unwrap();
-
         let state = scope.state.lock().unwrap();
         assert_eq!(state.submissions.len(), 1);
         assert!(Arc::ptr_eq(&state.submissions[0], &pending.submission));
@@ -870,7 +874,7 @@ mod tests {
             Ok(Some(managers.iter().map(|manager| Arc::new(manager.retrieve_buffer(0).unwrap())).collect())),
             &ExecutionFence::new(Vec::new()),
         );
-        managers[1].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+        managers[1].transfer_data(0, Arc::new([]), 0, true).unwrap().r#await().unwrap();
         let (progress, lines) = with_captured_prints(|| {
             let progress = thread::scope(|threads| {
                 let (sender, receiver) = channel();
@@ -878,6 +882,7 @@ mod tests {
                 threads.spawn(move || {
                     session.execute_program(&program, vec![first]).unwrap();
                     let tokens = ordered_tail_tokens(scope);
+
                     // CPU serializes multi-device launches. Check device 1's readiness on the first execution
                     // and that the second dispatch returns while device 0's token is pending.
                     tokens[1].ready().unwrap().r#await().unwrap();
@@ -886,13 +891,15 @@ mod tests {
                 });
 
                 let progress = receiver.recv_timeout(CALLBACK_TIMEOUT);
+
                 // Unblock both launches before joining the worker if either operation missed the deadline.
-                managers[0].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+                managers[0].transfer_data(0, Arc::new([]), 0, true).unwrap().r#await().unwrap();
                 progress
             });
             session.effects_barrier().unwrap();
             progress
         });
+
         assert_eq!(progress, Ok(()), "the ready device and second dispatch should progress independently");
         assert_eq!(lines.first().map(String::as_str), Some("effect: [1.0]"));
         let first_on_first_device = lines.iter().position(|line| line == "effect: [0.0]").unwrap();
@@ -931,6 +938,7 @@ mod tests {
         let (fence, promise) = pending_fence();
         let submission = Arc::clone(&reservation.submission);
         reservation.publish(Err(Arc::from("boundary failed")), &fence);
+
         // Capture publication before completing the fence without risking a blocking token lookup.
         let published = matches!(
             &*submission.publication.lock().unwrap(),
@@ -969,10 +977,13 @@ mod tests {
                 drop(second);
                 sender.send(()).unwrap();
             });
+
             let cancellation = receiver.recv_timeout(CALLBACK_TIMEOUT);
             let predecessor_pending = first.submission.completion.result().is_none();
+
             // Release any waiter on the predecessor even if cancellation timed out.
             drop(first);
+
             assert_eq!(cancellation, Ok(()));
             assert!(predecessor_pending);
         });
@@ -989,8 +1000,10 @@ mod tests {
         let successor = scope.reserve(Some(&[0])).unwrap();
 
         first.publish(Err(Arc::from("predecessor publication failed")), &ExecutionFence::new(Vec::new()));
+
         // Create the first forwarding link to the published failure.
         drop(second);
+
         // Extend the chain so the successor has to follow both links.
         drop(third);
 
@@ -1012,6 +1025,7 @@ mod tests {
         // Dropping the inner guard leaves the outer callback active on the original thread.
         drop(inner);
         assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 1);
+
         // Dropping the outer guard ends the last active callback on this thread.
         drop(outer);
         assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 0);
@@ -1036,8 +1050,10 @@ mod tests {
         let scope = EffectScope::default();
         let first = scope.reserve(Some(&[0])).unwrap();
         let head = Arc::downgrade(&first.submission);
+
         // Cancel the head so the rest of the reservations form forwarding links to it.
         drop(first);
+
         for _ in 1..10_000 {
             let _reservation = scope.reserve(Some(&[0])).unwrap();
         }
