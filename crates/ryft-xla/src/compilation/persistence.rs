@@ -2126,7 +2126,7 @@ mod tests {
         assert_eq!(restored.signature(), compiled.signature());
         let (outputs, prints) = with_captured_prints(|| {
             let outputs = session.execute_program(&restored, vec![input]).unwrap();
-            session.effects_barrier().unwrap();
+            session.synchronize().unwrap();
             outputs
         });
         assert!(outputs.is_empty());

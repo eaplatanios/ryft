@@ -2,7 +2,7 @@ use ryft_core::{ArrayType, DataType, ErfOperation};
 use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::lower_tensor_type;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 // [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
@@ -16,44 +16,51 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let mut input = input_values[0];
-        if output_types[0].data_type() == DataType::F8E8M0FNU {
-            // Both smallest encodings have erf outputs that round to 0x01 under the conversion contract of this format
-            // with only exponent bits. Raise 0x00 to 0x01 before CHLO's f32 expansion, where 2^-127 can otherwise
-            // flush to zero and produce NaN on conversion back. Integer comparison preserves this distinction even
-            // with FTZ.
-            let byte_type = output_types[0].clone().with_data_type(DataType::U8);
-            let byte_tensor_type = lower_tensor_type(&byte_type, lowerer.context(), lowerer.location())?;
-            let bits = lowerer.block().append_operation(stable_hlo::bitcast_convert(
-                input,
-                byte_tensor_type,
-                lowerer.location(),
-            )?)?;
-            let minimum = lower_f64_constant_splat(
-                1.0,
-                &byte_type,
-                byte_tensor_type,
-                &mut lowerer.block(),
-                lowerer.context(),
-                lowerer.location(),
-            )?;
-            let normalized = lowerer.block().append_operation(stable_hlo::maximum(
-                bits.result(0).unwrap().as_ref(),
-                minimum,
-                lowerer.location(),
-            )?)?;
-            input = lowerer
-                .block()
-                .append_operation(stable_hlo::bitcast_convert(
-                    normalized.result(0).unwrap().as_ref(),
-                    lower_tensor_type(&output_types[0], lowerer.context(), lowerer.location())?,
-                    lowerer.location(),
-                )?)?
-                .result(0)
-                .unwrap()
-                .as_ref();
-        }
+        let input = input_values[0];
         let result = lowerer.block().append_operation(chlo::erf(input, lowerer.location())?)?;
+        let result = result.result(0).unwrap().as_ref();
+        let output_type = &output_types[0];
+        if output_type.data_type() != DataType::F8E8M0FNU {
+            return Ok(vec![result]);
+        }
+
+        // Encoding 0x00 represents 2^-127, the only E8M0 value that is subnormal in f32. CHLO's expansion can
+        // flush it to zero, which converts back to NaN. Its true erf lies below the first rounding midpoint,
+        // so preserve 0x00 for that input. Select between integer encodings to keep the correction exact.
+        let byte_type = lower_tensor_type(
+            &output_type.clone().with_data_type(DataType::U8),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let input_bits =
+            lowerer
+                .block()
+                .append_operation(stable_hlo::bitcast_convert(input, byte_type, lowerer.location())?)?;
+        let input_bits = input_bits.result(0).unwrap().as_ref();
+        let predicate_type = lower_tensor_type(
+            &output_type.clone().with_data_type(DataType::Boolean),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let is_nonzero_encoding =
+            lowerer
+                .block()
+                .append_operation(stable_hlo::convert(input_bits, predicate_type, lowerer.location())?)?;
+        let result_bits =
+            lowerer
+                .block()
+                .append_operation(stable_hlo::bitcast_convert(result, byte_type, lowerer.location())?)?;
+        let selected_bits = lowerer.block().append_operation(stable_hlo::select(
+            is_nonzero_encoding.result(0).unwrap().as_ref(),
+            result_bits.result(0).unwrap().as_ref(),
+            input_bits,
+            lowerer.location(),
+        )?)?;
+        let result = lowerer.block().append_operation(stable_hlo::bitcast_convert(
+            selected_bits.result(0).unwrap().as_ref(),
+            lower_tensor_type(output_type, lowerer.context(), lowerer.location())?,
+            lowerer.location(),
+        )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
@@ -128,12 +135,11 @@ mod tests {
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 1);
 
-        // Cover every encoding of the format with only exponent bits, including the smallest input that the lowering
-        // raises and NaN.
+        // Cover every encoding, including the smallest input whose erf rounds back to itself and NaN.
         let bytes = (0..=255u8).collect::<Vec<_>>();
         let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[256], &bytes);
         let output = input.erf().unwrap().copy_to_host().unwrap();
-        assert_eq!(&output[..3], &[1, 1, 2]);
+        assert_eq!(&output[..3], &[0, 1, 2]);
         let reference =
             CoreArray::new(ArrayType::new_static(DataType::F8E8M0FNU, [256]), bytes).unwrap().erf().unwrap();
         assert_eq!(output, reference.logical_bytes());

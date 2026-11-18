@@ -1303,15 +1303,47 @@ mod tests {
             let output = input.convert_element_type(data_type).unwrap();
             assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
         }
+    }
 
-        // Exponent-only conversion has an upward normal tie and a distinct lowest exponent boundary.
+    #[test]
+    fn test_convert_element_type_operation_lower_f8e8m0fnu_rounding() {
+        let client = execution_client();
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 1);
+
+        // The lowest midpoint lies in the F32 subnormal range. F64 inputs one step to either side of it must
+        // retain their rounding direction through the intermediate narrowing to F32.
         let minimum = 2f64.powi(-127);
-        let midpoint = 3f64;
-        let values =
+        let midpoint = 1.5 * minimum;
+        let normal_midpoint = 3.0f64;
+        let f64_values = [
+            minimum.next_down(),
+            minimum,
+            minimum.next_up(),
+            midpoint.next_down(),
+            midpoint,
+            midpoint.next_up(),
+            normal_midpoint.next_down(),
+            normal_midpoint,
+            normal_midpoint.next_up(),
+        ];
+        let minimum = minimum as f32;
+        let midpoint = midpoint as f32;
+        let f32_values =
             [minimum.next_down(), minimum, minimum.next_up(), midpoint.next_down(), midpoint, midpoint.next_up()];
-        let input = replicated_array(&session, &mesh, DataType::F64, &[values.len()], &values_to_bytes(&values));
-        let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), vec![0, 0, 1, 128, 129, 129]);
+
+        for (data_type, bytes, expected) in [
+            (DataType::F32, values_to_bytes(&f32_values), &[0, 0, 0, 0, 1, 1][..]),
+            (DataType::F64, values_to_bytes(&f64_values), &[0, 0, 0, 0, 1, 1, 128, 129, 129][..]),
+        ] {
+            let host_input =
+                CoreArray::from_logical_bytes(ArrayType::new_static(data_type, [expected.len()]), &bytes).unwrap();
+            let device_input = replicated_array(&session, &mesh, data_type, &[expected.len()], &bytes);
+            let host_bytes = host_input.convert_element_type(DataType::F8E8M0FNU).unwrap().logical_bytes();
+            let device_output = device_input.convert_element_type(DataType::F8E8M0FNU).unwrap();
+            assert_eq!(host_bytes, expected, "host conversion from {data_type}");
+            assert_eq!(device_output.copy_to_host().unwrap(), host_bytes, "XLA conversion from {data_type}");
+        }
     }
 
     #[test]

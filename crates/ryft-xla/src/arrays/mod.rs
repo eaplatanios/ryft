@@ -2501,29 +2501,34 @@ mod tests {
         let session = session_with_client(client);
         let devices = client.addressable_devices().unwrap();
         let mesh = domain_mesh(client, "x", devices.len());
-        let array_type = ArrayType::new_static(DataType::F32, [2]);
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let bytes = values_to_bytes(&[1.0f32, 2.0]);
-        let upload = |device| client.buffer(bytes.as_slice(), BufferType::F32, [2u64], None, device, None).unwrap();
+        let values = CoreArray::vector(vec![1.0f32, 2.0]).unwrap();
+        let array_type = values.r#type().into_owned();
+        let shape = array_type.static_shape().unwrap();
+        let length = shape.as_slice()[0];
+        let data_type = array_type.data_type();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), shape.rank());
+        let bytes = values.storage_bytes();
+        let buffer_type = data_type.to_pjrt();
+        let upload = |device| client.buffer(bytes, buffer_type, [length as u64], None, device, None).unwrap();
 
         // The full replicated layout is present even when some or all buffers are absent.
         for buffer_count in 0..=devices.len() {
             let buffers = devices.iter().take(buffer_count).cloned().map(&upload).collect();
             let array =
                 Array::from_addressable_buffers(&session, array_type.clone(), mesh.clone(), None, buffers).unwrap();
-            assert_eq!(array.shape(), StaticShape::new(vec![2]));
-            assert_eq!(array.data_type(), DataType::F32);
+            assert_eq!(array.shape(), shape);
+            assert_eq!(array.data_type(), data_type);
             assert_eq!(array.sharding(), &sharding);
             assert_eq!(array.shards().len(), devices.len());
-            assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2])));
+            assert!(array.shards().iter().all(|shard| shard.shape() == shape));
             assert_eq!(
                 array.addressable_shards().map(|shard| shard.copy_to_host().unwrap()).collect::<Vec<_>>(),
-                vec![bytes.clone(); buffer_count],
+                vec![bytes; buffer_count],
             );
         }
 
         // Replication requires each buffer to hold the full logical value.
-        let global_type = ArrayType::new_static(DataType::F32, [4]);
+        let global_type = array_type.clone().with_shape(StaticShape::new(vec![length * devices.len()]));
         let buffers = devices.into_iter().map(upload).collect();
         let error = Array::from_addressable_buffers(&session, global_type.clone(), mesh, None, buffers).unwrap_err();
         assert!(matches!(

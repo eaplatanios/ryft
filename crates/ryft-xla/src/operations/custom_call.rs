@@ -1659,8 +1659,8 @@ mod tests {
             .with_effect_class(EffectClass::UnorderedIo);
         assert!(matches!(CustomCall::custom_call(&operation, [&input]), Ok(outputs) if outputs.is_empty()));
 
-        // The call has effects but no outputs, so its completion is only observable through the effects barrier.
-        session.effects_barrier().unwrap();
+        // Wait for the unordered I/O before inspecting the recorded attributes.
+        session.synchronize().unwrap();
         assert_eq!(
             *OBSERVED_ATTRIBUTES.lock().unwrap(),
             vec![
