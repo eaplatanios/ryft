@@ -56,6 +56,15 @@ static JAX_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
         .expect("failed to parse `JAX_COMMIT` from `WORKSPACE`")
 });
 
+/// Expected Triton commit for the OpenXLA revision pinned in [`WORKSPACE`].
+static TRITON_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
+    include_str!("WORKSPACE")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("TRITON_COMMIT = \""))
+        .and_then(|line| line.strip_suffix('"'))
+        .expect("failed to parse `TRITON_COMMIT` from `WORKSPACE`")
+});
+
 /// Crate-relative files and directories required by the Bazel native build. Directory entries are copied recursively.
 /// Keeping one inventory for copying and Cargo change tracking prevents clean source builds from silently missing
 /// native sources that are referenced by `BUILD.bazel`.
@@ -968,6 +977,7 @@ impl Display for BuildConfiguration {
 fn main() {
     println!("cargo::rustc-env=RYFT_XLA_COMMIT={}", *XLA_COMMIT);
     println!("cargo::rustc-env=RYFT_JAX_COMMIT={}", *JAX_COMMIT);
+    println!("cargo::rustc-env=RYFT_TRITON_COMMIT={}", *TRITON_COMMIT);
 
     // Skip linking to our XLA dependencies if this is executed from within a `docs.rs` pipeline.
     if env::var("DOCS_RS").is_ok() {

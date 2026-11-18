@@ -696,6 +696,26 @@ mod tests {
     }
 
     #[test]
+    fn test_compiler_from_configuration_historical_lowering() {
+        // Earlier revisions recorded no identity of the Rust lowering, so a bundle or tuning record of a lowering with
+        // a different admission policy matched the current compiler. Such a record is now malformed.
+        let historical = json!({
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(),
+            "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4,
+            "pipeline_stages": 2, "maximum_scratch_bytes": null,
+        });
+        assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&historical).unwrap()),
+            Err(Error::Invalid { message }) if message == "invalid recorded compiler configuration"));
+
+        // A record of a different lowering is rejected by its digest.
+        let mut different = historical.clone();
+        different["lowering_sha256"] = json!("0".repeat(64));
+        assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&different).unwrap()),
+            Err(Error::Invalid { message })
+                if message == "recorded compiler configuration belongs to a different Triton lowering"));
+    }
+
+    #[test]
     fn test_compiler_with_cancellation() {
         let cancellation = Arc::new(AtomicBool::new(true));
         let compiler = Compiler::new().with_cancellation(cancellation);

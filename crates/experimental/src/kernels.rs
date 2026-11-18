@@ -1933,6 +1933,7 @@ mod cutile {
                             |local: ArrayTracer| {
                                 // The kernel is physical, and its call accepts the local shard as it is placed.
                                 let physical = local.r#type().into_owned().with_sharding(None::<Sharding>).unwrap();
+                                let ones = Array::from_elements(physical.clone(), &[1.0f32; 17]).unwrap();
                                 let definition: KernelDefinition = KernelDefinition::trace(
                                     KernelCallOperation::new(
                                         Grid::new(vec![]).unwrap(),
@@ -1941,7 +1942,21 @@ mod cutile {
                                         ],
                                     )
                                     .unwrap(),
-                                    |(references, _)| references[0].write(&references[0].read()?),
+                                    |(references, _)| {
+                                        // The kernel adds one, so that the expected output can only come from
+                                        // running it. A plain copy would also pass if the call were skipped.
+                                        let context = references[0].context();
+                                        let one = ConstantOperation::new(ones.clone());
+                                        let one = context.bind(ArrayOperation::Constant(one), vec![], &[])?.remove(0);
+                                        let sum = context
+                                            .bind(
+                                                ArrayOperation::Add(AddOperation::new()),
+                                                vec![],
+                                                &[references[0].read()?, one],
+                                            )?
+                                            .remove(0);
+                                        references[0].write(&sum)
+                                    },
                                 )
                                 .unwrap();
                                 let value = local.into_value();
@@ -1964,10 +1979,11 @@ mod cutile {
                     Options::new(mesh.clone()).with_kernel_compiler(binding),
                 )
                 .unwrap();
-                let expected = (0..17).map(|value| value as f32 - 8.0).collect::<Vec<_>>();
+                let values = (0..17).map(|value| value as f32 - 8.0).collect::<Vec<_>>();
+                let expected = values.iter().map(|value| value + 1.0).collect::<Vec<_>>();
                 let input = session
                     .with_device_mesh(mesh)
-                    .array(r#type, expected.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
+                    .array(r#type, values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
                     .unwrap();
                 let output = compiled.executable().execute(&session, input).unwrap();
                 let bytes = output

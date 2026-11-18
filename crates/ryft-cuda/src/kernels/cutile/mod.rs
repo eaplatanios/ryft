@@ -898,6 +898,25 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_kernel_from_manifest_rejects_historical_configuration() {
+        // Configurations recorded before the digest of the Rust lowering sources was added lack it, so they are
+        // malformed, even though the rest of the record and the generated source are unchanged.
+        let definition = definition(false);
+        let kernel = VerifiedKernel::new(&definition, 1).unwrap();
+        let bytes = cubin();
+        let mut metadata = manifest(&kernel, &bytes);
+        let mut configuration = serde_json::from_slice::<serde_json::Value>(&metadata.configuration_key).unwrap();
+        configuration.as_object_mut().unwrap().remove("lowering_sha256");
+        metadata.configuration_key = serde_json::to_vec(&configuration).unwrap();
+        let column = metadata.configuration_key.len();
+        assert!(matches!(
+            CompiledKernel::from_manifest(&kernel, &serde_json::to_vec(&metadata).unwrap(), bytes),
+            Err(Error::Json(error))
+                if error.to_string() == format!("missing field `lowering_sha256` at line 1 column {column}")
+        ));
+    }
+
+    #[test]
     fn test_parameter_from_type_manual_sharding() {
         let base = ArrayType::new_static(DataType::F32, [4]);
         let sharding = |axis_type: MeshAxisType| {

@@ -56,3 +56,7 @@ pub const XLA_COMMIT: &str = env!("RYFT_XLA_COMMIT");
 
 /// JAX source revision paired with [`XLA_COMMIT`] by this crate's native build.
 pub const JAX_COMMIT: &str = env!("RYFT_JAX_COMMIT");
+
+/// Expected Triton source revision for [`XLA_COMMIT`]. The native build verifies this pin against the OpenXLA source
+/// tree and uses the verified revision in [`triton::RYFT_XLA_Triton_Get_Versions`].
+pub const TRITON_COMMIT: &str = env!("RYFT_TRITON_COMMIT");

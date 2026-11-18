@@ -63,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from Rust consumers that target the workspace baseline.
 - Compiled the native XLA/MLIR archive with hidden C++ symbol visibility while explicitly exporting source-owned C API
   entry points, avoiding symbol interposition with PJRT plugins that bundle their own XLA/MLIR copy.
+- Generated the native compiler's XLA, JAX, and Triton version metadata from the `WORKSPACE` pins, with Bazel
+  verifying the Triton revision against OpenXLA.
 
 ## [0.0.2] - 2026-03-02
 

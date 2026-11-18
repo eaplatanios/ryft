@@ -368,6 +368,7 @@ cc_library(
     }),
     deps = RYFT_PJRT_SYS_DEPENDENCIES,
     alwayslink = True,
+    implementation_deps = ["@ryft_source_revisions//:source_revisions"],
 )
 
 cc_static_library(

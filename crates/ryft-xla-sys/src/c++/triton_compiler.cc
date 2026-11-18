@@ -7,6 +7,8 @@
 #include <iterator>
 #include <string>
 
+#include "ryft_xla_sys/source_revisions.h"
+
 #if defined(RYFT_TRITON_COMPILER)
 #if defined(RYFT_TRITON_CUDA)
 #include "cuda.h"
@@ -330,9 +332,9 @@ void RYFT_XLA_Triton_Compile_Args_Destroy(RYFT_XLA_Triton_Compile_Args* args) {
 
 RYFT_XLA_Triton_Versions RYFT_XLA_Triton_Get_Versions() {
   RYFT_XLA_Triton_Versions versions{};
-  versions.xla = mlirStringRefCreateFromCString("f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163");
-  versions.jax = mlirStringRefCreateFromCString("9564ca1d3df0d312cad4346458b8d41ce5204ff7");
-  versions.triton = mlirStringRefCreateFromCString("2122e24efc1886bfa36337c1f5b07c47d827b1d4");
+  versions.xla = mlirStringRefCreateFromCString(RYFT_XLA_COMMIT);
+  versions.jax = mlirStringRefCreateFromCString(RYFT_JAX_COMMIT);
+  versions.triton = mlirStringRefCreateFromCString(RYFT_TRITON_COMMIT);
   versions.rocm_device_libs = mlirStringRefCreateFromCString("53996464fa8d94b182ac4aaa7dc3a109ab524f45");
   std::string assembler_version = "unavailable";
 #if defined(RYFT_TRITON_COMPILER)

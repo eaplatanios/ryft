@@ -229,6 +229,9 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
     - Update `XLA_COMMIT` and `XLA_SHA256` in `WORKSPACE`.
     - Update any `build.rs` references that still point to the old commit.
     - Update `JAX_COMMIT` and `JAX_SHA256` only when required by the selected OpenXLA commit.
+    - Set `TRITON_COMMIT` in `WORKSPACE` to the revision in the selected OpenXLA tree's
+      `third_party/triton/workspace.bzl`. Bazel verifies this pin when generating the source revision header for the
+      native version query.
     - Align `.bazelversion` and dependency initialization with the selected OpenXLA sources. Keep Bazel sandboxing
       enabled as unsandboxed actions can pick up undeclared, checked-in generated headers from third-party repositories
       instead of the generated headers supplied by their declared dependencies.
