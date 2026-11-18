@@ -35,6 +35,8 @@ build:posix --cxxopt=-fvisibility-inlines-hidden
 build:linux --config=posix
 build:linux --incompatible_enable_cc_toolchain_resolution
 build:linux --repo_env BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+# This is the oldest hermetic sysroot with a C++20 standard library on both Linux architectures.
+build:linux --repo_env=SYSROOT_DIST=linux_glibc_2_31
 build:linux --copt=-Wno-unknown-warning-option
 build:linux --copt=-Wno-stringop-truncation
 build:linux --copt=-Wno-array-parameter
