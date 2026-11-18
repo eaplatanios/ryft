@@ -45,8 +45,8 @@ use ryft_core::{
     MeshAxisType, Operation as CoreOperation, ProgramError, ShardingDimension, TypeError, Typed,
 };
 use ryft_kernels::{
-    KERNEL_KEY_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension,
-    KernelSchedule, NoKernelExtension, VerifiedKernel,
+    KERNEL_KEY_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension, KernelSchedule,
+    NoKernelExtension, VerifiedKernel,
 };
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};

@@ -2329,7 +2329,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::{domain_mesh, session_with_client, shares_effect_scope};
     use crate::tests::{
         assert_send_sync, cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, other_cpu_client,
         replicated_array, values_from_bytes, values_to_bytes,
@@ -3200,8 +3200,8 @@ mod tests {
         let fork = session.with_new_effect_scope();
         let reassociated = array.clone().associate(&fork).unwrap();
         assert!(reassociated.session().is_same_session(&session));
-        assert!(std::ptr::eq(reassociated.session().effect_scope(), fork.effect_scope()));
-        assert!(!std::ptr::eq(reassociated.session().effect_scope(), original.session().effect_scope()));
+        assert!(shares_effect_scope(reassociated.session(), &fork));
+        assert!(!shares_effect_scope(reassociated.session(), original.session()));
         assert_eq!(reassociated, original);
 
         // Associating with a handle of another session on the same client switches the session, and therefore its
@@ -3220,7 +3220,7 @@ mod tests {
 
         // Re-association never affects the clones that existed beforehand, which keep their original session.
         assert!(original.session().is_same_session(&session));
-        assert!(std::ptr::eq(original.session().effect_scope(), session.effect_scope()));
+        assert!(shares_effect_scope(original.session(), &session));
 
         // Association rejects a session of a different client, even when no numerical buffer could establish
         // ownership (e.g., for bufferless zero-space arrays).

@@ -33,7 +33,7 @@ use ryft_pjrt::{
 use crate::arrays::ArrayOutputLayout;
 use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
 use crate::lowering::signature::ExecutableSignature;
-use crate::sessions::effects::{ensure_effect_dispatch_allowed, format_effect_failures};
+use crate::sessions::effects::{ensure_effect_dispatch_is_allowed, format_effect_failures};
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, FromPjrt, RuntimeRequirement, Session,
     ToPjrt, Value,
@@ -492,7 +492,7 @@ impl Session {
         inputs: Vec<Array>,
         donation_overrides: &[(usize, bool)],
     ) -> Result<PreparedExecution, Error> {
-        ensure_effect_dispatch_allowed()?;
+        ensure_effect_dispatch_is_allowed()?;
         self.validate_program_owner(program)?;
         if program.kernel_execution_facts().is_some() {
             crate::kernels::distributed::validate_kernel_participants(self.client(), program.mesh())?;
@@ -669,7 +669,7 @@ impl Session {
         program: &CompiledProgram,
         inputs: Vec<Value>,
     ) -> StatefulExecution<Vec<Value>, Error> {
-        if let Err(error) = ensure_effect_dispatch_allowed() {
+        if let Err(error) = ensure_effect_dispatch_is_allowed() {
             return StatefulExecution::ready(Err(error));
         }
         if program.reference_states().is_empty() {
@@ -1073,7 +1073,7 @@ impl Session {
         array_output_count: usize,
         after_submission: impl FnOnce(&ExecutionFence),
     ) -> Result<Execution<Vec<Vec<Buffer<'static>>>>, Error> {
-        ensure_effect_dispatch_allowed()?;
+        ensure_effect_dispatch_is_allowed()?;
         let addressable_device_count = arguments.addressable_device_ids().len();
         let ordered = program.signature().has_ordered_io();
         if ordered {
@@ -1084,9 +1084,9 @@ impl Session {
                 return Err(ExecutionError::MissingDeviceOrderedEffect.into());
             }
         }
-        let ordered_devices = ordered.then(|| arguments.addressable_device_ids().to_vec());
+        let devices = ordered.then_some(arguments.addressable_device_ids());
         let mut reservation =
-            if program.signature().has_effects() { Some(self.effect_scope().reserve(ordered_devices)?) } else { None };
+            if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
         if let Some(reservation) = &reservation
             && ordered
         {
@@ -1154,32 +1154,21 @@ impl Session {
             .find(|outputs| outputs.outputs.len() != output_count)
             .map(|outputs| outputs.outputs.len());
         if let Some(reservation) = &mut reservation {
-            if let Some(actual) = invalid_count {
-                let reason: Arc<str> =
-                    Arc::from(format!("expected {output_count} output(s) per device, but got {actual}"));
-                // Retain completion until the submitted work is done, then report the boundary failure. The fence
-                // callback owns the published completion and the reason, because it may run later on whichever thread
-                // completes the last device event, or inline here when the fence is already ready.
-                let complete = reservation.publish(Err(Arc::clone(&reason)));
-                fence.on_ready(move |_| complete(Err(reason)));
+            let tokens = if let Some(actual) = invalid_count {
+                Err(Arc::from(format!("expected {output_count} output(s) per device, but got {actual}")))
+            } else if ordered {
+                Ok(Some(
+                    device_outputs
+                        .iter_mut()
+                        .map(|outputs| {
+                            Arc::new(outputs.outputs.remove(program.signature().ordered_io_output_index().unwrap()))
+                        })
+                        .collect(),
+                ))
             } else {
-                let tokens = if ordered {
-                    Some(
-                        device_outputs
-                            .iter_mut()
-                            .map(|outputs| {
-                                Arc::new(outputs.outputs.remove(program.signature().ordered_io_output_index().unwrap()))
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
-                let complete = reservation.publish(Ok(tokens));
-                // As above, the fence callback owns the published completion for its whole asynchronous lifetime.
-                fence.on_ready(move |result| complete(result.map_err(|error| Arc::from(error.to_string()))));
-            }
-            reservation.commit();
+                Ok(None)
+            };
+            reservation.publish(tokens, &fence);
         }
         if let Some(actual) = invalid_count {
             return Err(Error::Pjrt(ryft_pjrt::Error::invalid_argument(format!(

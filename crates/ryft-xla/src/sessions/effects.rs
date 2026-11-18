@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex};
 
 use ryft_core::DeviceId;
-use ryft_pjrt::Buffer;
+use ryft_pjrt::{Buffer, ExecutionFence};
 
 use crate::{Error, ExecutionError};
 
@@ -21,19 +21,28 @@ pub(super) struct EffectScope {
     state: Mutex<EffectScopeState>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl EffectScope {
-    /// Reserves an execution and captures its predecessor while holding the scope mutex.
+    /// Reserves an execution and captures its ordered predecessor, if any, while holding the scope mutex.
     ///
-    /// Use [`None`] for `ordered_devices` to track completion only. A device list joins the ordered I/O chain.
-    /// The first ordered reservation selects the list, and later reservations must match it in the same order.
-    /// Once an ordered execution records a failure, further ordered reservations require
-    /// [acknowledgment](Self::acknowledge).
-    pub(crate) fn reserve(&self, ordered_devices: Option<Vec<DeviceId>>) -> Result<EffectReservation, Error> {
-        ensure_effect_dispatch_allowed()?;
+    /// # Parameters
+    ///
+    ///   - `devices`: [`None`] tracks completion without joining the ordered I/O chain. For ordered I/O, pass the
+    ///     IDs of the addressable devices participating in this execution, in the order of PJRT's per-device input
+    ///     and output groups. There is one token buffer per device in that same order. The scope copies the list when
+    ///     starting a chain and compares later lists against it so each successor can pass predecessor tokens back
+    ///     to the devices that produced them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::ScopeDeviceMismatch`] if the device IDs or their order differ from the chain's
+    /// current list. Returns [`ExecutionError::ScopeNeedsRecovery`] for an ordered reservation after an ordered
+    /// failure has been recorded and before it is [acknowledged](Self::acknowledge). Returns
+    /// [`ExecutionError::ReentrantDispatch`] from within a managed effect callback.
+    pub(super) fn reserve(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
+        ensure_effect_dispatch_is_allowed()?;
+
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
-        if ordered_devices.is_some()
+        if devices.is_some()
             && state
                 .submissions
                 .iter()
@@ -41,27 +50,30 @@ impl EffectScope {
         {
             return Err(ExecutionError::ScopeNeedsRecovery.into());
         }
-        if let Some(devices) = &ordered_devices {
-            if let Some(previous) = &state.ordered_devices
-                && previous != devices
-            {
-                return Err(ExecutionError::ScopeDeviceMismatch {
-                    expected: previous.clone(),
-                    actual: devices.clone(),
+
+        if let Some(devices) = devices {
+            match state.devices.as_deref() {
+                Some(previous) if previous != devices => {
+                    return Err(ExecutionError::ScopeDeviceMismatch {
+                        expected: previous.to_vec(),
+                        actual: devices.to_vec(),
+                    }
+                    .into());
                 }
-                .into());
+                Some(_) => {}
+                None => state.devices = Some(devices.to_vec()),
             }
-            state.ordered_devices = Some(devices.clone());
         }
+
         let submission = Arc::new(EffectSubmission {
             identity: state.next_identity,
-            ordered: ordered_devices.is_some(),
+            ordered: devices.is_some(),
             completion: Arc::new(EffectCompletion::default()),
             publication: Mutex::new(EffectTokenPublication::Pending),
             publication_ready: Condvar::new(),
         });
         state.next_identity += 1;
-        let predecessor = if ordered_devices.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
+        let predecessor = if devices.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
         let mut retired = Vec::new();
         state.submissions.retain(|submission| {
             if matches!(submission.completion.result(), Some(Ok(()))) {
@@ -72,14 +84,18 @@ impl EffectScope {
             }
         });
         state.submissions.push(Arc::clone(&submission));
+
+        // Unlock the scope before retired submissions can destroy their PJRT token buffers.
         drop(state);
-        drop(retired);
+
         Ok(EffectReservation { submission, predecessor, committed: false })
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Waits for the executions in a snapshot of existing reservations and reports failures in reservation order.
     pub(super) fn barrier(&self) -> Result<(), Error> {
-        ensure_effect_dispatch_allowed()?;
+        ensure_effect_dispatch_is_allowed()?;
         let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
         let mut failures = Vec::new();
         let mut successful = HashSet::new();
@@ -91,19 +107,12 @@ impl EffectScope {
                 Err(error) => failures.push((submission.identity, error)),
             }
         }
-        let mut state = self.state.lock().expect("effect scope mutex poisoned");
-        state.observed.extend(failures.iter().map(|(identity, _)| *identity));
-        let mut retired = Vec::new();
-        state.submissions.retain(|submission| {
-            if successful.contains(&submission.identity) {
-                retired.push(Arc::clone(submission));
-                false
-            } else {
-                true
-            }
-        });
-        drop(state);
-        drop(retired);
+        {
+            let mut state = self.state.lock().expect("effect scope mutex poisoned");
+            state.observed.extend(failures.iter().map(|(identity, _)| *identity));
+            // The snapshot retains each removed submission until after the scope mutex is released.
+            state.submissions.retain(|submission| !successful.contains(&submission.identity));
+        }
         if failures.is_empty() {
             return Ok(());
         }
@@ -114,7 +123,7 @@ impl EffectScope {
     /// When there is an ordered failure, all ordered work must finish before acknowledgment can reset the chain and
     /// its device assignment. Pending unordered work remains tracked.
     pub(super) fn acknowledge(&self) -> Result<(), Error> {
-        ensure_effect_dispatch_allowed()?;
+        ensure_effect_dispatch_is_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         // Callbacks publish independently of the scope mutex. Read each completion exactly once so a failure
         // arriving after validation cannot be discarded by the retirement step below.
@@ -134,9 +143,9 @@ impl EffectScope {
             .iter()
             .filter_map(|(identity, _, result)| result.as_ref().map(|_| *identity))
             .collect::<HashSet<_>>();
-        let retired_tail = if ordered_failure { state.tail.take() } else { None };
+        let _retired_tail = if ordered_failure { state.tail.take() } else { None };
         if ordered_failure {
-            state.ordered_devices = None;
+            state.devices = None;
         }
         let mut retired = Vec::new();
         state.submissions.retain(|submission| {
@@ -148,9 +157,8 @@ impl EffectScope {
             }
         });
         state.observed.clear();
+        // Unlock the scope before the retired submissions and the former tail can destroy PJRT token buffers.
         drop(state);
-        drop(retired);
-        drop(retired_tail);
         Ok(())
     }
 }
@@ -172,7 +180,7 @@ struct EffectScopeState {
     observed: HashSet<u64>,
 
     /// Device list in token order for the current ordered chain. Acknowledging an ordered failure clears the list.
-    ordered_devices: Option<Vec<DeviceId>>,
+    devices: Option<Vec<DeviceId>>,
 }
 
 /// Reservation for an execution with effects. Dropping an uncommitted reservation cancels it and lets its successors
@@ -184,7 +192,7 @@ pub(crate) struct EffectReservation {
     /// Predecessor whose token publication successors will follow if this reservation is cancelled.
     predecessor: Option<Arc<EffectSubmission>>,
 
-    /// Whether the caller has committed the reservation and disarmed cancellation on drop.
+    /// Whether publication and callback registration have disarmed cancellation on drop.
     committed: bool,
 }
 
@@ -197,19 +205,25 @@ impl EffectReservation {
     }
 
     /// Publishes this submission's ordered I/O token buffers or its execution boundary failure to its successors.
-    /// Pass `Ok(None)` for a successful submission without ordered tokens. The returned callback owns the completion
-    /// state. Call it once the submitted device work finishes.
+    /// Pass `Ok(None)` for a successful submission without ordered tokens. The fence callback records the boundary
+    /// failure if one was published, or the fence's result otherwise. It owns the completion state independently
+    /// of the reservation and can run inline if the fence is already ready. Cancellation on drop is disarmed only
+    /// after callback registration returns.
     pub(crate) fn publish(
-        &self,
+        &mut self,
         tokens: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
-    ) -> impl FnOnce(Result<(), Arc<str>>) + Send + 'static + use<> {
+        fence: &ExecutionFence,
+    ) {
+        let boundary_failure = tokens.as_ref().err().cloned();
         self.submission.publish(tokens);
         let completion = Arc::clone(&self.submission.completion);
-        move |result| completion.complete(result)
-    }
-
-    /// Disarms cancellation on drop. Call this after publishing the submission and registering its completion callback.
-    pub(crate) fn commit(&mut self) {
+        fence.on_ready(move |result| {
+            let result = match boundary_failure {
+                Some(reason) => Err(reason),
+                None => result.map_err(|error| Arc::from(error.to_string())),
+            };
+            completion.complete(result);
+        });
         self.committed = true;
     }
 }
@@ -254,8 +268,16 @@ impl Drop for EffectCallbackGuard {
     }
 }
 
-/// Rejects reentrancy from managed callbacks before any scope or reference locks are taken.
-pub(crate) fn ensure_effect_dispatch_allowed() -> Result<(), Error> {
+/// Prevents the current thread from starting an execution, waiting at an effect barrier, or acknowledging effect
+/// errors while it is running a managed callback such as a print or assertion handler.
+///
+/// Call this before taking scope or reference locks. A nested dispatch or barrier can wait for the current
+/// execution, which needs the callback to return before it can finish.
+///
+/// # Errors
+///
+/// Returns [`ExecutionError::ReentrantDispatch`] if an [`EffectCallbackGuard`] is active on the current thread.
+pub(crate) fn ensure_effect_dispatch_is_allowed() -> Result<(), Error> {
     if EFFECT_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
         Err(ExecutionError::ReentrantDispatch.into())
     } else {
@@ -401,7 +423,7 @@ mod tests {
         MeshAxisType, OneOperation, Placeholder, Print, PrintOperation, ProgramError, Shape, ShardMapBoundary,
         ShardMapOperation, Sharding, ShardingDimension, StaticShape, Typed,
     };
-    use ryft_pjrt::{BufferSpecification, BufferType, Client};
+    use ryft_pjrt::{BufferSpecification, BufferType, Client, EventPromise};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
@@ -415,6 +437,12 @@ mod tests {
     };
 
     use super::*;
+
+    /// Creates a fence whose completion the test controls through its event promise.
+    fn pending_fence() -> (ExecutionFence, EventPromise) {
+        let (event, promise) = cpu_client(1).event(()).unwrap();
+        (ExecutionFence::new(vec![event]), promise)
+    }
 
     /// Submits two prints through one session on one device of `client` and checks that they print in submission order.
     /// With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token
@@ -437,21 +465,22 @@ mod tests {
                     client.addressable_devices().unwrap()[0].default_memory().unwrap(),
                 )
                 .unwrap();
-            let mut predecessor = session.effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-            let complete = predecessor.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-            complete(Ok(()));
-            predecessor.commit();
+            let mut predecessor = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
+            predecessor.publish(
+                Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])),
+                &ExecutionFence::new(Vec::new()),
+            );
             manager
         });
         let tail_pending = || {
-            let state = session.effect_scope().state.lock().unwrap();
+            let state = session.effect_scope.state.lock().unwrap();
             let tokens = state.tail.as_ref().unwrap().wait_for_tokens().unwrap().unwrap();
             !tokens[0].ready().unwrap().ready().unwrap()
         };
         let ((first_pending, second_pending), lines) = with_captured_prints(|| {
-            drop(first.print("first").unwrap());
+            let _ = first.print("first").unwrap();
             let first_pending = tail_pending();
-            drop(second.print("second").unwrap());
+            let _ = second.print("second").unwrap();
             let second_pending = tail_pending();
             if let Some(manager) = &manager {
                 manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
@@ -520,10 +549,11 @@ mod tests {
                     client.addressable_devices().unwrap()[0].default_memory().unwrap(),
                 )
                 .unwrap();
-            let mut predecessor = session.effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-            let complete = predecessor.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-            complete(Ok(()));
-            predecessor.commit();
+            let mut predecessor = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
+            predecessor.publish(
+                Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])),
+                &ExecutionFence::new(Vec::new()),
+            );
             manager
         });
         let ((), lines) = with_captured_prints(|| {
@@ -558,9 +588,9 @@ mod tests {
     #[test]
     fn test_effect_scope_reserve() {
         let scope = EffectScope::default();
-        let first = scope.reserve(Some(vec![0])).unwrap();
+        let first = scope.reserve(Some(&[0])).unwrap();
         let unordered = scope.reserve(None).unwrap();
-        let second = scope.reserve(Some(vec![0])).unwrap();
+        let second = scope.reserve(Some(&[0])).unwrap();
         assert_eq!(first.submission.identity, 0);
         assert_eq!(unordered.submission.identity, 1);
         assert_eq!(second.submission.identity, 2);
@@ -568,7 +598,7 @@ mod tests {
         assert!(unordered.predecessor.is_none());
         assert!(Arc::ptr_eq(second.predecessor.as_ref().unwrap(), &first.submission));
         assert!(matches!(
-            scope.reserve(Some(vec![1])),
+            scope.reserve(Some(&[1])),
             Err(Error::Execution(ExecutionError::ScopeDeviceMismatch { expected, actual }))
                 if expected == vec![0] && actual == vec![1],
         ));
@@ -577,17 +607,20 @@ mod tests {
         std::thread::scope(|threads| {
             let (sender, receiver) = std::sync::mpsc::channel();
             threads.spawn(move || {
+                // Signal the test thread once cancellation has finished.
                 drop(second);
                 sender.send(()).unwrap();
             });
             let cancellation = receiver.recv_timeout(Duration::from_secs(5));
             let predecessor_pending = first.submission.completion.result().is_none();
+            // Cancel the predecessor after observing it pending to release any waiter on its publication.
             drop(first);
             assert_eq!(cancellation, Ok(()));
             assert!(predecessor_pending);
         });
         assert_eq!(cancelled.completion.result(), Some(Ok(())));
         assert!(cancelled.wait_for_tokens().unwrap().is_none());
+        // The barrier would wait on this unpublished reservation until it is cancelled.
         drop(unordered);
         scope.barrier().unwrap();
     }
@@ -595,16 +628,21 @@ mod tests {
     #[test]
     fn test_effect_scope_reserve_device_assignment() {
         let scope = EffectScope::default();
-        let first = scope.reserve(Some(vec![0, 1])).unwrap();
+        let first = scope.reserve(Some(&[0, 1])).unwrap();
         let first_submission = Arc::clone(&first.submission);
+        let device_storage = scope.state.lock().unwrap().devices.as_ref().unwrap().as_ptr();
         assert!(matches!(
-            scope.reserve(Some(vec![1, 0])),
+            scope.reserve(Some(&[1, 0])),
             Err(Error::Execution(ExecutionError::ScopeDeviceMismatch { expected, actual }))
                 if expected == vec![0, 1] && actual == vec![1, 0],
         ));
+        // Cancel the first reservation to verify it remains the predecessor of the next one.
         drop(first);
-        let successor = scope.reserve(Some(vec![0, 1])).unwrap();
+        let successor = scope.reserve(Some(&[0, 1])).unwrap();
         assert!(Arc::ptr_eq(successor.predecessor.as_ref().unwrap(), &first_submission));
+        // A matching reservation reuses the chain's device storage.
+        assert_eq!(scope.state.lock().unwrap().devices.as_ref().unwrap().as_ptr(), device_storage);
+        // Cancel the unpublished successor before waiting at the barrier.
         drop(successor);
         scope.barrier().unwrap();
     }
@@ -613,8 +651,8 @@ mod tests {
     fn test_effect_scope_barrier_waits_for_fixed_snapshot() {
         let scope = EffectScope::default();
         let mut first = scope.reserve(None).unwrap();
-        let complete = first.publish(Ok(None));
-        first.commit();
+        let (fence, promise) = pending_fence();
+        first.publish(Ok(None), &fence);
         let references = Arc::strong_count(&first.submission);
         std::thread::scope(|threads| {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -627,10 +665,9 @@ mod tests {
             }
             let captured = Arc::strong_count(&first.submission) > references;
             let later = scope.reserve(None).unwrap();
-            complete(Ok(()));
+            promise.set(None).unwrap();
             let result = receiver.recv_timeout(Duration::from_secs(5));
             let later_pending = later.submission.completion.result().is_none();
-            drop(later);
             assert!(captured);
             result.unwrap().unwrap();
             assert!(later_pending);
@@ -641,16 +678,18 @@ mod tests {
     #[test]
     fn test_effect_scope_acknowledge() {
         let scope = EffectScope::default();
-        let mut first = scope.reserve(Some(vec![0])).unwrap();
-        let mut second = scope.reserve(Some(vec![0])).unwrap();
-        let complete_first = first.publish(Ok(None));
-        first.commit();
-        let complete_second = second.publish(Ok(None));
-        second.commit();
-        complete_first(Err(Arc::from("first effect failed")));
-        assert!(matches!(scope.reserve(Some(vec![0])), Err(Error::Execution(ExecutionError::ScopeNeedsRecovery))));
+        let mut first = scope.reserve(Some(&[0])).unwrap();
+        let mut second = scope.reserve(Some(&[0])).unwrap();
+        let (first_fence, first_promise) = pending_fence();
+        let (second_fence, second_promise) = pending_fence();
+        first.publish(Ok(None), &first_fence);
+        second.publish(Ok(None), &second_fence);
+        first_promise.set(Some(ryft_pjrt::Error::invalid_argument("first effect failed"))).unwrap();
+        assert_eq!(first.submission.completion.wait(), Err(Arc::from("first effect failed")));
+        assert!(matches!(scope.reserve(Some(&[0])), Err(Error::Execution(ExecutionError::ScopeNeedsRecovery))));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
-        complete_second(Err(Arc::from("second effect failed")));
+        second_promise.set(Some(ryft_pjrt::Error::invalid_argument("second effect failed"))).unwrap();
+        assert_eq!(second.submission.completion.wait(), Err(Arc::from("second effect failed")));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         let expected = concat!(
             "submission 0: first effect failed; submission 1: second effect failed; ",
@@ -667,9 +706,8 @@ mod tests {
         }
         scope.acknowledge().unwrap();
         scope.barrier().unwrap();
-        let recovered = scope.reserve(Some(vec![1])).unwrap();
+        let recovered = scope.reserve(Some(&[1])).unwrap();
         assert!(recovered.predecessor.is_none());
-        drop(recovered);
         // Acknowledgment changes scope bookkeeping, not outcomes retained by callers.
         assert_eq!(first.submission.completion.result(), Some(Err(Arc::from("first effect failed"))));
     }
@@ -678,11 +716,12 @@ mod tests {
     fn test_effect_scope_acknowledge_preserves_pending() {
         let scope = EffectScope::default();
         let mut pending = scope.reserve(None).unwrap();
-        let complete = pending.publish(Ok(None));
-        pending.commit();
+        let (fence, promise) = pending_fence();
+        pending.publish(Ok(None), &fence);
         scope.acknowledge().unwrap();
         assert_eq!(scope.state.lock().unwrap().submissions.len(), 1);
-        complete(Err(Arc::from("late completion failure")));
+        promise.set(Some(ryft_pjrt::Error::invalid_argument("late completion failure"))).unwrap();
+        assert_eq!(pending.submission.completion.wait(), Err(Arc::from("late completion failure")));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         assert!(matches!(
             scope.barrier(),
@@ -696,23 +735,31 @@ mod tests {
     #[test]
     fn test_effect_reservation_drop_forwards_predecessor_publication() {
         let scope = EffectScope::default();
-        let mut first = scope.reserve(Some(vec![0])).unwrap();
-        let second = scope.reserve(Some(vec![0])).unwrap();
-        let third = scope.reserve(Some(vec![0])).unwrap();
+        let mut first = scope.reserve(Some(&[0])).unwrap();
+        let second = scope.reserve(Some(&[0])).unwrap();
+        let third = scope.reserve(Some(&[0])).unwrap();
         let final_submission = Arc::clone(&third.submission);
         std::thread::scope(|threads| {
             let (sender, receiver) = std::sync::mpsc::channel();
             threads.spawn(move || {
+                // Cancel the last reservation while its immediate predecessor is still pending.
                 drop(third);
+                // Cancel the middle reservation so the last one forwards through both cancelled links.
                 drop(second);
                 sender.send(()).unwrap();
             });
             let cancellation = receiver.recv_timeout(Duration::from_secs(5));
-            let reason: Arc<str> = Arc::from("predecessor publication failed");
-            let complete = first.publish(Err(Arc::clone(&reason)));
-            first.commit();
-            complete(Err(reason));
+            let (fence, promise) = pending_fence();
+            first.publish(Err(Arc::from("predecessor publication failed")), &fence);
+            let failure_published = matches!(
+                &*first.submission.publication.lock().unwrap(),
+                EffectTokenPublication::Published(Err(reason)) if reason.as_ref() == "predecessor publication failed",
+            );
+            let completion_pending = first.submission.completion.result().is_none();
+            promise.set(Some(ryft_pjrt::Error::invalid_argument("execution fence failed"))).unwrap();
             assert_eq!(cancellation, Ok(()));
+            assert!(failure_published);
+            assert!(completion_pending);
         });
         assert!(matches!(
             final_submission.wait_for_tokens(),
@@ -740,6 +787,7 @@ mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == reason,
         ));
+        // Exit the managed callback before checking that the barrier can run again.
         drop(guard);
         scope.barrier().unwrap();
     }
@@ -756,16 +804,16 @@ mod tests {
     #[test]
     fn test_effect_submission_drop_releases_long_cancelled_chain() {
         let scope = EffectScope::default();
+        // Each reservation is cancelled at the end of its iteration, extending the forwarding chain.
         for _ in 0..10_000 {
-            drop(scope.reserve(Some(vec![0])).unwrap());
+            let _reservation = scope.reserve(Some(&[0])).unwrap();
         }
         let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
         assert!(tail.wait_for_tokens().unwrap().is_none());
         assert_eq!(tail.completion.result(), Some(Ok(())));
         scope.barrier().unwrap();
+        // Release the scope's reference so the tail owns the entire chain when it drops at the end of the test.
         drop(scope);
-        // The retained tail is the last owner of the entire cancelled chain.
-        drop(tail);
     }
 
     #[test]
@@ -878,14 +926,13 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let scope = session.effect_scope();
-        let mut predecessor = scope
-            .reserve(Some(devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect()))
-            .unwrap();
-        let complete = predecessor
-            .publish(Ok(Some(managers.iter().map(|manager| Arc::new(manager.retrieve_buffer(0).unwrap())).collect())));
-        complete(Ok(()));
-        predecessor.commit();
+        let scope = &session.effect_scope;
+        let device_ids = devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect::<Vec<_>>();
+        let mut predecessor = scope.reserve(Some(&device_ids)).unwrap();
+        predecessor.publish(
+            Ok(Some(managers.iter().map(|manager| Arc::new(manager.retrieve_buffer(0).unwrap())).collect())),
+            &ExecutionFence::new(Vec::new()),
+        );
         managers[1].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
         let (independent, lines) = with_captured_prints(|| {
             session.execute_program(&program, vec![first]).unwrap();

@@ -85,13 +85,13 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext, CastType,
     Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device,
-    DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache,
-    Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext, InterpretableOperation,
-    LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis, NestedTracingContext, ONE_OPERATION_NAME,
-    Operation as CoreOperation, OperationProvider, Parameter, Placeholder, ProgramError, Provenance, ProvenanceScope,
-    RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics,
-    TracingContext, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, ZERO_OPERATION_NAME, Zero,
-    ZeroOperation,
+    DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
+    DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext,
+    InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
+    NestedTracingContext, ONE_OPERATION_NAME, Operation as CoreOperation, OperationProvider, Parameter, Placeholder,
+    ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry,
+    SpecializationCacheStatistics, TracingContext, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram,
+    ZERO_OPERATION_NAME, Zero, ZeroOperation,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::protos::CompilationOptions;
@@ -100,7 +100,7 @@ use ryft_pjrt::{Client, ClientOptions, Plugin};
 use crate::arrays::{ConstantKind, RetainedArray};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::sessions::effects::{EffectScope, ensure_effect_dispatch_allowed};
+use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::{
@@ -332,12 +332,6 @@ impl Session {
         self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
     }
 
-    /// Returns the [`EffectScope`] that executions through this [`Session`] reserve their submissions in.
-    #[inline]
-    pub(crate) fn effect_scope(&self) -> &EffectScope {
-        &self.effect_scope
-    }
-
     /// Returns whether `other` is a handle of the same underlying [`Session`] as this one (i.e., whether the two share
     /// their compilation cache, runtime extensions, and retained constants), irrespective of their meshes and effect
     /// scopes.
@@ -406,6 +400,12 @@ impl Session {
     pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, buffer: B) -> Result<Array, Error> {
         let mesh = self.eager_mesh(&[], std::slice::from_ref(&r#type))?;
         Array::from_host_buffer(self, r#type, mesh, buffer)
+    }
+
+    /// Reserves an execution in this handle's effect scope. Pass the participating device IDs in PJRT's device
+    /// order to join its ordered I/O chain, or [`None`] to track completion alone.
+    pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
+        self.effect_scope.reserve(devices)
     }
 
     /// Waits for the previously reserved effects of this handle's scope, including unordered I/O and local assertions.
@@ -1029,7 +1029,7 @@ impl Context for Session {
         Self::Constant: 'r,
         Self::Operation: 'r,
     {
-        ensure_effect_dispatch_allowed()
+        ensure_effect_dispatch_is_allowed()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let operation = operation.into();
         let regions = regions.into();
@@ -1570,6 +1570,11 @@ pub(crate) mod tests {
         Session::builder().client(client).build().unwrap()
     }
 
+    /// Returns whether the session handles use the same effect scope.
+    pub(crate) fn shares_effect_scope(first: &Session, second: &Session) -> bool {
+        Arc::ptr_eq(&first.effect_scope, &second.effect_scope)
+    }
+
     /// Builds a one-axis mesh from the client's addressable devices for domain tests.
     pub(crate) fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1774,7 +1779,7 @@ pub(crate) mod tests {
         let session = session_with_client(client).with_device_mesh(mesh.clone());
         let clone = session.clone();
         assert!(clone.is_same_session(&session));
-        assert!(std::ptr::eq(clone.effect_scope(), session.effect_scope()));
+        assert!(shares_effect_scope(&clone, &session));
         assert_eq!(clone.device_mesh().unwrap(), &mesh);
 
         // The shared state of a session lives for as long as any of its handles.
@@ -1794,7 +1799,7 @@ pub(crate) mod tests {
         assert!(!session.target().unwrap().devices().is_empty());
         assert!(std::ptr::eq(session.client(), other.client()));
         assert!(!session.is_same_session(&other));
-        assert!(!std::ptr::eq(session.effect_scope(), other.effect_scope()));
+        assert!(!shares_effect_scope(&session, &other));
     }
 
     #[test]
@@ -1816,7 +1821,7 @@ pub(crate) mod tests {
         let meshed = session.with_device_mesh(mesh.clone());
         assert_eq!(meshed.device_mesh().unwrap(), &mesh);
         assert!(meshed.is_same_session(&session));
-        assert!(std::ptr::eq(meshed.effect_scope(), session.effect_scope()));
+        assert!(shares_effect_scope(&meshed, &session));
 
         // The handle that the mesh was added to is unaffected.
         assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
@@ -1829,11 +1834,11 @@ pub(crate) mod tests {
         let session = session_with_client(client).with_device_mesh(mesh.clone());
         let fork = session.with_new_effect_scope();
         assert!(fork.is_same_session(&session));
-        assert!(!std::ptr::eq(fork.effect_scope(), session.effect_scope()));
+        assert!(!shares_effect_scope(&fork, &session));
         assert_eq!(fork.device_mesh().unwrap(), &mesh);
 
         // A barrier of the new scope does not wait for effects that are pending in the scope of the original handle.
-        let pending = session.effect_scope().reserve(None).unwrap();
+        let pending = session.reserve_effects(None).unwrap();
         fork.effects_barrier().unwrap();
         drop(pending);
         session.effects_barrier().unwrap();
@@ -2035,10 +2040,8 @@ pub(crate) mod tests {
         session.effects_barrier().unwrap();
 
         // A barrier reports the failures of earlier submissions, and keeps reporting them until they are acknowledged.
-        let mut reservation = session.effect_scope().reserve(None).unwrap();
-        let complete = reservation.publish(Ok(None));
-        reservation.commit();
-        complete(Err(Arc::from("effect failed")));
+        let mut reservation = session.reserve_effects(None).unwrap();
+        reservation.publish(Err(Arc::from("effect failed")), &ExecutionFence::new(Vec::new()));
         assert!(matches!(
             session.effects_barrier(),
             Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
@@ -2055,10 +2058,8 @@ pub(crate) mod tests {
     fn test_session_acknowledge_effect_errors() {
         let client = execution_client();
         let session = session_with_client(client);
-        let mut reservation = session.effect_scope().reserve(None).unwrap();
-        let complete = reservation.publish(Ok(None));
-        reservation.commit();
-        complete(Err(Arc::from("effect failed")));
+        let mut reservation = session.reserve_effects(None).unwrap();
+        reservation.publish(Err(Arc::from("effect failed")), &ExecutionFence::new(Vec::new()));
 
         // Failures can only be acknowledged after a barrier has reported them.
         assert!(matches!(
@@ -2085,7 +2086,7 @@ pub(crate) mod tests {
         let fork = session.with_new_effect_scope();
         let resolved = fork.retained_constant(&handle).unwrap();
         assert_eq!(resolved, array);
-        assert!(std::ptr::eq(resolved.session().effect_scope(), fork.effect_scope()));
+        assert!(shares_effect_scope(resolved.session(), &fork));
 
         // Every session of the client that owns the array resolves the handle, and the array outlives its session.
         let other_session = session_with_client(client);
@@ -2569,7 +2570,7 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(output, value);
             assert!(output.session().is_same_session(&session));
-            assert!(std::ptr::eq(output.session().effect_scope(), session.effect_scope()));
+            assert!(shares_effect_scope(output.session(), &session));
 
             let operation = if checked {
                 CastOperation::checked(output_type.clone(), vec![output_type.clone()]).unwrap()
@@ -2578,7 +2579,7 @@ pub(crate) mod tests {
             };
             let outputs = selected.bind(operation, Vec::new(), std::slice::from_ref(&value)).unwrap();
             assert_eq!(outputs, vec![value.clone()]);
-            assert!(std::ptr::eq(outputs[0].session().effect_scope(), selected.effect_scope()));
+            assert!(shares_effect_scope(outputs[0].session(), &selected));
         }
         assert_eq!(session.cached_program_count(), 0);
     }
@@ -4409,7 +4410,7 @@ pub(crate) mod tests {
         let other = Session::builder().client(client).build().unwrap();
         assert!(std::ptr::eq(session.client(), other.client()));
         assert!(!session.is_same_session(&other));
-        assert!(!std::ptr::eq(session.effect_scope(), other.effect_scope()));
+        assert!(!shares_effect_scope(&session, &other));
         assert_eq!((session.cached_program_count(), session.state.eager_dispatch_cache.len()), (0, 0));
     }
 

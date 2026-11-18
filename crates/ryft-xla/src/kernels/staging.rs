@@ -743,7 +743,12 @@ where
             "pure kernel fallback must preserve the complete signature",
         )));
     }
-    if definition.effects().classes().into_iter().any(|effect| effect != ryft_core::EffectClass::OrderedState) {
+    if definition
+        .effects()
+        .classes()
+        .into_iter()
+        .any(|effect| effect != ryft_core::EffectClass::OrderedState)
+    {
         return Err(ProgramError::UnsupportedOperation {
             message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
         });
@@ -1850,15 +1855,9 @@ pub(crate) mod tests {
             evaluate(&[false, false, true], &[data_type.clone(), data_type.clone(), prefetch_type.clone()]).map(|_| ()),
             Err(mismatch.clone()),
         );
-        assert_eq!(
-            evaluate(&[false, true], &[data_type.clone(), i64_type.clone()]).map(|_| ()),
-            Err(mismatch.clone()),
-        );
+        assert_eq!(evaluate(&[false, true], &[data_type.clone(), i64_type.clone()]).map(|_| ()), Err(mismatch.clone()));
         assert_eq!(evaluate(&[false, false], &[data_type.clone(), i64_type]).map(|_| ()), Err(mismatch.clone()));
-        assert_eq!(
-            evaluate(&[true, false], &[prefetch_type.clone(), data_type.clone()]).map(|_| ()),
-            Err(mismatch),
-        );
+        assert_eq!(evaluate(&[true, false], &[prefetch_type.clone(), data_type.clone()]).map(|_| ()), Err(mismatch));
 
         // A known prefetch value must be specialized on the host instead, whether the data input is known or not.
         let unspecialized = ProgramError::UnsupportedOperation {
