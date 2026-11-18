@@ -80,7 +80,7 @@ impl Platform {
     }
 
     /// Returns the process-wide client of this platform for `options`, or for the default options of the platform if
-    /// `options` is [`None`]. Refer to [`process_client`] for information on how such clients are shared.
+    /// `options` is [`None`]. Calls for the same plugin and equal options share one client for the rest of the process.
     ///
     /// [`Self::Auto`] returns the client of the first accelerator, in order of preference, whose feature is enabled,
     /// whose plugin loads and initializes, and whose client has at least one addressable device, and the CPU client
@@ -94,7 +94,7 @@ impl Platform {
     /// be loaded or initialized or its client cannot be created.
     pub fn client(self, options: Option<ClientOptions>) -> Result<&'static Client<'static>, Error> {
         if self != Self::Auto {
-            return process_client(&self.plugin()?, options.unwrap_or_else(|| self.client_options()));
+            return client_for_plugin(&self.plugin()?, options.unwrap_or_else(|| self.client_options()));
         }
 
         if options.is_some() {
@@ -107,7 +107,7 @@ impl Platform {
         }
 
         for accelerator in Self::AUTO_PLATFORM_CANDIDATES.into_iter().filter(|accelerator| accelerator.is_available()) {
-            let client = accelerator.plugin().and_then(|plugin| process_client(&plugin, accelerator.client_options()));
+            let client = accelerator.client(None);
             if let Ok(client) = client
                 && client.addressable_devices().is_ok_and(|devices| !devices.is_empty())
             {
@@ -192,9 +192,7 @@ impl Display for Platform {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Client that `ryft-xla` created for sessions and that lives for the rest of the process.
+/// Client that the Ryft XLA backend created for sessions and that lives for the rest of the process.
 struct ProcessClient {
     /// Plugin that created the client.
     plugin: Plugin,
@@ -206,7 +204,7 @@ struct ProcessClient {
     client: &'static Client<'static>,
 }
 
-/// Clients that `ryft-xla` created for sessions, in creation order. Clients are never removed.
+/// Clients that the Ryft XLA backend created for sessions, in creation order. Clients are never removed.
 static PROCESS_CLIENTS: Mutex<Vec<ProcessClient>> = Mutex::new(Vec::new());
 
 /// Returns the process-wide client of `plugin` for `options`, creating it on first use. The client lives for the rest
@@ -219,7 +217,7 @@ static PROCESS_CLIENTS: Mutex<Vec<ProcessClient>> = Mutex::new(Vec::new());
 ///
 /// Returns [`Error::Pjrt`] if the plugin cannot be initialized or the client cannot be created. Neither failure is
 /// retained by this function, so a later request attempts to create the client again.
-pub(crate) fn process_client(plugin: &Plugin, options: ClientOptions) -> Result<&'static Client<'static>, Error> {
+pub(super) fn client_for_plugin(plugin: &Plugin, options: ClientOptions) -> Result<&'static Client<'static>, Error> {
     let mut clients = PROCESS_CLIENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = clients.iter().find(|existing| existing.plugin == *plugin && existing.options == options) {
         return Ok(existing.client);
@@ -298,13 +296,13 @@ mod tests {
     }
 
     #[test]
-    fn test_process_client() {
+    fn test_client_for_plugin() {
         // Clients are keyed by their plugin and options, irrespective of the platform that requested them.
         let plugin = load_cpu_plugin().unwrap();
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(5), ..Default::default() });
-        let client = process_client(&plugin, options.clone()).unwrap();
+        let client = client_for_plugin(&plugin, options.clone()).unwrap();
         assert_eq!(client.addressable_devices().unwrap().len(), 5);
-        assert!(std::ptr::eq(process_client(&plugin, options.clone()).unwrap(), client));
+        assert!(std::ptr::eq(client_for_plugin(&plugin, options.clone()).unwrap(), client));
         assert!(std::ptr::eq(Platform::Cpu.client(Some(options)).unwrap(), client));
     }
 }

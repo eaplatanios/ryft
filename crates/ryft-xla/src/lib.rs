@@ -110,10 +110,10 @@ pub(crate) mod tests {
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
+    use crate::Platform;
     use crate::{Array, FromPjrt, Session};
 
     /// Returns a CPU client with `device_count` addressable devices, for tests that need a fixed device count or that
@@ -184,15 +184,13 @@ pub(crate) mod tests {
         let client = match platform.as_str() {
             "cpu" => cpu_client(1),
             #[cfg(feature = "cuda-13")]
-            "cuda-13" => process_client(
-                &load_cuda_13_plugin().unwrap(),
-                ClientOptions::GPU(GpuClientOptions {
+            "cuda-13" => Platform::Cuda
+                .client(Some(ClientOptions::GPU(GpuClientOptions {
                     platform: Some(GpuPlatform::CUDA),
                     allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                     ..Default::default()
-                }),
-            )
-            .unwrap(),
+                })))
+                .unwrap(),
             _ => panic!("unsupported execution platform `{platform}`; CUDA testing requires `--features cuda-13`"),
         };
         let expected = if platform == "cpu" { "cpu" } else { "cuda" };

@@ -390,10 +390,10 @@ mod tests {
     };
     use ryft_pjrt::{BufferSpecification, BufferType, Client};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
+    use crate::sessions::platforms::Platform;
     use crate::sessions::tests::{domain_mesh, f64_vector, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_to_bytes};
     use crate::{
@@ -766,16 +766,13 @@ mod tests {
         // This proves token transport on a second plugin. Native tokens created through the asynchronous transfer path
         // from the host to the device gate CUDA executions, and the CUDA print handler observes device values in
         // submission order.
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         assert_session_array_ordered_effects(&client, false);
     }
 
@@ -788,16 +785,13 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_session_effect_metadata_reload_and_unordered_completion_on_cuda() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         assert_domain_effect_metadata_reload_and_unordered_completion(&client, false);
     }
 

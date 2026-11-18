@@ -28,7 +28,7 @@ pub struct MosaicGpuEmbedding;
 impl<Extension: KernelExtension> KernelOutputEmbedding<CompiledKernel, Extension> for MosaicGpuEmbedding {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         Ok(format!(
-            "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
+            "mosaic GPU embedding 1; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
              resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then \
              optional assertion token; row-major; no collectives; no custom barrier"
         )
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(
             key,
             format!(
-                "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
+                "mosaic GPU embedding 1; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
              resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then \
              optional assertion token; row-major; no collectives; no custom barrier"
             )

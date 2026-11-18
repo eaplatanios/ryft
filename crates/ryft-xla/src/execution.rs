@@ -1531,19 +1531,18 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
+    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program};
 
     use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
-    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_f32s, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, session_with_client, two_device_mesh,
     };
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Error, ExecutionError, FlatProgram, Options, ProgramBuilder, Reference, Session, ToMlir,
-        Value, compile_statefully, compile_statefully_with_captures,
+        Array, Constant, Error, ExecutionError, FlatProgram, Options, Platform, ProgramBuilder, Reference, Session,
+        ToMlir, Value, compile_statefully, compile_statefully_with_captures,
     };
 
     use super::*;
@@ -2033,12 +2032,9 @@ mod tests {
 
     #[test]
     fn test_execution_arguments_from_arrays_executes_manual_computation_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }),
-        )
-        .expect("failed to create 4-device CPU client");
+        let client = Platform::Cpu
+            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() })))
+            .expect("failed to create 4-device CPU client");
         let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);

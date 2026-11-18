@@ -770,7 +770,7 @@ mod tests {
     use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::sessions::platforms::process_client;
+    use crate::Platform;
     use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, execution_client};
 
@@ -943,11 +943,9 @@ mod tests {
         let mode = std::env::var("RYFT_KERNEL_MODE").unwrap();
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process as u32).unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }),
-        )
-        .unwrap();
+        let client = Platform::Cpu
+            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
+            .unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![]).unwrap(),
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],

@@ -101,7 +101,7 @@ use crate::arrays::{ConstantKind, RetainedArray};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectScope, ensure_effect_dispatch_allowed};
-use crate::sessions::platforms::process_client;
+use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::{
     Array, ArrayError, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LowerableOperation,
@@ -1276,7 +1276,7 @@ impl SessionBuilder {
         let client: &'static Client<'static> = match (self.client_source, self.client_options) {
             (ClientSource::Platform(platform), client_options) => platform.client(client_options)?,
             (ClientSource::Plugin(plugin), client_options) => {
-                process_client(&plugin, client_options.unwrap_or_default())?
+                client_for_plugin(&plugin, client_options.unwrap_or_default())?
             }
             (ClientSource::Client(client), None) => client,
             (ClientSource::Client(_), Some(_)) => {
@@ -1547,12 +1547,10 @@ pub(crate) mod tests {
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
-    #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
     use crate::sessions::runtimes::builtin_requirement;
     use crate::tests::{
         assert_send_sync, cpu_client, execution_client, hash_of, other_cpu_client, replicated_array, values_from_bytes,
@@ -4505,16 +4503,13 @@ pub(crate) mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_session_cuda_kernel_execution_and_persistence() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client);
         let definition: KernelDefinition =

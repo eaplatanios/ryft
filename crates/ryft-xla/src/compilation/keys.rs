@@ -778,12 +778,12 @@ mod tests {
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionOverride};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::Platform;
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
-    #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
     #[cfg(feature = "cuda-13")]
     use crate::sessions::tests::replicated_vector_type;
     use crate::sessions::tests::{
@@ -1061,16 +1061,13 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_session_dispatch_signature_reuses_one_specialization_for_bounded_dynamic_programs_on_cuda() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());

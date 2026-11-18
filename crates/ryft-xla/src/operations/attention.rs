@@ -993,12 +993,12 @@ mod tests {
         differentiable_dot_product_attention, dot_product_attention,
     };
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::Platform;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
-    #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Session, Tracer, to_mlir_module_for_program};
@@ -1486,15 +1486,13 @@ mod tests {
         // An `f32` bias of `1e6` is finite but beyond the range of `f16`, where it would be infinite and turn the
         // softmax of its row into NaNs. The fused kernels receive it saturated at the largest finite `f16` instead,
         // which still attends only to the first key/value position, like the portable body does with the bias itself.
-        let client = process_client(
-            &load_cuda_13_plugin().unwrap(),
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let halves = |dimensions: &[usize], values: &[f32]| {
@@ -1533,15 +1531,13 @@ mod tests {
         // evaluates the portable body for them. The scores of an empty head dimension are zero, so each query row
         // attends uniformly to the three key/value positions and its residual is `log(3)`, and a query row that has
         // no key/value position to attend to has the residual of an empty sum of exponentials.
-        let client = process_client(
-            &load_cuda_13_plugin().unwrap(),
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
@@ -1617,15 +1613,13 @@ mod tests {
         // forward kernels returned it, so their gradients agree with the portable gradients of the reference backend.
         // Probabilities that were reconstructed from a rounded residual would be one instead of one half, which would
         // double the value gradient.
-        let client = process_client(
-            &load_cuda_13_plugin().unwrap(),
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let session = session_with_client(&client);
         let mesh = domain_mesh(&client, "x", 1);
         let reference = |dimensions: &[usize], elements: &[f32]| {

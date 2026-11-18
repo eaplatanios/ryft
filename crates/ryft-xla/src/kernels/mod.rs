@@ -238,7 +238,9 @@ where
         // The immutable verified definition owns every body reference input and forbids reference constants,
         // captures, consumption, and escaping references. Removing only this local OrderedState is semantic
         // reference discharge at the operation boundary. External effects need a separately supported token ABI.
-        let effects = kernel.definition().body().effects();
+        // The effects of the definition include the assertions of mappings that may fail, which the custom call
+        // must preserve like assertions of the body.
+        let effects = kernel.definition().effects();
         if effects.has_explicit_ordered_state() {
             return Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedState });
         }
@@ -437,12 +439,13 @@ pub(crate) mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrOperation, ArrayIrValue, ArrayOperation, Context, DataType, LogicalMesh, MeshAxis,
+        Array as CoreArray, ArrayIrOperation, ArrayIrValue, ArrayOperation, Context, DataType, Dimension,
+        DimensionBounds, DimensionSubOperation, DimensionType, DimensionValue, EffectClasses, LogicalMesh, MeshAxis,
         Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite, Sharding, ShardingError,
         TiledLayout, Tracer as CoreTracer, TracingContext,
     };
     use ryft_kernels::{
-        BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError,
+        BlockMapping, BoundaryPolicy, Grid, GridDimension, GridExecution, KernelCallOperation, KernelCompilationError,
         KernelOperation as PortableKernelOperation, KernelParameter, KernelParameterAccess,
     };
 
@@ -466,6 +469,41 @@ pub(crate) mod tests {
             vec![
                 KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite, mapping)
                     .unwrap(),
+            ],
+        )
+        .unwrap();
+        KernelDefinition::trace(operation, |(references, _)| {
+            references[0].write(&references[0].read()?)?;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// An in-place copy over two grid points whose window starts at `1 - coordinate`. The coordinate type admits
+    /// values up to 3, so the mapping requires a runtime assertion, although no point of the grid fails it.
+    pub(crate) fn mapping_assertion_definition() -> KernelDefinition {
+        let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(4)).unwrap());
+        let mut mapping = CoreProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new();
+        let input = mapping.add_input(coordinate.clone().into());
+        let one = DimensionValue::constant(1).unwrap();
+        let start = mapping.add_constant(ArrayIrValue::Dimension(one.clone()));
+        let operation = DimensionSubOperation::new(&one.r#type(), &coordinate).unwrap();
+        let start = mapping.add_instruction(operation, vec![], vec![start, input], None).unwrap()[0];
+        let mapping = BlockMapping::new(
+            mapping.build(vec![start], vec![Placeholder], vec![Placeholder]).unwrap(),
+            vec![1],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::new_static(DataType::I32, vec![2]),
+                    KernelParameterAccess::ReadWrite,
+                    mapping,
+                )
+                .unwrap(),
             ],
         )
         .unwrap();
@@ -765,6 +803,78 @@ pub(crate) mod tests {
                 Err(KernelEmbeddingError::UnsupportedEffect { effect: actual }) if actual == effect,
             ));
         }
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_output_mapping_assertions() {
+        /// Implements the assertion of the mapping with a native handler and the canonical assertion token chain.
+        struct AssertingEmbedding;
+
+        impl KernelOutputEmbedding<DeferredCopy> for AssertingEmbedding {
+            fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
+                Ok(b"ryft.test.asserting_copy.schema1".to_vec())
+            }
+
+            fn custom_call(
+                &self,
+                kernel: &VerifiedKernel<'_>,
+                output: &DeferredCopy,
+            ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+                Ok(DeferredEmbedding.custom_call(kernel, output)?.with_effect_class(EffectClass::OrderedAssertion))
+            }
+        }
+
+        let definition = mapping_assertion_definition();
+        assert_eq!(definition.body().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+        let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
+        assert_eq!(definition.effects().classes(), assertion.union(EffectClasses::single(EffectClass::OrderedState)));
+        let verified = VerifiedKernel::new(&definition, 2).unwrap();
+        let output = DeferredCopy { schema: 1 };
+
+        // An embedding without the assertion would discard an observable failure of the mapping.
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"configuration", &output, &DeferredEmbedding),
+            Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedAssertion }),
+        ));
+        let compiled = CompiledKernel::from_output(&verified, b"configuration", &output, &AssertingEmbedding).unwrap();
+        assert_eq!(compiled.custom_call().effects().classes(), assertion);
+
+        // The emitted custom call is ordered through the assertion token chain.
+        let vector = ArrayType::new_static(DataType::I32, vec![2]);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(vector.clone().into());
+        builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.clone().into_simplified().unwrap().to_string(), program.to_string());
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![vector.clone()],
+            &vec![vector],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (module, _signature, requires_assertion_handler, _requirements) = lowered.into_parts();
+        assert!(requires_assertion_handler);
+        let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
+        let configuration = "e0d25cb2744279b74773008d0f4c001169484be52de590f2f2ce90c699015e4a";
+        assert_eq!(
+            module,
+            formatdoc! {r#"
+            module {{
+              func.func @main(%arg0: tensor<2xi32>) -> tensor<2xi32> {{
+                %0 = stablehlo.after_all  : !stablehlo.token
+                %1:2 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0, %0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 1 : i64, ryft.kernel.semantic = "{semantic}"}}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>]}} : (tensor<2xi32>, !stablehlo.token) -> (tensor<2xi32>, !stablehlo.token)
+                return %arg0 : tensor<2xi32>
+              }}
+            }}
+        "#}
+        );
     }
 
     #[test]

@@ -472,10 +472,8 @@ mod tests {
         Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, Placeholder, ProgramBuilder as CoreProgramBuilder,
     };
     use ryft_kernels::{KernelDefinition, KernelOperation, kernel};
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::sessions::platforms::process_client;
-    use crate::{RuntimeError, runtime_requirements};
+    use crate::{Platform, RuntimeError, runtime_requirements};
 
     use super::*;
 
@@ -644,8 +642,7 @@ mod tests {
 
     #[test]
     fn test_rocm_runtime_provider_initialize() {
-        let client =
-            process_client(&load_cpu_plugin().unwrap(), ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let client = Platform::Cpu.client(None).unwrap();
         let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let error = provider

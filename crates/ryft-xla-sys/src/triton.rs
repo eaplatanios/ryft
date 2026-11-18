@@ -326,7 +326,11 @@ mod tests {
         assert_eq!(revision, crate::XLA_COMMIT.as_bytes());
         let revision = unsafe { std::slice::from_raw_parts(versions.jax.data.cast::<u8>(), versions.jax.length) };
         assert_eq!(revision, crate::JAX_COMMIT.as_bytes());
-        assert_eq!(versions.triton.length, 40);
+        let revision = unsafe { std::slice::from_raw_parts(versions.triton.data.cast::<u8>(), versions.triton.length) };
+        assert_eq!(revision, crate::TRITON_COMMIT.as_bytes());
+
+        // A different 40-character Triton revision (i.e., one selected by an earlier XLA pin) must not match.
+        assert_ne!(revision, b"a77e7c793abc0d0c923a9afb275058e2fe57a198");
         assert_eq!(versions.rocm_device_libs.length, 40);
         assert!(versions.assembler_version_size > 0);
         assert_eq!(versions.cuda_toolkit_version > 0, versions.cuda_available);

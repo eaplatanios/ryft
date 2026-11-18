@@ -399,7 +399,7 @@ pub(crate) mod tests {
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput,
-        Program as PjrtProgram, load_cpu_plugin,
+        Program as PjrtProgram,
     };
 
     use crate::lowering::tests::{
@@ -414,12 +414,11 @@ pub(crate) mod tests {
     use crate::operations::{
         FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
     };
-    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{read_sharded_f32_array, session_with_client, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, ExecutionArguments, FromPjrt, Options, Reference, Session, TracedProgram,
-        Tracer, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
+        Array, ArrayConstant, ArrayTracer, ExecutionArguments, FromPjrt, Options, Platform, Reference, Session,
+        TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
     };
 
     use super::*;
@@ -1456,12 +1455,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map_operation_lower_executes_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }),
-        )
-        .expect("failed to create 4-device CPU client");
+        let client = Platform::Cpu
+            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() })))
+            .expect("failed to create 4-device CPU client");
         let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
@@ -2680,12 +2676,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map_operation_lower_renders_and_executes_matmul_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }),
-        )
-        .expect("failed to create 8-device CPU client");
+        let client = Platform::Cpu
+            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() })))
+            .expect("failed to create 8-device CPU client");
         let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);

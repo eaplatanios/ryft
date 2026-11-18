@@ -496,7 +496,7 @@ impl<C: CoreDomain<Type = ArrayIrType>> InterpretableOperation<C> for KernelOper
     }
 }
 
-impl<C: Context> PartiallyEvaluatableOperation<C> for KernelOperation
+impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for KernelOperation
 where
     Self: Into<C::Operation>,
 {
@@ -508,6 +508,10 @@ where
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let regions = driver.regions().map(|region| region.to_program()).collect::<Vec<_>>();
         if let PortableKernelOperation::Call(call) = &self.0 {
+            // The inputs are validated against the original call signature first, because the trailing scalar prefetch
+            // values are split off by position.
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            call.infer_output_types(&input_types, &driver.region_interfaces())?;
             let prefetch_count = call.prefetch_types().len();
             if prefetch_count != 0 && inputs[inputs.len() - prefetch_count..].iter().all(|input| input.is_known()) {
                 return Err(ProgramError::UnsupportedOperation {
@@ -703,9 +707,11 @@ where
 /// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the
 /// native kernel primal. This is an AD contract, not recovery from compiler errors, so the caller guarantees
 /// equivalence for every admitted input. Complete input and output types must agree. The fallback cannot contain
-/// references or effects, and the native body cannot declare observable effects beyond its confined local reference
-/// state. Existing canonical JVP construction derives the fallback rule, so reverse mode uses the same primitive
-/// transpose machinery and rematerialization can recompute only the explicitly selected pure derivative computation.
+/// references or effects, and the native call cannot have observable effects beyond its confined local reference
+/// state, which [`KernelDefinition::effects`] summarizes together with the assertions of its mappings and scalar
+/// prefetch conversions. Existing canonical JVP construction derives the fallback rule, so reverse mode uses the same
+/// primitive transpose machinery and rematerialization can recompute only the explicitly selected pure derivative
+/// computation.
 pub fn stage_kernel_with_fallback<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
@@ -723,13 +729,7 @@ where
             "pure kernel fallback must preserve the complete signature",
         )));
     }
-    if definition
-        .body()
-        .effects()
-        .classes()
-        .into_iter()
-        .any(|effect| effect != ryft_core::EffectClass::OrderedState)
-    {
+    if definition.effects().classes().into_iter().any(|effect| effect != ryft_core::EffectClass::OrderedState) {
         return Err(ProgramError::UnsupportedOperation {
             message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
         });
@@ -1400,27 +1400,29 @@ pub(crate) mod tests {
         ConditionOperation, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, EffectClass, LiftedCustomRules, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, NothingSavable, ProgramBuilder as CoreProgramBuilder, RecursiveBatchingDriver,
-        ReferenceRead, ReferenceReadOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
-        RematerializeOperation, ResidualPolicyReference, ReverseModeDifferentiate, ScanOperation, ShardMapBoundary,
+        MeshAxis, MeshAxisType, NothingSavable, PartialEvaluation, PartitionedProgram,
+        ProgramBuilder as CoreProgramBuilder, RecursiveBatchingDriver, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionDriver, RegionRef, RematerializeOperation,
+        ReshapeOperation, ResidualPolicyReference, ReverseModeDifferentiate, ScanOperation, ShardMapBoundary,
         ShardMapOperation, Sharding, ShardingDimension, StagedFunction as CoreStagedFunction, StagingContext,
         TransferToMemoryOperation, TypedProgram, WhileOperation,
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, KernelCompilationError, KernelCompiler, KernelParameter,
-        KernelParameterAccess, KernelSchedule, VerifiedKernel, whole_array_parameter,
+        KernelParameterAccess, KernelSchedule, MappingExpression, ParameterWindow, VerifiedKernel, mapped_call,
+        whole_array_parameter,
     };
     #[cfg(feature = "mosaic-gpu")]
     use ryft_mosaic::kernels::gpu::{
         Compiler as GpuCompiler, GpuOperation, Mma, Options as GpuOptions, Target as GpuTarget,
     };
+    use ryft_pjrt::{ClientOptions, CpuClientOptions};
 
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::session_with_client;
-    use crate::{ArrayConstant, FromPjrt, JitCallOperation, Options, ProgramBuilder, Session};
+    use crate::{ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, ProgramBuilder, Session};
 
     use super::*;
 
@@ -1722,6 +1724,215 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_partially_evaluate_inputs() {
+        /// Region driver that exposes the staged body of one kernel call and supports no recursive partial evaluation.
+        struct CallBodyDriver<'o> {
+            body: &'o FlatProgram,
+        }
+
+        impl RegionDriver<Constant, Operation> for CallBodyDriver<'_> {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Constant, Operation>>
+            where
+                Constant: 'r,
+                Operation: 'r,
+            {
+                std::iter::once(self.body.entry_region_ref())
+            }
+        }
+
+        impl PartialEvaluationDriver<TracingContext<Constant, Operation>> for CallBodyDriver<'_> {
+            fn partially_evaluate_region(
+                &self,
+                _context: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
+                _index: usize,
+                _inputs: Vec<PartialEvaluationValue<CoreTracer<TracingContext<Constant, Operation>>>>,
+            ) -> Result<Vec<PartialEvaluationValue<CoreTracer<TracingContext<Constant, Operation>>>>, ProgramError>
+            {
+                panic!("a kernel call never partially evaluates its body")
+            }
+
+            fn partially_evaluate_program(
+                &self,
+                _context: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
+                _region: RegionRef<'_, Constant, Operation>,
+                _knowledge: &[PartialValue<CoreTracer<TracingContext<Constant, Operation>>>],
+            ) -> Result<PartialEvaluation<TracingContext<Constant, Operation>>, ProgramError> {
+                panic!("a kernel call never partially evaluates its body")
+            }
+
+            fn partition_program(
+                &self,
+                _context: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
+                _region: RegionRef<'_, Constant, Operation>,
+                _input_known: &[bool],
+            ) -> Result<PartitionedProgram<Constant, Operation>, ProgramError> {
+                panic!("a kernel call never partitions its body")
+            }
+        }
+
+        // A call that copies the element of its `i32[4]` data input at the prefetched start into its `i32[1]` result,
+        // whose logical inputs are therefore `[i32[4], i32[]]`.
+        let data_type = ArrayType::new_static(DataType::I32, vec![4]);
+        let prefetch_type = ArrayType::scalar(DataType::I32);
+        let call = mapped_call(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                (
+                    data_type.clone(),
+                    KernelParameterAccess::ReadOnly,
+                    ParameterWindow::ElementStarts {
+                        block_shape: vec![1],
+                        boundary: BoundaryPolicy::InBounds,
+                        starts: vec![MappingExpression::Prefetch(0)],
+                    },
+                ),
+                (
+                    ArrayType::new_static(DataType::I32, vec![1]),
+                    KernelParameterAccess::WriteOnly,
+                    ParameterWindow::WholeArray,
+                ),
+            ],
+            vec![prefetch_type.clone()],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace_with_prefetch(call, |(references, _, _)| {
+            let value = references[0].read()?;
+            references[1].write(&value)
+        })
+        .unwrap();
+        let body = stage_body(&definition).unwrap();
+        let driver = CallBodyDriver { body: &body };
+        let operation =
+            KernelOperation::new(PortableKernelOperation::<NoKernelExtension>::Call(definition.operation().clone()));
+        let outer = TracingContext::<Constant, Operation>::new();
+        let evaluate = |known: &[bool], types: &[ArrayType]| {
+            let context = PartialEvaluationContext::new(outer.clone());
+            let inputs = known
+                .iter()
+                .zip(types)
+                .enumerate()
+                .map(|(index, (known, r#type))| {
+                    if *known {
+                        PartialEvaluationValue::known_input(outer.input(r#type.clone().into()))
+                    } else {
+                        context.unknown_input(r#type.clone().into(), index)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let outputs = operation.partially_evaluate(&context, &driver, &inputs)?;
+            context.into_evaluation(outputs)
+        };
+        let mismatch =
+            ProgramError::Type(TypeError::invalid("`kernel_call` input types do not match its logical signature"));
+
+        // Inputs that do not match the original signature are rejected before the prefetch values are split off,
+        // whether the trailing input is known or not.
+        let i64_type = ArrayType::scalar(DataType::I64);
+        assert_eq!(evaluate(&[], &[]).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(evaluate(&[true], &[prefetch_type.clone()]).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(evaluate(&[false], &[prefetch_type.clone()]).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(evaluate(&[true], &[data_type.clone()]).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(
+            evaluate(&[false, false, true], &[data_type.clone(), data_type.clone(), prefetch_type.clone()]).map(|_| ()),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(
+            evaluate(&[false, true], &[data_type.clone(), i64_type.clone()]).map(|_| ()),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(evaluate(&[false, false], &[data_type.clone(), i64_type]).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(
+            evaluate(&[true, false], &[prefetch_type.clone(), data_type.clone()]).map(|_| ()),
+            Err(mismatch),
+        );
+
+        // A known prefetch value must be specialized on the host instead, whether the data input is known or not.
+        let unspecialized = ProgramError::UnsupportedOperation {
+            message: "scalar-prefetched inputs of XLA kernels must be specialized on the host before partial \
+                evaluation"
+                .to_owned(),
+        };
+        assert_eq!(
+            evaluate(&[false, true], &[data_type.clone(), prefetch_type.clone()]).map(|_| ()),
+            Err(unspecialized.clone()),
+        );
+        assert_eq!(
+            evaluate(&[true, true], &[data_type.clone(), prefetch_type.clone()]).map(|_| ()),
+            Err(unspecialized),
+        );
+
+        // An unknown prefetch value leaves the original call and its complete input list residual.
+        let residual = evaluate(&[false, false], &[data_type.clone(), prefetch_type.clone()]).unwrap();
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {"
+                lambda %0:i32[4], %1:i32[] .
+                let %2:i32[1] = kernel_call [
+                    grid=[],
+                    prefetch_0=i32[],
+                    identities=[0, 0],
+                    identity_0_bounds=[0, ∞),
+                    parameter_0=read-only i32[4] [1] InBounds,
+                    mapping_0={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        in (%0)
+                    },
+                    parameter_1=write-only i32[1] [1] InBounds,
+                    mapping_1={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        let %1:dimension<0> = const 0
+                        in (%1)
+                    },
+                ] %0 %1 [
+                    body={
+                        lambda %0:ref<i32[1]>, %1:ref<i32[1]>, %2:i32[] .
+                        let %3:i32[1] = reference_read %0
+                            () = reference_write %1 %3
+                        in ()
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // A known data input becomes a residual program input after the unknown prefetch value.
+        let residual = evaluate(&[true, false], &[data_type, prefetch_type]).unwrap();
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:i32[4] .
+                let %2:i32[1] = kernel_call [
+                    grid=[],
+                    prefetch_0=i32[],
+                    identities=[0, 0],
+                    identity_0_bounds=[0, ∞),
+                    parameter_0=read-only i32[4] [1] InBounds,
+                    mapping_0={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        in (%0)
+                    },
+                    parameter_1=write-only i32[1] [1] InBounds,
+                    mapping_1={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        let %1:dimension<0> = const 0
+                        in (%1)
+                    },
+                ] %1 %0 [
+                    body={
+                        lambda %0:ref<i32[1]>, %1:ref<i32[1]>, %2:i32[] .
+                        let %3:i32[1] = reference_read %0
+                            () = reference_write %1 %3
+                        in ()
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_kernel_operation_batch() {
         let definition = differentiable_definition();
         let callees = [Arc::new(stage_body(&definition).unwrap())];
@@ -1870,6 +2081,38 @@ pub(crate) mod tests {
         let simplified = program.clone().into_simplified().unwrap();
         assert_eq!(simplified.to_string(), program.to_string());
         assert!(simplified.effects().classes().contains(EffectClass::OrderedAssertion));
+    }
+
+    #[test]
+    fn test_stage_kernel_unused_outputs_preserve_mapping_assertions() {
+        let definition = crate::kernels::tests::mapping_assertion_definition();
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                // The complete kernel result is deliberately unused by its enclosing computation.
+                stage_kernel(inputs[0].context(), &definition, &inputs)?;
+                Ok(Vec::<CoreTracer<TracingContext<Constant, Operation>>>::new())
+            },
+            definition.operation().input_types(),
+        )
+        .unwrap();
+        assert!(program.effects().classes().contains(EffectClass::OrderedAssertion));
+        let simplified = program.clone().into_simplified().unwrap();
+        assert_eq!(simplified.to_string(), program.to_string());
+
+        // Selection requires an embedding that preserves the assertion of the mapping.
+        let binding = KernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.aot"),
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            select_kernels(&program, Some(&binding), facts),
+            Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedAssertion }),
+        ));
     }
 
     #[test]
@@ -2248,13 +2491,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_kernel_execution_facts_from_target() {
-        let plugin = ryft_pjrt::load_cpu_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ryft_pjrt::ClientOptions::CPU(ryft_pjrt::CpuClientOptions { device_count: Some(1), ..Default::default() }),
+    fn test_stage_kernel_with_fallback_rejects_mapping_assertions() {
+        let definition = crate::kernels::tests::mapping_assertion_definition();
+        let vector = definition.operation().input_types()[0].clone();
+        let mut fallback = ProgramBuilder::new();
+        let input = fallback.add_input(vector.clone());
+        let fallback = fallback
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let error = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
+            },
+            vec![vector],
         )
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_kernel_execution_facts_from_target() {
+        let client = Platform::Cpu
+            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
+            .unwrap();
         let devices = client.addressable_devices().unwrap();
         let mesh = ryft_core::DeviceMesh::new(
             ryft_core::LogicalMesh::new(vec![]).unwrap(),
@@ -2641,39 +2905,58 @@ pub(crate) mod tests {
 
     #[test]
     fn test_select_kernels_in_shard_map() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap();
-        let global = ArrayType::new_static(DataType::I32, [4]).with_sharding(sharding.clone()).unwrap();
-        let local = ArrayType::new_static(DataType::I32, [2])
-            .with_sharding(sharding.clone().with_varying_manual_axes(["device"]).unwrap())
-            .unwrap();
-        let definition: KernelDefinition = KernelDefinition::trace(
-            KernelCallOperation::new(
-                Grid::new(vec![]).unwrap(),
-                vec![whole_array_parameter(local, KernelParameterAccess::ReadWrite).unwrap()],
+        // Builds a `shard_map` whose body is a kernel with a sharded local parameter and returns that body and the
+        // program, so that independently built equal programs can be compared. With `Some(request)`, the kernel
+        // reshapes its parameter, requesting the sharding of the parameter as its output sharding when `request` is
+        // `true`.
+        let build = |reshape: Option<bool>| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+            let sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap();
+            let global = ArrayType::new_static(DataType::I32, [4]).with_sharding(sharding.clone()).unwrap();
+            let local = ArrayType::new_static(DataType::I32, [2])
+                .with_sharding(sharding.clone().with_varying_manual_axes(["device"]).unwrap())
+                .unwrap();
+            let definition: KernelDefinition = KernelDefinition::trace(
+                KernelCallOperation::new(
+                    Grid::new(vec![]).unwrap(),
+                    vec![whole_array_parameter(local.clone(), KernelParameterAccess::ReadWrite).unwrap()],
+                )
+                .unwrap(),
+                |(references, _)| {
+                    if let Some(request) = reshape {
+                        let shape = local.shape().clone();
+                        let operation = ReshapeOperation::new(shape.clone(), shape)
+                            .with_output_sharding(local.sharding().filter(|_| request).cloned());
+                        let value = references[0].read()?;
+                        let operation = ArrayIrOperation::Array(ArrayOperation::Reshape(operation));
+                        let value = references[0].context().bind(operation, vec![], &[value])?;
+                        references[0].write(&value[0])?;
+                    }
+                    Ok(())
+                },
             )
-            .unwrap(),
-            |_| Ok(()),
-        )
-        .unwrap();
-        let body = kernel_primal(&definition).unwrap();
-        let operation = ShardMapOperation::from_program(
-            &body,
-            vec![global.clone().into()],
-            ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], vec!["device".to_owned()]).unwrap(),
-        )
-        .unwrap();
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(global.into());
-        let region = builder.import_region(body.entry_region_ref());
-        let outputs = builder
-            .add_instruction(Operation::ShardMap(Box::new(operation)), vec![region], vec![input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
+            let body = kernel_primal(&definition).unwrap();
+            let operation = ShardMapOperation::from_program(
+                &body,
+                vec![global.clone().into()],
+                ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], vec!["device".to_owned()]).unwrap(),
+            )
+            .unwrap();
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(global.into());
+            let region = builder.import_region(body.entry_region_ref());
+            let outputs = builder
+                .add_instruction(Operation::ShardMap(Box::new(operation)), vec![region], vec![input], None)
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            (body, program)
+        };
+        let (body, program) = build(None);
         let binding = binding(1);
         let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
         assert_eq!(
@@ -2693,7 +2976,7 @@ pub(crate) mod tests {
                         let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] = custom_call [
                             target=ryft.test.aot,
                             ryft.kernel.schema=1,
-                            ryft.kernel.semantic=\"193d08e41e9ea83ddfd4ebaa8644c04b0f17e9e73fccff9b135537513d969ce9\",
+                            ryft.kernel.semantic=\"30221f5fb25c2d4433e0f04ee6be39d671cfd07d6b32948f5398b957475dee25\",
                             ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                             input_output_alias=0->0,
                         ] %0
@@ -2707,6 +2990,18 @@ pub(crate) mod tests {
         assert!(matches!(select_kernels(&body, Some(&binding), facts),
             Err(KernelEmbeddingError::Invalid { message }) if message ==
                 "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`"));
+
+        // An independently built equal program selects the same keyed custom call, so it reuses the same entry.
+        let (_, again) = build(None);
+        assert_eq!(select_kernels(&again, Some(&binding), facts).unwrap().unwrap().to_string(), selected.to_string());
+
+        // A kernel body with a requested output sharding also has a key, which equal programs share and which differs
+        // from the key of the same body without the request.
+        let select = |reshape| select_kernels(&build(reshape).1, Some(&binding), facts).unwrap().unwrap().to_string();
+        let requested = select(Some(true));
+        assert_eq!(select(Some(true)), requested);
+        assert_ne!(select(Some(false)), requested);
+        assert_ne!(select(Some(false)), selected.to_string());
     }
 
     #[test]

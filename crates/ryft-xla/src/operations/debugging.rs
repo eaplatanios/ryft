@@ -558,13 +558,13 @@ mod tests {
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::Platform;
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
-    #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
     use crate::sessions::tests::{array_domain, domain_mesh, f64_vector, read_f64s, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
@@ -903,16 +903,13 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_print_operation_lower_executes_eagerly_on_cuda() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         assert_eager_bind_executes_print_effect(&client);
     }
 

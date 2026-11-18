@@ -25,7 +25,7 @@ impl KernelOutputEmbedding<CompiledKernel> for CuTileEmbedding {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         Ok(format!(
             "cuTile embedding 1; compiler schema {COMPILER_SCHEMA_VERSION}; cuda-tile {CUDA_TILE_VERSION}; \
-             tileiras {TILEIRAS_VERSION}; cutile_python_v2; cuda envelope 2; static i32 shapes and strides"
+             tileiras {TILEIRAS_VERSION}; cutile_python_v2; cuda envelope 1; static i32 shapes and strides"
         )
         .into_bytes())
     }
@@ -129,7 +129,7 @@ mod tests {
             String::from_utf8(CuTileEmbedding.configuration_key().unwrap()).unwrap(),
             concat!(
                 "cuTile embedding 1; compiler schema 1; cuda-tile 1.5.0; ",
-                "tileiras 13.3.36; cutile_python_v2; cuda envelope 2; static i32 shapes and strides",
+                "tileiras 13.3.36; cutile_python_v2; cuda envelope 1; static i32 shapes and strides",
             )
         );
     }

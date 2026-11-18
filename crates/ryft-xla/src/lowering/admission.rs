@@ -400,10 +400,10 @@ mod tests {
     };
     use ryft_pjrt::Client;
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::process_client;
+    use crate::Platform;
     use crate::sessions::tests::{
         domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type, session_with_client,
     };
@@ -1267,16 +1267,13 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_cuda_data_derived_padding_disciplines_execute_without_observable_padding() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -1329,16 +1326,13 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_cuda_data_derived_scaled_dot_and_attention_execute_fused_without_observable_padding() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = process_client(
-            &plugin,
-            ClientOptions::GPU(GpuClientOptions {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
                 ..Default::default()
-            }),
-        )
-        .unwrap();
+            })))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let session = session_with_client(&client).with_device_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [

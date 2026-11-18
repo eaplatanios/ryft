@@ -140,7 +140,7 @@ impl CudaKernelEmbedding {
             return Err(KernelEmbeddingError::Invalid { message: "cuda payload digest mismatch".to_owned() });
         }
         let envelope: CudaEnvelope = serde_json::from_str(payload)?;
-        if envelope.version != 2 {
+        if envelope.version != 1 {
             return Err(KernelEmbeddingError::Invalid {
                 message: format!("unsupported CUDA embedding schema `{}`", envelope.version),
             });
@@ -311,7 +311,7 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
         }
         let launch = output.launch_dimensions();
         let envelope = CudaEnvelope {
-            version: 2,
+            version: 1,
             format: match output.format() {
                 CudaArtifactFormat::Cubin => "cubin",
                 CudaArtifactFormat::Ptx => "ptx",
@@ -392,7 +392,8 @@ pub(super) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CudaEnvelope {
-    /// Envelope decoder version.
+    /// Envelope decoder version, which stays at 1 until the first release. Earlier development payloads are rejected
+    /// by their contents, because unknown fields are denied.
     version: u32,
 
     /// Canonical image format.
@@ -463,7 +464,7 @@ impl CudaEnvelope {
 
     /// Reconstructs the canonical driver artifact after validating the versioned envelope.
     fn artifact(&self) -> Result<CudaKernelArtifact, KernelEmbeddingError> {
-        if self.version != 2 || self.argument_bindings.len() != self.parameter_types.len() {
+        if self.version != 1 || self.argument_bindings.len() != self.parameter_types.len() {
             return Err(KernelEmbeddingError::Invalid {
                 message: "invalid cuda embedding schema or parameter count".to_owned(),
             });
@@ -692,13 +693,11 @@ mod tests {
     use ryft_pjrt::extensions::ffi::{
         XLA_FFI_ArgType_BUFFER, XLA_FFI_Buffer, XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN, XLA_FFI_RetType_BUFFER,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::sessions::platforms::process_client;
-    use crate::{Constant, ProgramBuilder, RuntimeError, runtime_requirements};
+    use crate::{Constant, Platform, ProgramBuilder, RuntimeError, runtime_requirements};
 
     use super::*;
 
@@ -872,8 +871,30 @@ mod tests {
         assert_eq!(rejection(&missing), "expected exactly one string attribute `ryft.cuda.payload`");
 
         let mut version = envelope(&original);
-        version.version = 3;
-        assert_eq!(rejection(&with_envelope(&original, &version)), "unsupported CUDA embedding schema `3`");
+        version.version = 2;
+        assert_eq!(rejection(&with_envelope(&original, &version)), "unsupported CUDA embedding schema `2`");
+
+        // The envelope first had version 1 while it carried `parameter_order`, which `parameters`, `row_major_layouts`,
+        // and `assertions` later replaced. A payload of that earlier format names the current version again, and it
+        // must still be rejected by its contents.
+        let mut historical = serde_json::to_value(envelope(&original)).unwrap();
+        let fields = historical.as_object_mut().unwrap();
+        for field in ["parameters", "row_major_layouts", "assertions"] {
+            fields.remove(field);
+        }
+        fields.insert("parameter_order".to_owned(), serde_json::json!([0]));
+        assert_eq!(fields["version"], serde_json::json!(1));
+        let payload = historical.to_string();
+        let historical = CustomCallOperation::new(original.target_name(), original.output_types().to_vec())
+            .with_input_output_alias(0, 0)
+            .unwrap()
+            .with_attribute("ryft.cuda.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
+            .with_attribute("ryft.cuda.payload", payload);
+        assert!(matches!(
+            CudaKernelEmbedding::from_custom_call(&verified, &historical),
+            Err(KernelEmbeddingError::Payload(error))
+                if error.to_string().starts_with("unknown field `parameter_order`"),
+        ));
 
         let mut count = envelope(&original);
         count.argument_bindings.push(CudaKernelBufferBinding::Input(0));
@@ -1172,8 +1193,7 @@ mod tests {
 
     #[test]
     fn test_cuda_runtime_provider_initialize() {
-        let client =
-            process_client(&load_cpu_plugin().unwrap(), ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let client = Platform::Cpu.client(None).unwrap();
         let target = Target::from_client(client).unwrap();
         let provider = runtime_provider();
         let error = provider
