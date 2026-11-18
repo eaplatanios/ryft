@@ -13,12 +13,11 @@ use ryft_pjrt::Error as PjrtError;
 
 use crate::{ArrayError, CompilationError, ExecutionError, LoweringError, RuntimeError, SessionError};
 
-/// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. Conditions
-/// owned by XLA are grouped by their owning contracts, while foreign errors keep their canonical carriers. Public entry
-/// points return this type even when their failure is owned by a more specific group. Batching and differentiation
-/// errors first convert through [`ProgramError`], preserving normalized core payloads. Core and array errors are
-/// boxed to keep this carrier compact. Converting either payload allocates one box on the error path, and cloning
-/// the error clones its boxed payload.
+/// Represents errors that can occur in the Ryft XLA backend. This type groups errors such as [`ArrayError`] and
+/// [`LoweringError`] in dedicated variants. Errors from `ryft-core`, PJRT, and MLIR retain their original types.
+/// Batching and differentiation errors first convert through [`ProgramError`], preserving the normalized core error.
+/// Core and array errors are boxed to keep this type compact. Converting either error allocates one box, and cloning
+/// the error clones its boxed value.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]

@@ -69,10 +69,11 @@ use crate::{
 
 // TODO(eaplatanios): Review this module.
 
-/// XLA-owned failures while admitting a program, constructing its StableHLO representation, or verifying it.
+/// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
+/// representation, or verifying the result.
 ///
-/// Public lowering entry points return [`Error`], which wraps these failures in [`Error::Lowering`]. Core program
-/// errors and native MLIR errors retain their own carriers instead of being wrapped by this enum.
+/// Public lowering entry points return these errors through [`Error::Lowering`]. Core program and native MLIR errors
+/// retain their original types in [`Error::Core`] and [`Error::Mlir`], respectively.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum LoweringError {
     /// The caller selected an empty function symbol or one containing whitespace.

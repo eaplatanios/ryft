@@ -34,7 +34,8 @@ pub use profile_guided::{
 };
 pub use programs::{CompiledProgram, LoweredProgram};
 
-/// XLA option, executable compatibility, persistence, and analysis failures.
+/// Represents errors produced while validating compilation [`Options`], checking or persisting an XLA executable, or
+/// interpreting compilation analysis.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum CompilationError {
     /// A requested compilation option combination is invalid.

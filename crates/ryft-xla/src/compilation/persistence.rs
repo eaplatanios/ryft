@@ -1460,7 +1460,7 @@ mod tests {
         replicated_scalar_type, replicated_vector_type, session_with_client,
     };
     use crate::tests::{cpu_client, values_to_bytes};
-    use crate::{Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Value};
+    use crate::{Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Value, with_captured_prints};
 
     use super::*;
 
@@ -2087,6 +2087,43 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn test_session_deserialize_compiled_program_validates_ordered_io_signature() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
+        let input = f64_vector(&session, &mesh, &[3.0]);
+        let mut builder = ProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
+            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        assert!(compiled.signature().has_ordered_io());
+        let bytes = compiled.serialize().unwrap().unwrap();
+
+        let restored = session.deserialize_compiled_program(&bytes).unwrap().unwrap();
+        assert_eq!(restored.signature(), compiled.signature());
+        let (outputs, prints) = with_captured_prints(|| {
+            let outputs = session.execute_program(&restored, vec![input]).unwrap();
+            session.effects_barrier().unwrap();
+            outputs
+        });
+        assert!(outputs.is_empty());
+        assert_eq!(prints, vec!["ordered: [3.0]"]);
+
+        let (mut metadata, executable) = decode_envelope(&bytes);
+        metadata.ordered_io = false;
+        let corrupted = encode_envelope(&metadata, executable);
+        assert!(matches!(
+            session.deserialize_compiled_program(&corrupted),
+            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
+                if reason == "effect signature does not match executable physical outputs",
+        ));
     }
 
     #[test]

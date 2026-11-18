@@ -54,11 +54,12 @@ pub mod placement;
 pub use device_put::{DevicePutLeaf, DevicePutOptions};
 pub use placement::DevicePutTarget;
 
-/// Errors owned by distributed array metadata, placement, buffer validation, and host materialization.
+/// Represents errors produced while validating distributed [`Array`] metadata and buffers, placing arrays on devices,
+/// or materializing arrays on the host.
 ///
-/// Array APIs return [`Error`], which retains these conditions in [`Error::Array`]. Foreign core and PJRT failures
-/// keep their root carriers unless a condition adds useful array context. [`Self::InvalidShardDimension`] retains
-/// its canonical core cause together with the shard and axis that failed transport encoding.
+/// Array APIs return these errors through [`Error::Array`]. Core and PJRT failures generally retain their original
+/// error types. [`Self::InvalidShardDimension`] also records the shard and dimension that failed transport encoding
+/// alongside the original core error.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ArrayError {
     /// An array type is missing required sharding metadata.

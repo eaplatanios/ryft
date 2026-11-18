@@ -1,17 +1,3 @@
-//! Native runtime extensions that compiled programs require and that sessions initialize lazily.
-//!
-//! A custom call declares the native runtime contracts that it depends on as [`RuntimeRequirement`]s, which
-//! [`with_runtime_requirements`] attaches under the reserved [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] and
-//! [`runtime_requirements`] reads back. Compiled programs retain only these requirements and never an initialized
-//! extension, so cached executables stay independent of the session that produced them.
-//!
-//! [`RuntimeExtensions`] configures the [`RuntimeProvider`]s of a [`Session`](crate::Session) before the session is
-//! constructed. Each session initializes one [`RuntimeExtension`] instance for each requirement before it first
-//! compiles, loads, or executes a program that needs it, and shares that instance with later calls. Before each native
-//! submission, the required extensions attach invocation data to one [`ExecutionResources`], and the session retains
-//! those resources until the execution completes, even when its outputs are discarded. [`named_ffi_type_id`] gives
-//! providers deterministic native type IDs for their user data.
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
@@ -27,43 +13,37 @@ use ryft_pjrt::{Client, ExecutionContext, ExecutionFence};
 use crate::Error;
 use crate::sessions::targets::Target;
 
-// TODO(eaplatanios): Review this module.
-
-/// Invalid runtime declarations, provider configuration, or extension admission.
+/// Represents errors produced while declaring [`RuntimeRequirement`]s, configuring [`RuntimeExtensions`], initializing
+/// a [`RuntimeExtension`], or attaching native user data to [`ExecutionResources`]. Runtime APIs return these errors
+/// through [`Error::Runtime`].
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum RuntimeError {
-    /// A requirement identifier or encoded declaration is invalid.
     #[error("invalid runtime requirement: {reason}")]
     InvalidRequirement { reason: String },
 
-    /// One program requests incompatible contracts from the same extension.
     #[error("conflicting requirements for runtime extension `{identifier}`")]
     ConflictingRequirements { identifier: String },
 
-    /// No configured provider owns a required identifier.
     #[error("no provider is configured for runtime extension `{identifier}`")]
     MissingProvider { identifier: String },
 
-    /// A provider was added twice without explicitly requesting replacement.
     #[error("a provider is already configured for runtime extension `{identifier}`")]
     DuplicateProvider { identifier: String },
 
-    /// The provider does not implement the requested ABI.
     #[error("runtime extension `{identifier}` does not support ABI version {version}")]
     UnsupportedVersion { identifier: String, version: u32 },
 
-    /// Configuration specific to the provider does not match the selected runtime contract.
     #[error("invalid configuration for runtime extension `{identifier}`: {reason}")]
     InvalidConfiguration { identifier: String, reason: String },
 
-    /// An initializer recursively requested its own unfinished instance.
     #[error("recursive initialization of runtime extension `{identifier}`")]
     RecursiveInitialization { identifier: String },
 
-    /// Two extensions attempted to install data under one native type identifier.
     #[error("execution context already contains user data for FFI type {type_id}")]
     DuplicateUserData { type_id: i64 },
 }
+
+// TODO(eaplatanios): Review this module.
 
 /// Reserved attribute of a source operation that holds canonical runtime requirements. XLA lowering consumes this
 /// attribute and does not forward it to the native custom call handler. Other custom call attributes retain their usual
@@ -167,11 +147,13 @@ pub fn normalize_runtime_requirements(
     Ok(canonical.into_values().collect())
 }
 
-/// Attaches canonical runtime requirements to a custom call for consumption by XLA lowering.
+/// Declares the native runtime contracts a custom call needs by encoding its [`RuntimeRequirement`]s in the
+/// [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] for XLA lowering.
 ///
 /// This function accepts one annotation per operation. Identical requirements deduplicate, while conflicting
-/// requirements or a preexisting annotation are errors. The encoded annotation is bounded by
-/// [`MAX_RUNTIME_REQUIREMENTS_BYTES`]. Native FFI handlers receive none of this bookkeeping.
+/// requirements or a preexisting annotation are errors. An empty list adds no attribute. The encoded annotation is
+/// bounded by [`MAX_RUNTIME_REQUIREMENTS_BYTES`]. XLA lowering consumes the annotation and excludes it from the
+/// attributes passed to the native FFI handler.
 pub fn with_runtime_requirements(
     operation: CustomCallOperation,
     requirements: impl IntoIterator<Item = RuntimeRequirement>,
@@ -221,7 +203,8 @@ pub fn with_runtime_requirements(
     Ok(operation.with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, String::from_utf8(encoded.bytes).unwrap()))
 }
 
-/// Reads and validates the reserved requirement annotation of a custom call.
+/// Reads and validates the [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] of a custom call and returns its canonical
+/// [`RuntimeRequirement`]s. Returns an empty list when the attribute is absent.
 pub fn runtime_requirements(operation: &CustomCallOperation) -> Result<Vec<RuntimeRequirement>, Error> {
     let mut annotations = operation.attributes().iter().filter(|(name, _)| name == RUNTIME_REQUIREMENTS_ATTRIBUTE);
     let Some((_, attribute)) = annotations.next() else {
@@ -347,9 +330,11 @@ pub trait RuntimeProvider: Send + Sync {
     ) -> Result<Arc<dyn RuntimeExtension>, Error>;
 }
 
-/// Live extension instance shared by calls through one session.
+/// Live extension instance shared by calls through one [`Session`](crate::Session).
 ///
-/// The session keeps its stable allocation alive until all executions borrowing extension data have completed.
+/// The session initializes one instance for each [`RuntimeRequirement`] before it first compiles, loads, or executes
+/// a program that needs the requirement. Later calls reuse the instance. The session keeps its stable allocation
+/// alive until all executions borrowing extension data have completed.
 /// Implementations must synchronize native handler access across devices and threads. Extensions that only register
 /// native handlers may use the default preparation behavior, which does not create an execution context. A runtime
 /// cannot borrow a client that does not live for the rest of the process.
@@ -373,7 +358,10 @@ pub trait RuntimeExtension: Send + Sync {
         Ok(())
     }
 
-    /// Attaches invocation data and retains any additional owners needed through completion.
+    /// Attaches invocation data before native submission and retains any additional owners needed through completion.
+    ///
+    /// The session calls this method on each required extension with the same [`ExecutionResources`] for the
+    /// invocation.
     fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
         let _ = resources;
         Ok(())
@@ -382,8 +370,9 @@ pub trait RuntimeExtension: Send + Sync {
 
 /// Immutable provider configuration, independent of initialized session runtime instances.
 ///
-/// Configure [`RuntimeProvider`]s before constructing a [`Session`](crate::Session). Each session initializes its own
-/// instances lazily when a compiled program requires them.
+/// Supply this configuration to [`SessionBuilder::runtime_extensions`](super::SessionBuilder::runtime_extensions)
+/// before constructing a [`Session`](crate::Session). The session uses these [`RuntimeProvider`]s to initialize its
+/// own [`RuntimeExtension`] instances lazily.
 #[derive(Clone)]
 pub struct RuntimeExtensions {
     /// Providers keyed by their public contract identifiers.
@@ -545,8 +534,8 @@ pub(crate) struct RetainedExecutionResources {
 /// such as the host callback behind `print` (i.e., the `ryft.print` extension) or the launcher of precompiled CUDA
 /// kernels (i.e., the `ryft.kernel.cuda` extension). A program names the extensions that it needs as
 /// [`RuntimeRequirement`]s, and the [`RuntimeProvider`]s in the [`RuntimeExtensions`] of a session know how to create
-/// the matching [`RuntimeExtension`] instances. The [module documentation](self) describes these parts in more
-/// detail. A registry ties them to one session, in three steps that follow the life of an execution.
+/// the matching [`RuntimeExtension`] instances. A registry ties them to one session in three steps that follow the
+/// life of an execution.
 ///
 ///   - **Initialization:** [`Self::ensure`] creates the instance of each requirement on first use and shares it with
 ///     later calls. For example, lowering a program that prints attaches the `ryft.print` requirement to it. Before
@@ -843,47 +832,45 @@ fn validate_identifier(identifier: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
+    use std::thread;
     use std::time::Duration;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayType, DataType};
+    use ryft_core::{CustomCallAttribute, CustomCallOperation};
+    use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiTypeInformation, FfiUserData};
+    use ryft_pjrt::{Client, ExecutionFence};
 
-    use crate::sessions::Session;
+    use crate::Error;
+    use crate::sessions::targets::Target;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::execution_client;
 
-    use super::*;
+    use super::{
+        ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError,
+        RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRegistry, RuntimeRequirement, builtin_requirement,
+        named_ffi_type_id, normalize_runtime_requirements, runtime_requirements, validate_builtin_requirement,
+        with_runtime_requirements,
+    };
 
-    /// Factory borrowing test counters, demonstrating a non-`'static` provider configuration.
+    /// Provider that counts initialization attempts and can fail the next attempt.
     struct CountingProvider {
-        /// Contract identity used by the fixture.
+        /// Identifier of the contract provided by this fixture.
         identifier: &'static str,
 
-        /// Number of actual initializer calls.
-        calls: &'static AtomicUsize,
+        /// Number of calls to the initializer.
+        calls: AtomicUsize,
 
-        /// Whether the next initialization must fail before publishing an instance.
-        fail: &'static AtomicBool,
-
-        /// Optional counter of the resources of each invocation that have been destroyed.
-        drops: Option<Arc<AtomicUsize>>,
+        /// Whether the next initializer call should return an error.
+        fail: AtomicBool,
     }
 
-    /// Instance borrowing the client, whose optional resources must be retained through the whole launch.
-    struct CountingRuntime {
-        /// Borrowed client checked during invocation preparation.
-        client: &'static Client<'static>,
-
-        /// Optional counter of the resources of each invocation that have been destroyed.
-        drops: Option<Arc<AtomicUsize>>,
-    }
-
-    /// Resource whose destruction establishes completion of the fixture's retained ownership.
-    struct DropCounter(Arc<AtomicUsize>);
-
-    impl Drop for DropCounter {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+    impl CountingProvider {
+        /// Creates a provider with no initialization attempts or scheduled failures.
+        fn new(identifier: &'static str) -> Self {
+            Self { identifier, calls: AtomicUsize::new(0), fail: AtomicBool::new(false) }
         }
     }
 
@@ -898,45 +885,61 @@ mod tests {
             target: &Target,
             requirement: &RuntimeRequirement,
         ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-            let _ = target;
-            validate_builtin_requirement(requirement, self.identifier)?;
+            let _ = (client, target, requirement);
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.swap(false, Ordering::SeqCst) {
                 return Err(Error::custom(std::io::Error::other("fixture initialization failed")));
             }
-            Ok(Arc::new(CountingRuntime { client, drops: self.drops.clone() }))
+            Ok(Arc::new(RegistrationOnlyRuntime))
         }
     }
 
-    impl RuntimeExtension for CountingRuntime {
-        fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
-            assert!(std::ptr::eq(self.client, resources.client()));
-            if let Some(drops) = &self.drops {
-                resources.retain(DropCounter(Arc::clone(drops)));
-            }
-            Ok(())
+    /// Runtime that needs no invocation context or retained resources.
+    struct RegistrationOnlyRuntime;
+
+    impl RuntimeExtension for RegistrationOnlyRuntime {}
+
+    /// Resource that counts how many owners the registry has released.
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Prepares one single-device invocation without runtime requirements.
+    fn prepare_without_requirements(registry: &RuntimeRegistry) -> ExecutionResources {
+        let client = registry.client;
+        let target = Target::from_client(client).unwrap();
+        registry.prepare(&[], &target, &domain_mesh(client, "x", 1)).unwrap()
     }
 
     #[test]
     fn test_runtime_requirement_new() {
-        let requirement = RuntimeRequirement::new("test.provider", 2, vec![1, 2]).unwrap();
-        assert_eq!(requirement.identifier(), "test.provider");
-        assert_eq!(requirement.abi_version(), 2);
-        assert_eq!(requirement.configuration(), &[1, 2]);
-        for identifier in ["", "invalid\0identifier"] {
-            assert!(matches!(
-                RuntimeRequirement::new(identifier, 1, []),
-                Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
-                    if reason == "identifier must be nonempty and contain no NUL",
-            ));
-        }
+        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
         assert_eq!(
-            serde_json::from_str::<RuntimeRequirement>(r#"{"identifier":"","abi_version":1,"configuration":[]}"#)
-                .unwrap_err()
-                .to_string(),
-            "invalid runtime requirement: identifier must be nonempty and contain no NUL",
+            requirement,
+            RuntimeRequirement { identifier: "test.provider".into(), abi_version: 2, configuration: vec![1, 2] },
         );
+    }
+
+    #[test]
+    fn test_runtime_requirement_new_rejects_invalid_identifiers() {
+        assert!(matches!(
+            RuntimeRequirement::new("", 1, []),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "identifier must be nonempty and contain no NUL",
+        ));
+        assert!(matches!(
+            RuntimeRequirement::new("invalid\0identifier", 1, []),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "identifier must be nonempty and contain no NUL",
+        ));
+    }
+
+    #[test]
+    fn test_runtime_requirement_new_bounds_metadata() {
         assert!(matches!(
             RuntimeRequirement::new("x".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1), 1, []),
             Err(Error::SizeLimitExceeded { message })
@@ -947,6 +950,44 @@ mod tests {
             Err(Error::SizeLimitExceeded { message })
                 if message == "runtime configuration exceeds the metadata size limit",
         ));
+    }
+
+    #[test]
+    fn test_runtime_requirement_identifier() {
+        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
+        assert_eq!(requirement.identifier(), "test.provider");
+    }
+
+    #[test]
+    fn test_runtime_requirement_abi_version() {
+        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
+        assert_eq!(requirement.abi_version(), 2);
+    }
+
+    #[test]
+    fn test_runtime_requirement_configuration() {
+        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
+        assert_eq!(requirement.configuration(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_runtime_requirement_deserialize() {
+        let encoded = serde_json::json!({"identifier": "test.provider", "abi_version": 2, "configuration": [1, 2]});
+        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
+        assert_eq!(serde_json::from_value::<RuntimeRequirement>(encoded.clone()).unwrap(), requirement);
+        assert_eq!(serde_json::to_value(requirement).unwrap(), encoded);
+    }
+
+    #[test]
+    fn test_runtime_requirement_deserialize_rejects_invalid_identifiers() {
+        assert_eq!(
+            serde_json::from_value::<RuntimeRequirement>(
+                serde_json::json!({"identifier": "", "abi_version": 1, "configuration": []}),
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid runtime requirement: identifier must be nonempty and contain no NUL",
+        );
     }
 
     #[test]
@@ -967,33 +1008,66 @@ mod tests {
         let second = builtin_requirement("test.b");
         assert_eq!(
             normalize_runtime_requirements([second.clone(), first.clone(), second.clone()]).unwrap(),
-            vec![first.clone(), second],
+            vec![first, second],
         );
+    }
+
+    #[test]
+    fn test_normalize_runtime_requirements_rejects_conflicts() {
+        let first = builtin_requirement("test.a");
         assert!(matches!(
-            normalize_runtime_requirements([first, RuntimeRequirement::new("test.a", 2, []).unwrap()]),
+            normalize_runtime_requirements([first.clone(), RuntimeRequirement::new("test.a", 2, []).unwrap()]),
+            Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.a",
+        ));
+        assert!(matches!(
+            normalize_runtime_requirements([first, RuntimeRequirement::new("test.a", 1, [5]).unwrap()]),
             Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.a",
         ));
     }
 
     #[test]
     fn test_with_runtime_requirements() {
-        let call = CustomCallOperation::new("test.call", vec![ArrayType::scalar(DataType::F32)]);
-        let annotated =
-            with_runtime_requirements(call, [builtin_requirement("test.b"), builtin_requirement("test.a")]).unwrap();
+        let call = CustomCallOperation::new("test.call", vec![]).with_attribute("enabled", true);
+        let first = builtin_requirement("test.a");
+        let second = RuntimeRequirement::new("test.b", 2, [5]).unwrap();
+        let annotated = with_runtime_requirements(call, [second.clone(), first, second]).unwrap();
         assert_eq!(
-            runtime_requirements(&annotated).unwrap(),
-            vec![builtin_requirement("test.a"), builtin_requirement("test.b")],
+            annotated.attributes(),
+            &[
+                ("enabled".into(), CustomCallAttribute::from(true)),
+                (
+                    RUNTIME_REQUIREMENTS_ATTRIBUTE.into(),
+                    CustomCallAttribute::from(concat!(
+                        r#"[1,[{"identifier":"test.a","abi_version":1,"configuration":[]},"#,
+                        r#"{"identifier":"test.b","abi_version":2,"configuration":[5]}]]"#,
+                    )),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_with_runtime_requirements_omits_empty_annotation() {
+        let call = CustomCallOperation::new("test.call", vec![]).with_attribute("enabled", true);
+        assert_eq!(with_runtime_requirements(call.clone(), []).unwrap(), call);
+    }
+
+    #[test]
+    fn test_with_runtime_requirements_rejects_existing_annotation() {
+        let call = CustomCallOperation::new("test.call", vec![]).with_attribute(
+            RUNTIME_REQUIREMENTS_ATTRIBUTE,
+            r#"[1,[{"identifier":"test.a","abi_version":1,"configuration":[]}]]"#,
         );
         assert!(matches!(
-            with_runtime_requirements(annotated, [builtin_requirement("test.a")]),
+            with_runtime_requirements(call, [builtin_requirement("test.a")]),
             Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
                 if reason == "duplicate runtime-requirement annotation",
         ));
     }
 
     #[test]
-    fn test_with_runtime_requirements_bounds_encoded_configuration() {
-        let call = CustomCallOperation::new("test.call", vec![ArrayType::scalar(DataType::F32)]);
+    fn test_with_runtime_requirements_bounds_encoded_annotation() {
+        let call = CustomCallOperation::new("test.call", vec![]);
         let requirement =
             RuntimeRequirement::new("test.provider", 1, vec![255; MAX_RUNTIME_REQUIREMENTS_BYTES]).unwrap();
         assert!(matches!(
@@ -1004,24 +1078,47 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_requirements() {
+        let call = CustomCallOperation::new("test.call", vec![]).with_attribute("enabled", true);
+        assert_eq!(runtime_requirements(&call).unwrap(), Vec::new());
+
+        // Readers normalize persisted annotations, including ones written in a different order.
+        let annotated = call.with_attribute(
+            RUNTIME_REQUIREMENTS_ATTRIBUTE,
+            indoc! {r#"
+                [1, [
+                    {"identifier": "test.b", "abi_version": 2, "configuration": [5]},
+                    {"identifier": "test.a", "abi_version": 1, "configuration": []},
+                    {"identifier": "test.b", "abi_version": 2, "configuration": [5]}
+                ]]
+            "#},
+        );
+        assert_eq!(
+            runtime_requirements(&annotated).unwrap(),
+            vec![builtin_requirement("test.a"), RuntimeRequirement::new("test.b", 2, [5]).unwrap()],
+        );
+    }
+
+    #[test]
     fn test_runtime_requirements_rejects_invalid_annotations() {
-        let call = || CustomCallOperation::new("test.call", vec![ArrayType::scalar(DataType::F32)]);
+        let call = CustomCallOperation::new("test.call", vec![]);
         assert!(matches!(
-            runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, true)),
+            runtime_requirements(&call.clone().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, true)),
             Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
                 if reason == "runtime requirements must be encoded as a string",
         ));
         assert!(matches!(
-            runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[2,[]]")),
+            runtime_requirements(&call.clone().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[2,[]]")),
             Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
                 if reason == "unsupported runtime-requirement encoding version 2",
         ));
-        // The reason of a malformed annotation is the diagnostic of the JSON decoder.
+        // The parser supplies the reason for malformed JSON.
         assert!(matches!(
-            runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "not json")),
+            runtime_requirements(&call.clone().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "not json")),
             Err(Error::Runtime(RuntimeError::InvalidRequirement { .. })),
         ));
-        let duplicate = call()
+        let duplicate = call
+            .clone()
             .with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[1,[]]")
             .with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[1,[]]");
         assert!(matches!(
@@ -1031,7 +1128,7 @@ mod tests {
         ));
         assert!(matches!(
             runtime_requirements(
-                &call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, " ".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1)),
+                &call.with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, " ".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1)),
             ),
             Err(Error::SizeLimitExceeded { message })
                 if message == "runtime requirements exceed the metadata size limit",
@@ -1040,25 +1137,22 @@ mod tests {
 
     #[test]
     fn test_named_ffi_type_id() {
-        const CUDA: FfiTypeId = named_ffi_type_id("ryft.kernel.cuda.runtime");
-        let rocm = named_ffi_type_id("ryft.kernel.rocm.runtime");
+        const FIRST: FfiTypeId = named_ffi_type_id("test.runtime.first");
+        let second = named_ffi_type_id("test.runtime.second");
         let empty = named_ffi_type_id("");
 
         // Equal names produce equal IDs, including across compile-time and runtime evaluation.
-        assert_eq!(named_ffi_type_id("ryft.kernel.cuda.runtime"), CUDA);
-        assert_ne!(CUDA, rocm);
+        assert_eq!(named_ffi_type_id("test.runtime.first"), FIRST);
+        assert_ne!(FIRST, second);
 
-        // Every ID lies above XLA's sequentially assigned IDs and is never the unknown ID.
-        for id in [CUDA, rocm, empty] {
+        // The high range reserves all lower IDs for XLA's sequential allocation.
+        for id in [FIRST, second, empty] {
             assert!(i64::from(id) >= 1 << 62);
-            assert!(!id.is_unknown());
         }
     }
 
     #[test]
     fn test_runtime_extensions_new() {
-        // The built-in configuration provides the kernel runtimes of the enabled backends and the runtimes of the
-        // managed print and assertion handlers, and it is also the default configuration.
         #[cfg(feature = "rocm")]
         let expected = vec!["ryft.assert", "ryft.kernel.cuda", "ryft.kernel.rocm", "ryft.ordered-io", "ryft.print"];
         #[cfg(not(feature = "rocm"))]
@@ -1068,91 +1162,203 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_extensions_with_provider_and_replacement() {
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-        let provider = || {
-            Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None })
-                as Arc<dyn RuntimeProvider>
-        };
-        let configuration = RuntimeExtensions::empty().with_provider(provider()).unwrap();
-        assert_eq!(configuration.identifiers().collect::<Vec<_>>(), vec!["test.provider"]);
+    fn test_runtime_extensions_empty() {
+        assert_eq!(RuntimeExtensions::empty().identifiers().count(), 0);
+    }
+
+    #[test]
+    fn test_runtime_extensions_with_provider() {
+        let provider: Arc<dyn RuntimeProvider> = Arc::new(CountingProvider::new("test.provider"));
+        let configuration = RuntimeExtensions::empty().with_provider(Arc::clone(&provider)).unwrap();
+        assert!(Arc::ptr_eq(&configuration.providers["test.provider"], &provider));
         assert!(matches!(
-            configuration.clone().with_provider(provider()),
+            configuration.with_provider(provider),
             Err(Error::Runtime(RuntimeError::DuplicateProvider { identifier })) if identifier == "test.provider",
         ));
-        let replaced = configuration.with_replaced_provider(provider()).unwrap();
-        assert_eq!(replaced.identifiers().collect::<Vec<_>>(), vec!["test.provider"]);
+    }
+
+    #[test]
+    fn test_runtime_extensions_with_replaced_provider() {
+        let original: Arc<dyn RuntimeProvider> = Arc::new(CountingProvider::new("test.provider"));
+        let replacement: Arc<dyn RuntimeProvider> = Arc::new(CountingProvider::new("test.provider"));
+        let configuration = RuntimeExtensions::empty().with_provider(Arc::clone(&original)).unwrap();
+        let replaced = configuration.clone().with_replaced_provider(Arc::clone(&replacement)).unwrap();
+        assert!(Arc::ptr_eq(&replaced.providers["test.provider"], &replacement));
+        assert!(Arc::ptr_eq(&configuration.providers["test.provider"], &original));
         assert!(matches!(
-            RuntimeExtensions::empty().with_replaced_provider(provider()),
+            RuntimeExtensions::empty().with_replaced_provider(replacement),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.provider",
         ));
     }
 
     #[test]
-    fn test_runtime_extensions_debug() {
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    fn test_runtime_extensions_identifiers() {
         let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
+            .with_provider(Arc::new(CountingProvider::new("test.b")))
+            .unwrap()
+            .with_provider(Arc::new(CountingProvider::new("test.a")))
             .unwrap();
+        assert_eq!(configuration.identifiers().collect::<Vec<_>>(), vec!["test.a", "test.b"]);
+    }
+
+    #[test]
+    fn test_runtime_extensions_debug() {
+        let configuration =
+            RuntimeExtensions::empty().with_provider(Arc::new(CountingProvider::new("test.provider"))).unwrap();
         assert_eq!(format!("{:?}", RuntimeExtensions::empty()), "RuntimeExtensions { identifiers: [] }");
         assert_eq!(format!("{configuration:?}"), r#"RuntimeExtensions { identifiers: ["test.provider"] }"#);
     }
 
     #[test]
-    fn test_runtime_registry_ensure_initializes_once_per_session_and_retries_failure() {
+    fn test_execution_resources_client() {
         let client = execution_client();
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
-        let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
-            .unwrap();
-        let first = Session::builder().client(client).runtime_extensions(configuration.clone()).build().unwrap();
-        let second = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-        let requirement = builtin_requirement("test.provider");
-        assert_eq!(
-            first
-                .runtimes()
-                .ensure(std::slice::from_ref(&requirement), first.target().unwrap())
-                .unwrap_err()
-                .to_string(),
-            "fixture initialization failed",
-        );
-        first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
-        first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        second.runtimes().ensure(&[requirement], second.target().unwrap()).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let resources = prepare_without_requirements(&registry);
+        assert!(std::ptr::eq(resources.client(), client));
+    }
+
+    #[test]
+    fn test_execution_resources_retain() {
+        let registry = RuntimeRegistry::new(execution_client(), RuntimeExtensions::empty());
+        let mut resources = prepare_without_requirements(&registry);
+        let drops = Arc::new(AtomicUsize::new(0));
+        resources.retain(DropCounter(Arc::clone(&drops)));
+        let (context, retained) = resources.into_parts();
+        assert!(context.is_none());
+        assert!(retained.needed);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(retained);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_execution_resources_add_ffi_user_data() {
+        let client = execution_client();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let mut resources = prepare_without_requirements(&registry);
+        let name = "ryft.test.execution_resources";
+        let type_id = named_ffi_type_id(name);
+        assert_eq!(client.register_ffi_type(name, type_id, FfiTypeInformation::new(None)).unwrap(), type_id);
+        assert!(resources.context.is_none());
+
+        let value = Arc::new(42i32);
+        let pointer = Arc::as_ptr(&value).cast_mut().cast();
+        resources.retain(value);
+        // SAFETY: The retained Arc keeps the registered value alive at a stable address.
+        unsafe { resources.add_ffi_user_data(FfiUserData::new(type_id, pointer)) }.unwrap();
+        assert!(resources.context.is_some());
+        // SAFETY: The same Arc still owns the value for this duplicate binding attempt.
+        assert!(matches!(
+            unsafe { resources.add_ffi_user_data(FfiUserData::new(type_id, pointer)) },
+            Err(Error::Runtime(RuntimeError::DuplicateUserData { type_id: actual })) if actual == i64::from(type_id),
+        ));
+    }
+
+    #[test]
+    fn test_runtime_registry_ensure() {
+        let client = execution_client();
+        let target = Target::from_client(client).unwrap();
+        let provider = Arc::new(CountingProvider::new("test.provider"));
+        let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
+        let first = RuntimeRegistry::new(client, configuration.clone());
+        let second = RuntimeRegistry::new(client, configuration);
+        let requirements = [builtin_requirement("test.provider")];
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        first.ensure(&requirements, &target).unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        first.ensure(&requirements, &target).unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        second.ensure(&requirements, &target).unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_runtime_registry_ensure_retries_failed_initialization() {
+        let client = execution_client();
+        let target = Target::from_client(client).unwrap();
+        let provider = Arc::new(CountingProvider::new("test.provider"));
+        provider.fail.store(true, Ordering::SeqCst);
+        let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
+        let registry = RuntimeRegistry::new(client, configuration);
+        let requirements = [builtin_requirement("test.provider")];
+        let error = registry.ensure(&requirements, &target).unwrap_err();
+        assert_eq!(error.downcast_custom::<std::io::Error>().unwrap().to_string(), "fixture initialization failed",);
+        registry.ensure(&requirements, &target).unwrap();
+        registry.ensure(&requirements, &target).unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn test_runtime_registry_ensure_initializes_once_under_concurrent_calls() {
-        let client = execution_client();
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-        let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
-            .unwrap();
-        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-        let target = session.target().unwrap();
-        std::thread::scope(|threads| {
-            for _ in 0..8 {
-                let session = &session;
-                threads
-                    .spawn(move || session.runtimes().ensure(&[builtin_requirement("test.provider")], target).unwrap());
+        /// Provider whose first initializer waits for the test to allow publication.
+        struct BlockingProvider {
+            /// Number of calls to the initializer.
+            calls: AtomicUsize,
+
+            /// Notifies the test that the first initializer has started.
+            started: mpsc::Sender<()>,
+
+            /// Blocks the first initializer until the competing calls are in progress.
+            publish: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl RuntimeProvider for BlockingProvider {
+            fn identifier(&self) -> &str {
+                "test.concurrent"
             }
-        });
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            fn initialize(
+                &self,
+                client: &'static Client<'static>,
+                target: &Target,
+                requirement: &RuntimeRequirement,
+            ) -> Result<Arc<dyn RuntimeExtension>, Error> {
+                let _ = (client, target, requirement);
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.started.send(()).unwrap();
+                    self.publish.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(Arc::new(RegistrationOnlyRuntime))
+            }
+        }
+
+        let client = execution_client();
+        let target = Arc::new(Target::from_client(client).unwrap());
+        let (started, initializing) = mpsc::channel();
+        let (publish, permission) = mpsc::channel();
+        let provider =
+            Arc::new(BlockingProvider { calls: AtomicUsize::new(0), started, publish: Mutex::new(permission) });
+        let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
+        let registry = Arc::new(RuntimeRegistry::new(client, configuration));
+        let start = Arc::new(Barrier::new(2));
+        let (finished, completed) = mpsc::channel();
+        let spawn = || {
+            let (registry, target, start, finished) =
+                (registry.clone(), target.clone(), start.clone(), finished.clone());
+            thread::spawn(move || {
+                start.wait();
+                finished.send(registry.ensure(&[builtin_requirement("test.concurrent")], &target)).unwrap();
+            })
+        };
+        let first = spawn();
+        let second = spawn();
+        initializing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = completed.recv_timeout(Duration::from_millis(100));
+        publish.send(()).unwrap();
+        assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+        completed.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        completed.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn test_runtime_registry_ensure_retries_after_recursion_and_unwind() {
-        /// Provider that first reenters the session and then panics before succeeding.
+        /// Provider that first reenters the registry and then panics before succeeding.
         struct ReentrantProvider {
-            /// Association used solely to exercise recursive initialization, which the test clears at its end to
-            /// break the ownership cycle between the session and its provider.
-            session: Mutex<Option<Session>>,
+            /// Registry to reenter during the first initialization attempt.
+            registry: OnceLock<Weak<RuntimeRegistry>>,
 
             /// Number of attempts, selecting the fixture's successive failure modes.
             calls: AtomicUsize,
@@ -1169,34 +1375,40 @@ mod tests {
                 target: &Target,
                 requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension>, Error> {
+                let _ = client;
                 match self.calls.fetch_add(1, Ordering::SeqCst) {
-                    0 => {
-                        let session = self.session.lock().unwrap().clone().unwrap();
-                        session.runtimes().ensure(std::slice::from_ref(requirement), target)?;
-                        unreachable!()
-                    }
+                    0 => self
+                        .registry
+                        .get()
+                        .unwrap()
+                        .upgrade()
+                        .unwrap()
+                        .ensure(std::slice::from_ref(requirement), target)?,
                     1 => panic!("fixture initializer unwound"),
-                    _ => Ok(Arc::new(CountingRuntime { client, drops: None })),
+                    _ => {}
                 }
+                Ok(Arc::new(RegistrationOnlyRuntime))
             }
         }
 
         let client = execution_client();
-        let provider = Arc::new(ReentrantProvider { session: Mutex::new(None), calls: AtomicUsize::new(0) });
+        let target = Target::from_client(client).unwrap();
+        let provider = Arc::new(ReentrantProvider { registry: OnceLock::new(), calls: AtomicUsize::new(0) });
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
-        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-        *provider.session.lock().unwrap() = Some(session.clone());
-        let requirement = builtin_requirement("test.recursive");
-        let ensure = || session.runtimes().ensure(std::slice::from_ref(&requirement), session.target().unwrap());
+        let registry = Arc::new(RuntimeRegistry::new(client, configuration));
+        provider.registry.set(Arc::downgrade(&registry)).unwrap();
+        let requirements = [builtin_requirement("test.recursive")];
+        let ensure = || registry.ensure(&requirements, &target);
+        // Both a returned error and a panic must release the initialization slot for another attempt.
         assert!(matches!(
             ensure(),
             Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier })) if identifier == "test.recursive",
         ));
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(ensure)).is_err());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ensure)).unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"fixture initializer unwound"));
         ensure().unwrap();
         ensure().unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
-        *provider.session.lock().unwrap() = None;
     }
 
     #[test]
@@ -1209,9 +1421,8 @@ mod tests {
             /// The other provider requested during its first initialization.
             dependency: &'static str,
 
-            /// Association permitting reentry, which the test clears at its end to break the ownership cycle
-            /// between the session and its providers.
-            session: Mutex<Option<Session>>,
+            /// Registry to reenter during the first initialization attempt.
+            registry: OnceLock<Weak<RuntimeRegistry>>,
 
             /// Rendezvous ensuring both outer initializers have started before either reenters.
             started: Arc<std::sync::Barrier>,
@@ -1231,29 +1442,30 @@ mod tests {
                 target: &Target,
                 requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-                let _ = requirement;
+                let _ = (client, requirement);
                 if self.reenter.swap(false, Ordering::SeqCst) {
                     self.started.wait();
-                    let session = self.session.lock().unwrap().clone().unwrap();
-                    session.runtimes().ensure(&[builtin_requirement(self.dependency)], target)?;
+                    let registry = self.registry.get().unwrap().upgrade().unwrap();
+                    registry.ensure(&[builtin_requirement(self.dependency)], target)?;
                 }
-                Ok(Arc::new(CountingRuntime { client, drops: None }))
+                Ok(Arc::new(RegistrationOnlyRuntime))
             }
         }
 
         let client = execution_client();
-        let started = Arc::new(std::sync::Barrier::new(2));
+        let target = Arc::new(Target::from_client(client).unwrap());
+        let started = Arc::new(Barrier::new(2));
         let left = Arc::new(DependentProvider {
             identifier: "test.left",
             dependency: "test.right",
-            session: Mutex::new(None),
+            registry: OnceLock::new(),
             started: Arc::clone(&started),
             reenter: AtomicBool::new(true),
         });
         let right = Arc::new(DependentProvider {
             identifier: "test.right",
             dependency: "test.left",
-            session: Mutex::new(None),
+            registry: OnceLock::new(),
             started,
             reenter: AtomicBool::new(true),
         });
@@ -1262,151 +1474,146 @@ mod tests {
             .unwrap()
             .with_provider(right.clone())
             .unwrap();
-        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-        *left.session.lock().unwrap() = Some(session.clone());
-        *right.session.lock().unwrap() = Some(session.clone());
-        std::thread::scope(|threads| {
-            let run =
-                |identifier| session.runtimes().ensure(&[builtin_requirement(identifier)], session.target().unwrap());
-            let left = threads.spawn(move || run("test.left"));
-            let right = threads.spawn(move || run("test.right"));
-            let results = [left.join().unwrap(), right.join().unwrap()];
-            // The thread that reenters second observes the cycle, while the other one may complete its initialization.
-            assert!(results.iter().any(|result| matches!(
-                result,
-                Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier }))
-                    if identifier == "test.left" || identifier == "test.right",
-            )));
-            assert!(results.iter().all(|result| matches!(
-                result,
-                Ok(()) | Err(Error::Runtime(RuntimeError::RecursiveInitialization { .. })),
-            )));
-        });
-        session
-            .runtimes()
-            .ensure(&[builtin_requirement("test.left"), builtin_requirement("test.right")], session.target().unwrap())
+        let registry = Arc::new(RuntimeRegistry::new(client, configuration));
+        left.registry.set(Arc::downgrade(&registry)).unwrap();
+        right.registry.set(Arc::downgrade(&registry)).unwrap();
+        let (finished, completed) = mpsc::channel();
+        let spawn = |identifier, dependency| {
+            let (registry, target, finished) = (registry.clone(), target.clone(), finished.clone());
+            thread::spawn(move || {
+                let result = registry.ensure(&[builtin_requirement(identifier)], &target);
+                finished.send((dependency, result)).unwrap();
+            })
+        };
+        let left = spawn("test.left", "test.right");
+        let right = spawn("test.right", "test.left");
+        // One or both initializers can observe the cycle, depending on when the rejected attempt rolls back.
+        let mut rejected = 0;
+        for _ in 0..2 {
+            let (dependency, result) = completed.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Err(error) = result {
+                assert!(matches!(
+                    error,
+                    Error::Runtime(RuntimeError::RecursiveInitialization { identifier }) if identifier == dependency,
+                ));
+                rejected += 1;
+            }
+        }
+        left.join().unwrap();
+        right.join().unwrap();
+        assert!(rejected > 0);
+        registry
+            .ensure(&[builtin_requirement("test.left"), builtin_requirement("test.right")], &target)
             .unwrap();
-        *left.session.lock().unwrap() = None;
-        *right.session.lock().unwrap() = None;
     }
 
     #[test]
-    fn test_runtime_registry_ensure_rejects_missing_provider_before_initialization() {
+    fn test_runtime_registry_ensure_rejects_missing_provider() {
         let client = execution_client();
-        let session = Session::builder().client(client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         assert!(matches!(
-            session.runtimes().ensure(&[builtin_requirement("test.missing")], session.target().unwrap()),
+            registry.ensure(&[builtin_requirement("test.missing")], &Target::from_client(client).unwrap()),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing",
         ));
     }
 
     #[test]
-    fn test_runtime_registry_prepare_registration_only_creates_no_context_or_retained_launch() {
+    fn test_runtime_registry_prepare() {
         let client = execution_client();
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-        let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider { identifier: "test.provider", calls, fail, drops: None }))
-            .unwrap();
-        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
+        let target = Target::from_client(client).unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        for requirements in [Vec::new(), vec![builtin_requirement("test.provider")]] {
-            let resources = session.runtimes().prepare(&requirements, session.target().unwrap(), &mesh).unwrap();
-            let (context, lease) = resources.into_parts();
-            assert!(context.is_none());
-            assert!(!lease.needed);
-            let (event, promise) = client.event(()).unwrap();
-            let fence = ExecutionFence::new(vec![event]);
-            session.runtimes().retain(&fence, lease);
-            assert!(session.runtimes().pending.lock().unwrap().is_empty());
-            promise.set(None).unwrap();
-            fence.block_until_ready().unwrap();
-        }
+        let provider = Arc::new(CountingProvider::new("test.provider"));
+        let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
+        let registry = RuntimeRegistry::new(client, configuration);
+        let requirements = [builtin_requirement("test.provider")];
+        let (context, retained) = registry.prepare(&requirements, &target, &mesh).unwrap().into_parts();
+
+        // A registration-only extension still initializes, but its invocation needs no context or owners.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(context.is_none());
+        assert!(!retained.needed);
     }
 
     #[test]
-    fn test_runtime_registry_retain_releases_completed_resources_without_session_drop() {
+    fn test_runtime_registry_retain() {
         let client = execution_client();
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         let drops = Arc::new(AtomicUsize::new(0));
-        let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls,
-                fail,
-                drops: Some(Arc::clone(&drops)),
-            }))
-            .unwrap();
-        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-        let resources = session
-            .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(client, "x", 1))
-            .unwrap();
-        let (_, lease) = resources.into_parts();
+        let mut resources = prepare_without_requirements(&registry);
+        resources.retain(DropCounter(Arc::clone(&drops)));
+        let (_, retained) = resources.into_parts();
         let (event, promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![event]);
-        session.runtimes().retain(&fence, lease);
+        registry.retain(&fence, retained);
+        let pending_before_completion = registry.pending.lock().unwrap().len();
+        let drops_before_completion = drops.load(Ordering::SeqCst);
         promise.set(None).unwrap();
         fence.block_until_ready().unwrap();
-        let resources = session
-            .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(client, "x", 1))
-            .unwrap();
-        let (_, lease) = resources.into_parts();
-        session.runtimes().retain(&fence, lease);
+        assert_eq!(pending_before_completion, 1);
+        assert_eq!(drops_before_completion, 0);
+
+        // Retaining a new submission releases completed owners, including the new ones if its fence is ready.
+        let mut resources = prepare_without_requirements(&registry);
+        resources.retain(DropCounter(Arc::clone(&drops)));
+        let (_, retained) = resources.into_parts();
+        registry.retain(&ExecutionFence::new(vec![]), retained);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
-        assert!(session.runtimes().pending.lock().unwrap().is_empty());
+        assert!(registry.pending.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn test_runtime_registry_drop_retains_resources_after_dropped_outputs() {
+    fn test_runtime_registry_retain_skips_submissions_without_resources() {
         let client = execution_client();
-        let calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
-        let fail: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let (_, retained) = prepare_without_requirements(&registry).into_parts();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        registry.retain(&fence, retained);
+        let pending_before_completion = registry.pending.lock().unwrap().len();
+        promise.set(None).unwrap();
+        fence.block_until_ready().unwrap();
+        assert_eq!(pending_before_completion, 0);
+    }
+
+    #[test]
+    fn test_runtime_registry_drop_waits_for_all_events_after_fence_is_dropped() {
+        let client = execution_client();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         let drops = Arc::new(AtomicUsize::new(0));
-        let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls,
-                fail,
-                drops: Some(Arc::clone(&drops)),
-            }))
-            .unwrap();
-        let session = Session::builder().client(client).runtime_extensions(configuration).build().unwrap();
-        let resources = session
-            .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(client, "x", 1))
-            .unwrap();
-        let (_, lease) = resources.into_parts();
+        let mut resources = prepare_without_requirements(&registry);
+        resources.retain(DropCounter(Arc::clone(&drops)));
+        let (_, retained) = resources.into_parts();
         let (first, first_promise) = client.event(()).unwrap();
         let (second, second_promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![first, second]);
-        session.runtimes().retain(&fence, lease);
+        registry.retain(&fence, retained);
         drop(fence);
-        std::thread::scope(|threads| {
-            let (started, waiting) = std::sync::mpsc::channel();
-            let (released, completed) = std::sync::mpsc::channel();
-            threads.spawn(move || {
-                started.send(()).unwrap();
-                drop(session);
-                released.send(()).unwrap();
-            });
-            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(matches!(
-                completed.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            first_promise.set(Some(ryft_pjrt::Error::aborted("terminal test failure"))).unwrap();
-            assert_eq!(drops.load(Ordering::SeqCst), 0);
-            assert!(matches!(
-                completed.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            second_promise.set(None).unwrap();
-            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        first_promise.set(Some(ryft_pjrt::Error::aborted("test execution failed"))).unwrap();
+
+        let (started, waiting) = mpsc::channel();
+        let (released, completed) = mpsc::channel();
+        let teardown = thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(registry);
+            released.send(()).unwrap();
         });
+        let started = waiting.recv_timeout(Duration::from_secs(5));
+        let early = completed.recv_timeout(Duration::from_millis(100));
+        let drops_before_completion = drops.load(Ordering::SeqCst);
+        // Release the last event even if teardown finished early, so a failing assertion cannot strand a waiter.
+        second_promise.set(None).unwrap();
+
+        started.unwrap();
+        assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+        assert_eq!(drops_before_completion, 0);
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        teardown.join().unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_builtin_requirement() {
+        assert_eq!(builtin_requirement("test.builtin"), RuntimeRequirement::new("test.builtin", 1, []).unwrap(),);
     }
 
     #[test]

@@ -97,7 +97,10 @@ pub use cuda::{
 
 // TODO(eaplatanios): Promote kernel embedding errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
-/// Invalid compiler output or unsupported XLA embedding contract.
+/// Represents errors produced while compiling a kernel or embedding it as an XLA custom call through
+/// [`CompiledKernel`].
+///
+/// Converting to [`crate::Error`] preserves the concrete error in [`crate::Error::Custom`].
 #[derive(Debug, Error)]
 pub enum KernelEmbeddingError {
     /// PJRT registration or execution context setup failed.
@@ -397,17 +400,18 @@ pub(crate) fn dense_memory_layouts(
     })
 }
 
-/// Requires manual shards that are already local, because adapter selection never synthesizes partitioning or a
-/// collective.
+/// Requires the array inputs of a kernel call to be manual shards that are already local, because adapter selection
+/// never synthesizes partitioning or a collective. The parameter types of a kernel are physical, so `inputs` are the
+/// types of the values that the call receives.
 pub(crate) fn validate_kernel_sharding(
-    parameters: &[ArrayType],
+    inputs: &[ArrayType],
     bound_axes: &BTreeMap<String, MeshAxis>,
 ) -> Result<(), KernelEmbeddingError> {
-    for (index, parameter) in parameters.iter().enumerate() {
-        let Some(sharding) = parameter.sharding() else { continue };
+    for (index, input) in inputs.iter().enumerate() {
+        let Some(sharding) = input.sharding() else { continue };
         let invalid = || KernelEmbeddingError::Invalid {
             message: format!(
-                "kernel parameter {index} requires a local shard with all partitioned axes bound by `shard_map`"
+                "kernel input {index} requires a local shard with all partitioned axes bound by `shard_map`"
             ),
         };
         if !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty() {
@@ -1045,14 +1049,14 @@ pub(crate) mod tests {
         assert!(matches!(
             validate_kernel_sharding(std::slice::from_ref(&local), &BTreeMap::new()),
             Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+                if message == "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`",
         ));
         let mismatched =
             BTreeMap::from([("device".to_owned(), MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap())]);
         assert!(matches!(
             validate_kernel_sharding(&[local], &mismatched),
             Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+                if message == "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`",
         ));
         let replicated = ArrayType::new_static(DataType::F32, [8])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
@@ -1064,7 +1068,7 @@ pub(crate) mod tests {
         assert!(matches!(
             validate_kernel_sharding(&[unconstrained], &bound),
             Err(KernelEmbeddingError::Invalid { message })
-                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+                if message == "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`",
         ));
         // Types cannot record placement over auto mesh axes, so no kernel parameter is partitioned over one.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Auto).unwrap()]).unwrap();

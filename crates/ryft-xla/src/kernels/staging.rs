@@ -11,19 +11,20 @@ use ryft_core::{
     ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     Domain as CoreDomain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation as CoreOperation, OperationBoundaryPruning, OperationFoldOutput,
-    OperationProvider, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
+    InterpretationDriver, LogicalMesh, MaybeZero, MeshAxisType, MeshContext, Operation as CoreOperation,
+    OperationBoundaryPruning,
+    OperationFoldOutput, OperationProvider, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program as CoreProgram,
     ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Tracer as CoreTracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
-    TypedProgram, Value as CoreValue,
+    Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, ShardMapBoundary, ShardMapOperation, Sharding,
+    ShardingDimension, Tracer as CoreTracer, TracingContext, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value as CoreValue,
 };
 use ryft_kernels::{
     KernelCallOperation, KernelCompiler, KernelCompletionProtocol, KernelDefinition,
     KernelExtension as PortableKernelExtension, KernelExtensionMemory, KernelOperation as PortableKernelOperation,
-    KernelSchedule, NoKernelExtension, VerifiedKernel,
+    KernelParameterAccess, KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
 use ryft_mlir::ValueRef;
 
@@ -127,10 +128,14 @@ impl ReferenceAccessOperation for KernelExtension {
 }
 
 impl PortableKernelExtension for KernelExtension {
-    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+    fn semantic_key(
+        &self,
+        identity: &mut dyn FnMut(&ryft_core::DimensionVariable) -> usize,
+    ) -> Result<Vec<u8>, TypeError> {
+        let _ = &identity;
         match *self {
             #[cfg(feature = "mosaic-gpu")]
-            Self::Mosaic(ref operation) => operation.semantic_key(),
+            Self::Mosaic(ref operation) => operation.semantic_key(identity),
         }
     }
 
@@ -543,7 +548,7 @@ where
 
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for KernelOperation
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + MeshContext,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -557,6 +562,14 @@ where
             });
         };
         let definition = definition_from_body(call, driver.region(0)?)?;
+        // One kernel call runs on one device, so a batch that is placed on mesh axes outside of every manual region
+        // is batched per device inside a `shard_map` over those axes. Scalar prefetched inputs are not parameters and
+        // must be specialized before batching, which the ordinary path reports.
+        if call.prefetch_types().is_empty()
+            && let Some((mesh, axes)) = unbound_batch_placement(inputs)?
+        {
+            return batch_in_shard_map(context.parent(), &definition, inputs, &mesh, axes);
+        }
         let (definition, axes) = definition
             .batched_inputs(inputs, ryft_kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
             .map_err(ProgramError::custom)?;
@@ -571,6 +584,158 @@ where
             .map(|(value, axis)| ArrayIrBatch::new(value, axis.map(|axis| axis as isize)))
             .collect::<Result<Vec<_>, _>>()
     }
+}
+
+/// Returns the mesh and the mesh axes that the mapped `inputs` of a kernel place their batch axes on when no enclosing
+/// manual region binds those axes, and [`None`] when the batch is not placed on mesh axes, when it is already the
+/// local batch of an enclosing manual region, or when the mapped inputs do not agree on the placement (which
+/// [`KernelDefinition::batched_inputs`] then reports).
+///
+/// A value varies along a manual axis only inside a manual region that binds the axis, so a batch dimension that is
+/// placed on axes along which its value varies is a local shard, and one placed on axes along which it does not vary
+/// is a global value. An enclosing manual region that does not track manual variation leaves no such evidence, so
+/// its local batches are not recognized here.
+fn unbound_batch_placement<V: CoreValue<Type = ArrayIrType>>(
+    inputs: &[ArrayIrBatch<V>],
+) -> Result<Option<(LogicalMesh, Vec<String>)>, BatchingError> {
+    let mut placement = None::<Option<(LogicalMesh, Vec<String>)>>;
+    for input in inputs {
+        let Some(axis) = input.batch_axis_position() else { continue };
+        let r#type = input.value().r#type();
+        let ArrayIrType::Array(r#type) = r#type.as_ref() else { return Ok(None) };
+        let current = match r#type.sharding().map(|sharding| (sharding, &sharding.dimensions()[axis])) {
+            Some((sharding, ShardingDimension::Sharded(axes))) => {
+                match axes.iter().filter(|axis| sharding.varying_manual_axes().contains(*axis)).count() {
+                    0 => Some((sharding.mesh().clone(), axes.clone())),
+                    bound if bound == axes.len() => None,
+                    _ => {
+                        return Err(BatchingError::UnsupportedOperation {
+                            message: format!(
+                                "kernel batch axis is placed on {}, of which an enclosing manual region binds only a \
+                                 part",
+                                sharding.dimensions()[axis],
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
+        match &placement {
+            None => placement = Some(current),
+            Some(previous) if previous != &current => return Ok(None),
+            Some(_) => {}
+        }
+    }
+    Ok(placement.flatten())
+}
+
+/// Batches `definition` over packed `inputs` whose batch axes are placed on the `axes` of `mesh`, by staging a
+/// `shard_map` over those axes whose body batches the kernel over the local batch of each device. A kernel runs on one
+/// device and its compiler cannot partition it, while its batch items are independent, so every device runs the grid
+/// of its own items. This follows the batching rule of JAX's `pallas_call`, which binds the batched call inside a
+/// `shard_map` over the mesh axes of the batch with the local batch size.
+///
+/// The parameter types of a kernel are physical, so the body applies the kernel that is batched over the local batch
+/// extent to the local shards as they are. Its results vary along the manual axes like its inputs, and the output
+/// shardings of the map place the batch axis of every result on those axes. The results are typed over `mesh`, which
+/// types the axes either as manual or, for a caller in JAX's explicit sharding mode, as explicit (refer to
+/// [`ShardMapBoundary::caller_mesh`]).
+fn batch_in_shard_map<C>(
+    context: &C,
+    definition: &KernelDefinition<KernelExtension>,
+    inputs: &[ArrayIrBatch<C::Value>],
+    mesh: &LogicalMesh,
+    axes: Vec<String>,
+) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
+where
+    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+{
+    let unsupported = |message: String| BatchingError::UnsupportedOperation { message };
+    let explicit_count = axes.iter().filter(|axis| mesh.axis_type(axis) == Some(MeshAxisType::Explicit)).count();
+    if explicit_count != 0 && explicit_count != axes.len() {
+        return Err(unsupported(format!(
+            "kernel batch axis is placed on {}, which mixes explicit and manual mesh axes",
+            ShardingDimension::Sharded(axes),
+        )));
+    }
+    let map_mesh = mesh.with_axis_types(&axes, MeshAxisType::Manual).map_err(ProgramError::custom)?;
+
+    // The placement of every input over the mesh of the map, and the batch axis of every parameter.
+    let mut input_types = Vec::with_capacity(inputs.len());
+    let mut input_shardings = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let r#type = input.value().r#type();
+        let ArrayIrType::Array(r#type) = r#type.as_ref() else {
+            return Err(unsupported("kernel batching accepts only ordinary array inputs".to_owned()));
+        };
+        input_shardings.push(match r#type.sharding() {
+            Some(sharding) => {
+                Sharding::new(map_mesh.clone(), sharding.dimensions().to_vec()).map_err(ProgramError::custom)?
+            }
+            None => Sharding::replicated(map_mesh.clone(), r#type.rank()),
+        });
+        input_types.push(r#type.clone());
+    }
+    let mut packed = inputs.iter();
+    let mut batch_axes = Vec::with_capacity(definition.operation().parameters().len());
+    let mut output_shardings = Vec::new();
+    let mut output_axes = Vec::new();
+    for parameter in definition.operation().parameters() {
+        let axis = if parameter.access() == KernelParameterAccess::WriteOnly {
+            Some(0)
+        } else {
+            let input = packed.next().ok_or_else(|| {
+                unsupported("kernel batching requires one input for every readable parameter".to_owned())
+            })?;
+            input.batch_axis_position()
+        };
+        batch_axes.push(axis);
+        if parameter.access() != KernelParameterAccess::ReadOnly {
+            // Every writable parameter is mapped, and only the batch axis of its result is placed on the mesh.
+            let axis =
+                axis.ok_or_else(|| unsupported("writable kernel parameters require a mapped batch axis".to_owned()))?;
+            let mut dimensions = vec![ShardingDimension::Replicated; parameter.r#type().rank() + 1];
+            *dimensions
+                .get_mut(axis)
+                .ok_or_else(|| unsupported("kernel batch axis is out of bounds for its parameter".to_owned()))? =
+                ShardingDimension::Sharded(axes.clone());
+            output_shardings.push(Sharding::new(map_mesh.clone(), dimensions).map_err(ProgramError::custom)?);
+            output_axes.push(Some(axis));
+        }
+    }
+
+    let boundary =
+        ShardMapBoundary::new(map_mesh, input_shardings, output_shardings, axes).map_err(ProgramError::custom)?;
+    let boundary = if explicit_count != 0 { boundary.with_explicit_caller_axes() } else { boundary };
+    let local_input_types = input_types
+        .iter()
+        .enumerate()
+        .map(|(index, r#type)| boundary.local_input_type(index, &boundary.global_input_type(index, r#type)?))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ProgramError::custom)?;
+    let local_batch_size = inputs
+        .iter()
+        .zip(&local_input_types)
+        .find_map(|(input, r#type)| Some(r#type.static_shape()?.dimensions()[input.batch_axis_position()?]))
+        .ok_or_else(|| unsupported("kernel batching requires a mapped input with a static shape".to_owned()))?;
+    let local = definition
+        .batched(local_batch_size, &batch_axes, ryft_kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
+        .map_err(ProgramError::custom)?;
+    let body = kernel_program(&local, local_input_types.into_iter().map(ArrayIrType::Array).collect())?;
+    let operation =
+        ShardMapOperation::from_program(&body, input_types.into_iter().map(ArrayIrType::Array).collect(), boundary)
+            .map_err(ProgramError::custom)?;
+    let values = context.bind(
+        Operation::ShardMap(Box::new(operation)),
+        vec![body],
+        &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+    )?;
+    values
+        .into_iter()
+        .zip(output_axes)
+        .map(|(value, axis)| ArrayIrBatch::new(value, axis.map(|axis| axis as isize)))
+        .collect::<Result<Vec<_>, _>>()
 }
 
 impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for KernelOperation {
@@ -723,7 +888,8 @@ where
 /// equivalence for every admitted input. Complete input and output types must agree. The fallback cannot contain
 /// references or effects, and the native call cannot have observable effects beyond its confined local reference
 /// state, which [`KernelDefinition::effects`] summarizes together with the assertions of its mappings and scalar
-/// prefetch conversions. Existing canonical JVP construction derives the fallback rule, so reverse mode uses the same
+/// prefetch conversions. State that the body declares explicitly (e.g., through an external call) is observable and
+/// is rejected, as it is at the compiled embedding boundary. Existing canonical JVP construction derives the fallback rule, so reverse mode uses the same
 /// primitive transpose machinery and rematerialization can recompute only the explicitly selected pure derivative
 /// computation.
 pub fn stage_kernel_with_fallback<C, Extension>(
@@ -743,11 +909,11 @@ where
             "pure kernel fallback must preserve the complete signature",
         )));
     }
-    if definition
-        .effects()
-        .classes()
-        .into_iter()
-        .any(|effect| effect != ryft_core::EffectClass::OrderedState)
+    // Only the private reference state of the body may be dropped with the primal. State that the body declares
+    // explicitly (e.g., an external call) is observable, like every other effect class.
+    let effects = definition.effects();
+    if effects.has_explicit_ordered_state()
+        || effects.classes().into_iter().any(|effect| effect != ryft_core::EffectClass::OrderedState)
     {
         return Err(ProgramError::UnsupportedOperation {
             message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
@@ -1192,14 +1358,17 @@ pub(crate) fn select_kernels(
                             .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
                         let definition = definition_from_body(operation, body)
                             .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
-                        validate_kernel_sharding(
-                            &operation
-                                .parameters()
-                                .iter()
-                                .map(|parameter| parameter.r#type().into_owned())
-                                .collect::<Vec<_>>(),
-                            bound_axes,
-                        )?;
+                        // The parameter types of a kernel are physical, so the placement to validate is that of the
+                        // values that the call receives.
+                        let input_types = instruction
+                            .inputs()
+                            .iter()
+                            .filter_map(|input| match region.atoms()[input.index()].r#type().as_ref() {
+                                ArrayIrType::Array(r#type) => Some(r#type.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        validate_kernel_sharding(&input_types, bound_axes)?;
                         let compiled = binding.compile(&definition, &facts)?;
                         selected = true;
                         return Ok(Instruction::new(
@@ -1312,13 +1481,17 @@ fn stage_body<Extension: PortableKernelExtension + Into<KernelExtension>>(
 fn kernel_primal<Extension: PortableKernelExtension + Into<KernelExtension>>(
     definition: &KernelDefinition<Extension>,
 ) -> Result<FlatProgram, ProgramError> {
+    kernel_program(definition, definition.operation().input_types())
+}
+
+/// Builds a program that applies `definition` to inputs of `input_types`, which are its declared input types up to
+/// their shardings (e.g., the local shards of a manual region).
+fn kernel_program<Extension: PortableKernelExtension + Into<KernelExtension>>(
+    definition: &KernelDefinition<Extension>,
+    input_types: Vec<ArrayIrType>,
+) -> Result<FlatProgram, ProgramError> {
     let mut builder = ryft_core::ProgramBuilder::new();
-    let inputs = definition
-        .operation()
-        .input_types()
-        .into_iter()
-        .map(|r#type| builder.add_input(r#type))
-        .collect::<Vec<_>>();
+    let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
     let body = stage_body(definition)?;
     let body_region = builder.import_region(body.entry_region_ref());
     let outputs = builder
@@ -1419,7 +1592,7 @@ pub(crate) mod tests {
         ConditionOperation, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, EffectClass, LiftedCustomRules, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, NothingSavable, PartialEvaluation, PartitionedProgram,
+        MeshAxis, MeshAxisType, NamedAxis, NothingSavable, PartialEvaluation, PartitionedProgram,
         ProgramBuilder as CoreProgramBuilder, RecursiveBatchingDriver, ReferenceRead, ReferenceReadOperation,
         ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionDriver, RegionRef, RematerializeOperation,
         ReshapeOperation, ResidualPolicyReference, ReverseModeDifferentiate, ScanOperation, ShardMapBoundary,
@@ -2001,6 +2174,418 @@ pub(crate) mod tests {
         assert_eq!(definition_from_body(call, body).unwrap().operation().input_types(), program.input_types().as_ref());
     }
 
+    /// Batches `definition`, whose only input is an `f32[3]` item, along axis 1 of a packed `f32[3, 4]` input with
+    /// `sharding` in a fresh trace whose enclosing manual regions bind `bound_axes`. Returns the staged program
+    /// together with the batch axis of every result, or the batching error.
+    fn batch_sharded(
+        definition: &KernelDefinition,
+        sharding: Sharding,
+        bound_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
+        let callees = [Arc::new(stage_body(definition).unwrap())];
+        let regions = AttachedRegions::Callees(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let packed = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(sharding).unwrap();
+        let mut result = None;
+        let (_, program) = TracingContext::<Constant, Operation>::trace_with_named_axes(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                let parent = inputs[0].context();
+                let extent = parent.constant(Constant::Dimension(DimensionValue::constant(4).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                let outputs = KernelOperation::new(PortableKernelOperation::<NoKernelExtension>::Call(
+                    definition.operation().clone(),
+                ))
+                .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(1))?]);
+                Ok::<_, ProgramError>(match outputs {
+                    Ok(outputs) => {
+                        result = Some(Ok(outputs.iter().map(ArrayIrBatch::batch_axis_position).collect::<Vec<_>>()));
+                        outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>()
+                    }
+                    Err(error) => {
+                        result = Some(Err(error));
+                        Vec::new()
+                    }
+                })
+            },
+            vec![ArrayIrType::Array(packed)],
+            bound_axes,
+        )
+        .unwrap();
+        result.unwrap().map(|axes| (program.into_flat_program(), axes))
+    }
+
+    /// Returns a kernel over `f32[3]` items that copies its input into its output, through one read-write parameter
+    /// when `in_place` is set and from a read-only parameter into a write-only parameter otherwise.
+    fn item_copy_definition(in_place: bool) -> KernelDefinition {
+        let item = ArrayType::new_static(DataType::F32, [3]);
+        let parameters = if in_place {
+            vec![whole_array_parameter(item, KernelParameterAccess::ReadWrite).unwrap()]
+        } else {
+            vec![
+                whole_array_parameter(item.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(item, KernelParameterAccess::WriteOnly).unwrap(),
+            ]
+        };
+        let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), parameters).unwrap();
+        KernelDefinition::trace(call, |(references, _)| references[references.len() - 1].write(&references[0].read()?))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_kernel_operation_batch_sharded_batch_axes() {
+        // The batch axis is placed on the mesh axis `x`, which no enclosing manual region binds. The rule stages a
+        // `shard_map` over `x` whose body batches the kernel over the local batch of each device, because a kernel
+        // runs on one device and cannot be partitioned.
+        let stage = |axis_type: MeshAxisType, in_place: bool| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let sharding =
+                Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap();
+            let (program, axes) = batch_sharded(&item_copy_definition(in_place), sharding, Vec::new()).unwrap();
+            assert_eq!(axes, vec![Some(if in_place { 1 } else { 0 })]);
+            program
+        };
+        // A caller that types `x` as explicit receives results typed over its own mesh. The body applies the physical
+        // kernel to the local shard, and the write-only result gains the batch as its leading dimension, which the
+        // output sharding of the map places like the batch axis of the input.
+        assert_eq!(
+            stage(MeshAxisType::Explicit, false).to_string(),
+            indoc! {"
+                lambda %0:f32[3, 4][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] .
+                let %1:dimension<4> = const 4
+                    %2:f32[4, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = shard_map [
+                        mesh=['x'=2:manual],
+                        caller_mesh=['x'=2:explicit],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                        manual_axes=['x'],
+                        global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                        global_output_types=[f32[4, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}]],
+                    ] %0 [
+                        body={
+                            lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                            let %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = kernel_call [
+                                grid=[2:parallel],
+                                identities=[0, 0, 0],
+                                identity_0_bounds=[0, 2),
+                                parameter_0=read-only f32[3, 2] [3, 1] InBounds,
+                                mapping_0={
+                                    lambda %0:dimension<batch ∈ [0, 2)> .
+                                    let %1:dimension<0> = const 0
+                                    in (%1, %0)
+                                },
+                                parameter_1=write-only f32[2, 3] [1, 3] InBounds,
+                                mapping_1={
+                                    lambda %0:dimension<batch ∈ [0, 2)> .
+                                    let %1:dimension<0> = const 0
+                                    in (%0, %1)
+                                },
+                            ] %0 [
+                                body={
+                                    lambda %0:ref<f32[3, 1]>, %1:ref<f32[1, 3]>, %2:dimension<batch ∈ [0, 2)> .
+                                    let %3:f32[3] = reference_read [transforms=[index(axis=1, index=0)]] %0
+                                        () = reference_write [transforms=[index(axis=0, index=0)]] %1 %3
+                                    in ()
+                                },
+                            ]
+                            in (%1)
+                        },
+                    ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // A read-write parameter keeps the batch axis of its input.
+        let manual = stage(MeshAxisType::Manual, true);
+        assert_eq!(
+            manual.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}] .
+                let %1:dimension<4> = const 4
+                    %2:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}] = shard_map [
+                        mesh=['x'=2:manual],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        manual_axes=['x'],
+                        global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                        global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                    ] %0 [
+                        body={
+                            lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                            let %1:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = kernel_call [
+                                grid=[2:parallel],
+                                identities=[0, 0],
+                                identity_0_bounds=[0, 2),
+                                parameter_0=read-write f32[3, 2] [3, 1] InBounds,
+                                mapping_0={
+                                    lambda %0:dimension<batch ∈ [0, 2)> .
+                                    let %1:dimension<0> = const 0
+                                    in (%1, %0)
+                                },
+                            ] %0 [
+                                body={
+                                    lambda %0:ref<f32[3, 1]>, %1:dimension<batch ∈ [0, 2)> .
+                                    let %2:f32[3] = reference_read [transforms=[index(axis=1, index=0)]] %0
+                                        () = reference_write [transforms=[index(axis=1, index=0)]] %0 %2
+                                    in ()
+                                },
+                            ]
+                            in (%1)
+                        },
+                    ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // The local shards vary only along the axis that the map binds, so the compiler binding selects the kernel
+        // inside the map, and the custom call types its result like the kernel call did.
+        let binding = binding(1);
+        assert_eq!(
+            select_kernels(&manual, Some(&binding), facts).unwrap().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}] .
+                let %1:dimension<4> = const 4
+                    %2:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}] = shard_map [
+                        mesh=['x'=2:manual],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        manual_axes=['x'],
+                        global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                        global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                    ] %0 [
+                        body={
+                            lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                            let %1:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = custom_call [
+                                target=ryft.test.aot,
+                                ryft.kernel.schema=1,
+                                ryft.kernel.semantic=\"93588cd1e2b84de11eb6ee99e1bebae728ebb6f7248d90960d547303721a0aa2\",
+                                ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
+                                input_output_alias=0->0,
+                            ] %0
+                            in (%1)
+                        },
+                    ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            select_kernels(&stage(MeshAxisType::Explicit, true), Some(&binding), facts).unwrap().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[3, 4][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] .
+                let %1:dimension<4> = const 4
+                    %2:f32[3, 4][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] = shard_map [
+                        mesh=['x'=2:manual],
+                        caller_mesh=['x'=2:explicit],
+                        input_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        output_shardings=[{mesh<['x'=2:manual]>, [{}, {'x'}]}],
+                        manual_axes=['x'],
+                        global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {'x'}]}]],
+                        global_output_types=[f32[3, 4][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}]],
+                    ] %0 [
+                        body={
+                            lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                            let %1:f32[3, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = custom_call [
+                                target=ryft.test.aot,
+                                ryft.kernel.schema=1,
+                                ryft.kernel.semantic=\"93588cd1e2b84de11eb6ee99e1bebae728ebb6f7248d90960d547303721a0aa2\",
+                                ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
+                                input_output_alias=0->0,
+                            ] %0
+                            in (%1)
+                        },
+                    ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_kernel_operation_batch_bound_and_mixed_batch_axes() {
+        // Batches an in-place kernel in a trace whose enclosing manual regions bind the mesh axes named `bound`, and
+        // returns the staged operation or the batching error.
+        let mesh = |x: MeshAxisType| {
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, x).unwrap(),
+                MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            ])
+            .unwrap()
+        };
+        let batch = |sharding: Sharding, bound: &[&str], checks_manual_variation: bool| {
+            let bound_axes = bound
+                .iter()
+                .map(|name| {
+                    let mesh = sharding.mesh().clone();
+                    let axis = mesh.axis_index(name).unwrap();
+                    (name.to_string(), NamedAxis::Mesh { mesh, axis, size: 2, checks_manual_variation })
+                })
+                .collect();
+            batch_sharded(&item_copy_definition(true), sharding, bound_axes)
+                .map(|(program, _)| program.instructions()[0].operation().clone())
+        };
+        let sharded = |mesh: LogicalMesh, axes: &[&str]| {
+            Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(axes.iter().copied())])
+                .unwrap()
+        };
+
+        // A batch that is placed on mesh axes that an enclosing manual region binds is the local batch of that region,
+        // so the kernel is batched in place, whether or not the region tracks manual variation.
+        let local = sharded(mesh(MeshAxisType::Manual), &["x"]);
+        assert!(matches!(
+            batch(local.clone().with_varying_manual_axes(["x"]).unwrap(), &["x"], true),
+            Ok(Operation::Kernel(_)),
+        ));
+        assert!(matches!(batch(local, &["x"], false), Ok(Operation::Kernel(_))));
+
+        // A global batch is wrapped in a `shard_map` over the axes that it is placed on, including when an enclosing
+        // manual region binds another axis.
+        assert!(matches!(batch(sharded(mesh(MeshAxisType::Manual), &["x", "y"]), &[], true), Ok(Operation::ShardMap(_))));
+        assert!(matches!(batch(sharded(mesh(MeshAxisType::Manual), &["x"]), &["y"], true), Ok(Operation::ShardMap(_))));
+
+        // A placement of which an enclosing manual region binds only a part, or that mixes explicit and manual axes,
+        // is neither.
+        assert!(matches!(
+            batch(sharded(mesh(MeshAxisType::Manual), &["x", "y"]), &["x"], true),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "kernel batch axis is placed on {'x', 'y'}, of which an enclosing manual region binds \
+                               only a part",
+        ));
+        assert!(matches!(
+            batch(sharded(mesh(MeshAxisType::Explicit), &["x", "y"]), &[], true),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "kernel batch axis is placed on {'x', 'y'}, which mixes explicit and manual mesh axes",
+        ));
+    }
+
+    #[test]
+    fn test_kernel_operation_batch_sharded_constant_store() {
+        // The body stores a constant, which is the same on every device, into the window of each batch item. Kernel
+        // types are physical, so the constant carries no mesh and fits the local kernel of every device.
+        let item = ArrayType::new_static(DataType::F32, [3]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(item.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(item.clone(), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut body = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
+        body.add_input(call.parameters()[0].body_type());
+        let output = body.add_input(call.parameters()[1].body_type());
+        let value = CoreArray::from_elements(item, &[1.0f32, 2.0, 3.0]).unwrap();
+        let value = body.add_constant(ArrayIrValue::Array(value));
+        body.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], None).unwrap();
+        let definition =
+            KernelDefinition::new(call, body.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
+                    .unwrap();
+            let (program, axes) = batch_sharded(&definition, sharding, Vec::new()).unwrap();
+            assert_eq!(axes, vec![Some(0)]);
+            assert!(matches!(program.instructions()[0].operation(), Operation::ShardMap(_)));
+            let output_sharding =
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]).unwrap();
+            assert_eq!(
+                program.output_types().as_ref(),
+                &[ArrayIrType::Array(
+                    ArrayType::new_static(DataType::F32, [4, 3]).with_sharding(output_sharding).unwrap()
+                )],
+            );
+        }
+    }
+
+    #[cfg(feature = "triton")]
+    #[test]
+    fn test_kernel_operation_batch_sharded_batch_axes_triton_admission() {
+        // The kernel that the staged `shard_map` applies on each device has physical parameter types, so the Triton
+        // lowering admits it. Only admission runs here, and nothing is compiled.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap();
+        let (program, _) = batch_sharded(&item_copy_definition(false), sharding, Vec::new()).unwrap();
+        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
+        let Operation::Kernel(KernelOperation(PortableKernelOperation::Call(call))) =
+            body.instructions()[0].operation()
+        else {
+            panic!("expected a kernel call in the body of the staged `shard_map`");
+        };
+        let local =
+            definition_from_body(call, program.region_ref(body.instructions()[0].regions()[0]).unwrap()).unwrap();
+        let local = KernelDefinition::new(
+            local.operation().clone(),
+            local
+                .body()
+                .map_operations(|operation| operation.clone().map_extension(NoKernelExtension::try_from))
+                .unwrap(),
+        )
+        .unwrap();
+        let verified = VerifiedKernel::new(&local, 16).unwrap();
+        let admission = ryft_triton::kernels::Compiler::new().admit(
+            &verified,
+            &ryft_triton::kernels::Target::Cuda { major: 12, minor: 1 },
+            &ryft_triton::kernels::Options::default(),
+            &KernelSchedule::default(),
+        );
+
+        // Admission lowers the kernel before it asks the linked native archive for the target, so an archive without
+        // the CUDA target reports that it is unavailable only after the lowering admitted the kernel.
+        match admission {
+            Ok(()) => {}
+            Err(ryft_kernels::KernelCompilationError::Unavailable { message }) => {
+                assert_eq!(message, "linked native archive does not include the requested Triton compiler target");
+            }
+            Err(error) => panic!("Triton admission rejected the local kernel: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_kernel_operation_batch_sharded_prefetch() {
+        // The kernel has no parameters and one scalar prefetched input, whose packed values are placed on `x`. A
+        // prefetched input is not a parameter, so no kernel can be batched per device, and batching reports that the
+        // input must be specialized first.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let definition: KernelDefinition = KernelDefinition::trace_with_prefetch(
+            KernelCallOperation::new_with_prefetch(Grid::new(vec![]).unwrap(), vec![], vec![scalar]).unwrap(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let callees = [Arc::new(stage_body(&definition).unwrap())];
+        let regions = AttachedRegions::Callees(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let packed = ArrayType::new_static(DataType::I32, [4])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let mut error = None;
+        TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                let parent = inputs[0].context();
+                let extent = parent.constant(Constant::Dimension(DimensionValue::constant(4).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                error = KernelOperation::new(PortableKernelOperation::<NoKernelExtension>::Call(
+                    definition.operation().clone(),
+                ))
+                .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])
+                .err();
+                Ok::<_, ProgramError>(Vec::<CoreTracer<TracingContext<Constant, Operation>>>::new())
+            },
+            vec![ArrayIrType::Array(packed)],
+        )
+        .unwrap();
+        assert_eq!(
+            error.map(|error| error.to_string()),
+            Some(
+                "kernel transform is unsupported: scalar-prefetched inputs must be specialized before batching"
+                    .to_owned()
+            ),
+        );
+    }
+
     #[test]
     fn test_stage_kernel() {
         let program = program();
@@ -2454,6 +3039,56 @@ pub(crate) mod tests {
             ProgramError::UnsupportedOperation {
                 message: "pure kernel fallback cannot contain references or observable effects".to_owned(),
             },
+        );
+    }
+
+    #[test]
+    fn test_stage_kernel_with_fallback_rejects_external_state() {
+        // The body calls an external function that declares state. A pure fallback would replace the primal under
+        // differentiation, and that call with it, although only the private reference state of a body may be dropped.
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let mut body = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
+        let inputs = definition
+            .body()
+            .input_types()
+            .into_owned()
+            .into_iter()
+            .map(|r#type| body.add_input(r#type))
+            .collect::<Vec<_>>();
+        body.splice_program(definition.body(), &inputs).unwrap();
+        body.add_instruction(
+            ArrayOperation::<CoreArray>::CustomCall(
+                CustomCallOperation::new("test.external", vec![]).with_effect_class(EffectClass::OrderedState),
+            ),
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        let definition = KernelDefinition::new(
+            definition.operation().clone(),
+            body.build(vec![], vec![Placeholder], vec![]).unwrap(),
+        )
+        .unwrap();
+        assert!(definition.effects().has_explicit_ordered_state());
+        let mut fallback = ProgramBuilder::new();
+        let input = fallback.add_input(scalar.clone());
+        let fallback = fallback
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let error = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
+            },
+            vec![scalar],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
+            }
         );
     }
 
@@ -2918,10 +3553,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_select_kernels_in_shard_map() {
-        // Builds a `shard_map` whose body is a kernel with a sharded local parameter and returns that body and the
-        // program, so that independently built equal programs can be compared. With `Some(request)`, the kernel
-        // reshapes its parameter, requesting the sharding of the parameter as its output sharding when `request` is
-        // `true`.
+        // Builds a `shard_map` whose body applies a kernel to its local shard and returns that body and the program,
+        // so that independently built equal programs can be compared. With `Some(request)`, the kernel also reshapes
+        // the value of its parameter, requesting a replicated output sharding when `request` is `true`.
         let build = |reshape: Option<bool>| {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
             let sharding =
@@ -2930,27 +3564,28 @@ pub(crate) mod tests {
             let local = ArrayType::new_static(DataType::I32, [2])
                 .with_sharding(sharding.clone().with_varying_manual_axes(["device"]).unwrap())
                 .unwrap();
+            let physical = ArrayType::new_static(DataType::I32, [2]);
             let definition: KernelDefinition = KernelDefinition::trace(
                 KernelCallOperation::new(
                     Grid::new(vec![]).unwrap(),
-                    vec![whole_array_parameter(local.clone(), KernelParameterAccess::ReadWrite).unwrap()],
+                    vec![whole_array_parameter(physical.clone(), KernelParameterAccess::ReadWrite).unwrap()],
                 )
                 .unwrap(),
                 |(references, _)| {
                     if let Some(request) = reshape {
-                        let shape = local.shape().clone();
+                        let shape = physical.shape().clone();
                         let operation = ReshapeOperation::new(shape.clone(), shape)
-                            .with_output_sharding(local.sharding().filter(|_| request).cloned());
+                            .with_output_sharding(request.then(|| Sharding::replicated(mesh.clone(), 1)));
                         let value = references[0].read()?;
                         let operation = ArrayIrOperation::Array(ArrayOperation::Reshape(operation));
-                        let value = references[0].context().bind(operation, vec![], &[value])?;
-                        references[0].write(&value[0])?;
+                        references[0].context().bind(operation, vec![], std::slice::from_ref(&value))?;
+                        references[0].write(&value)?;
                     }
                     Ok(())
                 },
             )
             .unwrap();
-            let body = kernel_primal(&definition).unwrap();
+            let body = kernel_program(&definition, vec![local.into()]).unwrap();
             let operation = ShardMapOperation::from_program(
                 &body,
                 vec![global.clone().into()],
@@ -2986,10 +3621,10 @@ pub(crate) mod tests {
                 ] %0 [
                     body={
                         lambda %0:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] .
-                        let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{'device'}], varying_manual={'device'}}] = custom_call [
+                        let %1:i32[2][sharding={mesh<['device'=2:manual]>, [{}], varying_manual={'device'}}] = custom_call [
                             target=ryft.test.aot,
                             ryft.kernel.schema=1,
-                            ryft.kernel.semantic=\"30221f5fb25c2d4433e0f04ee6be39d671cfd07d6b32948f5398b957475dee25\",
+                            ryft.kernel.semantic=\"f7cc50a3ef48ecb6d57641d539824244179a0ebd191571eaeb72fbbecf87a870\",
                             ryft.kernel.configuration=\"515ef62b84d55eb9cf36a09e7cd9bbbc71b81d00380ee8324af729c3e7766e27\",
                             input_output_alias=0->0,
                         ] %0
@@ -3002,7 +3637,7 @@ pub(crate) mod tests {
         );
         assert!(matches!(select_kernels(&body, Some(&binding), facts),
             Err(KernelEmbeddingError::Invalid { message }) if message ==
-                "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`"));
+                "kernel input 0 requires a local shard with all partitioned axes bound by `shard_map`"));
 
         // An independently built equal program selects the same keyed custom call, so it reuses the same entry.
         let (_, again) = build(None);

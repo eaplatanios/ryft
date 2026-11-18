@@ -25,7 +25,8 @@ use crate::{Array, CompilationAnalysis, CompiledProgram, Error, Options, Session
 
 // TODO(eaplatanios): Promote kernel AOT errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
-/// A bundle is malformed, incompatible, or cannot be produced by the selected backend.
+/// Represents errors produced while creating, serializing, or loading a [`KernelAotBundle`] or invoking a
+/// [`LoadedKernel`].
 ///
 /// Converting to [`Error`] unwraps [`Self::Xla`] and wraps every other variant in [`Error::Custom`]. Converting an
 /// [`Error`] into this type uses [`Self::Xla`], so round trips preserve canonical errors and shared custom payloads.

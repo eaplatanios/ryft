@@ -1112,7 +1112,7 @@ impl CoreConstant<Value, Constant> for Session {
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
 pub type Tracer = DomainTracer<Session>;
 
-/// Invalid configuration of a [`SessionBuilder`].
+/// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionError {
     /// The Cargo feature of `ryft-xla` that provides the plugin of the requested platform is not enabled.

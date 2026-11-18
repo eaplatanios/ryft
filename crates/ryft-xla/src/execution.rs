@@ -41,7 +41,8 @@ use crate::{
 
 // TODO(eaplatanios): Review this module.
 
-/// XLA invocation, runtime capability, completion, and effect recovery failures.
+/// Represents errors produced while invoking a [`CompiledProgram`], waiting for submitted work to finish, or
+/// recovering an effect scope.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ExecutionError {
     /// The executable belongs to a different live PJRT client.

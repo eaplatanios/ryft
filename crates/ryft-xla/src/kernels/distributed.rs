@@ -50,7 +50,8 @@ use crate::{Array, DistributedRuntime, Error, FromPjrt};
 
 // TODO(eaplatanios): Promote distributed kernel errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
-/// Failure in kernel execution coordinated by the host. Submitted device work is drained before returning an error.
+/// Represents errors produced while configuring or executing a [`DistributedKernel`]. The host drains submitted
+/// device work before returning an execution error.
 ///
 /// Converting to [`Error`] unwraps [`Self::Xla`] and wraps every other variant in [`Error::Custom`]. Converting an
 /// [`Error`] into this type uses [`Self::Xla`], so round trips preserve canonical errors and shared custom payloads.

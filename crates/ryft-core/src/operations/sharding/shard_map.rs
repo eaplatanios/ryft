@@ -799,6 +799,19 @@ impl ShardMapBoundary {
         self
     }
 
+    /// Returns this boundary with its global outputs typed over [`Self::mesh`] with the active manual axes typed as
+    /// [`Explicit`](MeshAxisType::Explicit) (i.e., setting [`Self::caller_mesh`] to that mesh), which is the mesh of a
+    /// caller in JAX's explicit sharding mode. The [`ShardMap`] capability selects this mesh itself from the types of
+    /// the caller's inputs. A transform rule outside of that capability that stages a `shard_map` around the values of
+    /// such a caller uses this function, so that the outputs of the map are typed like those values. A boundary
+    /// without active manual axes is returned unchanged.
+    #[inline]
+    pub fn with_explicit_caller_axes(self) -> Self {
+        // The active manual axes are axes of the mesh by construction.
+        let caller_mesh = self.mesh.with_axis_types(&self.manual_axes, MeshAxisType::Explicit).unwrap();
+        self.with_caller_mesh(Some(caller_mesh))
+    }
+
     /// Selects whether array outputs must be statically proven invariant along active manual axes that their output
     /// shardings do not tile. The default is `true`. With `false`, the caller promises that those devices produce
     /// identical logical output bytes for every valid input. The reference backend verifies the promise at runtime,
@@ -9107,6 +9120,16 @@ mod tests {
         let caller_mesh = mesh.clone().with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
         assert_eq!(boundary.clone().with_caller_mesh(Some(caller_mesh.clone())).caller_mesh(), &caller_mesh);
         assert_eq!(boundary.clone().with_caller_mesh(Some(mesh)), boundary);
+    }
+
+    #[test]
+    fn test_shard_map_boundary_with_explicit_caller_axes() {
+        // Only the active manual axes are typed as explicit, so the free manual axis `y` keeps its type.
+        let mesh = manual_mesh_2x2();
+        let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
+        let caller_mesh = mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
+        assert_eq!(boundary.clone().with_explicit_caller_axes().caller_mesh(), &caller_mesh);
+        assert_eq!(boundary.clone().with_explicit_caller_axes(), boundary.with_caller_mesh(Some(caller_mesh)));
     }
 
     #[test]

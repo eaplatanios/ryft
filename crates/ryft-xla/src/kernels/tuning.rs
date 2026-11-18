@@ -23,7 +23,10 @@ use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
 // TODO(eaplatanios): Promote kernel tuning errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
-/// Invalid tuning input, incomplete execution, or incompatible persisted measurements.
+/// Represents errors produced while preparing a [`KernelTuningRequest`], measuring schedules with a [`KernelTuner`],
+/// or persisting and loading measurements.
+///
+/// Converting to [`crate::Error`] preserves the concrete error in [`crate::Error::Custom`].
 #[derive(Debug, Error)]
 pub enum KernelTuningError {
     /// Input or persisted metadata violates the bounded measurement contract.
