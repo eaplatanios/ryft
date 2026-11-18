@@ -33,7 +33,7 @@ use ryft_pjrt::{
 use crate::arrays::ArrayOutputLayout;
 use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
 use crate::lowering::signature::ExecutableSignature;
-use crate::sessions::effects::{ensure_effect_dispatch_is_allowed, format_effect_failures};
+use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, FromPjrt, RuntimeRequirement, Session,
     ToPjrt, Value,
@@ -100,7 +100,11 @@ pub enum ExecutionError {
     #[error(
         "{}; call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` to recover \
          once affected work is complete",
-        format_effect_failures(.failures),
+        .failures
+            .iter()
+            .map(|(identity, error)| format!("submission {identity}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; "),
     )]
     EffectSubmissionFailures { failures: Vec<(u64, Arc<str>)> },
 
@@ -1085,8 +1089,7 @@ impl Session {
             }
         }
         let devices = ordered.then_some(arguments.addressable_device_ids());
-        let mut reservation =
-            if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
+        let reservation = if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
         if let Some(reservation) = &reservation
             && ordered
         {
@@ -1153,7 +1156,7 @@ impl Session {
             .iter()
             .find(|outputs| outputs.outputs.len() != output_count)
             .map(|outputs| outputs.outputs.len());
-        if let Some(reservation) = &mut reservation {
+        if let Some(reservation) = reservation {
             let tokens = if let Some(actual) = invalid_count {
                 Err(Arc::from(format!("expected {output_count} output(s) per device, but got {actual}")))
             } else if ordered {

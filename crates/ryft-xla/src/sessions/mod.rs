@@ -1551,6 +1551,7 @@ pub(crate) mod tests {
 
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
+    use crate::sessions::effects::EffectCallbackGuard;
     use crate::sessions::runtimes::builtin_requirement;
     use crate::tests::{
         assert_send_sync, cpu_client, execution_client, hash_of, other_cpu_client, replicated_array, values_from_bytes,
@@ -2254,6 +2255,17 @@ pub(crate) mod tests {
             )
             .into()),
         );
+    }
+
+    #[test]
+    fn test_session_bind_rejects_managed_callbacks() {
+        let session = session_with_client(execution_client());
+        let _guard = EffectCallbackGuard::enter();
+        assert!(matches!(
+            session.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "execution and effect barriers cannot be entered from a managed callback",
+        ));
     }
 
     #[test]

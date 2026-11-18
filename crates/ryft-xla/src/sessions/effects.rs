@@ -218,13 +218,13 @@ impl EffectReservation {
         self.predecessor.as_ref().map_or(Ok(None), |previous| previous.wait_for_tokens())
     }
 
-    /// Publishes this submission's ordered I/O token buffers or its execution boundary failure to its successors.
-    /// Pass `Ok(None)` for a successful submission without ordered tokens. The fence callback records the boundary
-    /// failure if one was published, or the fence's result otherwise. It owns the completion state independently
-    /// of the reservation and can run inline if the fence is already ready. Cancellation on drop is disarmed only
-    /// after callback registration returns.
+    /// Consumes the reservation and publishes its ordered I/O token buffers or execution boundary failure to its
+    /// successors. Pass `Ok(None)` for a successful submission without ordered tokens. The fence callback records
+    /// the boundary failure if one was published, or the fence's result otherwise. It owns the completion state
+    /// independently of the reservation and can run inline if the fence is already ready. Cancellation on drop is
+    /// disarmed only after callback registration returns.
     pub(crate) fn publish(
-        &mut self,
+        mut self,
         tokens: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
         fence: &ExecutionFence,
     ) {
@@ -294,24 +294,12 @@ pub(crate) fn ensure_effect_dispatch_is_allowed() -> Result<(), Error> {
     if EFFECT_CALLBACK_DEPTH.get() != 0 { Err(ExecutionError::ReentrantDispatch.into()) } else { Ok(()) }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Renders the failures observed by an effect barrier in their original submission order.
-pub(crate) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
-    failures
-        .iter()
-        .map(|(identity, error)| format!("submission {identity}: {error}"))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 /// Records the outcome of one execution with effects. The result is pending until device work finishes or the
-/// reservation is cancelled. A cancelled reservation records success so a barrier can stop waiting for it.
-///
-/// A PJRT completion callback can own this state independently of the session because it holds no client resources.
+/// reservation is canceled. A canceled reservation records success so a barrier can stop waiting for it. A PJRT
+/// completion callback can own this state independently of the session because it holds no client resources.
 #[derive(Default)]
 struct EffectCompletion {
-    /// Result recorded once when the execution completes or the reservation is cancelled.
+    /// Result recorded once when the execution completes or the reservation is canceled.
     result: Mutex<Option<Result<(), Arc<str>>>>,
 
     /// Wakes barrier callers when the terminal outcome becomes available.
@@ -331,7 +319,7 @@ impl EffectCompletion {
         self.result.lock().expect("effect completion mutex poisoned").clone()
     }
 
-    /// Blocks the current thread until the execution finishes or the reservation is cancelled, then returns the
+    /// Blocks the current thread until the execution finishes or the reservation is canceled, then returns the
     /// recorded result. The wait can begin before device work is submitted.
     fn wait(&self) -> Result<(), Arc<str>> {
         let mut result = self.result.lock().expect("effect completion mutex poisoned");
@@ -341,6 +329,8 @@ impl EffectCompletion {
         result.as_ref().unwrap().clone()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Host publication state for a submission's per-device ordered I/O token buffers.
 #[derive(Clone, Default)]
@@ -449,7 +439,7 @@ mod tests {
 
     use super::{
         EFFECT_CALLBACK_DEPTH, EffectCallbackGuard, EffectScope, EffectSubmission, EffectTokenPublication,
-        ensure_effect_dispatch_is_allowed, format_effect_failures,
+        ensure_effect_dispatch_is_allowed,
     };
 
     const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -509,7 +499,7 @@ mod tests {
                     client.addressable_devices().unwrap()[0].default_memory().unwrap(),
                 )
                 .unwrap();
-            let mut predecessor = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
+            let predecessor = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
             predecessor.publish(
                 Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])),
                 &ExecutionFence::new(Vec::new()),
@@ -570,7 +560,8 @@ mod tests {
         assert!(!program.signature().has_ordered_io());
 
         // Leave a completed entry at the ordered tail so any unordered reservation that joins the chain is visible.
-        let mut ordered = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
+        let ordered = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
+        let ordered_identity = ordered.submission.identity;
         ordered.publish(Ok(None), &ExecutionFence::new(Vec::new()));
         let ((), lines) = with_captured_prints(|| {
             let execution = session.execute_compiled_async(&program, vec![input]).unwrap();
@@ -578,7 +569,7 @@ mod tests {
             let state = session.effect_scope.state.lock().unwrap();
             assert_eq!(state.submissions.len(), 1);
             assert!(!state.submissions[0].ordered);
-            assert!(Arc::ptr_eq(state.tail.as_ref().unwrap(), &ordered.submission));
+            assert_eq!(state.tail.as_ref().unwrap().identity, ordered_identity);
             // Release the scope mutex before the barrier takes its snapshot.
             drop(state);
             session.effects_barrier().unwrap();
@@ -624,7 +615,7 @@ mod tests {
     #[test]
     fn test_effect_scope_reserve_retires_successful_submissions() {
         let scope = EffectScope::default();
-        let mut completed = scope.reserve(None).unwrap();
+        let completed = scope.reserve(None).unwrap();
         completed.publish(Ok(None), &ExecutionFence::new(Vec::new()));
         let pending = scope.reserve(None).unwrap();
 
@@ -636,9 +627,9 @@ mod tests {
     #[test]
     fn test_effect_scope_barrier() {
         let scope = EffectScope::default();
-        let mut first = scope.reserve(None).unwrap();
-        let mut successful = scope.reserve(None).unwrap();
-        let mut last = scope.reserve(None).unwrap();
+        let first = scope.reserve(None).unwrap();
+        let successful = scope.reserve(None).unwrap();
+        let last = scope.reserve(None).unwrap();
 
         // Publish failures in reverse order to distinguish reservation order from completion order.
         let ready = ExecutionFence::new(Vec::new());
@@ -672,16 +663,17 @@ mod tests {
     #[test]
     fn test_effect_scope_barrier_waits_for_fixed_snapshot() {
         let scope = EffectScope::default();
-        let mut first = scope.reserve(None).unwrap();
+        let first = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
+        let first_submission = Arc::clone(&first.submission);
         first.publish(Ok(None), &fence);
-        let initial_references = Arc::strong_count(&first.submission);
+        let initial_references = Arc::strong_count(&first_submission);
         thread::scope(|threads| {
             let (sender, receiver) = channel();
             let scope = &scope;
             threads.spawn(move || sender.send(scope.barrier()).unwrap());
 
-            let snapshot_captured = wait_for_barrier_snapshot(scope, &first.submission, initial_references);
+            let snapshot_captured = wait_for_barrier_snapshot(scope, &first_submission, initial_references);
             let later = snapshot_captured.then(|| scope.reserve(None).unwrap());
             promise.set(None).unwrap();
             let result = receiver.recv_timeout(CALLBACK_TIMEOUT);
@@ -694,8 +686,9 @@ mod tests {
     #[test]
     fn test_effect_scope_acknowledge() {
         let scope = EffectScope::default();
-        let mut failed = scope.reserve(Some(&[0])).unwrap();
-        let mut tail = scope.reserve(Some(&[0])).unwrap();
+        let failed = scope.reserve(Some(&[0])).unwrap();
+        let tail = scope.reserve(Some(&[0])).unwrap();
+        let failed_completion = Arc::clone(&failed.submission.completion);
         let tail_submission = Arc::downgrade(&tail.submission);
         let ready = ExecutionFence::new(Vec::new());
         tail.publish(Ok(None), &ready);
@@ -709,7 +702,6 @@ mod tests {
                 if failures == vec![(0, Arc::from("ordered effect failed"))],
         ));
         // The scope is now the only owner of the successful tail, which the barrier removed from its tracked list.
-        drop(tail);
         assert!(tail_submission.upgrade().is_some());
 
         let unordered = scope.reserve(None).unwrap();
@@ -721,16 +713,17 @@ mod tests {
         scope.barrier().unwrap();
         let recovered = scope.reserve(Some(&[1])).unwrap();
         assert!(recovered.predecessor.is_none());
-        assert_eq!(failed.submission.completion.result(), Some(Err(Arc::from("ordered effect failed"))));
+        assert_eq!(failed_completion.result(), Some(Err(Arc::from("ordered effect failed"))));
     }
 
     #[test]
     fn test_effect_scope_acknowledge_rejects_pending_ordered_work_after_failure() {
         let scope = EffectScope::default();
-        let mut failed = scope.reserve(Some(&[0])).unwrap();
+        let failed = scope.reserve(Some(&[0])).unwrap();
         let (fence, promise) = pending_fence();
+        let failed_submission = Arc::clone(&failed.submission);
         failed.publish(Ok(None), &fence);
-        let initial_references = Arc::strong_count(&failed.submission);
+        let initial_references = Arc::strong_count(&failed_submission);
 
         thread::scope(|threads| {
             let (sender, receiver) = channel();
@@ -738,7 +731,7 @@ mod tests {
             threads.spawn(move || sender.send(scope.barrier()).unwrap());
 
             // Have the barrier report the failure while a later ordered reservation is still pending.
-            let snapshot_captured = wait_for_barrier_snapshot(scope, &failed.submission, initial_references);
+            let snapshot_captured = wait_for_barrier_snapshot(scope, &failed_submission, initial_references);
             let later = snapshot_captured.then(|| scope.reserve(Some(&[0])).unwrap());
             promise.set(Some(ryft_pjrt::Error::invalid_argument("ordered effect failed"))).unwrap();
             let report = receiver.recv_timeout(CALLBACK_TIMEOUT);
@@ -759,7 +752,7 @@ mod tests {
     #[test]
     fn test_effect_scope_acknowledge_preserves_pending_unordered_work() {
         let scope = EffectScope::default();
-        let mut pending = scope.reserve(None).unwrap();
+        let pending = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
         pending.publish(Ok(None), &fence);
         scope.acknowledge().unwrap();
@@ -780,7 +773,7 @@ mod tests {
         let device = &client.addressable_devices().unwrap()[0];
         let devices = [Device::from_pjrt(device).unwrap().id()];
         let scope = EffectScope::default();
-        let mut first = scope.reserve(Some(&devices)).unwrap();
+        let first = scope.reserve(Some(&devices)).unwrap();
         let successor = scope.reserve(Some(&devices)).unwrap();
         assert!(first.wait_for_predecessor_tokens().unwrap().is_none());
 
@@ -872,7 +865,7 @@ mod tests {
             .collect::<Vec<_>>();
         let scope = &session.effect_scope;
         let device_ids = devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect::<Vec<_>>();
-        let mut predecessor = scope.reserve(Some(&device_ids)).unwrap();
+        let predecessor = scope.reserve(Some(&device_ids)).unwrap();
         predecessor.publish(
             Ok(Some(managers.iter().map(|manager| Arc::new(manager.retrieve_buffer(0).unwrap())).collect())),
             &ExecutionFence::new(Vec::new()),
@@ -914,39 +907,42 @@ mod tests {
     #[test]
     fn test_effect_reservation_publish() {
         let scope = EffectScope::default();
-        let mut reservation = scope.reserve(None).unwrap();
+        let reservation = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
-        let submission = Arc::clone(&reservation.submission);
+        let submission = Arc::downgrade(&reservation.submission);
+        let completion = Arc::clone(&reservation.submission.completion);
         reservation.publish(Ok(None), &fence);
 
-        // A published reservation may be dropped while its fence callback still owns the pending completion.
-        drop(reservation);
-        let pending = submission.completion.result();
+        // The fence callback keeps only the completion alive, so the submission can be released before it fires.
+        drop(scope);
+        let submission_released = submission.upgrade().is_none();
+        let pending = completion.result();
         promise.set(None).unwrap();
+        assert!(submission_released);
         assert_eq!(pending, None);
-        assert_eq!(submission.completion.wait(), Ok(()));
-        scope.barrier().unwrap();
+        assert_eq!(completion.wait(), Ok(()));
     }
 
     #[test]
     fn test_effect_reservation_publish_boundary_failure() {
         let scope = EffectScope::default();
-        let mut reservation = scope.reserve(Some(&[0])).unwrap();
+        let reservation = scope.reserve(Some(&[0])).unwrap();
         let successor = scope.reserve(Some(&[0])).unwrap();
         let (fence, promise) = pending_fence();
+        let submission = Arc::clone(&reservation.submission);
         reservation.publish(Err(Arc::from("boundary failed")), &fence);
         // Capture publication before completing the fence without risking a blocking token lookup.
         let published = matches!(
-            &*reservation.submission.publication.lock().unwrap(),
+            &*submission.publication.lock().unwrap(),
             EffectTokenPublication::Published(Err(reason)) if reason.as_ref() == "boundary failed",
         );
-        let pending = reservation.submission.completion.result();
+        let pending = submission.completion.result();
         promise.set(Some(ryft_pjrt::Error::invalid_argument("execution fence failed"))).unwrap();
 
         assert!(published);
         assert_eq!(pending, None);
         assert!(matches!(successor.wait_for_predecessor_tokens(), Err(reason) if reason.as_ref() == "boundary failed"));
-        assert_eq!(reservation.submission.completion.wait(), Err(Arc::from("boundary failed")));
+        assert_eq!(submission.completion.wait(), Err(Arc::from("boundary failed")));
     }
 
     #[test]
@@ -987,7 +983,7 @@ mod tests {
     #[test]
     fn test_effect_reservation_drop_forwards_predecessor_publication() {
         let scope = EffectScope::default();
-        let mut first = scope.reserve(Some(&[0])).unwrap();
+        let first = scope.reserve(Some(&[0])).unwrap();
         let second = scope.reserve(Some(&[0])).unwrap();
         let third = scope.reserve(Some(&[0])).unwrap();
         let successor = scope.reserve(Some(&[0])).unwrap();
@@ -1033,15 +1029,6 @@ mod tests {
         assert!(matches!(scope.reserve(None), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
         assert!(matches!(scope.barrier(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
-    }
-
-    #[test]
-    fn test_format_effect_failures() {
-        assert_eq!(format_effect_failures(&[]), "");
-        assert_eq!(
-            format_effect_failures(&[(0, Arc::from("first effect failed")), (3, Arc::from("second effect failed"))]),
-            "submission 0: first effect failed; submission 3: second effect failed",
-        );
     }
 
     #[test]

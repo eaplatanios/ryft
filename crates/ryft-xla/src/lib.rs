@@ -174,6 +174,18 @@ pub(crate) mod tests {
         client
     }
 
+    /// Returns the process-wide CUDA client for tests that explicitly exercise the CUDA plugin.
+    #[cfg(feature = "cuda-13")]
+    pub(crate) fn cuda_client() -> &'static Client<'static> {
+        Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            })))
+            .unwrap()
+    }
+
     /// Returns the execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`, which is a [`cpu_client`] with one
     /// device or the process-wide CUDA client.
     ///
@@ -184,13 +196,7 @@ pub(crate) mod tests {
         let client = match platform.as_str() {
             "cpu" => cpu_client(1),
             #[cfg(feature = "cuda-13")]
-            "cuda-13" => Platform::Cuda
-                .client(Some(ClientOptions::GPU(GpuClientOptions {
-                    platform: Some(GpuPlatform::CUDA),
-                    allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                    ..Default::default()
-                })))
-                .unwrap(),
+            "cuda-13" => cuda_client(),
             _ => panic!("unsupported execution platform `{platform}`; CUDA testing requires `--features cuda-13`"),
         };
         let expected = if platform == "cpu" { "cpu" } else { "cuda" };
