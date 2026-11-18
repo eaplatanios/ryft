@@ -83,21 +83,21 @@ use std::sync::{Arc, OnceLock};
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayIrValue, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext, CastType,
-    Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device,
-    DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext,
+    ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext,
+    CastType, Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType,
+    Device, DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType,
+    DimensionValue, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
-    NestedTracingContext, ONE_OPERATION_NAME, Operation as CoreOperation, OperationProvider, Parameter, Placeholder,
-    ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry,
-    SpecializationCacheStatistics, TracingContext, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram,
-    ZERO_OPERATION_NAME, Zero, ZeroOperation,
+    NestedTracingContext, Operation as CoreOperation, OperationProvider, Parameter, Placeholder, ProgramError,
+    Provenance, ProvenanceScope, RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry,
+    SpecializationCacheStatistics, TracingContext, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Zero,
+    ZeroOperation,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Plugin};
 
-use crate::arrays::{ConstantKind, RetainedArray};
+use crate::arrays::RetainedArray;
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
@@ -216,8 +216,7 @@ pub struct Session {
     /// State of this session that contains resources shared by every handle of this session.
     state: Arc<SessionState>,
 
-    /// Default device mesh of this handle, which eager binds without array inputs execute on and which the constant
-    /// materialization fast path requires.
+    /// Default device mesh of this handle, which eager binds without array inputs execute on.
     mesh: Option<DeviceMesh>,
 
     /// Selected ordering and completion scope, which clones of this handle share and which
@@ -347,7 +346,9 @@ impl Session {
         inputs: &[Array],
         logical_mesh: Option<&LogicalMesh>,
     ) -> Result<DeviceMesh, ProgramError> {
-        if let Some(mesh) = self.inherited_device_mesh(inputs) {
+        // The eager dispatch cache keys its entries on this same choice between the first input's mesh and the mesh of
+        // this handle, in `Context::bind`. The two must stay in agreement.
+        if let Some(mesh) = inputs.first().map(Array::mesh).or(self.mesh.as_ref()) {
             return Ok(mesh.clone());
         }
 
@@ -569,37 +570,6 @@ impl Session {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the [`DeviceMesh`] that a value computed from `inputs` inherits, which is the mesh of the first input
-    /// or else the mesh configured on this handle, and [`None`] when there is neither. This is the part of
-    /// [`Self::device_mesh_for`] that depends on more than the operation and the client, so the eager dispatch cache
-    /// keys its entries on it. It needs no device query, which keeps cache hits cheap.
-    fn inherited_device_mesh<'m>(&'m self, inputs: &'m [Array]) -> Option<&'m DeviceMesh> {
-        inputs.first().map(Array::mesh).or(self.mesh.as_ref())
-    }
-
-    /// Materializes a concrete [`Array`] whose addressable shards are filled with the constant that `kind` selects. An
-    /// `array_type` without a sharding is replicated over the mesh of this session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArrayError::MissingMesh`] if this session has no mesh, [`ArrayError::DynamicShape`] if `array_type`
-    /// does not have a static shape, and an [`Error`] if `array_type` cannot be replicated over that mesh or the
-    /// constant cannot be materialized.
-    fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array, Error> {
-        let mesh = self.device_mesh()?;
-        if array_type.static_shape().is_none() {
-            return Err(ArrayError::DynamicShape { shape: array_type.shape().clone() }.into());
-        }
-        let effective_type = match array_type.sharding() {
-            Some(_) => array_type.clone(),
-            None => array_type.replicated(mesh)?,
-        };
-
-        // The constant belongs to this session so that chained eager operations and transforms over it recover a
-        // context that keeps the same session, effect scope, and compilation options.
-        Array::from_constant(self, effective_type, mesh.clone(), kind)
-    }
 }
 
 impl Clone for Session {
@@ -675,9 +645,9 @@ impl Context for Session {
     // Work that involves no device computation never reaches the compilation cache. Reference operations act on handles
     // on the host, while dimension operations, dimension casts and comparisons, and conversions between dimensions and
     // scalars are decided on the host. Only their array results are uploaded, as replicated scalars with eager
-    // placement. Reference operands of any other operation, and reference state carried by attached regions, are
-    // rejected because XLA eager execution lowers each operation. The nullary additive and multiplicative identities
-    // keep a fast path that materializes the constant directly through the runtime client without compiling a program.
+    // placement. A literal constant is host data already, so it is uploaded as well. Reference operands of any other
+    // operation, and reference state carried by attached regions, are rejected because XLA eager execution lowers each
+    // operation.
     fn bind<'r, P, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: P,
@@ -694,23 +664,6 @@ impl Context for Session {
         let operation = operation.into();
         let regions = regions.into();
         operation.validate_region_interfaces(&regions.region_interfaces())?;
-        let name = operation.name();
-        if inputs.is_empty() && (name == ZERO_OPERATION_NAME || name == ONE_OPERATION_NAME) {
-            // Output type inference also rejects the data types that cannot represent the requested identity.
-            let output_types = operation.infer_output_types(&[], &[])?;
-            check_count!("output", output_types, 1, ProgramError);
-            let array_type = <&ArrayType>::try_from(&output_types[0])?.clone();
-            // The direct constant materialization fast path needs a concrete device mesh, so sessions without a mesh
-            // fall through to the compiled eager path below, which derives a default execution mesh instead. So do
-            // the data types whose value of one has no host encoding here (e.g., the 8-bit floating-point types).
-            let kind = if name == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
-            if self.device_mesh().is_ok() && kind.has_host_encoding(array_type.data_type()) {
-                let value = self
-                    .constant(&array_type, kind)
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                return Ok(vec![Value::Array(value)]);
-            }
-        }
 
         // Reference operations act on shared handles rather than on device computations, so they run on the host
         // through the generic `ArrayIrValue` reference implementations in `ryft-core`, which own handle validation
@@ -835,6 +788,29 @@ impl Context for Session {
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
             return Ok(vec![Value::Array(output)]);
         }
+        // Core arrays store little-endian element encodings and PJRT reads native ones, so the two only coincide on
+        // little-endian targets. The other targets take the compiled path, whose lowering converts between them, and
+        // so do token literals, which that lowering rejects.
+        if let Operation::Array(ArrayOperation::Constant(operation)) = &operation
+            && cfg!(target_endian = "little")
+            && operation.value().r#type().data_type() != DataType::Token
+        {
+            // A literal is host data already, so it is uploaded like any other host buffer. Embedding it in a compiled
+            // program instead would compile and retain one program for every distinct literal (e.g., for every value
+            // that `Fill` is given).
+            check_count!("input", inputs, 0, ProgramError);
+            operation.infer_output_types(&[], &[])?;
+            let literal = operation.value();
+            let r#type = literal.r#type().into_owned();
+            // The upload takes dense row-major bytes, which is how a literal without a layout is stored.
+            let bytes = match r#type.layout() {
+                Some(_) => Cow::Owned(literal.logical_bytes()),
+                None => Cow::Borrowed(literal.storage_bytes()),
+            };
+            let output = Array::from_host_buffer(self, r#type, None, None, bytes)
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            return Ok(vec![Value::Array(output)]);
+        }
 
         // A composite call whose concrete inputs refine the types that its primal region was traced over (e.g., a named
         // call staged in a bounded-dynamic program) replays its primal region, exactly as the interpretation rule of
@@ -917,7 +893,11 @@ impl Context for Session {
             &operation,
             region_keys.as_slice(),
             inputs,
-            self.inherited_device_mesh(array_inputs.as_slice()),
+            // This is the mesh that `Self::device_mesh_for` resolves for these inputs when it does not have to fall
+            // back to the devices of the client, and it must stay in agreement with that function. The fallbacks
+            // depend only on the operation and the client, which the key already covers, and leaving them out keeps
+            // cache hits free of device queries.
+            array_inputs.first().map(Array::mesh).or(self.mesh.as_ref()),
         );
         let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
@@ -1110,10 +1090,9 @@ impl Context for Session {
 // Context capability that materializes additive identity arrays. Transform machinery over this session (e.g., the
 // batching rules of nullary constant operations and the accumulator seeding of recursive higher-order rules)
 // synthesizes constants through the `Zero`, `One`, `Fill`, and `Iota` leaves of the active context, which are driven
-// by types alone. The binds below take the constant materialization fast path on sessions constructed with a concrete
-// mesh, and the compiled eager dispatch path over a derived default mesh otherwise. Dynamic array zeros are
-// intentionally not available through this capability, because it receives only a type and they require explicit
-// first-class extent operands.
+// by types alone. The bind below goes through the eager dispatch cache like any other operation, so a program is
+// compiled for the first zero of each type and reused afterwards. Dynamic array zeros are intentionally not available
+// through this capability, because it receives only a type and they require explicit first-class extent operands.
 impl Zero<Value> for Session {
     fn zero(&self, r#type: &ArrayIrType) -> Result<Value, ProgramError> {
         let mut outputs = self.bind(Operation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
@@ -1570,12 +1549,13 @@ pub(crate) mod tests {
         ConstantOperation, DataType, DenseDifferentiableType, Device, Dimension as CoreDimension,
         DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionSizeOperation,
         DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation, DomainTracer,
-        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, MeshAxisType, Mul, MulOperation, Neg,
-        NegOperation, OneOperation, ParallelReduceOperation, Placeholder, ProjectedContext, ProjectedValue, Reduce,
-        ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ScanOperation, SelectOperation,
-        Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension,
-        ShardingError, StaticShape, SubOperation, Typed, Value as CoreValue, WhileOperation, ZeroOperation, batch,
-        differentiate_at, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Fill, Layout, MeshAxisType, Mul,
+        MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Placeholder, ProjectedContext,
+        ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType,
+        ScanOperation, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
+        Sharding, ShardingDimension, ShardingError, StaticShape, SubOperation, TiledLayout, Typed, Value as CoreValue,
+        WhileOperation, ZeroOperation, batch, differentiate_at, i4, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_core::{EffectClass, OneLike, ReferenceRead, ReferenceWrite, Tracer as CoreTracer};
@@ -2150,87 +2130,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_constant_zero_space_array_is_bufferless() {
-        let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh);
-        let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
-
-        let array = session.constant(&array_type, ConstantKind::Zero).unwrap();
-
-        assert_eq!(array.data_type(), DataType::Zero);
-        assert!(array.addressable_shards().next().unwrap().buffer().is_none());
-    }
-
-    #[test]
-    fn test_session_constant_defaults_missing_sharding_to_replicated() {
-        let client = cpu_client(2);
-        let mesh = domain_mesh(client, "x", 2);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
-
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let array = session.constant(&array_type, ConstantKind::Zero).unwrap();
-
-        assert_eq!(array.shape(), StaticShape::new(vec![3, 2]));
-        assert_eq!(array.shards().len(), 2);
-        assert_eq!(array.addressable_shards().count(), 2);
-        for shard in array.addressable_shards() {
-            assert_eq!(values_from_bytes::<f32>(&shard.copy_to_host().unwrap()), vec![0.0; 6]);
-        }
-    }
-
-    #[test]
-    fn test_session_constant_fills_sharded_array_with_ones() {
-        let client = cpu_client(2);
-        // Constants take their placement from their types, which record placement over explicit mesh axes only.
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            client
-                .addressable_devices()
-                .unwrap()
-                .into_iter()
-                .map(|device| Device::from_pjrt(device).unwrap())
-                .collect(),
-        )
-        .unwrap();
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let session = session_with_client(client).with_device_mesh(mesh);
-
-        let array = session.constant(&array_type, ConstantKind::One).unwrap();
-
-        assert_eq!(array.shape(), StaticShape::new(vec![4]));
-        assert_eq!(array.shards().len(), 2);
-        assert_eq!(array.addressable_shards().count(), 2);
-        for shard in array.addressable_shards() {
-            assert_eq!(shard.shape(), StaticShape::new(vec![2]));
-            assert_eq!(values_from_bytes::<f32>(&shard.copy_to_host().unwrap()), vec![1.0, 1.0]);
-        }
-    }
-
-    #[test]
-    fn test_session_constant_rejects_missing_meshes_and_dynamic_shapes() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        assert!(matches!(
-            session.constant(&ArrayType::scalar(DataType::F32), ConstantKind::Zero),
-            Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh),
-        ));
-
-        let session = session.with_device_mesh(domain_mesh(client, "x", 1));
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(4)).unwrap());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows)]));
-        assert!(matches!(
-            session.constant(&array_type, ConstantKind::Zero),
-            Err(Error::Array(error))
-                if matches!(&*error, ArrayError::DynamicShape { shape } if shape == array_type.shape()),
-        ));
-    }
-
-    #[test]
     fn test_session_named_axis() {
         let client = execution_client();
         assert!(session_with_client(client).named_axis("x").is_none());
@@ -2291,21 +2190,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_bind_identity_without_host_encoding() {
-        // The value one of these data types has no host encoding here, so a session with a mesh cannot synthesize it
-        // from host bytes and stages a program for it like a session without a mesh.
-        let client = execution_client();
-        let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh);
-        for data_type in [DataType::U4, DataType::F8E5M2] {
-            let outputs = session.bind(OneOperation::new(ArrayType::scalar(data_type)), Vec::new(), &[]).unwrap();
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(program_array(&outputs[0]).data_type(), data_type);
-            assert_eq!(program_array(&outputs[0]).shape().as_slice(), &[] as &[usize]);
-        }
-    }
-
-    #[test]
     fn test_session_bind_identity_rejects_unrepresentable_type() {
         let client = execution_client();
         let session = session_with_client(client);
@@ -2319,7 +2203,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_bind_identity_fast_path_rejects_attached_regions() {
+    fn test_session_bind_identity_rejects_attached_regions() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client).with_device_mesh(mesh);
@@ -2517,6 +2401,53 @@ pub(crate) mod tests {
         };
         assert_eq!(from_scalar.value().extent(), 5);
         assert_eq!(session.cached_program_count(), 0);
+    }
+
+    #[test]
+    fn test_session_bind_uploads_literal_constants_without_compilation() {
+        let client = execution_client();
+        let session = session_with_client(client);
+
+        // A literal is uploaded from its host bytes, which hold one element per byte for the sub-byte data types.
+        let outputs = session
+            .bind(ConstantOperation::new(CoreArray::vector(vec![1.5f32, -2.0, 0.25]).unwrap()), Vec::new(), &[])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(read_f32s(client, program_array(&outputs[0])), vec![1.5, -2.0, 0.25]);
+        let predicates = session
+            .bind(ConstantOperation::new(CoreArray::vector(vec![true, false]).unwrap()), Vec::new(), &[])
+            .unwrap();
+        assert_eq!(read_booleans(client, program_array(&predicates[0])), vec![true, false]);
+        let nibbles = CoreArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap();
+        let nibbles = session.bind(ConstantOperation::new(nibbles), Vec::new(), &[]).unwrap();
+        assert_eq!(program_array(&nibbles[0]).data_type(), DataType::I4);
+        assert_eq!(program_array(&nibbles[0]).copy_to_host().unwrap(), vec![0x08, 0x07]);
+
+        // A literal with a layout is stored in the order of that layout and is uploaded in logical row-major order.
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let r#type = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone());
+        let literal = CoreArray::from_elements(r#type, &[1f64, 2., 3., 4., 5., 6.]).unwrap();
+        assert_ne!(literal.storage_bytes(), literal.logical_bytes().as_slice());
+        let outputs = session.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap();
+        assert_eq!(program_array(&outputs[0]).layout(), Some(&layout));
+        assert_eq!(
+            values_from_bytes::<f64>(&program_array(&outputs[0]).copy_to_host().unwrap()),
+            vec![1., 2., 3., 4., 5., 6.],
+        );
+
+        // None of the literals above compiled a program, and a literal takes no inputs.
+        assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (0, 0));
+        assert_eq!(
+            session.bind(ConstantOperation::new(CoreArray::scalar(1f32).unwrap()), Vec::new(), &outputs),
+            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
+        );
+
+        // Every value that `Fill` is given therefore shares the one program that broadcasts its literal.
+        let context = ProjectedContext::<Session, ArrayType>::new(session.clone());
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        assert_eq!(read_f32s(client, &context.fill(&r#type, 2.5f32).unwrap()), vec![2.5, 2.5]);
+        assert_eq!(read_f32s(client, &context.fill(&r#type, 3.5f32).unwrap()), vec![3.5, 3.5]);
+        assert_eq!(session.cached_program_count(), 1);
     }
 
     #[test]
@@ -3962,13 +3893,16 @@ pub(crate) mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
 
-        // A session with a mesh materializes the zero directly, while a session without one compiles a program for it.
-        for (session, program_count) in
-            [(session_with_client(client).with_device_mesh(mesh), 0), (session_with_client(client), 1)]
-        {
+        // A zero is an ordinary eager operation with or without a mesh, so one program is compiled for each type.
+        for session in [session_with_client(client).with_device_mesh(mesh), session_with_client(client)] {
             let zero = session.zero(&r#type).unwrap();
             assert_eq!(read_f32s(client, program_array(&zero)), vec![0.0, 0.0]);
-            assert_eq!(session.cached_program_count(), program_count);
+            session.zero(&r#type).unwrap();
+            assert_eq!(session.cached_program_count(), 1);
+
+            // A zero of the structural zero data type needs no storage.
+            let zero = session.zero(&ArrayIrType::Array(ArrayType::new_static(DataType::Zero, [3]))).unwrap();
+            assert!(program_array(&zero).addressable_shards().next().unwrap().buffer().is_none());
         }
     }
 
