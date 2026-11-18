@@ -547,8 +547,6 @@ pub(crate) struct RuntimeRegistry {
     pending: Mutex<Vec<PendingExecution>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl RuntimeRegistry {
     /// Creates a [`RuntimeRegistry`] for `client` using the providers in `extensions`. Each registry initializes its
     /// own instances on demand, even when several registries share the same providers.
@@ -607,26 +605,16 @@ impl RuntimeRegistry {
         };
 
         let mut completed = Vec::new();
-        {
-            let mut pending = self.pending.lock().expect("runtime completion mutex poisoned");
-            let mut index = 0;
-            while index < pending.len() {
-                if matches!(pending[index].fence.is_ready(), Ok(false)) {
-                    index += 1;
-                } else {
-                    completed.push(pending.swap_remove(index));
-                }
-            }
-            if matches!(fence.is_ready(), Ok(false)) {
-                pending.push(PendingExecution { fence: fence.clone(), _resources: resources });
-            } else {
-                completed.push(PendingExecution { fence: fence.clone(), _resources: resources });
-            }
+        let mut pending = self.pending.lock().expect("runtime completion mutex poisoned");
+        completed.extend(pending.extract_if(.., |execution| !matches!(execution.fence.is_ready(), Ok(false))));
+        if matches!(fence.is_ready(), Ok(false)) {
+            pending.push(PendingExecution { fence: fence.clone(), _resources: resources });
+        } else {
+            completed.push(PendingExecution { fence: fence.clone(), _resources: resources });
         }
 
-        // Completed executions no longer need their resources. They are dropped after the pending lock is released,
-        // so destructors of retained resources never run while that lock is held.
-        drop(completed);
+        // Release the lock before running destructors for completed executions' retained resources.
+        drop(pending);
     }
 
     /// Returns the cached instance for `requirement` or initializes it through the matching [`RuntimeProvider`]. The
@@ -635,8 +623,8 @@ impl RuntimeRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::MissingProvider`] if the session has no matching provider and propagates any error from
-    /// initialization. To prevent deadlocks, a thread already initializing an extension in this registry receives
+    /// Returns [`RuntimeError::MissingProvider`] if the session has no matching provider and propagates any error
+    /// from initialization. To prevent deadlocks, a thread already initializing an extension in this registry receives
     /// [`RuntimeError::RecursiveInitialization`] if resolving the requirement would make it wait for an initializer.
     fn instance(&self, requirement: &RuntimeRequirement) -> Result<Arc<dyn RuntimeExtension>, Error> {
         let provider = self
@@ -644,12 +632,14 @@ impl RuntimeRegistry {
             .providers
             .get(requirement.identifier())
             .ok_or_else(|| RuntimeError::MissingProvider { identifier: requirement.identifier.clone() })?;
+
         let slot = {
             let mut instances = self.instances.lock().expect("runtime registry mutex poisoned");
             Arc::clone(instances.entry(requirement.clone()).or_insert_with(|| {
                 Arc::new(RuntimeInitialization { state: Mutex::new(Initialization::Empty), ready: Condvar::new() })
             }))
         };
+
         let current = std::thread::current().id();
         let mut state = slot.state.lock().expect("runtime initialization mutex poisoned");
         loop {
@@ -695,7 +685,11 @@ impl RuntimeRegistry {
                 }
             }
         }
+
+        // The slot stays marked as running while the provider initializes. Release its lock so nested lookups,
+        // publication, and rollback can acquire it.
         drop(state);
+
         let mut rollback = InitializationGuard { slot: &slot, active: true };
         let runtime = provider.initialize(self.client, requirement)?;
         *slot.state.lock().expect("runtime initialization mutex poisoned") =
@@ -707,8 +701,8 @@ impl RuntimeRegistry {
 }
 
 impl Drop for RuntimeRegistry {
-    /// Waits for tracked submissions to finish before dropping their resources and the initialized extensions.
     fn drop(&mut self) {
+        // Wait for tracked submissions to finish before dropping their resources and the initialized extensions.
         let pending = std::mem::take(self.pending.get_mut().expect("runtime completion mutex poisoned"));
         for execution in pending {
             // Failure is terminal too, and its diagnostics remain in the caller's fence and in effect and reference
@@ -720,6 +714,8 @@ impl Drop for RuntimeRegistry {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Constructs the fixed ABI used by built-in runtime providers.
 pub(crate) fn builtin_requirement(identifier: &str) -> RuntimeRequirement {
