@@ -2041,7 +2041,7 @@ pub(crate) mod tests {
         session.effects_barrier().unwrap();
 
         // A barrier reports the failures of earlier submissions, and keeps reporting them until they are acknowledged.
-        let mut reservation = session.reserve_effects(None).unwrap();
+        let reservation = session.reserve_effects(None).unwrap();
         reservation.publish(Err(Arc::from("effect failed")), &ExecutionFence::new(Vec::new()));
         assert!(matches!(
             session.effects_barrier(),
@@ -2059,7 +2059,7 @@ pub(crate) mod tests {
     fn test_session_acknowledge_effect_errors() {
         let client = execution_client();
         let session = session_with_client(client);
-        let mut reservation = session.reserve_effects(None).unwrap();
+        let reservation = session.reserve_effects(None).unwrap();
         reservation.publish(Err(Arc::from("effect failed")), &ExecutionFence::new(Vec::new()));
 
         // Failures can only be acknowledged after a barrier has reported them.
