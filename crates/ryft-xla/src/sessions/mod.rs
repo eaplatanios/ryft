@@ -335,6 +335,66 @@ impl Session {
         self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
     }
 
+    /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
+    /// computed from `inputs` is placed where they live, so the first input's mesh takes precedence over the mesh
+    /// configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in enumeration
+    /// order. If all three are absent, the first addressable device forms a mesh with a single device. Eager operations
+    /// derive `logical_mesh` from the first sharded output. This lets transforms place nullary constants through
+    /// [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on sessions without
+    /// a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller omits the mesh.
+    pub(crate) fn device_mesh_for(
+        &self,
+        inputs: &[Array],
+        logical_mesh: Option<&LogicalMesh>,
+    ) -> Result<DeviceMesh, ProgramError> {
+        if let Some(mesh) = self.inherited_device_mesh(inputs) {
+            return Ok(mesh.clone());
+        }
+
+        let devices = self
+            .client()
+            .addressable_devices()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        if let Some(logical_mesh) = logical_mesh {
+            let device_count = logical_mesh.device_count();
+            if devices.len() < device_count {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "eager XLA placement of a value without array inputs over mesh {:?} requires \
+                         {} addressable device(s) but the client only has {}",
+                        logical_mesh,
+                        device_count,
+                        devices.len(),
+                    ),
+                });
+            }
+
+            let devices = devices
+                .iter()
+                .take(device_count)
+                .map(|device| {
+                    Device::from_pjrt(device)
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            return DeviceMesh::new(logical_mesh.clone(), devices)
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() });
+        }
+
+        let device = devices.first().ok_or_else(|| ProgramError::InvalidArgument {
+            message: "eager XLA execution requires at least one addressable device".to_string(),
+        })?;
+        let device =
+            Device::from_pjrt(device).map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let axis = MeshAxis::new("x", 1, MeshAxisType::Auto)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let logical_mesh = LogicalMesh::new(vec![axis])
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        DeviceMesh::new(logical_mesh, vec![device])
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+    }
+
     /// Returns whether `other` is a handle of the same underlying [`Session`] as this one (i.e., whether the two share
     /// their compilation cache, runtime extensions, and retained constants), irrespective of their meshes and effect
     /// scopes.
@@ -509,68 +569,6 @@ impl Session {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
-    /// computed from `inputs` is placed where they live, so the first input's mesh takes precedence over the mesh
-    /// configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in enumeration
-    /// order. If all three are absent, the first addressable device forms a mesh with a single device.
-    ///
-    /// Eager operations derive `logical_mesh` from the first sharded output. This lets transforms place nullary
-    /// constants through [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on
-    /// sessions without a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller
-    /// omits the mesh.
-    pub(crate) fn device_mesh_for(
-        &self,
-        inputs: &[Array],
-        logical_mesh: Option<&LogicalMesh>,
-    ) -> Result<DeviceMesh, ProgramError> {
-        if let Some(mesh) = self.inherited_device_mesh(inputs) {
-            return Ok(mesh.clone());
-        }
-
-        let devices = self
-            .client()
-            .addressable_devices()
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        if let Some(logical_mesh) = logical_mesh {
-            let device_count = logical_mesh.device_count();
-            if devices.len() < device_count {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!(
-                        "eager XLA placement of a value without array inputs over mesh {:?} requires \
-                         {} addressable device(s) but the client only has {}",
-                        logical_mesh,
-                        device_count,
-                        devices.len(),
-                    ),
-                });
-            }
-
-            let devices = devices
-                .iter()
-                .take(device_count)
-                .map(|device| {
-                    Device::from_pjrt(device)
-                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            return DeviceMesh::new(logical_mesh.clone(), devices)
-                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() });
-        }
-
-        let device = devices.first().ok_or_else(|| ProgramError::InvalidArgument {
-            message: "eager XLA execution requires at least one addressable device".to_string(),
-        })?;
-        let device =
-            Device::from_pjrt(device).map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let axis = MeshAxis::new("x", 1, MeshAxisType::Auto)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let logical_mesh = LogicalMesh::new(vec![axis])
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        DeviceMesh::new(logical_mesh, vec![device])
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
-    }
 
     /// Returns the [`DeviceMesh`] that a value computed from `inputs` inherits, which is the mesh of the first input
     /// or else the mesh configured on this handle, and [`None`] when there is neither. This is the part of
