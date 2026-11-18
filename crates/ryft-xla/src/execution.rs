@@ -1160,8 +1160,8 @@ impl Session {
                 // Retain completion until the submitted work is done, then report the boundary failure. The fence
                 // callback owns the published completion and the reason, because it may run later on whichever thread
                 // completes the last device event, or inline here when the fence is already ready.
-                let completion = reservation.publish(Err(Arc::clone(&reason)));
-                fence.on_ready(move |_| completion.complete(Err(reason)));
+                let complete = reservation.publish(Err(Arc::clone(&reason)));
+                fence.on_ready(move |_| complete(Err(reason)));
             } else {
                 let carrier = if ordered {
                     Some(
@@ -1175,9 +1175,9 @@ impl Session {
                 } else {
                     None
                 };
-                let completion = reservation.publish(Ok(carrier));
+                let complete = reservation.publish(Ok(carrier));
                 // As above, the fence callback owns the published completion for its whole asynchronous lifetime.
-                fence.on_ready(move |result| completion.complete(result.map_err(|error| Arc::from(error.to_string()))));
+                fence.on_ready(move |result| complete(result.map_err(|error| Arc::from(error.to_string()))));
             }
             reservation.commit();
         }

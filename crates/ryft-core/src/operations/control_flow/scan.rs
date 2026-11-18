@@ -4226,7 +4226,7 @@ fn reconstruct_partitioned_scan<
         for instruction in known_region.instructions() {
             let effects = instruction.operation().effects();
             if instruction.regions().is_empty()
-                && effects.is_pure()
+                && !effects.has_execution_effects()
                 && !effects.summary().has_deferred_work()
                 && instruction.inputs().iter().all(|input| invariant_atoms[input.index()])
             {
@@ -11927,7 +11927,14 @@ mod tests {
             builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![inputs[2]], None).unwrap();
             vec![inputs[1]]
         });
-        assert!(body.partition(&[true, true, false]).unwrap().residual_program().effects().classes().is_ordered());
+        assert!(
+            body.partition(&[true, true, false])
+                .unwrap()
+                .residual_program()
+                .effects()
+                .classes()
+                .contains_ordered_class()
+        );
         let program = scan_program(TestScanOperation::new(1, 3), body, vec![scalar_type.clone(), stacked_type.clone()]);
         let outer = TracingContext::<Array, TestOperation>::new();
         let carry = outer.input(scalar_type);
@@ -11938,7 +11945,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Known(carry)]);
-        assert!(evaluation.program.effects().classes().is_ordered());
+        assert!(evaluation.program.effects().classes().contains_ordered_class());
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"

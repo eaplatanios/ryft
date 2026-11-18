@@ -21,9 +21,9 @@ use ryft_core::{
     TypedProgram, Value as CoreValue,
 };
 use ryft_kernels::{
-    KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension,
-    KernelExtensionMemory, KernelOperation as PortableKernelOperation, KernelSchedule, NoKernelExtension,
-    VerifiedKernel,
+    KernelCallOperation, KernelCompiler, KernelCompletionProtocol, KernelDefinition,
+    KernelExtension as PortableKernelExtension, KernelExtensionMemory, KernelOperation as PortableKernelOperation,
+    KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
 use ryft_mlir::ValueRef;
 
@@ -138,6 +138,20 @@ impl PortableKernelExtension for KernelExtension {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => operation.memory_semantics(),
+        }
+    }
+
+    fn completion_protocol(&self) -> KernelCompletionProtocol {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.completion_protocol(),
+        }
+    }
+
+    fn replay_cost(&self) -> Option<usize> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.replay_cost(),
         }
     }
 }

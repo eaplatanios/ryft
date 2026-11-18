@@ -4141,7 +4141,12 @@ mod tests {
         );
         assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
         assert_eq!(simplified.instructions()[1].operation(), &TestRegionOperation::Add);
-        assert!(!simplified.region(RegionId::new(0)).unwrap().instructions()[0].operation().effects().is_pure());
+        assert!(
+            simplified.region(RegionId::new(0)).unwrap().instructions()[0]
+                .operation()
+                .effects()
+                .has_execution_effects(),
+        );
     }
 
     #[test]

@@ -1,18 +1,3 @@
-//! Ordering and completion tracking for the effects of executions submitted through a [`Session`](crate::Session).
-//!
-//! Every execution with effects reserves a position in an `EffectScope` before dispatch. Ordered executions form a
-//! chain in which each submission consumes the token carrier that its predecessor publishes, so ordered I/O observes
-//! submission order even when launches complete asynchronously. Unordered executions only record their completion.
-//! A reservation that is dropped before it is published is cancelled, and its successors then inherit the carrier of
-//! its own predecessor without waiting on the host.
-//!
-//! PJRT callbacks retain only an `EffectCompletion`, which borrows no client resources and never acquires the scope
-//! mutex. [`Session::effects_barrier`](crate::Session::effects_barrier) waits for a fixed snapshot of earlier
-//! submissions and reports their failures in submission order, and
-//! [`Session::acknowledge_effect_errors`](crate::Session::acknowledge_effect_errors) clears observed failures once the
-//! affected work has completed. `EffectCallbackGuard` marks managed callbacks, and `ensure_effect_dispatch_allowed`
-//! rejects dispatch and barriers that would reenter from inside one.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -21,49 +6,20 @@ use ryft_pjrt::Buffer;
 
 use crate::{Error, ExecutionError};
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
-/// State that only records completion, so PJRT callbacks can retain it without retaining any resource that borrows
-/// the client.
-#[derive(Default)]
-pub(crate) struct EffectCompletion {
-    /// Immutable terminal outcome, published once after submission or cancellation.
-    result: Mutex<Option<Result<(), Arc<str>>>>,
-
-    /// Wakes barrier callers when the terminal outcome becomes available.
-    ready: Condvar,
-}
-
-impl EffectCompletion {
-    /// Records completion without entering scope state or running user code.
-    pub(crate) fn complete(&self, result: Result<(), Arc<str>>) {
-        *self.result.lock().expect("effect completion mutex poisoned") = Some(result);
-        self.ready.notify_all();
-    }
-
-    /// Returns a nonblocking snapshot of the completion state.
-    fn result(&self) -> Option<Result<(), Arc<str>>> {
-        self.result.lock().expect("effect completion mutex poisoned").clone()
-    }
-
-    /// Waits for this invocation, including the interval between its reservation and its submission.
-    fn wait(&self) -> Result<(), Arc<str>> {
-        let mut result = self.result.lock().expect("effect completion mutex poisoned");
-        while result.is_none() {
-            result = self.ready.wait(result).expect("effect completion mutex poisoned");
-        }
-        result.as_ref().unwrap().clone()
-    }
-}
-
-/// Ordering and completion scope that every handle of a session selects, separate from numerical values and
-/// compilation artifacts.
+/// Tracks executions with effects and keeps ordered I/O in submission order.
 ///
-/// Cloned sessions share their selected scope, while
-/// [`Session::with_new_effect_scope`](crate::Session::with_new_effect_scope) starts an independent sequence.
-/// Submissions reserve positions before dispatch so ordered work observes its predecessors even when launches complete
-/// asynchronously. [`Self::barrier`] waits for earlier reservations and reports failures in submission order.
-/// [`Self::acknowledge`] permits recovery only after affected work has completed and its failures have been observed.
+/// Cloning a [`Session`](crate::Session) shares its effect scope. Use
+/// [`Session::with_new_effect_scope`](crate::Session::with_new_effect_scope) to give a handle independent ordering and
+/// completion tracking. The same compiled program can run in either scope.
+///
+/// Each execution with effects reserves a place in the scope before dispatch. Ordered executions pass device tokens
+/// from one execution to the next, preserving effect order even when device work runs asynchronously. The scope also
+/// tracks completion of unordered executions.
+///
+/// [`Self::barrier`] waits for work already reserved when the barrier starts and reports failures in submission
+/// order. [`Self::acknowledge`] clears reported failures once the affected work has completed.
 #[derive(Default)]
 pub(crate) struct EffectScope {
     /// Reservation, observation, and recovery state, which is never held across PJRT calls or device waits.
@@ -193,7 +149,8 @@ impl EffectScope {
     }
 }
 
-/// Reservation that is released on every preparation or submission failure.
+/// Reservation for an execution with effects. Dropping an uncommitted reservation cancels it and lets its successors
+/// inherit its predecessor's carrier. Cancellation can proceed without waiting for the predecessor to publish.
 pub(crate) struct EffectReservation {
     /// Invocation being prepared or published.
     submission: Arc<EffectSubmission>,
@@ -212,14 +169,15 @@ impl EffectReservation {
         self.predecessor.as_ref().map_or(Ok(None), |previous| previous.carrier())
     }
 
-    /// Publishes the ordered carrier or the boundary failure of this submission to its successors, and returns the
-    /// completion that the caller must complete once the submitted device work is done.
+    /// Publishes the ordered carrier or the boundary failure of this submission to its successors. The returned
+    /// callback owns the completion state. Call it once the submitted device work finishes.
     pub(crate) fn publish(
         &self,
         carrier: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
-    ) -> Arc<EffectCompletion> {
+    ) -> impl FnOnce(Result<(), Arc<str>>) + Send + 'static + use<> {
         self.submission.publish(carrier);
-        Arc::clone(&self.submission.completion)
+        let completion = Arc::clone(&self.submission.completion);
+        move |result| completion.complete(result)
     }
 
     /// Marks this reservation as published, so that dropping it no longer cancels its submission.
@@ -240,7 +198,7 @@ impl Drop for EffectReservation {
     }
 }
 
-std::thread_local! {
+thread_local! {
     /// Depth of managed callbacks on the current thread. It only detects reentrancy, while effect ordering lives in
     /// the explicit session scope.
     static EFFECT_CALLBACK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -279,6 +237,43 @@ pub(crate) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
         .map(|(identity, error)| format!("submission {identity}: {error}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Records the outcome of one execution with effects. The result is pending until device work finishes or the
+/// reservation is cancelled. A cancelled reservation records success so a barrier can stop waiting for it.
+///
+/// A PJRT completion callback can own this state independently of the session because it holds no client resources.
+#[derive(Default)]
+struct EffectCompletion {
+    /// Result recorded once when the execution completes or the reservation is cancelled.
+    result: Mutex<Option<Result<(), Arc<str>>>>,
+
+    /// Wakes barrier callers when the terminal outcome becomes available.
+    ready: Condvar,
+}
+
+impl EffectCompletion {
+    /// Stores the result and wakes waiting threads. The callback can record the result while another thread holds
+    /// the effect scope's mutex.
+    fn complete(&self, result: Result<(), Arc<str>>) {
+        *self.result.lock().expect("effect completion mutex poisoned") = Some(result);
+        self.ready.notify_all();
+    }
+
+    /// Returns the recorded result, or [`None`] if completion is pending.
+    fn result(&self) -> Option<Result<(), Arc<str>>> {
+        self.result.lock().expect("effect completion mutex poisoned").clone()
+    }
+
+    /// Blocks the current thread until the execution finishes or the reservation is cancelled, then returns the
+    /// recorded result. The wait can begin before device work is submitted.
+    fn wait(&self) -> Result<(), Arc<str>> {
+        let mut result = self.result.lock().expect("effect completion mutex poisoned");
+        while result.is_none() {
+            result = self.ready.wait(result).expect("effect completion mutex poisoned");
+        }
+        result.as_ref().unwrap().clone()
+    }
 }
 
 /// Host publication state for an effect carrier, including cancellation forwarding without a host wait.

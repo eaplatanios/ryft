@@ -411,8 +411,8 @@ impl Session {
     /// Waits for the previously reserved effects of this handle's scope, including unordered I/O and local assertions.
     /// The backend may execute work inline, and this function waits only for work that is still pending. Later
     /// reservations and other scopes (e.g., those of [`Self::with_new_effect_scope`] handles) are excluded. Failures
-    /// are retained until explicitly acknowledged. Call this function before the process exits to ensure that effects
-    /// are observed.
+    /// are reported in submission order and retained until explicitly acknowledged. Call this function before the
+    /// process exits to ensure that effects are observed.
     pub fn effects_barrier(&self) -> Result<(), Error> {
         self.effect_scope.barrier()
     }
@@ -2036,9 +2036,9 @@ pub(crate) mod tests {
 
         // A barrier reports the failures of earlier submissions, and keeps reporting them until they are acknowledged.
         let mut reservation = session.effect_scope().reserve(None).unwrap();
-        let completion = reservation.publish(Ok(None));
+        let complete = reservation.publish(Ok(None));
         reservation.commit();
-        completion.complete(Err(Arc::from("effect failed")));
+        complete(Err(Arc::from("effect failed")));
         assert!(matches!(
             session.effects_barrier(),
             Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
@@ -2056,9 +2056,9 @@ pub(crate) mod tests {
         let client = execution_client();
         let session = session_with_client(client);
         let mut reservation = session.effect_scope().reserve(None).unwrap();
-        let completion = reservation.publish(Ok(None));
+        let complete = reservation.publish(Ok(None));
         reservation.commit();
-        completion.complete(Err(Arc::from("effect failed")));
+        complete(Err(Arc::from("effect failed")));
 
         // Failures can only be acknowledged after a barrier has reported them.
         assert!(matches!(

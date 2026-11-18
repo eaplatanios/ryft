@@ -3452,7 +3452,7 @@ fn stage_storage<V: Value<Type: 'static>, O: Operation<Type = V::Type> + Operati
             message: format!("the operation family of the program cannot hold its payload `{}`", payload.type_name()),
         })?;
         let name = operation.name();
-        if !operation.effects().is_pure() {
+        if operation.effects().has_execution_effects() {
             return Err(ResidualPolicyError::InvalidStorage {
                 storage: storage.name(),
                 message: format!("its operation `{name}` is not pure"),

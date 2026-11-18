@@ -1108,7 +1108,7 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
                 let mode = instruction
                     .operation()
                     .effects()
-                    .accesses()
+                    .reference_accesses()
                     .find_map(|(input, mode)| (input == input_index).then_some(mode))
                     .unwrap();
                 infer_reference_view_type(reference.referent(), descriptor.transforms(), &binding_types, mode)
@@ -1904,7 +1904,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
 
             // Direct accesses declared by the operation, in declaration order.
             let effects = operation.effects();
-            for (input_index, mode) in effects.accesses() {
+            for (input_index, mode) in effects.reference_accesses() {
                 let atom = input_atom(input_index, "accessed")?;
                 let record = self.resolve(value_id(atom), name, id, input_index)?;
                 let root = record.root;

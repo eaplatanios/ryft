@@ -1476,7 +1476,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.contains_atom_type_in_closure(Type::is_reference)
             || self
                 .instructions_in_closure()
-                .any(|(_, instruction)| instruction.operation().effects().has_reference_declarations())
+                .any(|(_, instruction)| instruction.operation().effects().has_reference_effects())
     }
 
     /// Returns whether any [`Instruction`] in this [`Region`]'s attached region closure accesses a reference (i.e.,
@@ -1488,7 +1488,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     #[inline]
     pub fn contains_reference_accesses_in_closure(self) -> bool {
         self.instructions_in_closure()
-            .any(|(_, instruction)| instruction.operation().effects().has_accesses())
+            .any(|(_, instruction)| instruction.operation().effects().has_reference_accesses())
     }
 
     /// Returns whether any [`Instruction`] in this [`Region`]'s complete attached region closure applies an

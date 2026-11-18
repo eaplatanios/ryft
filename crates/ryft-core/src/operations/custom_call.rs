@@ -2275,7 +2275,7 @@ mod tests {
         assert_eq!(operation.output_types(), &[ArrayType::new_static(DataType::F32, [2])]);
         assert!(!operation.has_side_effect());
         assert_eq!(operation.effect_class(), None);
-        assert!(operation.effects().is_pure());
+        assert!(!operation.effects().has_execution_effects());
         assert_eq!(operation.batching(), CustomCallBatching::Rejected);
         assert_eq!(operation.to_string(), "custom_call [target=ryft.test.add_one]");
 

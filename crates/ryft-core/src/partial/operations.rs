@@ -207,7 +207,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RecursivePartialEvaluationDriver<'_
         let mut shared_reference_boundary = false;
         let effect_ordering = if let Some(analysis) = reference_analysis {
             let effects = region.instruction_effects(instruction_index)?;
-            if effects.classes().is_ordered() {
+            if effects.classes().contains_ordered_class() {
                 // Resolve input roots once for both ordering and alias detection. Allocation identity includes views,
                 // even when the views select different elements of the allocation.
                 let mut roots = HashSet::new();
@@ -463,11 +463,11 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///     residual program over its inputs' residual program [`Atom`](crate::Atom)s, materializing each known input as
     ///     a residual input for a known variable or as an inlined residual program constant for a literal, so that the
     ///     operation runs at residual program execution time.
-    ///   - An operation with an ordered effect (i.e., [`EffectClasses::is_ordered`](crate::EffectClasses::is_ordered)
-    ///     over the operation and its executable computation regions) also follows the ordering rules on
-    ///     [`PartialEvaluationContext`] where once an ordered operation has been staged, every later ordered operation
-    ///     is staged too, even when all of its inputs are known, and reference operations under an eager known side
-    ///     follow the context's [`ReferencePlacement`].
+    ///   - When the operation or its executable computation regions contain an
+    ///     [ordered effect class](crate::EffectClasses::contains_ordered_class), the operation follows
+    ///     [`PartialEvaluationContext`]'s ordering rules. Once an ordered operation has been staged, every later
+    ///     ordered operation is staged too, even when all its inputs are known. Reference operations under an eager
+    ///     known side follow the context's [`ReferencePlacement`].
     ///   - An operation that carries deferred work over the same scope is always residualized, even when all of its
     ///     inputs are known. Refer to [`PartialEvaluationContext::fold_or_residualize`] for more information.
     ///

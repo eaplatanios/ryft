@@ -747,7 +747,7 @@ where
             || callee.output_types().iter().any(Type::is_reference)
             || callee
                 .instructions_in_closure()
-                .any(|(_, instruction)| instruction.operation().effects().has_accesses());
+                .any(|(_, instruction)| instruction.operation().effects().has_reference_accesses());
         if accesses_references {
             return fold_or_residualize_jit_call(self, context, driver, inputs);
         }

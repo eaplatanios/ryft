@@ -147,7 +147,7 @@ pub(super) fn reference_access_layout<O: ReferenceAccessOperation>(
     operation: &O,
     input_count: usize,
 ) -> Result<Vec<Option<ReferenceAccessDescriptor<'_, O::Transform>>>, (usize, String)> {
-    let accesses = operation.effects().accesses().collect::<BTreeMap<_, _>>();
+    let accesses = operation.effects().reference_accesses().collect::<BTreeMap<_, _>>();
     let malformed = |input: usize, message: String| (input, format!("operation `{}` {message}", operation.name()));
     if let Some((&input, _)) = accesses.range(input_count..).next() {
         return Err(malformed(

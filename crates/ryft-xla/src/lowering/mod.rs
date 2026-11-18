@@ -267,7 +267,7 @@ where
             region
                 .instructions()
                 .iter()
-                .any(|instruction| instruction.operation().effects().has_reference_declarations())
+                .any(|instruction| instruction.operation().effects().has_reference_effects())
         })
 }
 

@@ -119,7 +119,7 @@ impl EffectsSummary {
     /// applies only to repeated invocation; opaque state, ordered non-reference effects, and unaccounted ordered work
     /// retain global ordering.
     pub(super) fn effect_ordering<K: Eq + Hash, R: IntoIterator<Item = K>>(self, references: R) -> EffectOrdering<K> {
-        if !self.classes().is_ordered() {
+        if !self.classes().contains_ordered_class() {
             return EffectOrdering::default();
         }
         if self.has_explicit_ordered_state()
@@ -311,7 +311,11 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         outputs: Vec<PartialEvaluationOutput<usize>>,
     ) -> Result<Self, ProgramError> {
         let effect_ordering = [&known_program, &residual_program].map(|program| {
-            if program.effects().classes().is_ordered() { EffectOrdering::Global } else { EffectOrdering::default() }
+            if program.effects().classes().contains_ordered_class() {
+                EffectOrdering::Global
+            } else {
+                EffectOrdering::default()
+            }
         });
         let partition = Self {
             known_program,

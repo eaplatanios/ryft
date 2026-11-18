@@ -413,7 +413,7 @@ where
             || body.output_types().iter().any(Type::is_reference)
             || body
                 .instructions_in_closure()
-                .any(|(_, instruction)| instruction.operation().effects().has_reference_declarations());
+                .any(|(_, instruction)| instruction.operation().effects().has_reference_effects());
         if inputs.iter().all(PartialEvaluationValue::is_known)
             || !effects.classes().is_empty()
             || effects.is_retained_when_unused()

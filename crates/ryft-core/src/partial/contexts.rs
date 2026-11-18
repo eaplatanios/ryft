@@ -480,7 +480,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     #[inline]
     pub fn can_fold_effects(&self, effects: EffectClasses) -> bool {
         (self.state.allow_effect_folding || effects.is_empty())
-            && (!effects.is_ordered() || !self.state.defer_ordered_effects.get())
+            && (!effects.contains_ordered_class() || !self.state.defer_ordered_effects.get())
     }
 
     /// Applies the default partial evaluation policy to the provided `operation`. When all inputs are known, the
@@ -576,7 +576,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Reference and region applications retain their existing binding and failure-ordering paths. Local
         // regionless folds resolve before substitution: an input replacement preserves that input's shared
         // materialization slot, and a singleton replacement becomes a known constant of the inferred output type.
-        if regions.region_count() == 0 && !operation.effects().has_reference_declarations() {
+        if regions.region_count() == 0 && !operation.effects().has_reference_effects() {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             if !input_types.iter().any(Type::is_reference) {
                 let replacements = (|| -> Result<_, ProgramError> {
@@ -588,7 +588,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 })()
                 .inspect_err(|_| {
                     // A failed ordered application must not let later known effects run ahead of the failed work.
-                    if operation.effects().classes().is_ordered() {
+                    if operation.effects().classes().contains_ordered_class() {
                         self.state.defer_ordered_effects.set(true);
                     }
                 })?;
@@ -622,7 +622,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.state.reference_placement == ReferencePlacement::Stage
                 && self.state.parent.is_eager()
                 && (inputs.iter().any(|input| input.r#type().is_reference())
-                    || operation.effects().has_reference_declarations()
+                    || operation.effects().has_reference_effects()
                     || regions.regions().enumerate().any(|(index, region)| {
                         operation.region_role(index) == Some(RegionRole::Computation)
                     // Checked reference-effect endpoints are reference-typed, so inspecting atoms covers
@@ -651,7 +651,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let region_interfaces = regions.region_interfaces();
             can_defer_unsupported = !input_types.iter().any(Type::is_reference)
-                && !operation.effects().has_reference_declarations()
+                && !operation.effects().has_reference_effects()
                 && operation
                     .infer_output_types(&input_types, &region_interfaces)
                     .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
@@ -768,7 +768,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Record the ordering restriction before emission, which may fail partway through. Even if binding retains that
         // failure as poisoned outputs, later ordered operations must not execute ahead of the failed work. Retaining
         // the restriction without an emitted instruction can only defer additional ordered operations.
-        if effects.is_ordered() {
+        if effects.contains_ordered_class() {
             self.state.defer_ordered_effects.set(true);
         }
 
@@ -816,10 +816,12 @@ impl<C: Context> PartialEvaluationContext<C> {
         // operations must not move ahead of it either.
         let specialized_effects_are_ordered = match &specialized {
             Some(specialized) => specialized.iter().enumerate().any(|(index, region)| {
-                operation.region_role(index) == Some(RegionRole::Computation) && region.effects().classes().is_ordered()
+                operation.region_role(index) == Some(RegionRole::Computation)
+                    && region.effects().classes().contains_ordered_class()
             }),
             None => regions.regions().enumerate().any(|(index, region)| {
-                operation.region_role(index) == Some(RegionRole::Computation) && region.effects().classes().is_ordered()
+                operation.region_role(index) == Some(RegionRole::Computation)
+                    && region.effects().classes().contains_ordered_class()
             }),
         };
         if specialized_effects_are_ordered {

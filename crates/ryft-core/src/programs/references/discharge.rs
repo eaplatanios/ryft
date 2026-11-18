@@ -500,7 +500,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TryFrom<PartialReferenceDischargeRe
         // instruction position rather than the first one encountered, keeping the diagnostic reproducible.
         if let Some((instruction_id, instruction)) = entry
             .instructions_in_closure()
-            .filter(|(_, instruction)| instruction.operation().effects().has_reference_declarations())
+            .filter(|(_, instruction)| instruction.operation().effects().has_reference_effects())
             .min_by_key(|(instruction_id, _)| *instruction_id)
         {
             return Err(ProgramError::MalformedProgram(format!(
@@ -3423,11 +3423,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
     {
         let effects = operation.effects();
-        if !effects.has_accesses() || effects.allocation_output_indices().next().is_some() {
+        if !effects.has_reference_accesses() || effects.allocation_output_indices().next().is_some() {
             return Ok(None);
         }
         let mut consumed = Vec::new();
-        for (input_index, mode) in effects.accesses() {
+        for (input_index, mode) in effects.reference_accesses() {
             let Some(ReferenceDischargeValue::Reference(reference)) = inputs.get(input_index) else {
                 return Ok(None);
             };
@@ -4233,11 +4233,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// discharge counterpart of ordinary interpretation. The destination decides what replaying means (e.g., an eager
     /// destination executes the operation and a staging destination records it).
     ///
-    /// The precondition is reference freedom, not purity in the [`Effects::is_pure`](crate::Effects::is_pure) sense. An
-    /// operation with ordered or other effects replays here unchanged, because the replay reproduces those effects in
-    /// the destination exactly as the source performed them. Attached regions are copied into the destination as they
-    /// stand, which is the complete rewrite for regions that hold no state to thread, unless an operation in a region
-    /// defers part of its discharge (refer to [`Operation::defers_reference_discharge`]). Those regions are rebuilt by
+    /// Reference-free operations can still have [execution effects](crate::Effects::has_execution_effects). Replay
+    /// reproduces those effects in the destination exactly as the source performed them. Attached regions are copied
+    /// into the destination as they stand when they hold no state to thread, unless an operation in a region defers
+    /// part of its discharge (refer to [`Operation::defers_reference_discharge`]). Those regions are rebuilt by
     /// [`discharge_local_reference_operation`](Self::discharge_local_reference_operation) instead, so that the
     /// deferring operation records its discharge. An application is rejected as soon as a reference appears among its
     /// inputs or anywhere inside an attached region's closure. If references are confined to individual regions,

@@ -821,7 +821,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // names a reference-typed value, because a region-carrying operation carrying a reference through its boundary
         // declares nothing and is recognized only by its identity-forwarding hook.
         let instruction = self.instructions.last().unwrap();
-        let contains_references = instruction.operation().effects().has_reference_declarations()
+        let contains_references = instruction.operation().effects().has_reference_effects()
             || instruction
                 .inputs
                 .iter()
@@ -883,7 +883,7 @@ impl ReferenceLifetimes {
         }
         let name = operation.name();
         let effects = operation.effects();
-        for (input_index, mode) in effects.accesses() {
+        for (input_index, mode) in effects.reference_accesses() {
             let Some(atom) = inputs.get(input_index) else {
                 continue;
             };
@@ -911,7 +911,7 @@ impl ReferenceLifetimes {
     /// Records the consumptions and alias edges performed by one accepted application.
     fn record<O: Operation>(&mut self, operation: &O, inputs: &[AtomId], outputs: &[AtomId]) {
         let effects = operation.effects();
-        for (input_index, mode) in effects.accesses() {
+        for (input_index, mode) in effects.reference_accesses() {
             if mode.is_consuming()
                 && let Some(atom) = inputs.get(input_index)
             {

@@ -15,6 +15,16 @@
 //! its old value is dead, which is equivalent to a store because the read selects only the elements that the swap then
 //! overwrites and its result is unused.
 //!
+//! The host rejects an in-bounds tile load whose window leaves its source view and any tile load whose window limit
+//! exceeds the canonical dimension width, and the generated source cannot report such a failure at run time. Admission
+//! therefore requires the start bounds of every tile load to rule it out, so an admitted in-bounds load reads only
+//! valid elements and lowers like a masked one. For the same reason, admission rejects every assertion instead of
+//! dropping it.
+//!
+//! A dot lowers to one `ct.mma` whose accumulator has the output element type, which is the requested accumulation
+//! type. Admission accepts only the default precision, because the operand conversions of `ct.mma` for an explicit
+//! precision or algorithm have not been qualified.
+//!
 //! A read that follows a write to the same parameter in one block is expected to observe that write. Tile IR orders
 //! memory operations only through tokens, and the cuTile front end threads them so that every load waits for the last
 //! store to any array that may alias its own. The exporter declares all parameters in one alias group, so that
@@ -27,10 +37,14 @@
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation,
-    DimensionValue, DotDimensionNumbers, Operation, ProgramError, ReductionKind, ReferenceAccessOperation, RegionRef,
-    Typed, validated_reference_access_descriptors,
+    DimensionValue, DotDimensionNumbers, MAX_DIMENSION_EXTENT, Operation, ProgramError, ReductionKind,
+    ReferenceAccessMode, ReferenceAccessOperation, RegionRef, Typed, infer_reference_view_type,
+    validated_reference_access_descriptors,
 };
-use ryft_kernels::{BoundaryPolicy, GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
+use ryft_kernels::{
+    BoundaryPolicy, GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, TILE_LOAD_OPERATION_NAME,
+    TileLoadOperation, VerifiedKernel,
+};
 
 use crate::kernels::cutile::{Error, Options, Parameter, data_type_name, launch_grid};
 
@@ -293,6 +307,11 @@ impl Lowering {
                 .collect::<Vec<_>>();
             let expression = |index: usize| inputs[index].expression().map(str::to_owned);
             let results = match instruction.operation() {
+                // An assertion has no results, and the generated source cannot report its failure to the caller.
+                KernelOperation::Portable(ArrayIrOperation::Assert(_))
+                | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(_))) => {
+                    return Err(unsupported("assert", "runtime assertions require native failure propagation"));
+                }
                 KernelOperation::Portable(ArrayIrOperation::Array(operation)) => {
                     let input_types = types
                         .iter()
@@ -301,7 +320,12 @@ impl Lowering {
                             _ => Err(unsupported(operation.name(), "array operation received a non-array value")),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let ArrayIrType::Array(output) = &output_types[0] else { unreachable!() };
+                    let [ArrayIrType::Array(output)] = output_types.as_slice() else {
+                        return Err(unsupported(
+                            operation.name(),
+                            "array operations must have exactly one array result",
+                        ));
+                    };
                     let inputs = inputs
                         .iter()
                         .map(|input| input.expression().map(str::to_owned))
@@ -379,6 +403,7 @@ impl Lowering {
                     vec![]
                 }
                 KernelOperation::TileLoad(operation) => {
+                    validate_tile_load(operation, &types)?;
                     let Value::Reference { parameter, starts, limits, axes, fixed, validity, .. } = &inputs[0] else {
                         unreachable!()
                     };
@@ -775,6 +800,19 @@ impl Lowering {
                     && types[1].rank() == 2
                     && matches!(output.data_type(), DataType::F16 | DataType::F32 | DataType::F64) =>
             {
+                // `ct.mma` accumulates in the element type of its accumulator, which is the output type and therefore
+                // the requested accumulation type. How it converts the operands for an explicit precision or algorithm
+                // has not been qualified, so only the default precision is admitted.
+                if !operation.precision().is_default() {
+                    let precision = operation.precision();
+                    return Err(unsupported(
+                        operation.name(),
+                        &format!("precision `{precision}` has no qualified cuTile MMA conversion"),
+                    ));
+                }
+                if operation.output_sharding().is_some() {
+                    return Err(unsupported(operation.name(), "output shardings are unsupported"));
+                }
                 if types[0].data_type() != types[1].data_type()
                     || !matches!(
                         (types[0].data_type(), output.data_type()),
@@ -924,7 +962,7 @@ fn comparison(direction: ComparisonDirection) -> &'static str {
 
 /// Emits arithmetic only when canonical bounds already prove that it cannot raise an assertion.
 fn dimension(operation: &DimensionOperation<DimensionValue>, inputs: &[String]) -> Result<String, Error> {
-    if !operation.effects().is_pure() {
+    if operation.effects().has_execution_effects() {
         return Err(unsupported(operation.name(), "dimension arithmetic must be proven total"));
     }
     Ok(match operation {
@@ -941,6 +979,38 @@ fn dimension(operation: &DimensionOperation<DimensionValue>, inputs: &[String]) 
     })
 }
 
+/// Validates that the start bounds of a tile load with the input types `input_types` prove that the host never rejects
+/// its window, which the generated source cannot report at run time. Every window limit must fit the canonical
+/// dimension width, which also keeps the 64-bit window arithmetic from overflowing, and the window of an in-bounds load
+/// must also lie inside the view that its transforms select. An in-bounds load that satisfies this check reads only
+/// valid elements, so it lowers like a masked load.
+fn validate_tile_load(operation: &TileLoadOperation, input_types: &[ArrayIrType]) -> Result<(), Error> {
+    let rank = operation.block_shape().len();
+    let ArrayIrType::Reference(reference) = &input_types[0] else { unreachable!() };
+    let bindings = input_types[rank + 2..].iter().collect::<Vec<_>>();
+    let view =
+        infer_reference_view_type(reference.referent(), operation.transforms(), &bindings, ReferenceAccessMode::Read)?;
+    let shape = view.static_shape().unwrap();
+    let starts = &input_types[1..rank + 1];
+    for ((start, &block), &extent) in starts.iter().zip(operation.block_shape()).zip(shape.dimensions()) {
+        let ArrayIrType::Dimension(start) = start else { unreachable!() };
+        let limit = start.maximum_extent().and_then(|maximum| maximum.checked_add(block));
+        let (bound, reason) = match operation.boundary_policy() {
+            BoundaryPolicy::InBounds => {
+                (extent, "in-bounds tile loads require start bounds that prove the window lies inside the source view")
+            }
+            BoundaryPolicy::Masked => (
+                MAX_DIMENSION_EXTENT,
+                "tile load start bounds must prove that the window limit fits the canonical dimension width",
+            ),
+        };
+        if limit.is_none_or(|limit| limit > bound) {
+            return Err(unsupported(TILE_LOAD_OPERATION_NAME, reason));
+        }
+    }
+    Ok(())
+}
+
 /// Attaches a precise owning-operation diagnostic to every unsupported path.
 fn unsupported(operation: &'static str, reason: &str) -> Error {
     Error::Unsupported { operation, reason: reason.to_owned() }
@@ -951,8 +1021,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArraySliceAxis, BroadcastLikeOperation, Context, DimensionBounds, DimensionMulOperation, DimensionType,
-        FillLikeOperation, IotaLikeOperation, IotaOperation, ReferenceRead, ReferenceWrite,
+        ArraySliceAxis, AssertOperation, AssertionError, BroadcastLikeOperation, ConditionOperation, Context,
+        DimensionBounds, DimensionMulOperation, DimensionType, DotAlgorithm, DotAlgorithmPreset, DotInputPrecision,
+        DotOperation, DotPrecision, FillLikeOperation, IotaLikeOperation, IotaOperation, Placeholder, ProgramBuilder,
+        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, TypeError,
     };
     use ryft_kernels::{
         Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess, MappingExpression,
@@ -996,6 +1068,189 @@ mod tests {
         )
         .unwrap();
         KernelDefinition::trace(call, |(references, _)| references[1].write(&references[0].read()?)).unwrap()
+    }
+
+    /// Reason for which admission rejects an in-bounds tile load whose window it cannot prove valid.
+    const IN_BOUNDS_REASON: &str =
+        "in-bounds tile loads require start bounds that prove the window lies inside the source view";
+
+    /// Lowers `definition` and returns its complete source.
+    fn lowered_source(definition: &KernelDefinition) -> String {
+        let kernel = VerifiedKernel::new(definition, 1).unwrap();
+        lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap().code
+    }
+
+    /// Returns the operation and reason of the admission failure of `definition`.
+    fn rejection(definition: &KernelDefinition) -> (&'static str, String) {
+        let kernel = VerifiedKernel::new(definition, 1).unwrap();
+        match lower(&kernel, &Options::default(), &KernelSchedule::default()) {
+            Err(Error::Unsupported { operation, reason }) => (operation, reason),
+            Err(error) => panic!("expected an admission failure, got {error:?}"),
+            Ok(_) => panic!("expected an admission failure"),
+        }
+    }
+
+    /// Builds the common tile load fixture, which loads two elements with the padding value −1 at the constant element
+    /// start `start` of the view that `transforms` select from the four element input, and stores them in the two
+    /// element output.
+    fn tile_load_definition(
+        boundary: BoundaryPolicy,
+        start: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [4]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(start).unwrap()));
+        let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+        let operation = TileLoadOperation::new(vec![2], boundary).unwrap().with_transforms(transforms);
+        let tile = builder.add_instruction(operation, vec![], vec![inputs[0], start, other], None).unwrap()[0];
+        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None).unwrap();
+        KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
+    }
+
+    /// Builds two definitions that contain the in-bounds tile load of [`tile_load_definition`] at the start 3, which
+    /// the host never executes. The first runs it over an empty grid, which leaves its read-write output unchanged, and
+    /// the second runs it in the untaken branch of a condition whose other branch returns the padding value.
+    fn unreachable_tile_load_definitions() -> Vec<KernelDefinition> {
+        let source = ArrayType::new_static(DataType::F32, [4]);
+        let empty_grid = mapped_call(
+            Grid::new(vec![GridDimension::new(0usize.into(), GridExecution::Parallel)]).unwrap(),
+            vec![
+                (source.clone(), KernelParameterAccess::ReadOnly, ParameterWindow::WholeArray),
+                (
+                    ArrayType::new_static(DataType::F32, [2]),
+                    KernelParameterAccess::ReadWrite,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![2],
+                        boundary: BoundaryPolicy::Masked,
+                        indices: vec![MappingExpression::GridCoordinate(0)],
+                    },
+                ),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let untaken_branch = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(source.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let load = |builder: &mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, source| {
+            let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+            let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+            let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::InBounds).unwrap();
+            builder.add_instruction(operation, vec![], vec![source, start, other], None).unwrap()[0]
+        };
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs =
+            empty_grid.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let tile = load(&mut builder, inputs[0]);
+        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None).unwrap();
+        let empty_grid =
+            KernelDefinition::new(empty_grid, builder.build(vec![], vec![Placeholder; 3], vec![]).unwrap()).unwrap();
+
+        let mut taken = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = taken.add_input(untaken_branch.parameters()[0].body_type());
+        let tile = load(&mut taken, reference);
+        let taken = taken
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![tile],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut padding = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        padding.add_input(untaken_branch.parameters()[0].body_type());
+        let fill = padding.add_constant(ArrayIrValue::Array(Array::vector(vec![-1f32, -1.0]).unwrap()));
+        let padding = padding
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![fill],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs =
+            untaken_branch.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+        let taken = builder.import_region(taken.entry_region_ref());
+        let padding = builder.import_region(padding.entry_region_ref());
+        let tile = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![taken, padding],
+                vec![predicate, inputs[0]],
+                None,
+            )
+            .unwrap()[0];
+        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None).unwrap();
+        let untaken_branch =
+            KernelDefinition::new(untaken_branch, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap())
+                .unwrap();
+        vec![empty_grid, untaken_branch]
+    }
+
+    /// Builds the dot precision fixture, which multiplies its two 32×32 inputs with `operation`, and returns it
+    /// together with the inputs `1.0009765625 · I` and `I`, where `1.0009765625 = 1 + 2⁻¹⁰` is exact in F32 and
+    /// TensorFloat-32 and rounds to 1 in BF16.
+    fn dot_definition(operation: DotOperation) -> (KernelDefinition, Vec<Array>) {
+        let r#type = ArrayType::new_static(DataType::F32, [32, 32]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::trace(call, |(references, _)| {
+            let inputs = [references[0].read()?, references[1].read()?];
+            let operation = ArrayIrOperation::from(ArrayOperation::Dot(operation));
+            references[2].write(&inputs[0].context().bind(operation, vec![], &inputs)?.remove(0))
+        })
+        .unwrap();
+        let diagonal = |value: f32| {
+            let elements = (0..32 * 32).map(|index| if index % 33 == 0 { value } else { 0.0 }).collect::<Vec<_>>();
+            Array::from_elements(r#type.clone(), &elements).unwrap()
+        };
+        (definition, vec![diagonal(1.0 + 1.0 / 1024.0), diagonal(1.0)])
+    }
+
+    /// Builds the assertion fixture, which checks the constant `condition` with the zero result `operation` and then
+    /// copies its one element input to its output.
+    fn assertion_definition(operation: KernelOperation, condition: bool) -> KernelDefinition {
+        let r#type = ArrayType::new_static(DataType::F32, [1]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type, KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let condition = builder.add_constant(ArrayIrValue::Array(Array::scalar(condition).unwrap()));
+        builder.add_instruction(operation, vec![], vec![condition], None).unwrap();
+        let value = builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![inputs[0]], None).unwrap()[0];
+        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], value], None).unwrap();
+        KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
     }
 
     #[test]
@@ -1064,6 +1319,194 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_dot_precision() {
+        // The host default preserves the diagonal value, and the default precision lowers to one `ct.mma` over the
+        // unconverted operands that accumulates into an F32 tile.
+        let (definition, inputs) = dot_definition(DotOperation::matmul());
+        assert_eq!(definition.interpret(inputs.clone(), 1), Ok(vec![inputs[0].clone()]));
+        assert_eq!(
+            lowered_source(&definition),
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0, p1, p2):
+                v0 = ct.reshape(ct.arange(32, dtype=ct.int64), (32, 1))
+                v1 = (0 + v0)
+                v2 = ct.reshape(ct.arange(32, dtype=ct.int64), (1, 32))
+                v3 = (0 + v2)
+                v4 = ct.gather(p0, (v1, v3), mask=((v0 < 32) & (v1 < (0 + 32))) & ((v2 < 32) & (v3 < (0 + 32))), padding_value=0, check_bounds=True)
+                v5 = ct.reshape(ct.arange(32, dtype=ct.int64), (32, 1))
+                v6 = (0 + v5)
+                v7 = ct.reshape(ct.arange(32, dtype=ct.int64), (1, 32))
+                v8 = (0 + v7)
+                v9 = ct.gather(p1, (v6, v8), mask=((v5 < 32) & (v6 < (0 + 32))) & ((v7 < 32) & (v8 < (0 + 32))), padding_value=0, check_bounds=True)
+                v10 = ct.reshape(ct.arange(32, dtype=ct.int32), (32, 1))
+                v11 = ct.reshape(ct.arange(32, dtype=ct.int32), (1, 32))
+                v12 = ct.reshape(ct.arange(32, dtype=ct.int32), (32, 1))
+                v13 = ct.reshape(ct.arange(32, dtype=ct.int32), (1, 32))
+                v14 = ct.mma(ct.where((v10 < 32) & (v11 < 32), v4, 0), ct.where((v12 < 32) & (v13 < 32), v9, 0), ct.full((32, 32), 0, ct.float32))
+                v15 = ct.reshape(ct.arange(32, dtype=ct.int64), (32, 1))
+                v16 = (0 + v15)
+                v17 = ct.reshape(ct.arange(32, dtype=ct.int64), (1, 32))
+                v18 = (0 + v17)
+                ct.scatter(p2, (v16, v18), v14, mask=((v15 < 32) & (v16 < (0 + 32))) & ((v17 < 32) & (v18 < (0 + 32))), check_bounds=True)
+                return
+        "},
+        );
+
+        // Rounding the operands to BF16 rounds the diagonal value to 1 on the host. The conversions of `ct.mma` for an
+        // explicit precision are not qualified, so admission rejects every precision other than the default.
+        let (definition, inputs) =
+            dot_definition(DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32));
+        assert_eq!(definition.interpret(inputs.clone(), 1), Ok(vec![inputs[1].clone()]));
+        assert_eq!(
+            rejection(&definition),
+            ("dot", "precision `bf16_bf16_f32` has no qualified cuTile MMA conversion".to_owned()),
+        );
+        for precision in [
+            DotPrecision::from(DotInputPrecision::High),
+            DotPrecision::from(DotInputPrecision::Highest),
+            DotPrecision::from((DotInputPrecision::Default, DotInputPrecision::Highest)),
+            DotPrecision::from(DotAlgorithmPreset::F32_F32_F32),
+            DotPrecision::from(DotAlgorithmPreset::TF32_TF32_F32),
+            DotPrecision::from(DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32)),
+        ] {
+            let (definition, _) = dot_definition(DotOperation::matmul().with_precision(precision));
+            assert_eq!(
+                rejection(&definition),
+                ("dot", format!("precision `{precision}` has no qualified cuTile MMA conversion")),
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_assertions() {
+        // A true assertion has no results, so the copy that follows it returns `[5.0]` on the host, while a false
+        // assertion fails. The generated source cannot report an assertion failure to its caller, so admission rejects
+        // both forms of the assertion whatever its condition, instead of dropping it.
+        let source = Array::vector(vec![5f32]).unwrap();
+        let reason = "runtime assertions require native failure propagation".to_owned();
+        for operation in [
+            KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(AssertOperation::new("check")))),
+            KernelOperation::Portable(ArrayIrOperation::Assert(AssertOperation::new("check"))),
+        ] {
+            let passing = assertion_definition(operation.clone(), true);
+            assert_eq!(passing.interpret(vec![source.clone()], 1), Ok(vec![source.clone()]));
+            assert_eq!(rejection(&passing), ("assert", reason.clone()));
+            let failing = assertion_definition(operation, false);
+            assert_eq!(
+                failing.interpret(vec![source.clone()], 1),
+                Err(ProgramError::from(AssertionError::Failed { message: "check".to_owned(), observations: vec![] })),
+            );
+            assert_eq!(rejection(&failing), ("assert", reason.clone()));
+        }
+    }
+
+    #[test]
+    fn test_lower_tile_load() {
+        // A masked window at element 3 of `[3, 5, 7, 9]` gathers its valid element and takes the padding value for
+        // the element beyond the source view.
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+        let definition = tile_load_definition(BoundaryPolicy::Masked, 3, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![9f32, -1.0]).unwrap()]));
+        assert_eq!(
+            lowered_source(&definition),
+            indoc! {"
+            import cuda.tile as ct
+
+            @ct.kernel
+            def ryft_cutile_kernel(p0, p1):
+                v0 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), ())
+                v1 = ct.reshape(ct.arange(2, dtype=ct.int64), (2,))
+                v2 = ((0 + 3) + v1)
+                v3 = ct.gather(p0, (v2,), mask=((v1 < 2) & (v2 < (0 + 4))), padding_value=v0, check_bounds=True)
+                v4 = ct.reshape(ct.arange(2, dtype=ct.int64), (2,))
+                v5 = (0 + v4)
+                ct.scatter(p1, (v5,), v3, mask=((v4 < 2) & (v5 < (0 + 2))), check_bounds=True)
+                return
+        "},
+        );
+
+        // The same window under the in-bounds policy fails on the host. cuTile cannot report that failure at run time,
+        // so admission rejects every in-bounds load whose start bounds do not prove the window valid.
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 3, vec![]);
+        assert_eq!(
+            definition.interpret(vec![source], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
+        );
+        assert_eq!(rejection(&definition), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+    }
+
+    #[test]
+    fn test_lower_tile_load_boundaries() {
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+
+        // An in-bounds load whose start bounds prove a wholly valid window lowers like the masked load of that window.
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 2, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![7f32, 9.0]).unwrap()]));
+        assert_eq!(
+            lowered_source(&definition),
+            lowered_source(&tile_load_definition(BoundaryPolicy::Masked, 2, vec![])),
+        );
+
+        // Bounds apply to the selected view `[5, 7, 9]` rather than to the whole source, so the window at element 2 of
+        // that view fails even though it lies inside the source.
+        let slice = || vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] }];
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 1, slice());
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![7f32, 9.0]).unwrap()]));
+        assert_eq!(
+            lowered_source(&definition),
+            lowered_source(&tile_load_definition(BoundaryPolicy::Masked, 1, slice())),
+        );
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 2, slice());
+        assert_eq!(
+            definition.interpret(vec![source.clone()], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
+        );
+        assert_eq!(rejection(&definition), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+
+        // A masked window that starts beyond the view consists entirely of padding.
+        let definition = tile_load_definition(BoundaryPolicy::Masked, 4, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![-1f32, -1.0]).unwrap()]));
+        lowered_source(&definition);
+
+        // A window limit beyond the canonical dimension width fails on the host under either policy, and the 64-bit
+        // window arithmetic of cuTile would overflow, so admission rejects it even for a masked load.
+        let definition = tile_load_definition(BoundaryPolicy::Masked, MAX_DIMENSION_EXTENT - 1, vec![]);
+        assert_eq!(
+            definition.interpret(vec![source], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` window limit exceeds the canonical dimension width",
+            )))),
+        );
+        assert_eq!(
+            rejection(&definition),
+            (
+                TILE_LOAD_OPERATION_NAME,
+                "tile load start bounds must prove that the window limit fits the canonical dimension width".to_owned(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_lower_tile_load_unreachable() {
+        // Admission cannot tell whether an in-bounds load runs, so it rejects the load even where the host never
+        // executes it.
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+        let [empty_grid, untaken_branch] = unreachable_tile_load_definitions().try_into().ok().unwrap();
+        let output = Array::vector(vec![1f32, 2.0]).unwrap();
+        assert_eq!(empty_grid.interpret(vec![source.clone(), output.clone()], 1), Ok(vec![output]));
+        assert_eq!(rejection(&empty_grid), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+        assert_eq!(untaken_branch.interpret(vec![source], 1), Ok(vec![Array::vector(vec![-1f32, -1.0]).unwrap()]));
+        assert_eq!(rejection(&untaken_branch), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+    }
+
+    #[test]
     fn test_lower_masked_load() {
         // The masked window limits clip to the array, so the padding element of the second window and the physical
         // padding of every tile take the value `other`.
@@ -1088,16 +1531,18 @@ mod tests {
                 v1 = (ct.astype(ct.bid(0), ct.int64) // 2)
                 v2 = (v0 * 3)
                 v3 = (v0 * 3)
-                v4 = ct.broadcast_to(ct.full((), True, ct.bool_), (4,))
-                v5 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), (4,))
-                v6 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
-                v7 = (v2 + v6)
-                v8 = (((v6 < 3) & (v7 < ct.minimum((v2 + 3), 5)))) & (v4)
-                v9 = ct.gather(p0, (v7,), mask=v8, padding_value=0, check_bounds=True)
-                v10 = ct.where(v8, v9, v5)
-                v11 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
-                v12 = (v3 + v11)
-                ct.scatter(p1, (v12,), v10, mask=((v11 < 3) & (v12 < (v3 + 3))), check_bounds=True)
+                v4 = ct.broadcast_to(ct.full((), True, ct.bool_), ())
+                v5 = ct.broadcast_to(ct.reshape(v4, (1,)), (4,))
+                v6 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), ())
+                v7 = ct.broadcast_to(ct.reshape(v6, (1,)), (4,))
+                v8 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v9 = (v2 + v8)
+                v10 = (((v8 < 3) & (v9 < ct.minimum((v2 + 3), 5)))) & (v5)
+                v11 = ct.gather(p0, (v9,), mask=v10, padding_value=0, check_bounds=True)
+                v12 = ct.where(v10, v11, v7)
+                v13 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v14 = (v3 + v13)
+                ct.scatter(p1, (v14,), v12, mask=((v13 < 3) & (v14 < (v3 + 3))), check_bounds=True)
                 return
         "}
         );
@@ -1170,16 +1615,17 @@ mod tests {
                 v3 = (v0 * 3)
                 v4 = ct.broadcast_to(ct.full((), True, ct.bool_), (4,))
                 v5 = ct.broadcast_to(ct.bitcast(ct.full((), 1091567616, ct.uint32), ct.float32), (4,))
-                v6 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), (4,))
-                v7 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
-                v8 = (v2 + v7)
-                v9 = (((v7 < 3) & (v8 < ct.minimum((v2 + 3), 5)))) & (v4)
-                v10 = ct.gather(p0, (v8,), mask=v9, padding_value=0, check_bounds=True)
-                v11 = ct.where(v9, v10, v6)
-                ct.scatter(p0, (v8,), v5, mask=v9, check_bounds=True)
-                v12 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
-                v13 = (v3 + v12)
-                ct.scatter(p1, (v13,), v11, mask=((v12 < 3) & (v13 < (v3 + 3))), check_bounds=True)
+                v6 = ct.broadcast_to(ct.bitcast(ct.full((), 3212836864, ct.uint32), ct.float32), ())
+                v7 = ct.broadcast_to(ct.reshape(v6, (1,)), (4,))
+                v8 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v9 = (v2 + v8)
+                v10 = (((v8 < 3) & (v9 < ct.minimum((v2 + 3), 5)))) & (v4)
+                v11 = ct.gather(p0, (v9,), mask=v10, padding_value=0, check_bounds=True)
+                v12 = ct.where(v10, v11, v7)
+                ct.scatter(p0, (v9,), v5, mask=v10, check_bounds=True)
+                v13 = ct.reshape(ct.arange(4, dtype=ct.int64), (4,))
+                v14 = (v3 + v13)
+                ct.scatter(p1, (v14,), v12, mask=((v13 < 3) & (v14 < (v3 + 3))), check_bounds=True)
                 return
         "}
         );

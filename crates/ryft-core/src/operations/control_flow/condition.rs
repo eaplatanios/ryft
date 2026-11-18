@@ -8687,7 +8687,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evaluation.outputs, Vec::new());
-        assert!(evaluation.program.effects().classes().is_ordered());
+        assert!(evaluation.program.effects().classes().contains_ordered_class());
         let known_program = known_side_program(&outer, &evaluation, 2);
         assert_eq!(
             known_program.to_string(),
@@ -9479,8 +9479,24 @@ mod tests {
         };
         let true_branch = branch("true");
         let false_branch = branch("false");
-        assert!(true_branch.partition(&[false]).unwrap().residual_program().effects().classes().is_ordered());
-        assert!(false_branch.partition(&[false]).unwrap().residual_program().effects().classes().is_ordered());
+        assert!(
+            true_branch
+                .partition(&[false])
+                .unwrap()
+                .residual_program()
+                .effects()
+                .classes()
+                .contains_ordered_class()
+        );
+        assert!(
+            false_branch
+                .partition(&[false])
+                .unwrap()
+                .residual_program()
+                .effects()
+                .classes()
+                .contains_ordered_class()
+        );
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
@@ -9509,7 +9525,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Known(_)]));
-        assert!(evaluation.program.effects().classes().is_ordered());
+        assert!(evaluation.program.effects().classes().contains_ordered_class());
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
@@ -11161,7 +11177,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        assert!(program.effects().classes().is_ordered());
+        assert!(program.effects().classes().contains_ordered_class());
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(
             program.interpret(vec![Array::scalar(true).unwrap(), input.clone()]),
@@ -15857,7 +15873,7 @@ mod tests {
             .unwrap();
         let transposed = program.entry_region_ref().transpose(&[1], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
-        assert!(transposed.program().effects().classes().is_ordered());
+        assert!(transposed.program().effects().classes().contains_ordered_class());
         assert!(transposed.program().output_ids().is_empty());
         assert_eq!(
             transposed.program().to_string(),
@@ -15901,7 +15917,7 @@ mod tests {
         // Standard-error capture is unavailable here. The retained ordered print and successful execution of both
         // selected branches pin this path; backend tests additionally capture the actual callback output.
         for program in [transposed.program().as_ref(), &simplified] {
-            assert!(program.effects().classes().is_ordered());
+            assert!(program.effects().classes().contains_ordered_class());
             assert!(program.output_ids().is_empty());
             for predicate in [true, false] {
                 assert_eq!(
