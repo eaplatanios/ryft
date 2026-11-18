@@ -298,8 +298,7 @@ impl<O> HostCopy<O> {
                     state = copy.completed.wait(state).unwrap_or_else(PoisonError::into_inner);
                 }
 
-                let HostCopyState::Ready(event) = std::mem::replace(&mut *state, HostCopyState::CompletedWithoutEvent)
-                else {
+                let HostCopyState::Ready(event) = std::mem::replace(&mut *state, HostCopyState::Taken) else {
                     unreachable!("a readback must have its event installed before waiting");
                 };
 
@@ -341,18 +340,22 @@ impl<O> PendingHostCopy<O> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         *state = match *state {
             HostCopyState::Registering => HostCopyState::Pending(event),
-            HostCopyState::CompletedWithoutEvent => HostCopyState::Ready(event),
-            HostCopyState::Pending(_) | HostCopyState::Ready(_) => unreachable!("host copy event already installed"),
+            HostCopyState::CompletedBeforeInstallation => HostCopyState::Ready(event),
+            HostCopyState::Pending(_) | HostCopyState::Ready(_) | HostCopyState::Taken => {
+                unreachable!("host copy event already installed")
+            }
         };
     }
 
     /// Records callback completion and wakes the caller if it is waiting for the event.
     fn complete(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        *state = match std::mem::replace(&mut *state, HostCopyState::CompletedWithoutEvent) {
-            HostCopyState::Registering => HostCopyState::CompletedWithoutEvent,
+        *state = match std::mem::replace(&mut *state, HostCopyState::CompletedBeforeInstallation) {
+            HostCopyState::Registering => HostCopyState::CompletedBeforeInstallation,
             HostCopyState::Pending(event) => HostCopyState::Ready(event),
-            completed @ (HostCopyState::CompletedWithoutEvent | HostCopyState::Ready(_)) => completed,
+            completed @ (HostCopyState::CompletedBeforeInstallation
+            | HostCopyState::Ready(_)
+            | HostCopyState::Taken) => completed,
         };
 
         // Release the state lock before waking the reader.
@@ -370,11 +373,14 @@ enum HostCopyState<O> {
     /// The event is installed and its callback has yet to report completion.
     Pending(Event<O>),
 
-    /// The callback reported completion before event installation, or the reader has taken the completed event.
-    CompletedWithoutEvent,
+    /// The callback reported completion while the submitting thread still holds the event.
+    CompletedBeforeInstallation,
 
     /// The event is installed and its callback has reported completion. The reader can take the event.
     Ready(Event<O>),
+
+    /// The reader has taken the completed event to retrieve its payload.
+    Taken,
 }
 
 #[cfg(test)]
@@ -385,26 +391,29 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use ryft_core::{ArrayType, DataType, Neg};
+    use pretty_assertions::assert_eq;
+
     use ryft_pjrt::{Error as PjrtError, ExecutionFence};
 
-    use crate::sessions::tests::{domain_mesh, session_with_client};
-    use crate::tests::{cpu_client, execution_client, values_to_bytes};
-    use crate::{Array, DevicePutTarget, Error, ExecutionError};
+    use crate::tests::execution_client;
+    use crate::{Error, ExecutionError};
 
     use super::{HostCopy, HostCopyCompletion, HostCopyState, PendingHostCopy, WorkTracker};
 
     #[test]
     fn test_work_tracker_register() {
         let tracker = WorkTracker::<bool, &str>::default();
-        assert_eq!(tracker.snapshot(), 0);
         assert_eq!(tracker.register(true), 0);
         assert_eq!(tracker.register(false), 1);
-        assert_eq!(tracker.snapshot(), 2);
+
         let state = tracker.lock();
         assert_eq!(
-            state.pending.iter().map(|(&identity, pending)| (identity, pending.tag)).collect::<Vec<_>>(),
-            vec![(0, true), (1, false)]
+            state
+                .pending
+                .iter()
+                .map(|(&identity, pending)| (identity, pending.tag, pending.remaining, pending.error))
+                .collect::<Vec<_>>(),
+            vec![(0, true, 1, None), (1, false, 1, None)],
         );
         assert!(state.failures.is_empty());
     }
@@ -436,28 +445,41 @@ mod tests {
     }
 
     #[test]
-    fn test_work_tracker_wait() {
-        let tracker = WorkTracker::<bool, &str>::default();
-        let first = tracker.register(true);
+    fn test_work_tracker_snapshot() {
+        let tracker = WorkTracker::<(), ()>::default();
+        assert_eq!(tracker.snapshot(), 0);
+        let first = tracker.register(());
         let snapshot = tracker.snapshot();
-        let later = tracker.register(false);
+        let later = tracker.register(());
+        assert_eq!(snapshot, later);
+
+        // Retiring submissions leaves the exclusive registration boundary in place.
+        tracker.complete(first, None);
+        tracker.complete(later, None);
+        assert_eq!(tracker.snapshot(), 2);
+    }
+
+    #[test]
+    fn test_work_tracker_wait() {
+        let tracker = Arc::new(WorkTracker::<(), &str>::default());
+        let first = tracker.register(());
+        let snapshot = tracker.snapshot();
+        let later = tracker.register(());
         let (sender, receiver) = channel();
-        let result = thread::scope(|threads| {
-            let tracker = &tracker;
-            threads.spawn(move || {
-                let failures = tracker.wait(snapshot).failures.keys().copied().collect::<Vec<_>>();
-                sender.send(failures).unwrap();
-            });
-
-            // Only the first submission belongs to the snapshot, so its completion releases the waiter.
-            tracker.complete(first, Some("failed"));
-            let result = receiver.recv_timeout(Duration::from_secs(5));
-
-            // Complete the later submission so that the waiter can return even if it missed the deadline.
-            tracker.complete(later, None);
-            result
+        let waiting_tracker = Arc::clone(&tracker);
+        let waiter = thread::spawn(move || {
+            let state = waiting_tracker.wait(snapshot);
+            let failures = state.failures.keys().copied().collect::<Vec<_>>();
+            let pending = state.pending.keys().copied().collect::<Vec<_>>();
+            sender.send((failures, pending)).unwrap();
         });
-        assert_eq!(result, Ok(vec![first]));
+
+        // The waiter must observe the first failure while the later submission is still pending.
+        tracker.complete(first, Some("failed"));
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        tracker.complete(later, None);
+        assert_eq!(result, Ok((vec![first], vec![later])));
+        waiter.join().unwrap();
     }
 
     #[test]
@@ -466,79 +488,65 @@ mod tests {
         let identity = tracker.register(true);
         let poisoned = catch_unwind(|| {
             let _state = tracker.state.lock().unwrap();
-            panic!("poison tracker state");
+            panic!("fixture poisoned tracker state");
         });
-        assert!(poisoned.is_err());
+        assert_eq!(poisoned.unwrap_err().downcast_ref::<&str>(), Some(&"fixture poisoned tracker state"));
         assert!(tracker.state.is_poisoned());
 
-        // Locking repairs the mutex, so completion callbacks and waiters keep working after a panic.
-        tracker.complete(identity, Some("failed"));
+        let state = tracker.lock();
         assert!(!tracker.state.is_poisoned());
-        assert_eq!(tracker.wait(tracker.snapshot()).failures.get(&identity), Some(&(true, "failed")));
+        let pending = state.pending.get(&identity).unwrap();
+        assert_eq!((pending.tag, pending.remaining, pending.error), (true, 1, None));
+        assert!(state.failures.is_empty());
     }
 
     #[test]
-    fn test_work_tracker_synchronize_waits_for_its_snapshot() {
+    fn test_work_tracker_reserve() {
+        let work = Arc::new(WorkTracker::default());
+        let reservation = work.reserve();
+        assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(1));
+
+        // Canceling before enqueue retires the registration without reporting a failure.
+        drop(reservation);
+        let state = work.lock();
+        assert!(state.pending.is_empty());
+        assert!(state.failures.is_empty());
+    }
+
+    #[test]
+    fn test_work_tracker_synchronize() {
         let work = Arc::new(WorkTracker::default());
         let mut first = work.reserve();
-        let canceled = work.reserve();
         let mut second = work.reserve();
         let snapshot = work.snapshot();
         let mut later = work.reserve();
-        let (event, promise) = execution_client().event(()).unwrap();
-        let (sender, receiver) = channel();
 
-        let result = thread::scope(|threads| {
-            threads.spawn(|| sender.send(work.wait_for_snapshot(snapshot)).unwrap());
+        // Failures arrive in reverse registration order, and the latest failure belongs to a later snapshot.
+        later.track_error(PjrtError::aborted("later failed").into());
+        drop(later);
+        second.track_error(PjrtError::aborted("second failed").into());
+        drop(second);
+        first.track_error(PjrtError::aborted("first failed").into());
+        drop(first);
 
-            // Complete in a different order from registration. The canceled entry has no completion to publish.
-            second.track_error(PjrtError::aborted("second failed").into());
-            drop(second);
-            drop(canceled);
-            first.track_fence(ExecutionFence::new(vec![event]));
-            drop(first);
-            promise.set(Some(PjrtError::aborted("first failed"))).unwrap();
-
-            // Release the later reservation even if the waiter fails to return within the deadline.
-            let result = receiver.recv_timeout(Duration::from_secs(5));
-            later.track_error(PjrtError::aborted("later failed").into());
-            drop(later);
-            result
-        });
-        let Err(Error::Execution(ExecutionError::SynchronizationFailures { failures })) = result.unwrap() else {
+        let Err(Error::Execution(ExecutionError::SynchronizationFailures { failures })) =
+            work.wait_for_snapshot(snapshot)
+        else {
             panic!("synchronization should report both failures");
         };
         assert!(matches!(
             &failures[..],
             [(0, Error::Pjrt(PjrtError::Aborted { message: first, .. })),
-             (2, Error::Pjrt(PjrtError::Aborted { message: second, .. }))]
+             (1, Error::Pjrt(PjrtError::Aborted { message: second, .. }))]
                 if first == "first failed" && second == "second failed",
         ));
         assert!(matches!(
             work.synchronize(),
             Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
-                if matches!(&failures[..], [(3, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                if matches!(&failures[..], [(2, Error::Pjrt(PjrtError::Aborted { message, .. }))]
                     if message == "later failed"),
         ));
         work.synchronize().unwrap();
-    }
-
-    #[test]
-    fn test_work_reservation_drop_publishes_partial_batch() {
-        let work = Arc::new(WorkTracker::default());
-        let (event, promise) = execution_client().event(()).unwrap();
-        let mut reservation = work.reserve();
-        reservation.track_events([event]);
-        // Leaving the submission early still publishes completion for the transfer already enqueued.
-        drop(reservation);
-        assert_eq!(work.lock().pending.first_key_value().map(|(&identity, _)| identity), Some(0));
-        promise.set(Some(PjrtError::aborted("copy failed"))).unwrap();
-        assert!(matches!(
-            work.synchronize(),
-            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
-                if matches!(&failures[..], [(0, Error::Pjrt(PjrtError::Aborted { message, .. }))]
-                    if message == "copy failed"),
-        ));
     }
 
     #[test]
@@ -546,7 +554,7 @@ mod tests {
         let client = execution_client();
         let work = Arc::new(WorkTracker::default());
         let (event, promise) = client.event(vec![1, 2, 3]).unwrap();
-        let abandoned_payload = Arc::new(vec![4]);
+        let abandoned_payload = Arc::new(());
         let retained_payload = Arc::downgrade(&abandoned_payload);
         let (abandoned_event, abandoned_promise) = client.event(abandoned_payload).unwrap();
         let mut reservation = work.reserve();
@@ -554,6 +562,7 @@ mod tests {
         let abandoned = reservation.track_host_copy(abandoned_event);
         drop(reservation);
         drop(abandoned);
+
         // The callback retains the abandoned copy's event and payload while the copy is pending.
         assert_eq!(retained_payload.strong_count(), 1);
         assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(2));
@@ -571,45 +580,88 @@ mod tests {
     }
 
     #[test]
-    fn test_work_tracker_reserve_tracks_execution_and_transfers() {
-        let client = cpu_client(2);
-        let session = session_with_client(client);
-        let mesh = domain_mesh(client, "x", 2);
-        let (source_mesh, _) = DevicePutTarget::device(mesh.devices()[0]).resolve(1).unwrap();
-        let scoped = session.with_new_effect_scope().with_device_mesh(source_mesh);
+    fn test_work_reservation_track_host_copy_already_ready() {
+        let work = Arc::new(WorkTracker::default());
+        let (event, promise) = execution_client().event(()).unwrap();
+        promise.set(Some(PjrtError::aborted("copy failed before tracking"))).unwrap();
+        let mut reservation = work.reserve();
+        let copy = reservation.track_host_copy(event);
 
-        let input = Array::from_host_buffer(
-            &scoped,
-            ArrayType::new_static(DataType::F32, [2]),
-            None,
-            None,
-            values_to_bytes(&[1.0f32, 2.0]),
-        )
-        .unwrap();
-        assert_eq!(session.state.work.snapshot(), 1);
-
-        let output = Neg::neg(&input).unwrap();
-        assert_eq!(session.state.work.snapshot(), 2);
-
-        let placed = output.into_placement(&scoped, DevicePutTarget::device(mesh.devices()[1])).unwrap();
-        assert_eq!(session.state.work.snapshot(), 3);
-
-        let copy = placed.begin_copy_to_host().unwrap();
-        assert_eq!(session.state.work.snapshot(), 4);
-        drop((input, placed, copy));
-        session.synchronize().unwrap();
+        // A ready readback reports its native error without adding a pending dependency.
+        assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(1));
+        assert!(matches!(
+            copy.wait(),
+            Err(PjrtError::Aborted { message, .. }) if message == "copy failed before tracking",
+        ));
+        drop(reservation);
+        assert!(matches!(
+            work.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(0, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                    if message == "copy failed before tracking"),
+        ));
     }
 
     #[test]
-    fn test_host_copy_wait_after_inline_completion() {
+    fn test_work_reservation_finish() {
+        let client = execution_client();
+        let work = Arc::new(WorkTracker::default());
+        let (first_event, first_promise) = client.event(()).unwrap();
+        let (second_event, second_promise) = client.event(()).unwrap();
+        let second_fence = ExecutionFence::new(vec![second_event]);
+        let mut reservation = work.reserve();
+        reservation.track_fence(ExecutionFence::new(vec![first_event]));
+        reservation.track_fence(second_fence.clone());
+        let fence = reservation.finish().unwrap();
+
+        // The second fence can fail while the joined fence still waits for the first.
+        second_promise.set(Some(PjrtError::aborted("second fence failed"))).unwrap();
+        let error = second_fence.block_until_ready().unwrap_err();
+        assert_eq!(fence.is_ready(), Ok(false));
+        assert!(work.lock().pending.contains_key(&0));
+
+        // The returned fence and the session tracker both observe the joined completion.
+        first_promise.set(None).unwrap();
+        assert_eq!(fence.block_until_ready(), Err(error));
+        assert!(matches!(
+            work.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(0, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                    if message == "second fence failed"),
+        ));
+    }
+
+    #[test]
+    fn test_work_reservation_drop() {
+        let work = Arc::new(WorkTracker::default());
+        let (event, promise) = execution_client().event(()).unwrap();
+        let mut reservation = work.reserve();
+        reservation.track_events([event]);
+
+        // Leaving the submission early still tracks the transfer already enqueued.
+        drop(reservation);
+        assert!(work.lock().pending.contains_key(&0));
+        promise.set(Some(PjrtError::aborted("copy failed"))).unwrap();
+        assert!(matches!(
+            work.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(0, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                    if message == "copy failed"),
+        ));
+    }
+
+    #[test]
+    fn test_host_copy_wait() {
         let (event, promise) = execution_client().event(42).unwrap();
         let copy = Arc::new(PendingHostCopy::new());
         promise.set(None).unwrap();
 
         // Simulate an inline callback by reporting completion before installing the event.
         copy.complete();
-        assert!(matches!(*copy.state.lock().unwrap(), HostCopyState::CompletedWithoutEvent));
+        assert!(matches!(*copy.state.lock().unwrap(), HostCopyState::CompletedBeforeInstallation));
         copy.install(event);
-        assert_eq!(HostCopy(HostCopyCompletion::Pending(copy)).wait(), Ok(42));
+        assert!(matches!(*copy.state.lock().unwrap(), HostCopyState::Ready(_)));
+        assert_eq!(HostCopy(HostCopyCompletion::Pending(Arc::clone(&copy))).wait(), Ok(42));
+        assert!(matches!(*copy.state.lock().unwrap(), HostCopyState::Taken));
     }
 }
