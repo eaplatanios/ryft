@@ -7,6 +7,7 @@ exports_files([
     "xla-embedded-constants-target.patch",
     "xla-fp6-nan-predicate.patch",
     "xla-llvm-sharded-op-defs.patch",
+    "xla-pjrt-gpu-stream-options.patch",
     "xla-triton-nvidia-llvm-bit-cast.patch",
     "xla-xnnpack-integer-min-max.patch",
 ])

@@ -841,8 +841,6 @@ fn validate_identifier(identifier: &str) -> Result<(), Error> {
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

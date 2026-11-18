@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Poll, Waker};
 
 use prost::Message;
@@ -1361,10 +1361,16 @@ struct ExecutionFenceState {
 }
 
 impl ExecutionFenceState {
+    /// Locks the recorded completion state even if the mutex was poisoned. Native cleanup and callbacks run outside
+    /// this lock, and callers still use the result published by [`Self::record`] after cleanup finishes.
+    fn lock_completion(&self) -> MutexGuard<'_, ExecutionFenceCompletion> {
+        self.completion.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Records one device event result and invokes terminal callbacks after releasing the state lock.
     fn record(&self, error: Option<Error>) {
         let result = {
-            let mut completion = self.completion.lock().expect("execution fence completion mutex poisoned");
+            let mut completion = self.lock_completion();
             if completion.remaining == 0 {
                 return;
             }
@@ -1375,9 +1381,10 @@ impl ExecutionFenceState {
             (completion.remaining == 0).then(|| completion.error.clone().map_or(Ok(()), Err))
         };
         if let Some(result) = result {
+            // The owner locks protect ownership transfers. Recover their contents so cleanup can finish after poison.
             // Native context destruction can inspect userdata. It must finish while callers still see this fence
             // as pending and therefore retain every borrowed userdata allocation.
-            let keepalive = self.keepalive.lock().expect("execution fence keepalive mutex poisoned").take();
+            let keepalive = self.keepalive.lock().unwrap_or_else(PoisonError::into_inner).take();
             drop(keepalive);
 
             // Native callbacks retain this state so registered completion consumers survive after every public fence
@@ -1389,11 +1396,11 @@ impl ExecutionFenceState {
             // from that callback is sanctioned PJRT usage: the upstream `ConvertCEventToCppFuture` bridge likewise
             // calls `PJRT_Event_Destroy` as its callback's final action (refer to `pjrt_c_api_helpers.cc`). Plugins
             // must tolerate event destruction overlapping callback-dispatch teardown. Destruction runs outside locks.
-            let events = std::mem::take(&mut *self.events.lock().expect("execution fence events mutex poisoned"));
+            let events = std::mem::take(&mut *self.events.lock().unwrap_or_else(PoisonError::into_inner));
             drop(events);
 
             let callbacks = {
-                let mut completion = self.completion.lock().expect("execution fence completion mutex poisoned");
+                let mut completion = self.lock_completion();
                 completion.result = Some(result.clone());
                 std::mem::take(&mut completion.callbacks)
             };
@@ -1467,7 +1474,7 @@ impl ExecutionFence {
                     Err(Error::MissingFunction { function_name: "PJRT_Event_Await", .. }) => {
                         // No observer can establish completion. Pin owned launch data rather than freeing pointers
                         // that a nonconforming plugin may still borrow after all public fence handles disappear.
-                        if state.keepalive.lock().expect("execution fence keepalive mutex poisoned").is_some() {
+                        if state.keepalive.lock().unwrap_or_else(PoisonError::into_inner).is_some() {
                             std::mem::forget(Arc::clone(&state));
                         }
                         continue;
@@ -1480,15 +1487,15 @@ impl ExecutionFence {
             }
         }
 
-        *state.events.lock().expect("execution fence events mutex poisoned") = retained_events;
+        *state.events.lock().unwrap_or_else(PoisonError::into_inner) = retained_events;
 
         // If every event completed while its callback was still being registered, the terminal transition has already
         // run against an empty retention vector, and no later `record` call will release the events that were just
         // installed. Releasing them here, on the constructing thread, keeps the ownership cycle bounded in that race
         // as well: a concurrent terminal `record` and this cleanup take from the same vector, so the events are dropped
         // exactly once.
-        if state.completion.lock().expect("execution fence completion mutex poisoned").remaining == 0 {
-            let events = std::mem::take(&mut *state.events.lock().expect("execution fence events mutex poisoned"));
+        if state.lock_completion().remaining == 0 {
+            let events = std::mem::take(&mut *state.events.lock().unwrap_or_else(PoisonError::into_inner));
             drop(events);
         }
 
@@ -1505,13 +1512,7 @@ impl ExecutionFence {
             return Ok(true);
         };
 
-        state
-            .completion
-            .lock()
-            .expect("execution fence completion mutex poisoned")
-            .result
-            .clone()
-            .map_or(Ok(false), |result| result.map(|_| true))
+        state.lock_completion().result.clone().map_or(Ok(false), |result| result.map(|_| true))
     }
 
     /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
@@ -1520,9 +1521,9 @@ impl ExecutionFence {
             return Ok(());
         };
 
-        let mut completion = state.completion.lock().expect("execution fence completion mutex poisoned");
+        let mut completion = state.lock_completion();
         while completion.result.is_none() {
-            completion = state.ready.wait(completion).expect("execution fence completion mutex poisoned while waiting");
+            completion = state.ready.wait(completion).unwrap_or_else(PoisonError::into_inner);
         }
         completion.result.clone().unwrap()
     }
@@ -1572,7 +1573,7 @@ impl ExecutionFence {
         };
 
         let callback = {
-            let mut completion = state.completion.lock().expect("execution fence completion mutex poisoned");
+            let mut completion = state.lock_completion();
             if let Some(result) = &completion.result {
                 Some((Box::new(callback) as ExecutionFenceCallback, result.clone()))
             } else {
@@ -3227,6 +3228,16 @@ mod tests {
         static SUBMISSION_EVENTS: RefCell<Vec<*mut crate::events::ffi::PJRT_Event>> = const { RefCell::new(Vec::new()) };
     }
 
+    /// Poisons `mutex` by unwinding while holding its lock.
+    fn poison_mutex<T>(mutex: &Mutex<T>) {
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("fixture poisoned the mutex");
+        });
+        assert_eq!(panic.unwrap_err().downcast_ref::<&str>(), Some(&"fixture poisoned the mutex"));
+        assert!(mutex.is_poisoned());
+    }
+
     /// Transfers controlled real native events through a successful launch while leaving output handles null.
     unsafe extern "C" fn submit_controlled_events(
         args: *mut ffi::PJRT_LoadedExecutable_Execute_Args,
@@ -4487,30 +4498,28 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_fence_readiness_transitions_around_a_blocked_waiter() {
+    fn test_execution_fence_observes_completion_with_a_poisoned_mutex() {
         let client = test_cpu_client();
         let (event, promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![event]);
 
-        // Nothing has completed the underlying event yet, so readiness polling reports `false` instead of waiting.
+        poison_mutex(&fence.state.as_ref().unwrap().completion);
         assert_eq!(fence.is_ready(), Ok(false));
 
-        // Poll while another thread enters `block_until_ready`. This cannot distinguish a conservative poll from a
-        // truthful one (the waiter releases the completion lock either way and the event is genuinely pending), and
-        // the handshake orders only thread start, not parking, so the poll-while-parked overlap is opportunistic
-        // rather than guaranteed. What it pins is that after completion the waiter and a poll observe one shared
-        // terminal result.
         let waiting_fence = fence.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (started, waiting) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            sender.send(()).unwrap();
-            waiting_fence.block_until_ready()
+            started.send(()).unwrap();
+            finished.send(waiting_fence.block_until_ready()).unwrap();
         });
-        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(fence.is_ready(), Ok(false));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before_completion = completed.recv_timeout(Duration::from_millis(100));
 
         promise.set(None).unwrap();
-        assert_eq!(waiter.join().unwrap(), Ok(()));
+        assert_eq!(before_completion, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(completed.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        waiter.join().unwrap();
         assert_eq!(fence.is_ready(), Ok(true));
     }
 
@@ -4536,6 +4545,10 @@ mod tests {
             vec![event],
             Some(Box::new(BlockingCleanup { started, release: release_receiver })),
         );
+        let state = fence.state.as_ref().unwrap();
+        poison_mutex(&state.keepalive);
+        poison_mutex(&state.events);
+
         std::thread::scope(|threads| {
             threads.spawn(move || promise.set(None).unwrap());
             started_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4547,6 +4560,7 @@ mod tests {
             assert_eq!(fence.block_until_ready(), Ok(()));
             assert_eq!(callback_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
         });
+        assert!(state.events.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
     }
 
     #[test]

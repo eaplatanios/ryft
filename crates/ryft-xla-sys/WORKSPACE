@@ -25,6 +25,7 @@ http_archive(
         "//patches:xla-embedded-constants-target.patch",
         "//patches:xla-fp6-nan-predicate.patch",
         "//patches:xla-llvm-sharded-op-defs.patch",
+        "//patches:xla-pjrt-gpu-stream-options.patch",
         "//patches:xla-triton-nvidia-llvm-bit-cast.patch",
         "//patches:xla-xnnpack-integer-min-max.patch",
     ],

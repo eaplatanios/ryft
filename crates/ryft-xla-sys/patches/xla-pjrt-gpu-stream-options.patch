@@ -1,0 +1,15 @@
+diff --git a/xla/pjrt/gpu/se_gpu_pjrt_client.cc b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
+--- a/xla/pjrt/gpu/se_gpu_pjrt_client.cc
++++ b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
+@@ -1403,6 +1403,7 @@
+   if (compute_stream_priority.has_value()) {
+-    stream_options.emplace();
+-    stream_options->priority = *compute_stream_priority;
+-    stream_options->num_device_to_host_streams = 4;
+-    stream_options->num_device_to_device_streams = 4;
++    stream_options = LocalDeviceState::StreamOptions{
++        .priority = *compute_stream_priority,
++        .num_device_to_host_streams = 4,
++        .num_device_to_device_streams = 4,
++    };
+   }
