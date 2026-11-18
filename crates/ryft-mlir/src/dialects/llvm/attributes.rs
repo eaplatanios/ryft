@@ -13,10 +13,10 @@ use ryft_xla_sys::bindings::{
     MlirLLVMCConv_MlirLLVMCConvMSP430_BUILTIN, MlirLLVMCConv_MlirLLVMCConvMSP430_INTR,
     MlirLLVMCConv_MlirLLVMCConvPTX_Device, MlirLLVMCConv_MlirLLVMCConvPTX_Kernel,
     MlirLLVMCConv_MlirLLVMCConvPreserveAll, MlirLLVMCConv_MlirLLVMCConvPreserveMost,
-    MlirLLVMCConv_MlirLLVMCConvSPIR_FUNC, MlirLLVMCConv_MlirLLVMCConvSPIR_KERNEL, MlirLLVMCConv_MlirLLVMCConvSwift,
-    MlirLLVMCConv_MlirLLVMCConvSwiftTail, MlirLLVMCConv_MlirLLVMCConvTail,
-    MlirLLVMCConv_MlirLLVMCConvWASM_EmscriptenInvoke, MlirLLVMCConv_MlirLLVMCConvWin64,
-    MlirLLVMCConv_MlirLLVMCConvX86_64_SysV, MlirLLVMCConv_MlirLLVMCConvX86_FastCall,
+    MlirLLVMCConv_MlirLLVMCConvPreserveNone, MlirLLVMCConv_MlirLLVMCConvSPIR_FUNC,
+    MlirLLVMCConv_MlirLLVMCConvSPIR_KERNEL, MlirLLVMCConv_MlirLLVMCConvSwift, MlirLLVMCConv_MlirLLVMCConvSwiftTail,
+    MlirLLVMCConv_MlirLLVMCConvTail, MlirLLVMCConv_MlirLLVMCConvWASM_EmscriptenInvoke,
+    MlirLLVMCConv_MlirLLVMCConvWin64, MlirLLVMCConv_MlirLLVMCConvX86_64_SysV, MlirLLVMCConv_MlirLLVMCConvX86_FastCall,
     MlirLLVMCConv_MlirLLVMCConvX86_INTR, MlirLLVMCConv_MlirLLVMCConvX86_RegCall,
     MlirLLVMCConv_MlirLLVMCConvX86_StdCall, MlirLLVMCConv_MlirLLVMCConvX86_ThisCall,
     MlirLLVMCConv_MlirLLVMCConvX86_VectorCall, MlirLLVMComdat, MlirLLVMComdat_MlirLLVMComdatAny,
@@ -231,6 +231,9 @@ pub enum CallingConvention {
     /// Swift tail calling convention.
     SwiftTail,
 
+    /// Runtime calling convention in which the callee preserves no general-purpose registers.
+    PreserveNone,
+
     /// x86 stdcall calling convention.
     X86StdCall,
 
@@ -350,6 +353,7 @@ impl CallingConvention {
         Self::Tail,
         Self::CfGuardCheck,
         Self::SwiftTail,
+        Self::PreserveNone,
         Self::X86StdCall,
         Self::X86FastCall,
         Self::ArmApcs,
@@ -402,6 +406,7 @@ impl CallingConvention {
             Self::Tail => MlirLLVMCConv_MlirLLVMCConvTail,
             Self::CfGuardCheck => MlirLLVMCConv_MlirLLVMCConvCFGuard_Check,
             Self::SwiftTail => MlirLLVMCConv_MlirLLVMCConvSwiftTail,
+            Self::PreserveNone => MlirLLVMCConv_MlirLLVMCConvPreserveNone,
             Self::X86StdCall => MlirLLVMCConv_MlirLLVMCConvX86_StdCall,
             Self::X86FastCall => MlirLLVMCConv_MlirLLVMCConvX86_FastCall,
             Self::ArmApcs => MlirLLVMCConv_MlirLLVMCConvARM_APCS,
@@ -1230,10 +1235,12 @@ mod tests {
     #[test]
     fn test_calling_convention_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_calling_convention_attribute(CallingConvention::Fast).unwrap();
-        assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
-        assert_eq!(attribute.value().unwrap(), CallingConvention::Fast);
+        for value in [CallingConvention::Fast, CallingConvention::PreserveNone] {
+            let attribute = context.llvm_calling_convention_attribute(value).unwrap();
+            assert_eq!(&context, attribute.context());
+            assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
+            assert_eq!(attribute.value().unwrap(), value);
+        }
     }
 
     #[test]

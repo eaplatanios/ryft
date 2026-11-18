@@ -1,10 +1,13 @@
 //! CUDA array and scalar ABI embedding and validated payload reconstruction.
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use std::sync::Arc;
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use ryft_core::DeviceMesh;
 use ryft_core::{
-    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, EffectClass, Memory,
-    Operation as CoreOperation, Typed,
+    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation as CoreOperation,
+    Typed,
 };
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
@@ -13,32 +16,35 @@ use ryft_cuda::{
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_cuda::{CudaKernelArgument, CudaKernelLauncher, CudaScalarValue};
 use ryft_kernels::{KernelParameterAccess, VerifiedKernel};
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::Client;
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
-    FfiOutput, FfiTypeInformation, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+    FfiOutput, FfiTypeId, FfiTypeInformation, FfiUserData, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
-use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiUserData};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
-use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
-use crate::{
-    CustomCallOperationExtension, Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement,
-    ToPjrt,
-};
+use crate::sessions::runtimes::builtin_requirement;
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use crate::sessions::runtimes::validate_builtin_requirement;
+use crate::{CustomCallOperationExtension, Error, ToPjrt};
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use crate::{ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement};
 
 // TODO(eaplatanios): Review this module.
 
-/// Registered handler for versioned ready CUDA artifacts embedded in StableHLO.
+/// Custom call target for the built-in CUDA artifact handler.
 pub const CUDA_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.cuda";
 
 /// Name of the native type through which the built-in CUDA artifact handler recovers its session runtime.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 const CUDA_RUNTIME_TYPE_NAME: &str = "ryft.kernel.cuda.runtime";
 
 /// Explicit native type ID registered under [`CUDA_RUNTIME_TYPE_NAME`] and used to look up the session runtime.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 const CUDA_RUNTIME_TYPE_ID: FfiTypeId = FfiTypeId::from_name(CUDA_RUNTIME_TYPE_NAME);
 
 impl From<ryft_cuda::Error> for Error {
@@ -86,11 +92,11 @@ impl CudaKernelParameterBinding {
 /// operands, writable arrays use results, and read-write arrays retain their canonical alias between an operand and a
 /// result. Static scalars expand a compiler-owned ABI without adding logical array parameters or a second launch path.
 ///
-/// Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] to use the native handler owned by the session. The XLA session
-/// initializes its launcher during compilation and reload, supplies execution context user data at submission, and
-/// retains fences over whole executions through session cleanup. Other target names select explicitly registered
-/// handlers with the same payload contract. Artifact construction and embedding alone do not establish the safety of
-/// executable code.
+/// Embedding and payload validation are available on CPU hosts. Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] and enable
+/// `cuda-12` or `cuda-13` to use the built-in native handler. The session initializes its launcher during compilation
+/// or reload, supplies execution context user data at submission, and retains fences over whole executions through
+/// session cleanup. Other target names select explicitly registered handlers with the same payload contract.
+/// Artifact construction and embedding alone do not establish the safety of executable code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaKernelEmbedding {
     /// Registered XLA FFI target that decodes this envelope.
@@ -384,6 +390,7 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
 }
 
 /// Returns the built-in CUDA provider without loading a driver or a PJRT plugin.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 pub(super) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(CudaRuntimeProvider)
 }
@@ -514,41 +521,32 @@ impl CudaEnvelope {
 /// Launcher owned by the session and borrowed by native execution contexts. The session waits on its existing
 /// execution fences before dropping this object, so cached modules are released while the externally borrowed PJRT
 /// client is alive.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 struct CudaKernelRuntime {
     /// PJRT client against which this runtime validates invocation meshes.
     client: &'static Client<'static>,
 
     /// Existing driver owner, including its canonical bounded module cache and cleanup reporting.
-    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     launcher: CudaKernelLauncher,
 }
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 impl CudaKernelRuntime {
     /// Loads the driver and idempotently registers the shared handler for this CUDA plugin.
     fn new(client: &'static Client<'static>) -> Result<Self, Error> {
-        #[cfg(not(any(feature = "cuda-12", feature = "cuda-13")))]
-        {
-            let _ = client;
-            Err(KernelEmbeddingError::Invalid {
-                message: "cuda artifact execution requires the `cuda-12` or `cuda-13` feature".to_owned(),
-            }
-            .into())
-        }
-        #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-        {
-            let launcher = client.cuda_kernel_launcher()?;
-            client.register_ffi_type(CUDA_RUNTIME_TYPE_NAME, CUDA_RUNTIME_TYPE_ID, FfiTypeInformation::new(None))?;
-            client.register_ffi_handler(
-                CUDA_KERNEL_CUSTOM_CALL_TARGET,
-                "CUDA",
-                FfiHandler::from(cuda_kernel_handler as XLA_FFI_Handler),
-                FfiHandlerTraits::NONE,
-            )?;
-            Ok(Self { client, launcher })
-        }
+        let launcher = client.cuda_kernel_launcher()?;
+        client.register_ffi_type(CUDA_RUNTIME_TYPE_NAME, CUDA_RUNTIME_TYPE_ID, FfiTypeInformation::new(None))?;
+        client.register_ffi_handler(
+            CUDA_KERNEL_CUSTOM_CALL_TARGET,
+            "CUDA",
+            FfiHandler::from(cuda_kernel_handler as XLA_FFI_Handler),
+            FfiHandlerTraits::NONE,
+        )?;
+        Ok(Self { client, launcher })
     }
 }
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 impl RuntimeExtension for CudaKernelRuntime {
     fn validate(&self, mesh: &DeviceMesh) -> Result<(), Error> {
         crate::kernels::distributed::validate_kernel_participants(self.client, mesh)?;
@@ -563,8 +561,10 @@ impl RuntimeExtension for CudaKernelRuntime {
 }
 
 /// Lazily initializes CUDA launch support for a selected PJRT client.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 struct CudaRuntimeProvider;
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 impl RuntimeProvider for CudaRuntimeProvider {
     fn identifier(&self) -> &str {
         CUDA_KERNEL_CUSTOM_CALL_TARGET
@@ -700,7 +700,9 @@ mod tests {
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::{Constant, Platform, ProgramBuilder, RuntimeError};
+    use crate::{Constant, ProgramBuilder};
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    use crate::{Platform, RuntimeError};
 
     use super::*;
 
@@ -1195,6 +1197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     fn test_cuda_runtime_provider_initialize() {
         let client = Platform::Cpu.client(None).unwrap();
         let provider = runtime_provider();

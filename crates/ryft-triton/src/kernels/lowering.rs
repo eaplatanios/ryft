@@ -61,13 +61,10 @@
 //!
 //! # Memory Ordering
 //!
-//! This section describes Triton as read from its sources at revision `678608832e2eed6a2d29462cc08e5c105089bea8`,
-//! with the patches of the OpenXLA checkout that selects that revision. The linked compiler reports revision
-//! `2122e24efc1886bfa36337c1f5b07c47d827b1d4`, so these statements have not been confirmed against the compiler that
-//! actually runs, and only the NVIDIA lowering was read. No kernel that relies on them has been compiled natively or
-//! run on a device.
+//! These observations come from reviewing the NVIDIA lowering and software pipeliner in Triton revision
+//! `678608832e2eed6a2d29462cc08e5c105089bea8` with the patches from the OpenXLA checkout that selected it.
 //!
-//! That Triton keeps the global memory accesses of one thread in program order. Its passes honor the memory
+//! In that revision, Triton keeps the global memory accesses of one thread in program order. Its passes honor the memory
 //! effects of `tt.load` (a read of `GlobalMemory`) and `tt.store` (a write of it). CSE merges only loads that no write
 //! separates, `triton-licm` hoists a load only out of an `scf.for` that writes nothing, and the instruction reordering
 //! of TritonGPU moves no global access. The NVIDIA lowering emits every load and store as inline PTX with side effects

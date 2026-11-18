@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163` and the JAX dependency pin
+- Upgraded the OpenXLA dependency pin to commit `aaed3e0327d520ee375451ca42dd239ee40a50e6` and the JAX dependency pin
   to commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`, together with their LLVM, StableHLO, Shardy, and Triton pins.
-  Native builds now use Bazel 8.8.2, CCCL 3.4.0 and XLA's pinned ROCm 10.0.0 multiarch distribution.
+  Native builds now use Bazel 8.8.2, CCCL 3.4.0 and XLA's pinned ROCm 10.0.0 multiarch distribution. Also, the pinned
+  Triton sources require C++20.
 - Updated the ROCm plugin feature, artifact names, environment variables and path accessor to ROCm 10.
 - Removed the obsolete `enable_libnvjitlink_support` Bazel flag following XLA's unconditional nvJitLink support.
 - Removed the CUDA 12 `sm_50` target because the pinned Eigen headers require compute capability 6.0 or newer.

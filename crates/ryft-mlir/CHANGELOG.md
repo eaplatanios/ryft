@@ -53,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded to the LLVM, StableHLO (v1.24.0), Shardy, and Triton revisions pinned by OpenXLA commit
-  `f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163` and JAX commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`.
+- Upgraded to the LLVM, StableHLO (v1.25.0), Shardy, and Triton revisions pinned by OpenXLA commit
+  `aaed3e0327d520ee375451ca42dd239ee40a50e6` and JAX commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`.
 - Changed all `OperationBuilder::add_*` functions to return `Result<Self, Error>` and report context mismatches
   immediately. Callers must now handle each addition's result (for example, using `?` in builder chains). A failed
   addition consumes the builder and destroys its owned regions, including any rejected regions passed to that addition.

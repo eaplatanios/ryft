@@ -6375,16 +6375,22 @@ unsafe extern "C" {
     pub fn mlirRegisterConversionConvertVectorToArmSMEPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateConversionConvertVectorToGPU() -> MlirPass;
+    pub fn mlirCreateConversionConvertVectorToGPUPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterConversionConvertVectorToGPU();
+    pub fn mlirRegisterConversionConvertVectorToGPUPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateConversionConvertVectorToLLVMPass() -> MlirPass;
 }
 unsafe extern "C" {
     pub fn mlirRegisterConversionConvertVectorToLLVMPass();
+}
+unsafe extern "C" {
+    pub fn mlirCreateConversionConvertVectorToNVGPUPass() -> MlirPass;
+}
+unsafe extern "C" {
+    pub fn mlirRegisterConversionConvertVectorToNVGPUPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateConversionConvertVectorToSCF() -> MlirPass;
@@ -9000,6 +9006,7 @@ pub const MlirLLVMCConv_MlirLLVMCConvCXX_FAST_TLS: MlirLLVMCConv = 17;
 pub const MlirLLVMCConv_MlirLLVMCConvTail: MlirLLVMCConv = 18;
 pub const MlirLLVMCConv_MlirLLVMCConvCFGuard_Check: MlirLLVMCConv = 19;
 pub const MlirLLVMCConv_MlirLLVMCConvSwiftTail: MlirLLVMCConv = 20;
+pub const MlirLLVMCConv_MlirLLVMCConvPreserveNone: MlirLLVMCConv = 21;
 pub const MlirLLVMCConv_MlirLLVMCConvX86_StdCall: MlirLLVMCConv = 64;
 pub const MlirLLVMCConv_MlirLLVMCConvX86_FastCall: MlirLLVMCConv = 65;
 pub const MlirLLVMCConv_MlirLLVMCConvARM_APCS: MlirLLVMCConv = 66;
@@ -9546,6 +9553,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn mlirRegisterLLVMRequestCWrappersPass();
+}
+unsafe extern "C" {
+    pub fn mlirCreateLLVMSimplifyCFGPass() -> MlirPass;
+}
+unsafe extern "C" {
+    pub fn mlirRegisterLLVMSimplifyCFGPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateLLVMUseDefaultVisibilityPass() -> MlirPass;

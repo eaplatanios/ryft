@@ -11,9 +11,8 @@
 //! [`Session::new`] creates a session on a client that it creates for the best available [`Platform`], and
 //! [`Session::builder`] allows configuring everything in detail. Clone a session wherever another handle is
 //! needed. Clones share its resources, while creating another session gives an independent cache and effect
-//! scope, even on the same client. Configure built-in or downstream providers through [`RuntimeExtensions`] and
-//! [`SessionBuilder::runtime_extensions`]. Each session initializes its own runtime instances lazily when an executable
-//! requires them.
+//! scope, even on the same client. Refer to [`RuntimeExtensions`] for how sessions configure providers and
+//! initialize the runtime extensions required by compiled programs.
 //!
 //! [`Options`] supplies the execution [`DeviceMesh`], sharding overrides, donation flags, and backend compilation
 //! policies for a staged function. The session's default [`CompilationOptions`] supply the underlying PJRT compiler

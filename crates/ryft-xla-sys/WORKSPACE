@@ -7,15 +7,15 @@ load("//bazel:source_revisions.bzl", "source_revisions_repository")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "f824cdd4dce2f2c0ce092fb7cfdc7ad1ebc92163"
+XLA_COMMIT = "aaed3e0327d520ee375451ca42dd239ee40a50e6"
 
-XLA_SHA256 = "4c97509bf17c004632011f9c656e9afaa2ea0e432d0f648651301415588073b3"
+XLA_SHA256 = "6c33286169c2e4a2f6b827c0c9f4bb2bb8b8a699bf7ec7db0c1525f106535e8b"
 
 JAX_COMMIT = "9564ca1d3df0d312cad4346458b8d41ce5204ff7"
 
 JAX_SHA256 = "b19d4509c7c07b7e320ec7fca98e55103498b7665b66d2d6814b555b3f7c0031"
 
-TRITON_COMMIT = "2122e24efc1886bfa36337c1f5b07c47d827b1d4"
+TRITON_COMMIT = "46eccb199bfd3f3559b512c4a15870bd45e6a74d"
 
 http_archive(
     name = "xla",
@@ -25,7 +25,6 @@ http_archive(
         "//patches:xla-embedded-constants-target.patch",
         "//patches:xla-fp6-nan-predicate.patch",
         "//patches:xla-llvm-sharded-op-defs.patch",
-        "//patches:xla-llvm-windows-symlinks.patch",
         "//patches:xla-xnnpack-integer-min-max.patch",
     ],
     sha256 = XLA_SHA256,

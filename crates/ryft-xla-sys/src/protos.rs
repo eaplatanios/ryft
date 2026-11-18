@@ -1038,6 +1038,9 @@ pub enum AutoTuneBackend {
 
     /// TensorIR CUDA Tile fusion emitter.
     TensorIr = 19,
+
+    /// cuDNN fusion code generation based on fission into library operations.
+    CudnnFission = 20,
 }
 
 /// Controls the behavior of the auto-tuning results cache. Auto-tuning can be expensive and so XLA supports caching the
@@ -1563,7 +1566,7 @@ pub enum EarlyExitPoint {
 /// This type corresponds to `DebugOptions` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
 #[prost(
-    reserved = "5, 63, 80, 93, 94, 98, 117, 130, 133, 134, 139, 141, 143, 152, 156, 158, 160, 161, 162, 165, 167, 168, 169, 171, 172, 173, 176, 177, 178, 179, 180, 183, 184, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 204, 206, 207, 211, 214, 217, 218, 220, 221, 226, 227, 229, 230, 231, 233, 234, 235, 238, 239, 241, 242, 243, 249, 263, 264, 266, 270, 271, 275, 276, 278, 279, 281, 282, 286, 298, 299, 300, 302, 303, 309, 313, 314, 319, 320, 325, 326, 332, 346, 352, 354, 355, 358, 361, 367, 369, 371, 376, 385, 388, 389, 394, 396, 398, 402, 413, 420, 423, 430, 435, 443, 446, 450, 458, 464, 477, 480"
+    reserved = "5, 63, 80, 93, 94, 98, 117, 130, 133, 134, 139, 141, 143, 152, 156, 158, 160, 161, 162, 165, 167, 168, 169, 171, 172, 173, 176, 177, 178, 179, 180, 183, 184, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 204, 206, 207, 211, 214, 217, 218, 220, 221, 226, 227, 229, 230, 231, 233, 234, 235, 238, 239, 241, 242, 243, 249, 263, 264, 266, 270, 271, 275, 276, 278, 279, 281, 282, 286, 292, 295, 298, 299, 300, 302, 303, 309, 313, 314, 316, 319, 320, 325, 326, 332, 334, 346, 352, 354, 355, 358, 361, 367, 369, 371, 376, 385, 388, 389, 394, 396, 398, 402, 413, 420, 423, 430, 434, 435, 442, 443, 445, 446, 450, 456, 458, 464, 477, 480"
 )]
 pub struct DebugOptions {
     /// If `true`, host-to-host copies will be allowed even when automatic host compute offloading is disabled.
@@ -1777,10 +1780,6 @@ pub struct DebugOptions {
     #[prost(float, optional, tag = "225")]
     pub xla_gpu_auto_spmd_partitioning_memory_budget_ratio: Option<f32>,
 
-    /// Relative precision (tolerance) for comparing different GEMM solutions during auto-tuning.
-    #[prost(float, optional, tag = "316")]
-    pub xla_gpu_autotune_gemm_rtol: Option<f32>,
-
     /// Auto-tuning level:
     ///
     ///   - `0` disables auto-tuning,
@@ -1848,6 +1847,10 @@ pub struct DebugOptions {
     #[prost(int32, optional, tag = "285")]
     pub xla_gpu_cudnn_gemm_fusion_level: Option<i32>,
 
+    /// Controls cuDNN compilation of non-GEMM fusions. Level `0` disables it and level `1` enables pointwise fusions.
+    #[prost(int32, optional, tag = "510")]
+    pub xla_gpu_cudnn_non_gemm_fusion_level: Option<i32>,
+
     /// Maximum number of kernel configurations (plans) to consider during cuDNN GEMM auto-tuning.
     #[prost(int32, optional, tag = "318")]
     pub xla_gpu_cudnn_gemm_max_plans: Option<i32>,
@@ -1877,12 +1880,9 @@ pub struct DebugOptions {
     #[prost(int32, optional, tag = "331")]
     pub xla_gpu_dot_merger_threshold_mb: Option<i32>,
 
-    /// File path for writing autotune logs in text format.
-    #[prost(string, optional, tag = "292")]
-    pub xla_gpu_dump_autotune_logs_to: Option<String>,
-
     /// File path for writing autotune results. Binary format is used unless the filename
     /// ends with `.txt` or `.textproto`.
+    #[deprecated = "Use `xla_dump_autotune_cache_to` instead."]
     #[prost(string, optional, tag = "222")]
     pub xla_gpu_dump_autotune_results_to: Option<String>,
 
@@ -2064,11 +2064,8 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "219")]
     pub xla_gpu_exhaustive_tiling_search: Option<bool>,
 
-    /// List of auto-tuner backends to enable. If empty, all backends are enabled.
-    #[prost(enumeration = "AutoTuneBackend", repeated, tag = "442")]
-    pub xla_gpu_experimental_autotune_backends: Vec<i32>,
-
     /// Specifies the behavior of the per-kernel auto-tuning cache.
+    #[deprecated = "Use `xla_autotune_cache_mode` instead."]
     #[prost(enumeration = "AutoTuneCacheMode", optional, tag = "324")]
     pub xla_gpu_experimental_autotune_cache_mode: Option<i32>,
 
@@ -2130,10 +2127,6 @@ pub struct DebugOptions {
     /// If `true`, auto-tuning between the native and Triton fusion emitters will be enabled.
     #[prost(bool, optional, tag = "409")]
     pub xla_gpu_experimental_enable_fusion_autotuner: Option<bool>,
-
-    /// If `true`, every already-constructed fusion will be redirected to the Triton emitter with automatic tiling.
-    #[prost(bool, optional, tag = "334")]
-    pub xla_gpu_experimental_enable_fusion_block_level_rewriter: Option<bool>,
 
     /// If `true`, heuristic-based collective combining will be enabled.
     #[prost(bool, optional, tag = "366")]
@@ -2240,10 +2233,6 @@ pub struct DebugOptions {
     #[prost(int32, optional, tag = "476")]
     pub xla_gpu_fusion_autotune_top_k_configs: Option<i32>,
 
-    /// Path to a `.textproto` file for overriding autotune results.
-    #[prost(string, optional, tag = "434")]
-    pub xla_gpu_gemm_autotuner_override_file: Option<String>,
-
     /// Minimum combined number of elements in matmul inputs/outputs for rewriting to cuBLAS or Triton.
     #[prost(int64, optional, tag = "283")]
     pub xla_gpu_gemm_rewrite_size_threshold: Option<i64>,
@@ -2278,6 +2267,7 @@ pub struct DebugOptions {
 
     /// File path for loading autotune results. Binary format is used unless the filename ends
     /// with `.txt` or `.textproto`.
+    #[deprecated = "Use `xla_load_autotune_cache_from` instead."]
     #[prost(string, optional, tag = "223")]
     pub xla_gpu_load_autotune_results_from: Option<String>,
 
@@ -2329,11 +2319,8 @@ pub struct DebugOptions {
     #[prost(int64, optional, tag = "339")]
     pub xla_gpu_operand_bytes_threshold_for_windowed_einsum: Option<i64>,
 
-    /// Override configuration for the GEMM auto-tuner.
-    #[prost(string, optional, tag = "295")]
-    pub xla_gpu_override_gemm_autotuner: Option<String>,
-
     /// Directory path for the per-fusion autotune cache.
+    #[deprecated = "Use `xla_autotune_cache_dir` instead."]
     #[prost(string, optional, tag = "310")]
     pub xla_gpu_per_fusion_autotune_cache_dir: Option<String>,
 
@@ -2369,6 +2356,7 @@ pub struct DebugOptions {
     pub xla_gpu_redzone_padding_bytes: Option<i64>,
 
     /// If `true`, compilation will fail if complete AOT auto-tuning results are not available.
+    #[deprecated = "Use `xla_fail_on_autotune_cache_miss` instead."]
     #[prost(bool, optional, tag = "284")]
     pub xla_gpu_require_complete_aot_autotune_results: Option<bool>,
 
@@ -2467,7 +2455,8 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "71")]
     pub xla_llvm_enable_noalias_metadata: Option<bool>,
 
-    /// If `true`, `!invariant.load` metadata will be emitted in the generated LLVM IR.
+    /// Deprecated GPU compilation flag for emitting invariant load metadata.
+    #[deprecated = "This flag has no effect. XLA no longer emits `!invariant.load` metadata."]
     #[prost(bool, optional, tag = "72")]
     pub xla_llvm_enable_invariant_load_metadata: Option<bool>,
 
@@ -2722,10 +2711,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "462")]
     pub xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl: Option<bool>,
 
-    /// If `true`, experimental tiling propagation will be enabled in GPU compiler passes.
-    #[prost(bool, optional, tag = "456")]
-    pub xla_gpu_experimental_enable_tiling_propagation: Option<bool>,
-
     /// Cost model options for experimental GEMM fusion tiling decisions.
     #[prost(map = "string, string", tag = "474")]
     pub xla_gpu_experimental_cost_model_gemm_tiling_options: HashMap<String, String>,
@@ -2936,10 +2921,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "444")]
     pub xla_gpu_experimental_all_fusions_with_triton: Option<bool>,
 
-    /// If `true`, dump instructions before and after auto-tuning.
-    #[prost(bool, optional, tag = "445")]
-    pub xla_gpu_dump_autotuned_instructions: Option<bool>,
-
     /// If `true`, include inline stack frames when dumping HLO.
     #[prost(bool, optional, tag = "447")]
     pub xla_hlo_print_inline_stack_frames: Option<bool>,
@@ -3082,6 +3063,94 @@ pub struct DebugOptions {
     /// falling back to a heuristic algorithm index.
     #[prost(bool, optional, tag = "563")]
     pub xla_gpu_require_exact_blas_lt_algorithm: Option<bool>,
+
+    /// If `true`, annotates CUDA graph nodes so profiles can attribute command buffer work to HLO operations.
+    /// Requires CUDA 13.2 or newer.
+    #[prost(bool, optional, tag = "564")]
+    pub xla_gpu_enable_command_buffer_telemetry: Option<bool>,
+
+    /// If `true`, enables experimental thread-block specialized horizontal fusion of independent small GPU kernels.
+    #[prost(bool, optional, tag = "565")]
+    pub xla_gpu_experimental_enable_horizontal_fusion: Option<bool>,
+
+    /// If `true`, allows deterministic compilation to reuse auto-tuning cache entries from timing-based runs.
+    #[prost(bool, optional, tag = "566")]
+    pub xla_gpu_experimental_use_autotune_cache_also_for_deterministic_ops: Option<bool>,
+
+    /// If `true`, combines dependent small fusions into a single GPU kernel with multiple synchronized phases.
+    #[prost(bool, optional, tag = "567")]
+    pub xla_gpu_experimental_multi_phase_fusion: Option<bool>,
+
+    /// If `true`, allocates temporary buffers for modules that use every device in the topology in collective memory.
+    #[prost(bool, optional, tag = "568")]
+    pub xla_gpu_temp_buffer_use_collective_color: Option<bool>,
+
+    /// Weights remote copies in the work assignment model for ragged all-to-all GPU kernels. The default is `0.22`,
+    /// and values outside `(0, 1]` use the default.
+    #[prost(float, optional, tag = "569")]
+    pub xla_gpu_experimental_ragged_all_to_all_fabric_cost_weight: Option<f32>,
+
+    /// If `true`, flushes the GPU L2 cache before each timed auto-tuning run. Defaults to `true`.
+    #[prost(bool, optional, tag = "570")]
+    pub xla_gpu_autotune_flush_l2_cache: Option<bool>,
+
+    /// Number of timed runs averaged to rank each GPU auto-tuning candidate. Defaults to `3`.
+    #[prost(int32, optional, tag = "571")]
+    pub xla_gpu_autotune_num_timed_runs: Option<i32>,
+
+    /// If `true`, keeps buffers for eligible collectives out of output allocations to avoid re-recording those
+    /// collectives on each command buffer execution. Applies to the `SKIP_TEMP` and `SKIP_PROFILED` update modes.
+    #[prost(bool, optional, tag = "572")]
+    pub xla_gpu_command_buffer_keep_collectives_out_of_outputs: Option<bool>,
+
+    /// Backends considered by configuration assignment and auto-tuning. An empty list enables every backend
+    /// available on the platform, subject to the other compilation options.
+    #[prost(enumeration = "AutoTuneBackend", repeated, tag = "573")]
+    pub xla_config_assigner_backends: Vec<i32>,
+
+    /// Relative tolerance used to compare auto-tuning candidates with the reference result.
+    #[prost(float, optional, tag = "574")]
+    pub xla_autotune_rtol: Option<f32>,
+
+    /// If `true`, dumps isolated HLO instructions before and after configuration assignment.
+    #[prost(bool, optional, tag = "575")]
+    pub xla_dump_isolated_hlos_pre_and_post_config_assignment: Option<bool>,
+
+    /// File to write auto-tuning logs to. The logs are binary unless the file ends in `.txt` or `.textproto`.
+    #[prost(string, optional, tag = "576")]
+    pub xla_dump_autotune_logs_to: Option<String>,
+
+    /// Overrides Triton auto-tuning with one configuration in `AutotuneResult.TritonGemmKey` textproto format.
+    #[prost(string, optional, tag = "577")]
+    pub xla_gpu_override_triton_config: Option<String>,
+
+    /// Path to a textproto file that overrides the Triton configurations considered by the auto-tuner.
+    #[prost(string, optional, tag = "578")]
+    pub xla_gpu_override_triton_configs_file: Option<String>,
+
+    /// File to write the auto-tuning cache to. The cache is binary unless the file ends in `.txt` or `.textproto`.
+    #[prost(string, optional, tag = "579")]
+    pub xla_dump_autotune_cache_to: Option<String>,
+
+    /// File to load an auto-tuning cache from. The cache is binary unless the file ends in `.txt` or `.textproto`.
+    #[prost(string, optional, tag = "580")]
+    pub xla_load_autotune_cache_from: Option<String>,
+
+    /// Directory where per-instruction auto-tuning cache entries are stored.
+    #[prost(string, optional, tag = "581")]
+    pub xla_autotune_cache_dir: Option<String>,
+
+    /// Controls how the auto-tuner reads and writes cached results.
+    #[prost(enumeration = "AutoTuneCacheMode", optional, tag = "582")]
+    pub xla_autotune_cache_mode: Option<i32>,
+
+    /// If `true`, fails compilation when a required ahead-of-time auto-tuning result is missing from the cache.
+    #[prost(bool, optional, tag = "583")]
+    pub xla_fail_on_autotune_cache_miss: Option<bool>,
+
+    /// If `true`, allows RAFT radix selection for stable top-k operations with unsigned 64-bit packed inputs.
+    #[prost(bool, optional, tag = "584")]
+    pub xla_gpu_experimental_enable_raft_u64_radix: Option<bool>,
 }
 
 /// Represents the device IDs assigned to replicas for a single computation. In XLA's device assignment model, each
@@ -4779,7 +4848,10 @@ mod tests {
     #[test]
     fn test_debug_options_optional_fields() {
         // Explicit false values and enum selections must survive wire decoding and re-encoding.
-        let bytes = [0x98, 0x22, 0x13, 0xa0, 0x22, 0x00, 0xa8, 0x22, 0x01, 0xe0, 0x22, 0x02];
+        let bytes = [
+            0x98, 0x22, 0x13, 0xa0, 0x22, 0x00, 0xa8, 0x22, 0x01, 0xe0, 0x22, 0x02, 0xea, 0x23, 0x01, 0x14, 0xb8, 0x24,
+            0x01,
+        ];
         let options = DebugOptions::decode(bytes.as_slice()).unwrap();
         assert_eq!(options.xla_autotuner_preferred_backend(), AutoTuneBackend::TensorIr);
         assert_eq!(options.xla_cpu_mock_custom_calls, Some(false));
@@ -4788,6 +4860,8 @@ mod tests {
             options.xla_gpu_experimental_deterministic_ops_triton(),
             DeterministicOperationsTritonMode::Unchecked,
         );
+        assert_eq!(options.xla_config_assigner_backends, vec![AutoTuneBackend::CudnnFission as i32]);
+        assert_eq!(options.xla_fail_on_autotune_cache_miss, Some(true));
         assert_eq!(options.encode_to_vec(), bytes);
         assert_eq!(DebugOptions::default().encode_to_vec(), Vec::<u8>::new());
     }

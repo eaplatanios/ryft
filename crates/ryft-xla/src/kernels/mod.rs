@@ -418,16 +418,15 @@ pub(crate) fn placed_custom_call(
     Ok(placed)
 }
 
-/// Returns available native kernel providers without initializing their drivers.
+/// Returns the native kernel providers selected by this build's features. Their drivers initialize on first use.
 pub(crate) fn runtime_providers() -> Vec<Arc<dyn RuntimeProvider>> {
-    #[cfg(feature = "rocm")]
-    {
-        vec![cuda::runtime_provider(), rocm::runtime_provider()]
-    }
-    #[cfg(not(feature = "rocm"))]
-    {
-        vec![cuda::runtime_provider()]
-    }
+    [
+        #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+        cuda::runtime_provider(),
+        #[cfg(feature = "rocm")]
+        rocm::runtime_provider(),
+    ]
+    .into()
 }
 
 /// Validates the native memref ABI and fixes complete row-major operand and result layouts, including default types.

@@ -549,7 +549,7 @@ pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result
 }
 
 /// Returns the built-in assertion provider without loading a PJRT plugin.
-pub(crate) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
+pub(crate) fn assertion_runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(AssertionRuntimeProvider)
 }
 
@@ -2257,7 +2257,7 @@ mod tests {
     #[test]
     fn test_assertion_runtime_provider_initialize() {
         let client = execution_client();
-        let provider = runtime_provider();
+        let provider = assertion_runtime_provider();
         let requirement = builtin_requirement(ASSERT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.

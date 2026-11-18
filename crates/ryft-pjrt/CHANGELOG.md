@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.117` and XLA FFI bindings for version `0.5`, including
+- Updated our PJRT C API bindings for version `0.118` and XLA FFI bindings for version `0.5`, including
   GPU handler traits, the recording stage, invocation extensions, and preservation of native FFI error codes.
   FFI state access now rejects both execution and recording stages before calling native code, and invocation
   extensions validate their generic header before exposing borrowed backend data. `FfiHandlerBundle::new` now requires

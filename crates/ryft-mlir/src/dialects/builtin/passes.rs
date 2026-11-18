@@ -71,8 +71,13 @@ mlir_pass!(conversion_to_emit_c_pass, ConversionConvertToEmitC);
 mlir_pass!(conversion_to_llvm_pass, ConversionConvertToLLVMPass);
 mlir_pass!(conversion_vector_to_amx_pass, ConversionConvertVectorToAMX);
 mlir_pass!(conversion_vector_to_arm_sme_pass, ConversionConvertVectorToArmSMEPass);
-mlir_pass!(conversion_vector_to_gpu_pass, ConversionConvertVectorToGPU);
+mlir_pass!(conversion_vector_to_gpu_pass, ConversionConvertVectorToGPUPass);
 mlir_pass!(conversion_vector_to_llvm_pass, ConversionConvertVectorToLLVMPass);
+mlir_pass!(
+    conversion_vector_to_nvgpu_pass,
+    ConversionConvertVectorToNVGPUPass,
+    "Lowers vector operations to the NVIDIA GPU dialect.",
+);
 mlir_pass!(conversion_vector_to_scf_pass, ConversionConvertVectorToSCF);
 mlir_pass!(conversion_vector_to_spirv_pass, ConversionConvertVectorToSPIRVPass);
 mlir_pass!(conversion_vector_to_xe_gpu_pass, ConversionConvertVectorToXeGPU);
@@ -139,6 +144,18 @@ mod tests {
         // Verify that there are no segmentation faults, even when we try to register multiple times.
         register_conversions_passes();
         register_conversions_passes();
+    }
+
+    #[test]
+    fn test_conversion_vector_to_gpu_pass() {
+        register_conversion_vector_to_gpu_pass();
+        let _ = create_conversion_vector_to_gpu_pass().unwrap();
+    }
+
+    #[test]
+    fn test_conversion_vector_to_nvgpu_pass() {
+        register_conversion_vector_to_nvgpu_pass();
+        let _ = create_conversion_vector_to_nvgpu_pass().unwrap();
     }
 
     #[test]

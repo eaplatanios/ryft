@@ -21,8 +21,8 @@ build --action_env=GRPC_BAZEL_RUNTIME=1
 build --build_tag_filters -no_oss
 
 build:posix --copt=-Wno-sign-compare
-build:posix --cxxopt=-std=c++17
-build:posix --host_cxxopt=-std=c++17
+build:posix --cxxopt=-std=c++20
+build:posix --host_cxxopt=-std=c++20
 build:posix --copt -Wno-error=unused-command-line-argument
 build:posix --copt=-Wno-gnu-offsetof-extensions
 build:posix --copt=-Qunused-arguments
@@ -84,8 +84,8 @@ build:windows --host_copt=-DWIN32_LEAN_AND_MEAN
 build:windows --copt=-DNOGDI
 build:windows --host_copt=-DNOGDI
 build:windows --copt=/Zc:preprocessor
-build:windows --cxxopt=/std:c++17
-build:windows --host_cxxopt=/std:c++17
+build:windows --cxxopt=/std:c++20
+build:windows --host_cxxopt=/std:c++20
 build:windows --cxxopt=-fno-delayed-template-parsing
 build:windows --host_cxxopt=-fno-delayed-template-parsing
 build:windows --linkopt=/DEBUG

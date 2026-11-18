@@ -43,6 +43,9 @@ impl From<ryft_rocm::Error> for Error {
 
 /// Embeds a validated HSACO artifact with one pointer per canonical logical parameter.
 ///
+/// With the `rocm` feature, CPU hosts can embed and validate artifacts without loading the HIP driver. The session
+/// loads the driver when it initializes the built-in handler for a ROCm client.
+///
 /// Buffers use dense row-major layouts and canonical declaration order. Read-only parameters use operands and
 /// write-only parameters use result buffers. Read-write aliases, scalar prefetch, and device assertion transports
 /// are rejected. The session owns native modules until every submitted fence over a whole execution completes.
