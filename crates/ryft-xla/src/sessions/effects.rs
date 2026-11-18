@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use ryft_core::DeviceId;
 use ryft_pjrt::{Buffer, ExecutionFence};
@@ -245,11 +245,18 @@ impl EffectReservation {
 impl Drop for EffectReservation {
     fn drop(&mut self) {
         if !self.committed {
-            // Cancellation must not wait, because the predecessor may still be prepared on this same calling thread.
-            *self.submission.publication.lock().expect("effect publication mutex poisoned") =
-                EffectTokenPublication::Forward(self.predecessor.take());
+            // Cancellation can forward immediately, even when the predecessor is still being prepared.
+            let mut publication = self.submission.publication.lock().unwrap_or_else(PoisonError::into_inner);
+
+            // Keep any previous token buffers alive until both sets of waiters have been notified.
+            let _ = std::mem::replace(&mut *publication, EffectTokenPublication::Forward(self.predecessor.take()));
+            self.submission.publication.clear_poison();
+
+            // Release the repaired publication before waking successors.
+            drop(publication);
+
             self.submission.publication_ready.notify_all();
-            self.submission.completion.complete(Ok(()));
+            self.submission.completion.cancel();
         }
     }
 }
@@ -311,6 +318,18 @@ impl EffectCompletion {
     /// the effect scope's mutex.
     fn complete(&self, result: Result<(), Arc<str>>) {
         *self.result.lock().expect("effect completion mutex poisoned") = Some(result);
+        self.ready.notify_all();
+    }
+
+    /// Records a canceled reservation as complete and repairs any poisoned completion state before waking waiters.
+    fn cancel(&self) {
+        let mut result = self.result.lock().unwrap_or_else(PoisonError::into_inner);
+        *result = Some(Ok(()));
+        self.result.clear_poison();
+
+        // Release the repaired result before waking barrier callers.
+        drop(result);
+
         self.ready.notify_all();
     }
 
@@ -398,13 +417,14 @@ impl EffectSubmission {
 impl Drop for EffectSubmission {
     fn drop(&mut self) {
         // Canceled reservations can form a long forwarding chain. Detach uniquely owned links before dropping
-        // each node so scope teardown does not consume one stack frame per canceled submission.
-        let mut publication = std::mem::take(self.publication.get_mut().expect("effect publication mutex poisoned"));
+        // each node so scope teardown does not consume one stack frame per canceled submission. Exclusive access
+        // lets us dismantle each link even if its publication mutex was poisoned.
+        let mut publication = std::mem::take(self.publication.get_mut().unwrap_or_else(PoisonError::into_inner));
         while let EffectTokenPublication::Forward(Some(predecessor)) = publication {
             match Arc::try_unwrap(predecessor) {
                 Ok(mut predecessor) => {
                     publication =
-                        std::mem::take(predecessor.publication.get_mut().expect("effect publication mutex poisoned"));
+                        std::mem::take(predecessor.publication.get_mut().unwrap_or_else(PoisonError::into_inner));
                 }
                 Err(_) => break,
             }
@@ -414,8 +434,9 @@ impl Drop for EffectSubmission {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::mpsc::channel;
+    use std::panic::catch_unwind;
+    use std::sync::mpsc::{Sender, channel};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -448,6 +469,27 @@ mod tests {
     fn pending_fence() -> (ExecutionFence, EventPromise) {
         let (event, promise) = cpu_client(1).event(()).unwrap();
         (ExecutionFence::new(vec![event]), promise)
+    }
+
+    /// Holds a poisoned guard until the parent knows the waiter is about to park.
+    fn wait_for_cancellation<T>(
+        state: &Mutex<T>,
+        ready: &Condvar,
+        is_pending: impl Fn(&T) -> bool,
+        started: Sender<()>,
+    ) {
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(is_pending(&state));
+        started.send(()).unwrap();
+
+        let deadline = Instant::now() + CALLBACK_TIMEOUT;
+        while is_pending(&state) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "cancellation did not wake the waiter");
+            let (next, timeout) = ready.wait_timeout(state, remaining).unwrap_or_else(PoisonError::into_inner);
+            assert!(!timeout.timed_out(), "cancellation did not wake the waiter");
+            state = next;
+        }
     }
 
     /// Waits for the barrier to retain the submission in its snapshot and release the scope lock.
@@ -992,6 +1034,55 @@ mod tests {
     }
 
     #[test]
+    fn test_effect_reservation_drop_repairs_poisoned_state_and_wakes_waiters() {
+        let scope = EffectScope::default();
+        let first = scope.reserve(Some(&[0])).unwrap();
+        let reservation = scope.reserve(Some(&[0])).unwrap();
+        let submission = Arc::clone(&reservation.submission);
+        first.publish(Err(Arc::from("predecessor publication failed")), &ExecutionFence::new(Vec::new()));
+
+        let poisoned = catch_unwind(|| {
+            let _publication = submission.publication.lock().unwrap();
+            let _completion = submission.completion.result.lock().unwrap();
+            panic!("poison cancellation state");
+        });
+        assert!(poisoned.is_err());
+        assert!(submission.publication.is_poisoned());
+        assert!(submission.completion.result.is_poisoned());
+
+        thread::scope(|threads| {
+            let (sender, receiver) = channel();
+            let publication_started = sender.clone();
+            let publication = &submission.publication;
+            let publication_ready = &submission.publication_ready;
+            threads.spawn(move || {
+                wait_for_cancellation(
+                    publication,
+                    publication_ready,
+                    |publication| matches!(publication, EffectTokenPublication::Pending),
+                    publication_started,
+                );
+            });
+            let completion = &submission.completion;
+            threads
+                .spawn(move || wait_for_cancellation(&completion.result, &completion.ready, Option::is_none, sender));
+            let first_started = receiver.recv_timeout(CALLBACK_TIMEOUT);
+            let second_started = receiver.recv_timeout(CALLBACK_TIMEOUT);
+
+            // Cancel after both waiters have reached their pending state.
+            drop(reservation);
+            assert_eq!(first_started, Ok(()));
+            assert_eq!(second_started, Ok(()));
+        });
+
+        assert_eq!(submission.completion.wait(), Ok(()));
+        assert!(matches!(
+            submission.wait_for_tokens(),
+            Err(reason) if reason.as_ref() == "predecessor publication failed",
+        ));
+    }
+
+    #[test]
     fn test_effect_reservation_drop_forwards_predecessor_publication() {
         let scope = EffectScope::default();
         let first = scope.reserve(Some(&[0])).unwrap();
@@ -1067,5 +1158,37 @@ mod tests {
         // Releasing the tail must also release the head of the chain without overflowing the stack.
         drop(tail);
         assert!(head.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_effect_submission_drop_recovers_poisoned_publication() {
+        for poison_tail in [true, false] {
+            let scope = EffectScope::default();
+            let predecessor = scope.reserve(Some(&[0])).unwrap();
+            let tail = scope.reserve(Some(&[0])).unwrap();
+            let predecessor_submission = Arc::clone(&predecessor.submission);
+            let tail_submission = Arc::clone(&tail.submission);
+            let predecessor_released = Arc::downgrade(&predecessor_submission);
+
+            // Cancel both reservations so the tail holds a forwarding link to its predecessor.
+            drop((tail, predecessor));
+
+            let publication =
+                if poison_tail { &tail_submission.publication } else { &predecessor_submission.publication };
+            let poisoned = catch_unwind(|| {
+                let _guard = publication.lock().unwrap();
+                panic!("poison effect publication");
+            });
+            assert!(poisoned.is_err());
+            assert!(publication.is_poisoned());
+
+            // Release the extra owners so teardown can take exclusive ownership of the forwarding link.
+            drop((scope, predecessor_submission));
+
+            // Exercise teardown after poisoning either the tail itself or the link it owns.
+            drop(tail_submission);
+
+            assert!(predecessor_released.upgrade().is_none());
+        }
     }
 }
