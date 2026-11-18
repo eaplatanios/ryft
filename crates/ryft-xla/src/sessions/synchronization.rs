@@ -225,7 +225,7 @@ impl WorkReservation {
         }
 
         // Registration can invoke the callback inline. Keep the event on this stack until registration returns.
-        copy.install_event(event);
+        copy.install(event);
         HostCopy(HostCopyCompletion::Pending(copy))
     }
 
@@ -269,8 +269,6 @@ impl Drop for WorkReservation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// A pending submission and its outstanding completion notifications.
 pub(super) struct PendingWork<T, E> {
     /// Tag that the owner stored with the submission.
@@ -278,10 +276,10 @@ pub(super) struct PendingWork<T, E> {
 
     /// Number of completion notifications that the submission still waits for. It starts at one, for the
     /// submission itself, and a [`WorkReservation`] adds one for each pending host copy that it tracks.
-    remaining: usize,
+    pub(super) remaining: usize,
 
     /// First failure reported by a notification.
-    error: Option<E>,
+    pub(super) error: Option<E>,
 }
 
 /// A copy whose payload can be consumed independently of session synchronization.
@@ -299,12 +297,15 @@ impl<O> HostCopy<O> {
                 while matches!(*state, HostCopyState::Pending(_)) {
                     state = copy.completed.wait(state).unwrap_or_else(PoisonError::into_inner);
                 }
+
                 let HostCopyState::Ready(event) = std::mem::replace(&mut *state, HostCopyState::CompletedWithoutEvent)
                 else {
                     unreachable!("a readback must have its event installed before waiting");
                 };
+
                 // Release the state lock before calling into PJRT.
                 drop(state);
+
                 event.r#await()
             }
         }
@@ -336,7 +337,7 @@ impl<O> PendingHostCopy<O> {
     }
 
     /// Stores the event after registration, preserving any completion that arrived inline.
-    fn install_event(&self, event: Event<O>) {
+    fn install(&self, event: Event<O>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         *state = match *state {
             HostCopyState::Registering => HostCopyState::Pending(event),
@@ -353,8 +354,10 @@ impl<O> PendingHostCopy<O> {
             HostCopyState::Pending(event) => HostCopyState::Ready(event),
             completed @ (HostCopyState::CompletedWithoutEvent | HostCopyState::Ready(_)) => completed,
         };
+
         // Release the state lock before waking the reader.
         drop(state);
+
         self.completed.notify_one();
     }
 }
@@ -606,7 +609,7 @@ mod tests {
         // Simulate an inline callback by reporting completion before installing the event.
         copy.complete();
         assert!(matches!(*copy.state.lock().unwrap(), HostCopyState::CompletedWithoutEvent));
-        copy.install_event(event);
+        copy.install(event);
         assert_eq!(HostCopy(HostCopyCompletion::Pending(copy)).wait(), Ok(42));
     }
 }
