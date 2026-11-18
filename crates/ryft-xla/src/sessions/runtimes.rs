@@ -528,24 +528,21 @@ impl Debug for RuntimeExtensions {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
-/// executions.
-///
-/// The registry manages the session lifecycle described by [`RuntimeExtensions`].
+/// executions. The registry manages the session lifecycle described by [`RuntimeExtensions`]:
 ///
 ///   - **Initialization:** [`Self::ensure`] creates the instance of each requirement on first use and shares it with
 ///     later calls. For example, lowering a program that prints attaches the `ryft.print` requirement to it. Before
 ///     the session first compiles, loads, or executes such a program, the registry asks the print provider to
-///     initialize, which registers the native print handler with the client. Later programs that print reuse that
-///     instance.
+///     initialize, which registers the native print handler with the client. Later programs that print reuse
+///     that instance.
 ///   - **Preparation:** Before each native submission, [`Self::prepare`] lets every required instance validate the
 ///     invocation and attach its data to one [`ExecutionResources`]. The print extension attaches nothing, while the
 ///     CUDA kernel extension attaches a pointer to itself, which its native handler reads while it launches kernels.
 ///   - **Retention:** [`Self::retain`] keeps those resources alive until the execution completes, even when its
 ///     outputs are dropped. Dropping the registry waits for the executions that still borrow resources.
 pub(crate) struct RuntimeRegistry {
+    // TODO(eaplatanios): Review from here onwards.
     /// Externally owned client associated with all initialized instances.
     client: &'static Client<'static>,
 
