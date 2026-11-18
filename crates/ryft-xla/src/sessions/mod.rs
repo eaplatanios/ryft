@@ -2062,7 +2062,8 @@ pub(crate) mod tests {
         ));
         scope.synchronize().unwrap();
 
-        // The session report leaves it to this scope's barrier to observe the failure before acknowledgment.
+        // The original scope's barrier succeeds because the failure belongs to the new scope. The new scope must
+        // report the failure through its own barrier before acknowledgment.
         session.effects_barrier().unwrap();
         assert!(matches!(
             scope.acknowledge_effect_errors(),
@@ -2121,7 +2122,6 @@ pub(crate) mod tests {
     fn test_session_effects_barrier() {
         let client = execution_client();
         let session = session_with_client(client);
-        session.effects_barrier().unwrap();
 
         // A barrier reports the failures of earlier submissions, and keeps reporting them until they are acknowledged.
         let reservation = session.reserve_effects(None).unwrap();

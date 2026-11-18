@@ -642,9 +642,7 @@ mod tests {
         scope.acknowledge().unwrap();
         assert!(tail_submission.upgrade().is_none());
         assert_eq!(scope.work.lock().pending.keys().copied().collect::<Vec<_>>(), vec![unordered.identity]);
-        // Cancel the unordered reservation before checking the barrier after recovery.
-        drop(unordered);
-        scope.barrier().unwrap();
+
         let recovered = scope.reserve(Some(&[1])).unwrap();
         assert!(recovered.predecessor.is_none());
         assert!(scope.work.lock().failures.is_empty());

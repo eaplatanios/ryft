@@ -234,7 +234,12 @@ impl WorkReservation {
         self.error.get_or_insert(error);
     }
 
-    /// Publishes completion and returns the fence for callers that also need to attach it to an output.
+    /// Hands off completion tracking to the session and returns the combined [`ExecutionFence`], if any,
+    /// without waiting for it. Fence construction can wait for native completion if PJRT callback registration fails.
+    /// Cross-host sends have no local destination buffers, so the placement code attaches this fence to the returned
+    /// [`Array`](crate::Array). This lets the array's readiness functions wait for the sends and report a send failure.
+    /// Dropping the reservation is enough for [`Session::synchronize`](crate::Session::synchronize) to wait for the
+    /// submission.
     pub(crate) fn finish(mut self) -> Option<ExecutionFence> {
         self.publish()
     }
