@@ -490,7 +490,6 @@ impl Session {
         // Arrays produced by the same program, or cloned from one array, share their mesh allocation, so pointer
         // equality settles the common case without comparing devices.
         let first_mesh = inputs[0].mesh();
-        let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(Device::id).collect::<Vec<_>>();
         for (index, input) in inputs.iter().enumerate().skip(1) {
             let mesh = input.mesh();
             if !std::ptr::eq(mesh, first_mesh)
@@ -500,8 +499,8 @@ impl Session {
                     "received incompatible devices for eager XLA execution: input #{} is placed on devices {:?} \
                      but input #0 is placed on devices {:?}",
                     index,
-                    device_ids(mesh),
-                    device_ids(first_mesh),
+                    mesh.devices().iter().map(Device::id).collect::<Vec<_>>(),
+                    first_mesh.devices().iter().map(Device::id).collect::<Vec<_>>(),
                 )));
             }
         }
@@ -511,24 +510,21 @@ impl Session {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Resolves the concrete [`DeviceMesh`] for eager execution. The first input's mesh takes precedence over the
-    /// mesh configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in
-    /// enumeration order. If all three are absent, the first addressable device forms a mesh with a single device.
+    /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
+    /// computed from `inputs` is placed where they live, so the first input's mesh takes precedence over the mesh
+    /// configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in enumeration
+    /// order. If all three are absent, the first addressable device forms a mesh with a single device.
     ///
     /// Eager operations derive `logical_mesh` from the first sharded output. This lets transforms place nullary
     /// constants through [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on
     /// sessions without a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller
     /// omits the mesh.
-    pub(crate) fn eager_mesh(
+    pub(crate) fn device_mesh_for(
         &self,
         inputs: &[Array],
         logical_mesh: Option<&LogicalMesh>,
     ) -> Result<DeviceMesh, ProgramError> {
-        if let Some(input) = inputs.first() {
-            return Ok(input.mesh().clone());
-        }
-
-        if let Ok(mesh) = self.device_mesh() {
+        if let Some(mesh) = self.inherited_device_mesh(inputs) {
             return Ok(mesh.clone());
         }
 
@@ -574,6 +570,14 @@ impl Session {
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         DeviceMesh::new(logical_mesh, vec![device])
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+    }
+
+    /// Returns the [`DeviceMesh`] that a value computed from `inputs` inherits, which is the mesh of the first input
+    /// or else the mesh configured on this handle, and [`None`] when there is neither. This is the part of
+    /// [`Self::device_mesh_for`] that depends on more than the operation and the client, so the eager dispatch cache
+    /// keys its entries on it. It needs no device query, which keeps cache hits cheap.
+    fn inherited_device_mesh<'m>(&'m self, inputs: &'m [Array]) -> Option<&'m DeviceMesh> {
+        inputs.first().map(Array::mesh).or(self.mesh.as_ref())
     }
 
     /// Materializes a concrete [`Array`] whose addressable shards are filled with the constant that `kind` selects. An
@@ -915,7 +919,7 @@ impl Context for Session {
             &operation,
             region_keys.as_slice(),
             inputs,
-            array_inputs.first().map(Array::mesh).or_else(|| self.device_mesh().ok()),
+            self.inherited_device_mesh(array_inputs.as_slice()),
         );
         let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
@@ -1025,7 +1029,7 @@ impl Context for Session {
                             .collect::<Result<Vec<_>, _>>()?;
                         let logical_mesh =
                             output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
-                        let mesh = self.eager_mesh(array_inputs.as_slice(), logical_mesh)?;
+                        let mesh = self.device_mesh_for(array_inputs.as_slice(), logical_mesh)?;
                         let mut options = Options::new(mesh);
 
                         // Arguments are placed as their runtime arrays are, including over the auto mesh axes that
