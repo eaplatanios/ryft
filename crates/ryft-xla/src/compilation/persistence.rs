@@ -32,7 +32,6 @@ use crate::compilation::keys::COMPILER_IDENTITY;
 use crate::compilation::programs::CompiledProgram;
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::lowering::signature::ExecutableSignature;
-use crate::sessions::runtimes::builtin_requirement;
 use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
@@ -728,7 +727,7 @@ impl Session {
         for (required, identifier) in
             [(metadata.requires_assertion_handler, "ryft.assert"), (metadata.ordered_io, "ryft.ordered-io")]
         {
-            if required && !runtime_requirements.contains(&builtin_requirement(identifier)) {
+            if required && !runtime_requirements.contains(&RuntimeRequirement::builtin(identifier)) {
                 return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!("effect metadata requires runtime extension `{identifier}` with ABI version 1"),
                 }));
@@ -1636,7 +1635,7 @@ mod tests {
         let baseline = serde_json::to_value(decode_envelope(&bytes).0).unwrap();
         assert_eq!(baseline["runtime_requirements"], serde_json::json!([]));
         let mut missing: PersistentExecutableMetadata = serde_json::from_value(baseline).unwrap();
-        missing.runtime_requirements = vec![crate::sessions::runtimes::builtin_requirement("test.missing-runtime")];
+        missing.runtime_requirements = vec![RuntimeRequirement::builtin("test.missing-runtime")];
         assert!(matches!(
             session.deserialize_program(&encode(missing)),
             Err(Error::Runtime(crate::sessions::runtimes::RuntimeError::MissingProvider { identifier }))
@@ -1644,11 +1643,11 @@ mod tests {
         ));
         let mut explicit = decode_envelope(&bytes).0;
         explicit.runtime_requirements =
-            vec![builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")];
+            vec![RuntimeRequirement::builtin("ryft.assert"), RuntimeRequirement::builtin("ryft.ordered-io")];
         let explicit = session.deserialize_program(&encode(explicit)).unwrap().unwrap();
         assert_eq!(
             explicit.runtime_requirements(),
-            &[builtin_requirement("ryft.assert"), builtin_requirement("ryft.ordered-io")],
+            &[RuntimeRequirement::builtin("ryft.assert"), RuntimeRequirement::builtin("ryft.ordered-io")],
         );
         assert!(!explicit.requires_assertion_handler());
         assert!(!explicit.signature().has_ordered_io());

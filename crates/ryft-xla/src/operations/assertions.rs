@@ -26,7 +26,6 @@ use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::sessions::effects::EffectCallbackGuard;
-use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
     RuntimeProvider, RuntimeRequirement,
@@ -629,7 +628,7 @@ impl LowerableOperation for AssertOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
-        lowerer.require_runtime(builtin_requirement(ASSERT_CUSTOM_CALL_TARGET))?;
+        lowerer.require_runtime(RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET))?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
         lower_assert_to_custom_call(
             self.name(),
@@ -656,7 +655,7 @@ impl LowerableOperation for AssertOperation<ArrayIrType> {
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
-        lowerer.require_runtime(builtin_requirement(ASSERT_CUSTOM_CALL_TARGET))?;
+        lowerer.require_runtime(RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET))?;
         let context = lowerer.context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
@@ -710,7 +709,7 @@ impl RuntimeProvider for AssertionRuntimeProvider {
         client: &'static Client<'static>,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        validate_builtin_requirement(requirement, self.identifier())?;
+        requirement.validate_builtin(self.identifier())?;
         let platform_name = client.platform_name()?;
         let supported = platform_name.eq_ignore_ascii_case("cpu")
             || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
@@ -2258,7 +2257,7 @@ mod tests {
     fn test_assertion_runtime_provider_initialize() {
         let client = execution_client();
         let provider = assertion_runtime_provider();
-        let requirement = builtin_requirement(ASSERT_CUSTOM_CALL_TARGET);
+        let requirement = RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
         provider.initialize(client, &requirement).unwrap();
@@ -2314,7 +2313,7 @@ mod tests {
         .unwrap();
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
         assert!(requires_assertion_handler);
-        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement(ASSERT_CUSTOM_CALL_TARGET)]);
+        assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET)]);
         assert!(signature.requires_assertion_handler());
         assert!(signature.has_effects());
         assert!(!signature.has_ordered_io());

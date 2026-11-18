@@ -60,7 +60,6 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
-use crate::sessions::runtimes::builtin_requirement;
 use crate::sharding::ShardyTensorSharding;
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, FlatProgram, Operation, Program, RaggedDotLoweringStrategy,
@@ -2302,10 +2301,10 @@ where
     let requires_assertion_handler = signature.requires_assertion_handler();
     let mut runtime_requirements = collective_state.runtime_requirements.borrow().clone();
     if requires_assertion_handler {
-        runtime_requirements.push(builtin_requirement("ryft.assert"));
+        runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
     }
     if signature.has_ordered_io() {
-        runtime_requirements.push(builtin_requirement("ryft.ordered-io"));
+        runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
     }
     let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
     Ok(LoweredModule {

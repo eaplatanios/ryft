@@ -1551,7 +1551,6 @@ pub(crate) mod tests {
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::sessions::effects::EffectCallbackGuard;
-    use crate::sessions::runtimes::builtin_requirement;
     use crate::tests::{
         assert_send_sync, cpu_client, execution_client, hash_of, other_cpu_client, replicated_array, values_from_bytes,
         values_to_bytes,
@@ -4403,7 +4402,7 @@ pub(crate) mod tests {
         // The supplied configuration replaces the built-in providers, so a session with an empty configuration cannot
         // satisfy a requirement that the default configuration satisfies.
         let client = execution_client();
-        let requirement = builtin_requirement("ryft.ordered-io");
+        let requirement = RuntimeRequirement::builtin("ryft.ordered-io");
         let session = session_with_client(client);
         session.runtimes().ensure(std::slice::from_ref(&requirement)).unwrap();
         let session = Session::builder().client(client).runtime_extensions(RuntimeExtensions::empty()).build().unwrap();

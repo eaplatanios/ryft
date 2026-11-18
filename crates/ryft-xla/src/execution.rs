@@ -35,8 +35,8 @@ use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
 use crate::lowering::signature::ExecutableSignature;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::{
-    Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, FromPjrt, RuntimeRequirement, Session,
-    ToPjrt, Value,
+    Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, ExecutionResources, FromPjrt,
+    RuntimeRequirement, Session, ToPjrt, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -408,9 +408,10 @@ impl Session {
         // stateful call path owns holder leases and pending generations. A stateful program arriving here must
         // therefore already carry state values as plain arrays (e.g., as ABI tests do), and its hidden outputs that
         // carry final reference states are returned verbatim.
+        let mut resources = Some(self.prepare_execution_resources(program)?);
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
         let (arguments, input_refinements, physical_output_count) = prepared.into_arguments()?;
-        let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, |_| {})?;
+        let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, &mut resources, |_| {})?;
         let (physical_outputs, fence) = execution.into_parts();
         let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
         let outputs = self.reconstruct_compiled_outputs(
@@ -487,19 +488,23 @@ impl Session {
         Ok(execution.into_output())
     }
 
-    /// Materializes and validates physical execution arguments without submitting device work.
+    /// Validates the program and prepares its runtime resources before argument materialization and effect reservation.
+    fn prepare_execution_resources(&self, program: &CompiledProgram) -> Result<ExecutionResources, Error> {
+        ensure_effect_dispatch_is_allowed()?;
+        self.validate_program_owner(program)?;
+        if program.kernel_execution_facts().is_some() {
+            crate::kernels::distributed::validate_kernel_participants(self.client(), program.mesh())?;
+        }
+        self.runtimes().prepare(program.runtime_requirements(), program.mesh())
+    }
+
+    /// Materializes and validates physical execution arguments without submitting the executable.
     fn prepare_compiled_execution(
         &self,
         program: &CompiledProgram,
         inputs: Vec<Array>,
         donation_overrides: &[(usize, bool)],
     ) -> Result<PreparedExecution, Error> {
-        ensure_effect_dispatch_is_allowed()?;
-        self.validate_program_owner(program)?;
-        if program.kernel_execution_facts().is_some() {
-            crate::kernels::distributed::validate_kernel_participants(self.client(), program.mesh())?;
-        }
-        self.ensure_runtime_requirements(program.runtime_requirements())?;
         if inputs.len() != program.input_types().len() {
             return Err(Error::from(ProgramError::InvalidInputCount {
                 expected: program.input_types().len(),
@@ -791,6 +796,8 @@ impl Session {
             }
             let mut inputs = Some(inputs);
 
+            // Snapshot retries reuse the same invocation resources. Prepare them before acquiring reference guards.
+            let mut resources = Some(self.prepare_execution_resources(program)?);
             let donation_overrides =
                 reference_state_input_indices.iter().map(|&index| (index, false)).collect::<Vec<_>>();
             let (
@@ -884,7 +891,7 @@ impl Session {
                 let prepared_replacement_storage = RefCell::new(prepared_replacements);
                 let publication: RefCell<Option<CoreReferenceCompletion>> = RefCell::new(None);
                 let replacement_transactions = RefCell::new(Vec::with_capacity(mutated_outputs.len()));
-                let execution = self.execute_pjrt_buffers(program, execution_inputs, physical_output_count, |fence| {
+                let after_submission = |fence: &ExecutionFence| {
                     let mut completions = dependencies.clone();
                     completions.push(CoreReferenceCompletion::new(ReferenceCompletion { fence: fence.clone() }));
                     #[cfg(test)]
@@ -902,7 +909,14 @@ impl Session {
                         transactions.push((logical_output_index, prepared.begin(completion.clone())));
                     }
                     *publication.borrow_mut() = Some(completion);
-                });
+                };
+                let execution = self.execute_pjrt_buffers(
+                    program,
+                    execution_inputs,
+                    physical_output_count,
+                    &mut resources,
+                    after_submission,
+                );
                 break 'snapshot (
                     execution,
                     input_refinements,
@@ -1065,6 +1079,8 @@ impl Session {
     ///   - `arguments`: Physical array inputs grouped by device, to which this function appends the hidden effect
     ///     tokens of ordered programs.
     ///   - `array_output_count`: Number of physical array outputs that every device returns.
+    ///   - `resources`: Prepared invocation resources. This function takes them at the PJRT handoff so the caller
+    ///     can release any reference guards before dropping the resources after an earlier failure.
     ///   - `after_submission`: Callback that runs synchronously on this thread, exactly once, with the fence of the
     ///     whole execution right after PJRT accepts the submission and before the results are checked. It does not
     ///     run when submission fails.
@@ -1073,6 +1089,7 @@ impl Session {
         program: &CompiledProgram,
         mut arguments: ExecutionArguments,
         array_output_count: usize,
+        resources: &mut Option<ExecutionResources>,
         after_submission: impl FnOnce(&ExecutionFence),
     ) -> Result<Execution<Vec<Vec<Buffer<'static>>>>, Error> {
         ensure_effect_dispatch_is_allowed()?;
@@ -1135,8 +1152,7 @@ impl Session {
                 "injected failure before execution submission".to_string(),
             )));
         }
-        let resources = self.runtimes().prepare(program.runtime_requirements(), program.mesh())?;
-        let (context, retained_resources) = resources.into_parts();
+        let (context, retained_resources) = resources.take().unwrap().into_parts();
         // These leases stay in this stack frame on every error path. PJRT destroys the context before returning an
         // error, and if submission succeeded it first waits for every device, so the leases outlive all native use.
         let (mut device_outputs, fence) = program
@@ -1514,14 +1530,14 @@ mod tests {
         ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation,
         CompilationCacheDomain, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension,
         DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation,
-        Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
+        Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
         StagedFunction as CoreStagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program};
+    use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program};
 
     use crate::execution::ExecutionArguments;
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
@@ -1531,8 +1547,9 @@ mod tests {
     };
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Error, ExecutionError, FlatProgram, Options, Platform, ProgramBuilder, Reference, Session,
-        ToMlir, Value, compile_statefully, compile_statefully_with_captures,
+        Array, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET, Platform,
+        ProgramBuilder, Reference, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, ToMlir,
+        Value, compile_statefully, compile_statefully_with_captures,
     };
 
     use super::*;
@@ -2196,6 +2213,61 @@ mod tests {
     }
 
     #[test]
+    fn test_session_execute_compiled_async_prepares_runtime_before_arguments() {
+        /// Print runtime that initializes successfully but rejects invocation preparation.
+        struct RejectingPrintRuntime;
+
+        impl RuntimeProvider for RejectingPrintRuntime {
+            fn identifier(&self) -> &str {
+                PRINT_CUSTOM_CALL_TARGET
+            }
+
+            fn initialize(
+                &self,
+                client: &'static Client<'static>,
+                requirement: &RuntimeRequirement,
+            ) -> Result<Arc<dyn RuntimeExtension>, Error> {
+                let _ = (client, requirement);
+                Ok(Arc::new(Self))
+            }
+        }
+
+        impl RuntimeExtension for RejectingPrintRuntime {
+            fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
+                let _ = resources;
+                Err(RuntimeError::InvalidConfiguration {
+                    identifier: PRINT_CUSTOM_CALL_TARGET.to_owned(),
+                    reason: "test runtime rejected the invocation".to_owned(),
+                }
+                .into())
+            }
+        }
+
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = session_with_client(client);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("test value"), vec![], vec![input], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let extensions = RuntimeExtensions::new().with_replaced_provider(Arc::new(RejectingPrintRuntime)).unwrap();
+        let session = Session::builder().client(client).runtime_extensions(extensions).build().unwrap();
+
+        // The missing input makes the error distinguish preparation from argument validation.
+        assert!(matches!(
+            session.execute_compiled_async(&compiled, vec![]),
+            Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
+                if identifier == PRINT_CUSTOM_CALL_TARGET && reason == "test runtime rejected the invocation",
+        ));
+    }
+
+    #[test]
     fn test_session_execute_stateless_zero_identity_preserves_logical_type_and_canonical_value() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
@@ -2537,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_prepare_compiled_execution_validates_kernel_participants() {
+    fn test_session_prepare_execution_resources_validates_kernel_participants() {
         let client = execution_client();
         let mesh = domain_mesh(client, "device", 1);
         let session = session_with_client(client);
@@ -2570,7 +2642,7 @@ mod tests {
         // A topology change cannot reach resharding, donation, or PJRT execution, and the retained input stays
         // readable.
         assert!(matches!(
-            session.prepare_compiled_execution(&program, vec![input.clone()], &[]),
+            session.prepare_execution_resources(&program),
             Err(error)
                 if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
                     Some(crate::kernels::KernelEmbeddingError::Invalid { message })

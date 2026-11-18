@@ -2327,12 +2327,11 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::runtimes::builtin_requirement;
     use crate::sessions::tests::{domain_mesh, read_f32s, session_with_client};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, CustomCallOperationExtension, Options, StagedFunction,
-        ToPjrt, Value, compile, stage, to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, CustomCallOperationExtension, Options, RuntimeRequirement,
+        StagedFunction, ToPjrt, Value, compile, stage, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -2786,7 +2785,7 @@ mod tests {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(array_type.clone().into());
             let operation = CustomCallOperation::new(identifier, vec![array_type.clone()])
-                .with_runtime_requirements([builtin_requirement(identifier)])
+                .with_runtime_requirements([RuntimeRequirement::builtin(identifier)])
                 .unwrap();
             let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
             Arc::new(
@@ -2852,7 +2851,7 @@ mod tests {
         .unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
-        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement("test.active")]);
+        assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("test.active")]);
         assert_eq!(
             stable_hlo,
             indoc! {r#"

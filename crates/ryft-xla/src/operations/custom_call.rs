@@ -563,7 +563,6 @@ mod tests {
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::sessions::runtimes::builtin_requirement;
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{
         ADD_ONE_CUSTOM_CALL_TARGET, cpu_client, ensure_add_one_handler_registered, replicated_array, values_from_bytes,
@@ -1228,7 +1227,7 @@ mod tests {
         )
         .unwrap();
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
-        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement("ryft.assert")]);
+        assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")]);
         // This direct lowering fixture has no ordered boundary slot and needs no transport admission.
         assert!(!signature.has_ordered_io());
         assert!(requires_assertion_handler);

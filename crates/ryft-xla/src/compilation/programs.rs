@@ -955,7 +955,6 @@ mod tests {
 
     use crate::compilation::functions::stage;
     use crate::lowering::signature::ExecutableSignature;
-    use crate::sessions::runtimes::builtin_requirement;
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{device_mesh_2x2, execution_client};
     use crate::{Error, Options, Session};
@@ -1062,7 +1061,7 @@ mod tests {
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible kernel execution facts",
         ));
-        let requirements = [builtin_requirement("test.runtime")];
+        let requirements = [RuntimeRequirement::builtin("test.runtime")];
         let replacement = InvocationMetadata { runtime_requirements: &requirements, ..current };
         assert_eq!(current.incompatible_field(replacement), Some("runtime requirements"));
         assert!(matches!(

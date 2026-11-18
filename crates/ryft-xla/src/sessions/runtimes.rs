@@ -66,12 +66,42 @@ pub struct RuntimeRequirement {
 }
 
 impl RuntimeRequirement {
+    /// ABI version shared by the built-in runtime providers.
+    const BUILTIN_ABI_VERSION: u32 = 1;
+
     /// Creates a [`RuntimeRequirement`] after validating its identifier.
     #[inline]
     pub fn new(identifier: impl Into<String>, abi_version: u32) -> Result<Self, Error> {
         let identifier = identifier.into();
         validate_identifier(&identifier)?;
         Ok(Self { identifier, abi_version })
+    }
+
+    /// Creates a requirement for a known built-in contract identifier using the built-in ABI version.
+    #[inline]
+    pub(crate) fn builtin(identifier: &str) -> Self {
+        Self::new(identifier, Self::BUILTIN_ABI_VERSION).unwrap()
+    }
+
+    /// Validates that this requirement names `identifier` and uses the built-in ABI version.
+    #[inline]
+    pub(crate) fn validate_builtin(&self, identifier: &str) -> Result<(), Error> {
+        if self.identifier() != identifier {
+            return Err(RuntimeError::InvalidRequirement {
+                reason: format!("expected runtime extension `{identifier}`"),
+            }
+            .into());
+        }
+
+        if self.abi_version() != Self::BUILTIN_ABI_VERSION {
+            return Err(RuntimeError::UnsupportedVersion {
+                identifier: identifier.into(),
+                version: self.abi_version(),
+            }
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Returns the namespaced runtime contract identifier.
@@ -710,34 +740,11 @@ impl Drop for RuntimeRegistry {
             match execution.fence.block_until_ready() {
                 Ok(()) | Err(_) => {}
             }
-            drop(execution);
         }
     }
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Constructs the fixed ABI used by built-in runtime providers.
-pub(crate) fn builtin_requirement(identifier: &str) -> RuntimeRequirement {
-    RuntimeRequirement::new(identifier, 1).unwrap()
-}
-
-/// Validates the identifier and fixed ABI of a built-in extension.
-pub(crate) fn validate_builtin_requirement(requirement: &RuntimeRequirement, identifier: &str) -> Result<(), Error> {
-    if requirement.identifier() != identifier {
-        return Err(
-            RuntimeError::InvalidRequirement { reason: format!("expected runtime extension `{identifier}`") }.into()
-        );
-    }
-    if requirement.abi_version() != 1 {
-        return Err(RuntimeError::UnsupportedVersion {
-            identifier: identifier.into(),
-            version: requirement.abi_version(),
-        }
-        .into());
-    }
-    Ok(())
-}
 
 /// Initialization state for one session and complete runtime descriptor.
 enum Initialization {
@@ -824,8 +831,7 @@ mod tests {
     use super::{
         CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES,
         RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
-        RuntimeRegistry, RuntimeRequirement, builtin_requirement, normalize_runtime_requirements,
-        validate_builtin_requirement,
+        RuntimeRegistry, RuntimeRequirement, normalize_runtime_requirements,
     };
 
     /// Provider that counts initialization attempts and can fail the next attempt.
@@ -912,6 +918,26 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_requirement_builtin() {
+        assert_eq!(RuntimeRequirement::builtin("test.builtin"), RuntimeRequirement::new("test.builtin", 1).unwrap());
+    }
+
+    #[test]
+    fn test_runtime_requirement_validate_builtin() {
+        RuntimeRequirement::builtin("test.builtin").validate_builtin("test.builtin").unwrap();
+        assert!(matches!(
+            RuntimeRequirement::builtin("test.other").validate_builtin("test.builtin"),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "expected runtime extension `test.builtin`",
+        ));
+        assert!(matches!(
+            RuntimeRequirement::new("test.builtin", 2).unwrap().validate_builtin("test.builtin"),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version }))
+                if identifier == "test.builtin" && version == 2,
+        ));
+    }
+
+    #[test]
     fn test_runtime_requirement_deserialize() {
         let encoded = serde_json::json!({"identifier": "test.provider", "abi_version": 2});
         let requirement = RuntimeRequirement::new("test.provider", 2).unwrap();
@@ -929,8 +955,8 @@ mod tests {
 
     #[test]
     fn test_normalize_runtime_requirements() {
-        let first = builtin_requirement("test.a");
-        let second = builtin_requirement("test.b");
+        let first = RuntimeRequirement::builtin("test.a");
+        let second = RuntimeRequirement::builtin("test.b");
         assert_eq!(
             normalize_runtime_requirements([second.clone(), first.clone(), second.clone()]).unwrap(),
             vec![first.clone(), second],
@@ -946,7 +972,7 @@ mod tests {
     #[test]
     fn test_custom_call_operation_with_runtime_requirements() {
         let call = CustomCallOperation::new("test.call", vec![]).with_attribute("enabled", true);
-        let first = builtin_requirement("test.a");
+        let first = RuntimeRequirement::builtin("test.a");
         let second = RuntimeRequirement::new("test.b", 2).unwrap();
         let annotated = call.clone().with_runtime_requirements([second.clone(), first.clone(), second]).unwrap();
         assert_eq!(
@@ -1001,7 +1027,7 @@ mod tests {
         );
         assert_eq!(
             annotated.runtime_requirements().unwrap(),
-            vec![builtin_requirement("test.a"), RuntimeRequirement::new("test.b", 2).unwrap()],
+            vec![RuntimeRequirement::builtin("test.a"), RuntimeRequirement::new("test.b", 2).unwrap()],
         );
 
         // The annotation must be a JSON string with a supported encoding version.
@@ -1151,7 +1177,7 @@ mod tests {
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let first = RuntimeRegistry::new(client, configuration.clone());
         let second = RuntimeRegistry::new(client, configuration);
-        let requirements = [builtin_requirement("test.provider")];
+        let requirements = [RuntimeRequirement::builtin("test.provider")];
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         first.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -1168,7 +1194,7 @@ mod tests {
         provider.fail.store(true, Ordering::SeqCst);
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = RuntimeRegistry::new(client, configuration);
-        let requirements = [builtin_requirement("test.provider")];
+        let requirements = [RuntimeRequirement::builtin("test.provider")];
         let error = registry.ensure(&requirements).unwrap_err();
         assert_eq!(error.downcast_custom::<std::io::Error>().unwrap().to_string(), "fixture initialization failed",);
         registry.ensure(&requirements).unwrap();
@@ -1222,7 +1248,7 @@ mod tests {
             let (registry, start, finished) = (registry.clone(), start.clone(), finished.clone());
             thread::spawn(move || {
                 start.wait();
-                finished.send(registry.ensure(&[builtin_requirement("test.concurrent")])).unwrap();
+                finished.send(registry.ensure(&[RuntimeRequirement::builtin("test.concurrent")])).unwrap();
             })
         };
         let first = spawn();
@@ -1274,7 +1300,7 @@ mod tests {
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = Arc::new(RuntimeRegistry::new(client, configuration));
         provider.registry.set(Arc::downgrade(&registry)).unwrap();
-        let requirements = [builtin_requirement("test.recursive")];
+        let requirements = [RuntimeRequirement::builtin("test.recursive")];
         let ensure = || registry.ensure(&requirements);
         // Both a returned error and a panic must release the initialization slot for another attempt.
         assert!(matches!(
@@ -1322,7 +1348,7 @@ mod tests {
                 if self.reenter.swap(false, Ordering::SeqCst) {
                     self.started.wait();
                     let registry = self.registry.get().unwrap().upgrade().unwrap();
-                    registry.ensure(&[builtin_requirement(self.dependency)])?;
+                    registry.ensure(&[RuntimeRequirement::builtin(self.dependency)])?;
                 }
                 Ok(Arc::new(RegistrationOnlyRuntime))
             }
@@ -1356,7 +1382,7 @@ mod tests {
         let spawn = |identifier, dependency| {
             let (registry, finished) = (registry.clone(), finished.clone());
             thread::spawn(move || {
-                let result = registry.ensure(&[builtin_requirement(identifier)]);
+                let result = registry.ensure(&[RuntimeRequirement::builtin(identifier)]);
                 finished.send((dependency, result)).unwrap();
             })
         };
@@ -1377,7 +1403,9 @@ mod tests {
         left.join().unwrap();
         right.join().unwrap();
         assert!(rejected > 0);
-        registry.ensure(&[builtin_requirement("test.left"), builtin_requirement("test.right")]).unwrap();
+        registry
+            .ensure(&[RuntimeRequirement::builtin("test.left"), RuntimeRequirement::builtin("test.right")])
+            .unwrap();
     }
 
     #[test]
@@ -1385,7 +1413,7 @@ mod tests {
         let client = execution_client();
         let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         assert!(matches!(
-            registry.ensure(&[builtin_requirement("test.missing")]),
+            registry.ensure(&[RuntimeRequirement::builtin("test.missing")]),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing",
         ));
     }
@@ -1397,7 +1425,7 @@ mod tests {
         let provider = Arc::new(CountingProvider::new("test.provider"));
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = RuntimeRegistry::new(client, configuration);
-        let requirements = [builtin_requirement("test.provider")];
+        let requirements = [RuntimeRequirement::builtin("test.provider")];
         let (context, retained) = registry.prepare(&requirements, &mesh).unwrap().into_parts();
 
         // A registration-only extension still initializes, but its invocation needs no context or retained resources.
@@ -1449,7 +1477,7 @@ mod tests {
         let registry = RuntimeRegistry::new(client, configuration);
         let mesh = domain_mesh(client, "invocation", 1);
         assert!(matches!(
-            registry.prepare(&[builtin_requirement("test.mesh")], &mesh),
+            registry.prepare(&[RuntimeRequirement::builtin("test.mesh")], &mesh),
             Err(error) if error.downcast_custom::<std::io::Error>()
                 .is_some_and(|error| error.to_string() == "fixture rejected the invocation mesh"),
         ));
@@ -1548,25 +1576,5 @@ mod tests {
         completed.recv_timeout(Duration::from_secs(5)).unwrap();
         teardown.join().unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_builtin_requirement() {
-        assert_eq!(builtin_requirement("test.builtin"), RuntimeRequirement::new("test.builtin", 1).unwrap());
-    }
-
-    #[test]
-    fn test_validate_builtin_requirement() {
-        validate_builtin_requirement(&builtin_requirement("test.builtin"), "test.builtin").unwrap();
-        assert!(matches!(
-            validate_builtin_requirement(&builtin_requirement("test.other"), "test.builtin"),
-            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
-                if reason == "expected runtime extension `test.builtin`",
-        ));
-        assert!(matches!(
-            validate_builtin_requirement(&RuntimeRequirement::new("test.builtin", 2).unwrap(), "test.builtin"),
-            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version }))
-                if identifier == "test.builtin" && version == 2,
-        ));
     }
 }

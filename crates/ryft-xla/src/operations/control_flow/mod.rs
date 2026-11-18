@@ -522,10 +522,9 @@ mod tests {
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::runtimes::builtin_requirement;
     use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, ExecutionArguments, FromPjrt, to_mlir_module_for_program};
+    use crate::{Array, ExecutionArguments, FromPjrt, RuntimeRequirement, to_mlir_module_for_program};
 
     use super::*;
 
@@ -680,7 +679,7 @@ mod tests {
         .unwrap();
         let (_, _, requires_assertion_handler, runtime_requirements) = active.into_parts();
         assert!(requires_assertion_handler);
-        assert_eq!(runtime_requirements.as_ref(), &[builtin_requirement("ryft.assert")],);
+        assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")],);
 
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());

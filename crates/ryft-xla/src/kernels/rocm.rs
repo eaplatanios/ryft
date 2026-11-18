@@ -21,7 +21,6 @@ use sha2::{Digest, Sha256};
 use crate::kernels::{
     KernelEmbeddingError, KernelOutputEmbedding, ROCM_KERNEL_CUSTOM_CALL_TARGET, dense_memory_layouts,
 };
-use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     CustomCallOperationExtension, Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement,
     ToPjrt,
@@ -208,7 +207,7 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<RocmKer
             .with_attribute("ryft.rocm.row_major", true);
         if self.target_name == ROCM_KERNEL_CUSTOM_CALL_TARGET {
             return operation
-                .with_runtime_requirements([builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)])
+                .with_runtime_requirements([RuntimeRequirement::builtin(ROCM_KERNEL_CUSTOM_CALL_TARGET)])
                 .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() });
         }
         Ok(operation)
@@ -368,7 +367,7 @@ impl RuntimeProvider for RocmRuntimeProvider {
         client: &'static Client<'static>,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        validate_builtin_requirement(requirement, self.identifier())?;
+        requirement.validate_builtin(self.identifier())?;
         if !client.platform_name()?.eq_ignore_ascii_case("rocm") {
             return Err(Error::custom(KernelEmbeddingError::Invalid {
                 message: "rocm artifact calls require a rocm platform".to_owned(),
@@ -566,7 +565,7 @@ mod tests {
         assert_eq!(operation.target_name(), ROCM_KERNEL_CUSTOM_CALL_TARGET);
         assert_eq!(
             operation.runtime_requirements().unwrap(),
-            vec![builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)]
+            vec![RuntimeRequirement::builtin(ROCM_KERNEL_CUSTOM_CALL_TARGET)]
         );
         assert_eq!(operation.output_types(), &[r#type]);
         assert!(operation.input_output_aliases().is_empty());
@@ -650,7 +649,10 @@ mod tests {
     fn test_rocm_runtime_provider_initialize() {
         let client = Platform::Cpu.client(None).unwrap();
         let provider = runtime_provider();
-        let error = provider.initialize(client, &builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET)).err().unwrap();
+        let error = provider
+            .initialize(client, &RuntimeRequirement::builtin(ROCM_KERNEL_CUSTOM_CALL_TARGET))
+            .err()
+            .unwrap();
         assert!(
             matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
             if message == "rocm artifact calls require a rocm platform")

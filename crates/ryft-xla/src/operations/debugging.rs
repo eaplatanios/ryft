@@ -17,7 +17,6 @@ use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::sessions::effects::EffectCallbackGuard;
-use crate::sessions::runtimes::{builtin_requirement, validate_builtin_requirement};
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension, RuntimeProvider,
     RuntimeRequirement,
@@ -153,7 +152,7 @@ impl LowerableOperation for PrintOperation<ArrayType> {
         // call that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain
         // instead of the value data flow.
         check_count!("input", input_values, 1, ProgramError);
-        lowerer.require_runtime(builtin_requirement(PRINT_CUSTOM_CALL_TARGET))?;
+        lowerer.require_runtime(RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET))?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
         lower_print_to_custom_call(
             self.label(),
@@ -181,7 +180,7 @@ impl RuntimeProvider for PrintRuntimeProvider {
         client: &'static Client<'static>,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        validate_builtin_requirement(requirement, self.identifier())?;
+        requirement.validate_builtin(self.identifier())?;
         ensure_print_handler_registered(client)?;
         Ok(Arc::new(PrintRuntime))
     }
@@ -205,7 +204,7 @@ impl RuntimeProvider for OrderedIoRuntimeProvider {
         client: &'static Client<'static>,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        validate_builtin_requirement(requirement, self.identifier())?;
+        requirement.validate_builtin(self.identifier())?;
         let platform_name = client.platform_name()?;
         if !["cpu", "cuda"].iter().any(|platform| platform_name.eq_ignore_ascii_case(platform)) {
             return Err(ExecutionError::UnsupportedEffectPlatform { platform: platform_name.into_owned() }.into());
@@ -693,7 +692,7 @@ mod tests {
     fn test_print_runtime_provider_initialize() {
         let client = cpu_client(1);
         let provider = print_runtime_provider();
-        let requirement = builtin_requirement(PRINT_CUSTOM_CALL_TARGET);
+        let requirement = RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
         provider.initialize(client, &requirement).unwrap();
@@ -711,7 +710,7 @@ mod tests {
     fn test_ordered_io_runtime_provider_initialize() {
         let client = cpu_client(1);
         let provider = ordered_io_runtime_provider();
-        provider.initialize(client, &builtin_requirement("ryft.ordered-io")).unwrap();
+        provider.initialize(client, &RuntimeRequirement::builtin("ryft.ordered-io")).unwrap();
     }
 
     #[test]
@@ -791,9 +790,12 @@ mod tests {
             let (stable_hlo, signature, _, runtime_requirements) = lowered.into_parts();
             assert_eq!(signature.has_ordered_io(), ordered);
             let requirements = if ordered {
-                vec![builtin_requirement("ryft.ordered-io"), builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
+                vec![
+                    RuntimeRequirement::builtin("ryft.ordered-io"),
+                    RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET),
+                ]
             } else {
-                vec![builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
+                vec![RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET)]
             };
             assert_eq!(runtime_requirements.as_ref(), requirements);
             assert_eq!(signature.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);

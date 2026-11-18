@@ -27,12 +27,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
-use crate::sessions::runtimes::builtin_requirement;
+use crate::{CustomCallOperationExtension, Error, RuntimeRequirement, ToPjrt};
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use crate::sessions::runtimes::validate_builtin_requirement;
-use crate::{CustomCallOperationExtension, Error, ToPjrt};
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use crate::{ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement};
+use crate::{ExecutionResources, RuntimeExtension, RuntimeProvider};
 
 // TODO(eaplatanios): Review this module.
 
@@ -382,7 +379,7 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
         }
         if self.target_name == CUDA_KERNEL_CUSTOM_CALL_TARGET {
             operation = operation
-                .with_runtime_requirements([builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)])
+                .with_runtime_requirements([RuntimeRequirement::builtin(CUDA_KERNEL_CUSTOM_CALL_TARGET)])
                 .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
         }
         Ok(operation)
@@ -575,7 +572,7 @@ impl RuntimeProvider for CudaRuntimeProvider {
         client: &'static Client<'static>,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-        validate_builtin_requirement(requirement, self.identifier())?;
+        requirement.validate_builtin(self.identifier())?;
         if !client.platform_name()?.eq_ignore_ascii_case("cuda") {
             return Err(Error::custom(KernelEmbeddingError::Invalid {
                 message: "cuda artifact calls require a cuda platform".to_owned(),
@@ -1088,7 +1085,7 @@ mod tests {
             }}
         "#},
         );
-        assert_eq!(requirements.as_ref(), &[builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)]);
+        assert_eq!(requirements.as_ref(), &[RuntimeRequirement::builtin(CUDA_KERNEL_CUSTOM_CALL_TARGET)]);
         assert!(!signature.has_effects());
         assert!(!assertions);
     }
@@ -1201,7 +1198,10 @@ mod tests {
     fn test_cuda_runtime_provider_initialize() {
         let client = Platform::Cpu.client(None).unwrap();
         let provider = runtime_provider();
-        let error = provider.initialize(client, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)).err().unwrap();
+        let error = provider
+            .initialize(client, &RuntimeRequirement::builtin(CUDA_KERNEL_CUSTOM_CALL_TARGET))
+            .err()
+            .unwrap();
         assert!(
             matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
             if message == "cuda artifact calls require a cuda platform")
