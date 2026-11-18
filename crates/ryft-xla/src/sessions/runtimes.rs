@@ -368,59 +368,65 @@ pub struct ExecutionResources {
     retained: Vec<Box<dyn RetainedResource>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ExecutionResources {
     /// Returns the client receiving the invocation.
+    #[inline]
     pub fn client(&self) -> &'static Client<'static> {
         self.client
     }
 
-    /// Retains a resource until the whole execution completes. When native user data points into the resource, use an
-    /// allocation such as `Arc` or `Box` to keep the pointee's address stable when moving the resource into this method.
+    /// Retains a resource until the whole execution completes. When native user data points into the resource, use
+    /// an allocation such as `Arc` or `Box` to keep the pointee's address stable when moving the resource into this
+    /// method.
+    #[inline]
     pub fn retain<T: 'static + Send + Sync>(&mut self, resource: T) {
         self.retained.push(Box::new(resource));
     }
 
-    /// Adds one borrowed native user data binding to this invocation, creating the context lazily.
-    ///
-    /// `data` pairs a native [`FfiTypeId`] with a raw pointer, which the native handlers of this invocation look up by
-    /// that type ID and dereference during execution.
+    /// Adds one borrowed native user data binding to this invocation, creating the context lazily. `data` pairs a
+    /// native [`FfiTypeId`] with a raw pointer, which the native handlers of this invocation look up by that type ID
+    /// and dereference during execution.
     ///
     /// # Safety
     ///
     /// Neither the pointer nor its pointee is checked. The pointer must point to a value of the type registered under
-    /// its native type ID and remain stable until completion. The session's runtime instance or a resource held
-    /// through [`Self::retain`] must keep the pointee alive. Native handlers may access it concurrently on several
-    /// devices, so the pointee must support those accesses. The function is public so that third-party FFI integrations
-    /// can attach their own data, and its `unsafe` boundary keeps native pointer insertion explicit.
+    /// its native type ID and remain stable until completion. The session's runtime instance or a resource held through
+    /// [`Self::retain`] must keep the pointee alive. Native handlers may access it concurrently on several devices, so
+    /// the pointee must support those accesses. The function is public so that third-party FFI integrations can attach
+    /// their own data, and its `unsafe` boundary keeps native pointer insertion explicit.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::DuplicateUserData`] if this invocation already holds user data for the same type ID, and
-    /// an [`Error`] if the execution context cannot be created or the native insertion fails.
+    /// Returns [`RuntimeError::DuplicateUserData`] if this invocation already holds user data for the same type ID,
+    /// and an [`Error`] if the execution context cannot be created or the native insertion fails.
     pub unsafe fn add_ffi_user_data(&mut self, data: FfiUserData) -> Result<(), Error> {
         let type_id = data.type_id;
         if self.user_data.contains(&type_id) {
             return Err(RuntimeError::DuplicateUserData { type_id: type_id.into() }.into());
         }
+
         if self.context.is_none() {
             self.context = Some(self.client.execution_context()?);
         }
+
         unsafe { self.context.as_ref().unwrap().add_ffi_user_data(data) }?;
 
         // The type ID is recorded only after the native insertion succeeds, so that a failed call can be retried.
         self.user_data.insert(type_id);
+
         Ok(())
     }
 
-    /// Separates the native execution context from the resources the session must retain.
+    /// Returns the optional [`ExecutionContext`] for PJRT submission and the resources the session keeps alive
+    /// until the execution fence is ready.
     pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources) {
         let Self { context, retained, .. } = self;
         let needed = context.is_some() || !retained.is_empty();
         (context, RetainedExecutionResources { needed, _resources: retained })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Immutable provider configuration, independent of initialized session runtime instances.
 ///
