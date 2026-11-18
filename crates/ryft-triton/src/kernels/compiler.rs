@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::kernels::{
     Artifact, COMPILER_SCHEMA_VERSION, CompiledKernel, Error, Options, TRITON_VERSION, Target, XLA_VERSION, lowering,
+    lowering_sha256,
 };
 
 /// Linked native compiler and optional caller-owned cancellation signal.
@@ -73,7 +74,9 @@ impl Compiler {
 
     /// Restores validated compiler configuration for AOT loading without invoking the compiler or a GPU runtime.
     /// This compiler can check compatibility but cannot compile new kernels. Configuration records describe
-    /// compatibility; they do not authenticate native code or its producer.
+    /// compatibility; they do not authenticate native code or its producer. A record must carry the digest of the
+    /// Rust lowering of this build (refer to [`lowering_sha256`]), so a record without one or with another one is
+    /// rejected.
     pub fn from_configuration(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > 1024 * 1024 {
             return Err(Error::Invalid { message: "compiler configuration exceeds 1 MiB".into() });
@@ -82,12 +85,28 @@ impl Compiler {
         let fields = configuration
             .as_object()
             .ok_or_else(|| Error::Invalid { message: "compiler configuration must be an object".into() })?;
-        let expected = ["schema", "versions", "target", "warp_count", "pipeline_stages", "maximum_scratch_bytes"];
+        let expected = [
+            "schema",
+            "versions",
+            "lowering_sha256",
+            "target",
+            "warp_count",
+            "pipeline_stages",
+            "maximum_scratch_bytes",
+        ];
         if fields.len() != expected.len()
             || expected.iter().any(|name| !fields.contains_key(*name))
             || configuration["schema"] != json!(COMPILER_SCHEMA_VERSION)
         {
             return Err(Error::Invalid { message: "invalid recorded compiler configuration".into() });
+        }
+
+        // The record was produced by the Rust lowering that its digest identifies. Another lowering may admit other
+        // kernels or emit other code for the same kernel, so its records do not describe this compiler.
+        if configuration["lowering_sha256"] != json!(lowering_sha256()) {
+            return Err(Error::Invalid {
+                message: "recorded compiler configuration belongs to a different Triton lowering".into(),
+            });
         }
         let target: Target = serde_json::from_value(configuration["target"].clone())?;
         target.validate()?;
@@ -157,8 +176,8 @@ impl Compiler {
         });
         Self::validate_versions(&versions, target)?;
         Ok(serde_json::to_vec(&json!({
-            "schema": COMPILER_SCHEMA_VERSION, "versions": versions, "target": target,
-            "warp_count": options.warp_count(), "pipeline_stages": stages,
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions, "lowering_sha256": lowering_sha256(),
+            "target": target, "warp_count": options.warp_count(), "pipeline_stages": stages,
             "maximum_scratch_bytes": schedule.maximum_scratch_bytes(),
         }))?)
     }
@@ -610,7 +629,7 @@ mod tests {
     #[test]
     fn test_compiler_from_configuration() {
         let configuration = json!({
-            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(),
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "lowering_sha256": lowering_sha256(),
             "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4,
             "pipeline_stages": 2, "maximum_scratch_bytes": null,
         });
@@ -669,8 +688,8 @@ mod tests {
             "pipeline_stages": 2, "maximum_scratch_bytes": null,
         });
         let fresh = json!({
-            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "target": target, "warp_count": 4,
-            "pipeline_stages": 2, "maximum_scratch_bytes": null,
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "lowering_sha256": lowering_sha256(),
+            "target": target, "warp_count": 4, "pipeline_stages": 2, "maximum_scratch_bytes": null,
         });
         assert_eq!(COMPILER_SCHEMA_VERSION, 1);
         assert_eq!(historical["schema"], fresh["schema"]);
@@ -695,9 +714,6 @@ mod tests {
         assert_eq!(cache.get(&key), Some(&"fresh"));
     }
 
-    // TODO(eaplatanios): Remove this `ignore` when the recorded configuration includes a SHA-256 digest of the Rust
-    //  lowering sources, which requires `sha2` as a dependency of this crate.
-    #[ignore = "the recorded configuration does not yet identify the Rust lowering"]
     #[test]
     fn test_compiler_from_configuration_historical_lowering() {
         // Earlier revisions recorded no identity of the Rust lowering, so a bundle or tuning record of a lowering with
@@ -710,12 +726,16 @@ mod tests {
         assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&historical).unwrap()),
             Err(Error::Invalid { message }) if message == "invalid recorded compiler configuration"));
 
-        // A record of a different lowering is rejected by its digest.
+        // A record of a different lowering is rejected by its digest, and a record of this lowering is restored.
         let mut different = historical.clone();
         different["lowering_sha256"] = json!("0".repeat(64));
         assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&different).unwrap()),
             Err(Error::Invalid { message })
                 if message == "recorded compiler configuration belongs to a different Triton lowering"));
+        let mut current = historical;
+        current["lowering_sha256"] = json!(lowering_sha256());
+        assert!(Compiler::from_configuration(&serde_json::to_vec(&current).unwrap()).is_ok());
+        assert_eq!(lowering_sha256().len(), 64);
     }
 
     #[test]
@@ -764,8 +784,9 @@ mod tests {
     #[test]
     fn test_compiler_configuration_key() {
         let configuration = json!({
-            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "target": Target::Cuda { major: 12, minor: 1 },
-            "warp_count": 4, "pipeline_stages": 2, "maximum_scratch_bytes": null,
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "lowering_sha256": lowering_sha256(),
+            "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4, "pipeline_stages": 2,
+            "maximum_scratch_bytes": null,
         });
         let bytes = serde_json::to_vec(&configuration).unwrap();
         let compiler = Compiler::from_configuration(&bytes).unwrap();
@@ -865,8 +886,9 @@ mod tests {
     #[test]
     fn test_compiler_compile() {
         let configuration = json!({
-            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "target": Target::Cuda { major: 12, minor: 1 },
-            "warp_count": 4, "pipeline_stages": 2, "maximum_scratch_bytes": null,
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "lowering_sha256": lowering_sha256(),
+            "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4, "pipeline_stages": 2,
+            "maximum_scratch_bytes": null,
         });
         let compiler = Compiler::from_configuration(&serde_json::to_vec(&configuration).unwrap()).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [256]);

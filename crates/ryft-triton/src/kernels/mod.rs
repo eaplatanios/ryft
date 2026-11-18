@@ -8,6 +8,7 @@
 
 use ryft_core::{ArrayType, ProgramError, TypeError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Configuration, portable admission, native compilation and artifact failures.
@@ -84,6 +85,25 @@ mod compiler;
 mod lowering;
 
 pub use compiler::Compiler;
+
+/// Returns the hexadecimal SHA-256 digest of every Rust source file of this adapter (i.e., `kernels/mod.rs`,
+/// `kernels/lowering.rs`, and `kernels/compiler.rs`), in that order and each preceded by its byte length. These files
+/// determine the emitted module and its admission.
+///
+/// The compiler configuration key includes it, so that runtime-only records of a different lowering or admission
+/// policy (e.g., XLA ahead-of-time bundles and persisted tuning measurements) never match the current compiler,
+/// without a revision constant that must be changed by hand. The digest covers whole files, so formatting,
+/// documentation, and test edits also change it, which is the conservative direction. It does not cover dependencies
+/// such as `ryft-core`, `ryft-kernels`, and `ryft-mlir`, or the native compiler, which the recorded source revisions
+/// identify.
+pub fn lowering_sha256() -> String {
+    let mut hash = Sha256::new();
+    for source in [include_str!("mod.rs"), include_str!("lowering.rs"), include_str!("compiler.rs")] {
+        hash.update((source.len() as u64).to_le_bytes());
+        hash.update(source);
+    }
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// Version of the typed lowering, native bridge and physical argument contract.
 ///

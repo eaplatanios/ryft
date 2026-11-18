@@ -365,7 +365,7 @@ pub struct ExecutionResources {
     user_data: HashSet<FfiTypeId>,
 
     /// Additional resources held through execution.
-    retained: Vec<Box<dyn RetainedResource>>,
+    retained: RetainedExecutionResources,
 }
 
 impl ExecutionResources {
@@ -423,24 +423,21 @@ impl ExecutionResources {
     /// resources requires retaining the fence.
     pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, Option<RetainedExecutionResources>) {
         let Self { context, retained, .. } = self;
-        let resources =
-            (context.is_some() || !retained.is_empty()).then_some(RetainedExecutionResources { _resources: retained });
+        let resources = (context.is_some() || !retained.is_empty()).then_some(retained);
         (context, resources)
     }
 }
 
 /// Invocation resources retained by the session through execution.
-pub(crate) struct RetainedExecutionResources {
-    /// Additional resources destroyed after the whole execution completes.
-    _resources: Vec<Box<dyn RetainedResource>>,
-}
+pub(crate) type RetainedExecutionResources = Vec<Box<dyn Send + Sync>>;
 
 // TODO(eaplatanios): Review from here onwards.
 
 /// Immutable provider configuration, independent of initialized session runtime instances. Supply this
 /// configuration to [`SessionBuilder::runtime_extensions`](super::SessionBuilder::runtime_extensions) before
 /// constructing a [`Session`](crate::Session). The session uses these [`RuntimeProvider`]s to initialize its
-/// own [`RuntimeExtension`] instances lazily.
+/// own [`RuntimeExtension`] instances lazily. The [`RuntimeProvider`] example shows how to add a provider and
+/// declare which custom calls require it.
 #[derive(Clone)]
 pub struct RuntimeExtensions {
     /// [`RuntimeProvider`]s keyed by their public contract identifiers.
@@ -448,7 +445,12 @@ pub struct RuntimeExtensions {
 }
 
 impl RuntimeExtensions {
-    /// Creates the built-in [`RuntimeExtensions`]. Providers are lazy, so this does not load accelerator drivers.
+    /// Creates the built-in [`RuntimeExtensions`], with providers for assertions (`ryft.assert`), ordered I/O
+    /// (`ryft.ordered-io`), printing (`ryft.print`), and CUDA kernels (`ryft.kernel.cuda`). The `rocm` feature adds
+    /// a provider for ROCm kernels (`ryft.kernel.rocm`).
+    ///
+    /// The session initializes runtime extensions only as programs require them. Creating this configuration does
+    /// not load accelerator drivers.
     pub fn new() -> Self {
         let mut configuration = Self::empty();
         let mut providers = crate::kernels::runtime_providers();
@@ -713,10 +715,6 @@ pub(crate) fn validate_builtin_requirement(requirement: &RuntimeRequirement, ide
     }
     Ok(())
 }
-
-/// Erased ownership with the session's client lifetime, without requiring `Any` or `'static`.
-trait RetainedResource: Send + Sync {}
-impl<T: Send + Sync> RetainedResource for T {}
 
 /// Initialization state for one session and complete runtime descriptor.
 enum Initialization {

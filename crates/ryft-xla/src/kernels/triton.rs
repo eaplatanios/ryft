@@ -122,7 +122,7 @@ mod tests {
         ArrayType, CustomCallAttribute, DataType, Device, DeviceMesh, DiskCache, LogicalMesh, StatefulExecution,
     };
     use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, kernel};
-    use ryft_triton::kernels::{Compiler, Error, Options, TRITON_VERSION, XLA_VERSION};
+    use ryft_triton::kernels::{Compiler, Error, Options, TRITON_VERSION, XLA_VERSION, lowering_sha256};
     use serde_json::json;
 
     use crate::FromPjrt;
@@ -259,8 +259,8 @@ mod tests {
                 "cuda_available": true, "rocm_available": true, "cuda_toolkit_version": 13020,
                 "assembler_version": "13.0.88",
             },
-            "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4, "pipeline_stages": 2,
-            "maximum_scratch_bytes": null,
+            "lowering_sha256": lowering_sha256(), "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4,
+            "pipeline_stages": 2, "maximum_scratch_bytes": null,
         }))
         .unwrap()
     }
