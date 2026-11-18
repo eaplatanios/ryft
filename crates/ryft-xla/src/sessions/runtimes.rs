@@ -456,21 +456,18 @@ pub struct RuntimeExtensions {
     providers: BTreeMap<String, Arc<dyn RuntimeProvider>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl RuntimeExtensions {
     /// Creates the built-in [`RuntimeExtensions`], with providers for assertions (i.e., `ryft.assert`), ordered I/O
-    /// (i.e., `ryft.ordered-io`), printing (i.e., `ryft.print`), and CUDA kernels (i.e., `ryft.kernel.cuda`). The
-    /// `rocm` feature also adds a provider for ROCm kernels (i.e., `ryft.kernel.rocm`).
-    ///
-    /// The session initializes runtime extensions only as programs require them. Creating this configuration does
-    /// not load accelerator drivers.
+    /// (i.e., `ryft.ordered-io`), and printing (i.e., `ryft.print`). Either `cuda-12` or `cuda-13` adds the CUDA
+    /// kernel provider (i.e., `ryft.kernel.cuda`). The `rocm` feature adds the ROCm kernel provider (i.e.,
+    /// `ryft.kernel.rocm`). The session initializes runtime extensions only as programs require them.
+    /// Creating this configuration does not load accelerator drivers.
     pub fn new() -> Self {
         let mut configuration = Self::empty();
         let mut providers = crate::kernels::runtime_providers();
-        providers.push(crate::operations::debugging::runtime_provider());
+        providers.push(crate::operations::debugging::print_runtime_provider());
         providers.push(crate::operations::debugging::ordered_io_runtime_provider());
-        providers.push(crate::operations::assertions::runtime_provider());
+        providers.push(crate::operations::assertions::assertion_runtime_provider());
         for provider in providers {
             configuration = configuration.with_provider(provider).unwrap();
         }
@@ -478,6 +475,7 @@ impl RuntimeExtensions {
     }
 
     /// Creates an empty provider configuration for explicit integrations.
+    #[inline]
     pub fn empty() -> Self {
         Self { providers: BTreeMap::new() }
     }
@@ -506,7 +504,8 @@ impl RuntimeExtensions {
         Ok(self)
     }
 
-    /// Returns configured contract identifiers in deterministic order.
+    /// Returns configured [`RuntimeProvider`] identifiers in deterministic order.
+    #[inline]
     pub fn identifiers(&self) -> impl Iterator<Item = &str> {
         self.providers.keys().map(String::as_str)
     }
@@ -528,6 +527,8 @@ impl Debug for RuntimeExtensions {
             .finish()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
 /// executions.
@@ -1021,10 +1022,15 @@ mod tests {
 
     #[test]
     fn test_runtime_extensions_new() {
-        #[cfg(feature = "rocm")]
-        let expected = vec!["ryft.assert", "ryft.kernel.cuda", "ryft.kernel.rocm", "ryft.ordered-io", "ryft.print"];
-        #[cfg(not(feature = "rocm"))]
-        let expected = vec!["ryft.assert", "ryft.kernel.cuda", "ryft.ordered-io", "ryft.print"];
+        let expected = [
+            "ryft.assert",
+            #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+            "ryft.kernel.cuda",
+            #[cfg(feature = "rocm")]
+            "ryft.kernel.rocm",
+            "ryft.ordered-io",
+            "ryft.print",
+        ];
         assert_eq!(RuntimeExtensions::new().identifiers().collect::<Vec<_>>(), expected);
         assert_eq!(RuntimeExtensions::default().identifiers().collect::<Vec<_>>(), expected);
     }

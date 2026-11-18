@@ -131,7 +131,7 @@ pub fn with_captured_prints<R, F: FnOnce() -> R>(body: F) -> (R, Vec<String>) {
 }
 
 /// Returns the built-in print provider without loading a PJRT plugin.
-pub(crate) fn runtime_provider() -> Arc<dyn RuntimeProvider> {
+pub(crate) fn print_runtime_provider() -> Arc<dyn RuntimeProvider> {
     Arc::new(PrintRuntimeProvider)
 }
 
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn test_print_runtime_provider_initialize() {
         let client = cpu_client(1);
-        let provider = runtime_provider();
+        let provider = print_runtime_provider();
         let requirement = builtin_requirement(PRINT_CUSTOM_CALL_TARGET);
 
         // Repeated initialization registers the same handler again, which XLA accepts.
