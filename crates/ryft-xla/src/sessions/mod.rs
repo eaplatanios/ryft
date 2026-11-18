@@ -470,422 +470,11 @@ impl Session {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Returns a new [`Array`] that belongs to this handle and shares the storage that `constant` retains.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError::Type`] error if `constant` retains an array of another PJRT client, whose buffers
-    /// this session cannot use.
-    pub(crate) fn retained_constant(&self, constant: &SessionConstant) -> Result<Array, ProgramError> {
-        if !std::ptr::eq(constant.client, self.client()) {
-            return Err(TypeError::invalid(format!(
-                "session constant `{constant}` retains an array of a different PJRT client than the client of this \
-                 session",
-            ))
-            .into());
-        }
-        Ok(constant.storage.to_array(self))
-    }
-
-    /// Retains the storage of `array` and returns a [`SessionConstant`] handle that owns it. The storage stays
-    /// retained for as long as any handle to it exists. Retaining one array more than once returns equal handles, so
-    /// that repeatedly importing the same captured array (e.g., the weights that a compiled function captures)
-    /// stages the same constant every time.
-    fn retain_constant(&self, array: &Array) -> SessionConstant {
-        SessionConstant {
-            r#type: array.r#type().into_owned(),
-            storage: Arc::new(array.retain()),
-            client: self.client(),
-        }
-    }
-
-    /// Executes `operation` eagerly on reference handles on the host if it is a reference operation, and returns
-    /// [`None`] otherwise. Reference operations act on shared handles rather than on device computations, so they
-    /// execute through the generic [`ArrayIrValue`] reference implementations in `ryft-core`, which own handle
-    /// validation and locking, and new references are bound to this session.
-    fn eager_reference_bind(
-        &self,
-        operation: &Operation,
-        inputs: &[Value],
-    ) -> Option<Result<Vec<Value>, ProgramError>> {
-        let context = EagerContext::<ArrayIrValue<Array>>::new();
-        let inputs = || inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
-        let outputs = match operation {
-            Operation::ReferenceNew(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
-            Operation::ReferenceRead(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
-            Operation::ReferenceWrite(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
-            Operation::ReferenceSwap(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
-            Operation::ReferenceAddUpdate(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
-            Operation::ReferenceAtomicAddUpdate(operation) => {
-                operation.interpret(&context, &EmptyRegionDriver, &inputs())
-            }
-            Operation::ReferenceFreeze(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
-            _ => return None,
-        };
-        Some(outputs.and_then(|outputs| {
-            outputs
-                .into_iter()
-                .map(|output| Value::from_array_ir_value(output, self).map_err(ProgramError::from))
-                .collect()
-        }))
-    }
-
-    /// Uploads a replicated scalar with the provided host `bytes` and `data_type`, placed through [`Self::eager_mesh`].
-    fn eager_scalar(&self, data_type: DataType, bytes: &[u8]) -> Result<Array, ProgramError> {
-        let output_type = ArrayType::scalar(data_type);
-        let mesh = self.eager_mesh(&[], None)?;
-        let output_type = output_type
-            .replicated(&mesh)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Array::from_host_buffer(self, output_type, mesh, None, bytes)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
-    }
-
-    /// Eagerly executes one operation on concrete input [`Array`]s. This is the JAX-style op-by-op dispatch path behind
-    /// [`Context::bind`].
-    ///
-    /// An application is first looked up in the session's eager dispatch cache, keyed by the operation, the structure
-    /// of its attached regions, its inputs, the lowering mesh, and the compilation options, which together form an
-    /// [`EagerDispatchKey`]. A hit validates the input placement and executes the cached program directly, skipping
-    /// program construction, lowering, and compilation key construction. On a miss, the operation is built into a flat
-    /// program with a single instruction over the physical [`ArrayType`]s of the inputs, including their shardings,
-    /// compiled through this session's compilation cache, and executed on this session's PJRT client. The compilation
-    /// cache key contains the complete lowered computation, its effective compilation options, and the derived mesh, so
-    /// repeated eager binds of the same lowering reuse one compiled executable without conflating distinct
-    /// computations. Higher-order operations (e.g., `condition`, `while`, `scan`, `jit_call`, and `shard_map`) receive
-    /// their nested programs as attached regions and flow through this same path, and the compiler handles their
-    /// control flow, so no host interpreter loops are needed.
-    ///
-    /// Work that involves no device computation never reaches the compilation cache. Reference operations act on
-    /// handles on the host through [`Self::eager_reference_bind`], while dimension operations, dimension casts and
-    /// comparisons, and conversions between dimensions and scalars are decided on the host. Only their array results
-    /// are uploaded, through [`Self::eager_scalar`]. Reference operands of any other operation, and reference state
-    /// carried by attached regions, are rejected because XLA eager execution lowers each operation.
-    fn eager_bind(
-        &self,
-        operation: Operation,
-        regions: AttachedRegions<'_, Constant, Operation>,
-        inputs: &[Value],
-    ) -> Result<Vec<Value>, ProgramError> {
-        if let Some(outputs) = self.eager_reference_bind(&operation, inputs) {
-            return outputs;
-        }
-        if inputs.iter().any(|input| matches!(input, Value::Reference(_))) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "eager XLA execution lowers each operation and cannot bind a reference operand; discharge \
-                          references before lowering"
-                    .to_string(),
-            });
-        }
-        // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone would
-        // miss a pure pass-through or capture of a reference type. The borrowed closure scan covers dormant rule
-        // regions too without cloning their program graphs. Although those rules do not execute in this eager bind,
-        // ordinary XLA rejects unresolved references across the whole artifact, so accepting one here would only defer
-        // failure to compilation with a less targeted diagnostic.
-        if operation.effects().classes().contains(EffectClass::OrderedState)
-            || regions.regions().any(|region| {
-                region.contains_effect_in_closure(EffectClass::OrderedState)
-                    || region.contains_atom_type_in_closure(Type::is_reference)
-            })
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{}` carries reference state that XLA eager execution cannot lower; discharge references before \
-                     lowering",
-                    operation.name(),
-                ),
-            });
-        }
-        // `Context::bind` has already rejected attached regions for the operations that declare no region slots, which
-        // includes every operation that is executed on the host below.
-        if let Operation::Dimension(operation) = &operation {
-            let inputs = inputs
-                .iter()
-                .map(|input| {
-                    <Value as ryft_core::ValueProjection<DimensionType>>::projected(input)
-                        .map(|dimension| dimension.value().clone())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
-                operation.clone(),
-                Vec::new(),
-                inputs.as_slice(),
-            )?;
-            return Ok(outputs
-                .into_iter()
-                .map(|output| Value::Dimension(Dimension::new(output, self.clone())))
-                .collect());
-        }
-        if let Operation::DimensionSize(operation) = &operation {
-            check_count!("input", inputs, 1, ProgramError);
-            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            let extent = array.dimension_size(operation.axis())?;
-            // Arrays derived from this dimension are placed on the mesh of the array that it was read from.
-            let value = DimensionValue::new(operation.output_type().clone(), extent)?;
-            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
-        }
-        if let Operation::DimensionFromScalar(operation) = &operation {
-            check_count!("input", inputs, 1, ProgramError);
-            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
-            let value = array.to_dimension(operation.output_type().to_variable())?;
-            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
-        }
-
-        if matches!(&operation, Operation::DimensionToScalar(_)) {
-            check_count!("input", inputs, 1, ProgramError);
-            let dimension = <Value as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
-            let extent = i64::try_from(dimension.value().extent()).unwrap();
-            return Ok(vec![Value::Array(self.eager_scalar(DataType::I64, extent.to_ne_bytes().as_slice())?)]);
-        }
-        if let Operation::Compare(operation) = &operation
-            && let [Value::Dimension(left), Value::Dimension(right)] = inputs
-        {
-            // Both extents are concrete, so the predicate is decided on the host by the comparison of first-class
-            // dimensions, which proves it from their types and extents, instead of compiling a program for each pair
-            // of extents. Only the Boolean result is materialized in this session.
-            let output =
-                Compare::<ArrayIrValue<ryft_core::Array>>::compare(left.value(), right.value(), operation.direction())?;
-            let output = Concretizable::<bool>::concretize(&output)?;
-            return Ok(vec![Value::Array(self.eager_scalar(DataType::Boolean, &[u8::from(output)])?)]);
-        }
-
-        // A composite call whose concrete inputs refine the types that its primal region was traced over (e.g., a named
-        // call staged in a bounded-dynamic program) replays its primal region, exactly as the interpretation rule of
-        // composites does, because that region describes the call at its traced types rather than at the exact types
-        // of its inputs. Calls at their traced types compile as one program, so backend implementations of named
-        // composites (e.g., fused kernels) still apply to them. A named call that explicitly requests a backend
-        // implementation reports that it cannot use it instead of silently replaying its body.
-        if operation.name() == COMPOSITE_OPERATION_NAME
-            && let Some(primal) = regions.regions().next()
-            && primal
-                .interface()
-                .input_types()
-                .iter()
-                .zip(inputs)
-                .any(|(declared, input)| *declared != *input.r#type())
-        {
-            if let Some(key) = operation.composite_key() {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                // A session whose target cannot be queried cannot compile the call either, so the failure is reported
-                // here instead of silently selecting the portable body.
-                let target =
-                    self.target().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                let target_platform = Some(target.platform_name());
-                let implementation = NamedCompositeImplementation::select(
-                    key,
-                    input_types.as_slice(),
-                    primal.interface().output_types(),
-                    target_platform,
-                );
-                if let Some(error) = implementation.and_then(|implementation| implementation.body_substitution_error())
-                {
-                    return Err(ProgramError::UnsupportedOperation { message: error.to_string() });
-                }
-            }
-            return primal.interpret_in_context(self, inputs.to_vec());
-        }
-
-        let array_inputs = inputs
-            .iter()
-            .filter_map(|input| match input {
-                Value::Array(array) => Some(array.clone()),
-                Value::Dimension(_) | Value::Reference(_) => None,
-            })
-            .collect::<Vec<_>>();
-
-        if let Operation::Cast(operation) = &operation
-            && matches!(operation.output_type(), ArrayIrType::Dimension(_))
-        {
-            // `Context::bind` rejects attached regions. Validate the original declaration before observing every
-            // array witness producer, because the host dimension has no buffer that could retain those dependencies.
-            // Eager values have exact types, so interpreted inference proves the relationship or rejects it and never
-            // leaves a check to a backend.
-            let values = inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
-            let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-            let (_, interpreted) = ArrayIrType::infer_cast_output_type(operation, &input_types)?;
-            if interpreted.is_none() {
-                return Err(ProgramError::Concretization {
-                    message: format!(
-                        "`{}` cannot check symbolic type relationships during interpretation; \
-                         bind the operation through its context",
-                        operation.name(),
-                    ),
-                });
-            }
-            self.validate_eager_placement(&array_inputs)?;
-            for input in &array_inputs {
-                input
-                    .block_until_ready()
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            }
-            return Ok(vec![Value::from_array_ir_value(values[0].clone(), self)?]);
-        }
-
-        // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
-        // and its inputs directly to a compiled program, so a repeated application skips program construction,
-        // lowering, and compilation key construction and only revalidates its input placement. Hits are looked up
-        // through a borrowed query, and the owned key is only built on a miss.
-        let region_keys = regions.regions().map(RegionRef::key).collect::<Vec<_>>();
-        let query = EagerDispatchQuery::new(
-            &operation,
-            region_keys.as_slice(),
-            inputs,
-            array_inputs.first().map(Array::mesh).or_else(|| self.device_mesh().ok()),
-        );
-        let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
-            Some(compiled) => {
-                self.validate_eager_placement(array_inputs.as_slice())?;
-                compiled
-            }
-            None => {
-                // The query borrows `region_keys`, so the key takes them only after its last use of the query.
-                let key_inputs = (0..inputs.len()).map(|index| query.input(index).into_owned()).collect();
-                let key_mesh = query.mesh().cloned();
-                let key = EagerDispatchKey::new(operation.clone(), region_keys.into(), key_inputs, key_mesh);
-                let entry = self
-                    .state
-                    .eager_dispatch_cache
-                    .try_entry(key)
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                match entry {
-                    SpecializationCacheEntry::Occupied(compiled) => {
-                        self.validate_eager_placement(array_inputs.as_slice())?;
-                        compiled
-                    }
-                    SpecializationCacheEntry::Vacant(producer) => producer.insert(self.compile_eager_operation(
-                        operation,
-                        regions,
-                        inputs,
-                        array_inputs.as_slice(),
-                    )?),
-                }
-            }
-        };
-
-        // Execution produces outputs that belong to this session, so chained eager operations and transforms over them
-        // keep executing in the same session and effect scope. Arrays of session constants precede the inputs.
-        let mut arguments = compiled
-            .constants
-            .iter()
-            .map(|constant| self.retained_constant(constant))
-            .collect::<Result<Vec<_>, _>>()?;
-        arguments.extend(array_inputs);
-        let mut arrays = self
-            .execute_program(&compiled.program, arguments)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
-            .into_iter();
-        compiled
-            .outputs
-            .iter()
-            .map(|output| match output {
-                EagerOutput::Array => arrays.next().map(Value::Array).ok_or_else(|| {
-                    ProgramError::MalformedProgram("eager program returned fewer arrays than its outputs".to_string())
-                }),
-                EagerOutput::Dimension(value) => Ok(Value::Dimension(Dimension::new(value.clone(), self.clone()))),
-            })
-            .collect()
-    }
-
-    /// Builds one eager operation application into a program with a single instruction over the physical types of the
-    /// inputs, including their shardings, validates the placement of its array inputs, lowers the program, and
-    /// compiles it through this session's compilation cache, so that equal lowerings share one compiled program.
-    fn compile_eager_operation(
-        &self,
-        operation: Operation,
-        regions: AttachedRegions<'_, Constant, Operation>,
-        inputs: &[Value],
-        array_inputs: &[Array],
-    ) -> Result<EagerDispatchProgram, ProgramError> {
-        // Build the program with a single instruction, attaching the provided region bodies to that instruction.
-        let region_input_types = vec![None; regions.region_count()];
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let region_ids = regions.import_into(&builder, &region_input_types)?;
-        let output_atoms = {
-            let mut builder = builder.borrow_mut();
-            // Eager dimension values have static types, which define no identities, so equal dimension inputs share one
-            // constant instruction.
-            let mut dimension_atoms = HashMap::new();
-            let input_atoms = inputs
-                .iter()
-                .map(|input| match input {
-                    Value::Array(array) => Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned()))),
-                    Value::Dimension(dimension) => {
-                        let dimension = dimension.value();
-                        if let Some(&atom) = dimension_atoms.get(dimension) {
-                            return Ok(atom);
-                        }
-                        let operation = DimensionOperation::Constant(ConstantOperation::new(dimension.clone()));
-                        let atom =
-                            builder.add_instruction(Operation::Dimension(operation), Vec::new(), Vec::new(), None)?[0];
-                        dimension_atoms.insert(dimension, atom);
-                        Ok(atom)
-                    }
-                    Value::Reference(_) => {
-                        unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
-                    }
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            builder.add_instruction(operation, region_ids, input_atoms, None)?.to_vec()
-        };
-        self.validate_eager_placement(array_inputs)?;
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let outputs = output_atoms
-            .iter()
-            .map(|atom| -> Result<_, ProgramError> {
-                Ok(match builder.atoms()[atom.index()].r#type().as_ref() {
-                    ArrayIrType::Dimension(r#type) if let Some(extent) = r#type.extent() => {
-                        EagerOutput::Dimension(DimensionValue::constant(extent).map_err(TypeError::from)?)
-                    }
-                    _ => EagerOutput::Array,
-                })
-            })
-            .collect::<Result<Arc<[_]>, _>>()?;
-        let array_output_atoms = output_atoms
-            .into_iter()
-            .zip(outputs.iter())
-            .filter_map(|(atom, output)| matches!(output, EagerOutput::Array).then_some(atom))
-            .collect::<Vec<_>>();
-        let output_count = array_output_atoms.len();
-        let program: FlatProgram = builder.build(
-            array_output_atoms,
-            vec![Placeholder; array_inputs.len()],
-            vec![Placeholder; output_count],
-        )?;
-
-        // Derive the mesh after building the program so that operations without inputs can fall back to their inferred
-        // output shardings, and then compile through the session's compilation cache.
-        let output_types = program
-            .output_types()
-            .iter()
-            .map(<&ArrayType>::try_from)
-            .map(|result| result.cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let logical_mesh = output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
-        let mesh = self.eager_mesh(array_inputs, logical_mesh)?;
-        let mut options = Options::new(mesh);
-        // Arguments are placed as their runtime arrays are, including over the auto mesh axes that types never record.
-        if array_inputs.iter().any(|array| array.sharding().references_auto_axis()) {
-            options = options
-                .with_input_placements(array_inputs.iter().map(|array| Some(array.sharding().clone())).collect());
-        }
-        let lowered = self
-            .lower_program(&program, 0, &options)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let program = self
-            .compilation_cache()
-            .compile(self, &lowered)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(EagerDispatchProgram { program, constants: Arc::clone(lowered.session_constants()), outputs })
-    }
-
     /// Validates that every input lives on this session's PJRT client and that all inputs share one device placement,
     /// mirroring JAX's incompatible devices diagnostic for compiled computations on the eager path. Every [`Array`]
     /// belongs to a session whose client owns its addressable shard buffers, which is validated at construction, so
     /// client identity is exact and also rejects arrays with the same device IDs that a *different* client owns.
-    fn validate_eager_placement(&self, inputs: &[Array]) -> Result<(), ProgramError> {
+    fn validate_input_placement(&self, inputs: &[Array]) -> Result<(), ProgramError> {
         if inputs.is_empty() {
             return Ok(());
         }
@@ -1052,19 +641,37 @@ impl Context for Session {
                 "XLA captured constant `{constant}` requires a captured program capture table"
             ))
             .into()),
-            Constant::Session(constant) => Ok(Value::Array(self.retained_constant(&constant)?)),
+            Constant::Session(constant) => Ok(Value::Array(constant.to_array(self)?)),
             Constant::Dimension(value) => Ok(Value::Dimension(Dimension::new(value, self.clone()))),
-            Constant::Boolean(value) => Ok(Value::Array(self.eager_scalar(DataType::Boolean, &[u8::from(value)])?)),
+            Constant::Boolean(value) => {
+                // A Boolean literal is uploaded as a replicated scalar with eager placement.
+                Array::from_host_buffer(self, ArrayType::scalar(DataType::Boolean), None, None, [u8::from(value)])
+                    .map(Value::Array)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+            }
         }
     }
 
-    // Eagerly executes `operation` on concrete input arrays, mirroring JAX's op-by-op dispatch. A repeated application,
-    // including one whose attached regions are structurally equal to those of an earlier application, is served from
-    // the session's eager dispatch cache. Otherwise, `Self::eager_bind` builds the operation into a program with a
-    // single instruction over the physical array types of the inputs, including their shardings, compiles it through
-    // this session's compilation cache, and executes it on this session's PJRT client. The nullary additive and
-    // multiplicative identities keep a fast path that materializes the constant directly through the runtime client
-    // without compiling a program.
+    // Eagerly executes `operation` on concrete inputs, mirroring JAX's op-by-op dispatch.
+    //
+    // An application is first looked up in the session's eager dispatch cache, keyed by the operation, the structure of
+    // its attached regions, its inputs, and the lowering mesh, which together form an `EagerDispatchKey`. A hit
+    // validates the input placement and executes the cached program directly, skipping program construction, lowering,
+    // and compilation key construction. On a miss, the operation is built into a flat program with a single instruction
+    // over the physical array types of the inputs, including their shardings, compiled through this session's
+    // compilation cache, and executed on this session's PJRT client. The compilation cache key contains the complete
+    // lowered computation, its effective compilation options, and the derived mesh, so repeated eager binds of the same
+    // lowering reuse one compiled executable without conflating distinct computations. Higher-order operations (e.g.,
+    // `condition`, `while`, `scan`, `jit_call`, and `shard_map`) receive their nested programs as attached regions and
+    // flow through this same path, and the compiler handles their control flow, so no host interpreter loops are
+    // needed.
+    //
+    // Work that involves no device computation never reaches the compilation cache. Reference operations act on handles
+    // on the host, while dimension operations, dimension casts and comparisons, and conversions between dimensions and
+    // scalars are decided on the host. Only their array results are uploaded, as replicated scalars with eager
+    // placement. Reference operands of any other operation, and reference state carried by attached regions, are
+    // rejected because XLA eager execution lowers each operation. The nullary additive and multiplicative identities
+    // keep a fast path that materializes the constant directly through the runtime client without compiling a program.
     fn bind<'r, P, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: P,
@@ -1098,7 +705,371 @@ impl Context for Session {
                 return Ok(vec![Value::Array(value)]);
             }
         }
-        self.eager_bind(operation, regions, inputs)
+
+        // Reference operations act on shared handles rather than on device computations, so they run on the host
+        // through the generic `ArrayIrValue` reference implementations in `ryft-core`, which own handle validation
+        // and locking. Those implementations take values without sessions, which are only built once the operation
+        // is known to be a reference operation, so every other operation pays for nothing but this match.
+        let context = EagerContext::<ArrayIrValue<Array>>::new();
+        let host_inputs = || inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
+        let host_outputs = match &operation {
+            Operation::ReferenceNew(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            Operation::ReferenceRead(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            Operation::ReferenceWrite(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            Operation::ReferenceSwap(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            Operation::ReferenceAddUpdate(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            Operation::ReferenceAtomicAddUpdate(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            Operation::ReferenceFreeze(operation) => {
+                Some(operation.interpret(&context, &EmptyRegionDriver, &host_inputs()))
+            }
+            _ => None,
+        };
+        if let Some(outputs) = host_outputs {
+            // The outputs are associated with this session, including the references that the operation created.
+            return outputs?.into_iter().map(|output| Ok(Value::from_array_ir_value(output, self)?)).collect();
+        }
+
+        // Every other operation is lowered, and lowering cannot bind reference operands.
+        if inputs.iter().any(|input| matches!(input, Value::Reference(_))) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "eager XLA execution lowers each operation and cannot bind a reference operand; discharge \
+                          references before lowering"
+                    .to_string(),
+            });
+        }
+        // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone would
+        // miss a pure pass-through or capture of a reference type. The borrowed closure scan covers dormant rule
+        // regions too without cloning their program graphs. Although those rules do not execute in this eager bind,
+        // ordinary XLA rejects unresolved references across the whole artifact, so accepting one here would only defer
+        // failure to compilation with a less targeted diagnostic.
+        if operation.effects().classes().contains(EffectClass::OrderedState)
+            || regions.regions().any(|region| {
+                region.contains_effect_in_closure(EffectClass::OrderedState)
+                    || region.contains_atom_type_in_closure(Type::is_reference)
+            })
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` carries reference state that XLA eager execution cannot lower; discharge references before \
+                     lowering",
+                    operation.name(),
+                ),
+            });
+        }
+        // `Context::bind` has already rejected attached regions for the operations that declare no region slots, which
+        // includes every operation that is executed on the host below.
+        if let Operation::Dimension(operation) = &operation {
+            let inputs = inputs
+                .iter()
+                .map(|input| {
+                    <Value as ryft_core::ValueProjection<DimensionType>>::projected(input)
+                        .map(|dimension| dimension.value().clone())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
+                operation.clone(),
+                Vec::new(),
+                inputs.as_slice(),
+            )?;
+            return Ok(outputs
+                .into_iter()
+                .map(|output| Value::Dimension(Dimension::new(output, self.clone())))
+                .collect());
+        }
+        if let Operation::DimensionSize(operation) = &operation {
+            check_count!("input", inputs, 1, ProgramError);
+            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            let extent = array.dimension_size(operation.axis())?;
+            // Arrays derived from this dimension are placed on the mesh of the array that it was read from.
+            let value = DimensionValue::new(operation.output_type().clone(), extent)?;
+            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
+        }
+        if let Operation::DimensionFromScalar(operation) = &operation {
+            check_count!("input", inputs, 1, ProgramError);
+            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
+            let value = array.to_dimension(operation.output_type().to_variable())?;
+            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
+        }
+
+        if matches!(&operation, Operation::DimensionToScalar(_)) {
+            check_count!("input", inputs, 1, ProgramError);
+            let dimension = <Value as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
+            let extent = i64::try_from(dimension.value().extent()).unwrap();
+            let output =
+                Array::from_host_buffer(self, ArrayType::scalar(DataType::I64), None, None, extent.to_ne_bytes())
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            return Ok(vec![Value::Array(output)]);
+        }
+        if let Operation::Compare(operation) = &operation
+            && let [Value::Dimension(left), Value::Dimension(right)] = inputs
+        {
+            // Both extents are concrete, so the predicate is decided on the host by the comparison of first-class
+            // dimensions, which proves it from their types and extents, instead of compiling a program for each pair
+            // of extents. Only the Boolean result is materialized in this session.
+            let output =
+                Compare::<ArrayIrValue<ryft_core::Array>>::compare(left.value(), right.value(), operation.direction())?;
+            let output = Concretizable::<bool>::concretize(&output)?;
+            let output =
+                Array::from_host_buffer(self, ArrayType::scalar(DataType::Boolean), None, None, [u8::from(output)])
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            return Ok(vec![Value::Array(output)]);
+        }
+
+        // A composite call whose concrete inputs refine the types that its primal region was traced over (e.g., a named
+        // call staged in a bounded-dynamic program) replays its primal region, exactly as the interpretation rule of
+        // composites does, because that region describes the call at its traced types rather than at the exact types
+        // of its inputs. Calls at their traced types compile as one program, so backend implementations of named
+        // composites (e.g., fused kernels) still apply to them. A named call that explicitly requests a backend
+        // implementation reports that it cannot use it instead of silently replaying its body.
+        if operation.name() == COMPOSITE_OPERATION_NAME
+            && let Some(primal) = regions.regions().next()
+            && primal
+                .interface()
+                .input_types()
+                .iter()
+                .zip(inputs)
+                .any(|(declared, input)| *declared != *input.r#type())
+        {
+            if let Some(key) = operation.composite_key() {
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                // A session whose target cannot be queried cannot compile the call either, so the failure is reported
+                // here instead of silently selecting the portable body.
+                let target =
+                    self.target().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                let target_platform = Some(target.platform_name());
+                let implementation = NamedCompositeImplementation::select(
+                    key,
+                    input_types.as_slice(),
+                    primal.interface().output_types(),
+                    target_platform,
+                );
+                if let Some(error) = implementation.and_then(|implementation| implementation.body_substitution_error())
+                {
+                    return Err(ProgramError::UnsupportedOperation { message: error.to_string() });
+                }
+            }
+            return primal.interpret_in_context(self, inputs.to_vec());
+        }
+
+        let array_inputs = inputs
+            .iter()
+            .filter_map(|input| match input {
+                Value::Array(array) => Some(array.clone()),
+                Value::Dimension(_) | Value::Reference(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        if let Operation::Cast(operation) = &operation
+            && matches!(operation.output_type(), ArrayIrType::Dimension(_))
+        {
+            // `Context::bind` rejects attached regions. Validate the original declaration before observing every
+            // array witness producer, because the host dimension has no buffer that could retain those dependencies.
+            // Eager values have exact types, so interpreted inference proves the relationship or rejects it and never
+            // leaves a check to a backend.
+            let values = inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
+            let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+            let (_, interpreted) = ArrayIrType::infer_cast_output_type(operation, &input_types)?;
+            if interpreted.is_none() {
+                return Err(ProgramError::Concretization {
+                    message: format!(
+                        "`{}` cannot check symbolic type relationships during interpretation; \
+                         bind the operation through its context",
+                        operation.name(),
+                    ),
+                });
+            }
+            self.validate_input_placement(&array_inputs)?;
+            for input in &array_inputs {
+                input
+                    .block_until_ready()
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            }
+            return Ok(vec![Value::from_array_ir_value(values[0].clone(), self)?]);
+        }
+
+        // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
+        // and its inputs directly to a compiled program, so a repeated application skips program construction,
+        // lowering, and compilation key construction and only revalidates its input placement. Hits are looked up
+        // through a borrowed query, and the owned key is only built on a miss.
+        let region_keys = regions.regions().map(RegionRef::key).collect::<Vec<_>>();
+        let query = EagerDispatchQuery::new(
+            &operation,
+            region_keys.as_slice(),
+            inputs,
+            array_inputs.first().map(Array::mesh).or_else(|| self.device_mesh().ok()),
+        );
+        let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
+            Some(compiled) => {
+                self.validate_input_placement(array_inputs.as_slice())?;
+                compiled
+            }
+            None => {
+                // The query borrows `region_keys`, so the key takes them only after its last use of the query.
+                let key_inputs = (0..inputs.len()).map(|index| query.input(index).into_owned()).collect();
+                let key_mesh = query.mesh().cloned();
+                let key = EagerDispatchKey::new(operation.clone(), region_keys.into(), key_inputs, key_mesh);
+                let entry = self
+                    .state
+                    .eager_dispatch_cache
+                    .try_entry(key)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                match entry {
+                    SpecializationCacheEntry::Occupied(compiled) => {
+                        self.validate_input_placement(array_inputs.as_slice())?;
+                        compiled
+                    }
+                    SpecializationCacheEntry::Vacant(producer) => {
+                        // This application has not been compiled before. Build a program with a single instruction
+                        // for it, attaching the provided region bodies to that instruction.
+                        let region_input_types = vec![None; regions.region_count()];
+                        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+                        let region_ids = regions.import_into(&builder, &region_input_types)?;
+                        let output_atoms = {
+                            let mut builder = builder.borrow_mut();
+
+                            // Array inputs become inputs of the program, with their physical types and shardings.
+                            // Dimension inputs are baked in as constants instead, which is why their extents are
+                            // part of the dispatch key. Eager dimension values have static types, which define no
+                            // identities, so equal dimension inputs share one constant instruction.
+                            let mut dimension_atoms = HashMap::new();
+                            let input_atoms = inputs
+                                .iter()
+                                .map(|input| match input {
+                                    Value::Array(array) => {
+                                        Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned())))
+                                    }
+                                    Value::Dimension(dimension) => {
+                                        let dimension = dimension.value();
+                                        if let Some(&atom) = dimension_atoms.get(dimension) {
+                                            return Ok(atom);
+                                        }
+                                        let operation =
+                                            DimensionOperation::Constant(ConstantOperation::new(dimension.clone()));
+                                        let atom = builder.add_instruction(
+                                            Operation::Dimension(operation),
+                                            Vec::new(),
+                                            Vec::new(),
+                                            None,
+                                        )?[0];
+                                        dimension_atoms.insert(dimension, atom);
+                                        Ok(atom)
+                                    }
+                                    Value::Reference(_) => {
+                                        unreachable!("reference inputs are rejected before the dispatch cache lookup")
+                                    }
+                                })
+                                .collect::<Result<Vec<_>, ProgramError>>()?;
+                            builder.add_instruction(operation, region_ids, input_atoms, None)?.to_vec()
+                        };
+
+                        // Adding the instruction has inferred the output types, so type errors are reported before
+                        // placement errors.
+                        self.validate_input_placement(array_inputs.as_slice())?;
+                        let builder =
+                            Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+
+                        // An output that is a dimension with a static type is already known, so it is recorded as a
+                        // host value and left out of the program. Every other output is an array that the compiled
+                        // program returns.
+                        let outputs = output_atoms
+                            .iter()
+                            .map(|atom| -> Result<_, ProgramError> {
+                                Ok(match builder.atoms()[atom.index()].r#type().as_ref() {
+                                    ArrayIrType::Dimension(r#type) if let Some(extent) = r#type.extent() => {
+                                        EagerOutput::Dimension(
+                                            DimensionValue::constant(extent).map_err(TypeError::from)?,
+                                        )
+                                    }
+                                    _ => EagerOutput::Array,
+                                })
+                            })
+                            .collect::<Result<Arc<[_]>, _>>()?;
+                        let array_output_atoms = output_atoms
+                            .into_iter()
+                            .zip(outputs.iter())
+                            .filter_map(|(atom, output)| matches!(output, EagerOutput::Array).then_some(atom))
+                            .collect::<Vec<_>>();
+                        let output_count = array_output_atoms.len();
+                        let program: FlatProgram = builder.build(
+                            array_output_atoms,
+                            vec![Placeholder; array_inputs.len()],
+                            vec![Placeholder; output_count],
+                        )?;
+
+                        // The mesh is derived after the program is built, so that an operation without array inputs
+                        // can fall back to the logical mesh of its inferred output shardings.
+                        let output_types = program
+                            .output_types()
+                            .iter()
+                            .map(<&ArrayType>::try_from)
+                            .map(|result| result.cloned())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let logical_mesh =
+                            output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
+                        let mesh = self.eager_mesh(array_inputs.as_slice(), logical_mesh)?;
+                        let mut options = Options::new(mesh);
+
+                        // Arguments are placed as their runtime arrays are, including over the auto mesh axes that
+                        // types never record.
+                        if array_inputs.iter().any(|array| array.sharding().references_auto_axis()) {
+                            options = options.with_input_placements(
+                                array_inputs.iter().map(|array| Some(array.sharding().clone())).collect(),
+                            );
+                        }
+
+                        // Lower the program and compile it through the compilation cache of the session, so that
+                        // equal lowerings share one compiled program even when their dispatch keys differ.
+                        let lowered = self
+                            .lower_program(&program, 0, &options)
+                            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                        let program = self
+                            .compilation_cache()
+                            .compile(self, &lowered)
+                            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                        producer.insert(EagerDispatchProgram {
+                            program,
+                            constants: Arc::clone(lowered.session_constants()),
+                            outputs,
+                        })
+                    }
+                }
+            }
+        };
+
+        // Execution produces outputs that belong to this session, so chained eager operations and transforms over them
+        // keep executing in the same session and effect scope. Arrays of session constants precede the inputs.
+        let mut arguments =
+            compiled.constants.iter().map(|constant| constant.to_array(self)).collect::<Result<Vec<_>, _>>()?;
+        arguments.extend(array_inputs);
+        let mut arrays = self
+            .execute_program(&compiled.program, arguments)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+            .into_iter();
+        compiled
+            .outputs
+            .iter()
+            .map(|output| match output {
+                EagerOutput::Array => arrays.next().map(Value::Array).ok_or_else(|| {
+                    ProgramError::MalformedProgram("eager program returned fewer arrays than its outputs".to_string())
+                }),
+                EagerOutput::Dimension(value) => Ok(Value::Dimension(Dimension::new(value.clone(), self.clone()))),
+            })
+            .collect()
     }
 
     // Every `Session` is backed by a PJRT client, so it executes every bound operation for real and its concrete arrays
@@ -1387,6 +1358,31 @@ pub struct SessionConstant {
 }
 
 impl SessionConstant {
+    /// Retains the storage of `array` and returns a handle that owns it. The storage stays retained for as long as
+    /// any handle to it exists. Retaining one array more than once returns equal handles, so that repeatedly
+    /// importing the same captured array (e.g., the weights that a compiled function captures) stages the same
+    /// constant every time.
+    pub(crate) fn new(array: &Array) -> Self {
+        Self { r#type: array.r#type().into_owned(), storage: Arc::new(array.retain()), client: array.client() }
+    }
+
+    /// Returns a new [`Array`] that shares the storage that this handle retains and belongs to `session`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::Type`] error if this handle retains an array of another PJRT client than the one of
+    /// `session`, whose buffers that session cannot use.
+    pub(crate) fn to_array(&self, session: &Session) -> Result<Array, ProgramError> {
+        if !std::ptr::eq(self.client, session.client()) {
+            return Err(TypeError::invalid(format!(
+                "session constant `{self}` retains an array of a different PJRT client than the client of this \
+                 session",
+            ))
+            .into());
+        }
+        Ok(self.storage.to_array(session))
+    }
+
     /// Returns this handle with the identities of its type renamed by `renaming`.
     pub(crate) fn rename_type_identities(
         &self,
@@ -1459,7 +1455,7 @@ pub struct ThroughSession;
 impl ImportingContext<Session, ThroughSession> for TracingContext<Constant, Operation, Constant> {
     #[inline]
     fn import(&self, value: Value) -> Result<Self::Value, ProgramError> {
-        self.lift(session_constant(value)?)
+        self.lift(value.constant()?)
     }
 }
 
@@ -1469,7 +1465,7 @@ where
 {
     #[inline]
     fn import(&self, value: Value) -> Result<Self::Value, ProgramError> {
-        self.lift(session_constant(value)?)
+        self.lift(value.constant()?)
     }
 }
 
@@ -1548,18 +1544,6 @@ enum DiskCacheSource {
 
     /// Disk cache that the [`DiskCache::ENV_VAR`] environment variable configures, if it is set.
     Environment,
-}
-
-/// Converts `value` into the immediate [`Constant`] that a trace capturing constants stages for it.
-fn session_constant(value: Value) -> Result<Constant, ProgramError> {
-    match value {
-        Value::Array(array) => Ok(Constant::Session(array.session().retain_constant(&array))),
-        Value::Dimension(dimension) => Ok(Constant::Dimension(dimension.into_value())),
-        Value::Reference(_) => {
-            Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
-                .into())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2157,59 +2141,6 @@ pub(crate) mod tests {
         ));
         session.acknowledge_effect_errors().unwrap();
         session.effects_barrier().unwrap();
-    }
-
-    #[test]
-    fn test_session_retained_constant() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
-            .unwrap();
-        let handle = session.retain_constant(&array);
-
-        // The resolved array shares the retained storage and belongs to the resolving handle.
-        let fork = session.with_new_effect_scope();
-        let resolved = fork.retained_constant(&handle).unwrap();
-        assert_eq!(resolved, array);
-        assert!(shares_effect_scope(resolved.session(), &fork));
-
-        // Every session of the client that owns the array resolves the handle, and the array outlives its session.
-        let other_session = session_with_client(client);
-        drop((array, resolved, fork, session));
-        let resolved = other_session.retained_constant(&handle).unwrap();
-        assert!(resolved.session().is_same_session(&other_session));
-        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
-
-        // Sessions of another client cannot use the buffers of the array.
-        let foreign_session = session_with_client(other_cpu_client(1));
-        assert_eq!(
-            foreign_session.retained_constant(&handle),
-            Err(TypeError::invalid(format!(
-                "session constant `{handle}` retains an array of a different PJRT client than the client of this \
-                 session",
-            ))
-            .into()),
-        );
-    }
-
-    #[test]
-    fn test_session_retain_constant() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
-            .unwrap();
-
-        // Retaining one array twice yields equal handles, and the handles keep the array alive after the array itself
-        // is dropped.
-        let handle = session.retain_constant(&array);
-        let duplicate = session.retain_constant(&array);
-        assert_eq!(duplicate, handle);
-        drop((array, duplicate));
-        let resolved = session.retained_constant(&handle).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
-
-        // An array that was resolved from a handle has storage of its own, so retaining it yields another handle.
-        assert_ne!(session.retain_constant(&resolved), handle);
     }
 
     #[test]
@@ -4513,13 +4444,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_constant_new() {
+        let client = execution_client();
+        let session = session_with_client(client);
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+
+        // Retaining one array twice yields equal handles, and the handles keep the array alive after the array itself
+        // is dropped.
+        let handle = SessionConstant::new(&array);
+        let duplicate = SessionConstant::new(&array);
+        assert_eq!(duplicate, handle);
+        drop((array, duplicate));
+        let resolved = handle.to_array(&session).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
+
+        // An array that was resolved from a handle has storage of its own, so retaining it yields another handle.
+        assert_ne!(SessionConstant::new(&resolved), handle);
+    }
+
+    #[test]
+    fn test_session_constant_to_array() {
+        let client = execution_client();
+        let session = session_with_client(client);
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        let handle = SessionConstant::new(&array);
+
+        // The resolved array shares the retained storage and belongs to the resolving handle.
+        let fork = session.with_new_effect_scope();
+        let resolved = handle.to_array(&fork).unwrap();
+        assert_eq!(resolved, array);
+        assert!(shares_effect_scope(resolved.session(), &fork));
+
+        // Every session of the client that owns the array resolves the handle, and the array outlives its session.
+        let other_session = session_with_client(client);
+        drop((array, resolved, fork, session));
+        let resolved = handle.to_array(&other_session).unwrap();
+        assert!(resolved.session().is_same_session(&other_session));
+        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
+
+        // Sessions of another client cannot use the buffers of the array.
+        let foreign_session = session_with_client(other_cpu_client(1));
+        assert_eq!(
+            handle.to_array(&foreign_session),
+            Err(TypeError::invalid(format!(
+                "session constant `{handle}` retains an array of a different PJRT client than the client of this \
+                 session",
+            ))
+            .into()),
+        );
+    }
+
+    #[test]
     fn test_session_constant_rename_type_identities() {
         // Renaming keeps the storage of a handle and only renames its type.
         let client = execution_client();
         let session = session_with_client(client);
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        let handle = session.retain_constant(&array);
+        let handle = SessionConstant::new(&array);
         let renamed = handle.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
         assert_eq!(renamed, handle);
         assert!(Arc::ptr_eq(&renamed.storage, &handle.storage));
@@ -4538,13 +4522,13 @@ pub(crate) mod tests {
         let other =
             Array::from_host_buffer(&other_session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
                 .unwrap();
-        let handle = session.retain_constant(&first);
+        let handle = SessionConstant::new(&first);
 
         // Handles are equal when they refer to the same retained array of the same session with the same type.
         assert_eq!(handle, handle.clone());
-        assert_eq!(handle, session.retain_constant(&first));
-        assert_ne!(handle, session.retain_constant(&second));
-        assert_ne!(handle, other_session.retain_constant(&other));
+        assert_eq!(handle, SessionConstant::new(&first));
+        assert_ne!(handle, SessionConstant::new(&second));
+        assert_ne!(handle, SessionConstant::new(&other));
     }
 
     #[test]
@@ -4556,12 +4540,12 @@ pub(crate) mod tests {
         let second =
             Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
                 .unwrap();
-        let handle = session.retain_constant(&first);
-        let other = session.retain_constant(&second);
-        assert_eq!(hash_of(&handle), hash_of(&session.retain_constant(&first)));
+        let handle = SessionConstant::new(&first);
+        let other = SessionConstant::new(&second);
+        assert_eq!(hash_of(&handle), hash_of(&SessionConstant::new(&first)));
         assert_ne!(hash_of(&handle), hash_of(&other));
         let constants = HashMap::from([(handle.clone(), "first"), (other.clone(), "second")]);
-        assert_eq!(constants.get(&session.retain_constant(&first)), Some(&"first"));
+        assert_eq!(constants.get(&SessionConstant::new(&first)), Some(&"first"));
         assert_eq!(constants.get(&other), Some(&"second"));
     }
 
@@ -4571,7 +4555,7 @@ pub(crate) mod tests {
         let session = session_with_client(client);
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        let handle = session.retain_constant(&array);
+        let handle = SessionConstant::new(&array);
         assert_eq!(handle.to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
     }
 
@@ -4588,33 +4572,7 @@ pub(crate) mod tests {
             1f32.to_ne_bytes(),
         )
         .unwrap();
-        assert_eq!(session.retain_constant(&array).r#type().into_owned(), replicated_scalar_type(&mesh, DataType::F32));
-    }
-
-    #[test]
-    fn test_session_constant() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
-            .unwrap();
-
-        // Arrays are retained by their session and become handles to their retained storage.
-        let Ok(Constant::Session(handle)) = session_constant(Value::Array(array.clone())) else {
-            panic!("an array was not converted into a session constant");
-        };
-        assert_eq!(session.retained_constant(&handle).unwrap(), array);
-
-        // Dimensions become immediate constants, and references are rejected.
-        let extent = DimensionValue::constant(2).unwrap();
-        assert_eq!(
-            session_constant(Value::Dimension(Dimension::new(extent.clone(), session.clone()))),
-            Ok(Constant::Dimension(extent)),
-        );
-        assert_eq!(
-            session_constant(Value::Reference(Reference::new(ArrayReference::new(array), session))),
-            Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
-                .into()),
-        );
+        assert_eq!(SessionConstant::new(&array).r#type().into_owned(), replicated_scalar_type(&mesh, DataType::F32));
     }
 
     #[cfg(feature = "cuda-13")]

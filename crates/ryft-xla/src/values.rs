@@ -273,6 +273,25 @@ impl Value {
         }
     }
 
+    /// Converts this value into the immediate [`Constant`] that a trace whose capture table holds constants stages
+    /// for it. An array is retained and becomes a [`Constant::Session`] handle to its storage, and a dimension
+    /// becomes a [`Constant::Dimension`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::Type`] error for a reference, because its state cannot be shared with a trace that
+    /// outlives the current transform.
+    pub(crate) fn constant(self) -> Result<Constant, ProgramError> {
+        match self {
+            Self::Array(value) => Ok(Constant::Session(SessionConstant::new(&value))),
+            Self::Dimension(value) => Ok(Constant::Dimension(value.into_value())),
+            Self::Reference(_) => Err(TypeError::invalid(
+                "cannot import an XLA reference into a trace whose capture table holds constants",
+            )
+            .into()),
+        }
+    }
+
     /// Returns this member's diagnostic kind name.
     fn kind_name(&self) -> &'static str {
         match self {
@@ -1167,6 +1186,32 @@ mod tests {
         assert!(same_session(restored[0].session(), &session));
         assert!(same_session(restored[1].session(), &other_session));
         assert!(same_session(restored[2].session(), &other_session));
+    }
+
+    #[test]
+    fn test_value_constant() {
+        let client = execution_client();
+        let session = session_with_client(client);
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+
+        // Arrays are retained by their session and become handles to their retained storage.
+        let Ok(Constant::Session(handle)) = Value::Array(array.clone()).constant() else {
+            panic!("an array was not converted into a session constant");
+        };
+        assert_eq!(handle.to_array(&session).unwrap(), array);
+
+        // Dimensions become immediate constants, and references are rejected.
+        let extent = DimensionValue::constant(2).unwrap();
+        assert_eq!(
+            Value::Dimension(Dimension::new(extent.clone(), session.clone())).constant(),
+            Ok(Constant::Dimension(extent)),
+        );
+        assert_eq!(
+            Value::Reference(Reference::new(ArrayReference::new(array), session)).constant(),
+            Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
+                .into()),
+        );
     }
 
     #[test]
