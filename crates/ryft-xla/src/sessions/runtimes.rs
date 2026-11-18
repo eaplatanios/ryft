@@ -245,8 +245,7 @@ impl CustomCallOperationExtension for CustomCallOperation {
 /// handlers look up their user data with the same constant ID.
 ///
 /// Providers and extensions own their state, and they may hold the client, which lives for the rest of the process.
-/// For example, a downstream crate can add a contract that only registers native handlers alongside the built-in
-/// providers and annotate its custom calls with the same requirement.
+/// See [`RuntimeExtensions`] for how a session configures providers and uses its initialized extensions.
 ///
 /// # Example
 ///
@@ -431,23 +430,38 @@ impl ExecutionResources {
 /// Invocation resources retained by the session through execution.
 pub(crate) type RetainedExecutionResources = Vec<Box<dyn Send + Sync>>;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Immutable provider configuration, independent of initialized session runtime instances. Supply this
-/// configuration to [`SessionBuilder::runtime_extensions`](super::SessionBuilder::runtime_extensions) before
-/// constructing a [`Session`](crate::Session). The session uses these [`RuntimeProvider`]s to initialize its
-/// own [`RuntimeExtension`] instances lazily. The [`RuntimeProvider`] example shows how to add a provider and
-/// declare which custom calls require it.
+/// Configures the runtime extensions available to a [`Session`](crate::Session), such as native print handlers and
+/// precompiled kernel launchers.
+///
+/// Supply this configuration through [`SessionBuilder::runtime_extensions`](super::SessionBuilder::runtime_extensions)
+/// before building a session. [`Self::new`] includes the built-in providers, and [`Self::with_provider`] adds another
+/// [`RuntimeProvider`] under its contract identifier. Programs declare the native support they need through
+/// [`RuntimeRequirement`]s, each of which names a provider and specifies the required ABI version.
+///
+/// On first use of a requirement during compilation, loading, or execution, the session calls the matching
+/// [`RuntimeProvider::initialize`] with its PJRT [`Client`]. The session reuses the resulting [`RuntimeExtension`]
+/// for later calls that need the same requirement. Sessions built from the same configuration each initialize their
+/// own instances. Compiled programs carry the requirements so another compatible session can resolve them through
+/// its own providers.
+///
+/// Before each native submission, the session calls [`RuntimeExtension::validate`] for the invocation's mesh and
+/// [`RuntimeExtension::prepare`] to attach any invocation data to shared [`ExecutionResources`]. The session keeps
+/// those resources alive until execution completes, even if callers discard the outputs.
+///
+/// The [provider example](RuntimeProvider#example) shows how to implement a provider, add it to a session,
+/// and annotate the custom calls that require it.
 #[derive(Clone)]
 pub struct RuntimeExtensions {
     /// [`RuntimeProvider`]s keyed by their public contract identifiers.
     providers: BTreeMap<String, Arc<dyn RuntimeProvider>>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl RuntimeExtensions {
-    /// Creates the built-in [`RuntimeExtensions`], with providers for assertions (`ryft.assert`), ordered I/O
-    /// (`ryft.ordered-io`), printing (`ryft.print`), and CUDA kernels (`ryft.kernel.cuda`). The `rocm` feature adds
-    /// a provider for ROCm kernels (`ryft.kernel.rocm`).
+    /// Creates the built-in [`RuntimeExtensions`], with providers for assertions (i.e., `ryft.assert`), ordered I/O
+    /// (i.e., `ryft.ordered-io`), printing (i.e., `ryft.print`), and CUDA kernels (i.e., `ryft.kernel.cuda`). The
+    /// `rocm` feature also adds a provider for ROCm kernels (i.e., `ryft.kernel.rocm`).
     ///
     /// The session initializes runtime extensions only as programs require them. Creating this configuration does
     /// not load accelerator drivers.
@@ -518,12 +532,7 @@ impl Debug for RuntimeExtensions {
 /// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
 /// executions.
 ///
-/// A runtime extension is the native support that a compiled program needs beyond what the PJRT plugin provides,
-/// such as the host callback behind `print` (i.e., the `ryft.print` extension) or the launcher of precompiled CUDA
-/// kernels (i.e., the `ryft.kernel.cuda` extension). A program names the extensions that it needs as
-/// [`RuntimeRequirement`]s, and the [`RuntimeProvider`]s in the [`RuntimeExtensions`] of a session know how to create
-/// the matching [`RuntimeExtension`] instances. A registry ties them to one session in three steps that follow the
-/// life of an execution.
+/// The registry manages the session lifecycle described by [`RuntimeExtensions`].
 ///
 ///   - **Initialization:** [`Self::ensure`] creates the instance of each requirement on first use and shares it with
 ///     later calls. For example, lowering a program that prints attaches the `ryft.print` requirement to it. Before
@@ -535,9 +544,6 @@ impl Debug for RuntimeExtensions {
 ///     CUDA kernel extension attaches a pointer to itself, which its native handler reads while it launches kernels.
 ///   - **Retention:** [`Self::retain`] keeps those resources alive until the execution completes, even when its
 ///     outputs are dropped. Dropping the registry waits for the executions that still borrow resources.
-///
-/// Instances belong to one session and are never shared between sessions. Compiled programs retain only their
-/// requirements, so a cached program can run in any session whose providers satisfy them.
 pub(crate) struct RuntimeRegistry {
     /// Externally owned client associated with all initialized instances.
     client: &'static Client<'static>,
