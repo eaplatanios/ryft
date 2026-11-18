@@ -1,15 +1,3 @@
-//! Platforms that sessions execute on, and the PJRT clients that `ryft-xla` creates for them.
-//!
-//! [`Platform`] names the platforms whose PJRT plugins `ryft-xla` can load, and a
-//! [`SessionBuilder`](crate::SessionBuilder) selects one of them. A client that `ryft-xla` creates for a session lives
-//! for the rest of the process, like the backend clients of JAX, and sessions that request the same plugin with equal
-//! client options share it. Sharing matters most on accelerators, where a second client in the same process would
-//! reserve device memory of its own. Programs that need a client that `ryft-xla` cannot create (e.g., one bound to a
-//! [`DistributedRuntime`](crate::DistributedRuntime)) create it themselves, keep it for the rest of the process, and
-//! pass it to [`SessionBuilder::client`](crate::SessionBuilder::client).
-
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::Display;
 use std::sync::Mutex;
 
@@ -20,10 +8,10 @@ use ryft_pjrt::{
 use crate::Error;
 use crate::sessions::SessionError;
 
-/// Platform that a [`Session`](crate::Session) executes on, which selects the PJRT plugin of the client that
-/// `ryft-xla` creates for the session. Every platform other than [`Self::Cpu`] requires the Cargo feature of
-/// `ryft-xla` that provides its plugin, and requesting a platform without its feature is reported when the session is
-/// built, so code that selects a platform needs no conditional compilation.
+/// Platform that a [`Session`](crate::Session) executes on, which selects the PJRT plugin of the client that the Ryft
+/// XLA backend creates for the session. Use [`SessionBuilder::platform`](crate::SessionBuilder::platform) to select a
+/// specific platform. Each accelerator platform requires the Cargo feature that provides its plugin. Building the
+/// session reports a missing feature, so code that selects a platform can do so without conditional compilation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Platform {
     /// First accelerator among [`Self::Cuda`], [`Self::Rocm`], [`Self::Tpu`], [`Self::Neuron`], [`Self::Metal`], and
@@ -63,6 +51,7 @@ macro_rules! load_platform_plugin {
         {
             Ok(ryft_pjrt::$load()?)
         }
+
         #[cfg(not(feature = $feature))]
         {
             Err(SessionError::UnavailablePlatform { platform: $platform, feature: $feature }.into())
@@ -72,10 +61,12 @@ macro_rules! load_platform_plugin {
 
 impl Platform {
     /// Accelerator platforms that [`Self::Auto`] considers, in order of preference.
-    const ACCELERATORS: [Self; 6] = [Self::Cuda, Self::Rocm, Self::Tpu, Self::Neuron, Self::Metal, Self::Mps];
+    const AUTO_PLATFORM_CANDIDATES: [Self; 6] =
+        [Self::Cuda, Self::Rocm, Self::Tpu, Self::Neuron, Self::Metal, Self::Mps];
 
     /// Returns whether the feature of this crate that provides the plugin of this platform is enabled.
     /// [`Self::Auto`] and [`Self::Cpu`] are always available.
+    #[inline]
     pub fn is_available(self) -> bool {
         match self {
             Self::Auto | Self::Cpu => true,
@@ -85,60 +76,6 @@ impl Platform {
             Self::Neuron => cfg!(feature = "neuron"),
             Self::Metal => cfg!(feature = "metal"),
             Self::Mps => cfg!(feature = "mps"),
-        }
-    }
-
-    /// Loads the PJRT plugin of this platform. [`Self::Auto`] has no plugin of its own, and [`Self::client`] resolves
-    /// it to one of the other platforms instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::UnavailablePlatform`] if the feature that provides the plugin is not enabled, and
-    /// [`Error::Pjrt`] if the plugin cannot be loaded.
-    fn plugin(self) -> Result<Plugin, Error> {
-        match self {
-            Self::Auto | Self::Cpu => Ok(load_cpu_plugin()?),
-            Self::Cuda => {
-                #[cfg(feature = "cuda-13")]
-                {
-                    Ok(ryft_pjrt::load_cuda_13_plugin()?)
-                }
-                #[cfg(all(feature = "cuda-12", not(feature = "cuda-13")))]
-                {
-                    Ok(ryft_pjrt::load_cuda_12_plugin()?)
-                }
-                #[cfg(not(any(feature = "cuda-13", feature = "cuda-12")))]
-                {
-                    Err(SessionError::UnavailablePlatform { platform: self, feature: "cuda-13" }.into())
-                }
-            }
-            Self::Rocm => load_platform_plugin!(self, "rocm-10", load_rocm_10_plugin),
-            Self::Tpu => load_platform_plugin!(self, "tpu", load_tpu_plugin),
-            Self::Neuron => load_platform_plugin!(self, "neuron", load_neuron_plugin),
-            Self::Metal => load_platform_plugin!(self, "metal", load_metal_plugin),
-            Self::Mps => load_platform_plugin!(self, "mps", load_mps_plugin),
-        }
-    }
-
-    /// Returns the options of the client that `ryft-xla` creates for this platform when a session supplies none.
-    /// These are the defaults of `ryft-pjrt` for the platform, except that the allocator of a CUDA client grows on
-    /// demand instead of reserving most of the device memory up front. The client is shared by every session of the
-    /// process and is never destroyed, and on devices whose memory is shared with the host an up-front reservation
-    /// would also take that memory from the rest of the system. The allocator is still the best-fit one, and not
-    /// [`GpuMemoryAllocator::CudaAsync`], which asks the driver for every buffer. That costs about 100 microseconds
-    /// per eager operation and made an eager forward pass of a Transformer about five times slower.
-    fn client_options(self) -> ClientOptions {
-        match self {
-            Self::Cpu => ClientOptions::CPU(CpuClientOptions::default()),
-            Self::Cuda => ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::BFC { memory_fraction: 0.75, preallocate: false },
-                ..Default::default()
-            }),
-            Self::Rocm => {
-                ClientOptions::GPU(GpuClientOptions { platform: Some(GpuPlatform::ROCm), ..Default::default() })
-            }
-            Self::Auto | Self::Tpu | Self::Neuron | Self::Metal | Self::Mps => ClientOptions::default(),
         }
     }
 
@@ -153,12 +90,13 @@ impl Platform {
     ///
     /// Returns [`SessionError::UnavailablePlatform`] if the feature that provides the plugin of an explicitly
     /// requested platform is not enabled, [`SessionError::InvalidClientOptions`] if `options` are supplied for
-    /// [`Self::Auto`], whose candidate platforms take different options, and [`Error::Pjrt`] if the plugin cannot be
-    /// loaded or initialized or its client cannot be created.
-    pub(super) fn client(self, options: Option<ClientOptions>) -> Result<&'static Client<'static>, Error> {
+    /// [`Self::Auto`], whose candidate platforms take different options, and [`Error::Pjrt`] if the plugin cannot
+    /// be loaded or initialized or its client cannot be created.
+    pub fn client(self, options: Option<ClientOptions>) -> Result<&'static Client<'static>, Error> {
         if self != Self::Auto {
             return process_client(&self.plugin()?, options.unwrap_or_else(|| self.client_options()));
         }
+
         if options.is_some() {
             return Err(SessionError::InvalidClientOptions {
                 reason: "client options require an explicit platform or plugin, because the platforms that \
@@ -167,7 +105,8 @@ impl Platform {
             }
             .into());
         }
-        for accelerator in Self::ACCELERATORS.into_iter().filter(|accelerator| accelerator.is_available()) {
+
+        for accelerator in Self::AUTO_PLATFORM_CANDIDATES.into_iter().filter(|accelerator| accelerator.is_available()) {
             let client = accelerator.plugin().and_then(|plugin| process_client(&plugin, accelerator.client_options()));
             if let Ok(client) = client
                 && client.addressable_devices().is_ok_and(|devices| !devices.is_empty())
@@ -175,11 +114,70 @@ impl Platform {
                 return Ok(client);
             }
         }
+
         Self::Cpu.client(None)
+    }
+
+    /// Loads the PJRT [`Plugin`] that corresponds to this platform. [`Self::Auto`] has no plugin of its own,
+    /// and, in that case, [`Self::client`] resolves it to one of the other platforms instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::UnavailablePlatform`] if the feature that provides the plugin is not enabled,
+    /// and [`Error::Pjrt`] if the plugin cannot be loaded.
+    fn plugin(self) -> Result<Plugin, Error> {
+        match self {
+            Self::Auto | Self::Cpu => Ok(load_cpu_plugin()?),
+            Self::Cuda => {
+                #[cfg(feature = "cuda-13")]
+                {
+                    Ok(ryft_pjrt::load_cuda_13_plugin()?)
+                }
+
+                #[cfg(all(feature = "cuda-12", not(feature = "cuda-13")))]
+                {
+                    Ok(ryft_pjrt::load_cuda_12_plugin()?)
+                }
+
+                #[cfg(not(any(feature = "cuda-13", feature = "cuda-12")))]
+                {
+                    Err(SessionError::UnavailablePlatform { platform: self, feature: "cuda-13" }.into())
+                }
+            }
+            Self::Rocm => load_platform_plugin!(self, "rocm-10", load_rocm_10_plugin),
+            Self::Tpu => load_platform_plugin!(self, "tpu", load_tpu_plugin),
+            Self::Neuron => load_platform_plugin!(self, "neuron", load_neuron_plugin),
+            Self::Metal => load_platform_plugin!(self, "metal", load_metal_plugin),
+            Self::Mps => load_platform_plugin!(self, "mps", load_mps_plugin),
+        }
+    }
+
+    /// Returns the [`ClientOptions`] of the client that the Ryft XLA backend creates for this [`Platform`] when a
+    /// [`Session`](crate::Session) supplies none. These are the defaults of `ryft-pjrt` for the platform, except that
+    /// the allocator of a CUDA client grows on demand instead of reserving most of the device memory up front. The
+    /// client is shared by every session of the process and is never destroyed, and on devices whose memory is shared
+    /// with the host an up-front reservation would also take that memory from the rest of the system. The allocator is
+    /// still the best-fit one, and not [`GpuMemoryAllocator::CudaAsync`], which asks the driver for every buffer. That
+    /// costs about 100 microseconds per eager operation and made an eager forward pass of a 1B-parameter Transformer
+    /// about five times slower.
+    fn client_options(self) -> ClientOptions {
+        match self {
+            Self::Cpu => ClientOptions::CPU(CpuClientOptions::default()),
+            Self::Cuda => ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::BFC { memory_fraction: 0.75, preallocate: false },
+                ..Default::default()
+            }),
+            Self::Rocm => {
+                ClientOptions::GPU(GpuClientOptions { platform: Some(GpuPlatform::ROCm), ..Default::default() })
+            }
+            Self::Auto | Self::Tpu | Self::Neuron | Self::Metal | Self::Mps => ClientOptions::default(),
+        }
     }
 }
 
 impl Display for Platform {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Auto => "auto",
@@ -193,6 +191,8 @@ impl Display for Platform {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Client that `ryft-xla` created for sessions and that lives for the rest of the process.
 struct ProcessClient {
@@ -211,8 +211,9 @@ static PROCESS_CLIENTS: Mutex<Vec<ProcessClient>> = Mutex::new(Vec::new());
 
 /// Returns the process-wide client of `plugin` for `options`, creating it on first use. The client lives for the rest
 /// of the process, and every later request for the same plugin with equal options returns it, so that sessions built
-/// independently of each other share one client and its device resources. Requests are serialized, so concurrent
-/// first requests for one configuration create a single client.
+/// independently of each other share one client and its device resources. On accelerators, sharing avoids separate
+/// clients reserving device memory independently. Requests are serialized, so concurrent first requests for one
+/// configuration create a single client.
 ///
 /// # Errors
 ///
@@ -223,9 +224,11 @@ pub(crate) fn process_client(plugin: &Plugin, options: ClientOptions) -> Result<
     if let Some(existing) = clients.iter().find(|existing| existing.plugin == *plugin && existing.options == options) {
         return Ok(existing.client);
     }
+
     // Plugin initialization fails when the runtime of an accelerator is unavailable, which is reported here rather
     // than left to panic on the first use of the plugin.
     plugin.initialize()?;
+
     let client: &'static Client<'static> = Box::leak(Box::new(plugin.client(options.clone())?));
     clients.push(ProcessClient { plugin: plugin.clone(), options, client });
     Ok(client)
