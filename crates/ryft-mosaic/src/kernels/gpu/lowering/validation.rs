@@ -556,11 +556,12 @@ pub(super) fn checked_array(r#type: &ArrayType) -> Result<(), Error> {
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayIrOperation, ArrayIrValue, Context, ProgramBuilder, ReferenceRead, ReferenceWrite, TiledLayout,
+        Array, ArrayIrOperation, ArrayIrValue, Context, ProgramBuilder, ReferenceRead, ReferenceRoot, ReferenceWrite,
+        TiledLayout,
     };
     use ryft_kernels::{
         AsyncCopyOperation, BlockMapping, BoundaryPolicy, Grid, GridDimension, KernelCallOperation, KernelDefinition,
-        KernelParameter, ScratchOperation, WaitOperation, whole_array_parameter,
+        KernelInitializationError, KernelParameter, ScratchOperation, WaitOperation, whole_array_parameter,
     };
 
     use super::*;
@@ -810,13 +811,18 @@ mod tests {
             plan.instruction_scratch.iter().map(|(_, types)| types.clone()).collect::<Vec<_>>(),
             vec![vec![ArrayType::new_static(DataType::U8, [512])]]
         );
+        // The tensor memory completion protocol requires exactly one commit before the wait, so verification rejects
+        // the wait of an uncommitted copy. The planner keeps its own commit checks as a defense, but they cannot be
+        // reached through a verified kernel, and `Plan::new` accepts only a verified kernel.
         let definition = scale_definition(DataType::F8E8M0FNU, false);
-        let kernel = VerifiedKernel::new(&definition, 1).unwrap();
-        assert!(matches!(
-            Plan::new(&kernel, &target, &Options::default(), &KernelSchedule::default()),
-            Err(Error::Unsupported { operation: "mosaic_gpu.tmem.wait", reason })
-                if reason == "tensor-memory completion must be committed before waiting",
-        ));
+        let region = RegionId::new(0);
+        assert_eq!(
+            VerifiedKernel::new(&definition, 1).map(|_| ()),
+            Err(KernelInitializationError::IncompatibleCompletion {
+                instruction: InstructionId::new(region, 3),
+                token: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 2), output_index: 0 },
+            }),
+        );
     }
 
     #[test]

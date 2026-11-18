@@ -12,7 +12,10 @@
 //! batch coordinate along that dimension. The body keeps its instructions and attached regions. Every reference
 //! access of a mapped parameter receives a leading static index into its size one window, so the body reaches the
 //! original referents through folded access paths, and all other instructions are copied unchanged. Unmapped
-//! read-only parameters remain shared by all batch items.
+//! read-only parameters remain shared by all batch items. The batch dimension of a sharded parameter is placed as the
+//! packed inputs place their batch axes (refer to [`KernelDefinition::batched_inputs`]), so the batched call accepts
+//! the packed inputs unchanged and its results carry the same placement. A batch placement on mesh axes is rejected,
+//! because the window of one batch item cannot keep it.
 //!
 //! Batching rejects the inputs for which this rewrite is not sound, with a [`KernelTransformError::Unsupported`]
 //! that names the rejected contract.
@@ -42,8 +45,8 @@ use std::collections::BTreeMap;
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, Atom, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, Context,
-    Dimension, DimensionBounds, DimensionType, Operation, Placeholder, ProgramBuilder, ProgramError, Typed,
-    TypedProgram, Value, rewrite_reference_access_transforms, validated_reference_access_descriptors,
+    Dimension, DimensionBounds, DimensionType, Operation, Placeholder, ProgramBuilder, ProgramError, ShardingDimension,
+    Typed, TypedProgram, Value, rewrite_reference_access_transforms, validated_reference_access_descriptors,
 };
 use thiserror::Error;
 
@@ -67,6 +70,10 @@ pub enum KernelTransformError {
     #[error(transparent)]
     Initialization(#[from] KernelInitializationError),
 
+    /// The batch placement of the inputs is ambiguous or cannot be inserted into a rewritten parameter type.
+    #[error(transparent)]
+    Batching(#[from] BatchingError),
+
     /// The selected transform has no proven rule for this input contract.
     #[error("kernel transform is unsupported: {message}")]
     Unsupported {
@@ -81,10 +88,13 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
     /// arrays remain shared, and every writable parameter must be mapped, including functional read-write aliases.
     ///
     /// `axes` follows all parameters, including write-only outputs. Each mapped axis is inserted into the full array
-    /// and block shape of its parameter. Canonical type insertion preserves the data type, memory, and sharding while
-    /// clearing the layout. Explicit source layouts are rejected because restoring them on the selected referents is
-    /// not justified. Scalar prefetched inputs must be specialized first (e.g., with
-    /// [`KernelDefinition::specialize_prefetch`]). A new executable proof checks all transformed accesses.
+    /// and block shape of its parameter. The full array type is batched with
+    /// [`ArrayType::batched`](ryft_core::ArrayType::batched), which preserves the data type and memory while clearing
+    /// the layout. Parameter types are physical, so the batch dimension has no placement, and the batched call accepts
+    /// packed inputs however their batch is placed (refer to [`KernelCallOperation`]). Explicit source layouts are
+    /// rejected because restoring them on the selected referents is not justified. Scalar prefetched inputs must be
+    /// specialized first (e.g., with [`KernelDefinition::specialize_prefetch`]). A new executable proof checks all
+    /// transformed accesses.
     ///
     /// # Parameters
     ///
@@ -96,9 +106,10 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
     ///
     /// Returns [`KernelTransformError::Unsupported`] when `axes` does not cover every parameter, when the call has
     /// scalar prefetched inputs, when a writable parameter is unmapped, when a mapped parameter has an explicit layout,
-    /// or when the body uses a mapped reference outside a reference access. Returns [`KernelTransformError::Kernel`]
-    /// when canonical construction rejects the batched call or body, and [`KernelTransformError::Initialization`] when
-    /// the new executable proof rejects the transformed accesses.
+    /// or when the body uses a mapped reference outside a reference access. Returns [`KernelTransformError::Batching`]
+    /// when a mapped axis is out of bounds, [`KernelTransformError::Kernel`] when canonical construction rejects the
+    /// batched call or body, and [`KernelTransformError::Initialization`] when the new executable proof rejects the
+    /// transformed accesses.
     pub fn batched(
         &self,
         batch_size: usize,
@@ -139,8 +150,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
             let mut shape = parameter.mapping().block_shape().to_vec();
             let mut r#type = parameter.r#type().into_owned();
             if let Some(axis) = *axis {
-                r#type =
-                    r#type.with_inserted_dimension(axis, Dimension::Static(batch_size)).map_err(KernelError::from)?;
+                r#type = r#type.batched(axis, Dimension::Static(batch_size), ShardingDimension::Replicated)?;
                 starts.insert(axis, batch);
                 shape.insert(axis, 1);
             }
@@ -236,17 +246,24 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
     /// structurally batched programs. A dynamic batch extent is therefore rejected, because the batch becomes a static
     /// grid dimension. Every batch item uses the same statically shaped block windows.
     ///
+    /// The packed inputs may be placed. Their unbatched types must be the declared input types up to their shardings,
+    /// and the batched call accepts the packed inputs as they are, because the parameter types of a kernel are
+    /// physical and placement belongs to the call. The results are typed by the batched call, so they have no
+    /// placement of their own.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelTransformError::Unsupported`] when the unbatched input types differ from the kernel signature,
-    /// or when a batched input is not an ordinary array, has a dynamic batch extent, or has a batch extent that differs
-    /// from that of another input. Otherwise, returns the errors of [`KernelDefinition::batched`].
+    /// when a batched input is not an ordinary array, has a dynamic batch extent, or has a batch extent that differs
+    /// from that of another input, or when the batched call does not accept the packed input types (e.g., because of
+    /// an explicit packed layout). Otherwise, returns the errors of [`KernelDefinition::batched`].
     pub fn batched_inputs<V: Value<Type = ArrayIrType>>(
         &self,
         inputs: &[ArrayIrBatch<V>],
         maximum_programs: usize,
     ) -> Result<(Self, Vec<Option<usize>>), KernelTransformError> {
-        if inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>() != self.operation().input_types() {
+        let unbatched_types = inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>();
+        if self.operation().output_types_for(&unbatched_types).is_err() {
             return Err(unsupported("batched input types differ from the kernel signature"));
         }
         let mut batch_size = None;
@@ -269,6 +286,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
         let Some(batch_size) = batch_size else {
             return Ok((self.clone(), vec![None; self.operation().output_types().len()]));
         };
+        let input_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<_>>();
         let mut inputs = inputs.iter();
         let axes = self
             .operation()
@@ -289,7 +307,11 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
             .zip(&axes)
             .filter_map(|(parameter, axis)| (parameter.access() != KernelParameterAccess::ReadOnly).then_some(*axis))
             .collect();
-        Ok((self.batched(batch_size, &axes, maximum_programs)?, output_axes))
+        let batched = self.batched(batch_size, &axes, maximum_programs)?;
+        if batched.operation().output_types_for(&input_types).is_err() {
+            return Err(unsupported("batched kernel parameter types differ from the packed input types"));
+        }
+        Ok((batched, output_axes))
     }
 }
 
@@ -315,7 +337,10 @@ where
             KernelDefinition::new(call.clone(), driver.region(0)?.to_program()).map_err(ProgramError::custom)?;
         let (definition, axes) = definition
             .batched_inputs(inputs, DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
-            .map_err(ProgramError::custom)?;
+            .map_err(|error| match error {
+                KernelTransformError::Batching(error) => error,
+                error => ProgramError::custom(error).into(),
+            })?;
         let values = context.parent().bind(
             definition.operation().clone(),
             vec![definition.body().clone()],
@@ -342,7 +367,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArraySliceAxis, ArrayType, AttachedRegions, ConditionOperation, DataType, DimensionValue, DimensionVariable,
-        EagerContext, RecursiveBatchingDriver, ReferenceRead, ReferenceWrite, ReferenceWriteOperation, Shape, Tracer,
+        EagerContext, Layout, LogicalMesh, MeshAxis, MeshAxisType, RecursiveBatchingDriver, ReferenceRead,
+        ReferenceWrite, ReferenceWriteOperation, Shape, Sharding, ShardingDimension, TiledLayout, Tracer,
         TracingContext,
     };
 
@@ -352,6 +378,41 @@ mod tests {
     };
 
     use super::*;
+
+    /// Returns an `f32` array type of the provided static `shape` placed on `dimensions` of a mesh with the explicit
+    /// axes `x` and `y` and the manual axis `m`, each of size 2.
+    fn sharded_type(shape: &[usize], dimensions: Vec<ShardingDimension>) -> ArrayType {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        ArrayType::new_static(DataType::F32, shape.to_vec())
+            .with_sharding(Sharding::new(mesh, dimensions).unwrap())
+            .unwrap()
+    }
+
+    /// Returns a kernel over `f32[2]` items with a mapped input, a shared read-only input, a write-only output, and a
+    /// read-write accumulator, whose body copies the input into the output and the shared input into the accumulator.
+    fn copy_definition() -> KernelDefinition {
+        let item = ArrayType::new_static(DataType::F32, [2]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(item.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(item.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(item.clone(), KernelParameterAccess::WriteOnly).unwrap(),
+                whole_array_parameter(item, KernelParameterAccess::ReadWrite).unwrap(),
+            ],
+        )
+        .unwrap();
+        KernelDefinition::trace(call, |(references, _)| {
+            references[2].write(&references[0].read()?)?;
+            references[3].write(&references[1].read()?)
+        })
+        .unwrap()
+    }
 
     #[test]
     fn test_kernel_transform_error_display() {
@@ -586,6 +647,17 @@ mod tests {
         let (unmapped, axes) = definition.batched_inputs(&[ArrayIrBatch::new(value, None).unwrap()], 1).unwrap();
         assert_eq!(axes, vec![None]);
         assert_eq!(unmapped.semantic_key().unwrap(), definition.semantic_key().unwrap());
+
+        // Batching clears the layout of a mapped parameter, so a packed input with an explicit layout could not be
+        // passed to the batched call.
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let r#type = ArrayType::new_static(DataType::I32, [2, 3]).with_layout(layout);
+        let input = Array::from_elements(r#type, &[1i32, 2, 3, 4, 5, 6]).unwrap();
+        assert!(matches!(
+            definition.batched_inputs(&[ArrayIrBatch::new(ArrayIrValue::Array(input), Some(1)).unwrap()], 3),
+            Err(KernelTransformError::Unsupported { message })
+                if message == "batched kernel parameter types differ from the packed input types",
+        ));
     }
 
     #[test]
@@ -623,6 +695,89 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_kernel_definition_batched_inputs_placed() {
+        // The kernel is physical, and the packed inputs are placed over a mesh in three different ways. The batched
+        // call accepts them as they are, and its results have no placement.
+        let definition = copy_definition();
+        let item = sharded_type(&[2], vec![ShardingDimension::sharded(["y"])]);
+        let shared = Array::from_elements(item, &[5.0f32, 6.0]).unwrap();
+        for axis in ["x", "m"] {
+            let input_type =
+                sharded_type(&[2, 2], vec![ShardingDimension::sharded([axis]), ShardingDimension::sharded(["y"])]);
+            let accumulator_type =
+                sharded_type(&[2, 2], vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded([axis])]);
+            let input = Array::from_elements(input_type, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+            let accumulator = Array::from_elements(accumulator_type, &[0.0f32; 4]).unwrap();
+            let inputs = [
+                ArrayIrBatch::new(ArrayIrValue::Array(input.clone()), Some(0)).unwrap(),
+                ArrayIrBatch::new(ArrayIrValue::Array(shared.clone()), None).unwrap(),
+                ArrayIrBatch::new(ArrayIrValue::Array(accumulator.clone()), Some(1)).unwrap(),
+            ];
+            let (batched, axes) = definition.batched_inputs(&inputs, 4).unwrap();
+            assert_eq!(axes, vec![Some(0), Some(1)]);
+            let matrix = ArrayType::new_static(DataType::F32, [2, 2]);
+            assert_eq!(
+                batched.operation().input_types(),
+                vec![
+                    ArrayIrType::Array(matrix.clone()),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+                    ArrayIrType::Array(matrix.clone()),
+                ],
+            );
+            assert_eq!(
+                batched.semantic_key().unwrap(),
+                definition.batched(2, &[Some(0), None, Some(0), Some(1)], 4).unwrap().semantic_key().unwrap()
+            );
+
+            // The host interpreter executes the placed arrays as ordinary host arrays.
+            let copied = Array::from_elements(matrix.clone(), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+            let accumulated = Array::from_elements(matrix, &[5.0f32, 5.0, 6.0, 6.0]).unwrap();
+            let outputs = batched.interpret(vec![input.clone(), shared.clone(), accumulator], 4).unwrap();
+            assert_eq!(outputs, vec![copied.clone(), accumulated.clone()]);
+
+            // Ordinary batching binds the batched call on the packed inputs.
+            let parent = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
+            let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+                parent,
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            );
+            let callees = [Arc::new(definition.body().clone())];
+            let regions = AttachedRegions::Callees(&callees);
+            let driver = RecursiveBatchingDriver::new(&regions);
+            let outputs =
+                KernelOperation::Call(definition.operation().clone()).batch(&context, &driver, &inputs).unwrap();
+            assert_eq!(
+                outputs,
+                vec![
+                    ArrayIrBatch::new(ArrayIrValue::Array(copied), Some(0)).unwrap(),
+                    ArrayIrBatch::new(ArrayIrValue::Array(accumulated), Some(1)).unwrap(),
+                ],
+            );
+        }
+
+        // Placed inputs must share one mesh, like the inputs of any other operation.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other = ArrayType::new_static(DataType::F32, [2, 2])
+            .with_sharding(
+                Sharding::new(other_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let input_type =
+            sharded_type(&[2, 2], vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]);
+        let batch = |r#type: ArrayType, axis: isize| {
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::from_elements(r#type, &[0.0f32; 4]).unwrap()), Some(axis))
+                .unwrap()
+        };
+        let shared = ArrayIrBatch::new(ArrayIrValue::Array(shared), None).unwrap();
+        assert!(matches!(
+            definition.batched_inputs(&[batch(input_type, 0), shared, batch(other, 0)], 4),
+            Err(KernelTransformError::Unsupported { message })
+                if message == "batched input types differ from the kernel signature",
+        ));
     }
 
     #[test]

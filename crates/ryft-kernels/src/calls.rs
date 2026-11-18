@@ -17,7 +17,9 @@
 //! the call, every parameter that is not write-only contributes an ordinary array input, the scalar prefetched arrays
 //! follow those inputs, and every parameter that is not read-only contributes an ordinary array result. A read-write
 //! parameter therefore contributes one input and one result that may share storage (refer to
-//! [`KernelCallOperation::aliases`]), and no reference or input mutation is visible outside the call.
+//! [`KernelCallOperation::aliases`]), and no reference or input mutation is visible outside the call. A mapping or
+//! scalar prefetch conversion that may fail is an observable assertion of the call itself, and
+//! [`KernelDefinition::effects`] summarizes it together with the effects of the body.
 //!
 //! # Definitions and Validation
 //!
@@ -50,16 +52,18 @@
 //! compiled work.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::hash::Hash;
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
     ArrayTypeRefinements, Dimension, DimensionBounds, DimensionFromScalar, DimensionFromScalarOperation, DimensionType,
-    DimensionVariable, EagerContext, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
-    PadOperation, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot, Tracer, TracingContext, Type,
-    TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
+    DimensionVariable, EagerContext, EffectClass, EffectClasses, Effects, EffectsSummary, FlatProgram,
+    InputRegionProvenance, InstructionId, LogicalMesh, Operation, OperationFormatter, PadOperation, Placeholder,
+    ProgramBuilder, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceType, RegionInterface, RegionRef, RegionSlot, Sharding, Tracer, TracingContext, Type, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
 };
 use thiserror::Error;
 
@@ -188,17 +192,28 @@ impl KernelParameter {
     /// storage has no required physical layout. Invalid elements are accessible only through masked memory operations
     /// with an explicit fallback, and padding does not initialize them.
     ///
+    /// The full array type is physical. It has no sharding, because a kernel runs on one device and every type in its
+    /// body follows from its parameters. How an argument is placed is a property of the call (refer to
+    /// [`KernelCallOperation`]), which accepts placed inputs of this type.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::ParameterRank`] when the block rank of `mapping` differs from the rank of `type`, and
-    /// [`KernelError::Type`] when a masked window has a full array type without a static shape or when the slice or
-    /// padding type rules reject the block.
+    /// [`KernelError::Type`] when `type` has a sharding, when a masked window has a full array type without a static
+    /// shape, or when the slice or padding type rules reject the block.
     pub fn new(r#type: ArrayType, access: KernelParameterAccess, mapping: BlockMapping) -> Result<Self, KernelError> {
         if r#type.rank() != mapping.block_shape().len() {
             return Err(KernelError::ParameterRank {
                 array_rank: r#type.rank(),
                 block_rank: mapping.block_shape().len(),
             });
+        }
+        if r#type.sharding().is_some() {
+            return Err(TypeError::invalid(format!(
+                "kernel parameter type `{type}` has a sharding, but a kernel runs on one device and its call accepts \
+                 placed inputs",
+            ))
+            .into());
         }
         let referent = if mapping.boundary_policy() == BoundaryPolicy::Masked {
             let shape = r#type
@@ -310,8 +325,9 @@ impl Typed for KernelParameter {
 pub const KERNEL_CALL_OPERATION_NAME: &str = "kernel_call";
 
 /// Version of the encoding of kernel semantic keys, which [`KernelDefinition::semantic_key`] writes as the only version
-/// in its header. An incompatible change to the encoded semantics requires a new version. This version is independent
-/// of the version of serialized kernel sources and of adapter artifact and executable persistence versions.
+/// in its header. The version stays at 1 until the first release of `ryft-kernels`, and unreleased encoding changes
+/// reuse it. After that release, every incompatible change to the encoded semantics increments it. This version is
+/// independent of the version of serialized kernel sources and of adapter artifact and executable persistence versions.
 pub const KERNEL_KEY_VERSION: u32 = 1;
 
 /// Higher-order operation with one attached kernel body that preserves its block references.
@@ -320,6 +336,31 @@ pub const KERNEL_KEY_VERSION: u32 = 1;
 /// results omit read-only parameters. A read-write parameter therefore contributes one ordinary input and one ordinary
 /// result. This functional alias relationship does not expose a reference state slot or permit an input mutation
 /// visible outside the call. The body returns no values, because its stores produce the declared array results.
+///
+/// The parameter and scalar prefetch types are physical and have no sharding, because a kernel runs on one device.
+/// Placement belongs to the call. An input may have a sharding that places it over a mesh and that records manual
+/// variation, as long as it carries no pending reduction and every such input uses the same mesh. The results have the
+/// declared types. A kernel cannot be assumed to produce the same result on every device, so when an input varies
+/// along manual axes, every result varies along them too and is placed replicated on the mesh of the inputs, which is
+/// also how a custom call types its results. No result keeps the dimension placement of an input, including the
+/// result of a read-write parameter. Whether a placed input is the local shard that one device can run the kernel on
+/// is decided where a kernel is compiled for a backend and not here.
+///
+/// The call declares an [`EffectClass::OrderedAssertion`] of its own exactly when one of the following may fail:
+///
+///   - a mapping program (e.g., a division by a prefetched dimension that may be zero),
+///   - the conversion of a scalar prefetched value to the dimension type of a mapping input that receives it, which
+///     fails for a negative or out of bounds value, or
+///   - the window checks of [`BlockMapping::evaluate`], which reject a window that exceeds its full array under
+///     [`BoundaryPolicy::InBounds`] and a window limit that exceeds the maximum dimension extent under either policy.
+///     A window is treated as able to fail unless [`BlockMapping::has_total_windows`] proves the checks from the
+///     bounds of the mapping output types and the full array type of its parameter.
+///
+/// Such a failure is observable even when the results of the call are unused, so simplification retains the call and
+/// preserves its order relative to other ordered effects. A call whose mapping programs are total, that converts no
+/// scalar prefetched value, and whose windows are proven (e.g., whole array windows, or tiles whose grid fits the
+/// array) declares no effect, so it is eliminated like pure work when its body is pure as well.
+/// [`KernelDefinition::effects`] combines these effects with those of the body.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelCallOperation {
     /// Logical execution grid, independent of native launch dimensions.
@@ -354,7 +395,7 @@ impl KernelCallOperation {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::Type`] when a prefetched type is not a rank-0 integer array type,
+    /// Returns [`KernelError::Type`] when a prefetched type is not a rank-0 integer array type or has a sharding,
     /// [`KernelError::MappingInputCount`] when a mapping does not take one input per grid dimension and prefetched
     /// array, [`KernelError::MappingInputIdentity`] when a mapping shares one dimension identity between coordinates
     /// that may differ, and [`KernelError::MappingInputBounds`] when a mapping input excludes a grid coordinate.
@@ -366,6 +407,13 @@ impl KernelCallOperation {
         for r#type in &prefetch_types {
             DimensionFromScalarOperation::new(DimensionVariable::new("prefetch", DimensionBounds::unbounded()).into())
                 .infer_output_types(&[ArrayIrType::Array(r#type.clone())], &[])?;
+            if r#type.sharding().is_some() {
+                return Err(TypeError::invalid(format!(
+                    "scalar prefetch type `{type}` has a sharding, but a kernel runs on one device and its call \
+                     accepts placed inputs",
+                ))
+                .into());
+            }
         }
         let maximum_extents = grid
             .dimensions()
@@ -497,7 +545,8 @@ impl KernelCallOperation {
             .collect()
     }
 
-    /// Returns ordinary outer array input types, excluding write-only outputs and appending scalar prefetch.
+    /// Returns the declared outer array input types, excluding write-only outputs and appending scalar prefetch. An
+    /// actual input may additionally be placed (refer to the type documentation).
     pub fn input_types(&self) -> Vec<ArrayIrType> {
         self.parameters
             .iter()
@@ -507,12 +556,72 @@ impl KernelCallOperation {
             .collect()
     }
 
-    /// Returns ordinary outer result types in parameter order.
+    /// Returns the declared result types in parameter order, which are the result types of a call on inputs without a
+    /// sharding. [`Self::output_types_for`] returns the result types for placed inputs.
     pub fn output_types(&self) -> Vec<ArrayIrType> {
         self.parameters
             .iter()
             .filter(|parameter| parameter.access != KernelParameterAccess::ReadOnly)
             .map(|parameter| ArrayIrType::Array(parameter.r#type.clone()))
+            .collect()
+    }
+
+    /// Returns the result types of this call for the provided actual `input_types`, which may be placed (refer to the
+    /// type documentation). They are the declared result types, replicated on the mesh of the inputs and varying along
+    /// each manual axis along which an input varies when there is such an axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when an input is not its declared array type up to its sharding, when an input carries
+    /// a pending reduction, or when placed inputs use different meshes.
+    pub fn output_types_for(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError> {
+        let mismatch = || {
+            TypeError::invalid(format!("`{KERNEL_CALL_OPERATION_NAME}` input types do not match its logical signature"))
+        };
+        let declared = self.input_types();
+        if input_types.len() != declared.len() {
+            return Err(mismatch());
+        }
+        let mut mesh = None::<&LogicalMesh>;
+        let mut varying_axes = BTreeSet::new();
+        for (actual, declared) in input_types.iter().zip(&declared) {
+            let (ArrayIrType::Array(actual), ArrayIrType::Array(declared)) = (actual, declared) else {
+                return Err(mismatch());
+            };
+            if actual.data_type() != declared.data_type()
+                || actual.shape() != declared.shape()
+                || actual.memory() != declared.memory()
+                || actual.layout() != declared.layout()
+            {
+                return Err(mismatch());
+            }
+            let Some(sharding) = actual.sharding() else { continue };
+            if !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{KERNEL_CALL_OPERATION_NAME}` input type `{actual}` carries a pending reduction",
+                )));
+            }
+            if mesh.is_some_and(|mesh| mesh != sharding.mesh()) {
+                return Err(TypeError::invalid(format!(
+                    "`{KERNEL_CALL_OPERATION_NAME}` placed inputs must use the same mesh",
+                )));
+            }
+            mesh = Some(sharding.mesh());
+            varying_axes.extend(sharding.varying_manual_axes().iter().cloned());
+        }
+        let Some(mesh) = mesh.filter(|_| !varying_axes.is_empty()) else {
+            return Ok(self.output_types());
+        };
+        self.parameters
+            .iter()
+            .filter(|parameter| parameter.access != KernelParameterAccess::ReadOnly)
+            .map(|parameter| {
+                let sharding = Sharding::replicated(mesh.clone(), parameter.r#type.rank())
+                    .with_varying_manual_axes(varying_axes.clone())
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                let r#type = parameter.r#type.clone().with_sharding(sharding);
+                Ok(ArrayIrType::Array(r#type.map_err(|error| TypeError::invalid(error.to_string()))?))
+            })
             .collect()
     }
 
@@ -658,6 +767,22 @@ impl KernelCallOperation {
         }
         identities
     }
+
+    /// Returns the effect classes of the mapping programs together with those of converting each scalar prefetched
+    /// value to the dimension type of every mapping input that receives it. These cover every failure that
+    /// [`Self::specialize_prefetch`] can raise, and [`Operation::effects`] adds the window checks to them.
+    pub(crate) fn mapping_program_effects(&self) -> EffectClasses {
+        self.parameters.iter().fold(EffectClasses::NONE, |classes, parameter| {
+            let program = parameter.mapping.program();
+            program.input_types().iter().skip(self.grid.dimensions().len()).fold(
+                classes.union(program.effects().classes()),
+                |classes, r#type| {
+                    let ArrayIrType::Dimension(r#type) = r#type else { unreachable!() };
+                    classes.union(DimensionFromScalarOperation::new(r#type.clone()).effects().classes())
+                },
+            )
+        })
+    }
 }
 
 impl Display for KernelCallOperation {
@@ -685,11 +810,7 @@ impl Operation for KernelCallOperation {
         if region_interfaces.len() != 1 {
             return Err(TypeError::invalid(format!("`{KERNEL_CALL_OPERATION_NAME}` requires exactly one body region")));
         }
-        if input_types != self.input_types() {
-            return Err(TypeError::invalid(format!(
-                "`{KERNEL_CALL_OPERATION_NAME}` input types do not match its logical signature",
-            )));
-        }
+        let output_types = self.output_types_for(input_types)?;
         let expected = self.body_input_types();
         if region_interfaces[0].input_types() != expected {
             return Err(TypeError::invalid(format!(
@@ -702,7 +823,7 @@ impl Operation for KernelCallOperation {
                 "`{KERNEL_CALL_OPERATION_NAME}` body must publish results through its declared output references",
             )));
         }
-        Ok(self.output_types())
+        Ok(output_types)
     }
 
     fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
@@ -724,6 +845,24 @@ impl Operation for KernelCallOperation {
         // grid does not order and that overlap with `KernelInitializationError::OverlappingWindows`. So two grid points
         // that may run concurrently never accumulate into the same element.
         region_index == 0 && !mode.is_consuming()
+    }
+
+    fn effects(&self) -> Cow<'_, Effects> {
+        // The mappings of every grid point run before its body, after every scalar prefetched value is converted to the
+        // dimension type of each mapping input that receives it, and the window that a mapping selects is then checked
+        // against its full array. A failure of any of these is observable even when the results of the call are unused,
+        // so their assertions belong to the call itself. The body effects reach the call through its attached
+        // computation region, and a mapping has no references, so the reference state of the body stays the only state
+        // of the call.
+        let mut classes = self.mapping_program_effects();
+        if self
+            .parameters
+            .iter()
+            .any(|parameter| !parameter.mapping.has_total_windows(parameter.r#type.shape()))
+        {
+            classes = classes.union(EffectClasses::single(EffectClass::OrderedAssertion));
+        }
+        if classes.is_empty() { Cow::Borrowed(Effects::empty()) } else { Cow::Owned(Effects::explicit(classes)) }
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -986,6 +1125,17 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         &self.references
     }
 
+    /// Returns the observable effects of one application of this definition, which is the authoritative summary for
+    /// every consumer that decides whether a call may be eliminated, replaced, or reordered (e.g., a pure fallback
+    /// or a compiler embedding). It combines the effects of the call itself (refer to [`KernelCallOperation`], whose
+    /// mappings, scalar prefetch conversions, and window checks may fail) with those of the body, which is exactly
+    /// what an enclosing program derives for an instruction that applies the call. The reference state of the body is
+    /// local to the call and appears as [`EffectClass::OrderedState`] without an explicit declaration, which is the
+    /// state that an embedding may discharge at the call boundary.
+    pub fn effects(&self) -> EffectsSummary {
+        self.operation.effects().summary().union(self.body.effects())
+    }
+
     /// Returns a versioned structural key of this definition, which identifies its semantics for caching.
     ///
     /// The key is derived from the same wire records as [`KernelDefinition::to_source`], encoded in the key mode of
@@ -998,11 +1148,13 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
     ///
     /// This is an encoding of cache identity, not a round trip executable serialization format, and it covers every
     /// valid definition rather than only the transport subset. Features that [`KernelDefinition::to_source`] rejects
-    /// are encoded through key-only records. Nested kernel calls, custom calls, and attached composites are encoded
-    /// structurally, and a registered extension provides its exact versioned payload through
-    /// [`KernelExtension::semantic_key`]. Operations without a wire record and distributed type metadata are
-    /// transitionally encoded by their diagnostic renderings after canonical identity renaming. Definitions whose
-    /// identity is local to the process return an error instead of inheriting it from diagnostic formatting.
+    /// are encoded through key-only records. Nested kernel calls, custom calls, attached composites, gathers,
+    /// scatters, the shardings of distributed array types, requested output shardings, sharding changes and
+    /// constraints, and dropout are encoded structurally, and a registered extension provides its exact versioned
+    /// payload through [`KernelExtension::semantic_key`]. Shardings keep their mesh axis names, which are semantic.
+    /// Operations without a wire record are transitionally encoded by their diagnostic renderings after canonical
+    /// identity renaming. Definitions whose identity is local to the process return an error instead of inheriting it
+    /// from diagnostic formatting.
     ///
     /// # Errors
     ///
@@ -1023,21 +1175,26 @@ type KernelTracer<Extension> = Tracer<TracingContext<ArrayIrValue<Array>, Kernel
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute, CompositeJvpRule, CompositeKey,
         CompositeOperation, CompositeTransposeOperation, ConditionOperation, ConstantOperation, Context,
         CustomCallAttribute, CustomCallOperation, CustomRuleDefinition, CustomRuleRegistration, DataType,
-        DimensionError, DimensionMulOperation, DimensionValue, EffectClass, EffectClasses, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, NamedComposite, NothingSavable, PrintOperation, Provenance, ProvenanceScope,
+        DimensionError, DimensionMulOperation, DimensionValue, EffectClass, EffectClasses, GatherDimensionNumbers,
+        GatherMode, GatherOperation, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType,
+        NamedComposite, NothingSavable, PrintOperation, Provenance, ProvenanceScope, ReduceOperation, ReductionKind,
         ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId,
-        RematerializeOperation, ResidualPolicyReference, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
-        TiledLayout, ZeroOperation,
+        RematerializeOperation, ReshapeOperation, ResidualPolicyReference, ScatterDimensionNumbers, ScatterMode,
+        ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
+        ShardingDimension, TiledLayout, UnreducedKind, ZeroOperation,
     };
 
     use crate::authoring::{MappingExpression, ParameterWindow, mapped_call, whole_array_parameter};
     use crate::grids::{GridDimension, GridExecution};
+    use crate::initialization::KernelInitializationError;
     use crate::memory::{MaskedStoreOperation, WindowMaskOperation};
     use crate::operations::tests::TestExtension;
 
@@ -1149,6 +1306,106 @@ mod tests {
         .unwrap()
     }
 
+    /// Read-only call with no results and an empty body whose single window starts at `start`, a mapping expression
+    /// over one signed scalar prefetched value.
+    fn prefetch_mapping_definition(start: MappingExpression) -> KernelDefinition {
+        let operation = mapped_call(
+            Grid::new(vec![]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::I32, vec![4]),
+                KernelParameterAccess::ReadOnly,
+                ParameterWindow::ElementStarts {
+                    block_shape: vec![1],
+                    boundary: BoundaryPolicy::InBounds,
+                    starts: vec![start],
+                },
+            )],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        KernelDefinition::trace_with_prefetch(operation, |_| Ok(())).unwrap()
+    }
+
+    /// Applies `definition` to the inputs of a program that leaves every result of the call unused.
+    fn unused_call_program(
+        definition: &KernelDefinition,
+    ) -> FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>> {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = definition
+            .operation()
+            .input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let body = builder.import_region(definition.body().entry_region_ref());
+        builder
+            .add_instruction(KernelOperation::Call(definition.operation().clone()), vec![body], inputs.clone(), None)
+            .unwrap();
+        builder.build(vec![], vec![Placeholder; inputs.len()], vec![]).unwrap()
+    }
+
+    /// Gathers one element of an `f32[2]` input at the start index held by an `i32[1, 1]` input with `operation`.
+    fn gather_definition(operation: GatherOperation) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, vec![2]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(
+                    ArrayType::new_static(DataType::I32, vec![1, 1]),
+                    KernelParameterAccess::ReadOnly,
+                )
+                .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, vec![1]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        KernelDefinition::trace(call, |(references, _)| {
+            let input = references[0].read()?;
+            let indices = references[1].read()?;
+            let gathered = references[0].context().bind(
+                ArrayIrOperation::Array(ArrayOperation::Gather(operation)),
+                vec![],
+                &[input, indices],
+            )?;
+            references[2].write(&gathered[0])
+        })
+        .unwrap()
+    }
+
+    /// Scatters an `f32[2]` update into an `f32[4]` input at the start indices held by an `i32[2, 1]` input with
+    /// `operation`.
+    fn scatter_definition(operation: ScatterOperation) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, vec![4]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(
+                    ArrayType::new_static(DataType::I32, vec![2, 1]),
+                    KernelParameterAccess::ReadOnly,
+                )
+                .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, vec![2]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, vec![4]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        KernelDefinition::trace(call, |(references, _)| {
+            let inputs = references[..3].iter().map(|reference| reference.read()).collect::<Result<Vec<_>, _>>()?;
+            let scattered = references[0].context().bind(
+                ArrayIrOperation::Array(ArrayOperation::Scatter(operation)),
+                vec![],
+                &inputs,
+            )?;
+            references[3].write(&scattered[0])
+        })
+        .unwrap()
+    }
+
     /// Shared dynamic extent across an input and output, with a fixed masked block of four elements.
     fn refinement_parameters() -> Vec<(ArrayType, KernelParameterAccess, BlockMapping)> {
         let extent = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(5)).unwrap());
@@ -1242,6 +1499,20 @@ mod tests {
                 ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4]))),
             );
         }
+    }
+
+    #[test]
+    fn test_kernel_parameter_new_rejects_shardings() {
+        // A kernel runs on one device, so its parameter types are physical, whatever the placement.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let r#type = ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        assert_eq!(
+            KernelParameter::new(r#type, KernelParameterAccess::ReadOnly, scalar_mapping()),
+            Err(KernelError::Type(TypeError::invalid(
+                "kernel parameter type `i32[][sharding={mesh<['x'=2:manual]>, []}]` has a sharding, but a kernel runs \
+                 on one device and its call accepts placed inputs",
+            ))),
+        );
     }
 
     #[test]
@@ -1557,6 +1828,20 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_call_operation_new_with_prefetch_rejects_shardings() {
+        // A scalar prefetched input is physical, like every parameter.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let scalar = ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        assert_eq!(
+            KernelCallOperation::new_with_prefetch(Grid::new(vec![]).unwrap(), vec![], vec![scalar]),
+            Err(KernelError::Type(TypeError::invalid(
+                "scalar prefetch type `i32[][sharding={mesh<['x'=2:manual]>, []}]` has a sharding, but a kernel runs \
+                 on one device and its call accepts placed inputs",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_kernel_call_operation_new_with_prefetch_rejects_prefetch_identity_aliasing() {
         // A prefetched dimension that shares its identity with a grid coordinate can never be specialized, because
         // binding it to a constant cannot preserve the runtime equality with the remaining coordinate.
@@ -1660,6 +1945,69 @@ mod tests {
         assert_eq!(
             copy_definition().operation().output_types(),
             vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))],
+        );
+    }
+
+    #[test]
+    fn test_kernel_call_operation_output_types_for() {
+        // The call has a read-only, a write-only, and a read-write `i32` scalar parameter, in this order, so it takes
+        // two inputs and returns the write-only result followed by the read-write result.
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                parameter(KernelParameterAccess::ReadOnly),
+                parameter(KernelParameterAccess::WriteOnly),
+                parameter(KernelParameterAccess::ReadWrite),
+            ],
+        )
+        .unwrap();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let placed = |sharding: Sharding| ArrayIrType::Array(scalar.clone().with_sharding(sharding).unwrap());
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
+
+        // Inputs without a sharding give the declared result types.
+        let unplaced = ArrayIrType::Array(scalar.clone());
+        assert_eq!(operation.output_types_for(&[unplaced.clone(), unplaced.clone()]), Ok(operation.output_types()));
+
+        // A placement alone does not reach the results, including the result of the read-write parameter that
+        // receives the placed input.
+        assert_eq!(
+            operation.output_types_for(&[unplaced.clone(), placed(replicated.clone())]),
+            Ok(operation.output_types()),
+        );
+
+        // Every result varies along the manual axes along which an input varies, including the results of parameters
+        // whose own inputs do not.
+        assert_eq!(
+            operation.output_types_for(&[placed(varying.clone()), unplaced.clone()]),
+            Ok(vec![placed(varying.clone()), placed(varying.clone())]),
+        );
+        assert_eq!(
+            operation.output_types_for(&[placed(varying.clone()), placed(replicated.clone())]),
+            Ok(vec![placed(varying.clone()), placed(varying.clone())]),
+        );
+
+        // Only the sharding of an input is free, a pending reduction is not a placement, and placed inputs share one
+        // mesh.
+        let mismatch = TypeError::invalid("`kernel_call` input types do not match its logical signature");
+        assert_eq!(operation.output_types_for(std::slice::from_ref(&unplaced)), Err(mismatch.clone()));
+        assert_eq!(
+            operation.output_types_for(&[ArrayIrType::Array(ArrayType::scalar(DataType::F32)), unplaced.clone()]),
+            Err(mismatch),
+        );
+        assert_eq!(
+            operation.output_types_for(&[placed(replicated.clone().with_unreduced_axes(["x"]).unwrap()), unplaced]),
+            Err(TypeError::invalid(
+                "`kernel_call` input type `i32[][sharding={mesh<['x'=2:manual]>, [], unreduced={'x'}}]` carries a \
+                 pending reduction",
+            )),
+        );
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        assert_eq!(
+            operation.output_types_for(&[placed(replicated), placed(Sharding::replicated(other_mesh, 0))]),
+            Err(TypeError::invalid("`kernel_call` placed inputs must use the same mesh")),
         );
     }
 
@@ -1832,6 +2180,250 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_call_operation_effects() {
+        let assertion = Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion));
+
+        // Calls without mappings convert no scalar prefetched value, and whole array mappings are total.
+        let empty = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+        assert_eq!(empty.effects().as_ref(), Effects::empty());
+        let prefetch_types = vec![ArrayType::scalar(DataType::I32)];
+        let unused_prefetch =
+            KernelCallOperation::new_with_prefetch(Grid::new(vec![]).unwrap(), vec![], prefetch_types).unwrap();
+        assert_eq!(unused_prefetch.effects().as_ref(), Effects::empty());
+        assert_eq!(copy_definition().operation().effects().as_ref(), Effects::empty());
+
+        // A mapping that may fail and a required conversion of a scalar prefetched value are both assertions.
+        let division = prefetch_mapping_definition(MappingExpression::Constant(0) / MappingExpression::Prefetch(0));
+        assert_eq!(division.operation().effects().as_ref(), &assertion);
+        let offset = prefetch_mapping_definition(MappingExpression::Prefetch(0));
+        assert_eq!(offset.operation().effects().as_ref(), &assertion);
+        let coordinate = mapped_call(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::I32, vec![4]),
+                KernelParameterAccess::ReadOnly,
+                ParameterWindow::ElementStarts {
+                    block_shape: vec![1],
+                    boundary: BoundaryPolicy::InBounds,
+                    starts: vec![MappingExpression::GridCoordinate(0) - MappingExpression::Constant(1)],
+                },
+            )],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(coordinate.effects().as_ref(), &assertion);
+
+        // Explicit specialization rebuilds the mappings with exact effects and removes the conversions.
+        let two = Array::scalar(2i32).unwrap();
+        let specialized = division.specialize_prefetch(std::slice::from_ref(&two)).unwrap();
+        assert_eq!(specialized.operation().effects().as_ref(), Effects::empty());
+        let specialized = offset.specialize_prefetch(std::slice::from_ref(&two)).unwrap();
+        assert_eq!(specialized.operation().effects().as_ref(), Effects::empty());
+    }
+
+    #[test]
+    fn test_kernel_call_operation_effects_division_by_zero() {
+        // A read-only call with no results whose mapping computes `0 / d` fails for a prefetched `d` of zero, when it
+        // is interpreted directly and after simplification of an enclosing program that discards the call.
+        let definition = prefetch_mapping_definition(MappingExpression::Constant(0) / MappingExpression::Prefetch(0));
+        let program = unused_call_program(&definition);
+        let simplified = program.clone().into_simplified().unwrap();
+        assert_eq!(simplified.to_string(), program.to_string());
+        let input = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        let zero = Array::scalar(0i32).unwrap();
+        let violation = ProgramError::custom(DimensionError::RequirementViolation {
+            message: "`dimension_div` requires right > 0; got left=0, right=0".to_owned(),
+        });
+        let expected = KernelError::Mapping(BlockMappingError::Program(violation));
+        let direct = definition.interpret(vec![input.clone(), zero.clone()], 1);
+        assert_eq!(direct, Err(ProgramError::custom(expected.clone())));
+        let inputs = vec![ArrayIrValue::Array(input), ArrayIrValue::Array(zero.clone())];
+        assert_eq!(program.interpret(inputs.clone()), Err(ProgramError::custom(expected.clone())));
+        assert_eq!(simplified.interpret(inputs), Err(ProgramError::custom(expected.clone())));
+        assert_eq!(definition.specialize_prefetch(&[zero]).unwrap_err(), expected);
+    }
+
+    #[test]
+    fn test_kernel_call_operation_effects_invalid_conversion() {
+        let definition = prefetch_mapping_definition(MappingExpression::Prefetch(0));
+        let program = unused_call_program(&definition);
+        let simplified = program.clone().into_simplified().unwrap();
+        assert_eq!(simplified.to_string(), program.to_string());
+        let input = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        let negative = Array::scalar(-1i32).unwrap();
+        let expected = KernelError::Program(ProgramError::Concretization {
+            message: "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range".to_owned(),
+        });
+        let direct = definition.interpret(vec![input.clone(), negative.clone()], 1);
+        assert_eq!(direct, Err(ProgramError::custom(expected.clone())));
+        let inputs = vec![ArrayIrValue::Array(input), ArrayIrValue::Array(negative.clone())];
+        assert_eq!(program.interpret(inputs.clone()), Err(ProgramError::custom(expected.clone())));
+        assert_eq!(simplified.interpret(inputs), Err(ProgramError::custom(expected.clone())));
+        assert_eq!(definition.specialize_prefetch(&[negative]).unwrap_err(), expected);
+    }
+
+    #[test]
+    fn test_kernel_call_operation_effects_valid_prefetch() {
+        // A valid prefetch succeeds, but the unspecialized call is retained because another value could fail.
+        let definition = prefetch_mapping_definition(MappingExpression::Constant(0) / MappingExpression::Prefetch(0));
+        let program = unused_call_program(&definition);
+        let simplified = program.clone().into_simplified().unwrap();
+        assert_eq!(simplified.to_string(), program.to_string());
+        let input = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        let two = Array::scalar(2i32).unwrap();
+        assert_eq!(definition.interpret(vec![input.clone(), two.clone()], 1), Ok(vec![]));
+        let inputs = vec![ArrayIrValue::Array(input.clone()), ArrayIrValue::Array(two.clone())];
+        assert_eq!(program.interpret(inputs.clone()), Ok(vec![]));
+        assert_eq!(simplified.interpret(inputs), Ok(vec![]));
+
+        // After explicit specialization, the mapping is a constant start and the unused pure call is eliminated.
+        let specialized = definition.specialize_prefetch(&[two]).unwrap();
+        let program = unused_call_program(&specialized);
+        assert_eq!(
+            program.clone().into_simplified().unwrap().to_string(),
+            indoc! {"
+                lambda %0:i32[4] .
+                in ()"},
+        );
+        assert_eq!(program.interpret(vec![ArrayIrValue::Array(input)]), Ok(vec![]));
+    }
+
+    #[test]
+    fn test_kernel_call_operation_effects_order() {
+        // A failing call and a failing conversion that precedes or follows it report the earlier failure in program
+        // order, both directly and after simplification.
+        let definition = prefetch_mapping_definition(MappingExpression::Constant(0) / MappingExpression::Prefetch(0));
+        let checked = DimensionVariable::new("checked", DimensionBounds::non_negative(Some(10)).unwrap());
+        let program = |assertion_first: bool| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let inputs = definition
+                .operation()
+                .input_types()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
+            let body = builder.import_region(definition.body().entry_region_ref());
+            let assertion = KernelOperation::Portable(ArrayIrOperation::DimensionFromScalar(
+                DimensionFromScalarOperation::new(checked.clone().into()),
+            ));
+            let call = KernelOperation::Call(definition.operation().clone());
+            if assertion_first {
+                builder.add_instruction(assertion.clone(), vec![], vec![scalar], None).unwrap();
+            }
+            builder.add_instruction(call, vec![body], inputs, None).unwrap();
+            if !assertion_first {
+                builder.add_instruction(assertion, vec![], vec![scalar], None).unwrap();
+            }
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 3], vec![])
+                .unwrap()
+        };
+        let inputs = vec![
+            ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0i32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(-1i32).unwrap()),
+        ];
+        let conversion = ProgramError::Concretization {
+            message: "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range".to_owned(),
+        };
+        let division = ProgramError::custom(KernelError::Mapping(BlockMappingError::Program(ProgramError::custom(
+            DimensionError::RequirementViolation {
+                message: "`dimension_div` requires right > 0; got left=0, right=0".to_owned(),
+            },
+        ))));
+        for (assertion_first, expected) in [(true, conversion), (false, division)] {
+            let program = program(assertion_first);
+            let simplified = program.clone().into_simplified().unwrap();
+            assert_eq!(simplified.to_string(), program.to_string());
+            assert_eq!(program.interpret(inputs.clone()), Err(expected.clone()));
+            assert_eq!(simplified.interpret(inputs.clone()), Err(expected));
+        }
+    }
+
+    #[test]
+    fn test_kernel_call_operation_effects_window_failures() {
+        // A read-only call with no results whose total mapping selects a window that fails its boundary checks fails
+        // when it is interpreted directly and after simplification of an enclosing program that discards the call.
+        let input = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        let assertion = Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion));
+        for (boundary, start, error) in [
+            (BoundaryPolicy::InBounds, 4, BlockMappingError::OutOfBounds { axis: 0, start: 4, limit: 5, extent: 4 }),
+            (
+                BoundaryPolicy::Masked,
+                MAX_DIMENSION_EXTENT,
+                BlockMappingError::Overflow { boundary: "window limit", axis: 0 },
+            ),
+        ] {
+            let operation = mapped_call(
+                Grid::new(vec![]).unwrap(),
+                vec![(
+                    ArrayType::new_static(DataType::I32, vec![4]),
+                    KernelParameterAccess::ReadOnly,
+                    ParameterWindow::ElementStarts {
+                        block_shape: vec![1],
+                        boundary,
+                        starts: vec![MappingExpression::Constant(start)],
+                    },
+                )],
+                vec![],
+            )
+            .unwrap();
+            assert_eq!(operation.parameters()[0].mapping().program().effects().classes(), EffectClasses::NONE);
+            assert_eq!(operation.effects().as_ref(), &assertion);
+            let definition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
+            let program = unused_call_program(&definition);
+            let simplified = program.clone().into_simplified().unwrap();
+            assert_eq!(simplified.to_string(), program.to_string());
+            let expected = ProgramError::custom(KernelInitializationError::Mapping(error));
+            assert_eq!(definition.interpret(vec![input.clone()], 1), Err(expected.clone()));
+            let inputs = vec![ArrayIrValue::Array(input.clone())];
+            assert_eq!(program.interpret(inputs.clone()), Err(expected.clone()));
+            assert_eq!(simplified.interpret(inputs), Err(expected));
+        }
+
+        // Windows whose bounds prove the checks declare no effect, so an unused pure call is eliminated. Three blocks
+        // of two elements exceed an `i32[4]` unless they are masked.
+        let tiled = |extent: usize, boundary: BoundaryPolicy| {
+            mapped_call(
+                Grid::new(vec![GridDimension::new(Dimension::Static(extent), GridExecution::Parallel)]).unwrap(),
+                vec![(
+                    ArrayType::new_static(DataType::I32, vec![4]),
+                    KernelParameterAccess::ReadOnly,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![2],
+                        boundary,
+                        indices: vec![MappingExpression::GridCoordinate(0)],
+                    },
+                )],
+                vec![],
+            )
+            .unwrap()
+        };
+        assert_eq!(tiled(2, BoundaryPolicy::InBounds).effects().as_ref(), Effects::empty());
+        assert_eq!(tiled(3, BoundaryPolicy::InBounds).effects().as_ref(), &assertion);
+        assert_eq!(tiled(3, BoundaryPolicy::Masked).effects().as_ref(), Effects::empty());
+        let whole = mapped_call(
+            Grid::new(vec![]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::I32, vec![4]),
+                KernelParameterAccess::ReadOnly,
+                ParameterWindow::WholeArray,
+            )],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(whole.effects().as_ref(), Effects::empty());
+        let definition = KernelDefinition::trace(tiled(2, BoundaryPolicy::InBounds), |_| Ok(())).unwrap();
+        assert_eq!(
+            unused_call_program(&definition).into_simplified().unwrap().to_string(),
+            indoc! {"
+                lambda %0:i32[4] .
+                in ()"},
+        );
+    }
+
+    #[test]
     fn test_kernel_call_operation_rename_type_identities() {
         let operation = copy_definition().operation().clone();
         let renamed = operation.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
@@ -1869,7 +2461,7 @@ mod tests {
     #[test]
     fn test_kernel_definition_new_rejects_shard_maps() {
         // A kernel body runs on one device, so a `shard_map` anywhere in the attached region closure of its body is
-        // rejected, whether its result is used, unused, or produced inside a nested region.
+        // rejected, whether it is applied in the body itself or inside a nested region.
 
         // Identity `shard_map` over an `i32` scalar that is replicated along the manual mesh axis `x`, whose body is
         // attached as a kernel family region. Its global input and output types carry the replicated sharding.
@@ -1891,17 +2483,19 @@ mod tests {
             (operation, body)
         }
 
-        // Copy kernel `output = f(input)` over parameters of type `r#type`, where `apply` stages `f` and returns the
-        // written value.
+        // Scalar copy kernel whose body also runs `apply` on a constant of the placed type `r#type` between its read
+        // and its write. Kernel parameters are physical, so only such a constant can have the global type of a
+        // `shard_map` boundary.
         fn definition(
             r#type: &ArrayType,
-            apply: impl FnOnce(&mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, AtomId) -> AtomId,
+            apply: impl FnOnce(&mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, AtomId),
         ) -> (Result<KernelDefinition, KernelError>, RegionId) {
+            let scalar = ArrayType::scalar(DataType::I32);
             let operation = KernelCallOperation::new(
                 Grid::new(vec![]).unwrap(),
                 vec![
-                    KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadOnly, scalar_mapping()).unwrap(),
-                    KernelParameter::new(r#type.clone(), KernelParameterAccess::WriteOnly, scalar_mapping()).unwrap(),
+                    KernelParameter::new(scalar.clone(), KernelParameterAccess::ReadOnly, scalar_mapping()).unwrap(),
+                    KernelParameter::new(scalar, KernelParameterAccess::WriteOnly, scalar_mapping()).unwrap(),
                 ],
             )
             .unwrap();
@@ -1909,27 +2503,28 @@ mod tests {
             let input = builder.add_input(operation.parameters()[0].body_type());
             let output = builder.add_input(operation.parameters()[1].body_type());
             let value = builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![input], None).unwrap()[0];
-            let value = apply(&mut builder, value);
+            let placed =
+                builder.add_constant(ArrayIrValue::Array(Array::from_elements(r#type.clone(), &[0i32]).unwrap()));
+            apply(&mut builder, placed);
             builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], None).unwrap();
             let body = builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
             let entry = body.entry_region_ref().id();
             (KernelDefinition::new(operation, body), entry)
         }
 
-        // Every case stages a well typed body, because the kernel parameters, the value read from the input, the
-        // `shard_map` input and output, and the written value all have the global type of the identity `shard_map`
-        // boundary.
+        // Every case stages a well typed body, because the constant that the `shard_map` receives has the global type
+        // of the identity `shard_map` boundary.
         let (operation, _) = identity_shard_map();
         assert_eq!(operation.global_output_types(), operation.global_input_types());
         let global_type = <&ArrayType>::try_from(&operation.global_input_types()[0]).unwrap().clone();
 
-        // A `shard_map` of arrays whose result the kernel writes.
+        // A `shard_map` of arrays in the body itself.
         let (result, entry) = definition(&global_type, |builder, value| {
             let (operation, body) = identity_shard_map();
             let body = builder.import_program(body);
             builder
                 .add_instruction(ArrayIrOperation::ShardMap(operation), vec![body], vec![value], None)
-                .unwrap()[0]
+                .unwrap();
         });
         let error = result.unwrap_err();
         assert_eq!(
@@ -1942,20 +2537,6 @@ mod tests {
                 "kernel body instruction {} applies `shard_map`, which kernel bodies do not support",
                 InstructionId::new(entry, 1),
             ),
-        );
-
-        // A `shard_map` whose result is unused is rejected too, because the kernel body still contains it.
-        let (result, entry) = definition(&global_type, |builder, value| {
-            let (operation, body) = identity_shard_map();
-            let body = builder.import_program(body);
-            builder
-                .add_instruction(ArrayIrOperation::ShardMap(operation), vec![body], vec![value], None)
-                .unwrap();
-            value
-        });
-        assert_eq!(
-            result.unwrap_err(),
-            KernelError::UnsupportedOperation { operation: "shard_map", instruction: InstructionId::new(entry, 1) },
         );
 
         // A `shard_map` inside a nested region of the body is found through the attached region closure, and the error
@@ -1993,7 +2574,7 @@ mod tests {
                     vec![predicate, value],
                     None,
                 )
-                .unwrap()[0]
+                .unwrap();
         });
         assert_eq!(
             result.unwrap_err(),
@@ -2239,6 +2820,29 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_effects() {
+        // The local reference state of a body is derived from its accesses and is never an explicit declaration.
+        let copy = copy_definition();
+        assert_eq!(copy.effects(), copy.body().effects());
+        assert_eq!(copy.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert!(!copy.effects().has_explicit_ordered_state());
+
+        // Mapping and conversion assertions are added to the effects of the body.
+        let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
+        let division = prefetch_mapping_definition(MappingExpression::Constant(0) / MappingExpression::Prefetch(0));
+        assert_eq!(division.body().effects(), EffectsSummary::PURE);
+        assert_eq!(division.effects(), Effects::explicit(assertion).summary());
+        let prefetch = prefetch_definition();
+        assert_eq!(prefetch.effects().classes(), assertion.union(EffectClasses::single(EffectClass::OrderedState)));
+        assert!(prefetch.effects().is_retained_when_unused());
+        assert!(!prefetch.effects().has_explicit_ordered_state());
+
+        // A specialized total mapping and an empty body leave a pure call.
+        let two = Array::scalar(2i32).unwrap();
+        assert_eq!(division.specialize_prefetch(&[two]).unwrap().effects(), EffectsSummary::PURE);
+    }
+
+    #[test]
     fn test_kernel_definition_semantic_key() {
         let first = dynamic_definition("first", 4, true);
         let renamed = dynamic_definition("second", 4, true);
@@ -2310,6 +2914,182 @@ mod tests {
         assert_eq!(definitions[0].body().to_string(), definitions[1].body().to_string());
         assert_eq!(definitions[0].operation().to_string(), definitions[1].operation().to_string());
         assert_ne!(definitions[0].semantic_key().unwrap(), definitions[1].semantic_key().unwrap());
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_gather_fill_bits() {
+        // Two NaN fills that differ only in their payload bits produce distinct results on the fill path, so their
+        // gathers must have distinct keys and must not reuse each other's cached results.
+        let gather = || GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        let fill = |bits: u32| {
+            gather().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(f32::from_bits(bits)).unwrap())) })
+        };
+        let definitions = [0x7fc0_0001, 0x7fc0_0002].map(|bits| gather_definition(fill(bits)));
+        let input = Array::vector(vec![1f32, 2f32]).unwrap();
+        let out_of_bounds = Array::matrix(1, 1, vec![5i32]).unwrap();
+        let gathered_bits = |definition: &KernelDefinition| {
+            let outputs = definition.interpret(vec![input.clone(), out_of_bounds.clone()], 1).unwrap();
+            outputs[0].elements::<f32>().unwrap()[0].to_bits()
+        };
+        assert_eq!(definitions.iter().map(gathered_bits).collect::<Vec<_>>(), vec![0x7fc0_0001, 0x7fc0_0002]);
+        let keys = definitions.iter().map(|definition| definition.semantic_key().unwrap()).collect::<Vec<_>>();
+        assert_ne!(keys[0], keys[1]);
+        let mut cache = HashMap::new();
+        cache.insert(keys[0].clone(), gathered_bits(&definitions[0]));
+        assert_eq!(cache.get(&keys[1]), None);
+        cache.insert(keys[1].clone(), gathered_bits(&definitions[1]));
+        assert_eq!(cache.get(&keys[0]), Some(&0x7fc0_0001));
+        assert_eq!(cache.get(&keys[1]), Some(&0x7fc0_0002));
+
+        // A gather constructed twice has the same key, and every mode and promise has a distinct key.
+        assert_eq!(gather_definition(fill(0x7fc0_0001)).semantic_key().unwrap(), keys[0]);
+        let distinct = [
+            gather(),
+            gather().with_mode(GatherMode::Clip),
+            gather().with_mode(GatherMode::Fill { value: None }),
+            fill(0x7fc0_0001),
+            fill(0x7fc0_0002),
+            gather().with_indices_are_sorted(true),
+            gather().with_unique_indices(true),
+        ]
+        .into_iter()
+        .map(|operation| gather_definition(operation).semantic_key().unwrap())
+        .collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), 7);
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_scatter() {
+        let scatter = |kind| ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind);
+        let input = Array::vector(vec![1f32, 2f32, 3f32, 4f32]).unwrap();
+        let indices = Array::matrix(2, 1, vec![1i32, 5]).unwrap();
+        let updates = Array::vector(vec![10f32, 20f32]).unwrap();
+
+        // Each update semantics and bounds handling produces a distinct result and has a distinct key.
+        let variants = [
+            (scatter(ScatterReductionKind::Overwrite).with_mode(ScatterMode::Drop), vec![1f32, 10f32, 3f32, 4f32]),
+            (scatter(ScatterReductionKind::Add).with_mode(ScatterMode::Drop), vec![1f32, 12f32, 3f32, 4f32]),
+            (scatter(ScatterReductionKind::Add).with_mode(ScatterMode::Clip), vec![1f32, 12f32, 3f32, 24f32]),
+        ];
+        let mut keys = HashSet::new();
+        for (operation, expected) in variants {
+            let definition = scatter_definition(operation.clone());
+            assert_eq!(
+                definition.interpret(vec![input.clone(), indices.clone(), updates.clone()], 1),
+                Ok(vec![Array::vector(expected).unwrap()]),
+            );
+            assert_eq!(scatter_definition(operation).semantic_key(), definition.semantic_key());
+            keys.insert(definition.semantic_key().unwrap());
+        }
+        assert_eq!(keys.len(), 3);
+
+        // Every reduction kind and promise has a distinct key.
+        let distinct = [
+            scatter(ScatterReductionKind::Overwrite),
+            scatter(ScatterReductionKind::Add),
+            scatter(ScatterReductionKind::Mul),
+            scatter(ScatterReductionKind::Min),
+            scatter(ScatterReductionKind::Max),
+            scatter(ScatterReductionKind::Add).with_indices_are_sorted(true),
+            scatter(ScatterReductionKind::Add).with_unique_indices(true),
+        ]
+        .into_iter()
+        .map(|operation| scatter_definition(operation).semantic_key().unwrap())
+        .collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), 7);
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_shardings() {
+        // Builds a kernel without parameters whose body reshapes an `f32[4]` constant that carries `sharding`. Kernel
+        // parameters are physical, so a sharding can only appear on such a body value.
+        let definition = |sharding: Option<Sharding>| {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let shape = r#type.shape().clone();
+            let value = builder.add_constant(ArrayIrValue::Array(Array::from_elements(r#type, &[0.0f32; 4]).unwrap()));
+            let reshape = ArrayOperation::<Array>::Reshape(ReshapeOperation::new(shape.clone(), shape));
+            builder.add_instruction(reshape, vec![], vec![value], None).unwrap();
+            KernelDefinition::new(call, builder.build(vec![], vec![], vec![]).unwrap()).unwrap()
+        };
+        let mesh = |name: &str, size: usize, r#type: MeshAxisType| {
+            LogicalMesh::new(vec![MeshAxis::new(name, size, r#type).unwrap()]).unwrap()
+        };
+        let sharded = |name: &str, size: usize, r#type: MeshAxisType| {
+            Sharding::new(mesh(name, size, r#type), vec![ShardingDimension::sharded([name])]).unwrap()
+        };
+        let replicated = |r#type: MeshAxisType| Sharding::replicated(mesh("x", 2, r#type), 1);
+
+        // Separately constructed equal shardings share a key, which records the sharding structurally.
+        let key = definition(Some(sharded("x", 2, MeshAxisType::Explicit))).semantic_key().unwrap();
+        assert_eq!(definition(Some(sharded("x", 2, MeshAxisType::Explicit))).semantic_key().unwrap(), key);
+        assert!(key.contains(r#""sharding":{"mesh":[{"name":"x","size":2,"type":"Explicit"}],"#));
+
+        // Mesh axis names, sizes, and types, placements, and reduction state are all semantic.
+        let distinct = [
+            None,
+            Some(sharded("x", 2, MeshAxisType::Explicit)),
+            Some(sharded("y", 2, MeshAxisType::Explicit)),
+            Some(sharded("x", 4, MeshAxisType::Explicit)),
+            Some(sharded("x", 2, MeshAxisType::Manual)),
+            Some(replicated(MeshAxisType::Explicit)),
+            Some(Sharding::new(mesh("x", 2, MeshAxisType::Explicit), vec![ShardingDimension::Unconstrained]).unwrap()),
+            Some(replicated(MeshAxisType::Explicit).with_unreduced_axes(["x"]).unwrap()),
+            Some(
+                replicated(MeshAxisType::Explicit)
+                    .with_unreduced_axes(["x"])
+                    .unwrap()
+                    .with_unreduced_kind(UnreducedKind::Max)
+                    .unwrap(),
+            ),
+            Some(replicated(MeshAxisType::Explicit).with_reduced_axes(["x"]).unwrap()),
+            Some(replicated(MeshAxisType::Manual).with_varying_manual_axes(["x"]).unwrap()),
+        ]
+        .into_iter()
+        .map(|sharding| definition(sharding).semantic_key().unwrap())
+        .collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), 11);
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_output_shardings() {
+        // Builds a kernel without parameters whose body reduces an `f32[4, 2]` constant sharded along `x` over its
+        // first axis with `operation`. Kernel parameters are physical, so only a body value can be sharded.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let definition = |operation: ReduceOperation| {
+            let sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated])
+                    .unwrap();
+            let input_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
+            let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = Array::from_elements(input_type, &[0.0f32; 8]).unwrap();
+            let input = builder.add_constant(ArrayIrValue::Array(input));
+            builder
+                .add_instruction(ArrayOperation::<Array>::Reduce(operation), vec![], vec![input], None)
+                .unwrap();
+            KernelDefinition::new(call, builder.build(vec![], vec![], vec![]).unwrap()).unwrap()
+        };
+        let reduce = || ReduceOperation::new(vec![0], ReductionKind::Sum);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+
+        // Separately constructed equal requests share a key.
+        let key = definition(reduce().with_output_sharding(replicated.clone()).unwrap()).semantic_key().unwrap();
+        assert_eq!(definition(reduce().with_output_sharding(replicated.clone()).unwrap()).semantic_key().unwrap(), key);
+        assert!(key.contains(r#"{"KeyOnly":{"OutputSharding":{"operation":{"Reduce":{"axes":[0],"kind":"Sum"}},"#));
+
+        // The absence of a request and distinct requests have distinct keys.
+        let distinct = [
+            reduce(),
+            reduce().with_output_sharding(replicated).unwrap(),
+            reduce().with_output_sharding(unreduced).unwrap(),
+        ]
+        .into_iter()
+        .map(|operation| definition(operation).semantic_key().unwrap())
+        .collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), 3);
     }
 
     #[test]
@@ -2397,6 +3177,41 @@ mod tests {
                 assert_ne!(key, other);
             }
         }
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_extension_dimension_identities() {
+        // Builds a kernel over a grid with two dynamic extents of equal bounds, named `names`, whose body holds an
+        // extension that carries the extent identity of grid axis `selected` in its payload.
+        let key = |names: [&str; 2], selected: usize| {
+            let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+            let extents = names.map(|name| DimensionVariable::new(name, bounds));
+            let grid = Grid::new(
+                extents
+                    .iter()
+                    .map(|extent| GridDimension::new(Dimension::Dynamic(extent.clone()), GridExecution::Parallel))
+                    .collect(),
+            )
+            .unwrap();
+            let operation = KernelCallOperation::new(grid, vec![]).unwrap();
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            for r#type in operation.body_input_types() {
+                body.add_input(r#type);
+            }
+            let extension = TestExtension::Dimension(extents[selected].clone());
+            body.add_instruction(KernelOperation::Extension(extension), vec![], vec![], None).unwrap();
+            let definition =
+                KernelDefinition::new(operation, body.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+            definition.semantic_key().unwrap()
+        };
+
+        // Independently constructed definitions that differ only in the names of their identities share a key.
+        assert_eq!(key(["rows", "columns"], 0), key(["height", "width"], 0));
+        assert_eq!(key(["rows", "columns"], 1), key(["height", "width"], 1));
+
+        // Selecting the other of two distinct identities with equal names and bounds changes the key.
+        assert_ne!(key(["extent", "extent"], 0), key(["extent", "extent"], 1));
+        assert_ne!(key(["rows", "columns"], 0), key(["rows", "columns"], 1));
     }
 
     #[test]
@@ -2668,7 +3483,9 @@ mod tests {
         let value = builder
             .add_instruction(ReferenceReadOperation::new(), vec![], vec![input], Some(provenance.clone()))
             .unwrap()[0];
-        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], Some(provenance)).unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], Some(provenance))
+            .unwrap();
         let definition =
             KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
         assert_ne!(
@@ -2749,7 +3566,8 @@ mod tests {
         let definition =
             KernelDefinition::new(operation, body.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
 
-        // A deliberate change to this string requires a `KERNEL_KEY_VERSION` bump.
+        // After the first release of `ryft-kernels`, a deliberate change to this string requires a `KERNEL_KEY_VERSION`
+        // bump.
         assert_eq!(
             definition.semantic_key().unwrap(),
             concat!(
@@ -2773,6 +3591,33 @@ mod tests {
                 r#""root":0}}]}],"entry":0}}"#,
             ),
         );
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_replaces_historical_key() {
+        // The encoder that preceded the structured records (i.e., `KernelDefinition::semantic_key` at the parent of
+        // `d13108387`) framed `Debug` renderings by their byte lengths. This is the key that it produced for an empty
+        // kernel, reconstructed by hand from the source of that encoder in `crates/ryft-kernels/src/calls.rs`.
+        let historical = concat!(
+            "kernel key 2; schema 2\n",
+            "2:[]",
+            "34:call (Grid { dimensions: [] }, [])",
+            "8:end call",
+            "12:body entry 0",
+            "15:region ([], [])",
+            "9:end atoms",
+            "10:end region",
+        );
+        let definition: KernelDefinition =
+            KernelDefinition::trace(KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(), |_| Ok(()))
+                .unwrap();
+        let key = definition.semantic_key().unwrap();
+        assert_ne!(key, historical);
+        assert!(key.starts_with("kernel key 1\n{"));
+
+        // A cache populated with the historical key misses for the structured key of the same definition.
+        let cache = HashMap::from([(historical.to_owned(), "stale artifact")]);
+        assert_eq!(cache.get(&key), None);
     }
 
     #[test]

@@ -918,10 +918,9 @@ mod tests {
     #[test]
     fn test_runtime_requirement_new() {
         let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
-        assert_eq!(
-            requirement,
-            RuntimeRequirement { identifier: "test.provider".into(), abi_version: 2, configuration: vec![1, 2] },
-        );
+        assert_eq!(requirement.identifier(), "test.provider");
+        assert_eq!(requirement.abi_version(), 2);
+        assert_eq!(requirement.configuration(), &[1, 2]);
     }
 
     #[test]
@@ -950,24 +949,6 @@ mod tests {
             Err(Error::SizeLimitExceeded { message })
                 if message == "runtime configuration exceeds the metadata size limit",
         ));
-    }
-
-    #[test]
-    fn test_runtime_requirement_identifier() {
-        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
-        assert_eq!(requirement.identifier(), "test.provider");
-    }
-
-    #[test]
-    fn test_runtime_requirement_abi_version() {
-        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
-        assert_eq!(requirement.abi_version(), 2);
-    }
-
-    #[test]
-    fn test_runtime_requirement_configuration() {
-        let requirement = RuntimeRequirement::new("test.provider", 2, [1, 2]).unwrap();
-        assert_eq!(requirement.configuration(), &[1, 2]);
     }
 
     #[test]

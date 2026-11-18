@@ -4,17 +4,23 @@
 //! Static constraints do not remove shape or stride arguments. Writable references bind to the execution integration's
 //! result buffers; repeated read-only arguments may alias. No compiler is selected implicitly.
 //!
-//! The `cutile` feature exposes artifact validation and physical argument mappings. Enable `cutile-compiler` to
-//! generate source and invoke the pinned Python compiler. Compilation owns no CUDA runtime resources; the shared
+//! The `cutile` feature exposes artifact validation, source lowering, and physical argument mappings. Enable
+//! `cutile-compiler` to invoke the pinned Python compiler. Compilation owns no CUDA runtime resources; the shared
 //! [`CudaKernelArtifact`] and launcher APIs retain artifact loading and execution responsibilities.
+//!
+//! Every manifest records the SHA-256 digest of the cuTile source from which its cubin was compiled. Restoration
+//! lowers the kernel again with the current Rust lowering, which includes its admission policy, and accepts the
+//! manifest only when that lowering succeeds and emits source with the recorded digest. An artifact therefore stays
+//! eligible only while the current lowering would produce it, so changing the lowering needs no revision constant.
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use ryft_core::{
     ArrayType, DataType, Dimension, Layout, Memory, MeshAxisType, ProgramError, ShardingDimension, TypeError, Typed,
 };
-use ryft_kernels::{GridExecution, NoKernelExtension, VerifiedKernel};
+use ryft_kernels::{GridExecution, KernelSchedule, NoKernelExtension, VerifiedKernel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -107,7 +113,6 @@ pub enum Error {
 
 #[cfg(feature = "cutile-compiler")]
 mod compiler;
-#[cfg(feature = "cutile-compiler")]
 mod lowering;
 #[cfg(feature = "cutile-compiler")]
 pub use compiler::Compiler;
@@ -256,8 +261,17 @@ impl CompiledKernel {
     /// Reconstructs an artifact from an adapter-authored manifest and cubin without invoking Python.
     ///
     /// The caller supplies the verified body whose ABI and exact semantic identity must agree with the manifest.
+    /// Restoration lowers that body again with the schedule recorded in the manifest, so it applies the current
+    /// admission policy and requires the emitted source to match the recorded source digest. It does not apply the
+    /// source construction budget of [`Options`], which bounds compiler work and is excluded from compiler identity.
     /// Integrity checks detect corruption and mismatched metadata; they do not authenticate untrusted native code.
     /// Only trusted compiler output may subsequently be executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Json`] for a malformed manifest (e.g., one without a source digest), the lowering error (e.g.,
+    /// [`Error::Unsupported`]) when the current lowering rejects the kernel, and [`Error::Artifact`] when the current
+    /// lowering emits different source or the manifest does not match the kernel, ABI, toolchain, or bytes.
     pub fn from_manifest(
         kernel: &VerifiedKernel<'_, NoKernelExtension>,
         manifest: &[u8],
@@ -274,11 +288,20 @@ impl CompiledKernel {
             .iter()
             .map(|parameter| parameter.r#type().into_owned())
             .collect::<Vec<_>>();
-        let parameters = parameter_types.iter().map(Parameter::from_type).collect::<Result<Vec<_>, _>>()?;
         let semantic_key = kernel.definition().semantic_key()?;
         let configuration: Configuration = serde_json::from_slice(&parsed.configuration_key)?;
         let target = Target::new(configuration.target.compute_capability.0, configuration.target.compute_capability.1)?;
-        let grid = launch_grid(kernel)?;
+        let source = lowering::lower(
+            kernel,
+            &Options { maximum_instructions: usize::MAX, ..Options::default() },
+            &configuration.schedule()?,
+        )?;
+        if parsed.source_sha256 != hex::encode(Sha256::digest(&source.code)) {
+            return Err(Error::Artifact {
+                message: "manifest source digest does not match the current cuTile lowering".into(),
+            });
+        }
+        let (parameters, grid) = (source.parameters, source.grid);
         if parsed.schema != COMPILER_SCHEMA_VERSION
             || parsed.versions.cuda_tile != CUDA_TILE_VERSION
             || parsed.versions.tileiras != TILEIRAS_VERSION
@@ -512,6 +535,8 @@ struct Manifest {
     size_bytes: usize,
     /// Expected cubin digest.
     sha256: String,
+    /// Digest of the cuTile source from which the cubin was compiled, recorded by the Rust compiler adapter.
+    source_sha256: String,
 }
 
 /// Producer identity serialized independently of process controls and invocation values.
@@ -542,6 +567,29 @@ struct Configuration {
     worker_sha256: String,
 }
 
+impl Configuration {
+    /// Reconstructs the compilation schedule recorded in this producer identity.
+    fn schedule(&self) -> Result<KernelSchedule, Error> {
+        let nonzero = |value: Option<usize>| match value {
+            Some(value) => NonZeroUsize::new(value)
+                .map(Some)
+                .ok_or_else(|| Error::Artifact { message: "manifest records a zero schedule hint".into() }),
+            None => Ok(None),
+        };
+        let mut schedule = KernelSchedule::default();
+        if let Some(stages) = nonzero(self.pipeline_stages)? {
+            schedule = schedule.with_pipeline_stages(stages);
+        }
+        if let Some(depth) = nonzero(self.buffering_depth)? {
+            schedule = schedule.with_buffering_depth(depth);
+        }
+        if let Some(bytes) = self.maximum_scratch_bytes {
+            schedule = schedule.with_maximum_scratch_bytes(bytes);
+        }
+        Ok(schedule)
+    }
+}
+
 /// Computes the physical tile grid shared by lowering and runtime manifest verification.
 fn launch_grid(kernel: &VerifiedKernel<'_, NoKernelExtension>) -> Result<[u32; 3], Error> {
     let mut parallel = 1usize;
@@ -564,7 +612,10 @@ fn launch_grid(kernel: &VerifiedKernel<'_, NoKernelExtension>) -> Result<[u32; 3
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{LogicalMesh, MeshAxis, ReferenceRead, ReferenceWrite, Sharding, ShardingError};
+    use ryft_core::{
+        ArrayIrOperation, ArrayOperation, Context, DotAlgorithmPreset, DotOperation, LogicalMesh, MeshAxis,
+        ReferenceRead, ReferenceWrite, Sharding, ShardingError,
+    };
     use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
 
     use super::*;
@@ -586,6 +637,26 @@ mod tests {
                 references[0].write(&value)?;
             }
             Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Creates an unsharded product of two 32×32 F32 inputs that applies `operation`.
+    fn dot_definition(operation: DotOperation) -> KernelDefinition {
+        let r#type = ArrayType::new_static(DataType::F32, [32, 32]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type, KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        KernelDefinition::trace(call, |(references, _)| {
+            let inputs = [references[0].read()?, references[1].read()?];
+            let operation = ArrayIrOperation::from(ArrayOperation::Dot(operation));
+            references[2].write(&inputs[0].context().bind(operation, vec![], &inputs)?.remove(0))
         })
         .unwrap()
     }
@@ -636,6 +707,9 @@ mod tests {
             shared_memory_bytes: 0,
             size_bytes: bytes.len(),
             sha256: hex::encode(Sha256::digest(bytes)),
+            source_sha256: hex::encode(Sha256::digest(
+                lowering::lower(kernel, &Options::default(), &KernelSchedule::default()).unwrap().code,
+            )),
         }
     }
 
@@ -776,6 +850,53 @@ mod tests {
             Err(Error::Artifact { .. })
         ));
     }
+
+    #[test]
+    fn test_compiled_kernel_from_manifest_rejects_inadmissible_kernel() {
+        // An earlier lowering ignored the dot precision, so it emitted the source of the default precision dot for the
+        // BF16 dot and recorded the actual configuration and semantic key. Fresh admission now rejects that dot, and
+        // so must restoration.
+        let default = dot_definition(DotOperation::matmul());
+        let default = VerifiedKernel::new(&default, 1).unwrap();
+        let definition = dot_definition(DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32));
+        let kernel = VerifiedKernel::new(&definition, 1).unwrap();
+        let bytes = cubin();
+        let mut metadata = manifest(&default, &bytes);
+        metadata.semantic_key = definition.semantic_key().unwrap();
+        metadata.parameters = vec![Parameter { dtype: "float32".into(), shape: vec![32, 32], strides: vec![32, 1] }; 3];
+        assert!(matches!(
+            CompiledKernel::from_manifest(&kernel, &serde_json::to_vec(&metadata).unwrap(), bytes),
+            Err(Error::Unsupported { operation: "dot", reason })
+                if reason == "precision `bf16_bf16_f32` has no qualified cuTile MMA conversion"
+        ));
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_manifest_rejects_source_mismatch() {
+        // The current lowering admits this kernel, but the manifest records source that it does not emit (e.g., the
+        // source of an earlier lowering).
+        let definition = definition(false);
+        let kernel = VerifiedKernel::new(&definition, 1).unwrap();
+        let bytes = cubin();
+        let mut metadata = manifest(&kernel, &bytes);
+        metadata.source_sha256 = hex::encode(Sha256::digest("import cuda.tile as ct\n"));
+        assert!(matches!(
+            CompiledKernel::from_manifest(&kernel, &serde_json::to_vec(&metadata).unwrap(), bytes.clone()),
+            Err(Error::Artifact { message })
+                if message == "manifest source digest does not match the current cuTile lowering"
+        ));
+
+        // A manifest without a source digest is malformed.
+        let mut value = serde_json::to_value(manifest(&kernel, &bytes)).unwrap();
+        value.as_object_mut().unwrap().remove("source_sha256");
+        let value = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            CompiledKernel::from_manifest(&kernel, &value, bytes),
+            Err(Error::Json(error))
+                if error.to_string() == format!("missing field `source_sha256` at line 1 column {}", value.len())
+        ));
+    }
+
     #[test]
     fn test_parameter_from_type_manual_sharding() {
         let base = ArrayType::new_static(DataType::F32, [4]);

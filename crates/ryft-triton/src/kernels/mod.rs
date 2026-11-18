@@ -86,13 +86,17 @@ mod lowering;
 pub use compiler::Compiler;
 
 /// Version of the typed lowering, native bridge and physical argument contract.
-pub const COMPILER_SCHEMA_VERSION: u32 = 2;
+///
+/// This version stays at 1 until the first release of this crate, and unreleased format changes reuse it. Recorded
+/// configurations from earlier development builds are rejected by their contents (e.g., their source revisions),
+/// not by this number. After the first release, every incompatible change to the recorded configuration increments it.
+pub const COMPILER_SCHEMA_VERSION: u32 = 1;
 
 /// Source revision that owns the native pipeline and its Triton patches.
-pub const XLA_VERSION: &str = "eb6b90ed013f511eca088c52f541f3c0819f919e";
+pub const XLA_VERSION: &str = ryft_xla_sys::XLA_COMMIT;
 
 /// Triton revision selected by the pinned XLA workspace.
-pub const TRITON_VERSION: &str = "a77e7c793abc0d0c923a9afb275058e2fe57a198";
+pub const TRITON_VERSION: &str = ryft_xla_sys::TRITON_COMMIT;
 
 /// Explicit compiler architecture. Construction creates no runtime context; admission validates the target.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -72,11 +72,15 @@
 //! fields in declaration order. Key mode is a superset of transport mode. It ignores the record and literal budgets,
 //! and it encodes everything that transport rejects as unsupported through key-only records, which only serialize.
 //! [`KernelDefinition::from_source`] therefore never accepts them. Nested kernel calls, kernel extensions, custom
-//! calls, attached composites, and refined dimension arithmetic have exact structural key-only records, and named
-//! composites are keyed by their exact composite keys. The retained rule state of named composites, the remaining
-//! operations, and distributed type metadata are transitionally keyed by their [`Debug`](std::fmt::Debug) renderings,
-//! after renaming the nominal identities of the document to canonical names. Each such fallback is marked with a
-//! `TODO` that names what the wire form must cover to replace it.
+//! calls, attached composites, gathers and scatters (including the exact bits of an explicit gather fill), refined
+//! dimension arithmetic, the shardings of distributed array types (i.e., their placements and their unreduced and
+//! reduced axes), the requested output shardings of reduce, dot, reshape, broadcast, gather, and scatter, sharding
+//! changes and constraints, dropout, and guards have exact structural key-only records, and named composites are keyed
+//! by their exact composite keys. A sharding keeps its mesh axis names, because shardings and collectives refer to mesh
+//! axes by name. The local identities of a guard are numbered in the identity table of the document, like all other
+//! identities. The retained rule state of named composites and the remaining operations are transitionally keyed by
+//! their [`Debug`](std::fmt::Debug) renderings, after renaming the nominal identities of the document to canonical
+//! names. Each such fallback is marked with a `TODO` that names what the wire form must cover to replace it.
 //!
 //! # Untrusted Input
 //!
@@ -122,20 +126,21 @@ use ryft_core::{
     DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, DivOperation, DotAlgorithm,
     DotAlgorithmPreset, DotDimensionNumbers, DotInputPrecision, DotOperation, DotPrecision, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, EffectClass,
-    ErfOperation, ExpM1Operation, ExpOperation, FillLikeOperation, FlatProgram, FloorOperation, ImaginaryOperation,
-    Instruction, IotaLikeOperation, IotaOperation, Layout, Ln1pOperation, LogAddExpOperation, LogOperation,
-    LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MinOperation, MulOperation, NegOperation,
-    NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation, Parameter, Placeholder,
-    PowOperation, Program, ProgramError, Provenance, ProvenanceScope, REMATERIALIZE_OPERATION_NAME, RealOperation,
-    ReducePrecisionOperation, ReduceOperation, ReductionKind, ReferenceAccessOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Region, RegionId, RemOperation, ReshapeOperation,
-    ReverseOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation, SelectOperation, Shape, SignOperation,
-    SinOperation, SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, StopGradientOperation,
-    StridedLayout, SubOperation, TagOperation, TanOperation, TanhOperation, Tile, TileDimension, TiledLayout,
-    Tolerance, TransferToMemoryOperation, TransposeOperation, TypeError, TypeIdentityRenaming, Typed,
-    UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
-    validated_reference_access_descriptors,
+    ErfOperation, ExpM1Operation, ExpOperation, FillLikeOperation, FlatProgram, FloorOperation, GatherMode,
+    GatherOperation, GuardOperation, ImaginaryOperation, Instruction, IotaLikeOperation, IotaOperation, Layout,
+    Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory,
+    MeshAxisType, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OrOperation, PadOperation, Parameter, Placeholder, PowOperation, Program, ProgramError, Provenance,
+    ProvenanceScope, REMATERIALIZE_OPERATION_NAME, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ReductionKind, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
+    ReferenceWriteOperation, Region, RegionId, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation,
+    RsqrtOperation, SaturatingSubOperation, ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation,
+    Shape, Sharding, ShardingDimension, SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation,
+    SortOrdering, SqrtOperation, StopGradientOperation, StridedLayout, SubOperation, TagOperation, TanOperation,
+    TanhOperation, Tile, TileDimension, TiledLayout, Tolerance, TransferToMemoryOperation, TransposeOperation, Type,
+    TypeError, TypeIdentityRenaming, Typed, UnreducedKind, UpdateSliceOperation, WhileOperation, XorOperation,
+    ZeroLikeOperation, ZeroOperation, validated_reference_access_descriptors,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -283,7 +288,9 @@ pub(crate) fn encode_semantic_key<Extension: KernelExtension>(
 }
 
 /// Version of the encoding of [`KernelSource`] documents, which is independent of [`KERNEL_KEY_VERSION`] (i.e., the
-/// version of the encoding of semantic keys). Any change to the produced records requires a new version.
+/// version of the encoding of semantic keys). The version stays at 1 until the first release of `ryft-kernels`, and
+/// unreleased changes to the produced records reuse it. After that release, every incompatible change to the produced
+/// records increments it.
 const KERNEL_SOURCE_VERSION: u32 = 1;
 
 /// Maximum total physical bytes allocated for decoded literals, including layout padding.
@@ -378,11 +385,11 @@ struct WireArrayType {
     /// Memory placement.
     memory: WireMemory,
 
-    /// Key-only rendering of the distributed metadata (i.e., the sharding and the unreduced and reduced axes), which
-    /// only key mode records. Transport documents never contain it, and deserialization rejects it as an unknown
-    /// field.
+    /// Key-only record of the [`Sharding`], which carries all distributed metadata of the type (i.e., the placement
+    /// and the unreduced and reduced axes) and which only key mode records. Transport documents never contain it, and
+    /// deserialization rejects it as an unknown field.
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
-    distribution: Option<String>,
+    sharding: Option<Box<WireSharding>>,
 }
 
 /// Stable explicit data type tags, independent of Rust discriminants and diagnostic rendering.
@@ -2277,6 +2284,95 @@ enum WireKeyOnlyOperation {
         batching: WireCustomCallBatching,
     },
 
+    /// [`GatherOperation`] without a requested output sharding.
+    Gather {
+        /// Output axes that hold the window axes, in ascending order.
+        offset_dimensions: Vec<usize>,
+
+        /// Input axes with windows of size one that the output omits, in ascending order.
+        collapsed_slice_dimensions: Vec<usize>,
+
+        /// Input axis that each component of a start index vector addresses.
+        start_index_map: Vec<usize>,
+
+        /// Paired input and indices batching axes, in ascending input axis order.
+        batching_dimensions: Vec<(usize, usize)>,
+
+        /// Window extent along each input axis.
+        slice_sizes: Vec<usize>,
+
+        /// Handling of windows that extend outside the input.
+        mode: WireGatherMode,
+
+        /// Whether the caller promises that the start index vectors are sorted.
+        indices_are_sorted: bool,
+
+        /// Whether the caller promises that the gathered windows do not overlap.
+        unique_indices: bool,
+    },
+
+    /// [`ScatterOperation`] without a requested output sharding. Its reduction kind is its complete update semantics,
+    /// because the operation has no attached regions, and the enclosing instruction record encodes any region that an
+    /// instruction attaches.
+    Scatter {
+        /// Update axes that hold the window axes, in ascending order.
+        update_window_dimensions: Vec<usize>,
+
+        /// Input axes with windows of size one that the updates omit, in ascending order.
+        inserted_window_dimensions: Vec<usize>,
+
+        /// Input axis that each component of a start index vector addresses.
+        scatter_dimensions_to_operand_dimensions: Vec<usize>,
+
+        /// Input batching axes, in ascending order.
+        input_batching_dimensions: Vec<usize>,
+
+        /// Indices batching axes paired with the input batching axes.
+        scatter_indices_batching_dimensions: Vec<usize>,
+
+        /// Reduction that combines each update with the value that it targets.
+        kind: WireScatterReductionKind,
+
+        /// Handling of update windows that extend outside the input.
+        mode: WireScatterMode,
+
+        /// Whether the caller promises that the start index vectors are sorted.
+        indices_are_sorted: bool,
+
+        /// Whether the caller promises that the update windows do not overlap.
+        unique_indices: bool,
+    },
+
+    /// [`GuardOperation`] of the canonical array IR family.
+    Guard(WireGuard),
+
+    /// [`GuardOperation`] of the array member family.
+    ArrayGuard(WireGuard),
+
+    /// Reduce, dot, reshape, broadcast, gather, or scatter with a requested output [`Sharding`].
+    OutputSharding {
+        /// Record of the same operation without the request.
+        operation: Box<WireOperation>,
+
+        /// Requested output sharding.
+        sharding: Box<WireSharding>,
+    },
+
+    /// [`ReshardOperation`](ryft_core::ReshardOperation), holding its target sharding.
+    Reshard(Box<WireSharding>),
+
+    /// [`ConstrainShardingOperation`](ryft_core::ConstrainShardingOperation), holding its sharding constraint.
+    ConstrainSharding(Box<WireSharding>),
+
+    /// [`DropoutOperation`](ryft_core::DropoutOperation).
+    Dropout {
+        /// IEEE bits of the drop probability, which preserve every NaN payload.
+        rate: u64,
+
+        /// Axes along which one dropout mask is broadcast.
+        broadcast_axes: Vec<i128>,
+    },
+
     /// [`CompositeOperation`] whose rules are attached regions of its instruction.
     AttachedComposite {
         /// Number of leading inputs that are not differentiated.
@@ -2301,6 +2397,88 @@ enum WireKeyOnlyOperation {
     /// Transitional [`Debug`](std::fmt::Debug) rendering of an operation that has no wire record, after renaming the
     /// nominal identities of the document to canonical names.
     Debug(String),
+}
+
+/// Key-only record of a [`GuardOperation`] whose reference anchor positions are those that its constructor derives
+/// from its declared types.
+#[derive(Serialize)]
+struct WireGuard {
+    /// Name of the guarded boundary, which compiled checks may report.
+    boundary: String,
+
+    /// Declared input types, whose guard-local identities refer to the identity table of the document.
+    declared_types: Vec<WireType>,
+
+    /// Index of each retained identity in the identity table of the document, in retention order.
+    retained_identities: Vec<usize>,
+}
+
+/// Handling of [`GatherOperation`] windows that extend outside the input.
+#[derive(Serialize)]
+enum WireGatherMode {
+    /// Tag of [`GatherMode::PromiseInBounds`].
+    PromiseInBounds,
+
+    /// Tag of [`GatherMode::Clip`].
+    Clip,
+
+    /// [`GatherMode::Fill`], holding its explicit fill literal with its exact element type and bits, or `None` for the
+    /// default fill of the input element type.
+    Fill(Option<WireValue>),
+}
+
+/// Handling of [`ScatterOperation`] update windows that extend outside the input.
+#[derive(Copy, Clone, Serialize)]
+enum WireScatterMode {
+    /// Tag of [`ScatterMode::PromiseInBounds`].
+    PromiseInBounds,
+
+    /// Tag of [`ScatterMode::Clip`].
+    Clip,
+
+    /// Tag of [`ScatterMode::Drop`].
+    Drop,
+}
+
+impl From<ScatterMode> for WireScatterMode {
+    fn from(value: ScatterMode) -> Self {
+        match value {
+            ScatterMode::PromiseInBounds => Self::PromiseInBounds,
+            ScatterMode::Clip => Self::Clip,
+            ScatterMode::Drop => Self::Drop,
+        }
+    }
+}
+
+/// Reduction of a [`ScatterOperation`].
+#[derive(Copy, Clone, Serialize)]
+enum WireScatterReductionKind {
+    /// Tag of [`ScatterReductionKind::Overwrite`].
+    Overwrite,
+
+    /// Tag of [`ScatterReductionKind::Add`].
+    Add,
+
+    /// Tag of [`ScatterReductionKind::Mul`].
+    Mul,
+
+    /// Tag of [`ScatterReductionKind::Min`].
+    Min,
+
+    /// Tag of [`ScatterReductionKind::Max`].
+    Max,
+}
+
+impl From<ScatterReductionKind> for WireScatterReductionKind {
+    fn from(value: ScatterReductionKind) -> Self {
+        match value {
+            ScatterReductionKind::Overwrite => Self::Overwrite,
+            ScatterReductionKind::Add => Self::Add,
+            ScatterReductionKind::Mul => Self::Mul,
+            ScatterReductionKind::Min => Self::Min,
+            ScatterReductionKind::Max => Self::Max,
+        }
+    }
 }
 
 /// Explicit effect class.
@@ -2400,9 +2578,9 @@ impl From<&CustomCallAttribute> for WireCustomCallAttribute {
             CustomCallAttribute::F32(value) => Self::F32(value.to_bits()),
             CustomCallAttribute::F64(value) => Self::F64(value.to_bits()),
             CustomCallAttribute::Array(value) => Self::Array(value.into()),
-            CustomCallAttribute::Dictionary(attributes) => Self::Dictionary(
-                attributes.iter().map(|(name, value)| (name.clone(), value.into())).collect(),
-            ),
+            CustomCallAttribute::Dictionary(attributes) => {
+                Self::Dictionary(attributes.iter().map(|(name, value)| (name.clone(), value.into())).collect())
+            }
         }
     }
 }
@@ -2588,6 +2766,132 @@ impl From<&CompositeAttribute> for WireCompositeAttribute {
     }
 }
 
+/// Exact key-only record of a [`Sharding`], which holds every field that [`Sharding`] equality compares. Mesh axis
+/// names are semantic, unlike the names of dimension identities, because shardings, collectives, and the meshes that
+/// callers bind refer to mesh axes by name, so the record keeps them.
+#[derive(Serialize)]
+struct WireSharding {
+    /// Axes of the mesh, in mesh order.
+    mesh: Vec<WireMeshAxis>,
+
+    /// Placement of each array dimension, in dimension order.
+    dimensions: Vec<WireShardingDimension>,
+
+    /// Mesh axes along which values are unreduced, in ascending name order.
+    unreduced_axes: Vec<String>,
+
+    /// Combination of the values along the unreduced axes.
+    unreduced_kind: WireUnreducedKind,
+
+    /// Mesh axes along which values are already reduced, in ascending name order.
+    reduced_axes: Vec<String>,
+
+    /// Manual mesh axes along which values vary, in ascending name order.
+    varying_manual_axes: Vec<String>,
+}
+
+impl From<&Sharding> for WireSharding {
+    fn from(value: &Sharding) -> Self {
+        Self {
+            mesh: value
+                .mesh()
+                .axes()
+                .iter()
+                .map(|axis| WireMeshAxis {
+                    name: axis.name().to_owned(),
+                    size: axis.size(),
+                    r#type: axis.r#type().into(),
+                })
+                .collect(),
+            dimensions: value
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    ShardingDimension::Replicated => WireShardingDimension::Replicated,
+                    ShardingDimension::Sharded(axis_names) => WireShardingDimension::Sharded(axis_names.clone()),
+                    ShardingDimension::Unconstrained => WireShardingDimension::Unconstrained,
+                })
+                .collect(),
+            unreduced_axes: value.unreduced_axes().iter().cloned().collect(),
+            unreduced_kind: value.unreduced_kind().into(),
+            reduced_axes: value.reduced_axes().iter().cloned().collect(),
+            varying_manual_axes: value.varying_manual_axes().iter().cloned().collect(),
+        }
+    }
+}
+
+/// Named axis of the mesh of a [`WireSharding`].
+#[derive(Serialize)]
+struct WireMeshAxis {
+    /// Name of the axis.
+    name: String,
+
+    /// Number of devices along the axis.
+    size: usize,
+
+    /// Type of the axis.
+    r#type: WireMeshAxisType,
+}
+
+/// Explicit mesh axis type.
+#[derive(Copy, Clone, Serialize)]
+enum WireMeshAxisType {
+    /// Tag of [`MeshAxisType::Auto`].
+    Auto,
+
+    /// Tag of [`MeshAxisType::Explicit`].
+    Explicit,
+
+    /// Tag of [`MeshAxisType::Manual`].
+    Manual,
+}
+
+impl From<MeshAxisType> for WireMeshAxisType {
+    fn from(value: MeshAxisType) -> Self {
+        match value {
+            MeshAxisType::Auto => Self::Auto,
+            MeshAxisType::Explicit => Self::Explicit,
+            MeshAxisType::Manual => Self::Manual,
+        }
+    }
+}
+
+/// Placement of one array dimension of a [`WireSharding`].
+#[derive(Serialize)]
+enum WireShardingDimension {
+    /// Tag of [`ShardingDimension::Replicated`].
+    Replicated,
+
+    /// [`ShardingDimension::Sharded`], holding its mesh axis names in major to minor order.
+    Sharded(Vec<String>),
+
+    /// Tag of [`ShardingDimension::Unconstrained`].
+    Unconstrained,
+}
+
+/// Explicit combination of the values along unreduced mesh axes.
+#[derive(Copy, Clone, Serialize)]
+enum WireUnreducedKind {
+    /// Tag of [`UnreducedKind::Sum`].
+    Sum,
+
+    /// Tag of [`UnreducedKind::Max`].
+    Max,
+
+    /// Tag of [`UnreducedKind::Min`].
+    Min,
+}
+
+impl From<UnreducedKind> for WireUnreducedKind {
+    fn from(value: UnreducedKind) -> Self {
+        match value {
+            UnreducedKind::Sum => Self::Sum,
+            UnreducedKind::Max => Self::Max,
+            UnreducedKind::Min => Self::Min,
+        }
+    }
+}
+
 /// Purpose of an encoding, which decides how the [`Encoder`] treats what the transport schema does not cover.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum EncodingMode {
@@ -2656,49 +2960,44 @@ impl Encoder {
         })
     }
 
-    /// Encodes a dimension without converting its nominal identity to diagnostic text.
-    fn dimension(&mut self, dimension: &Dimension) -> WireDimension {
-        match dimension {
-            Dimension::Static(extent) => WireDimension::Static(*extent),
+    /// Encodes a dimension without converting its nominal identity to diagnostic text. Transport mode rejects every
+    /// static extent that [`validate_encoded_extent`] rejects, so that it writes only extents that the reader accepts.
+    fn dimension(&mut self, dimension: &Dimension) -> Result<WireDimension, KernelSerializationError> {
+        Ok(match dimension {
+            Dimension::Static(extent) => {
+                if self.mode == EncodingMode::Transport {
+                    validate_encoded_extent(*extent)?;
+                }
+                WireDimension::Static(*extent)
+            }
             Dimension::Dynamic(variable) => WireDimension::Dynamic(self.identity(variable)),
-        }
+        })
     }
 
-    /// Encodes local array metadata. Transport mode rejects distributed ownership and explicit layouts of
-    /// dynamically shaped arrays, while key mode encodes both.
+    /// Encodes local array metadata. Transport mode rejects distributed ownership and every type that
+    /// [`validate_array_type`] rejects, so that it writes only types that the reader accepts, while key mode encodes
+    /// all of them.
     fn array_type(&mut self, r#type: &ArrayType) -> Result<WireArrayType, KernelSerializationError> {
-        let distribution = if r#type.sharding().is_some()
-            || !r#type.unreduced_axes().is_empty()
-            || !r#type.reduced_axes().is_empty()
-        {
-            match self.mode {
-                EncodingMode::Transport => return Err(unsupported("distributed array type")),
-                // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers distributed
-                // array metadata.
-                EncodingMode::Key => {
-                    Some(format!("{:?}", (r#type.sharding(), r#type.unreduced_axes(), r#type.reduced_axes())))
-                }
-            }
-        } else {
-            None
+        // The unreduced and reduced axes of an array type are those of its sharding.
+        let sharding = match (self.mode, r#type.sharding()) {
+            (_, None) => None,
+            (EncodingMode::Transport, Some(_)) => return Err(unsupported("distributed array type")),
+            (EncodingMode::Key, Some(sharding)) => Some(Box::new(sharding.into())),
         };
-        if self.mode == EncodingMode::Transport
-            && r#type.layout().is_some()
-            && r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-        {
-            return Err(unsupported("dynamically shaped array with explicit layout"));
+        if self.mode == EncodingMode::Transport {
+            validate_array_type(r#type)?;
         }
         Ok(WireArrayType {
             data_type: r#type.data_type().into(),
-            shape: self.shape(r#type.shape()),
+            shape: self.shape(r#type.shape())?,
             layout: r#type.layout().map(WireLayout::encode),
             memory: r#type.memory().into(),
-            distribution,
+            sharding,
         })
     }
 
     /// Encodes a shape without converting the nominal identities of its dimensions to diagnostic text.
-    fn shape(&mut self, shape: &Shape) -> Vec<WireDimension> {
+    fn shape(&mut self, shape: &Shape) -> Result<Vec<WireDimension>, KernelSerializationError> {
         shape.dimensions().iter().map(|dimension| self.dimension(dimension)).collect()
     }
 
@@ -2706,7 +3005,7 @@ impl Encoder {
     fn r#type(&mut self, r#type: &ArrayIrType) -> Result<WireType, KernelSerializationError> {
         Ok(match r#type {
             ArrayIrType::Array(r#type) => WireType::Array(self.array_type(r#type)?),
-            ArrayIrType::Dimension(r#type) => WireType::Dimension(self.dimension(r#type.dimension())),
+            ArrayIrType::Dimension(r#type) => WireType::Dimension(self.dimension(r#type.dimension())?),
             ArrayIrType::Reference(r#type) => WireType::Reference(self.array_type(r#type.referent())?),
         })
     }
@@ -2722,8 +3021,7 @@ impl Encoder {
                         .literal_bytes
                         .checked_add(addressing.storage_byte_len())
                         .ok_or_else(|| unsupported("literal storage exceeds source allocation budget"))?;
-                    if self.literal_bytes > MAXIMUM_LITERAL_BYTES
-                        || addressing.element_count() > MAXIMUM_LITERAL_BYTES
+                    if self.literal_bytes > MAXIMUM_LITERAL_BYTES || addressing.element_count() > MAXIMUM_LITERAL_BYTES
                     {
                         return Err(unsupported("literal storage exceeds source allocation budget"));
                     }
@@ -2827,15 +3125,17 @@ impl Encoder {
             .grid()
             .dimensions()
             .iter()
-            .map(|dimension| WireGridDimension {
-                extent: self.dimension(dimension.extent()),
-                name: match self.mode {
-                    EncodingMode::Transport => dimension.name().map(str::to_owned),
-                    EncodingMode::Key => None,
-                },
-                execution: dimension.execution().into(),
+            .map(|dimension| {
+                Ok(WireGridDimension {
+                    extent: self.dimension(dimension.extent())?,
+                    name: match self.mode {
+                        EncodingMode::Transport => dimension.name().map(str::to_owned),
+                        EncodingMode::Key => None,
+                    },
+                    execution: dimension.execution().into(),
+                })
             })
-            .collect();
+            .collect::<Result<_, KernelSerializationError>>()?;
         let parameters = call
             .parameters()
             .iter()
@@ -2855,7 +3155,11 @@ impl Encoder {
                 })
             })
             .collect::<Result<_, KernelSerializationError>>()?;
-        let coordinates = call.coordinate_types().iter().map(|r#type| self.dimension(r#type.dimension())).collect();
+        let coordinates = call
+            .coordinate_types()
+            .iter()
+            .map(|r#type| self.dimension(r#type.dimension()))
+            .collect::<Result<_, _>>()?;
         let prefetch = call.prefetch_types().iter().map(|r#type| self.array_type(r#type)).collect::<Result<_, _>>()?;
         Ok(WireCall { grid, parameters, coordinates, prefetch })
     }
@@ -2891,8 +3195,11 @@ impl Encoder {
                 EncodingMode::Transport => {
                     return Err(unsupported(format!("kernel extension `{}`", operation.name())));
                 }
+                // The extension encodes the identities that it stores through the numbering of this document, so
+                // that its key depends only on their relationships, including those of identities that appear nowhere
+                // else in the kernel.
                 EncodingMode::Key => WireOperation::KeyOnly(WireKeyOnlyOperation::Extension(
-                    operation.semantic_key().map_err(ProgramError::from)?,
+                    operation.semantic_key(&mut |variable| self.identity(variable)).map_err(ProgramError::from)?,
                 )),
             },
         })
@@ -2912,7 +3219,7 @@ impl Encoder {
                 r#type: self.array_type(operation.r#type())?,
                 dimension: operation.dimension(),
             },
-            ArrayIrOperation::Array(operation) => self.array_operation(portable, operation)?,
+            ArrayIrOperation::Array(operation) => self.array_operation(portable, operation, input_types)?,
             ArrayIrOperation::Dimension(operation) => match operation {
                 DimensionOperation::Constant(operation) => {
                     WireOperation::DimensionConstant(self.value(&operation.value().clone().into())?)
@@ -2968,7 +3275,7 @@ impl Encoder {
                 self.preserved(portable, preserved, WireOperation::DimensionSize { axis: operation.axis() })?
             }
             ArrayIrOperation::DimensionFromScalar(operation) => {
-                WireOperation::DimensionFromScalar(self.dimension(operation.output_type().dimension()))
+                WireOperation::DimensionFromScalar(self.dimension(operation.output_type().dimension())?)
             }
             ArrayIrOperation::DimensionToScalar(_) => WireOperation::DimensionToScalar,
             ArrayIrOperation::ReferenceNew(_) => WireOperation::ReferenceNew,
@@ -2988,10 +3295,9 @@ impl Encoder {
             }
             ArrayIrOperation::Compare(operation) => WireOperation::DimensionCompare(operation.direction().into()),
             ArrayIrOperation::Reshape(operation) => {
-                if operation.output_sharding().is_some() {
-                    // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers requested
-                    // output shardings.
-                    return self.fallback(portable, format!("`{}` output sharding", portable.name()));
+                if let Some(sharding) = operation.output_sharding() {
+                    let stripped = ArrayIrOperation::Reshape(operation.clone().with_output_sharding(None));
+                    return self.output_sharding(portable, stripped, sharding, input_types);
                 }
                 let preserved = DynamicReshapeOperation::new()
                     .with_input_types(input_types)
@@ -2999,10 +3305,9 @@ impl Encoder {
                 self.preserved(portable, preserved, WireOperation::MixedReshape)?
             }
             ArrayIrOperation::Broadcast(operation) => {
-                if operation.output_sharding().is_some() {
-                    // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers requested
-                    // output shardings.
-                    return self.fallback(portable, format!("`{}` output sharding", portable.name()));
+                if let Some(sharding) = operation.output_sharding() {
+                    let stripped = ArrayIrOperation::Broadcast(operation.clone().with_output_sharding(None));
+                    return self.output_sharding(portable, stripped, sharding, input_types);
                 }
                 WireOperation::MixedBroadcast {
                     output_axes: operation.output_axes().to_vec(),
@@ -3040,13 +3345,13 @@ impl Encoder {
                 self.fallback(portable, format!("`{}`", portable.name()))?
             }
             ArrayIrOperation::Rematerialize(_) => return Err(self.rematerialize_error()),
-            ArrayIrOperation::LinearCall(_)
-            | ArrayIrOperation::RngBitGenerator(_)
-            | ArrayIrOperation::Assert(_)
-            | ArrayIrOperation::Guard(_) => {
+            ArrayIrOperation::LinearCall(_) | ArrayIrOperation::RngBitGenerator(_) | ArrayIrOperation::Assert(_) => {
                 // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers linear calls,
-                // random bit generation, assertions, and guards.
+                // random bit generation, and assertions.
                 self.fallback(portable, format!("`{}`", portable.name()))?
+            }
+            ArrayIrOperation::Guard(operation) => {
+                self.guard(portable, operation, Self::r#type, WireKeyOnlyOperation::Guard)?
             }
             ArrayIrOperation::Cast(operation) => WireOperation::MixedCast {
                 output_type: self.r#type(operation.output_type())?,
@@ -3072,6 +3377,7 @@ impl Encoder {
         &mut self,
         portable: &ArrayIrOperation<Array>,
         operation: &ArrayOperation<Array>,
+        input_types: &[ArrayIrType],
     ) -> Result<WireOperation, KernelSerializationError> {
         Ok(match operation {
             ArrayOperation::Zero(operation) => WireOperation::Zero(self.array_type(operation.r#type())?),
@@ -3081,17 +3387,15 @@ impl Encoder {
             ArrayOperation::Constant(operation) => {
                 WireOperation::ArrayConstant(self.value(&operation.value().clone().into())?)
             }
-            ArrayOperation::Iota(operation) => WireOperation::Iota {
-                r#type: self.array_type(operation.r#type())?,
-                dimension: operation.dimension(),
-            },
+            ArrayOperation::Iota(operation) => {
+                WireOperation::Iota { r#type: self.array_type(operation.r#type())?, dimension: operation.dimension() }
+            }
             ArrayOperation::FillLike(operation) => {
                 WireOperation::FillLike(self.value(&operation.value().clone().into())?)
             }
-            ArrayOperation::IotaLike(operation) => WireOperation::IotaLike {
-                dimension: operation.dimension(),
-                data_type: operation.data_type().into(),
-            },
+            ArrayOperation::IotaLike(operation) => {
+                WireOperation::IotaLike { dimension: operation.dimension(), data_type: operation.data_type().into() }
+            }
             ArrayOperation::Min(_) => WireOperation::Min,
             ArrayOperation::Max(_) => WireOperation::Max,
             ArrayOperation::Clamp(_) => WireOperation::Clamp,
@@ -3153,21 +3457,19 @@ impl Encoder {
             ArrayOperation::Imaginary(_) => WireOperation::Imaginary,
             ArrayOperation::Conjugate(_) => WireOperation::Conjugate,
             ArrayOperation::Reduce(operation) => {
-                if operation.output_sharding().is_some() {
-                    // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers requested
-                    // output shardings.
-                    return self.fallback(portable, format!("`{}` output sharding", portable.name()));
+                if let Some(sharding) = operation.output_sharding() {
+                    let stripped = operation.clone().with_output_sharding(None).map_err(ProgramError::from)?;
+                    let stripped = ArrayIrOperation::Array(ArrayOperation::Reduce(stripped));
+                    return self.output_sharding(portable, stripped, sharding, input_types);
                 }
                 WireOperation::Reduce { axes: operation.axes().to_vec(), kind: operation.kind().into() }
             }
-            ArrayOperation::ArgMax(operation) => WireOperation::ArgMax {
-                axis: operation.axis(),
-                index_data_type: operation.index_data_type().into(),
-            },
-            ArrayOperation::ArgMin(operation) => WireOperation::ArgMin {
-                axis: operation.axis(),
-                index_data_type: operation.index_data_type().into(),
-            },
+            ArrayOperation::ArgMax(operation) => {
+                WireOperation::ArgMax { axis: operation.axis(), index_data_type: operation.index_data_type().into() }
+            }
+            ArrayOperation::ArgMin(operation) => {
+                WireOperation::ArgMin { axis: operation.axis(), index_data_type: operation.index_data_type().into() }
+            }
             ArrayOperation::Cumulative(operation) => WireOperation::Cumulative {
                 axis: operation.axis(),
                 kind: operation.kind().into(),
@@ -3180,10 +3482,9 @@ impl Encoder {
                 ordering: operation.ordering().into(),
             },
             ArrayOperation::Dot(operation) => {
-                if operation.output_sharding().is_some() {
-                    // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers requested
-                    // output shardings.
-                    return self.fallback(portable, format!("`{}` output sharding", portable.name()));
+                if let Some(sharding) = operation.output_sharding() {
+                    let stripped = ArrayOperation::Dot(operation.clone().with_output_sharding(None));
+                    return self.output_sharding(portable, ArrayIrOperation::Array(stripped), sharding, input_types);
                 }
                 let dimensions = operation.dimensions();
                 let dimensions = [
@@ -3231,14 +3532,13 @@ impl Encoder {
                 WireOperation::Reverse(operation.axes().iter().map(|axis| axis.value()).collect())
             }
             ArrayOperation::Reshape(operation) => {
-                if operation.output_sharding().is_some() {
-                    // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers requested
-                    // output shardings.
-                    return self.fallback(portable, format!("`{}` output sharding", portable.name()));
+                if let Some(sharding) = operation.output_sharding() {
+                    let stripped = ArrayOperation::Reshape(operation.clone().with_output_sharding(None));
+                    return self.output_sharding(portable, ArrayIrOperation::Array(stripped), sharding, input_types);
                 }
                 WireOperation::Reshape {
-                    input_shape: self.shape(operation.input_shape()),
-                    output_shape: self.shape(operation.output_shape()),
+                    input_shape: self.shape(operation.input_shape())?,
+                    output_shape: self.shape(operation.output_shape())?,
                 }
             }
             ArrayOperation::Broadcast(operation) => WireOperation::Broadcast {
@@ -3252,14 +3552,11 @@ impl Encoder {
                 interior: operation.interior_padding().to_vec(),
             },
             ArrayOperation::Concatenate(operation) => WireOperation::Concatenate { axis: operation.axis() },
-            ArrayOperation::Gather(_) | ArrayOperation::Scatter(_) => {
-                // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers gathers and
-                // scatters.
-                self.fallback(portable, format!("`{}`", portable.name()))?
-            }
+            ArrayOperation::Gather(operation) => self.gather(portable, operation, input_types)?,
+            ArrayOperation::Scatter(operation) => self.scatter(portable, operation, input_types)?,
             ArrayOperation::Slice(operation) => WireOperation::Slice {
                 start_indices: operation.start_indices().to_vec(),
-                limits: operation.limits().iter().map(|limit| self.dimension(limit)).collect(),
+                limits: operation.limits().iter().map(|limit| self.dimension(limit)).collect::<Result<_, _>>()?,
                 strides: operation.strides().to_vec(),
             },
             ArrayOperation::UpdateSlice(operation) => WireOperation::UpdateSlice(operation.start_indices().to_vec()),
@@ -3287,10 +3584,11 @@ impl Encoder {
             ArrayOperation::TransferToMemory(operation) => {
                 WireOperation::TransferToMemory(operation.destination().into())
             }
-            ArrayOperation::Reshard(_) | ArrayOperation::ConstrainSharding(_) => {
-                // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers sharding
-                // changes and constraints.
-                self.fallback(portable, format!("`{}`", portable.name()))?
+            ArrayOperation::Reshard(operation) => {
+                self.key_only(portable, WireKeyOnlyOperation::Reshard(Box::new(operation.sharding().into())))?
+            }
+            ArrayOperation::ConstrainSharding(operation) => {
+                self.key_only(portable, WireKeyOnlyOperation::ConstrainSharding(Box::new(operation.sharding().into())))?
             }
             ArrayOperation::Condition(_) => WireOperation::ArrayCondition,
             ArrayOperation::While(operation) => WireOperation::ArrayWhile { bound: operation.iteration_bound() },
@@ -3301,16 +3599,27 @@ impl Encoder {
             ArrayOperation::StopGradient(_) => WireOperation::StopGradient,
             ArrayOperation::Tag(operation) => WireOperation::Tag(operation.key().to_owned()),
             ArrayOperation::Rematerialize(_) => return Err(self.rematerialize_error()),
+            ArrayOperation::Dropout(operation) => self.key_only(
+                portable,
+                WireKeyOnlyOperation::Dropout {
+                    rate: operation.rate().to_bits(),
+                    broadcast_axes: operation.broadcast_axes().as_slice().iter().map(|axis| axis.value()).collect(),
+                },
+            )?,
             ArrayOperation::LinearCall(_)
             | ArrayOperation::RngBitGenerator(_)
-            | ArrayOperation::Dropout(_)
             | ArrayOperation::Print(_)
-            | ArrayOperation::Assert(_)
-            | ArrayOperation::Guard(_) => {
+            | ArrayOperation::Assert(_) => {
                 // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers linear calls,
-                // random bit generation, dropout, printing, assertions, and guards.
+                // random bit generation, printing, and assertions.
                 self.fallback(portable, format!("`{}`", portable.name()))?
             }
+            ArrayOperation::Guard(operation) => self.guard(
+                portable,
+                operation,
+                |encoder, r#type| Ok(WireType::Array(encoder.array_type(r#type)?)),
+                WireKeyOnlyOperation::ArrayGuard,
+            )?,
             ArrayOperation::Cast(operation) => WireOperation::Cast {
                 output_type: self.array_type(operation.output_type())?,
                 input_types: operation
@@ -3337,8 +3646,8 @@ impl Encoder {
         reconstructed: Result<D, DimensionError>,
         record: fn(WireDimension, WireDimension) -> WireOperation,
     ) -> Result<WireOperation, KernelSerializationError> {
-        let left = self.dimension(operation.left_type().dimension());
-        let right = self.dimension(operation.right_type().dimension());
+        let left = self.dimension(operation.left_type().dimension())?;
+        let right = self.dimension(operation.right_type().dimension())?;
 
         // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
         if reconstructed.is_ok_and(|reconstructed| reconstructed == *operation) {
@@ -3392,6 +3701,99 @@ impl Encoder {
         }))
     }
 
+    /// Encodes a gather through an exact key-only record in key mode, and rejects it in transport mode. An explicit
+    /// fill literal retains its element type and exact bits (e.g., the payload of a NaN).
+    fn gather(
+        &mut self,
+        portable: &ArrayIrOperation<Array>,
+        operation: &GatherOperation,
+        input_types: &[ArrayIrType],
+    ) -> Result<WireOperation, KernelSerializationError> {
+        if self.mode == EncodingMode::Transport {
+            return Err(unsupported(format!("`{}`", portable.name())));
+        }
+        if let Some(sharding) = operation.output_sharding() {
+            let stripped = ArrayOperation::Gather(operation.clone().with_output_sharding(None));
+            return self.output_sharding(portable, ArrayIrOperation::Array(stripped), sharding, input_types);
+        }
+        let mode = match operation.mode() {
+            GatherMode::PromiseInBounds => WireGatherMode::PromiseInBounds,
+            GatherMode::Clip => WireGatherMode::Clip,
+            GatherMode::Fill { value } => WireGatherMode::Fill(
+                value.as_deref().map(|value| self.value(&ArrayIrValue::Array(value.clone()))).transpose()?,
+            ),
+        };
+        let dimensions = operation.dimensions();
+        Ok(WireOperation::KeyOnly(WireKeyOnlyOperation::Gather {
+            offset_dimensions: dimensions.offset_dimensions().to_vec(),
+            collapsed_slice_dimensions: dimensions.collapsed_slice_dimensions().to_vec(),
+            start_index_map: dimensions.start_index_map().to_vec(),
+            batching_dimensions: dimensions.batching_dimensions().to_vec(),
+            slice_sizes: operation.slice_sizes().to_vec(),
+            mode,
+            indices_are_sorted: operation.indices_are_sorted(),
+            unique_indices: operation.unique_indices(),
+        }))
+    }
+
+    /// Encodes a scatter through an exact key-only record in key mode, and rejects it in transport mode.
+    fn scatter(
+        &mut self,
+        portable: &ArrayIrOperation<Array>,
+        operation: &ScatterOperation,
+        input_types: &[ArrayIrType],
+    ) -> Result<WireOperation, KernelSerializationError> {
+        if self.mode == EncodingMode::Transport {
+            return Err(unsupported(format!("`{}`", portable.name())));
+        }
+        if let Some(sharding) = operation.output_sharding() {
+            let stripped = ArrayOperation::Scatter(operation.clone().with_output_sharding(None));
+            return self.output_sharding(portable, ArrayIrOperation::Array(stripped), sharding, input_types);
+        }
+        let dimensions = operation.dimensions();
+        Ok(WireOperation::KeyOnly(WireKeyOnlyOperation::Scatter {
+            update_window_dimensions: dimensions.update_window_dimensions().to_vec(),
+            inserted_window_dimensions: dimensions.inserted_window_dimensions().to_vec(),
+            scatter_dimensions_to_operand_dimensions: dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
+            input_batching_dimensions: dimensions.input_batching_dimensions().to_vec(),
+            scatter_indices_batching_dimensions: dimensions.scatter_indices_batching_dimensions().to_vec(),
+            kind: operation.kind().into(),
+            mode: operation.mode().into(),
+            indices_are_sorted: operation.indices_are_sorted(),
+            unique_indices: operation.unique_indices(),
+        }))
+    }
+
+    /// Encodes an operation with a requested output sharding through a key-only record in key mode, and rejects it in
+    /// transport mode. `stripped` is the same operation without that request, and the record holds the record of
+    /// `stripped` next to the exact sharding, so that the operation needs no transitional rendering.
+    fn output_sharding(
+        &mut self,
+        portable: &ArrayIrOperation<Array>,
+        stripped: ArrayIrOperation<Array>,
+        sharding: &Sharding,
+        input_types: &[ArrayIrType],
+    ) -> Result<WireOperation, KernelSerializationError> {
+        if self.mode == EncodingMode::Transport {
+            return Err(unsupported(format!("`{}` output sharding", portable.name())));
+        }
+        let operation = Box::new(self.portable_operation(&stripped, input_types)?);
+        let sharding = Box::new(sharding.into());
+        Ok(WireOperation::KeyOnly(WireKeyOnlyOperation::OutputSharding { operation, sharding }))
+    }
+
+    /// Returns the exact key-only `record` of `portable` in key mode, and rejects `portable` in transport mode.
+    fn key_only(
+        &self,
+        portable: &ArrayIrOperation<Array>,
+        record: WireKeyOnlyOperation,
+    ) -> Result<WireOperation, KernelSerializationError> {
+        match self.mode {
+            EncodingMode::Transport => Err(unsupported(format!("`{}`", portable.name()))),
+            EncodingMode::Key => Ok(WireOperation::KeyOnly(record)),
+        }
+    }
+
     /// Encodes a `composite` call through a key-only record in key mode, and rejects it in transport mode. A call
     /// with attached rules is identified by its regions and rule flags. A call with retained rules is identified
     /// across processes only by the key of a named definition (refer to [`NamedComposite`](ryft_core::NamedComposite)),
@@ -3426,6 +3828,48 @@ impl Encoder {
         // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers the retained rule
         // state of named composites.
         Ok(WireOperation::KeyOnly(WireKeyOnlyOperation::NamedComposite { operation: self.debug(portable)?, key }))
+    }
+
+    /// Encodes a guard of either family through the exact key-only record that `record` constructs in key mode, and
+    /// rejects it in transport mode. `declared_type` encodes one declared type of the family. The declared identities
+    /// of a guard are local to it and its renaming leaves them unchanged, so the record numbers them in the identity
+    /// table of the document, like those of atom types, which preserves the relationships that they express without
+    /// depending on their names.
+    fn guard<T: Type<Identity = DimensionVariable>>(
+        &mut self,
+        portable: &ArrayIrOperation<Array>,
+        operation: &GuardOperation<T>,
+        declared_type: fn(&mut Self, &T) -> Result<WireType, KernelSerializationError>,
+        record: fn(WireGuard) -> WireKeyOnlyOperation,
+    ) -> Result<WireOperation, KernelSerializationError> {
+        if self.mode == EncodingMode::Transport {
+            return Err(unsupported(format!("`{}`", portable.name())));
+        }
+
+        // The reference anchor positions of a guard are private. The record therefore covers only a guard whose anchor
+        // positions are those that its constructor derives from its declared types, which excludes a guard rewritten
+        // by reference discharge.
+        let reconstructed = GuardOperation::new(operation.boundary(), operation.declared_types().to_vec())
+            .with_retained_identities(operation.retained_identities().to_vec());
+        if reconstructed != *operation {
+            return Err(semantic_key_error(format!(
+                "`{}` operations with discharged reference anchors have no kernel semantic descriptor encoding",
+                portable.name(),
+            )));
+        }
+        Ok(WireOperation::KeyOnly(record(WireGuard {
+            boundary: operation.boundary().to_owned(),
+            declared_types: operation
+                .declared_types()
+                .iter()
+                .map(|r#type| declared_type(self, r#type))
+                .collect::<Result<_, _>>()?,
+            retained_identities: operation
+                .retained_identities()
+                .iter()
+                .map(|identity| self.identity(identity))
+                .collect(),
+        })))
     }
 
     /// Returns the error that rejects `rematerialize` operations, whose residual policies have an identity that is
@@ -3483,11 +3927,18 @@ impl Encoder {
         }
     }
 
-    /// Renders the [`Debug`](std::fmt::Debug) representation of `portable` after renaming every identity registered
-    /// so far to a canonical name derived from its index in the identity table, so that the rendering does not depend
-    /// on nominal names. Every identity of the input and output types of an instruction is registered before its
-    /// operation, and only an identity that appears solely in the payload keeps its nominal name.
+    /// Renders the [`Debug`](std::fmt::Debug) representation of `portable` after renaming its identities with
+    /// [`Encoder::canonical_renaming`], so that the rendering does not depend on nominal names.
     fn debug(&self, portable: &ArrayIrOperation<Array>) -> Result<String, KernelSerializationError> {
+        Ok(format!("{:?}", portable.rename_type_identities(&self.canonical_renaming()?).map_err(ProgramError::from)?))
+    }
+
+    /// Returns the renaming of every identity registered so far to a fresh identity with the same bounds and a
+    /// canonical name derived from its index in the identity table. Payloads renamed by it refer to the identities of
+    /// the document by position, as atom types do. Every identity of the call metadata and of the atoms of a region is
+    /// registered before the operations of that region, and only an identity that appears in no type registered
+    /// before a payload (e.g., one that appears solely in that payload) keeps its nominal name.
+    fn canonical_renaming(&self) -> Result<TypeIdentityRenaming<DimensionVariable>, KernelSerializationError> {
         // The renaming is a set of independent replacements, so the iteration order of the identity table is
         // irrelevant.
         let mut renaming = TypeIdentityRenaming::new();
@@ -3496,7 +3947,7 @@ impl Encoder {
                 .insert(variable.clone(), DimensionVariable::new(format!("dimension_{index}"), variable.bounds()))
                 .map_err(ProgramError::from)?;
         }
-        Ok(format!("{:?}", portable.rename_type_identities(&renaming).map_err(ProgramError::from)?))
+        Ok(renaming)
     }
 }
 
@@ -3549,20 +4000,18 @@ impl Decoder {
         wire.into_iter().map(|dimension| self.dimension(dimension)).collect()
     }
 
-    /// Reconstructs canonical local type metadata. Literals subsequently check their physical allocation size.
+    /// Reconstructs canonical local type metadata and validates it with [`validate_array_type`], exactly as the writer
+    /// does. Literals subsequently check their physical allocation size.
     fn array_type(&self, wire: WireArrayType) -> Result<ArrayType, KernelSerializationError> {
-        if wire.distribution.is_some() {
+        if wire.sharding.is_some() {
             return Err(invalid("array type has key-only distributed metadata"));
         }
         let shape = Shape::new(self.shape(wire.shape)?);
         let layout = wire.layout.map(WireLayout::decode);
-        let r#type =
-            ArrayType::new(wire.data_type.into(), shape).with_layout(layout).with_memory(Memory::from(wire.memory));
-        if r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
-            ArrayAddressing::new(r#type.clone())?;
-        } else if r#type.layout().is_some() {
-            return Err(unsupported("dynamically shaped array with explicit layout"));
-        }
+        let r#type = ArrayType::new(wire.data_type.into(), shape)
+            .with_layout(layout)
+            .with_memory(Memory::from(wire.memory));
+        validate_array_type(&r#type)?;
         Ok(r#type)
     }
 
@@ -3756,9 +4205,7 @@ impl Decoder {
                 let accuracy = accuracy.decode()?;
                 match function {
                     WireAccurateFunction::Exp => ArrayOperation::Exp(ExpOperation::new().with_accuracy(accuracy)),
-                    WireAccurateFunction::ExpM1 => {
-                        ArrayOperation::ExpM1(ExpM1Operation::new().with_accuracy(accuracy))
-                    }
+                    WireAccurateFunction::ExpM1 => ArrayOperation::ExpM1(ExpM1Operation::new().with_accuracy(accuracy)),
                     WireAccurateFunction::Log => ArrayOperation::Log(LogOperation::new().with_accuracy(accuracy)),
                     WireAccurateFunction::Ln1p => ArrayOperation::Ln1p(Ln1pOperation::new().with_accuracy(accuracy)),
                     WireAccurateFunction::Logistic => {
@@ -3769,9 +4216,7 @@ impl Decoder {
                     WireAccurateFunction::Tan => ArrayOperation::Tan(TanOperation::new().with_accuracy(accuracy)),
                     WireAccurateFunction::Tanh => ArrayOperation::Tanh(TanhOperation::new().with_accuracy(accuracy)),
                     WireAccurateFunction::Sqrt => ArrayOperation::Sqrt(SqrtOperation::new().with_accuracy(accuracy)),
-                    WireAccurateFunction::Rsqrt => {
-                        ArrayOperation::Rsqrt(RsqrtOperation::new().with_accuracy(accuracy))
-                    }
+                    WireAccurateFunction::Rsqrt => ArrayOperation::Rsqrt(RsqrtOperation::new().with_accuracy(accuracy)),
                 }
                 .into()
             }
@@ -3871,10 +4316,10 @@ impl Decoder {
                 ConcatenateOperation::<ArrayIrType>::new(axis, input_types).map_err(ProgramError::from)?,
             )
             .into(),
-            WireOperation::Slice { start_indices, limits, strides } => ArrayOperation::Slice(
-                SliceOperation::new(start_indices, self.shape(limits)?).with_strides(strides)?,
-            )
-            .into(),
+            WireOperation::Slice { start_indices, limits, strides } => {
+                ArrayOperation::Slice(SliceOperation::new(start_indices, self.shape(limits)?).with_strides(strides)?)
+                    .into()
+            }
             WireOperation::UpdateSlice(start_indices) => {
                 ArrayOperation::UpdateSlice(UpdateSliceOperation::new(start_indices)).into()
             }
@@ -3996,13 +4441,11 @@ impl Decoder {
                 .instructions
                 .into_iter()
                 .map(|instruction| {
-                    let input_types = instruction
-                        .inputs
-                        .iter()
-                        .map(|&index| atoms[index].r#type().into_owned())
-                        .collect::<Vec<_>>();
+                    let input_types =
+                        instruction.inputs.iter().map(|&index| atoms[index].r#type().into_owned()).collect::<Vec<_>>();
                     let mut operation = self.operation(instruction.operation, &input_types)?;
-                    let mut accesses = operation.effects().accesses().map(|(input, _)| input).collect::<Vec<_>>();
+                    let mut accesses =
+                        operation.effects().reference_accesses().map(|(input, _)| input).collect::<Vec<_>>();
                     accesses.sort_unstable();
                     if instruction.reference_transforms.iter().map(|path| path.input_index).collect::<Vec<_>>()
                         != accesses
@@ -4138,6 +4581,30 @@ impl<'de, T: Deserialize<'de>, const LIMIT: usize> Deserialize<'de> for BoundedC
     }
 }
 
+/// Validates array type metadata that both the writer and the reader of transport documents require. A static type
+/// must have a layout that matches its rank and a representable logical and physical storage size, which this checks
+/// without allocating storage. A dynamically shaped type cannot carry an explicit layout, because the transport schema
+/// does not support one.
+fn validate_array_type(r#type: &ArrayType) -> Result<(), KernelSerializationError> {
+    if r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
+        ArrayAddressing::new(r#type.clone())?;
+    } else if r#type.layout().is_some() {
+        return Err(unsupported("dynamically shaped array with explicit layout"));
+    }
+    Ok(())
+}
+
+/// Validates a static extent while encoding. The reader rejects an extent that exceeds [`MAX_DIMENSION_EXTENT`] (i.e.,
+/// one wider than the dimension type of the backends). A valid in-memory definition can still contain one (e.g., in an
+/// axis of an empty array), and it cannot be transported, so it is reported as unsupported rather than malformed.
+fn validate_encoded_extent(extent: usize) -> Result<(), KernelSerializationError> {
+    if extent > MAX_DIMENSION_EXTENT {
+        Err(unsupported(format!("dimension extent {extent} exceeding backend width")))
+    } else {
+        Ok(())
+    }
+}
+
 /// Validates collection sizes while decoding, before constructing canonical arena metadata. A document that exceeds
 /// the record budget is malformed.
 fn validate_decoded_records(count: usize) -> Result<(), KernelSerializationError> {
@@ -4147,11 +4614,7 @@ fn validate_decoded_records(count: usize) -> Result<(), KernelSerializationError
 /// Validates collection sizes while encoding. An in-memory definition that exceeds the record budget is valid but
 /// cannot be transported, so it is reported as unsupported rather than malformed.
 fn validate_encoded_records(count: usize) -> Result<(), KernelSerializationError> {
-    if count > MAXIMUM_RECORDS {
-        Err(unsupported(format!("record count exceeding {MAXIMUM_RECORDS}")))
-    } else {
-        Ok(())
-    }
+    if count > MAXIMUM_RECORDS { Err(unsupported(format!("record count exceeding {MAXIMUM_RECORDS}"))) } else { Ok(()) }
 }
 
 /// Creates an explicit diagnostic for an unsupported payload.
@@ -4207,12 +4670,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Context, LogicalMesh, MeshAxis, MeshAxisType, PrintOperation, ProgramBuilder, Sharding, TypedProgram,
+        ConstrainShardingOperation, Context, DropoutOperation, GatherDimensionNumbers, LogicalMesh, MeshAxis,
+        PrintOperation, ProgramBuilder, ReshardOperation, ScatterDimensionNumbers, TypedProgram,
     };
     use ryft_macros::kernel;
 
     use crate::authoring::whole_array_parameter;
     use crate::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
+    use crate::operations::tests::TestExtension;
 
     use super::*;
 
@@ -4312,6 +4777,17 @@ mod tests {
             }
             let result = context.bind(operation, vec![], &values)?.remove(0);
             context.bind(ReferenceWriteOperation::new(), vec![], &[output.clone(), result])?;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Builds a kernel that reads the block of its only `parameter` whole, so that the block type also occurs as the
+    /// referent of a body input and as the type of an intermediate value.
+    fn parameter_definition(parameter: KernelParameter) -> KernelDefinition {
+        let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![parameter]).unwrap();
+        KernelDefinition::trace(call, |(references, _)| {
+            references[0].context().bind(ReferenceReadOperation::new(), vec![], &[references[0].clone()])?;
             Ok(())
         })
         .unwrap()
@@ -4527,6 +5003,82 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_to_source_invalid_array_types() {
+        // Replaces the layout of the parameter type in the document of `definition` and reads the result back.
+        let read = |definition: &KernelDefinition, layout: Vec<isize>| {
+            let mut document = serde_json::to_value(definition).unwrap();
+            document["call"]["parameters"][0]["type"]["layout"] = serde_json::json!({ "Strided": layout });
+            KernelDefinition::from_source(serde_json::from_value(document).unwrap()).map(|_| ())
+        };
+        let whole = |r#type: ArrayType| {
+            parameter_definition(whole_array_parameter(r#type, KernelParameterAccess::ReadOnly).unwrap())
+        };
+
+        // A scalar that carries rank-1 strides.
+        let scalar = ArrayType::scalar(DataType::F32);
+        let strided = scalar.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let error = KernelSerializationError::Program(ProgramError::Type(TypeError::invalid(
+            "strided layout rank 1 does not match array rank 0",
+        )));
+        assert_eq!(whole(strided).to_source().map(|_| ()), Err(error.clone()));
+        assert_eq!(read(&whole(scalar), vec![4]), Err(error));
+
+        // A vector whose physical storage span overflows.
+        let vector = ArrayType::new_static(DataType::F32, [3]);
+        let strided = vector.clone().with_layout(Layout::Strided(StridedLayout::new(vec![isize::MAX])));
+        let error = KernelSerializationError::Program(ProgramError::Type(TypeError::invalid(
+            "physical storage span for array type `f32[3][layout=strided{9223372036854775807}]` cannot be represented",
+        )));
+        assert_eq!(whole(strided).to_source().map(|_| ()), Err(error.clone()));
+        assert_eq!(read(&whole(vector), vec![isize::MAX]), Err(error));
+    }
+
+    #[test]
+    fn test_kernel_definition_to_source_wide_static_dimensions() {
+        let Some(wide) = MAX_DIMENSION_EXTENT.checked_add(1) else {
+            return;
+        };
+
+        // Builds a kernel over a grid of extent two whose body creates an unused zero with a leading axis of `extent`.
+        // Its trailing axis is empty when `dynamic` is unset and the grid coordinate otherwise.
+        let definition = |extent: usize, dynamic: bool| {
+            let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
+            let call = KernelCallOperation::new(grid, vec![]).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let coordinate = builder.add_input(call.body_input_types().remove(0));
+            if dynamic {
+                let shape = Shape::new(vec![Dimension::Static(extent), call.coordinate_types()[0].dimension().clone()]);
+                let operation = ArrayIrOperation::Zero(ZeroOperation::new(ArrayType::new(DataType::F32, shape)));
+                builder.add_instruction(operation, vec![], vec![coordinate], None).unwrap();
+            } else {
+                let r#type = ArrayType::new_static(DataType::F32, [extent, 0]);
+                let operation = ArrayIrOperation::Array(ArrayOperation::Zero(ZeroOperation::new(r#type)));
+                builder.add_instruction(operation, vec![], vec![], None).unwrap();
+            }
+            KernelDefinition::new(call, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap()
+        };
+        let error = KernelSerializationError::Unsupported {
+            feature: format!("dimension extent {wide} exceeding backend width"),
+        };
+
+        // The wide axis of a zero result needs no storage, because its other axis is empty.
+        assert_eq!(definition(wide, false).to_source().map(|_| ()), Err(error.clone()));
+
+        // The reader rejects the same extent in a document that the writer produced for a narrower one.
+        let mut document = serde_json::to_value(definition(1, false)).unwrap();
+        document["body"]["regions"][0]["instructions"][0]["operation"]["Zero"]["shape"][0] =
+            serde_json::json!({ "Static": wide });
+        let message = format!("dimension extent {wide} exceeds backend width");
+        assert_eq!(
+            KernelDefinition::from_source(serde_json::from_value(document).unwrap()).map(|_| ()),
+            Err(KernelSerializationError::Invalid { message }),
+        );
+
+        // A static axis of a partially dynamic shape.
+        assert_eq!(definition(wide, true).to_source().map(|_| ()), Err(error));
+    }
+
+    #[test]
     fn test_kernel_definition_from_source() {
         let definition = literal_definition(Array::scalar(-0.0f32).unwrap());
         let decoded = KernelDefinition::from_source(definition.to_source().unwrap()).unwrap();
@@ -4634,19 +5186,116 @@ mod tests {
         let error = serde_json::from_value::<KernelSource>(serde_json::to_value(&document).unwrap()).unwrap_err();
         assert!(error.to_string().starts_with("unknown variant `KeyOnly`"));
 
-        // Key-only distributed type metadata is rejected as an unknown field.
+        // Gathers and scatters have exact key-only records, which transport rejects as well.
+        let gather = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        let definition = operation_definition(
+            ArrayOperation::Gather(gather),
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::I32, [1, 1])],
+            vec![],
+            ArrayType::new_static(DataType::F32, [1]),
+        );
+        assert_eq!(
+            definition.to_source().err(),
+            Some(KernelSerializationError::Unsupported { feature: "`gather`".to_owned() }),
+        );
+        let document = Encoder::new(EncodingMode::Key).definition(&definition).unwrap();
+        let error = serde_json::from_value::<KernelSource>(serde_json::to_value(&document).unwrap()).unwrap_err();
+        assert!(error.to_string().starts_with("unknown variant `KeyOnly`"));
+
+        // Key-only shardings of distributed types are rejected as an unknown field.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let wire = WireArrayType {
             data_type: WireDataType::F32,
             shape: vec![],
             layout: None,
             memory: WireMemory::Device,
-            distribution: Some("sharded".to_owned()),
+            sharding: Some(Box::new((&Sharding::replicated(mesh.clone(), 0)).into())),
         };
         let error = serde_json::from_value::<WireArrayType>(serde_json::to_value(&wire).unwrap()).err().unwrap();
         assert_eq!(
             error.to_string(),
-            "unknown field `distribution`, expected one of `data_type`, `shape`, `layout`, `memory`",
+            "unknown field `sharding`, expected one of `data_type`, `shape`, `layout`, `memory`",
         );
+        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let shape = r#type.shape().clone();
+        let value = builder.add_constant(ArrayIrValue::Array(Array::from_elements(r#type, &[0.0f32; 2]).unwrap()));
+        let reshape = ArrayOperation::<Array>::Reshape(ReshapeOperation::new(shape.clone(), shape));
+        builder.add_instruction(reshape, vec![], vec![value], None).unwrap();
+        let definition = KernelDefinition::new(call, builder.build(vec![], vec![], vec![]).unwrap()).unwrap();
+        let document = Encoder::new(EncodingMode::Key).definition(&definition).unwrap();
+        let error = serde_json::from_value::<KernelSource>(serde_json::to_value(&document).unwrap()).unwrap_err();
+        assert!(error.to_string().starts_with("unknown field `sharding`"));
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_guard_identities() {
+        // Builds a kernel over a 2×2 grid whose body guards its two coordinates with declared dimensions named
+        // `names`, which are one shared identity when `shared` is set and two independent identities otherwise.
+        let key = |names: [&str; 2], shared: bool| {
+            let bounds = DimensionBounds::unbounded();
+            let first = DimensionType::new(names[0], bounds);
+            let second = if shared { first.clone() } else { DimensionType::new(names[1], bounds) };
+            let declared_types = vec![ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)];
+            let guard = GuardOperation::new("coordinates", declared_types);
+            let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel); 2]).unwrap();
+            let call = KernelCallOperation::new(grid, vec![]).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let inputs = call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect();
+            builder.add_instruction(ArrayIrOperation::Guard(guard), vec![], inputs, None).unwrap();
+            let body = builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
+            KernelDefinition::new(call, body).unwrap().semantic_key().unwrap()
+        };
+
+        // A guard that requires equal coordinates differs from one over independent identities with equal names.
+        assert_ne!(key(["extent", "extent"], true), key(["extent", "extent"], false));
+
+        // Guards that differ only in the names of their identities share a key.
+        assert_eq!(key(["extent", "extent"], true), key(["rows", "columns"], true));
+        assert_eq!(key(["extent", "extent"], false), key(["rows", "columns"], false));
+
+        // The guards of the array member family number their identities in the same way.
+        let key = |names: [&str; 2], shared: bool| {
+            let bounds = DimensionBounds::unbounded();
+            let first = DimensionVariable::new(names[0], bounds);
+            let second = if shared { first.clone() } else { DimensionVariable::new(names[1], bounds) };
+            let declared_types = [first, second]
+                .map(|variable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)])));
+            let guard = ArrayOperation::Guard(GuardOperation::new("arrays", declared_types.to_vec()));
+            let vector = ArrayType::new_static(DataType::F32, [2]);
+            let definition = operation_definition(guard, vec![vector.clone(), vector.clone()], vec![], vector);
+            definition.semantic_key().unwrap()
+        };
+        assert_ne!(key(["extent", "extent"], true), key(["extent", "extent"], false));
+        assert_eq!(key(["extent", "extent"], true), key(["rows", "columns"], true));
+        assert_eq!(key(["extent", "extent"], false), key(["rows", "columns"], false));
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_extension_payload_identities() {
+        // Builds a kernel whose body holds two extensions that carry identities named `names` only in their payloads,
+        // which are one shared identity when `shared` is set and two independent identities otherwise.
+        let key = |names: [&str; 2], shared: bool| {
+            let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+            let first = DimensionVariable::new(names[0], bounds);
+            let second = if shared { first.clone() } else { DimensionVariable::new(names[1], bounds) };
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            for variable in [first, second] {
+                let extension = KernelOperation::Extension(TestExtension::Dimension(variable));
+                builder.add_instruction(extension, vec![], vec![], None).unwrap();
+            }
+            let body = builder.build(vec![], vec![], vec![]).unwrap();
+            let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+            KernelDefinition::new(call, body).unwrap().semantic_key().unwrap()
+        };
+
+        // Extensions that refer to one identity differ from extensions over independent identities with equal names.
+        assert_ne!(key(["extent", "extent"], true), key(["extent", "extent"], false));
+
+        // Extensions that differ only in the names of their identities share a key.
+        assert_eq!(key(["extent", "extent"], true), key(["rows", "columns"], true));
+        assert_eq!(key(["extent", "extent"], false), key(["rows", "columns"], false));
     }
 
     #[test]
@@ -4906,8 +5555,7 @@ mod tests {
         #[kernel(crate = "crate")]
         fn affine(
             #[input(data_type = F32, rank = 1)] input: &Array,
-            #[output(data_type = F32, shape = [input.shape()[0]], tile = [2], boundary = in_bounds)]
-            output: &mut Array,
+            #[output(data_type = F32, shape = [input.shape()[0]], tile = [2], boundary = in_bounds)] output: &mut Array,
         ) {
             let [block] = output.tile_index();
             let tiles = input.tiles([2]).pad(0.0);
@@ -5260,12 +5908,7 @@ mod tests {
         let extent = |extent: usize| ArrayIrType::from(DimensionValue::constant(extent).unwrap().r#type().into_owned());
         for (operation, input_types, extents, output_type) in [
             (ArrayIrOperation::One(OneOperation::new(matrix.clone())), vec![], vec![], matrix.clone()),
-            (
-                ArrayIrOperation::Iota(IotaOperation::new(matrix.clone(), 0).unwrap()),
-                vec![],
-                vec![],
-                matrix.clone(),
-            ),
+            (ArrayIrOperation::Iota(IotaOperation::new(matrix.clone(), 0).unwrap()), vec![], vec![], matrix.clone()),
             (
                 ArrayIrOperation::Reshape(
                     DynamicReshapeOperation::new().with_input_types(&[ir(&matrix), extent(6)]).unwrap(),
@@ -5401,6 +6044,55 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_serialize_array_types() {
+        // Dense, padded and reversed strided, and empty static types round trip exactly.
+        for r#type in [
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![16, -4]))),
+            ArrayType::new_static(DataType::F32, [0, 3]),
+            ArrayType::new_static(DataType::F32, [0, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![12, 4]))),
+        ] {
+            let definition =
+                parameter_definition(whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap());
+            let decoded = roundtrip(&definition);
+            assert_eq!(decoded.operation().parameters()[0].r#type().as_ref(), &r#type);
+            assert_eq!(decoded.body().to_string(), definition.body().to_string());
+        }
+
+        // A dynamically shaped intermediate type, which broadcasts a scalar to the extent of the grid coordinate, round
+        // trips without an explicit layout, and the reader rejects an explicit layout as an unsupported feature.
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(4), GridExecution::Parallel)]).unwrap();
+        let definition =
+            KernelDefinition::trace(KernelCallOperation::new(grid, vec![]).unwrap(), |(_, coordinates)| {
+                let context = coordinates[0].context();
+                let value = context.lift(ArrayIrValue::Array(Array::scalar(1.5f32).unwrap()))?;
+                let broadcast = ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![]));
+                context.bind(broadcast, vec![], &[value, coordinates[0].clone()])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            definition.body().to_string(),
+            indoc! {"
+                lambda %0:dimension<program_0 ∈ [0, 4)> .
+                let %1:f32[] = const 1.5
+                    %2:f32[program_0] = broadcast [output_axes=[]] %1 %0
+                in ()"},
+        );
+        let decoded = roundtrip(&definition);
+        assert_eq!(decoded.body().to_string(), definition.body().to_string());
+        let mut document = serde_json::to_value(&definition).unwrap();
+        let layout = &mut document["body"]["regions"][0]["atoms"][2]["Variable"]["Array"]["layout"];
+        *layout = serde_json::json!({ "Strided": [4] });
+        assert_eq!(
+            KernelDefinition::from_source(serde_json::from_value(document).unwrap()).map(|_| ()),
+            Err(KernelSerializationError::Unsupported {
+                feature: "dynamically shaped array with explicit layout".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_deserialize() {
         let extent = DimensionVariable::new("programs", DimensionBounds::non_negative(Some(9)).unwrap());
         let grid = Grid::new(vec![GridDimension::new(Dimension::Dynamic(extent), GridExecution::Parallel)]).unwrap();
@@ -5422,6 +6114,41 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<KernelDefinition>(wire).unwrap_err().to_string(),
             "unsupported kernel source schema version 999",
+        );
+    }
+
+    #[test]
+    fn test_encoder_array_type() {
+        // Key mode records every field of a sharding, while transport rejects distributed types.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Unconstrained])
+            .unwrap()
+            .with_unreduced_axes(["y"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap()
+            .with_varying_manual_axes(["z"])
+            .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
+        assert_eq!(
+            Encoder::new(EncodingMode::Transport).array_type(&r#type).err(),
+            Some(KernelSerializationError::Unsupported { feature: "distributed array type".to_owned() }),
+        );
+        let record = Encoder::new(EncodingMode::Key).array_type(&r#type).unwrap();
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            concat!(
+                r#"{"data_type":"F32","shape":[{"Static":4},{"Static":2}],"layout":null,"memory":"Device","#,
+                r#""sharding":{"mesh":[{"name":"x","size":2,"type":"Explicit"},"#,
+                r#"{"name":"y","size":2,"type":"Explicit"},{"name":"z","size":2,"type":"Manual"}],"#,
+                r#""dimensions":[{"Sharded":["x"]},"Unconstrained"],"#,
+                r#""unreduced_axes":["y"],"unreduced_kind":"Max","reduced_axes":[],"varying_manual_axes":["z"]}}"#,
+            ),
         );
     }
 
@@ -5450,19 +6177,33 @@ mod tests {
 
         // Requested reduction output shardings are distributed metadata, which the wire records exclude.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let operation = KernelOperation::<NoKernelExtension>::Portable(ArrayIrOperation::Array(
-            ArrayOperation::Reduce(
+        let operation =
+            KernelOperation::<NoKernelExtension>::Portable(ArrayIrOperation::Array(ArrayOperation::Reduce(
                 ReduceOperation::new(vec![0], ReductionKind::Sum)
                     .with_output_sharding(Sharding::replicated(mesh, 0))
                     .unwrap(),
-            ),
-        ));
+            )));
         assert!(matches!(
             Encoder::new(EncodingMode::Transport).operation(&operation, &[]),
             Err(KernelSerializationError::Unsupported { feature }) if feature == "`reduce` output sharding",
         ));
 
-        // Key mode records the same payloads through key-only records instead.
+        // Key mode records the same payloads through key-only records instead. The requested output sharding is
+        // recorded next to the record of the reduction without it.
+        let record = Encoder::new(EncodingMode::Key).operation(&operation, &[]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            concat!(
+                r#"{"KeyOnly":{"OutputSharding":{"operation":{"Reduce":{"axes":[0],"kind":"Sum"}},"#,
+                r#""sharding":{"mesh":[{"name":"x","size":2,"type":"Explicit"}],"dimensions":[],"#,
+                r#""unreduced_axes":[],"unreduced_kind":"Sum","reduced_axes":[],"varying_manual_axes":[]}}}}"#,
+            ),
+        );
+
+        // Operations without an exact record remain on the marked fallback.
+        let operation = KernelOperation::<NoKernelExtension>::Portable(ArrayIrOperation::Array(ArrayOperation::Print(
+            PrintOperation::new("value"),
+        )));
         assert!(matches!(
             Encoder::new(EncodingMode::Key).operation(&operation, &[]),
             Ok(WireOperation::KeyOnly(WireKeyOnlyOperation::Debug(_))),
@@ -5505,6 +6246,147 @@ mod tests {
     }
 
     #[test]
+    fn test_encoder_operation_gather_and_scatter() {
+        let fill = Array::scalar(f32::from_bits(0x7fc0_0001)).unwrap();
+        let gather = GatherOperation::new(
+            GatherDimensionNumbers::new(vec![1], vec![0], vec![0]).with_batching_dimensions(vec![(2, 0)]),
+            vec![1, 3, 1],
+        )
+        .with_mode(GatherMode::Fill { value: Some(Box::new(fill)) })
+        .with_unique_indices(true);
+        let scatter = ScatterOperation::new(
+            ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]).with_batching_dimensions(vec![2], vec![0]),
+            ScatterReductionKind::Max,
+        )
+        .with_mode(ScatterMode::Clip)
+        .with_indices_are_sorted(true);
+        let gather = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Gather(gather));
+        let scatter = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Scatter(scatter));
+
+        // Transport mode keeps rejecting both operations.
+        assert_eq!(
+            Encoder::new(EncodingMode::Transport).operation(&gather, &[]).err(),
+            Some(KernelSerializationError::Unsupported { feature: "`gather`".to_owned() }),
+        );
+        assert_eq!(
+            Encoder::new(EncodingMode::Transport).operation(&scatter, &[]).err(),
+            Some(KernelSerializationError::Unsupported { feature: "`scatter`".to_owned() }),
+        );
+
+        // Key mode records every semantic field, including the exact bits of the fill literal.
+        let record = Encoder::new(EncodingMode::Key).operation(&gather, &[]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            concat!(
+                r#"{"KeyOnly":{"Gather":{"offset_dimensions":[1],"collapsed_slice_dimensions":[0],"#,
+                r#""start_index_map":[0],"batching_dimensions":[[2,0]],"slice_sizes":[1,3,1],"#,
+                r#""mode":{"Fill":{"Array":{"type":{"data_type":"F32","shape":[],"layout":null,"memory":"Device"},"#,
+                r#""bytes":[1,0,192,127]}}},"indices_are_sorted":false,"unique_indices":true}}}"#,
+            ),
+        );
+        let record = Encoder::new(EncodingMode::Key).operation(&scatter, &[]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            concat!(
+                r#"{"KeyOnly":{"Scatter":{"update_window_dimensions":[1],"inserted_window_dimensions":[0],"#,
+                r#""scatter_dimensions_to_operand_dimensions":[0],"input_batching_dimensions":[2],"#,
+                r#""scatter_indices_batching_dimensions":[0],"kind":"Max","mode":"Clip","indices_are_sorted":true,"#,
+                r#""unique_indices":false}}}"#,
+            ),
+        );
+
+        // A requested output sharding is recorded next to the record of the gather without it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Gather(
+            GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+                .with_output_sharding(Sharding::replicated(mesh, 1)),
+        ));
+        assert_eq!(
+            Encoder::new(EncodingMode::Transport).operation(&sharded, &[]).err(),
+            Some(KernelSerializationError::Unsupported { feature: "`gather`".to_owned() }),
+        );
+        let record = Encoder::new(EncodingMode::Key).operation(&sharded, &[]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            concat!(
+                r#"{"KeyOnly":{"OutputSharding":{"operation":{"KeyOnly":{"Gather":{"offset_dimensions":[],"#,
+                r#""collapsed_slice_dimensions":[0],"start_index_map":[0],"batching_dimensions":[],"#,
+                r#""slice_sizes":[1],"mode":"PromiseInBounds","indices_are_sorted":false,"unique_indices":false}}},"#,
+                r#""sharding":{"mesh":[{"name":"x","size":2,"type":"Explicit"}],"dimensions":["Replicated"],"#,
+                r#""unreduced_axes":[],"unreduced_kind":"Sum","reduced_axes":[],"varying_manual_axes":[]}}}}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_encoder_operation_sharding_records() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["y", "x"])]).unwrap();
+        let sharding_json = concat!(
+            r#"{"mesh":[{"name":"x","size":2,"type":"Explicit"},{"name":"y","size":4,"type":"Explicit"}],"#,
+            r#""dimensions":[{"Sharded":["y","x"]}],"unreduced_axes":[],"unreduced_kind":"Sum","reduced_axes":[],"#,
+            r#""varying_manual_axes":[]}"#,
+        );
+        let encode = |mode, operation: ArrayOperation<Array>| {
+            Encoder::new(mode)
+                .operation(&KernelOperation::<NoKernelExtension>::from(operation), &[])
+                .map(|record| serde_json::to_string(&record).unwrap())
+        };
+
+        // Sharding changes and constraints hold their exact shardings, and transport rejects both.
+        let reshard = ArrayOperation::Reshard(ReshardOperation::new(sharding.clone()));
+        assert_eq!(
+            encode(EncodingMode::Transport, reshard.clone()),
+            Err(KernelSerializationError::Unsupported { feature: "`reshard`".to_owned() }),
+        );
+        assert_eq!(encode(EncodingMode::Key, reshard), Ok(format!(r#"{{"KeyOnly":{{"Reshard":{sharding_json}}}}}"#)));
+        let constraint = ArrayOperation::ConstrainSharding(ConstrainShardingOperation::new(sharding.clone()));
+        assert_eq!(
+            encode(EncodingMode::Key, constraint),
+            Ok(format!(r#"{{"KeyOnly":{{"ConstrainSharding":{sharding_json}}}}}"#)),
+        );
+
+        // A dropout holds the IEEE bits of its rate.
+        let dropout = ArrayOperation::Dropout(DropoutOperation::new(0.25, vec![1]));
+        assert_eq!(
+            encode(EncodingMode::Transport, dropout.clone()),
+            Err(KernelSerializationError::Unsupported { feature: "`dropout`".to_owned() }),
+        );
+        assert_eq!(
+            encode(EncodingMode::Key, dropout),
+            Ok(r#"{"KeyOnly":{"Dropout":{"rate":4598175219545276416,"broadcast_axes":[1]}}}"#.to_owned()),
+        );
+
+        // Every operation with a requested output sharding holds the record of the operation without it.
+        let output_sharding = |record: &str| {
+            format!(r#"{{"KeyOnly":{{"OutputSharding":{{"operation":{record},"sharding":{sharding_json}}}}}}}"#)
+        };
+        let shape = Shape::new(vec![Dimension::Static(4)]);
+        let reshape = ReshapeOperation::new(shape.clone(), shape);
+        assert_eq!(
+            encode(EncodingMode::Key, ArrayOperation::Reshape(reshape.with_output_sharding(sharding.clone()))),
+            Ok(output_sharding(r#"{"Reshape":{"input_shape":[{"Static":4}],"output_shape":[{"Static":4}]}}"#)),
+        );
+        let dot = DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]));
+        assert_eq!(
+            encode(EncodingMode::Key, ArrayOperation::Dot(dot.with_output_sharding(sharding.clone()))),
+            Ok(output_sharding(r#"{"Dot":{"dimensions":[[0],[0],[],[]],"accumulation":null}}"#)),
+        );
+        let broadcast = DynamicBroadcastOperation::new(vec![0]).with_output_sharding(sharding);
+        let broadcast = KernelOperation::<NoKernelExtension>::Portable(ArrayIrOperation::Broadcast(broadcast));
+        assert_eq!(
+            Encoder::new(EncodingMode::Key)
+                .operation(&broadcast, &[])
+                .map(|record| serde_json::to_string(&record).unwrap()),
+            Ok(output_sharding(r#"{"MixedBroadcast":{"output_axes":[0],"output_layout":null}}"#)),
+        );
+    }
+
+    #[test]
     fn test_decoder_value_invalid_literal_size() {
         let wire = WireValue::Array {
             r#type: WireArrayType {
@@ -5512,7 +6394,7 @@ mod tests {
                 shape: vec![WireDimension::Static(usize::MAX)],
                 layout: None,
                 memory: WireMemory::Device,
-                distribution: None,
+                sharding: None,
             },
             bytes: vec![],
         };
@@ -5528,7 +6410,7 @@ mod tests {
                 shape: vec![],
                 layout: None,
                 memory: WireMemory::Device,
-                distribution: None,
+                sharding: None,
             },
             bytes: vec![0],
         };
@@ -5546,7 +6428,7 @@ mod tests {
                 shape: vec![WireDimension::Static(2)],
                 layout: Some(WireLayout::Strided(vec![MAXIMUM_LITERAL_BYTES as isize])),
                 memory: WireMemory::Device,
-                distribution: None,
+                sharding: None,
             },
             bytes: vec![1, 2],
         };
@@ -5603,6 +6485,28 @@ mod tests {
         let sequence = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new([1u8, 2, 3].into_iter());
         let result = BoundedCollection::<u8, 2>::deserialize(sequence);
         assert_eq!(result.err().unwrap().to_string(), "kernel source sequence exceeds 2 entries");
+    }
+
+    #[test]
+    fn test_validate_array_type() {
+        let strided = |strides: Vec<isize>| Layout::Strided(StridedLayout::new(strides));
+        let extent = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(4)).unwrap());
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let padded = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(strided(vec![16, -4]));
+        assert_eq!(validate_array_type(&padded), Ok(()));
+        assert_eq!(validate_array_type(&dynamic), Ok(()));
+        assert_eq!(
+            validate_array_type(&ArrayType::scalar(DataType::F32).with_layout(strided(vec![4]))),
+            Err(KernelSerializationError::Program(ProgramError::Type(TypeError::invalid(
+                "strided layout rank 1 does not match array rank 0",
+            )))),
+        );
+        assert_eq!(
+            validate_array_type(&dynamic.with_layout(strided(vec![4]))),
+            Err(KernelSerializationError::Unsupported {
+                feature: "dynamically shaped array with explicit layout".to_owned(),
+            }),
+        );
     }
 
     #[test]

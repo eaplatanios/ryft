@@ -662,8 +662,9 @@ mod tests {
 
     use ryft_core::{
         AddOperation, ArrayIrOperation, BroadcastLikeOperation, BroadcastOperation, ConstantOperation, Context,
-        ConvertElementTypeOperation, DotDimensionNumbers, DotOperation, ExpOperation, FillLikeOperation,
-        IotaLikeOperation, IotaOperation, ReduceOperation, ReferenceRead, ReferenceWrite, SaturatingSubOperation,
+        ConvertElementTypeOperation, DotAlgorithmPreset, DotDimensionNumbers, DotInputPrecision, DotOperation,
+        ExpOperation, FillLikeOperation, IotaLikeOperation, IotaOperation, ReduceOperation, ReferenceRead,
+        ReferenceWrite, SaturatingSubOperation,
     };
     use ryft_kernels::{
         Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, KernelSchedule, VerifiedKernel,
@@ -820,6 +821,27 @@ mod tests {
         assert!(
             validate(&sum, &[ArrayType::new_static(DataType::F32, [0])], &ArrayType::scalar(DataType::F32)).is_ok()
         );
+    }
+
+    #[test]
+    fn test_validate_dot_precision() {
+        // The scalar dot computes in the element types of its operands and output, so admission accepts only the
+        // default precision without an explicit accumulation type, even when the request matches that computation.
+        let inputs = [ArrayType::new_static(DataType::F32, [2, 2]), ArrayType::new_static(DataType::F32, [2, 2])];
+        let output = ArrayType::new_static(DataType::F32, [2, 2]);
+        assert!(validate(&ArrayOperation::Dot(DotOperation::matmul()), &inputs, &output).is_ok());
+        for operation in [
+            DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32),
+            DotOperation::matmul().with_precision(DotAlgorithmPreset::F32_F32_F32),
+            DotOperation::matmul().with_precision(DotInputPrecision::Highest),
+            DotOperation::matmul().with_accumulation_type(DataType::F32),
+        ] {
+            assert!(matches!(
+                validate(&ArrayOperation::Dot(operation), &inputs, &output),
+                Err(Error::Unsupported { operation: "dot", reason })
+                    if reason == "operation or its metadata has no baseline scalar implementation",
+            ));
+        }
     }
 
     #[test]

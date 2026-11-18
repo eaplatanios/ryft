@@ -1301,10 +1301,7 @@ fn test_operation_payload_projection() {
         Ok(NestedFamily::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_)))),
     ));
     let size = DimensionSizeOperation::new(&ArrayType::new_static(DataType::F32, [2]), 0).unwrap();
-    assert!(matches!(
-        NestedFamily::from_payload(ErasedOperation::new(size)),
-        Ok(NestedFamily::DimensionSize(_)),
-    ));
+    assert!(matches!(NestedFamily::from_payload(ErasedOperation::new(size)), Ok(NestedFamily::DimensionSize(_)),));
     let payload = ErasedOperation::new(ProbeOperation::<0>::new());
     assert!(NestedFamily::from_payload(payload).unwrap_err().downcast::<ProbeOperation<0>>().is_ok());
 }

@@ -272,7 +272,7 @@ fn execute_cutile_add(client: &crate::Client<'_>, executable: &LoadedExecutable<
     let execution_inputs = [ExecutionInput::from(lhs), ExecutionInput::from(rhs)];
     let inputs = ExecutionDeviceInputs::from(execution_inputs.as_slice());
     let mut device_outputs = executable
-        .execute(vec![inputs], vec![], 0, None, None, None, None)
+        .execute(vec![inputs], vec![], 0, None, None, None, None, &[])
         .unwrap()
         .block_until_ready()
         .unwrap()

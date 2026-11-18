@@ -5,11 +5,11 @@ use std::fmt::{Display, Formatter};
 use std::sync::LazyLock;
 
 use ryft_core::{
-    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, EffectClasses, Effects, Operation, OperationFormatter,
-    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect,
-    ReferenceType, RegionInterface, TypeError,
+    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DimensionVariable, EffectClasses, Effects, Operation,
+    OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceEffect, ReferenceType, RegionInterface, TypeError,
 };
-use ryft_kernels::{KernelExtension, KernelExtensionMemory};
+use ryft_kernels::{KernelCompletionProtocol, KernelExtension, KernelExtensionMemory};
 
 /// A datacenter Blackwell tensor-memory allocation and its ordered asynchronous operations.
 ///
@@ -364,7 +364,7 @@ impl ReferenceAccessOperation for TmemOperation {
         // Tensor-memory accesses take whole references, so every access has an empty path and no bindings.
         let count = self.base_input_count();
         self.effects()
-            .accesses()
+            .reference_accesses()
             .any(|(index, _)| index == input_index)
             .then(|| ReferenceAccessDescriptor::new(&[], count..count))
     }
@@ -399,7 +399,22 @@ impl KernelExtension for TmemOperation {
         })
     }
 
-    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+    /// Every tensor memory completion token is committed exactly once to its completion barrier before its wait.
+    fn completion_protocol(&self) -> KernelCompletionProtocol {
+        match self {
+            Self::CopyScales
+            | Self::MmaBlockScaled { .. }
+            | Self::MmaNvfp4 { .. }
+            | Self::Mma { .. }
+            | Self::Commit
+            | Self::Wait => KernelCompletionProtocol::new("mosaic_gpu.tmem").with_required_commit(),
+            Self::AllocateScales { .. } | Self::Allocate { .. } | Self::Load | Self::Release => {
+                KernelCompletionProtocol::default()
+            }
+        }
+    }
+
+    fn semantic_key(&self, _identity: &mut dyn FnMut(&DimensionVariable) -> usize) -> Result<Vec<u8>, TypeError> {
         let mut key = b"ryft-mosaic.gpu.tmem.v2\0".to_vec();
         match self {
             Self::AllocateScales { rows, blocks, data_type } => {
@@ -435,6 +450,13 @@ mod tests {
     use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
+    use ryft_core::{Context, InstructionId, ReferenceRead, ReferenceRoot, RegionId};
+    use ryft_kernels::{
+        AsyncCopyOperation, Grid, KernelCallOperation, KernelDefinition, KernelInitializationError, KernelOperation,
+        KernelParameterAccess, ScratchOperation, VerifiedKernel, WaitOperation, whole_array_parameter,
+    };
+
+    use crate::kernels::gpu::GpuOperation;
 
     use super::*;
 
@@ -516,14 +538,14 @@ mod tests {
             ]
         );
         assert_ne!(
-            allocation.semantic_key().unwrap(),
+            allocation.semantic_key(&mut |_| 0).unwrap(),
             TmemOperation::AllocateScales { rows: 128, blocks: 2, data_type: DataType::F8E8M0FNU }
-                .semantic_key()
+                .semantic_key(&mut |_| 0)
                 .unwrap()
         );
         assert_ne!(
-            TmemOperation::CopyScales.semantic_key().unwrap(),
-            TmemOperation::MmaBlockScaled { accumulate: false }.semantic_key().unwrap()
+            TmemOperation::CopyScales.semantic_key(&mut |_| 0).unwrap(),
+            TmemOperation::MmaBlockScaled { accumulate: false }.semantic_key(&mut |_| 0).unwrap()
         );
     }
 
@@ -582,14 +604,14 @@ mod tests {
             ]
         );
         assert_ne!(
-            allocation.semantic_key().unwrap(),
+            allocation.semantic_key(&mut |_| 0).unwrap(),
             TmemOperation::AllocateScales { rows: 128, blocks: 8, data_type: DataType::F8E8M0FNU }
-                .semantic_key()
+                .semantic_key(&mut |_| 0)
                 .unwrap()
         );
         assert_ne!(
-            operation.semantic_key().unwrap(),
-            TmemOperation::MmaBlockScaled { accumulate: true }.semantic_key().unwrap()
+            operation.semantic_key(&mut |_| 0).unwrap(),
+            TmemOperation::MmaBlockScaled { accumulate: true }.semantic_key(&mut |_| 0).unwrap()
         );
     }
 
@@ -630,15 +652,97 @@ mod tests {
     }
 
     #[test]
+    fn test_tmem_operation_completion_protocol() {
+        // Tensor memory tokens follow a protocol that requires exactly one commit before the wait, so their own
+        // commit and wait complete them, while the portable wait cannot complete them and their commit and wait
+        // cannot complete a portable copy.
+        let protocol = KernelCompletionProtocol::new("mosaic_gpu.tmem").with_required_commit();
+        for operation in [
+            TmemOperation::CopyScales,
+            TmemOperation::MmaBlockScaled { accumulate: false },
+            TmemOperation::MmaNvfp4 { accumulate: false },
+            TmemOperation::Mma { accumulate: true },
+            TmemOperation::Commit,
+            TmemOperation::Wait,
+        ] {
+            assert_eq!(operation.completion_protocol(), protocol);
+            assert_eq!(GpuOperation::Tmem(operation).completion_protocol(), protocol);
+        }
+        assert_eq!(GpuOperation::Tmem(TmemOperation::Load).completion_protocol(), KernelCompletionProtocol::default());
+        assert_eq!(GpuOperation::Tmem(TmemOperation::Commit).replay_cost(), None);
+
+        // Starts either a tensor memory scale copy or a portable copy into scratch storage, and then applies each of
+        // `completions` to its token.
+        let definition = |scales: bool, completions: &[TmemOperation], portable_wait: bool| {
+            let r#type = if scales {
+                ArrayType::new_static(DataType::F8E8M0FNU, [128, 1])
+            } else {
+                ArrayType::new_static(DataType::I32, [4])
+            };
+            let operation = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap()],
+            )
+            .unwrap();
+            KernelDefinition::<GpuOperation>::trace(operation, |(references, _)| {
+                let context = references[0].context();
+                let token = if scales {
+                    let source = references[0].read()?;
+                    let allocation =
+                        TmemOperation::AllocateScales { rows: 128, blocks: 1, data_type: DataType::F8E8M0FNU };
+                    let destination = context
+                        .bind(KernelOperation::Extension(GpuOperation::Tmem(allocation)), vec![], &[])?
+                        .remove(0);
+                    let copy = KernelOperation::Extension(GpuOperation::Tmem(TmemOperation::CopyScales));
+                    context.bind(copy, vec![], &[source, destination])?.remove(0)
+                } else {
+                    let scratch = KernelOperation::Scratch(ScratchOperation::new(r#type, 16).unwrap());
+                    let destination = context.bind(scratch, vec![], &[])?.remove(0);
+                    let copy = KernelOperation::AsyncCopy(AsyncCopyOperation::new());
+                    context.bind(copy, vec![], &[references[0].clone(), destination])?.remove(0)
+                };
+                for &completion in completions {
+                    let completion = KernelOperation::Extension(GpuOperation::Tmem(completion));
+                    context.bind(completion, vec![], std::slice::from_ref(&token))?;
+                }
+                if portable_wait {
+                    context.bind(KernelOperation::Wait(WaitOperation), vec![], &[token])?;
+                }
+                Ok(())
+            })
+            .unwrap()
+        };
+        let verify = |definition: &KernelDefinition<GpuOperation>| VerifiedKernel::new(definition, 1).map(|_| ());
+        let region = RegionId::new(0);
+        let incompatible = |instruction, token| KernelInitializationError::IncompatibleCompletion {
+            instruction: InstructionId::new(region, instruction),
+            token: ReferenceRoot::Allocation { instruction: InstructionId::new(region, token), output_index: 0 },
+        };
+        assert_eq!(verify(&definition(true, &[TmemOperation::Commit, TmemOperation::Wait], false)), Ok(()));
+        assert_eq!(verify(&definition(true, &[TmemOperation::Wait], false)), Err(incompatible(3, 2)));
+        assert_eq!(
+            verify(&definition(true, &[TmemOperation::Commit, TmemOperation::Commit, TmemOperation::Wait], false)),
+            Err(incompatible(4, 2)),
+        );
+        assert_eq!(verify(&definition(true, &[TmemOperation::Commit], true)), Err(incompatible(4, 2)));
+        assert_eq!(verify(&definition(false, &[], true)), Ok(()));
+        assert_eq!(
+            verify(&definition(false, &[TmemOperation::Commit, TmemOperation::Wait], false)),
+            Err(incompatible(2, 1)),
+        );
+        assert_eq!(verify(&definition(false, &[TmemOperation::Wait], false)), Err(incompatible(2, 1)));
+    }
+
+    #[test]
     fn test_tmem_operation_semantic_key() {
         let allocate = TmemOperation::Allocate { rows: 128, columns: 32 };
         let different = TmemOperation::Allocate { rows: 128, columns: 64 };
-        assert_ne!(allocate.semantic_key().unwrap(), different.semantic_key().unwrap());
+        assert_ne!(allocate.semantic_key(&mut |_| 0).unwrap(), different.semantic_key(&mut |_| 0).unwrap());
         assert_ne!(
-            TmemOperation::Mma { accumulate: false }.semantic_key().unwrap(),
-            TmemOperation::Mma { accumulate: true }.semantic_key().unwrap()
+            TmemOperation::Mma { accumulate: false }.semantic_key(&mut |_| 0).unwrap(),
+            TmemOperation::Mma { accumulate: true }.semantic_key(&mut |_| 0).unwrap()
         );
-        assert_eq!(TmemOperation::Commit.semantic_key(), Ok(b"ryft-mosaic.gpu.tmem.v2\0\x02".to_vec()));
+        assert_eq!(TmemOperation::Commit.semantic_key(&mut |_| 0), Ok(b"ryft-mosaic.gpu.tmem.v2\0\x02".to_vec()));
         let values = HashMap::from([(allocate, 1), (different, 2)]);
         assert_eq!(values[&TmemOperation::Allocate { rows: 128, columns: 32 }], 1);
         assert_eq!(allocate.to_string(), "mosaic_gpu.tmem.allocate [rows=128, columns=32]");

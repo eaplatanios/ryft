@@ -15,12 +15,12 @@ CUDA `12.1`; AMD products are compiled and inspected without device execution.
 | CUDA `12.1` | PTX entry, pointer ABI, resources and native compiler tests | DGX Spark GB10, driver 580.173.02 |
 | ROCm `gfx908`, `gfx90a`, `gfx942` | Vector/dot HSACO and descriptor inspection | No AMD machine available |
 
-Source revisions are XLA `eb6b90ed013f511eca088c52f541f3c0819f919e`, JAX
-`a7606f995e1a92707cbeb257e487fa53e7abe84b`, and Triton `a77e7c793abc0d0c923a9afb275058e2fe57a198` with the pinned XLA
-patches. CUDA compilation requires the recorded CUDA 13.2 toolkit contract and assembler 13.0.88, producing PTX 9.0.
-The runtime integration requires the pinned PJRT FFI contract. ROCm uses HIP 7.13 and the native compiler's embedded
-ROCm device-bitcode revision `53996464fa8d94b182ac4aaa7dc3a109ab524f45`; see `ryft-rocm` for its exact ABI contract.
-A full native build with CUDA configuration disabled has not been qualified.
+Source revisions are the XLA and JAX revisions pinned by `ryft-xla-sys` (`ryft_xla_sys::XLA_COMMIT` and
+`ryft_xla_sys::JAX_COMMIT`) and the Triton revision that this XLA revision selects (`ryft_xla_sys::TRITON_COMMIT`),
+with the pinned XLA patches. CUDA compilation requires the recorded CUDA 13.2 toolkit contract and assembler 13.0.88,
+producing PTX 9.0. The runtime integration requires the pinned PJRT FFI contract. ROCm uses HIP 7.13 and the native
+compiler's embedded ROCm device-bitcode revision `53996464fa8d94b182ac4aaa7dc3a109ab524f45`; see `ryft-rocm` for its
+exact ABI contract. A full native build with CUDA configuration disabled has not been qualified.
 
 The initial portable subset uses static, unsharded, dense row-major F32 device parameters, one global pointer per
 logical parameter, and at most four axes per tile. AMD kernels admit one through 64 physical parameters. Immutable
@@ -70,8 +70,10 @@ operation family, and the macro-authored portable definition is unchanged.
 
 ## Persistence and deployment
 
-Schema 2 compiler identity includes validated source/toolchain versions, linked compiler capabilities, target
+Schema 1 compiler identity includes validated source/toolchain versions, linked compiler capabilities, target
 architecture, warp count, pipeline stages and scratch budget. It contains no executable hash or subprocess protocol.
+The schema stays at 1 until the first release, so records from earlier development builds are rejected by their
+contents and must be regenerated, together with any AOT bundle or tuning record that depends on them.
 Cancellation and output-capture limits do not change emitted-code identity.
 Concrete artifacts validate entry symbols, exact pointer arguments, target formats and resources before embedding.
 XLA adds its runtime/device facts and embedding ABI to the binding and AOT compatibility checks.

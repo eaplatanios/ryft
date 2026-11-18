@@ -1114,7 +1114,9 @@ mod tests {
         let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
         let operation = TileLoadOperation::new(vec![2], boundary).unwrap().with_transforms(transforms);
         let tile = builder.add_instruction(operation, vec![], vec![inputs[0], start, other], None).unwrap()[0];
-        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None).unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
         KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
     }
 
@@ -1157,10 +1159,15 @@ mod tests {
         };
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let inputs =
-            empty_grid.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let inputs = empty_grid
+            .body_input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
         let tile = load(&mut builder, inputs[0]);
-        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None).unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
         let empty_grid =
             KernelDefinition::new(empty_grid, builder.build(vec![], vec![Placeholder; 3], vec![]).unwrap()).unwrap();
 
@@ -1185,8 +1192,11 @@ mod tests {
             )
             .unwrap();
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let inputs =
-            untaken_branch.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let inputs = untaken_branch
+            .body_input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
         let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
         let taken = builder.import_region(taken.entry_region_ref());
         let padding = builder.import_region(padding.entry_region_ref());
@@ -1198,7 +1208,9 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None).unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
         let untaken_branch =
             KernelDefinition::new(untaken_branch, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap())
                 .unwrap();
@@ -1249,7 +1261,9 @@ mod tests {
         let condition = builder.add_constant(ArrayIrValue::Array(Array::scalar(condition).unwrap()));
         builder.add_instruction(operation, vec![], vec![condition], None).unwrap();
         let value = builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![inputs[0]], None).unwrap()[0];
-        builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], value], None).unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], value], None)
+            .unwrap();
         KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
     }
 
@@ -1844,8 +1858,9 @@ mod tests {
         let matrix_type = ArrayType::new_static(DataType::F32, [2, 2]);
         let output = ArrayType::new_static(DataType::F32, [4]);
         let transpose = ArrayOperation::Transpose(ryft_core::TransposeOperation::new(vec![1, 0]));
-        let transposed =
-            lowering.array(&transpose, &["input".to_owned()], &[matrix_type.clone()], &matrix_type).unwrap();
+        let transposed = lowering
+            .array(&transpose, &["input".to_owned()], std::slice::from_ref(&matrix_type), &matrix_type)
+            .unwrap();
         let reshape = ArrayOperation::Reshape(ryft_core::ReshapeOperation::new(
             matrix_type.shape().clone(),
             output.shape().clone(),
@@ -1872,7 +1887,9 @@ mod tests {
         ] {
             let r#type = ArrayType::new_static(value.r#type().data_type(), shape);
             let operation = ArrayOperation::FillLike(FillLikeOperation::new(value).unwrap());
-            lowering.array(&operation, &["exemplar".to_owned()], &[r#type.clone()], &r#type).unwrap();
+            lowering
+                .array(&operation, &["exemplar".to_owned()], std::slice::from_ref(&r#type), &r#type)
+                .unwrap();
         }
         assert_eq!(
             lowering.code,

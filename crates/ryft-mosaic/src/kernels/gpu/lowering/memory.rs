@@ -399,8 +399,7 @@ mod tests {
     use ryft_mlir::{Block, Context, Module, Operation, Value, WalkOrder, WalkResult};
 
     use crate::kernels::gpu::Target;
-    use crate::kernels::gpu::lowering::Buffer;
-    use crate::kernels::gpu::lowering::module;
+    use crate::kernels::gpu::lowering::{Buffer, module};
     use crate::kernels::gpu::synchronization::{CtaSynchronization, SynchronizationError};
 
     use super::*;

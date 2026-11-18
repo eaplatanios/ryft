@@ -61,13 +61,21 @@
 //! ```
 //!
 //! The [`kernel`] macro replaces the annotated function with a callable of the same name and a module that contains a
-//! `definition` function. The callable takes values of any [`KernelCall`] type. It interprets concrete host arrays and
-//! binds the call into the context of staged values. Host interpretation verifies the definition first, and that
-//! verification enumerates the grid points only when the mapping of a parameter lacks a separable tiling proof (i.e.,
-//! when [`BlockMapping::tiling_axes`] returns `None`). In that case, the callable rejects grids with more than
-//! [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`] points, and otherwise it does not cap the grid. The
-//! `definition` function takes the logical types of the inputs, checks them against the input annotations and the
-//! `requires` constraint, and returns the inspectable [`KernelDefinition`] that the body traces into.
+//! `definition` function. The callable takes values of any [`KernelCall`] type. It interprets concrete host
+//! [`Array`](ryft_core::Array)s through [`KernelDefinition::interpret`] with
+//! [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`] as its qualification bound, and it binds the call together with
+//! its body into the context of projected values whose operations are [`KernelOperation`]s (e.g., values traced by a
+//! [`TracingContext`](ryft_core::TracingContext) over [`KernelOperation`]). The `definition` function takes the
+//! logical types of the inputs, checks them against the input annotations and the `requires` constraint, and returns
+//! the inspectable [`KernelDefinition`] that the body traces into.
+//!
+//! Values staged by `ryft-xla` do not implement [`KernelCall`], so a kernel enters an XLA program through its
+//! definition instead. The `stage_kernel` function of the `kernels` module of `ryft-xla` binds the call of a
+//! [`KernelDefinition`] together with its body into the enclosing XLA program, and the compilation options of the XLA
+//! session select the compiler adapter that later compiles it. Staging invokes no compiler. The
+//! `stage_kernel_with_jvp`, `stage_kernel_with_vjp`, `stage_kernel_with_rules`, and `stage_kernel_with_fallback`
+//! functions of the same module also attach explicit derivative rules or a pure fallback program, because kernel calls
+//! have no implicit differentiation rule.
 //!
 //! The code that [`kernel`] generates names this crate through the `ryft` facade path `ryft::kernels` by default, so
 //! `#[ryft::kernels::kernel]` and `#[ryft::kernel]` need no arguments. Crates that depend on `ryft-kernels` directly,
@@ -92,6 +100,88 @@
 //! tokens, whereas some other mistakes (e.g., a `tile_index` pattern whose binding count differs from the rank of the
 //! grid) are reported when the definition is built.
 //!
+//! The following kernel adds two vectors of 5 elements in tiles of 2 elements, so its grid has 3 programs and the tile
+//! of the last program extends past the end of both vectors. Its loads fill the missing element with the padding value,
+//! and the masked output publishes only the element that lies inside the output.
+//!
+//! ```
+//! use ryft_core::{Array, ArrayType, DataType, Dimension};
+//! use ryft_kernels::kernel;
+//!
+//! #[kernel(crate = "ryft_kernels", requires = left.shape()[0] == right.shape()[0])]
+//! fn tiled_add(
+//!     #[input(data_type = F32, rank = 1)] left: &Array,
+//!     #[input(data_type = F32, rank = 1)] right: &Array,
+//!     #[output(data_type = F32, shape = [left.shape()[0]], tile = [2], boundary = masked)] output: &mut Array,
+//! ) {
+//!     let [block] = output.tile_index();
+//!     let left_tiles = left.tiles([2]).pad(0.0);
+//!     let right_tiles = right.tiles([2]).pad(0.0);
+//!     output.store(left_tiles.load([block]) + right_tiles.load([block]));
+//! }
+//!
+//! let left = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0, 5.0]).unwrap();
+//! let right = Array::vector(vec![10.0f32, 20.0, 30.0, 40.0, 50.0]).unwrap();
+//! assert_eq!(tiled_add(&left, &right), Ok(Array::vector(vec![11.0f32, 22.0, 33.0, 44.0, 55.0]).unwrap()));
+//! let vector = ArrayType::new_static(DataType::F32, [5]);
+//! let definition = tiled_add::definition(&vector, &vector).unwrap();
+//! assert_eq!(definition.operation().grid().dimensions()[0].extent(), &Dimension::Static(3));
+//! ```
+//!
+//! A `grid(...)` argument declares the grid explicitly instead, with one named axis per entry, each of which is
+//! parallel unless it is declared as `sequential(extent)`. Each parameter then declares its window with `block` and
+//! either `index`, whose entries are block indices over the grid axes, or `start`, whose entries are element starts,
+//! and optionally with `boundary = masked`. Inside the body, the axis names are the grid coordinates of the current
+//! program. The programs along a sequential axis run in order and may carry a write-only output window from one step
+//! to the next, so a body that initializes its window when the coordinate of that axis is zero (e.g., `if k == 0`)
+//! and accumulates into it at every step computes a sequentially carried reduction. A masked window is loaded with
+//! `load_or(fill)`, which fills its padding elements, and `accumulate` publishes only its valid elements. The
+//! following kernel multiplies a 3 by 3 matrix with a 3 by 2 matrix in blocks of 2 by 2 elements, so both the output
+//! blocks and the blocks of the contraction axis are partial at the edges.
+//!
+//! ```
+//! use ryft_core::{Array, ArrayType, DataType};
+//! use ryft_kernels::{GridExecution, kernel};
+//!
+//! #[kernel(
+//!     crate = "ryft_kernels",
+//!     grid(
+//!         i = left.shape()[0].div_ceil(2),
+//!         j = right.shape()[1].div_ceil(2),
+//!         k = sequential(left.shape()[1].div_ceil(2)),
+//!     ),
+//!     requires = left.shape()[1] == right.shape()[0],
+//! )]
+//! fn matmul(
+//!     #[input(data_type = F32, rank = 2, block = [2, 2], index = [i, k], boundary = masked)] left: &Array,
+//!     #[input(data_type = F32, rank = 2, block = [2, 2], index = [k, j], boundary = masked)] right: &Array,
+//!     #[output(
+//!         data_type = F32,
+//!         shape = [left.shape()[0], right.shape()[1]],
+//!         block = [2, 2],
+//!         index = [i, j],
+//!         boundary = masked,
+//!     )]
+//!     output: &mut Array,
+//! ) {
+//!     if k == 0 {
+//!         output.store(zeros::<f32>([2, 2]));
+//!     }
+//!     output.accumulate(left.load_or(0.0).dot(right.load_or(0.0)));
+//! }
+//!
+//! let left = Array::matrix(3, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap();
+//! let right = Array::matrix(3, 2, vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+//! assert_eq!(matmul(&left, &right), Ok(Array::matrix(3, 2, vec![4.0f32, 5.0, 10.0, 11.0, 16.0, 17.0]).unwrap()));
+//! let definition = matmul::definition(
+//!     &ArrayType::new_static(DataType::F32, [3, 3]),
+//!     &ArrayType::new_static(DataType::F32, [3, 2]),
+//! )
+//! .unwrap();
+//! let executions = definition.operation().grid().dimensions().iter().map(|axis| axis.execution()).collect::<Vec<_>>();
+//! assert_eq!(executions, [GridExecution::Parallel, GridExecution::Parallel, GridExecution::Sequential]);
+//! ```
+//!
 //! [`KernelDefinition::trace`] gives explicit control over the [`Grid`], the [`KernelParameter`]s, and their
 //! [`BlockMapping`]s, and the functions of [`authoring`] stage the same operations that the macro uses.
 //! [`mapped_call`] constructs a call from a grid and one [`ParameterWindow`] per parameter, whose block indices or
@@ -101,7 +191,30 @@
 //! completely. The [`memory`] module also provides scratch storage, masked loads and swaps, and asynchronous copies,
 //! which [`masked_load`], [`masked_store`], [`masked_swap`], [`window_mask`], [`accumulate`], [`scratch`],
 //! [`async_copy`], and [`wait`] stage. A [`KernelExtension`] adds target specific operations whose semantics an adapter
-//! owns.
+//! owns, including the [`KernelCompletionProtocol`] that the tokens of its asynchronous operations follow.
+//!
+//! # Qualification and Execution Bounds
+//!
+//! Verification (i.e., [`VerifiedKernel::new`], [`validate_kernel_initialization`], and the qualification that every
+//! host interpretation performs first) takes a `maximum_programs` argument, which bounds the work of enumerating grid
+//! points and is not part of the identity of a kernel. A parameter is qualified without enumerating the grid only when
+//! [`BlockMapping::tiling_axes`] recognizes its mapping and that recognition names every grid axis at most once. Every
+//! other parameter is qualified by evaluating its mapping at every grid point, which fails with
+//! [`KernelInitializationError::QualificationLimit`] when the grid has more than `maximum_programs` points. A
+//! recognized mapping is therefore not always qualified without enumeration. The diagonal windows of a mapping whose
+//! element starts are `(i, i)` with blocks of one element are recognized, so `tiling_axes` returns
+//! `Some(vec![Some(0), Some(0)])`, but they repeat the grid axis `i`, so that parameter is enumerated. When no
+//! parameter is enumerated, `maximum_programs` limits nothing, and a grid of any size is qualified.
+//!
+//! Execution has separate bounds. [`KernelDefinition::interpret`], which the [`kernel`] callable uses for host arrays
+//! and which ordinary program interpretation of a `kernel_call` uses with
+//! [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`], replays every grid point without a step limit, because kernel
+//! bodies admit only bounded loops. [`KernelDefinition::interpret_with_limits`] and
+//! [`KernelDefinition::interpret_with_trace`] cap the number of grid points before qualification, whether or not a
+//! parameter is enumerated, and they cap the replay steps (i.e., operation bindings and region entries) of the whole
+//! invocation. The schedule explorer [`KernelDefinition::interpret_interleavings`] applies the same cap on grid points,
+//! computes the exact replay steps of one interleaving and checks them against the step cap before any interleaving
+//! runs, and bounds the number of interleavings with its own `maximum_interleavings` argument.
 //!
 //! # Transforms, Identity, and Debugging
 //!
@@ -120,8 +233,7 @@
 //!     each program, up to explicit bounds.
 //!
 //! A successful interpretation proves only the interpreted case, and it implies neither target support nor native
-//! performance. Kernel calls have no implicit differentiation rule. The `kernels` module of `ryft-xla` stages kernels
-//! with explicit derivative rules or a pure fallback program, and it preserves the complete call through batching,
+//! performance. A kernel call that the `kernels` module of `ryft-xla` stages keeps its complete call through batching,
 //! control flow, and rematerialization.
 
 pub use ryft_macros::kernel;
@@ -147,8 +259,7 @@ pub use authoring::{
     select, tile_load, tile_store, wait, whole_array_parameter, window_mask, zeros,
 };
 pub use calls::{
-    KERNEL_CALL_OPERATION_NAME, KERNEL_KEY_VERSION, KernelCallOperation, KernelDefinition, KernelError,
-    KernelParameter,
+    KERNEL_CALL_OPERATION_NAME, KERNEL_KEY_VERSION, KernelCallOperation, KernelDefinition, KernelError, KernelParameter,
 };
 pub use compilation::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
 pub use grids::{Grid, GridDimension, GridError, GridExecution, GridPoints};
@@ -165,7 +276,9 @@ pub use memory::{
     MaskedSwapOperation, SCRATCH_OPERATION_NAME, ScratchOperation, WAIT_OPERATION_NAME, WINDOW_MASK_OPERATION_NAME,
     WaitOperation, WindowMaskOperation,
 };
-pub use operations::{KernelExtension, KernelExtensionMemory, KernelOperation, NoKernelExtension};
+pub use operations::{
+    KernelCompletionProtocol, KernelExtension, KernelExtensionMemory, KernelOperation, NoKernelExtension,
+};
 pub use scheduling::{KernelInterleaving, KernelSchedulingError};
 pub use serialization::{KernelSerializationError, KernelSource};
 pub use transforms::KernelTransformError;

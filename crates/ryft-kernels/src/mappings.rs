@@ -21,7 +21,9 @@
 //! and returns a [`BlockWindow`], which holds the original element starts, the slice that selects the valid
 //! intersection with the full array, and whether the window requires a mask. It rejects an out-of-bounds window under
 //! [`BoundaryPolicy::InBounds`], so that policy is checked whenever a window is evaluated rather than proved when the
-//! mapping is constructed. [`BlockWindow::overlap`] compares the valid intersections of two windows.
+//! mapping is constructed. [`BlockMapping::has_total_windows`] proves from the bounds of the mapping output types that
+//! these checks pass for every binding, which lets a kernel call that cannot fail them declare no assertion of its
+//! own. [`BlockWindow::overlap`] compares the valid intersections of two windows.
 //!
 //! # Separable Tiling
 //!
@@ -40,6 +42,15 @@
 //! describes indexing only, so callers still check concrete bounds, repeated or unused grid axes, coverage, and access
 //! policy.
 //!
+//! Recognition therefore does not mean that the windows of distinct grid points are disjoint or that consumers can
+//! avoid evaluating the mapping at every grid point. Several outputs may name the same grid axis. The diagonal element
+//! starts `(i, i)` with blocks of one element are recognized as `Some(vec![Some(0), Some(0)])`, although the windows
+//! follow the diagonal instead of tiling the array. Kernel qualification (i.e.,
+//! [`validate_kernel_initialization`](crate::initialization::validate_kernel_initialization)) qualifies a parameter
+//! without enumerating the grid only when its recognized axes are distinct. It evaluates every other mapping at every
+//! grid point, including a recognized mapping that repeats an axis, and that enumeration is what the
+//! `maximum_programs` bound of qualification limits.
+//!
 //! # Specialization and Identity
 //!
 //! [`BlockMapping::specialize`] binds the trailing inputs of a mapping (e.g., its scalar prefetched dimensions) to
@@ -57,11 +68,11 @@
 use std::hash::{Hash, Hasher};
 
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, Atom, AtomId,
-    Context, DimensionAddOperation, DimensionDivOperation, DimensionMaxOperation, DimensionMinOperation,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, Atom, AtomId, Context,
+    Dimension, DimensionAddOperation, DimensionDivOperation, DimensionMaxOperation, DimensionMinOperation,
     DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRefinements, DimensionRemOperation,
     DimensionSubOperation, DimensionValue, EagerContext, FlatProgram, MAX_DIMENSION_EXTENT, Operation, Placeholder,
-    ProgramBuilder, ProgramError, ReferenceViewOverlap, TypeError, Typed, TypedProgram,
+    ProgramBuilder, ProgramError, ReferenceViewOverlap, Shape, TypeError, Typed, TypedProgram,
 };
 use thiserror::Error;
 
@@ -285,8 +296,11 @@ impl BlockMapping {
 
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         for instruction in self.program.instructions() {
-            let values =
-                instruction.inputs().iter().map(|input| constants[input.index()].clone()).collect::<Option<Vec<_>>>();
+            let values = instruction
+                .inputs()
+                .iter()
+                .map(|input| constants[input.index()].clone())
+                .collect::<Option<Vec<_>>>();
             if let Some(values) = values {
                 let outputs = context.bind(instruction.operation().clone(), Vec::new(), &values)?;
                 for (output, value) in instruction.outputs().iter().zip(outputs) {
@@ -315,30 +329,30 @@ impl BlockMapping {
             // input metadata, so neither needs to be rebuilt.
             let operation = ArrayIrOperation::Dimension(match operation {
                 DimensionOperation::Constant(_) | DimensionOperation::SaturatingSub(_) => operation.clone(),
-                DimensionOperation::Max(_) => DimensionMaxOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Min(_) => DimensionMinOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Add(_) => DimensionAddOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Sub(_) => DimensionSubOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Mul(_) => DimensionMulOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Div(_) => DimensionDivOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Rem(_) => DimensionRemOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
-                DimensionOperation::Pow(_) => DimensionPowOperation::new(&input_types[0], &input_types[1])
-                    .map_err(ProgramError::from)?
-                    .into(),
+                DimensionOperation::Max(_) => {
+                    DimensionMaxOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Min(_) => {
+                    DimensionMinOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Add(_) => {
+                    DimensionAddOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Sub(_) => {
+                    DimensionSubOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Mul(_) => {
+                    DimensionMulOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Div(_) => {
+                    DimensionDivOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Rem(_) => {
+                    DimensionRemOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
+                DimensionOperation::Pow(_) => {
+                    DimensionPowOperation::new(&input_types[0], &input_types[1]).map_err(ProgramError::from)?.into()
+                }
             });
             let outputs =
                 builder.add_instruction(operation, vec![], inputs, Some(instruction.provenance().clone()))?.to_vec();
@@ -362,7 +376,9 @@ impl BlockMapping {
     /// block also admits the coordinate directly. Unknown expressions return `None` for the complete mapping.
     ///
     /// This describes indexing only, so callers still check concrete bounds, repeated or unused grid axes, coverage,
-    /// and access policy. Every instruction must contribute a recognized output, so this proof never skips a dead
+    /// and access policy. A result may name the same input axis more than once (e.g., `Some(vec![Some(0), Some(0)])`
+    /// for the diagonal element starts `(i, i)` with blocks of one element), and kernel qualification enumerates the
+    /// grid for such a mapping. Every instruction must contribute a recognized output, so this proof never skips a dead
     /// arithmetic instruction or a runtime dimension requirement that ordinary mapping evaluation would execute.
     pub fn tiling_axes(&self) -> Option<Vec<Option<usize>>> {
         if self.program.instructions().iter().any(|instruction| {
@@ -401,6 +417,41 @@ impl BlockMapping {
                 None
             })
             .collect()
+    }
+
+    /// Returns whether the window checks of [`Self::evaluate`] pass for every binding that the mapping input types
+    /// admit and for every full array of shape `array_shape`. The proof uses only the bounds of the mapping output
+    /// types, which the checked dimension operations of `ryft-core` derive from the bounds of their inputs. Along
+    /// each axis, the largest start that its type admits plus the block extent must not exceed
+    /// [`MAX_DIMENSION_EXTENT`], and neither may any extent that the array admits along that axis. Under
+    /// [`BoundaryPolicy::InBounds`], that limit must also not exceed the smallest extent that the array admits along
+    /// that axis. A start type without a finite upper bound, a dynamic array extent without one, and a shape whose rank
+    /// differs from the block rank all leave the checks unproven.
+    ///
+    /// This covers the checks that follow the mapping program and not failures of the program itself (e.g., a division
+    /// by zero), which the effects of the program declare. For example, the whole array windows of
+    /// [`whole_array_parameter`](crate::authoring::whole_array_parameter) and the tiles `i * 2` of an `[4]` array over
+    /// a grid of two programs pass, while the same tiles over a grid of three programs pass only when masked.
+    pub fn has_total_windows(&self, array_shape: &Shape) -> bool {
+        array_shape.rank() == self.block_shape.len()
+            && self.program.output_types().iter().zip(&self.block_shape).zip(array_shape.dimensions()).all(
+                |((r#type, &size), extent)| {
+                    let ArrayIrType::Dimension(r#type) = r#type else {
+                        unreachable!("validated mapping outputs are dimensions");
+                    };
+                    let (minimum, maximum) = match extent {
+                        Dimension::Static(extent) => (*extent, Some(*extent)),
+                        Dimension::Dynamic(variable) => {
+                            (variable.bounds().lower(), variable.bounds().upper().map(|upper| upper - 1))
+                        }
+                    };
+                    r#type.maximum_extent().and_then(|start| start.checked_add(size)).is_some_and(|limit| {
+                        limit <= MAX_DIMENSION_EXTENT
+                            && maximum.is_some_and(|maximum| maximum <= MAX_DIMENSION_EXTENT)
+                            && (self.boundary_policy == BoundaryPolicy::Masked || limit <= minimum)
+                    })
+                },
+            )
     }
 
     /// Interprets dimension bindings and intersects the resulting block with the concrete full array shape. The

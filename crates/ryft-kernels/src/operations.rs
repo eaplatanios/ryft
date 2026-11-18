@@ -28,11 +28,11 @@ use std::fmt::{Display, Formatter};
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
     ConditionOperation, ConstantOperation, Context, DimensionOperation, DimensionSizeOperation, DimensionType,
-    DimensionValue, Domain, DynamicBroadcastOperation, InterpretableOperation, InterpretationDriver, Operation,
-    OperationProjection, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    DimensionValue, DimensionVariable, Domain, DynamicBroadcastOperation, InterpretableOperation, InterpretationDriver,
+    Operation, OperationProjection, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
     PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, TypeError,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, TypeError, Typed,
 };
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
@@ -64,14 +64,16 @@ pub enum KernelExtensionMemory {
         completion_output_index: usize,
     },
 
-    /// Observes a pending completion reference without completing its accesses or publishing writes.
-    /// Hardware group counts and commit ordering remain the responsibility of the adapter.
+    /// Observes a pending completion reference of its [`KernelExtension::completion_protocol`] without completing its
+    /// accesses or publishing writes. Hardware group counts and commit ordering beyond what that protocol requires
+    /// remain the responsibility of the adapter.
     Commit {
         /// Index of the input that holds the observed completion reference.
         completion_input_index: usize,
     },
 
-    /// Consumes a pending completion reference and publishes its deferred writes.
+    /// Consumes a pending completion reference of its [`KernelExtension::completion_protocol`] and publishes its
+    /// deferred writes.
     Wait {
         /// Index of the input that holds the consumed completion reference.
         completion_input_index: usize,
@@ -82,6 +84,51 @@ pub enum KernelExtensionMemory {
         /// Index of the input that holds the consumed allocation.
         input_index: usize,
     },
+}
+
+/// Completion protocol that the token of an asynchronous extension operation follows from the operation that
+/// produced it to the wait that consumes it (see [`KernelExtension::completion_protocol`]).
+///
+/// Two protocols are compatible exactly when they are equal (i.e., when they have the same name and the same commit
+/// requirement). The portable [`AsyncCopyOperation`] and [`WaitOperation`] follow their own protocol, which is not a
+/// value of this type, so no extension protocol is compatible with it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KernelCompletionProtocol {
+    /// Name of the protocol, which includes the owner namespace of the extension (e.g., `mosaic_gpu.tmem`).
+    name: &'static str,
+
+    /// Whether exactly one commit must precede the wait.
+    requires_commit: bool,
+}
+
+impl KernelCompletionProtocol {
+    /// Creates a protocol named `name` whose tokens may be committed any number of times, including none, before
+    /// their wait.
+    pub const fn new(name: &'static str) -> Self {
+        Self { name, requires_commit: false }
+    }
+
+    /// Returns this protocol with the requirement that exactly one commit precede the wait of each token.
+    pub const fn with_required_commit(self) -> Self {
+        Self { requires_commit: true, ..self }
+    }
+
+    /// Returns the name of this protocol.
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Returns whether exactly one commit must precede the wait of each token of this protocol.
+    pub const fn requires_commit(&self) -> bool {
+        self.requires_commit
+    }
+}
+
+impl Default for KernelCompletionProtocol {
+    /// Returns the protocol named `extension`, whose tokens may be committed any number of times before their wait.
+    fn default() -> Self {
+        Self::new("extension")
+    }
 }
 
 /// Kernel semantics that an adapter owns, over the canonical array and reference universe.
@@ -101,14 +148,55 @@ pub trait KernelExtension:
         Err(TypeError::invalid(format!("kernel extension `{}` has no initialization contract", self.name())))
     }
 
+    /// Returns the completion protocol of the token that this operation produces, commits, or waits on.
+    ///
+    /// The verifier and the host interpreter consult this function only for operations whose
+    /// [`Self::memory_semantics`] is [`KernelExtensionMemory::Asynchronous`], [`KernelExtensionMemory::Commit`], or
+    /// [`KernelExtensionMemory::Wait`]. A token carries the protocol of the asynchronous operation that produced it,
+    /// and a commit or a wait accepts only a token whose protocol equals its own. It therefore never clears the
+    /// reservations or publishes the deferred writes of an operation whose protocol it does not implement. When the
+    /// protocol requires a commit, exactly one commit must precede the wait. Tokens of the portable
+    /// [`AsyncCopyOperation`] follow a protocol that no extension can name, so an extension commit or wait never
+    /// completes a portable copy and a [`WaitOperation`] never completes an extension token.
+    ///
+    /// The default is [`KernelCompletionProtocol::default`] for every operation of the extension family, which admits
+    /// any number of commits, including none. This keeps every pairing of an extension producer with an extension
+    /// commit or wait that was admitted before protocols existed, and it rejects only the pairings with portable
+    /// copies, whose deferred state an extension operation cannot complete. An extension that has more than one
+    /// asynchronous protocol, or a protocol that requires a commit, must override this function for all of its
+    /// asynchronous, commit, and wait operations.
+    fn completion_protocol(&self) -> KernelCompletionProtocol {
+        KernelCompletionProtocol::default()
+    }
+
+    /// Returns an upper bound on the number of host replay steps that any binding of this operation takes, or [`None`]
+    /// when no bound is known.
+    ///
+    /// A replay step is an operation binding or a region entry (see
+    /// [`KernelDefinition::interpret_with_limits`]). The bound covers the binding of this operation and every binding
+    /// and region entry that its interpretation rule performs through its interpretation driver, including those of
+    /// the operations that it binds, so it is at least 1. It also covers a binding that fails after its rule bound
+    /// further operations (e.g., to produce a diagnostic), because otherwise such an order would exhaust its planned
+    /// budget and report a step limit instead of its own error. It must not depend on the inputs of the binding,
+    /// because [`KernelDefinition::interpret_interleavings`] plans the replay cost of every order from it before any
+    /// order runs. The default is [`None`], with which the explorer rejects the operation before exploration, because
+    /// an interpretation rule may bind any number of further operations.
+    fn replay_cost(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns an exact, versioned encoding of this operation's semantic payload.
     ///
     /// The encoding must include an unambiguous owner namespace and schema version, every instruction mode and
     /// semantic option, and exact floating-point bits. It must not depend on diagnostic formatting or addresses.
-    /// Inputs, results, regions, and their types are encoded by the enclosing kernel. Type identities in the
-    /// payload must participate in ordinary operation identity renaming before this function is called.
-    /// Unsupported payloads fail explicitly, and implementing this function does not enable source deserialization.
-    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+    /// Inputs, results, regions, and their types are encoded by the enclosing kernel. An implementation encodes every
+    /// type identity that it stores as the index that `identity` returns for it, and never by its nominal name. The
+    /// enclosing kernel numbers the identities of the whole kernel through that function in order of occurrence and
+    /// records their bounds, so equal identities receive equal indices, including identities that appear nowhere
+    /// else in the kernel. Unsupported payloads fail explicitly, and implementing this function does not enable
+    /// source deserialization.
+    fn semantic_key(&self, identity: &mut dyn FnMut(&DimensionVariable) -> usize) -> Result<Vec<u8>, TypeError> {
+        let _ = identity;
         Err(TypeError::invalid(format!("kernel extension `{}` has no exact semantic identity contract", self.name())))
     }
 }
@@ -124,7 +212,7 @@ impl KernelExtension for NoKernelExtension {
         match *self {}
     }
 
-    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+    fn semantic_key(&self, _identity: &mut dyn FnMut(&DimensionVariable) -> usize) -> Result<Vec<u8>, TypeError> {
         match *self {}
     }
 }
@@ -272,9 +360,18 @@ where
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let regions = driver.region_programs();
         if let Self::Call(call) = self {
+            // The inputs are validated against the original call signature first, because the trailing scalar prefetch
+            // values are split off by position.
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            call.infer_output_types(&input_types, &driver.region_interfaces())?;
+
             // Only concrete scalar prefetch values specialize the call. Ordinary data inputs remain residual, even when
-            // known, because static transforms must never execute the mutations of a kernel.
-            if !call.prefetch_types().is_empty() {
+            // known, because static transforms must never execute the mutations of a kernel. Specialization executes
+            // the prefetch conversions and the mapping arithmetic over constants now, so it folds their assertions
+            // exactly as the default rule folds a known operation. When the context cannot fold those effects (e.g.,
+            // because an earlier ordered effect is residual), the original call keeps its prefetched operands, so that
+            // a failure is reported in program order when the residual program runs.
+            if !call.prefetch_types().is_empty() && context.can_fold_effects(call.mapping_program_effects()) {
                 let remaining = inputs.len() - call.prefetch_types().len();
                 let values = inputs[remaining..]
                     .iter()
@@ -456,6 +553,18 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
     }
 }
 
+/// Returns whether a commit (when `commit` is set) or a wait that follows the `completion` protocol may complete a
+/// pending token that follows the `producer` protocol now, where `committed` records whether a commit has already
+/// observed the token. [`None`] denotes the protocol of the portable async copy and wait, which has no commit.
+pub(crate) fn admits_completion(
+    producer: Option<KernelCompletionProtocol>,
+    committed: bool,
+    completion: Option<KernelCompletionProtocol>,
+    commit: bool,
+) -> bool {
+    producer == completion && producer.is_none_or(|protocol| !protocol.requires_commit() || committed != commit)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::borrow::Cow;
@@ -465,17 +574,19 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::macros::check_count;
     use ryft_core::{
-        AddOperation, ArrayReferenceTransformIndex, AttachedRegions, Condition, DataType, Dimension, DimensionBounds,
-        DimensionMulOperation, DimensionVariable, EagerContext, EffectClasses, Effects, EmptyRegionDriver,
-        ErasedOperation, NegOperation, OperationFoldOutput, OperationPayloadProjection, PartialEvaluationOutput,
-        PartialValue, Placeholder, ProgramBuilder, ReferenceAccessMode, ReferenceEffect, ReferenceRead, ReferenceSwap,
-        ReferenceType, ReferenceWrite, RegionDataFlow, ScanOperation, Shape, SubOperation, TagOperation, Tracer,
-        TracingContext,
+        AddOperation, ArrayReference, ArrayReferenceTransformIndex, AssertOperation, AssertionError, AttachedRegions,
+        Condition, DataType, Dimension, DimensionBounds, DimensionError, DimensionMulOperation, DimensionVariable,
+        EagerContext, EffectClasses, Effects, EmptyRegionDriver, ErasedOperation, NegOperation, OperationFoldOutput,
+        OperationPayloadProjection, PartialEvaluation, PartialEvaluationOutput, PartialValue, PartitionedProgram,
+        Placeholder, ProgramBuilder, ReferenceAccessMode, ReferenceEffect, ReferenceRead, ReferenceSwap, ReferenceType,
+        ReferenceWrite, RegionDataFlow, RegionDriver, RegionRef, ScanOperation, Shape, SubOperation, TagOperation,
+        Tracer, TracingContext, TypeIdentityRenaming,
     };
 
-    use crate::calls::KernelParameter;
+    use crate::authoring::{MappingExpression, ParameterWindow, mapped_call};
+    use crate::calls::{KernelError, KernelParameter};
     use crate::grids::Grid;
-    use crate::mappings::{BlockMapping, BoundaryPolicy};
+    use crate::mappings::{BlockMapping, BlockMappingError, BoundaryPolicy};
     use crate::validation::KernelParameterAccess;
 
     use super::*;
@@ -494,6 +605,10 @@ pub(crate) mod tests {
         /// `exact` extension provides a versioned semantic key over its payload.
         HiddenKey { key: u32, exact: bool },
 
+        /// Carries a dimension identity in its payload, which its exact semantic key encodes by name and bounds. It
+        /// has no inputs, results, or effects.
+        Dimension(DimensionVariable),
+
         /// Creates one uninitialized local reference allocation with the given referent.
         Allocate(ArrayType),
 
@@ -503,14 +618,24 @@ pub(crate) mod tests {
         /// Has no accesses and completes synchronously.
         Synchronous,
 
+        /// Synchronously copies the selection of its source reference into the selection of its destination reference.
+        /// The source is input 0 and the destination input 1 when `source_first` is set, and the other way around
+        /// otherwise, so the canonical effects declare the read first only in the former case. `transforms` holds the
+        /// static transforms applied to each input, indexed by input position.
+        CopyInto { source_first: bool, transforms: [Vec<ArrayReferenceTransform>; 2] },
+
         /// Asynchronous update from two sources that reads two references, writes a third, and allocates a completion.
-        Update,
+        /// Its host interpreter writes the first source into the destination when it is issued, which no other
+        /// instruction can observe before the wait, because the destination stays reserved until then. When `strict`
+        /// is set, its completion follows a protocol that requires exactly one commit before the wait, and otherwise
+        /// it follows the default protocol of [`KernelExtension::completion_protocol`].
+        Update { strict: bool },
 
-        /// Observes a pending completion reference.
-        Commit,
+        /// Observes a pending completion reference of the protocol that `strict` selects.
+        Commit { strict: bool },
 
-        /// Consumes a pending completion reference.
-        Wait,
+        /// Consumes a pending completion reference of the protocol that `strict` selects.
+        Wait { strict: bool },
 
         /// Consumes a local allocation.
         Release,
@@ -523,12 +648,14 @@ pub(crate) mod tests {
             match self {
                 Self::Rebinding => "test_rebinding",
                 Self::HiddenKey { .. } => "hidden_key_extension",
+                Self::Dimension(_) => "test_dimension",
                 Self::Allocate(_) => "test_allocate",
                 Self::MisclassifiedAllocation => "test_misclassified_allocation",
                 Self::Synchronous => "test_synchronous",
-                Self::Update => "test_async_update",
-                Self::Commit => "test_commit",
-                Self::Wait => "test_wait",
+                Self::CopyInto { .. } => "test_copy_into",
+                Self::Update { .. } => "test_async_update",
+                Self::Commit { .. } => "test_commit",
+                Self::Wait { .. } => "test_wait",
                 Self::Release => "test_release",
             }
         }
@@ -543,34 +670,63 @@ pub(crate) mod tests {
                     check_count!("input", input_types, 1, TypeError);
                     input_types.to_vec()
                 }
-                Self::HiddenKey { .. } | Self::Synchronous | Self::Commit | Self::Wait | Self::Release => vec![],
+                Self::HiddenKey { .. }
+                | Self::Dimension(_)
+                | Self::Synchronous
+                | Self::CopyInto { .. }
+                | Self::Commit { .. }
+                | Self::Wait { .. }
+                | Self::Release => vec![],
                 Self::Allocate(referent) => vec![ArrayIrType::Reference(ReferenceType::new(referent.clone()))],
                 Self::MisclassifiedAllocation => {
                     vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)))]
                 }
-                Self::Update => vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
+                Self::Update { .. } => {
+                    vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))]
+                }
             })
         }
 
         fn effects(&self) -> Cow<'_, Effects> {
             let declarations = match self {
-                Self::Rebinding | Self::HiddenKey { .. } => return Cow::Borrowed(Effects::empty()),
+                Self::Rebinding | Self::HiddenKey { .. } | Self::Dimension(_) => {
+                    return Cow::Borrowed(Effects::empty());
+                }
                 Self::Allocate(_) | Self::MisclassifiedAllocation => {
                     vec![ReferenceEffect::Allocate { output_index: 0 }]
                 }
                 Self::Synchronous => vec![],
-                Self::Update => vec![
+                Self::CopyInto { source_first, .. } => {
+                    let source = usize::from(!*source_first);
+                    vec![
+                        ReferenceEffect::Access { input_index: source, mode: ReferenceAccessMode::Read },
+                        ReferenceEffect::Access { input_index: 1 - source, mode: ReferenceAccessMode::Write },
+                    ]
+                }
+                Self::Update { .. } => vec![
                     ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
                     ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Read },
                     ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
                     ReferenceEffect::Allocate { output_index: 0 },
                 ],
-                Self::Commit => vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                Self::Wait | Self::Release => {
+                Self::Commit { .. } => {
+                    vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }]
+                }
+                Self::Wait { .. } | Self::Release => {
                     vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
                 }
             };
             Cow::Owned(Effects::new(EffectClasses::NONE, declarations).unwrap())
+        }
+
+        fn rename_type_identities(
+            &self,
+            renaming: &TypeIdentityRenaming<DimensionVariable>,
+        ) -> Result<Self, TypeError> {
+            Ok(match self {
+                Self::Dimension(variable) => Self::Dimension(renaming.rename(variable)),
+                _ => self.clone(),
+            })
         }
     }
 
@@ -581,11 +737,13 @@ pub(crate) mod tests {
             match self {
                 Self::Rebinding
                 | Self::HiddenKey { .. }
+                | Self::Dimension(_)
                 | Self::Allocate(_)
                 | Self::MisclassifiedAllocation
                 | Self::Synchronous => 0,
-                Self::Update => 3,
-                Self::Commit | Self::Wait | Self::Release => 1,
+                Self::CopyInto { .. } => 2,
+                Self::Update { .. } => 3,
+                Self::Commit { .. } | Self::Wait { .. } | Self::Release => 1,
             }
         }
 
@@ -594,8 +752,11 @@ pub(crate) mod tests {
             input_index: usize,
         ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
             match self {
-                Self::Rebinding | Self::HiddenKey { .. } => None,
-                _ => self.effects().accesses().any(|(index, _)| index == input_index).then(|| {
+                Self::Rebinding | Self::HiddenKey { .. } | Self::Dimension(_) => None,
+                Self::CopyInto { transforms, .. } => {
+                    transforms.get(input_index).map(|transforms| ReferenceAccessDescriptor::new(transforms, 2..2))
+                }
+                _ => self.effects().reference_accesses().any(|(index, _)| index == input_index).then(|| {
                     let count = self.base_input_count();
                     ReferenceAccessDescriptor::new(&[], count..count)
                 }),
@@ -614,6 +775,11 @@ pub(crate) mod tests {
                 Self::HiddenKey { .. } => Err(ProgramError::UnsupportedOperation {
                     message: "hidden extension has no reference accesses".to_owned(),
                 }),
+                Self::CopyInto { source_first, transforms: current } if input_index < 2 => {
+                    let mut current = current.clone();
+                    current[input_index] = transforms;
+                    Ok(Self::CopyInto { source_first: *source_first, transforms: current })
+                }
                 _ if transforms.is_empty() && self.reference_access_descriptor(input_index).is_some() => {
                     Ok(self.clone())
                 }
@@ -627,9 +793,11 @@ pub(crate) mod tests {
     impl KernelExtension for TestExtension {
         fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
             Ok(match self {
-                Self::Rebinding | Self::MisclassifiedAllocation | Self::Synchronous => {
-                    KernelExtensionMemory::Synchronous
-                }
+                Self::Rebinding
+                | Self::Dimension(_)
+                | Self::MisclassifiedAllocation
+                | Self::Synchronous
+                | Self::CopyInto { .. } => KernelExtensionMemory::Synchronous,
                 Self::HiddenKey { .. } => {
                     return Err(TypeError::invalid(format!(
                         "kernel extension `{}` has no initialization contract",
@@ -637,18 +805,40 @@ pub(crate) mod tests {
                     )));
                 }
                 Self::Allocate(_) => KernelExtensionMemory::Allocation { output_index: 0 },
-                Self::Update => KernelExtensionMemory::Asynchronous { completion_output_index: 0 },
-                Self::Commit => KernelExtensionMemory::Commit { completion_input_index: 0 },
-                Self::Wait => KernelExtensionMemory::Wait { completion_input_index: 0 },
+                Self::Update { .. } => KernelExtensionMemory::Asynchronous { completion_output_index: 0 },
+                Self::Commit { .. } => KernelExtensionMemory::Commit { completion_input_index: 0 },
+                Self::Wait { .. } => KernelExtensionMemory::Wait { completion_input_index: 0 },
                 Self::Release => KernelExtensionMemory::Release { input_index: 0 },
             })
         }
 
-        fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+        fn completion_protocol(&self) -> KernelCompletionProtocol {
+            match self {
+                Self::Update { strict: true } | Self::Commit { strict: true } | Self::Wait { strict: true } => {
+                    KernelCompletionProtocol::new("test.strict").with_required_commit()
+                }
+                _ => KernelCompletionProtocol::default(),
+            }
+        }
+
+        fn replay_cost(&self) -> Option<usize> {
+            match self {
+                // The binding of the extension and of the `sub` that its rule binds.
+                Self::Rebinding => Some(2),
+                _ => None,
+            }
+        }
+
+        fn semantic_key(&self, identity: &mut dyn FnMut(&DimensionVariable) -> usize) -> Result<Vec<u8>, TypeError> {
             match self {
                 Self::HiddenKey { key: payload, exact: true } => {
                     let mut key = b"test.hidden_key_extension\0v1\0".to_vec();
                     key.extend_from_slice(&payload.to_le_bytes());
+                    Ok(key)
+                }
+                Self::Dimension(variable) => {
+                    let mut key = b"test.dimension\0v1\0".to_vec();
+                    key.extend_from_slice(&identity(variable).to_le_bytes());
                     Ok(key)
                 }
                 _ => Err(TypeError::invalid(format!(
@@ -672,6 +862,25 @@ pub(crate) mod tests {
                     let operation =
                         KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())));
                     driver.bind(context, operation, AttachedRegions::Empty, &[inputs[0].clone(), inputs[0].clone()])
+                }
+                Self::Update { .. } => {
+                    check_count!("input", inputs, 3, ProgramError);
+                    let (ArrayIrValue::Reference(source), ArrayIrValue::Reference(destination)) =
+                        (&inputs[0], &inputs[2])
+                    else {
+                        return Err(ProgramError::MalformedProgram("test update requires references".to_owned()));
+                    };
+                    destination.write(source.read()?)?;
+                    let token = ArrayReference::new(Array::new(ArrayType::scalar(DataType::Token), vec![])?);
+                    Ok(vec![ArrayIrValue::Reference(token)])
+                }
+                Self::Commit { .. } => Ok(vec![]),
+                Self::Wait { .. } => {
+                    let [ArrayIrValue::Reference(token)] = inputs else {
+                        return Err(ProgramError::MalformedProgram("test wait requires one reference".to_owned()));
+                    };
+                    token.freeze()?;
+                    Ok(vec![])
                 }
                 _ => {
                     Err(ProgramError::MalformedProgram(format!("test extension `{}` has no interpreter", self.name())))
@@ -1075,6 +1284,386 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_partial_evaluation_mapping_failures() {
+        // A read-only call with no results whose mapping computes `0 / d` for the prefetched `d`.
+        let call = mapped_call(
+            Grid::new(vec![]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::I32, vec![4]),
+                KernelParameterAccess::ReadOnly,
+                ParameterWindow::ElementStarts {
+                    block_shape: vec![1],
+                    boundary: BoundaryPolicy::InBounds,
+                    starts: vec![MappingExpression::Constant(0) / MappingExpression::Prefetch(0)],
+                },
+            )],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace_with_prefetch(call, |_| Ok(())).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::I32, vec![4]).into());
+        let prefetch = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let region = builder.import_region(definition.body().entry_region_ref());
+        builder
+            .add_instruction(
+                KernelOperation::Call(definition.operation().clone()),
+                vec![region],
+                vec![input, prefetch],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        let data = PartialValue::Unknown(ArrayType::new_static(DataType::I32, vec![4]).into());
+
+        // An unknown prefetched value residualizes the call, which retains its assertion although it has no results.
+        let unknown = program
+            .partially_evaluate(&[data.clone(), PartialValue::Unknown(ArrayType::scalar(DataType::I32).into())])
+            .unwrap();
+        assert_eq!(
+            unknown.program().to_string(),
+            indoc! {"
+                lambda %0:i32[4], %1:i32[] .
+                let () = kernel_call [
+                    grid=[],
+                    prefetch_0=i32[],
+                    identities=[0],
+                    identity_0_bounds=[0, ∞),
+                    parameter_0=read-only i32[4] [1] InBounds,
+                    mapping_0={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        let %1:dimension<0> = const 0
+                            %2:dimension<0> = dimension_div [requires_runtime_assertion=true] %1 %0
+                        in (%2)
+                    },
+                ] %0 %1 [
+                    body={
+                        lambda %0:ref<i32[1]>, %1:i32[] .
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+
+        // A known zero fails specialization exactly as interpretation does.
+        let zero = ArrayIrValue::Array(Array::scalar(0i32).unwrap());
+        let violation = ProgramError::custom(DimensionError::RequirementViolation {
+            message: "`dimension_div` requires right > 0; got left=0, right=0".to_owned(),
+        });
+        assert_eq!(
+            program.partially_evaluate(&[data.clone(), PartialValue::Known(zero)]).unwrap_err(),
+            ProgramError::custom(KernelError::Mapping(BlockMappingError::Program(violation))),
+        );
+
+        // A known valid value specializes the mapping to a constant start, so the pure call is eliminated.
+        let two = ArrayIrValue::Array(Array::scalar(2i32).unwrap());
+        let known = program.partially_evaluate(&[data, PartialValue::Known(two)]).unwrap();
+        assert_eq!(
+            known.program().to_string(),
+            indoc! {"
+                lambda %0:i32[4] .
+                in ()"},
+        );
+    }
+
+    #[test]
+    fn test_kernel_operation_partial_evaluation_preserves_failure_order() {
+        // An assertion precedes a read-only call whose mapping computes `0 / d` for the prefetched `d`.
+        let call = mapped_call(
+            Grid::new(vec![]).unwrap(),
+            vec![(
+                ArrayType::new_static(DataType::I32, vec![4]),
+                KernelParameterAccess::ReadOnly,
+                ParameterWindow::ElementStarts {
+                    block_shape: vec![1],
+                    boundary: BoundaryPolicy::InBounds,
+                    starts: vec![MappingExpression::Constant(0) / MappingExpression::Prefetch(0)],
+                },
+            )],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace_with_prefetch(call, |_| Ok(())).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let condition = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(ArrayType::new_static(DataType::I32, vec![4]).into());
+        let prefetch = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let assertion = KernelOperation::Portable(ArrayIrOperation::Assert(AssertOperation::new("first")));
+        builder.add_instruction(assertion, vec![], vec![condition], None).unwrap();
+        let region = builder.import_region(definition.body().entry_region_ref());
+        builder
+            .add_instruction(
+                KernelOperation::Call(definition.operation().clone()),
+                vec![region],
+                vec![input, prefetch],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 3], vec![])
+            .unwrap();
+        let data = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+        let zero = Array::scalar(0i32).unwrap();
+        let first = AssertionError::Failed { message: "first".to_owned(), observations: vec![] };
+        let error = program
+            .interpret(vec![
+                ArrayIrValue::Array(Array::scalar(false).unwrap()),
+                ArrayIrValue::Array(data.clone()),
+                ArrayIrValue::Array(zero.clone()),
+            ])
+            .unwrap_err();
+        assert_eq!(error.downcast_custom::<AssertionError>(), Some(&first));
+
+        // A residual assertion keeps the known zero from being specialized ahead of it, so the original call and its
+        // prefetched operand remain residual and the assertion still fails first.
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(ArrayType::scalar(DataType::Boolean).into()),
+                PartialValue::Unknown(ArrayType::new_static(DataType::I32, vec![4]).into()),
+                PartialValue::Known(ArrayIrValue::Array(zero)),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {r#"
+                lambda %0:bool[], %1:i32[4], %2:i32[] .
+                let () = assert [message="first", labels=[]] %0
+                    () = kernel_call [
+                        grid=[],
+                        prefetch_0=i32[],
+                        identities=[0],
+                        identity_0_bounds=[0, ∞),
+                        parameter_0=read-only i32[4] [1] InBounds,
+                        mapping_0={
+                            lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                            let %1:dimension<0> = const 0
+                                %2:dimension<0> = dimension_div [requires_runtime_assertion=true] %1 %0
+                            in (%2)
+                        },
+                    ] %1 %2 [
+                        body={
+                            lambda %0:ref<i32[1]>, %1:i32[] .
+                            in ()
+                        },
+                    ]
+                in ()"#},
+        );
+        let condition = |value: bool| ArrayIrValue::Array(Array::scalar(value).unwrap());
+        let error = evaluation
+            .interpret(&EagerContext::new(), &[condition(false), ArrayIrValue::Array(data.clone())])
+            .unwrap_err();
+        assert_eq!(error.downcast_custom::<AssertionError>(), Some(&first));
+        let violation = ProgramError::custom(DimensionError::RequirementViolation {
+            message: "`dimension_div` requires right > 0; got left=0, right=0".to_owned(),
+        });
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[condition(true), ArrayIrValue::Array(data)]),
+            Err(ProgramError::custom(KernelError::Mapping(BlockMappingError::Program(violation)))),
+        );
+    }
+
+    #[test]
+    fn test_kernel_operation_partial_evaluation_inputs() {
+        /// Region driver that exposes the body of one kernel call and supports no recursive partial evaluation.
+        struct CallBodyDriver<'o> {
+            definition: &'o KernelDefinition,
+        }
+
+        impl RegionDriver<ArrayIrValue<Array>, KernelOperation> for CallBodyDriver<'_> {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, ArrayIrValue<Array>, KernelOperation>>
+            where
+                ArrayIrValue<Array>: 'r,
+                KernelOperation: 'r,
+            {
+                std::iter::once(self.definition.body().entry_region_ref())
+            }
+        }
+
+        impl PartialEvaluationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation>> for CallBodyDriver<'_> {
+            fn partially_evaluate_region(
+                &self,
+                _context: &PartialEvaluationContext<EagerContext<ArrayIrValue<Array>, KernelOperation>>,
+                _index: usize,
+                _inputs: Vec<PartialEvaluationValue<ArrayIrValue<Array>>>,
+            ) -> Result<Vec<PartialEvaluationValue<ArrayIrValue<Array>>>, ProgramError> {
+                panic!("a kernel call never partially evaluates its body")
+            }
+
+            fn partially_evaluate_program(
+                &self,
+                _context: &PartialEvaluationContext<EagerContext<ArrayIrValue<Array>, KernelOperation>>,
+                _region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation>,
+                _knowledge: &[PartialValue<ArrayIrValue<Array>>],
+            ) -> Result<PartialEvaluation<EagerContext<ArrayIrValue<Array>, KernelOperation>>, ProgramError>
+            {
+                panic!("a kernel call never partially evaluates its body")
+            }
+
+            fn partition_program(
+                &self,
+                _context: &PartialEvaluationContext<EagerContext<ArrayIrValue<Array>, KernelOperation>>,
+                _region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation>,
+                _input_known: &[bool],
+            ) -> Result<PartitionedProgram<ArrayIrValue<Array>, KernelOperation>, ProgramError> {
+                panic!("a kernel call never partitions its body")
+            }
+        }
+
+        // A call that copies the element of its `i32[4]` data input at the prefetched start into its `i32[1]` result,
+        // whose logical inputs are therefore `[i32[4], i32[]]`.
+        let data_type = ArrayType::new_static(DataType::I32, vec![4]);
+        let prefetch_type = ArrayType::scalar(DataType::I32);
+        let call = mapped_call(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                (
+                    data_type.clone(),
+                    KernelParameterAccess::ReadOnly,
+                    ParameterWindow::ElementStarts {
+                        block_shape: vec![1],
+                        boundary: BoundaryPolicy::InBounds,
+                        starts: vec![MappingExpression::Prefetch(0)],
+                    },
+                ),
+                (
+                    ArrayType::new_static(DataType::I32, vec![1]),
+                    KernelParameterAccess::WriteOnly,
+                    ParameterWindow::WholeArray,
+                ),
+            ],
+            vec![prefetch_type.clone()],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace_with_prefetch(call, |(references, _, _)| {
+            let value = references[0].read()?;
+            references[1].write(&value)
+        })
+        .unwrap();
+        let driver = CallBodyDriver { definition: &definition };
+        let operation = KernelOperation::Call(definition.operation().clone());
+        let data = ArrayIrValue::Array(Array::vector(vec![5i32, 6, 7, 8]).unwrap());
+        let two = ArrayIrValue::Array(Array::scalar(2i32).unwrap());
+        let evaluate = |inputs: &[Option<ArrayIrValue<Array>>], types: &[ArrayType]| {
+            let context = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, KernelOperation>::new());
+            let inputs = inputs
+                .iter()
+                .zip(types)
+                .enumerate()
+                .map(|(index, (input, r#type))| match input {
+                    Some(value) => PartialEvaluationValue::known_input(value.clone()),
+                    None => context.unknown_input(r#type.clone().into(), index),
+                })
+                .collect::<Vec<_>>();
+            let outputs = operation.partially_evaluate(&context, &driver, &inputs)?;
+            context.into_evaluation(outputs)
+        };
+        let mismatch =
+            ProgramError::Type(TypeError::invalid("`kernel_call` input types do not match its logical signature"));
+
+        // Inputs that do not match the original signature are rejected before the prefetch values are split off,
+        // whether the trailing input is known or not.
+        let i64_two = ArrayIrValue::Array(Array::scalar(2i64).unwrap());
+        let i64_type = ArrayType::scalar(DataType::I64);
+        assert_eq!(evaluate(&[], &[]).map(|_| ()), Err(mismatch.clone()));
+        let prefetch_types = std::slice::from_ref(&prefetch_type);
+        assert_eq!(evaluate(&[Some(two.clone())], prefetch_types).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(evaluate(&[None], prefetch_types).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(
+            evaluate(&[Some(data.clone())], std::slice::from_ref(&data_type)).map(|_| ()),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(
+            evaluate(&[None, None, Some(two.clone())], &[data_type.clone(), data_type.clone(), prefetch_type.clone()],)
+                .map(|_| ()),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(
+            evaluate(&[None, Some(i64_two)], &[data_type.clone(), i64_type.clone()]).map(|_| ()),
+            Err(mismatch.clone()),
+        );
+        assert_eq!(evaluate(&[None, None], &[data_type.clone(), i64_type]).map(|_| ()), Err(mismatch.clone()));
+        assert_eq!(
+            evaluate(&[Some(two.clone()), None], &[prefetch_type.clone(), data_type.clone()]).map(|_| ()),
+            Err(mismatch),
+        );
+
+        // A known prefetch value specializes the call, whose residual takes only the data input, known or not.
+        let expected = vec![ArrayIrValue::Array(Array::vector(vec![7i32]).unwrap())];
+        let specialized = indoc! {"
+            lambda %0:i32[4] .
+            let %1:i32[1] = kernel_call [
+                grid=[],
+                parameter_0=read-only i32[4] [1] InBounds,
+                mapping_0={
+                    lambda  .
+                    let %0:dimension<2> = const 2
+                    in (%0)
+                },
+                parameter_1=write-only i32[1] [1] InBounds,
+                mapping_1={
+                    lambda  .
+                    let %0:dimension<2> = const 2
+                        %1:dimension<0> = const 0
+                    in (%1)
+                },
+            ] %0 [
+                body={
+                    lambda %0:ref<i32[1]>, %1:ref<i32[1]> .
+                    let %2:i32[1] = reference_read %0
+                        () = reference_write %1 %2
+                    in ()
+                },
+            ]
+            in (%1)"};
+        let evaluation = evaluate(&[None, Some(two.clone())], &[data_type.clone(), prefetch_type.clone()]).unwrap();
+        assert_eq!(evaluation.program().to_string(), specialized);
+        assert_eq!(evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&data)), Ok(expected.clone()));
+        let evaluation =
+            evaluate(&[Some(data.clone()), Some(two.clone())], &[data_type.clone(), prefetch_type.clone()]).unwrap();
+        assert_eq!(evaluation.program().to_string(), specialized);
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(expected.clone()));
+
+        // An unknown prefetch value leaves the original call and its complete input list residual. The known data input
+        // becomes a residual program input after the unknown prefetch value.
+        let evaluation = evaluate(&[Some(data.clone()), None], &[data_type.clone(), prefetch_type.clone()]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:i32[4] .
+                let %2:i32[1] = kernel_call [
+                    grid=[],
+                    prefetch_0=i32[],
+                    identities=[0, 0],
+                    identity_0_bounds=[0, ∞),
+                    parameter_0=read-only i32[4] [1] InBounds,
+                    mapping_0={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        in (%0)
+                    },
+                    parameter_1=write-only i32[1] [1] InBounds,
+                    mapping_1={
+                        lambda %0:dimension<prefetch_0 ∈ [0, ∞)> .
+                        let %1:dimension<0> = const 0
+                        in (%1)
+                    },
+                ] %1 %0 [
+                    body={
+                        lambda %0:ref<i32[1]>, %1:ref<i32[1]>, %2:i32[] .
+                        let %3:i32[1] = reference_read %0
+                            () = reference_write %1 %3
+                        in ()
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&two)), Ok(expected.clone()));
+        let evaluation = evaluate(&[None, None], &[data_type, prefetch_type]).unwrap();
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[data, two]), Ok(expected));
+    }
+
+    #[test]
     fn test_kernel_operation_reference_access_descriptor() {
         let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
         let canonical =
@@ -1204,7 +1793,7 @@ pub(crate) mod tests {
         impl KernelExtension for UnavailableExtension {}
 
         assert_eq!(
-            UnavailableExtension.semantic_key(),
+            UnavailableExtension.semantic_key(&mut |_| 0),
             Err(TypeError::invalid("kernel extension `unavailable_extension` has no exact semantic identity contract")),
         );
         assert_eq!(

@@ -1,4 +1,7 @@
 //! Bounded AOT tool invocation and strict producer-manifest validation.
+//!
+//! The exporter records the toolchain, ABI, and cubin. The adapter adds the digest of the source that it generated,
+//! which [`CompiledKernel::from_manifest`] compares against the current lowering on every restoration.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -12,10 +15,9 @@ use ryft_kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, NoKer
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::kernels::cutile::lowering;
 use crate::kernels::cutile::{
     COMPILER_SCHEMA_VERSION, CUDA_TILE_VERSION, CompiledKernel, Configuration, Error, NVCC_VERSION, NVVM_VERSION,
-    Options, Parameter, TILEIRAS_VERSION, Target, Versions,
+    Options, Parameter, TILEIRAS_VERSION, Target, Versions, lowering,
 };
 
 /// Compiler installation and optional cancellation signal. Neither owns any CUDA runtime resource.
@@ -272,8 +274,15 @@ impl KernelCompiler for Compiler {
             if fs::metadata(&manifest_path)?.len() > options.maximum_diagnostic_bytes() as u64 {
                 return Err(Error::Artifact { message: "manifest exceeds the size limit".into() });
             }
-            let mut output =
-                CompiledKernel::from_manifest(kernel, &fs::read(manifest_path)?, fs::read(artifact_path)?)?;
+            // The adapter, not the exporter, records the digest of the source that it generated.
+            let mut manifest: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&fs::read(manifest_path)?)?;
+            let digest = hex::encode(Sha256::digest(&source.code));
+            if manifest.insert("source_sha256".into(), digest.into()).is_some() {
+                return Err(Error::Artifact { message: "exporter manifest records a source digest".into() });
+            }
+            let manifest = serde_json::to_vec(&manifest)?;
+            let mut output = CompiledKernel::from_manifest(kernel, &manifest, fs::read(artifact_path)?)?;
             if output.configuration_key() != configuration_key {
                 return Err(Error::Artifact { message: "manifest changed compiler identity".into() });
             }
@@ -441,8 +450,11 @@ mod tests {
         let cubin = crate::kernels::cutile::tests::cubin();
         let mut manifest = crate::kernels::cutile::tests::manifest(&kernel, &cubin);
         manifest.configuration_key = compiler.key(&target, &schedule).unwrap();
+        // The exporter does not record the source digest, which the adapter adds to its manifest.
+        let mut exported = serde_json::to_value(&manifest).unwrap();
+        let digest = exported.as_object_mut().unwrap().remove("source_sha256").unwrap();
         fs::write(directory.path().join("fixture.cubin"), &cubin).unwrap();
-        fs::write(directory.path().join("fixture.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(directory.path().join("fixture.json"), serde_json::to_vec(&exported).unwrap()).unwrap();
         // The fake tool only transports independent fixture metadata; it does not synthesize the decoder's result.
         let fixture = directory.path().to_str().unwrap().replace('\'', "'\"'\"'");
         fs::write(
@@ -474,6 +486,7 @@ fi
             ]
         );
         assert_eq!(output.semantic_key(), definition.semantic_key().unwrap());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(output.manifest()).unwrap()["source_sha256"], digest);
         assert_eq!(output.diagnostics(), "stdout:\ncompiled fixture\nstderr:\n");
     }
 }

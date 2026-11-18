@@ -12,8 +12,9 @@
 //! into one. Parallel grid dimensions permit every merge. Sequential grid dimensions impose completion dependencies, so
 //! a grid point whose coordinate along a sequential axis is nonzero starts only after its immediate predecessor along
 //! that axis has completed every instruction. These immediate predecessors suffice to enforce the complete partial
-//! order of the grid. Each interleaving is replayed with the canonical resumable interpreter, fresh private storage,
-//! and the same qualified context as [`KernelDefinition::interpret_with_trace`].
+//! order of the grid. The specialized definition is qualified once, and each interleaving is then replayed with the
+//! canonical resumable interpreter, fresh private storage and runtime state, and the same qualified context as
+//! [`KernelDefinition::interpret_with_trace`].
 //!
 //! # Admission
 //!
@@ -27,19 +28,33 @@
 //!     whose valid region ordinary interpretation publishes back after its grid point completes, and the ordered
 //!     replay of an interleaving has no such publication step.
 //!   - Every atomic update must select at most one element, so that one step represents one indivisible update.
+//!   - Every extension operation of the body must declare its replay cost through [`KernelExtension::replay_cost`].
+//!     The interpretation rule of an extension may bind further operations, each of which consumes a replay step, so
+//!     without a declared cost the replay cost of an order could not be planned without executing it. The plan is
+//!     sound only when that cost bounds every binding of the operation, including one whose rule binds diagnostic
+//!     operations and then fails, because an order that exhausts its steps reports the step limit instead of its own
+//!     execution error. An extension operation is one step of an interleaving, so the operations that its rule binds
+//!     run without interruption.
 //!
-//! Grid extents must already be static, and qualification (i.e., [`validate_kernel_initialization`]) rejects races
-//! and uninitialized accesses before exploration. Nested regions and masked windows remain executable by ordinary
-//! host interpretation, and unsupported kernels fail with [`KernelSchedulingError::Unsupported`].
+//! Grid extents must already be static, and qualification (i.e.,
+//! [`validate_kernel_initialization`](crate::initialization::validate_kernel_initialization)) rejects races and
+//! uninitialized accesses before exploration. Nested regions, masked windows, and extension operations remain
+//! executable by ordinary host interpretation, and unsupported kernels (including extension operations of unknown
+//! replay cost) fail with [`KernelSchedulingError::Unsupported`].
 //!
 //! # Limits and Results
 //!
 //! The [`KernelDebugOptions`] bound the number of grid points and the number of replay steps of each interleaving,
-//! and the `maximum_interleavings` argument bounds the number of interleavings. Exceeding any of these bounds returns
-//! an error before any interleaving executes, so a partial list is never presented as exhaustive. Each returned
-//! [`KernelInterleaving`] holds the functional outputs or the exact execution error of its order, together with the
-//! trace of the operation bindings that it attempted. An execution error stays attached to its interleaving and does
-//! not stop the remaining interleavings from executing.
+//! and the `maximum_interleavings` argument bounds the number of interleavings. The replay steps of each interleaving
+//! are bounded by one step per body entry, one per portable or kernel memory instruction, which binds no other
+//! operation, and the declared replay cost of every extension operation, for every grid point. The explorer computes
+//! that bound with checked arithmetic and checks it against the step limit, so every order, including one that fails,
+//! stays within that limit. Exceeding any of these bounds returns an error before any interleaving executes, so a
+//! partial list is never presented as exhaustive. Each returned [`KernelInterleaving`] holds the functional outputs or
+//! the exact execution error of its order, together with the trace of the operation bindings that it attempted. An
+//! execution error stays attached to its interleaving and does not stop the remaining interleavings from executing.
+
+use std::rc::Rc;
 
 use ryft_core::{
     Array, ArrayIrType, ArrayIrValue, Domain, EagerContext, InterpretableOperation, Operation, ProgramError,
@@ -49,7 +64,7 @@ use thiserror::Error;
 
 use crate::calls::KernelDefinition;
 use crate::grids::{Grid, GridExecution};
-use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
+use crate::initialization::{KernelInitializationError, validated_kernel_references};
 use crate::interpretation::{KernelDebugOptions, KernelTraceEntry};
 use crate::mappings::BoundaryPolicy;
 use crate::operations::{KernelExtension, KernelOperation};
@@ -72,7 +87,8 @@ pub enum KernelSchedulingError {
         maximum: usize,
     },
 
-    /// The total count of instructions and region entries cannot be represented by a host index.
+    /// The total count of replay steps (i.e., operation bindings and region entries) cannot be represented by a host
+    /// index.
     #[error("kernel interleaving step count exceeds the host index range")]
     StepCountOverflow,
 
@@ -127,9 +143,13 @@ where
     /// selecting a preferred answer.
     ///
     /// Atomic updates must select at most one element so an operation step represents one indivisible update.
-    /// Nested regions and masked windows are explicitly unsupported here. Scalar prefetch is specialized from the
-    /// supplied ordinary array inputs before planning, as in ordinary host interpretation. Dynamic grid extents must
-    /// already have been specialized. Exceeding a planning bound returns an error before any execution begins.
+    /// Nested regions, masked windows, and extension operations whose [`KernelExtension::replay_cost`] is unknown are
+    /// explicitly unsupported here. Scalar prefetch is specialized from the supplied ordinary array inputs before
+    /// planning, as in ordinary host interpretation. Dynamic grid extents must already have been specialized. Each
+    /// order takes at most one replay step per body entry and per portable or kernel memory instruction, plus the
+    /// declared replay cost of every extension operation, for every grid point, and exceeding a planning bound,
+    /// including that step count, returns an error before any execution begins. That bound covers failing orders only
+    /// when every declared replay cost also bounds the failing bindings of its operation.
     ///
     /// # Parameters
     ///
@@ -181,10 +201,19 @@ where
             return Err(ProgramError::custom(KernelSchedulingError::Unsupported { reason: "masked windows" }));
         }
         let body = self.body().entry_region_ref();
+        let mut costs = Vec::with_capacity(body.instructions().len());
         for instruction in body.instructions() {
+            costs.push(match instruction.operation() {
+                KernelOperation::Extension(extension) => extension.replay_cost().ok_or_else(|| {
+                    ProgramError::custom(KernelSchedulingError::Unsupported {
+                        reason: "extension operations of unknown replay cost",
+                    })
+                })?,
+                _ => 1,
+            });
             let descriptors =
                 validated_reference_access_descriptors(instruction.operation(), instruction.inputs().len())?;
-            for (input, mode) in instruction.operation().effects().accesses() {
+            for (input, mode) in instruction.operation().effects().reference_accesses() {
                 if mode == ReferenceAccessMode::AtomicAccumulate {
                     let r#type = body.atoms()[instruction.inputs()[input].index()].r#type();
                     let ArrayIrType::Reference(reference) = r#type.as_ref() else { unreachable!() };
@@ -227,13 +256,12 @@ where
                 maximum: options.maximum_programs(),
             }));
         }
-        validate_kernel_initialization(self.body().entry_region_ref(), self.operation(), options.maximum_programs())
-            .map_err(ProgramError::custom)?;
-        let instructions = self.body().entry_region().instructions().len();
-        let required = instructions
-            .checked_add(1)
-            .and_then(|count| count.checked_mul(points.len()))
-            .ok_or_else(|| ProgramError::custom(KernelSchedulingError::StepCountOverflow))?;
+        let references = Rc::new(
+            validated_kernel_references(self.body().entry_region_ref(), self.operation(), options.maximum_programs())
+                .map_err(ProgramError::custom)?,
+        );
+        let instructions = costs.len();
+        let required = replay_steps(costs, points.len()).map_err(ProgramError::custom)?;
         if required > options.maximum_steps() {
             return Err(ProgramError::custom(KernelSchedulingError::StepLimit {
                 required,
@@ -250,7 +278,8 @@ where
             .into_iter()
             .map(|order| {
                 let mut trace = Vec::new();
-                let result = self.interpret_in_order(inputs.clone(), options, Some(&order), &mut trace);
+                let result =
+                    self.interpret_in_order(inputs.clone(), options, Some((&order, references.clone())), &mut trace);
                 KernelInterleaving { result, trace }
             })
             .collect())
@@ -320,6 +349,20 @@ impl Grid {
     }
 }
 
+/// Returns the number of replay steps that one order of a flat body takes at most across `points` grid points, which
+/// is one body entry and the replay `costs` of the body instructions for every point. A portable or kernel memory
+/// instruction without attached regions binds no other operation, so its cost is exactly one step, and an extension
+/// operation costs its [`KernelExtension::replay_cost`], which must bound its failing bindings as well. An order that
+/// fails stops early, so it takes fewer steps. Extensions of unknown cost are not admitted, because their rules may
+/// bind further operations whose number is unknown before they run.
+fn replay_steps(costs: impl IntoIterator<Item = usize>, points: usize) -> Result<usize, KernelSchedulingError> {
+    costs
+        .into_iter()
+        .try_fold(1usize, |steps, cost| steps.checked_add(cost))
+        .and_then(|steps| steps.checked_mul(points))
+        .ok_or(KernelSchedulingError::StepCountOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -327,15 +370,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType,
-        CompareOperation, ComparisonDirection, ConditionOperation, Context, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, Placeholder, ProgramBuilder, Provenance, ReferenceAtomicAddUpdate,
-        ReferenceAtomicAddUpdateOperation, SelectOperation,
+        AttachedRegions, CompareOperation, ComparisonDirection, ConditionOperation, Context, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, InterpretationDriver, Placeholder, ProgramBuilder, Provenance,
+        ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAtomicAddUpdate,
+        ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceWrite, RegionInterface, SelectOperation,
+        SubOperation, TypeError,
     };
 
+    use crate::authoring::whole_array_parameter;
     use crate::calls::{KernelCallOperation, KernelParameter};
     use crate::grids::GridDimension;
     use crate::interpretation::KernelInterpretationError;
     use crate::mappings::BlockMapping;
+    use crate::operations::KernelExtensionMemory;
+    use crate::operations::tests::TestExtension;
     use crate::validation::KernelParameterAccess;
 
     use super::*;
@@ -559,6 +607,222 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_interleavings_extension_replay_costs() {
+        // The extension binds a nested `sub` through its interpretation rule and declares that cost, so the body
+        // entry, the three body instructions, and the nested binding take five replay steps.
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::<TestExtension>::trace(call, |(references, _coordinates)| {
+            let input = references[0].read()?;
+            let output = references[0]
+                .context()
+                .bind(KernelOperation::Extension(TestExtension::Rebinding), vec![], &[input])?
+                .remove(0);
+            references[1].write(&output)
+        })
+        .unwrap();
+        let input = Array::scalar(3f32).unwrap();
+        let options = KernelDebugOptions::default().with_maximum_steps(5);
+        let mut trace = Vec::new();
+        assert_eq!(
+            definition.interpret_with_trace(vec![input.clone()], &options, &mut trace),
+            Ok(vec![Array::scalar(0f32).unwrap()]),
+        );
+        assert_eq!(trace.len(), 4);
+        let interleavings = definition.interpret_interleavings(vec![input.clone()], &options, 1).unwrap();
+        assert_eq!(interleavings.len(), 1);
+        assert_eq!(interleavings[0].result(), &Ok(vec![Array::scalar(0f32).unwrap()]));
+        assert_eq!(
+            interleavings[0].trace().iter().map(KernelTraceEntry::operation).collect::<Vec<_>>(),
+            vec!["reference_read", "test_rebinding", "sub", "reference_write"],
+        );
+
+        // At a budget of four steps, planning fails with an outer error instead of running the order into its limit.
+        let error = definition
+            .interpret_interleavings(vec![input.clone()], &options.with_maximum_steps(4), 1)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelSchedulingError>(),
+            Some(&KernelSchedulingError::StepLimit { required: 5, maximum: 4 }),
+        );
+
+        // An extension of unknown replay cost is rejected before exploration, whatever the step budget.
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadWrite).unwrap()],
+        )
+        .unwrap();
+        let definition = KernelDefinition::<TestExtension>::trace(call, |(references, _coordinates)| {
+            references[0].context().bind(KernelOperation::Extension(TestExtension::Synchronous), vec![], &[])?;
+            Ok(())
+        })
+        .unwrap();
+        for maximum_steps in [1, usize::MAX] {
+            let error = definition
+                .interpret_interleavings(vec![input.clone()], &options.with_maximum_steps(maximum_steps), 1)
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<KernelSchedulingError>(),
+                Some(&KernelSchedulingError::Unsupported { reason: "extension operations of unknown replay cost" }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_interleavings_extension_failure_replay_costs() {
+        // Returns its input in one step when that input is zero, and otherwise binds two diagnostic `sub` operations
+        // before it fails, which takes three steps. It declares `cost` as its replay cost.
+        #[derive(Clone, Debug)]
+        struct DiagnosingExtension {
+            cost: usize,
+        }
+
+        impl Operation for DiagnosingExtension {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "test_diagnosing"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+        }
+
+        impl ReferenceAccessOperation for DiagnosingExtension {
+            type Transform = ArrayReferenceTransform;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<ArrayReferenceTransform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "test extension has no reference accesses".to_owned(),
+                })
+            }
+        }
+
+        impl KernelExtension for DiagnosingExtension {
+            fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+                Ok(KernelExtensionMemory::Synchronous)
+            }
+
+            fn replay_cost(&self) -> Option<usize> {
+                Some(self.cost)
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<DiagnosingExtension>>>
+            for DiagnosingExtension
+        {
+            fn interpret<
+                D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<DiagnosingExtension>>>,
+            >(
+                &self,
+                context: &EagerContext<ArrayIrValue<Array>, KernelOperation<DiagnosingExtension>>,
+                driver: &D,
+                inputs: &[ArrayIrValue<Array>],
+            ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+                let ArrayIrValue::Array(input) = &inputs[0] else { unreachable!() };
+                if input.elements::<i32>()?[0] == 0 {
+                    return Ok(inputs.to_vec());
+                }
+                for _ in 0..2 {
+                    let operation =
+                        KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())));
+                    driver.bind(context, operation, AttachedRegions::Empty, &[inputs[0].clone(), inputs[0].clone()])?;
+                }
+                Err(ProgramError::UnsupportedOperation { message: "nonzero diagnosing input".to_owned() })
+            }
+        }
+
+        let definition = |cost: usize| {
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![
+                    whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadOnly).unwrap(),
+                    whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::WriteOnly).unwrap(),
+                ],
+            )
+            .unwrap();
+            KernelDefinition::<DiagnosingExtension>::trace(call, |(references, _coordinates)| {
+                let input = references[0].read()?;
+                let operation = KernelOperation::Extension(DiagnosingExtension { cost });
+                let output = references[0].context().bind(operation, vec![], &[input])?.remove(0);
+                references[1].write(&output)
+            })
+            .unwrap()
+        };
+        let operations = |interleaving: &KernelInterleaving| {
+            interleaving.trace().iter().map(KernelTraceEntry::operation).collect::<Vec<_>>()
+        };
+
+        // A replay cost that bounds the failing binding too plans enough steps for the failing order to report its own
+        // execution error. The body entry, the read, the three steps of the failing extension, and the write take six.
+        let definition_with_bound = definition(3);
+        let options = KernelDebugOptions::default().with_maximum_steps(6);
+        let interleavings = definition_with_bound
+            .interpret_interleavings(vec![Array::scalar(0i32).unwrap()], &options, 1)
+            .unwrap();
+        assert_eq!(interleavings[0].result(), &Ok(vec![Array::scalar(0i32).unwrap()]));
+        assert_eq!(operations(&interleavings[0]), vec!["reference_read", "test_diagnosing", "reference_write"]);
+        let interleavings = definition_with_bound
+            .interpret_interleavings(vec![Array::scalar(1i32).unwrap()], &options, 1)
+            .unwrap();
+        assert_eq!(
+            interleavings[0].result(),
+            &Err(ProgramError::UnsupportedOperation { message: "nonzero diagnosing input".to_owned() }),
+        );
+        assert_eq!(operations(&interleavings[0]), vec!["reference_read", "test_diagnosing", "sub", "sub"]);
+        let error = definition_with_bound
+            .interpret_interleavings(vec![Array::scalar(1i32).unwrap()], &options.with_maximum_steps(5), 1)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelSchedulingError>(),
+            Some(&KernelSchedulingError::StepLimit { required: 6, maximum: 5 }),
+        );
+
+        // A replay cost that covers only the successful binding violates that contract, so the failing order runs
+        // into the step limit instead of reporting its execution error.
+        let definition_without_bound = definition(1);
+        let options = KernelDebugOptions::default().with_maximum_steps(4);
+        let interleavings = definition_without_bound
+            .interpret_interleavings(vec![Array::scalar(1i32).unwrap()], &options, 1)
+            .unwrap();
+        assert_eq!(
+            interleavings[0].result().as_ref().unwrap_err().downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::StepLimit {
+                maximum_steps: 4,
+                coordinate: vec![],
+                operation: "sub",
+                provenance: Provenance::unknown(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_interleavings_element_atomics() {
         // Both programs select the whole vector, and their atomic updates index the same single element of it.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -699,5 +963,19 @@ mod tests {
         let grid = Grid::new(vec![GridDimension::new(Dimension::Static(0), GridExecution::Parallel)]).unwrap();
         assert_eq!(grid.interleavings(&[0], &[], 3, 1), Ok(vec![vec![]]));
         assert_eq!(grid.interleavings(&[0], &[], 3, 0), Err(KernelSchedulingError::InterleavingLimit { maximum: 0 }));
+    }
+
+    #[test]
+    fn test_replay_steps() {
+        assert_eq!(replay_steps([1; 4], 2), Ok(10));
+        assert_eq!(replay_steps([1, 2, 1], 1), Ok(5));
+        assert_eq!(replay_steps([], 3), Ok(3));
+        assert_eq!(replay_steps([1; 3], 0), Ok(0));
+        assert_eq!(replay_steps([], usize::MAX), Ok(usize::MAX));
+        assert_eq!(replay_steps([usize::MAX - 1], 1), Ok(usize::MAX));
+        assert_eq!(replay_steps([1], usize::MAX), Err(KernelSchedulingError::StepCountOverflow));
+        assert_eq!(replay_steps([usize::MAX], 1), Err(KernelSchedulingError::StepCountOverflow));
+        assert_eq!(replay_steps([usize::MAX], 0), Err(KernelSchedulingError::StepCountOverflow));
+        assert_eq!(replay_steps([usize::MAX - 1, 1], 0), Err(KernelSchedulingError::StepCountOverflow));
     }
 }

@@ -4,11 +4,11 @@ use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
 use ryft_core::{
-    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DotOperation, EffectClass, EffectClasses, Effects,
-    Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface,
-    TypeError,
+    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DimensionVariable, DotOperation, EffectClass,
+    EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessOperation, RegionInterface, TypeError,
 };
-use ryft_kernels::{KernelExtension, KernelExtensionMemory, NoKernelExtension};
+use ryft_kernels::{KernelCompletionProtocol, KernelExtension, KernelExtensionMemory, NoKernelExtension};
 
 use crate::kernels::gpu::tmem::TmemOperation;
 
@@ -256,9 +256,23 @@ impl KernelExtension for GpuOperation {
         }
     }
 
-    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+    fn completion_protocol(&self) -> KernelCompletionProtocol {
         match self {
-            Self::Tmem(operation) => operation.semantic_key(),
+            Self::Tmem(operation) => operation.completion_protocol(),
+            _ => KernelCompletionProtocol::default(),
+        }
+    }
+
+    fn replay_cost(&self) -> Option<usize> {
+        match self {
+            Self::Tmem(operation) => operation.replay_cost(),
+            _ => None,
+        }
+    }
+
+    fn semantic_key(&self, identity: &mut dyn FnMut(&DimensionVariable) -> usize) -> Result<Vec<u8>, TypeError> {
+        match self {
+            Self::Tmem(operation) => operation.semantic_key(identity),
             Self::Wgmma => Ok(b"ryft-mosaic.gpu.operations.v1\0wgmma\0".to_vec()),
             Self::Nvfp4Sparse { tensor_scale } => {
                 let mut key = b"ryft-mosaic.gpu.operations.v1\0nvfp4_sparse\0".to_vec();
@@ -286,7 +300,10 @@ mod tests {
         assert_eq!(GpuOperation::Wgmma.to_string(), "mosaic_gpu.wgmma");
         assert_eq!(format!("{:?}", GpuOperation::Wgmma), "Wgmma");
         assert_eq!(GpuOperation::Wgmma.memory_semantics(), Ok(KernelExtensionMemory::Synchronous));
-        assert_eq!(GpuOperation::Wgmma.semantic_key(), Ok(b"ryft-mosaic.gpu.operations.v1\0wgmma\0".to_vec()));
+        assert_eq!(
+            GpuOperation::Wgmma.semantic_key(&mut |_| 0),
+            Ok(b"ryft-mosaic.gpu.operations.v1\0wgmma\0".to_vec())
+        );
     }
 
     #[test]
@@ -318,7 +335,10 @@ mod tests {
         assert_eq!(operation.infer_output_types(&inputs, &[]), Ok(vec![inputs[4].clone()]));
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(operation.to_string(), "mosaic_gpu.nvfp4_sparse [tensor_scale=false]");
-        assert_ne!(operation.semantic_key(), GpuOperation::Nvfp4 { tensor_scale: false }.semantic_key());
+        assert_ne!(
+            operation.semantic_key(&mut |_| 0),
+            GpuOperation::Nvfp4 { tensor_scale: false }.semantic_key(&mut |_| 0)
+        );
         inputs[5] = ArrayIrType::Array(ArrayType::new_static(DataType::U8, [16, 8]));
         assert!(matches!(operation.infer_output_types(&inputs, &[]), Err(TypeError::Invalid { message })
             if message == "`mosaic_gpu.nvfp4_sparse` operand, block-scale, and addend shapes are incompatible"));
@@ -353,8 +373,8 @@ mod tests {
     fn test_gpu_operation_nvfp4_semantic_key() {
         let operation = GpuOperation::Nvfp4 { tensor_scale: false };
         let scaled = GpuOperation::Nvfp4 { tensor_scale: true };
-        assert_eq!(operation.semantic_key(), Ok(b"ryft-mosaic.gpu.operations.v1\0nvfp4\0\0".to_vec()));
-        assert_eq!(scaled.semantic_key(), Ok(b"ryft-mosaic.gpu.operations.v1\0nvfp4\0\x01".to_vec()));
+        assert_eq!(operation.semantic_key(&mut |_| 0), Ok(b"ryft-mosaic.gpu.operations.v1\0nvfp4\0\0".to_vec()));
+        assert_eq!(scaled.semantic_key(&mut |_| 0), Ok(b"ryft-mosaic.gpu.operations.v1\0nvfp4\0\x01".to_vec()));
         assert_ne!(operation.to_string(), scaled.to_string());
         assert_eq!(operation.memory_semantics(), Ok(KernelExtensionMemory::Synchronous));
     }

@@ -4,7 +4,12 @@
 //! tensor under the validity mask of that window, which excludes its physical tile padding, its elements beyond the
 //! enclosing window, and its elements beyond the array. Reference reads and
 //! [`TileLoadOperation`](ryft_kernels::TileLoadOperation) lower to `tt.load` with that mask and an explicit `other`
-//! value, and reference writes lower to `tt.store` with that mask.
+//! value, and reference writes lower to `tt.store` with that mask. The host rejects an in-bounds tile load whose window
+//! leaves its source view and any tile load whose window limit exceeds the canonical dimension width, and the lowering
+//! cannot report such a failure at run time. Admission therefore requires the start bounds of every tile load to rule
+//! it out, so an admitted in-bounds load reads only valid elements and lowers like a masked one. A dot lowers to one
+//! `tt.dot` with IEEE input precision over unconverted F32 operands and an F32 accumulator, so admission accepts only
+//! the precisions that request that computation and rejects every other precision, algorithm, and accumulation type.
 //! [`MaskedLoadOperation`](ryft_kernels::MaskedLoadOperation) and
 //! [`MaskedStoreOperation`](ryft_kernels::MaskedStoreOperation) intersect that mask with their explicit mask, so
 //! they never touch padding, and a masked load takes the corresponding element of its `other` input for every element
@@ -45,7 +50,7 @@
 //! along which it repeats changes inside that loop and is not promoted. At the beginning of its scope, a read-write
 //! window is loaded once under its validity mask, and a write-only window starts from zeros. No read observes those
 //! zeros, because the verifier proves that every read follows a definite write (including through the first step rule
-//! of a carry axis), and they equal the zeroed storage that the host interpreter gives write-only parameters. Every
+//! of a carry axis), so they stand for the uninitialized storage of a write-only parameter. Every
 //! `scf.for` loop, `while` loop, and condition inside the scope carries the value. The loops carry it after their
 //! ordinary carries and before the iteration counter of a `while` loop, the bounded condition of a `while` loop yields
 //! it next to its predicate, and both branches of a condition yield it after their ordinary outputs. The scope ends
@@ -118,17 +123,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
-    ArrayReferenceTransformIndex, ArrayType, Atom, AtomId, ComparisonDirection, DataType, Dimension,
-    DimensionOperation, DimensionValue, DotDimensionNumbers, InstructionId, Layout, Memory, Operation as CoreOperation,
-    ReductionKind, ReferenceAccess, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot, RegionRef, Typed,
-    validated_reference_access_descriptors,
+    ArrayReferenceTransformIndex, ArrayType, Atom, AtomId, ComparisonDirection, DOT_OPERATION_NAME, DataType,
+    Dimension, DimensionOperation, DimensionValue, DotAlgorithm, DotAlgorithmPreset, DotDimensionNumbers,
+    DotInputPrecision, DotOperation, DotPrecision, InstructionId, Layout, MAX_DIMENSION_EXTENT, Memory,
+    Operation as CoreOperation, ReductionKind, ReferenceAccess, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceRoot, RegionRef, Typed, infer_reference_view_type, validated_reference_access_descriptors,
 };
 use ryft_kernels::{
-    ASYNC_COPY_OPERATION_NAME, GridExecution, KernelCallOperation, KernelOperation, KernelParameter,
+    ASYNC_COPY_OPERATION_NAME, BoundaryPolicy, GridExecution, KernelCallOperation, KernelOperation, KernelParameter,
     KernelParameterAccess, KernelReferenceSummary, KernelSchedule, KernelSwapLowering, TILE_LOAD_OPERATION_NAME,
-    VerifiedKernel,
+    TileLoadOperation, VerifiedKernel,
 };
-use ryft_mlir::dialects::{arith, scf, triton::tt};
+use ryft_mlir::dialects::triton::tt;
+use ryft_mlir::dialects::{arith, scf};
 use ryft_mlir::{
     Block, Context, DetachedBlock, DetachedOp, DialectHandle, Module, Operation, Size, Type, TypeRef,
     UnknownLocationRef, Value, ValueRef,
@@ -504,7 +511,7 @@ impl<'c, 't> Lowering<'c, 't> {
         operation: &DimensionOperation<DimensionValue>,
         inputs: &[Native<'c, 't>],
     ) -> Result<Native<'c, 't>, Error> {
-        if !operation.effects().is_pure() {
+        if operation.effects().has_execution_effects() {
             return Err(unsupported(operation.name(), "dimension arithmetic must be proven total"));
         }
         let location = self.location;
@@ -1198,6 +1205,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     vec![]
                 }
                 KernelOperation::TileLoad(operation) => {
+                    validate_tile_load(operation, &input_types)?;
                     let mut reference = inputs[0].reference()?.clone();
                     reference.shape = operation.block_shape().to_vec();
                     for (axis, start) in reference.starts.iter_mut().enumerate() {
@@ -1591,13 +1599,8 @@ impl<'c, 't> Lowering<'c, 't> {
                 }
                 result
             }
-            ArrayOperation::Dot(operation)
-                if operation.dimensions() == &DotDimensionNumbers::matmul()
-                    && types.len() == 2
-                    && types.iter().all(|r#type| r#type.rank() == 2 && r#type.data_type() == DataType::F32)
-                    && output.data_type() == DataType::F32
-                    && operation.output_sharding().is_none() =>
-            {
+            ArrayOperation::Dot(operation) => {
+                validate_dot(operation, types, output)?;
                 let zero = append(
                     block,
                     arith::constant(self.context.float_attribute(self.context.float32_type(), 0.0), location)?,
@@ -1911,6 +1914,73 @@ fn check_dimension(r#type: &ryft_core::DimensionType) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validates that the dot that [`Lowering::array`] emits for `operation` over inputs of types `types` with the output
+/// type `output` computes it as requested. That dot is one `tt.dot` with IEEE input precision over unconverted F32
+/// operands that accumulates into an F32 tile, which every Triton target supports. It therefore implements the default
+/// precision, the highest precision for either input, and the precise F32 algorithm, and admission rejects every other
+/// precision or algorithm (e.g., [`DotAlgorithmPreset::BF16_BF16_F32`], which rounds the operands), every operand,
+/// accumulation, or output type other than F32, and every output sharding. Parameter admission already rejects
+/// sharded operands and layouts other than dense row-major ones.
+fn validate_dot(operation: &DotOperation, types: &[ArrayType], output: &ArrayType) -> Result<(), Error> {
+    if operation.dimensions() != &DotDimensionNumbers::matmul() || types.iter().any(|r#type| r#type.rank() != 2) {
+        return Err(unsupported(DOT_OPERATION_NAME, "only rank-2 matrix multiplications are supported"));
+    }
+    if types.iter().chain([output]).any(|r#type| r#type.data_type() != DataType::F32) {
+        return Err(unsupported(DOT_OPERATION_NAME, "operands, accumulation, and results must be F32"));
+    }
+    let ieee = match operation.precision() {
+        DotPrecision::Inputs { lhs, rhs } => [lhs, rhs]
+            .into_iter()
+            .all(|precision| matches!(precision, DotInputPrecision::Default | DotInputPrecision::Highest)),
+        DotPrecision::Algorithm(algorithm) => {
+            algorithm == DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32)
+        }
+        DotPrecision::Preset(preset) => preset == DotAlgorithmPreset::F32_F32_F32,
+    };
+    if !ieee {
+        let precision = operation.precision();
+        return Err(unsupported(
+            DOT_OPERATION_NAME,
+            &format!("precision `{precision}` requires conversions or accumulation other than an IEEE F32 dot"),
+        ));
+    }
+    if operation.output_sharding().is_some() {
+        return Err(unsupported(DOT_OPERATION_NAME, "output shardings are unsupported"));
+    }
+    Ok(())
+}
+
+/// Validates that the start bounds of a tile load with the input types `input_types` prove that the host never rejects
+/// its window, which the lowering cannot report at run time. Every window limit must fit the canonical dimension width,
+/// and the window of an in-bounds load must also lie inside the view that its transforms select. An in-bounds load that
+/// satisfies this check reads only valid elements, so it lowers like a masked load.
+fn validate_tile_load(operation: &TileLoadOperation, input_types: &[ArrayIrType]) -> Result<(), Error> {
+    let rank = operation.block_shape().len();
+    let ArrayIrType::Reference(reference) = &input_types[0] else { unreachable!() };
+    let bindings = input_types[rank + 2..].iter().collect::<Vec<_>>();
+    let view =
+        infer_reference_view_type(reference.referent(), operation.transforms(), &bindings, ReferenceAccessMode::Read)?;
+    let shape = view.static_shape().unwrap();
+    let starts = &input_types[1..rank + 1];
+    for ((start, &block), &extent) in starts.iter().zip(operation.block_shape()).zip(shape.dimensions()) {
+        let ArrayIrType::Dimension(start) = start else { unreachable!() };
+        let limit = start.maximum_extent().and_then(|maximum| maximum.checked_add(block));
+        let (bound, reason) = match operation.boundary_policy() {
+            BoundaryPolicy::InBounds => {
+                (extent, "in-bounds tile loads require start bounds that prove the window lies inside the source view")
+            }
+            BoundaryPolicy::Masked => (
+                MAX_DIMENSION_EXTENT,
+                "tile load start bounds must prove that the window limit fits the canonical dimension width",
+            ),
+        };
+        if limit.is_none_or(|limit| limit > bound) {
+            return Err(unsupported(TILE_LOAD_OPERATION_NAME, reason));
+        }
+    }
+    Ok(())
+}
+
 /// Maps canonical integer predicates without changing signed ordering.
 fn integer_comparison(direction: ComparisonDirection, unsigned: bool) -> arith::IntegerComparisonPredicate {
     use arith::IntegerComparisonPredicate;
@@ -1956,16 +2026,16 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArraySliceAxis, BroadcastLikeOperation, BroadcastOperation, Context as CoreContext, FillLikeOperation,
-        IotaLikeOperation, IotaOperation, Placeholder, ProgramBuilder, ReferenceRead, ReferenceReadOperation,
-        ReferenceWrite, ReferenceWriteOperation,
+        ArraySliceAxis, BroadcastLikeOperation, BroadcastOperation, ConditionOperation, Context as CoreContext,
+        FillLikeOperation, IotaLikeOperation, IotaOperation, Placeholder, ProgramBuilder, ProgramError, ReferenceRead,
+        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, TypeError,
     };
     use ryft_kernels::{
-        BoundaryPolicy, Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess,
-        MappingExpression, ParameterWindow, compare, kernel, mapped_call, masked_load, masked_load_or, masked_store,
-        masked_swap, whole_array_parameter, window_mask,
+        Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess, MappingExpression,
+        ParameterWindow, compare, kernel, mapped_call, masked_load, masked_load_or, masked_store, masked_swap,
+        whole_array_parameter, window_mask,
     };
-    use ryft_mlir::{OpRef, Region};
+    use ryft_mlir::{OpRef, Region, WalkOrder, WalkResult};
 
     use super::*;
 
@@ -2345,6 +2415,164 @@ mod tests {
         KernelDefinition::new(call, body).unwrap()
     }
 
+    /// Reason for which admission rejects an in-bounds tile load whose window it cannot prove valid.
+    const IN_BOUNDS_REASON: &str =
+        "in-bounds tile loads require start bounds that prove the window lies inside the source view";
+
+    /// Builds the common tile load fixture, which loads two elements with the padding value −1 at the constant element
+    /// start `start` of the view that `transforms` select from the four element input, and stores them in the two
+    /// element output.
+    fn tile_load_definition(
+        boundary: BoundaryPolicy,
+        start: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [4]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(start).unwrap()));
+        let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+        let operation = TileLoadOperation::new(vec![2], boundary).unwrap().with_transforms(transforms);
+        let tile = builder.add_instruction(operation, vec![], vec![inputs[0], start, other], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
+        KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
+    }
+
+    /// Builds two definitions that contain the in-bounds tile load of [`tile_load_definition`] at the start 3, which
+    /// the host never executes. The first runs it over an empty grid, which leaves its read-write output unchanged, and
+    /// the second runs it in the untaken branch of a condition whose other branch returns the padding value.
+    fn unreachable_tile_load_definitions() -> Vec<KernelDefinition> {
+        let source = ArrayType::new_static(DataType::F32, [4]);
+        let empty_grid = mapped_call(
+            Grid::new(vec![GridDimension::new(0usize.into(), GridExecution::Parallel)]).unwrap(),
+            vec![
+                (source.clone(), KernelParameterAccess::ReadOnly, ParameterWindow::WholeArray),
+                (
+                    ArrayType::new_static(DataType::F32, [2]),
+                    KernelParameterAccess::ReadWrite,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![2],
+                        boundary: BoundaryPolicy::Masked,
+                        indices: vec![MappingExpression::GridCoordinate(0)],
+                    },
+                ),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let untaken_branch = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(source.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let load = |builder: &mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, source| {
+            let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+            let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+            let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::InBounds).unwrap();
+            builder.add_instruction(operation, vec![], vec![source, start, other], None).unwrap()[0]
+        };
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = empty_grid
+            .body_input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let tile = load(&mut builder, inputs[0]);
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
+        let empty_grid =
+            KernelDefinition::new(empty_grid, builder.build(vec![], vec![Placeholder; 3], vec![]).unwrap()).unwrap();
+
+        let mut taken = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = taken.add_input(untaken_branch.parameters()[0].body_type());
+        let tile = load(&mut taken, reference);
+        let taken = taken
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![tile],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut padding = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        padding.add_input(untaken_branch.parameters()[0].body_type());
+        let fill = padding.add_constant(ArrayIrValue::Array(Array::vector(vec![-1f32, -1.0]).unwrap()));
+        let padding = padding
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![fill],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = untaken_branch
+            .body_input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+        let taken = builder.import_region(taken.entry_region_ref());
+        let padding = builder.import_region(padding.entry_region_ref());
+        let tile = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![taken, padding],
+                vec![predicate, inputs[0]],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
+        let untaken_branch =
+            KernelDefinition::new(untaken_branch, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap())
+                .unwrap();
+        vec![empty_grid, untaken_branch]
+    }
+
+    /// Builds the dot precision fixture, which multiplies its two 32×32 inputs with `operation`, and returns it
+    /// together with the inputs `1.0009765625 · I` and `I`, where `1.0009765625 = 1 + 2⁻¹⁰` is exact in F32 and
+    /// TensorFloat-32 and rounds to 1 in BF16.
+    fn dot_definition(operation: DotOperation) -> (KernelDefinition, Vec<Array>) {
+        let r#type = ArrayType::new_static(DataType::F32, [32, 32]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::trace(call, |(references, _)| {
+            let inputs = [references[0].read()?, references[1].read()?];
+            let operation = ArrayIrOperation::from(ArrayOperation::Dot(operation));
+            references[2].write(&inputs[0].context().bind(operation, vec![], &inputs)?.remove(0))
+        })
+        .unwrap();
+        let diagonal = |value: f32| {
+            let elements = (0..32 * 32).map(|index| if index % 33 == 0 { value } else { 0.0 }).collect::<Vec<_>>();
+            Array::from_elements(r#type.clone(), &elements).unwrap()
+        };
+        (definition, vec![diagonal(1.0 + 1.0 / 1024.0), diagonal(1.0)])
+    }
+
     #[test]
     fn test_lower() {
         let context = Context::new();
@@ -2428,6 +2656,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lowered.grid, [4, 1, 1]);
+    }
+
+    #[test]
+    fn test_lower_dot_precision() {
+        // The host default preserves the diagonal value, and Triton emits one IEEE F32 dot without converting its
+        // operands, which accumulates into an F32 tile.
+        let (definition, inputs) = dot_definition(DotOperation::matmul());
+        assert_eq!(definition.interpret(inputs.clone(), 1), Ok(vec![inputs[0].clone()]));
+        let context = Context::new();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let lowered = lower(&context, &verified, &Options::default(), &KernelSchedule::default()).unwrap();
+        let mut dots = Vec::new();
+        lowered.module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if operation.name().as_str() == Ok("tt.dot") {
+                dots.push(
+                    [tt::INPUT_PRECISION_ATTRIBUTE, tt::MAX_NUM_IMPRECISE_ACC_ATTRIBUTE]
+                        .map(|name| operation.attribute(name).unwrap().unwrap().to_string()),
+                );
+            }
+            WalkResult::Advance
+        });
+        let ieee = context.triton_tt_input_precision_attribute(tt::InputPrecision::Ieee).unwrap().to_string();
+        assert_eq!(dots, vec![[ieee, "0 : i32".to_owned()]]);
+        let module = lowered.module.to_string();
+        assert_eq!(
+            module.lines().filter(|line| line.contains("tt.dot")).collect::<Vec<_>>(),
+            vec!["    %147 = tt.dot %128, %145, %146 : tensor<32x32xf32> * tensor<32x32xf32> -> tensor<32x32xf32>"],
+        );
+        assert_eq!(module.matches("arith.truncf").count() + module.matches("tt.fp_to_fp").count(), 0);
+
+        // Every request of full F32 precision computes that same dot.
+        for precision in [
+            DotPrecision::from(DotInputPrecision::Highest),
+            DotPrecision::from((DotInputPrecision::Default, DotInputPrecision::Highest)),
+            DotPrecision::from(DotAlgorithmPreset::F32_F32_F32),
+            DotPrecision::from(DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32)),
+        ] {
+            let (definition, _) = dot_definition(DotOperation::matmul().with_precision(precision));
+            assert_eq!(lowered_module(&definition), module);
+        }
+
+        // Rounding the operands to BF16 rounds the diagonal value to 1 on the host, which the IEEE dot would not.
+        let (definition, inputs) =
+            dot_definition(DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32));
+        assert_eq!(definition.interpret(inputs.clone(), 1), Ok(vec![inputs[1].clone()]));
+        assert_eq!(
+            rejection(&definition),
+            (
+                "dot",
+                "precision `bf16_bf16_f32` requires conversions or accumulation other than an IEEE F32 dot".to_owned(),
+            ),
+        );
     }
 
     #[test]
@@ -2980,9 +3260,8 @@ mod tests {
                 %c0_i64_10 = arith.constant 0 : i64
                 %49 = arith.select %48, %c0_i64_10, %c0_i64_10 : i64
                 %50 = tt.addptr %arg1, %49 : !tt.ptr<f32>, i64
-                %51 = \
-                        tt.atomic_rmw fadd, acq_rel, gpu, %50, %47, %48 \
-                    {operand_segment_sizes = array<i32: 1, 1, 1>} : (!tt.ptr<f32>, f32, i1) -> f32
+                %51 = tt.atomic_rmw fadd, acq_rel, gpu, %50, %47, %48 {operand_segment_sizes = array<i32: 1, 1, 1>} : \
+                    (!tt.ptr<f32>, f32, i1) -> f32
                 tt.return
               }
             }
@@ -3017,8 +3296,7 @@ mod tests {
                 %c0_i64_1 = arith.constant 0 : i64
                 %c2_i64_2 = arith.constant 2 : i64
                 %c1_i64 = arith.constant 1 : i64
-                %4 = \
-                        scf.for %arg2 = %c0_i64_1 to %c2_i64_2 step %c1_i64 iter_args(%arg3 = %3) -> (tensor<2xf32>)  : \
+                %4 = scf.for %arg2 = %c0_i64_1 to %c2_i64_2 step %c1_i64 iter_args(%arg3 = %3) -> (tensor<2xf32>)  : \
                     i64 {
                   %c2_i64_9 = arith.constant 2 : i64
                   %34 = arith.muli %arg2, %c2_i64_9 : i64
@@ -3028,19 +3306,19 @@ mod tests {
                   %c2_i64_12 = arith.constant 2 : i64
                   %36 = arith.addi %c0_i64_11, %c2_i64_12 : i64
                   %c0_i64_13 = arith.constant 0 : i64
-                  %true_14 = arith.constant true
-                  %37 = tt.splat %true_14 : i1 -> tensor<2xi1>
-                  %c0_i32 = arith.constant 0 : i32
-                  %38 = arith.bitcast %c0_i32 : i32 to f32
-                  %39 = tt.splat %38 : f32 -> tensor<2xf32>
-                  %40 = arith.cmpi eq, %arg2, %c0_i64_13 : i64
-                  %41 = scf.if %40 -> (tensor<2xf32>) {
+                  %37 = arith.cmpi eq, %arg2, %c0_i64_13 : i64
+                  %38 = scf.if %37 -> (tensor<2xf32>) {
                     %cst_20 = arith.constant 0.000000e+00 : f32
                     %74 = tt.splat %cst_20 : f32 -> tensor<2xf32>
                     scf.yield %74 : tensor<2xf32>
                   } else {
                     scf.yield %arg3 : tensor<2xf32>
                   }
+                  %true_14 = arith.constant true
+                  %39 = tt.splat %true_14 : i1 -> tensor<2xi1>
+                  %c0_i32 = arith.constant 0 : i32
+                  %40 = arith.bitcast %c0_i32 : i32 to f32
+                  %41 = tt.splat %40 : f32 -> tensor<2xf32>
                   %true_15 = arith.constant true
                   %42 = tt.splat %true_15 : i1 -> tensor<2xi1>
                   %43 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
@@ -3076,9 +3354,9 @@ mod tests {
                   %68 = arith.select %62, %67, %63 : tensor<2xi1>, tensor<2xi64>
                   %69 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
                   %70 = tt.addptr %69, %68 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
-                  %71 = arith.andi %62, %37 : tensor<2xi1>
-                  %72 = tt.load %70, %71, %39 : tensor<2x!tt.ptr<f32>>
-                  %73 = arith.addf %41, %72 : tensor<2xf32>
+                  %71 = arith.andi %62, %39 : tensor<2xi1>
+                  %72 = tt.load %70, %71, %41 : tensor<2x!tt.ptr<f32>>
+                  %73 = arith.addf %38, %72 : tensor<2xf32>
                   scf.yield %73 : tensor<2xf32>
                 }
                 %true_3 = arith.constant true
@@ -3156,8 +3434,7 @@ mod tests {
                 %c0_i64_2 = arith.constant 0 : i64
                 %c2_i64_3 = arith.constant 2 : i64
                 %c1_i64 = arith.constant 1 : i64
-                %7 = \
-                        scf.for %arg2 = %c0_i64_2 to %c2_i64_3 step %c1_i64 iter_args(%arg3 = %6) -> (tensor<2xf32>)  : \
+                %7 = scf.for %arg2 = %c0_i64_2 to %c2_i64_3 step %c1_i64 iter_args(%arg3 = %6) -> (tensor<2xf32>)  : \
                     i64 {
                   %c2_i64_9 = arith.constant 2 : i64
                   %c2_i64_10 = arith.constant 2 : i64
@@ -3172,108 +3449,108 @@ mod tests {
                   %c2_i64_14 = arith.constant 2 : i64
                   %42 = arith.addi %41, %c2_i64_14 : i64
                   %c0_i64_15 = arith.constant 0 : i64
-                  %true_16 = arith.constant true
-                  %43 = tt.splat %true_16 : i1 -> tensor<2x2xi1>
-                  %c0_i32 = arith.constant 0 : i32
-                  %44 = arith.bitcast %c0_i32 : i32 to f32
-                  %45 = tt.splat %44 : f32 -> tensor<2x2xf32>
-                  %true_17 = arith.constant true
-                  %46 = tt.splat %true_17 : i1 -> tensor<2xi1>
-                  %47 = arith.cmpi eq, %arg2, %c0_i64_15 : i64
-                  %48 = scf.if %47 -> (tensor<2xf32>) {
+                  %43 = arith.cmpi eq, %arg2, %c0_i64_15 : i64
+                  %44 = scf.if %43 -> (tensor<2xf32>) {
                     %cst_40 = arith.constant 0.000000e+00 : f32
                     %167 = tt.splat %cst_40 : f32 -> tensor<2xf32>
                     scf.yield %167 : tensor<2xf32>
                   } else {
                     scf.yield %arg3 : tensor<2xf32>
                   }
-                  %true_18 = arith.constant true
-                  %49 = tt.splat %true_18 : i1 -> tensor<2x2xi1>
-                  %50 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
-                  %51 = tt.reshape %50 : tensor<2xi32> -> tensor<2x1xi32>
-                  %52 = arith.extsi %51 : tensor<2x1xi32> to tensor<2x1xi64>
-                  %53 = tt.broadcast %52 : tensor<2x1xi64> -> tensor<2x2xi64>
+                  %true_16 = arith.constant true
+                  %45 = tt.splat %true_16 : i1 -> tensor<2x2xi1>
+                  %c0_i32 = arith.constant 0 : i32
+                  %46 = arith.bitcast %c0_i32 : i32 to f32
+                  %47 = tt.splat %46 : f32 -> tensor<2x2xf32>
+                  %true_17 = arith.constant true
+                  %48 = tt.splat %true_17 : i1 -> tensor<2x2xi1>
+                  %49 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %50 = tt.reshape %49 : tensor<2xi32> -> tensor<2x1xi32>
+                  %51 = arith.extsi %50 : tensor<2x1xi32> to tensor<2x1xi64>
+                  %52 = tt.broadcast %51 : tensor<2x1xi64> -> tensor<2x2xi64>
+                  %c2_i64_18 = arith.constant 2 : i64
+                  %53 = tt.splat %c2_i64_18 : i64 -> tensor<2x2xi64>
+                  %54 = arith.cmpi slt, %52, %53 : tensor<2x2xi64>
+                  %55 = arith.andi %48, %54 : tensor<2x2xi1>
+                  %56 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %57 = tt.reshape %56 : tensor<2xi32> -> tensor<1x2xi32>
+                  %58 = arith.extsi %57 : tensor<1x2xi32> to tensor<1x2xi64>
+                  %59 = tt.broadcast %58 : tensor<1x2xi64> -> tensor<2x2xi64>
                   %c2_i64_19 = arith.constant 2 : i64
-                  %54 = tt.splat %c2_i64_19 : i64 -> tensor<2x2xi64>
-                  %55 = arith.cmpi slt, %53, %54 : tensor<2x2xi64>
-                  %56 = arith.andi %49, %55 : tensor<2x2xi1>
-                  %57 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
-                  %58 = tt.reshape %57 : tensor<2xi32> -> tensor<1x2xi32>
-                  %59 = arith.extsi %58 : tensor<1x2xi32> to tensor<1x2xi64>
-                  %60 = tt.broadcast %59 : tensor<1x2xi64> -> tensor<2x2xi64>
-                  %c2_i64_20 = arith.constant 2 : i64
-                  %61 = tt.splat %c2_i64_20 : i64 -> tensor<2x2xi64>
-                  %62 = arith.cmpi slt, %60, %61 : tensor<2x2xi64>
-                  %63 = arith.andi %56, %62 : tensor<2x2xi1>
-                  %64 = tt.splat %true : i1 -> tensor<2x2xi1>
-                  %65 = arith.andi %63, %64 : tensor<2x2xi1>
-                  %c0_i64_21 = arith.constant 0 : i64
-                  %66 = tt.splat %c0_i64_21 : i64 -> tensor<2x2xi64>
-                  %67 = tt.splat %37 : i64 -> tensor<2x2xi64>
-                  %68 = arith.addi %67, %53 : tensor<2x2xi64>
-                  %69 = tt.splat %39 : i64 -> tensor<2x2xi64>
-                  %70 = arith.cmpi slt, %68, %69 : tensor<2x2xi64>
-                  %71 = arith.andi %65, %70 : tensor<2x2xi1>
+                  %60 = tt.splat %c2_i64_19 : i64 -> tensor<2x2xi64>
+                  %61 = arith.cmpi slt, %59, %60 : tensor<2x2xi64>
+                  %62 = arith.andi %55, %61 : tensor<2x2xi1>
+                  %63 = tt.splat %true : i1 -> tensor<2x2xi1>
+                  %64 = arith.andi %62, %63 : tensor<2x2xi1>
+                  %c0_i64_20 = arith.constant 0 : i64
+                  %65 = tt.splat %c0_i64_20 : i64 -> tensor<2x2xi64>
+                  %66 = tt.splat %37 : i64 -> tensor<2x2xi64>
+                  %67 = arith.addi %66, %52 : tensor<2x2xi64>
+                  %68 = tt.splat %39 : i64 -> tensor<2x2xi64>
+                  %69 = arith.cmpi slt, %67, %68 : tensor<2x2xi64>
+                  %70 = arith.andi %64, %69 : tensor<2x2xi1>
+                  %c3_i64_21 = arith.constant 3 : i64
+                  %71 = tt.splat %c3_i64_21 : i64 -> tensor<2x2xi64>
+                  %72 = arith.cmpi sge, %67, %65 : tensor<2x2xi64>
+                  %73 = arith.cmpi slt, %67, %71 : tensor<2x2xi64>
+                  %74 = arith.andi %72, %73 : tensor<2x2xi1>
+                  %75 = arith.andi %70, %74 : tensor<2x2xi1>
+                  %76 = tt.splat %38 : i64 -> tensor<2x2xi64>
+                  %77 = arith.addi %76, %59 : tensor<2x2xi64>
+                  %78 = tt.splat %40 : i64 -> tensor<2x2xi64>
+                  %79 = arith.cmpi slt, %77, %78 : tensor<2x2xi64>
+                  %80 = arith.andi %75, %79 : tensor<2x2xi1>
                   %c3_i64_22 = arith.constant 3 : i64
-                  %72 = tt.splat %c3_i64_22 : i64 -> tensor<2x2xi64>
-                  %73 = arith.cmpi sge, %68, %66 : tensor<2x2xi64>
-                  %74 = arith.cmpi slt, %68, %72 : tensor<2x2xi64>
-                  %75 = arith.andi %73, %74 : tensor<2x2xi1>
-                  %76 = arith.andi %71, %75 : tensor<2x2xi1>
-                  %77 = tt.splat %38 : i64 -> tensor<2x2xi64>
-                  %78 = arith.addi %77, %60 : tensor<2x2xi64>
-                  %79 = tt.splat %40 : i64 -> tensor<2x2xi64>
-                  %80 = arith.cmpi slt, %78, %79 : tensor<2x2xi64>
-                  %81 = arith.andi %76, %80 : tensor<2x2xi1>
-                  %c3_i64_23 = arith.constant 3 : i64
-                  %82 = tt.splat %c3_i64_23 : i64 -> tensor<2x2xi64>
-                  %83 = arith.cmpi sge, %78, %66 : tensor<2x2xi64>
-                  %84 = arith.cmpi slt, %78, %82 : tensor<2x2xi64>
-                  %85 = arith.andi %83, %84 : tensor<2x2xi1>
-                  %86 = arith.andi %81, %85 : tensor<2x2xi1>
-                  %c0_i64_24 = arith.constant 0 : i64
-                  %87 = tt.splat %c0_i64_24 : i64 -> tensor<2x2xi64>
-                  %88 = arith.select %85, %78, %87 : tensor<2x2xi1>, tensor<2x2xi64>
-                  %c1_i64_25 = arith.constant 1 : i64
-                  %89 = tt.splat %c1_i64_25 : i64 -> tensor<2x2xi64>
-                  %90 = arith.muli %88, %89 : tensor<2x2xi64>
-                  %91 = arith.addi %87, %90 : tensor<2x2xi64>
-                  %92 = arith.select %75, %68, %87 : tensor<2x2xi1>, tensor<2x2xi64>
-                  %c3_i64_26 = arith.constant 3 : i64
-                  %93 = tt.splat %c3_i64_26 : i64 -> tensor<2x2xi64>
-                  %94 = arith.muli %92, %93 : tensor<2x2xi64>
-                  %95 = arith.addi %91, %94 : tensor<2x2xi64>
-                  %96 = arith.select %86, %95, %87 : tensor<2x2xi1>, tensor<2x2xi64>
-                  %97 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x2x!tt.ptr<f32>>
-                  %98 = tt.addptr %97, %96 : tensor<2x2x!tt.ptr<f32>>, tensor<2x2xi64>
-                  %99 = arith.andi %86, %43 : tensor<2x2xi1>
-                  %100 = tt.load %98, %99, %45 : tensor<2x2x!tt.ptr<f32>>
-                  %true_27 = arith.constant true
-                  %101 = tt.splat %true_27 : i1 -> tensor<2x2xi1>
-                  %102 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
-                  %103 = tt.reshape %102 : tensor<2xi32> -> tensor<2x1xi32>
-                  %104 = arith.extsi %103 : tensor<2x1xi32> to tensor<2x1xi64>
-                  %105 = tt.broadcast %104 : tensor<2x1xi64> -> tensor<2x2xi64>
+                  %81 = tt.splat %c3_i64_22 : i64 -> tensor<2x2xi64>
+                  %82 = arith.cmpi sge, %77, %65 : tensor<2x2xi64>
+                  %83 = arith.cmpi slt, %77, %81 : tensor<2x2xi64>
+                  %84 = arith.andi %82, %83 : tensor<2x2xi1>
+                  %85 = arith.andi %80, %84 : tensor<2x2xi1>
+                  %c0_i64_23 = arith.constant 0 : i64
+                  %86 = tt.splat %c0_i64_23 : i64 -> tensor<2x2xi64>
+                  %87 = arith.select %84, %77, %86 : tensor<2x2xi1>, tensor<2x2xi64>
+                  %c1_i64_24 = arith.constant 1 : i64
+                  %88 = tt.splat %c1_i64_24 : i64 -> tensor<2x2xi64>
+                  %89 = arith.muli %87, %88 : tensor<2x2xi64>
+                  %90 = arith.addi %86, %89 : tensor<2x2xi64>
+                  %91 = arith.select %74, %67, %86 : tensor<2x2xi1>, tensor<2x2xi64>
+                  %c3_i64_25 = arith.constant 3 : i64
+                  %92 = tt.splat %c3_i64_25 : i64 -> tensor<2x2xi64>
+                  %93 = arith.muli %91, %92 : tensor<2x2xi64>
+                  %94 = arith.addi %90, %93 : tensor<2x2xi64>
+                  %95 = arith.select %85, %94, %86 : tensor<2x2xi1>, tensor<2x2xi64>
+                  %96 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x2x!tt.ptr<f32>>
+                  %97 = tt.addptr %96, %95 : tensor<2x2x!tt.ptr<f32>>, tensor<2x2xi64>
+                  %98 = arith.andi %85, %45 : tensor<2x2xi1>
+                  %99 = tt.load %97, %98, %47 : tensor<2x2x!tt.ptr<f32>>
+                  %true_26 = arith.constant true
+                  %100 = tt.splat %true_26 : i1 -> tensor<2x2xi1>
+                  %101 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %102 = tt.reshape %101 : tensor<2xi32> -> tensor<2x1xi32>
+                  %103 = arith.extsi %102 : tensor<2x1xi32> to tensor<2x1xi64>
+                  %104 = tt.broadcast %103 : tensor<2x1xi64> -> tensor<2x2xi64>
+                  %c2_i64_27 = arith.constant 2 : i64
+                  %105 = tt.splat %c2_i64_27 : i64 -> tensor<2x2xi64>
+                  %106 = arith.cmpi slt, %104, %105 : tensor<2x2xi64>
+                  %107 = arith.andi %100, %106 : tensor<2x2xi1>
+                  %108 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                  %109 = tt.reshape %108 : tensor<2xi32> -> tensor<1x2xi32>
+                  %110 = arith.extsi %109 : tensor<1x2xi32> to tensor<1x2xi64>
+                  %111 = tt.broadcast %110 : tensor<1x2xi64> -> tensor<2x2xi64>
                   %c2_i64_28 = arith.constant 2 : i64
-                  %106 = tt.splat %c2_i64_28 : i64 -> tensor<2x2xi64>
-                  %107 = arith.cmpi slt, %105, %106 : tensor<2x2xi64>
-                  %108 = arith.andi %101, %107 : tensor<2x2xi1>
-                  %109 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
-                  %110 = tt.reshape %109 : tensor<2xi32> -> tensor<1x2xi32>
-                  %111 = arith.extsi %110 : tensor<1x2xi32> to tensor<1x2xi64>
-                  %112 = tt.broadcast %111 : tensor<1x2xi64> -> tensor<2x2xi64>
-                  %c2_i64_29 = arith.constant 2 : i64
-                  %113 = tt.splat %c2_i64_29 : i64 -> tensor<2x2xi64>
-                  %114 = arith.cmpi slt, %112, %113 : tensor<2x2xi64>
-                  %115 = arith.andi %108, %114 : tensor<2x2xi1>
-                  %cst_30 = arith.constant 0.000000e+00 : f32
-                  %116 = tt.splat %cst_30 : f32 -> tensor<2x2xf32>
-                  %117 = arith.select %115, %100, %116 : tensor<2x2xi1>, tensor<2x2xf32>
-                  %118 = \"tt.reduce\"(%117) <{axis = 1 : i32}> ({
+                  %112 = tt.splat %c2_i64_28 : i64 -> tensor<2x2xi64>
+                  %113 = arith.cmpi slt, %111, %112 : tensor<2x2xi64>
+                  %114 = arith.andi %107, %113 : tensor<2x2xi1>
+                  %cst_29 = arith.constant 0.000000e+00 : f32
+                  %115 = tt.splat %cst_29 : f32 -> tensor<2x2xf32>
+                  %116 = arith.select %114, %99, %115 : tensor<2x2xi1>, tensor<2x2xf32>
+                  %117 = \"tt.reduce\"(%116) <{axis = 1 : i32}> ({
                   ^bb0(%arg4: f32, %arg5: f32):
                     %167 = arith.addf %arg4, %arg5 : f32
                     tt.reduce.return %167 : f32
                   }) : (tensor<2x2xf32>) -> tensor<2xf32>
+                  %true_30 = arith.constant true
+                  %118 = tt.splat %true_30 : i1 -> tensor<2xi1>
                   %cst_31 = arith.constant 0.000000e+00 : f32
                   %119 = tt.splat %cst_31 : f32 -> tensor<2xf32>
                   %true_32 = arith.constant true
@@ -3301,9 +3578,9 @@ mod tests {
                   %138 = arith.cmpi slt, %132, %136 : tensor<2xi64>
                   %139 = arith.andi %137, %138 : tensor<2xi1>
                   %140 = arith.andi %135, %139 : tensor<2xi1>
-                  %141 = arith.andi %140, %46 : tensor<2xi1>
-                  %142 = arith.select %141, %48, %119 : tensor<2xi1>, tensor<2xf32>
-                  %143 = arith.addf %142, %118 : tensor<2xf32>
+                  %141 = arith.andi %140, %118 : tensor<2xi1>
+                  %142 = arith.select %141, %44, %119 : tensor<2xi1>, tensor<2xf32>
+                  %143 = arith.addf %142, %117 : tensor<2xf32>
                   %true_36 = arith.constant true
                   %144 = tt.splat %true_36 : i1 -> tensor<2xi1>
                   %145 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
@@ -3329,8 +3606,8 @@ mod tests {
                   %162 = arith.cmpi slt, %156, %160 : tensor<2xi64>
                   %163 = arith.andi %161, %162 : tensor<2xi1>
                   %164 = arith.andi %159, %163 : tensor<2xi1>
-                  %165 = arith.andi %164, %46 : tensor<2xi1>
-                  %166 = arith.select %165, %143, %48 : tensor<2xi1>, tensor<2xf32>
+                  %165 = arith.andi %164, %118 : tensor<2xi1>
+                  %166 = arith.select %165, %143, %44 : tensor<2xi1>, tensor<2xf32>
                   scf.yield %166 : tensor<2xf32>
                 }
                 %true_4 = arith.constant true
@@ -3863,9 +4140,8 @@ mod tests {
                 %c0_i64_6 = arith.constant 0 : i64
                 %c2_i64_7 = arith.constant 2 : i64
                 %c1_i64_8 = arith.constant 1 : i64
-                %34 = \
-                        scf.for %arg2 = %c0_i64_6 to %c2_i64_7 step %c1_i64_8 iter_args(%arg3 = %33) -> (tensor<2xf32>)  : \
-                    i64 {
+                %34 = scf.for %arg2 = %c0_i64_6 to %c2_i64_7 step %c1_i64_8 iter_args(%arg3 = %33) -> (tensor<2xf32>)  \
+                    : i64 {
                   %c2_i64_15 = arith.constant 2 : i64
                   %64 = arith.muli %arg2, %c2_i64_15 : i64
                   %c2_i64_16 = arith.constant 2 : i64
@@ -4021,9 +4297,8 @@ mod tests {
                 %34 = arith.addi %c0_i64_6, %c2_i64_7 : i64
                 %c0_i64_8 = arith.constant 0 : i64
                 %c0_i64_9 = arith.constant 0 : i64
-                %35:3 = \
-                        scf.while (%arg1 = %c0_i64_8, %arg2 = %33, %arg3 = %c0_i64_9) : (i64, tensor<2xf32>, i64) -> (i64, \
-                    tensor<2xf32>, i64) {
+                %35:3 = scf.while (%arg1 = %c0_i64_8, %arg2 = %33, %arg3 = %c0_i64_9) : (i64, tensor<2xf32>, i64) -> \
+                    (i64, tensor<2xf32>, i64) {
                   %c2_i64_16 = arith.constant 2 : i64
                   %65 = arith.cmpi slt, %arg3, %c2_i64_16 : i64
                   %66:2 = scf.if %65 -> (i1, tensor<2xf32>) {
@@ -4168,6 +4443,201 @@ mod tests {
                 "atomic and other accesses of one parameter need a CTA barrier, which ryft-mlir does not expose"
                     .to_owned(),
             ),
+        );
+    }
+
+    #[test]
+    fn test_lower_tile_load() {
+        // A masked window at element 3 of `[3, 5, 7, 9]` loads its valid element and takes the padding value for the
+        // element beyond the source view.
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+        let definition = tile_load_definition(BoundaryPolicy::Masked, 3, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![9f32, -1.0]).unwrap()]));
+        assert_eq!(
+            lowered_module(&definition),
+            indoc! {"
+            module {
+              tt.func public @ryft_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.get_program_id x : i32
+                %1 = arith.extsi %0 : i32 to i64
+                %true = arith.constant true
+                %c0_i64 = arith.constant 0 : i64
+                %c4_i64 = arith.constant 4 : i64
+                %2 = arith.addi %c0_i64, %c4_i64 : i64
+                %c0_i64_0 = arith.constant 0 : i64
+                %c2_i64 = arith.constant 2 : i64
+                %3 = arith.addi %c0_i64_0, %c2_i64 : i64
+                %c3_i64 = arith.constant 3 : i64
+                %c-1082130432_i32 = arith.constant -1082130432 : i32
+                %4 = arith.bitcast %c-1082130432_i32 : i32 to f32
+                %5 = arith.addi %c0_i64, %c3_i64 : i64
+                %6 = tt.splat %4 : f32 -> tensor<2xf32>
+                %true_1 = arith.constant true
+                %7 = tt.splat %true_1 : i1 -> tensor<2xi1>
+                %8 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %9 = tt.reshape %8 : tensor<2xi32> -> tensor<2xi32>
+                %10 = arith.extsi %9 : tensor<2xi32> to tensor<2xi64>
+                %11 = tt.broadcast %10 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_2 = arith.constant 2 : i64
+                %12 = tt.splat %c2_i64_2 : i64 -> tensor<2xi64>
+                %13 = arith.cmpi slt, %11, %12 : tensor<2xi64>
+                %14 = arith.andi %7, %13 : tensor<2xi1>
+                %15 = tt.splat %true : i1 -> tensor<2xi1>
+                %16 = arith.andi %14, %15 : tensor<2xi1>
+                %c0_i64_3 = arith.constant 0 : i64
+                %17 = tt.splat %c0_i64_3 : i64 -> tensor<2xi64>
+                %18 = tt.splat %5 : i64 -> tensor<2xi64>
+                %19 = arith.addi %18, %11 : tensor<2xi64>
+                %20 = tt.splat %2 : i64 -> tensor<2xi64>
+                %21 = arith.cmpi slt, %19, %20 : tensor<2xi64>
+                %22 = arith.andi %16, %21 : tensor<2xi1>
+                %c4_i64_4 = arith.constant 4 : i64
+                %23 = tt.splat %c4_i64_4 : i64 -> tensor<2xi64>
+                %24 = arith.cmpi sge, %19, %17 : tensor<2xi64>
+                %25 = arith.cmpi slt, %19, %23 : tensor<2xi64>
+                %26 = arith.andi %24, %25 : tensor<2xi1>
+                %27 = arith.andi %22, %26 : tensor<2xi1>
+                %c0_i64_5 = arith.constant 0 : i64
+                %28 = tt.splat %c0_i64_5 : i64 -> tensor<2xi64>
+                %29 = arith.select %26, %19, %28 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64 = arith.constant 1 : i64
+                %30 = tt.splat %c1_i64 : i64 -> tensor<2xi64>
+                %31 = arith.muli %29, %30 : tensor<2xi64>
+                %32 = arith.addi %28, %31 : tensor<2xi64>
+                %33 = arith.select %27, %32, %28 : tensor<2xi1>, tensor<2xi64>
+                %34 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %35 = tt.addptr %34, %33 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                %36 = tt.load %35, %27, %6 : tensor<2x!tt.ptr<f32>>
+                %true_6 = arith.constant true
+                %37 = tt.splat %true_6 : i1 -> tensor<2xi1>
+                %38 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+                %39 = tt.reshape %38 : tensor<2xi32> -> tensor<2xi32>
+                %40 = arith.extsi %39 : tensor<2xi32> to tensor<2xi64>
+                %41 = tt.broadcast %40 : tensor<2xi64> -> tensor<2xi64>
+                %c2_i64_7 = arith.constant 2 : i64
+                %42 = tt.splat %c2_i64_7 : i64 -> tensor<2xi64>
+                %43 = arith.cmpi slt, %41, %42 : tensor<2xi64>
+                %44 = arith.andi %37, %43 : tensor<2xi1>
+                %45 = tt.splat %true : i1 -> tensor<2xi1>
+                %46 = arith.andi %44, %45 : tensor<2xi1>
+                %c0_i64_8 = arith.constant 0 : i64
+                %47 = tt.splat %c0_i64_8 : i64 -> tensor<2xi64>
+                %48 = tt.splat %c0_i64_0 : i64 -> tensor<2xi64>
+                %49 = arith.addi %48, %41 : tensor<2xi64>
+                %50 = tt.splat %3 : i64 -> tensor<2xi64>
+                %51 = arith.cmpi slt, %49, %50 : tensor<2xi64>
+                %52 = arith.andi %46, %51 : tensor<2xi1>
+                %c2_i64_9 = arith.constant 2 : i64
+                %53 = tt.splat %c2_i64_9 : i64 -> tensor<2xi64>
+                %54 = arith.cmpi sge, %49, %47 : tensor<2xi64>
+                %55 = arith.cmpi slt, %49, %53 : tensor<2xi64>
+                %56 = arith.andi %54, %55 : tensor<2xi1>
+                %57 = arith.andi %52, %56 : tensor<2xi1>
+                %c0_i64_10 = arith.constant 0 : i64
+                %58 = tt.splat %c0_i64_10 : i64 -> tensor<2xi64>
+                %59 = arith.select %56, %49, %58 : tensor<2xi1>, tensor<2xi64>
+                %c1_i64_11 = arith.constant 1 : i64
+                %60 = tt.splat %c1_i64_11 : i64 -> tensor<2xi64>
+                %61 = arith.muli %59, %60 : tensor<2xi64>
+                %62 = arith.addi %58, %61 : tensor<2xi64>
+                %63 = arith.select %57, %62, %58 : tensor<2xi1>, tensor<2xi64>
+                %64 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<2x!tt.ptr<f32>>
+                %65 = tt.addptr %64, %63 : tensor<2x!tt.ptr<f32>>, tensor<2xi64>
+                tt.store %65, %36, %57 {operand_segment_sizes = array<i32: 1, 1, 1>} : tensor<2x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+        "},
+        );
+
+        // The same window under the in-bounds policy fails on the host. Triton cannot report that failure at run time,
+        // so admission rejects every in-bounds load whose start bounds do not prove the window valid.
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 3, vec![]);
+        assert_eq!(
+            definition.interpret(vec![source], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
+        );
+        assert_eq!(rejection(&definition), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+    }
+
+    #[test]
+    fn test_lower_tile_load_boundaries() {
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+
+        // An in-bounds load whose start bounds prove a wholly valid window lowers like the masked load of that window.
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 2, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![7f32, 9.0]).unwrap()]));
+        assert_eq!(
+            lowered_module(&definition),
+            lowered_module(&tile_load_definition(BoundaryPolicy::Masked, 2, vec![])),
+        );
+
+        // Bounds apply to the selected view `[5, 7, 9]` rather than to the whole source, so the window at element 2 of
+        // that view fails even though it lies inside the source.
+        let slice = || vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] }];
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 1, slice());
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![7f32, 9.0]).unwrap()]));
+        assert_eq!(
+            lowered_module(&definition),
+            lowered_module(&tile_load_definition(BoundaryPolicy::Masked, 1, slice())),
+        );
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 2, slice());
+        assert_eq!(
+            definition.interpret(vec![source.clone()], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
+        );
+        assert_eq!(rejection(&definition), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+
+        // A masked window that starts beyond the view consists entirely of padding.
+        let definition = tile_load_definition(BoundaryPolicy::Masked, 4, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![-1f32, -1.0]).unwrap()]));
+        lowered_module(&definition);
+
+        // A window limit beyond the canonical dimension width fails on the host under either policy, and Triton rejects
+        // its start before it reaches the load because the start exceeds the signed 32-bit indexing range.
+        let definition = tile_load_definition(BoundaryPolicy::Masked, MAX_DIMENSION_EXTENT - 1, vec![]);
+        assert_eq!(
+            definition.interpret(vec![source], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` window limit exceeds the canonical dimension width",
+            )))),
+        );
+        assert_eq!(
+            rejection(&definition),
+            ("dimension", "dimension bounds must fit the signed 32-bit indexing domain".to_owned()),
+        );
+    }
+
+    #[test]
+    fn test_lower_tile_load_unreachable() {
+        // Admission cannot tell whether an in-bounds load runs, so it rejects the load even where the host never
+        // executes it. This is a missing capability of the adapter, unlike a malformed load, which fails when it is
+        // staged and never reaches an adapter.
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+        let [empty_grid, untaken_branch] = unreachable_tile_load_definitions().try_into().ok().unwrap();
+        let output = Array::vector(vec![1f32, 2.0]).unwrap();
+        assert_eq!(empty_grid.interpret(vec![source.clone(), output.clone()], 1), Ok(vec![output]));
+        assert_eq!(rejection(&empty_grid), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+        assert_eq!(untaken_branch.interpret(vec![source], 1), Ok(vec![Array::vector(vec![-1f32, -1.0]).unwrap()]));
+        assert_eq!(rejection(&untaken_branch), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = builder.add_input(
+            whole_array_parameter(ArrayType::new_static(DataType::F32, [4]), KernelParameterAccess::ReadOnly)
+                .unwrap()
+                .body_type(),
+        );
+        let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
+        let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+        let operation = TileLoadOperation::new(vec![2, 2], BoundaryPolicy::InBounds).unwrap();
+        assert_eq!(
+            builder.add_instruction(operation, vec![], vec![reference, start, start, other], None),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` source requires a static shape with the block rank",
+            )))),
         );
     }
 
@@ -4504,61 +4974,61 @@ mod tests {
                 %c1084227584_i32 = arith.constant 1084227584 : i32
                 %11 = arith.bitcast %c1084227584_i32 : i32 to f32
                 %12 = tt.splat %11 : f32 -> tensor<4xf32>
-                %c-1082130432_i32 = arith.constant -1082130432 : i32
-                %13 = arith.bitcast %c-1082130432_i32 : i32 to f32
-                %14 = tt.splat %13 : f32 -> tensor<4xf32>
                 %true_5 = arith.constant true
-                %15 = tt.splat %true_5 : i1 -> tensor<4xi1>
-                %16 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
-                %17 = tt.reshape %16 : tensor<4xi32> -> tensor<4xi32>
-                %18 = arith.extsi %17 : tensor<4xi32> to tensor<4xi64>
-                %19 = tt.broadcast %18 : tensor<4xi64> -> tensor<4xi64>
+                %13 = tt.splat %true_5 : i1 -> tensor<4xi1>
+                %14 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %15 = tt.reshape %14 : tensor<4xi32> -> tensor<4xi32>
+                %16 = arith.extsi %15 : tensor<4xi32> to tensor<4xi64>
+                %17 = tt.broadcast %16 : tensor<4xi64> -> tensor<4xi64>
                 %c3_i64_6 = arith.constant 3 : i64
-                %20 = tt.splat %c3_i64_6 : i64 -> tensor<4xi64>
-                %21 = arith.cmpi slt, %19, %20 : tensor<4xi64>
-                %22 = arith.andi %15, %21 : tensor<4xi1>
-                %23 = tt.splat %true : i1 -> tensor<4xi1>
-                %24 = arith.andi %22, %23 : tensor<4xi1>
+                %18 = tt.splat %c3_i64_6 : i64 -> tensor<4xi64>
+                %19 = arith.cmpi slt, %17, %18 : tensor<4xi64>
+                %20 = arith.andi %13, %19 : tensor<4xi1>
+                %21 = tt.splat %true : i1 -> tensor<4xi1>
+                %22 = arith.andi %20, %21 : tensor<4xi1>
                 %c0_i64_7 = arith.constant 0 : i64
-                %25 = tt.splat %c0_i64_7 : i64 -> tensor<4xi64>
-                %26 = tt.splat %7 : i64 -> tensor<4xi64>
-                %27 = arith.addi %26, %19 : tensor<4xi64>
-                %28 = tt.splat %8 : i64 -> tensor<4xi64>
-                %29 = arith.cmpi slt, %27, %28 : tensor<4xi64>
-                %30 = arith.andi %24, %29 : tensor<4xi1>
+                %23 = tt.splat %c0_i64_7 : i64 -> tensor<4xi64>
+                %24 = tt.splat %7 : i64 -> tensor<4xi64>
+                %25 = arith.addi %24, %17 : tensor<4xi64>
+                %26 = tt.splat %8 : i64 -> tensor<4xi64>
+                %27 = arith.cmpi slt, %25, %26 : tensor<4xi64>
+                %28 = arith.andi %22, %27 : tensor<4xi1>
                 %c2_i64 = arith.constant 2 : i64
-                %31 = tt.splat %c2_i64 : i64 -> tensor<4xi64>
-                %32 = arith.cmpi sge, %27, %25 : tensor<4xi64>
-                %33 = arith.cmpi slt, %27, %31 : tensor<4xi64>
-                %34 = arith.andi %32, %33 : tensor<4xi1>
-                %35 = arith.andi %30, %34 : tensor<4xi1>
+                %29 = tt.splat %c2_i64 : i64 -> tensor<4xi64>
+                %30 = arith.cmpi sge, %25, %23 : tensor<4xi64>
+                %31 = arith.cmpi slt, %25, %29 : tensor<4xi64>
+                %32 = arith.andi %30, %31 : tensor<4xi1>
+                %33 = arith.andi %28, %32 : tensor<4xi1>
                 %true_8 = arith.constant true
-                %36 = tt.splat %true_8 : i1 -> tensor<4xi1>
-                %37 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
-                %38 = tt.reshape %37 : tensor<4xi32> -> tensor<4xi32>
-                %39 = arith.extsi %38 : tensor<4xi32> to tensor<4xi64>
-                %40 = tt.broadcast %39 : tensor<4xi64> -> tensor<4xi64>
+                %34 = tt.splat %true_8 : i1 -> tensor<4xi1>
+                %35 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %36 = tt.reshape %35 : tensor<4xi32> -> tensor<4xi32>
+                %37 = arith.extsi %36 : tensor<4xi32> to tensor<4xi64>
+                %38 = tt.broadcast %37 : tensor<4xi64> -> tensor<4xi64>
                 %c3_i64_9 = arith.constant 3 : i64
-                %41 = tt.splat %c3_i64_9 : i64 -> tensor<4xi64>
-                %42 = arith.cmpi slt, %40, %41 : tensor<4xi64>
-                %43 = arith.andi %36, %42 : tensor<4xi1>
-                %44 = tt.splat %true : i1 -> tensor<4xi1>
-                %45 = arith.andi %43, %44 : tensor<4xi1>
+                %39 = tt.splat %c3_i64_9 : i64 -> tensor<4xi64>
+                %40 = arith.cmpi slt, %38, %39 : tensor<4xi64>
+                %41 = arith.andi %34, %40 : tensor<4xi1>
+                %42 = tt.splat %true : i1 -> tensor<4xi1>
+                %43 = arith.andi %41, %42 : tensor<4xi1>
                 %c0_i64_10 = arith.constant 0 : i64
-                %46 = tt.splat %c0_i64_10 : i64 -> tensor<4xi64>
-                %47 = tt.splat %7 : i64 -> tensor<4xi64>
-                %48 = arith.addi %47, %40 : tensor<4xi64>
-                %49 = tt.splat %8 : i64 -> tensor<4xi64>
-                %50 = arith.cmpi slt, %48, %49 : tensor<4xi64>
-                %51 = arith.andi %45, %50 : tensor<4xi1>
+                %44 = tt.splat %c0_i64_10 : i64 -> tensor<4xi64>
+                %45 = tt.splat %7 : i64 -> tensor<4xi64>
+                %46 = arith.addi %45, %38 : tensor<4xi64>
+                %47 = tt.splat %8 : i64 -> tensor<4xi64>
+                %48 = arith.cmpi slt, %46, %47 : tensor<4xi64>
+                %49 = arith.andi %43, %48 : tensor<4xi1>
                 %c2_i64_11 = arith.constant 2 : i64
-                %52 = tt.splat %c2_i64_11 : i64 -> tensor<4xi64>
-                %53 = arith.cmpi sge, %48, %46 : tensor<4xi64>
-                %54 = arith.cmpi slt, %48, %52 : tensor<4xi64>
-                %55 = arith.andi %53, %54 : tensor<4xi1>
-                %56 = arith.andi %51, %55 : tensor<4xi1>
-                %57 = arith.andi %56, %35 : tensor<4xi1>
-                %58 = arith.select %57, %12, %6 : tensor<4xi1>, tensor<4xf32>
+                %50 = tt.splat %c2_i64_11 : i64 -> tensor<4xi64>
+                %51 = arith.cmpi sge, %46, %44 : tensor<4xi64>
+                %52 = arith.cmpi slt, %46, %50 : tensor<4xi64>
+                %53 = arith.andi %51, %52 : tensor<4xi1>
+                %54 = arith.andi %49, %53 : tensor<4xi1>
+                %55 = arith.andi %54, %33 : tensor<4xi1>
+                %56 = arith.select %55, %12, %6 : tensor<4xi1>, tensor<4xf32>
+                %c-1082130432_i32 = arith.constant -1082130432 : i32
+                %57 = arith.bitcast %c-1082130432_i32 : i32 to f32
+                %58 = tt.splat %57 : f32 -> tensor<4xf32>
                 %true_12 = arith.constant true
                 %59 = tt.splat %true_12 : i1 -> tensor<4xi1>
                 %60 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
@@ -4584,9 +5054,9 @@ mod tests {
                 %77 = arith.cmpi slt, %71, %75 : tensor<4xi64>
                 %78 = arith.andi %76, %77 : tensor<4xi1>
                 %79 = arith.andi %74, %78 : tensor<4xi1>
-                %80 = arith.andi %79, %35 : tensor<4xi1>
-                %81 = arith.select %80, %58, %14 : tensor<4xi1>, tensor<4xf32>
-                %82 = arith.select %80, %12, %58 : tensor<4xi1>, tensor<4xf32>
+                %80 = arith.andi %79, %33 : tensor<4xi1>
+                %81 = arith.select %80, %56, %58 : tensor<4xi1>, tensor<4xf32>
+                %82 = arith.select %80, %12, %56 : tensor<4xi1>, tensor<4xf32>
                 %true_16 = arith.constant true
                 %83 = tt.splat %true_16 : i1 -> tensor<4xi1>
                 %84 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
@@ -4817,49 +5287,49 @@ mod tests {
                 %9 = arith.addi %8, %c3_i64_4 : i64
                 %c0_i32 = arith.constant 0 : i32
                 %10 = arith.bitcast %c0_i32 : i32 to f32
-                %c0_i32_5 = arith.constant 0 : i32
-                %11 = arith.bitcast %c0_i32_5 : i32 to f32
-                %12 = tt.splat %11 : f32 -> tensor<4xf32>
                 %cst = arith.constant 0.000000e+00 : f32
-                %13 = tt.splat %cst : f32 -> tensor<4xf32>
-                %true_6 = arith.constant true
-                %14 = tt.splat %true_6 : i1 -> tensor<4xi1>
-                %15 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
-                %16 = tt.reshape %15 : tensor<4xi32> -> tensor<4xi32>
-                %17 = arith.extsi %16 : tensor<4xi32> to tensor<4xi64>
-                %18 = tt.broadcast %17 : tensor<4xi64> -> tensor<4xi64>
-                %c3_i64_7 = arith.constant 3 : i64
-                %19 = tt.splat %c3_i64_7 : i64 -> tensor<4xi64>
-                %20 = arith.cmpi slt, %18, %19 : tensor<4xi64>
-                %21 = arith.andi %14, %20 : tensor<4xi1>
-                %22 = tt.splat %true : i1 -> tensor<4xi1>
-                %23 = arith.andi %21, %22 : tensor<4xi1>
+                %11 = tt.splat %cst : f32 -> tensor<4xf32>
+                %true_5 = arith.constant true
+                %12 = tt.splat %true_5 : i1 -> tensor<4xi1>
+                %13 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+                %14 = tt.reshape %13 : tensor<4xi32> -> tensor<4xi32>
+                %15 = arith.extsi %14 : tensor<4xi32> to tensor<4xi64>
+                %16 = tt.broadcast %15 : tensor<4xi64> -> tensor<4xi64>
+                %c3_i64_6 = arith.constant 3 : i64
+                %17 = tt.splat %c3_i64_6 : i64 -> tensor<4xi64>
+                %18 = arith.cmpi slt, %16, %17 : tensor<4xi64>
+                %19 = arith.andi %12, %18 : tensor<4xi1>
+                %20 = tt.splat %true : i1 -> tensor<4xi1>
+                %21 = arith.andi %19, %20 : tensor<4xi1>
                 %c0_i64 = arith.constant 0 : i64
-                %24 = tt.splat %c0_i64 : i64 -> tensor<4xi64>
-                %25 = tt.splat %6 : i64 -> tensor<4xi64>
-                %26 = arith.addi %25, %18 : tensor<4xi64>
-                %27 = tt.splat %7 : i64 -> tensor<4xi64>
-                %28 = arith.cmpi slt, %26, %27 : tensor<4xi64>
-                %29 = arith.andi %23, %28 : tensor<4xi1>
-                %c3_i64_8 = arith.constant 3 : i64
-                %30 = tt.splat %c3_i64_8 : i64 -> tensor<4xi64>
-                %31 = arith.cmpi sge, %26, %24 : tensor<4xi64>
-                %32 = arith.cmpi slt, %26, %30 : tensor<4xi64>
-                %33 = arith.andi %31, %32 : tensor<4xi1>
-                %34 = arith.andi %29, %33 : tensor<4xi1>
-                %c0_i64_9 = arith.constant 0 : i64
-                %35 = tt.splat %c0_i64_9 : i64 -> tensor<4xi64>
-                %36 = arith.select %33, %26, %35 : tensor<4xi1>, tensor<4xi64>
-                %c1_i64_10 = arith.constant 1 : i64
-                %37 = tt.splat %c1_i64_10 : i64 -> tensor<4xi64>
-                %38 = arith.muli %36, %37 : tensor<4xi64>
-                %39 = arith.addi %35, %38 : tensor<4xi64>
-                %40 = arith.select %34, %39, %35 : tensor<4xi1>, tensor<4xi64>
-                %41 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
-                %42 = tt.addptr %41, %40 : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
-                %43 = tt.load %42, %34, %13 : tensor<4x!tt.ptr<f32>>
-                %44 = tt.splat %10 : f32 -> tensor<4xf32>
-                %45 = arith.cmpf ogt, %43, %44 : tensor<4xf32>
+                %22 = tt.splat %c0_i64 : i64 -> tensor<4xi64>
+                %23 = tt.splat %6 : i64 -> tensor<4xi64>
+                %24 = arith.addi %23, %16 : tensor<4xi64>
+                %25 = tt.splat %7 : i64 -> tensor<4xi64>
+                %26 = arith.cmpi slt, %24, %25 : tensor<4xi64>
+                %27 = arith.andi %21, %26 : tensor<4xi1>
+                %c3_i64_7 = arith.constant 3 : i64
+                %28 = tt.splat %c3_i64_7 : i64 -> tensor<4xi64>
+                %29 = arith.cmpi sge, %24, %22 : tensor<4xi64>
+                %30 = arith.cmpi slt, %24, %28 : tensor<4xi64>
+                %31 = arith.andi %29, %30 : tensor<4xi1>
+                %32 = arith.andi %27, %31 : tensor<4xi1>
+                %c0_i64_8 = arith.constant 0 : i64
+                %33 = tt.splat %c0_i64_8 : i64 -> tensor<4xi64>
+                %34 = arith.select %31, %24, %33 : tensor<4xi1>, tensor<4xi64>
+                %c1_i64_9 = arith.constant 1 : i64
+                %35 = tt.splat %c1_i64_9 : i64 -> tensor<4xi64>
+                %36 = arith.muli %34, %35 : tensor<4xi64>
+                %37 = arith.addi %33, %36 : tensor<4xi64>
+                %38 = arith.select %32, %37, %33 : tensor<4xi1>, tensor<4xi64>
+                %39 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+                %40 = tt.addptr %39, %38 : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
+                %41 = tt.load %40, %32, %11 : tensor<4x!tt.ptr<f32>>
+                %42 = tt.splat %10 : f32 -> tensor<4xf32>
+                %43 = arith.cmpf ogt, %41, %42 : tensor<4xf32>
+                %c0_i32_10 = arith.constant 0 : i32
+                %44 = arith.bitcast %c0_i32_10 : i32 to f32
+                %45 = tt.splat %44 : f32 -> tensor<4xf32>
                 %true_11 = arith.constant true
                 %46 = tt.splat %true_11 : i1 -> tensor<4xi1>
                 %47 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
@@ -4895,8 +5365,8 @@ mod tests {
                 %72 = arith.select %66, %71, %67 : tensor<4xi1>, tensor<4xi64>
                 %73 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
                 %74 = tt.addptr %73, %72 : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
-                %75 = arith.andi %66, %45 : tensor<4xi1>
-                %76 = tt.load %74, %75, %12 : tensor<4x!tt.ptr<f32>>
+                %75 = arith.andi %66, %43 : tensor<4xi1>
+                %76 = tt.load %74, %75, %45 : tensor<4x!tt.ptr<f32>>
                 %true_17 = arith.constant true
                 %77 = tt.splat %true_17 : i1 -> tensor<4xi1>
                 %78 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
@@ -5162,6 +5632,58 @@ mod tests {
             ),
             Err(Error::Unsupported { operation: "broadcast_like", reason })
                 if reason == "broadcast axes must preserve source order",
+        ));
+    }
+
+    #[test]
+    fn test_lowering_array_dot() {
+        let matrix = ArrayType::new_static(DataType::F32, [2, 2]);
+        let dot = |operation: DotOperation| lowered_array(ArrayOperation::Dot(operation), vec![matrix.clone(); 2]);
+        assert!(matches!(dot(DotOperation::matmul()), Ok((_, _, Some(_)))));
+
+        // Every precision that rounds the operands or relaxes the F32 accumulation is rejected.
+        let f32 = DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32);
+        for precision in [
+            DotPrecision::from(DotInputPrecision::High),
+            DotPrecision::from((DotInputPrecision::Highest, DotInputPrecision::High)),
+            DotPrecision::from(DotAlgorithmPreset::BF16_BF16_F32),
+            DotPrecision::from(DotAlgorithmPreset::TF32_TF32_F32),
+            DotPrecision::from(DotAlgorithmPreset::BF16_BF16_F32_X3),
+            DotPrecision::from(f32.with_imprecise_accumulation(true)),
+            DotPrecision::from(f32.with_component_counts(2, 2).with_primitive_operation_count(3)),
+        ] {
+            assert!(matches!(
+                dot(DotOperation::matmul().with_precision(precision)),
+                Err(Error::Unsupported { operation: "dot", reason }) if reason == format!(
+                    "precision `{precision}` requires conversions or accumulation other than an IEEE F32 dot",
+                ),
+            ));
+        }
+
+        // An F32 accumulation type is the default for F32 operands. Every other one is also the output type, which no
+        // Triton tile represents.
+        assert_eq!(
+            dot(DotOperation::matmul().with_accumulation_type(DataType::F32)).ok(),
+            dot(DotOperation::matmul()).ok(),
+        );
+        assert!(matches!(
+            dot(DotOperation::matmul().with_accumulation_type(DataType::F16)),
+            Err(Error::Unsupported { operation: "array", reason })
+                if reason == "only F32, I64 and Boolean tile values are supported",
+        ));
+        assert!(matches!(
+            lowered_array(
+                ArrayOperation::Dot(DotOperation::matmul().with_accumulation_type(DataType::I64)),
+                vec![ArrayType::new_static(DataType::I64, [2, 2]); 2],
+            ),
+            Err(Error::Unsupported { operation: "dot", reason })
+                if reason == "operands, accumulation, and results must be F32",
+        ));
+        let batched = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]));
+        assert!(matches!(
+            lowered_array(ArrayOperation::Dot(batched), vec![ArrayType::new_static(DataType::F32, [2, 2, 2]); 2]),
+            Err(Error::Unsupported { operation: "dot", reason })
+                if reason == "only rank-2 matrix multiplications are supported",
         ));
     }
 

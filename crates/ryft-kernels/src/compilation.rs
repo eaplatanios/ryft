@@ -150,8 +150,12 @@ where
     Extension: KernelExtension,
 {
     /// Verifies initialization, accesses, bounds, output coverage, and the disjointness of mutable windows before
-    /// admission. The enumeration budget bounds verification work and is excluded from semantic and compiler
-    /// identity.
+    /// admission. `maximum_programs` bounds only the grid enumeration of qualification, which evaluates the mapping of
+    /// a parameter at every grid point when [`BlockMapping::tiling_axes`](crate::mappings::BlockMapping::tiling_axes)
+    /// does not recognize it or when its recognized axes repeat a grid axis (e.g., the diagonal element starts
+    /// `(i, i)`). A launch that enumerates more grid points fails with
+    /// [`KernelInitializationError::QualificationLimit`], and a launch without such a parameter is accepted at any
+    /// size. The bound is excluded from semantic and compiler identity.
     ///
     /// # Errors
     ///

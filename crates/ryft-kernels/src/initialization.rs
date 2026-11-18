@@ -34,7 +34,9 @@
 //!   - **Reads and writes.** A pure write (i.e., a write or a swap whose old value is unused, which lowers to a store)
 //!     adds the elements that it selects to the coverage of its root. Every other access reads its selection, so each
 //!     element that it selects must be initialized, and otherwise it fails with
-//!     [`KernelInitializationError::UninitializedRead`]. A
+//!     [`KernelInitializationError::UninitializedRead`]. Every read of an instruction is checked against the coverage
+//!     that enters that instruction, and its writes are added only once all of its accesses are checked, so an
+//!     instruction never reads an element that only it writes, whatever the order of its accesses. A
 //!     [`ReferenceNewOperation`](ryft_core::ReferenceNewOperation) allocation starts complete, because it is created
 //!     from a value.
 //!   - **Masked accesses.** A masked load, store, or swap whose mask is a constant reads and writes only the elements
@@ -60,11 +62,18 @@
 //!   - **Scratch allocations.** A [`ScratchOperation`](crate::memory::ScratchOperation) allocation starts empty.
 //!   - **Extensions.** An extension operation declares its timing through [`KernelExtension::memory_semantics`],
 //!     which must agree with its canonical reference effects, and otherwise it fails with
-//!     [`KernelInitializationError::InvalidExtension`]. Synchronous operations access memory like portable
-//!     operations, and allocations start empty. Asynchronous operations reserve their accesses like asynchronous
-//!     copies until a wait consumes their completion allocation, and commits must read a pending completion of the same
-//!     region. Releases retire an allocation of the current region that is neither a pending completion nor reserved by
-//!     one. Extensions with attached regions are rejected.
+//!     [`KernelInitializationError::InvalidExtension`]. This agreement is structural, so it is checked once for every
+//!     extension of the body, including for an empty launch and in branches that no analysis reaches. Synchronous
+//!     operations access memory like portable operations, and allocations start empty. Asynchronous operations reserve
+//!     their accesses like asynchronous copies until a wait consumes their completion allocation, and commits must read
+//!     a pending completion of the same region. Releases retire an allocation of the current region that is neither a
+//!     pending completion nor reserved by one. Extensions with attached regions are rejected.
+//!   - **Completion protocols.** Every pending token carries the completion protocol of the operation that produced
+//!     it, which is the portable protocol for an async copy and [`KernelExtension::completion_protocol`] for an
+//!     asynchronous extension. A commit or a wait must follow that protocol, and a protocol that requires a commit
+//!     admits exactly one commit before the wait. Otherwise the instruction fails with
+//!     [`KernelInitializationError::IncompatibleCompletion`] before any reservation is retired or any deferred write is
+//!     published, so neither a portable wait nor an extension commit or wait can complete the token of another family.
 //!
 //! # Control Flow
 //!
@@ -87,7 +96,8 @@
 //! of each carry axis. In the first case, the carry coordinate is zero and the parameters carried along that axis start
 //! empty. In the later case, they start complete, because the previous step of the chain left the same window
 //! complete. The coordinate of a grid axis with extent 1 is zero in every case. Every case must leave every
-//! write-only parameter complete, and otherwise it fails with [`KernelInitializationError::IncompleteBody`].
+//! write-only parameter complete, and otherwise it fails with [`KernelInitializationError::IncompleteBody`]. Every
+//! carry axis has an extent of at least 2, so a launch with grid points has at most as many cases as grid points.
 //!
 //! # Launch Qualification
 //!
@@ -105,6 +115,11 @@
 //! [`KernelInitializationError::IncompleteOutput`]. Finally, every nonempty reading access without a mask that the
 //! body analysis recorded on a masked parameter must stay within the elements that are valid in the window of every
 //! grid point, and otherwise it fails with [`KernelMemoryError::UnmaskedWindowAccess`].
+//!
+//! An empty launch (i.e., a grid with an axis of extent 0) never runs its body. Its body still passes the validation
+//! of the call, and every write-only output with an element still fails with
+//! [`KernelInitializationError::IncompleteOutput`], because no window covers it. The accesses of the body are not
+//! analyzed, so no carry case is enumerated and no read needs to be initialized.
 
 // Initialized element intervals are lists of ranges that often hold one interval, which this lint mistakes for a
 // range to collect.
@@ -122,10 +137,12 @@ use ryft_core::{
 use thiserror::Error;
 
 use crate::calls::{KernelCallOperation, KernelError};
-use crate::grids::GridExecution;
+use crate::grids::{GridError, GridExecution};
 use crate::mappings::{BlockMappingError, BoundaryPolicy};
 use crate::memory::{KernelMemoryError, WAIT_OPERATION_NAME};
-use crate::operations::{KernelExtension, KernelExtensionMemory, KernelOperation};
+use crate::operations::{
+    KernelCompletionProtocol, KernelExtension, KernelExtensionMemory, KernelOperation, admits_completion,
+};
 use crate::validation::{KernelParameterAccess, KernelReferenceSummary, KernelSwapLowering};
 
 /// A body or launch lacks a definite initialization or disjointness proof.
@@ -158,6 +175,18 @@ pub enum KernelInitializationError {
     #[error("kernel instruction {instruction} accesses copy token {token} without `{WAIT_OPERATION_NAME}`")]
     InvalidCopyTokenAccess {
         /// Instruction that accesses the token.
+        instruction: InstructionId,
+
+        /// Canonical completion allocation of the pending copy.
+        token: ReferenceRoot,
+    },
+
+    /// A commit or wait does not follow the completion protocol of the operation that produced its pending token (i.e.,
+    /// it belongs to another protocol, it waits before a commit that the protocol requires, or it repeats a commit
+    /// that the protocol requires exactly once). The reservations of the token stay in place.
+    #[error("kernel instruction {instruction} does not follow the completion protocol of pending copy {token}")]
+    IncompatibleCompletion {
+        /// Commit or wait instruction.
         instruction: InstructionId,
 
         /// Canonical completion allocation of the pending copy.
@@ -307,15 +336,17 @@ pub enum KernelInitializationError {
 /// maximal coordinate and proves coverage from its extents along each axis. Other mappings use bounded enumeration
 /// through the same interpreter. Overlapping mutable windows require grid ordering or exclusively atomic accumulation.
 /// Conflicts between atomic and other accesses remain races, because deterministic host traversal does not provide
-/// ordering that the grid contract lacks.
+/// ordering that the grid contract lacks. A launch without grid points never runs its body, so only its call
+/// validation and the coverage of its write-only outputs are checked, and any write-only output with an element is
+/// uncovered.
 ///
 /// # Parameters
 ///
 ///   - `region`: actual attached body being qualified.
 ///   - `call`: its canonical grid, full array types, accesses, and mappings.
-///   - `maximum_programs`: maximum grid size to enumerate when a mapping lacks a separable tiling proof. Such larger
-///     launches are rejected before body traversal. This resource limit does not participate in kernel semantic
-///     identity. Only the debug interpreter entry points (e.g.,
+///   - `maximum_programs`: maximum grid size to enumerate when a mapping lacks a separable tiling proof or when its
+///     recognized axes repeat a grid axis. Such larger launches are rejected before body traversal. This resource
+///     limit does not participate in kernel semantic identity. Only the debug interpreter entry points (e.g.,
 ///     [`KernelDefinition::interpret_with_limits`](crate::calls::KernelDefinition::interpret_with_limits)) also cap
 ///     grid points when no enumeration is needed here.
 ///
@@ -372,6 +403,7 @@ pub(crate) fn validated_kernel_references<Extension: KernelExtension>(
         });
     }
     let references = call.validate_body(region)?;
+    validate_extensions(region)?;
     let carry_axes = call
         .parameters()
         .iter()
@@ -398,20 +430,30 @@ pub(crate) fn validated_kernel_references<Extension: KernelExtension>(
     // at `k > 0` enters with the window that its predecessor left complete, which is the later case. Masked windows
     // reload the valid elements that their predecessor published and keep zero padding, so their tiles are
     // deterministic too. Every combination of cases occurs at some grid point, and because every carry axis has an
-    // extent of at least 2, there are at most as many cases as grid points. A grid axis with extent 1 always has
-    // coordinate zero, which every case knows.
+    // extent of at least 2, a launch with grid points has at most as many cases as grid points. A grid axis with
+    // extent 1 always has coordinate zero, which every case knows. An empty launch runs no body, so no case is
+    // analyzed, even though its carry axes may be too many to count their cases. The structural extension declarations
+    // were already validated above, independently of the cases.
+    let cases = if points.len() == 0 {
+        0
+    } else {
+        u32::try_from(carried_axes.len())
+            .ok()
+            .and_then(|count| 1usize.checked_shl(count))
+            .ok_or(KernelError::from(GridError::ProgramCountOverflow))?
+    };
     let mut bindings = BTreeMap::new();
     for parameter in 0..call.parameters().len() {
         let root = ReferenceRoot::RegionInput { region: region.id(), input_index: parameter };
         bindings.insert(root, root);
     }
     let mut unmasked_accesses = Vec::new();
-    for case in 0..1usize << carried_axes.len() {
+    for case in 0..cases {
         let later = |axis: usize| {
             carried_axes
                 .iter()
                 .position(|&carried| carried == axis)
-                .is_some_and(|position| case & (1 << position) != 0)
+                .is_some_and(|position| (case >> position) & 1 == 1)
         };
         let zero_coordinates = extents
             .iter()
@@ -659,6 +701,8 @@ impl Initialization<'_> {
                             (source, source_axes, ReferenceAccessMode::Read),
                             (destination, destination_axes, ReferenceAccessMode::Write),
                         ],
+                        protocol: None,
+                        committed: false,
                     },
                 );
                 self.types.insert(token, ArrayType::scalar(DataType::Token));
@@ -675,10 +719,7 @@ impl Initialization<'_> {
                 ) {
                     return Err(KernelInitializationError::InvalidCopyToken { value });
                 }
-                let pending =
-                    self.pending_copies.remove(&token).ok_or(KernelInitializationError::InvalidCopyToken { value })?;
-                self.complete(pending)?;
-                self.states.remove(&token);
+                self.complete(id, value, token, None, false)?;
                 continue;
             }
             if let KernelOperation::Scratch(operation) = instruction.operation() {
@@ -784,9 +825,31 @@ impl Initialization<'_> {
         Ok(())
     }
 
-    /// Publishes deferred writes only after the corresponding completion operation. A write whose selection is not
-    /// statically known may select any element, so it establishes no coverage.
-    fn complete(&mut self, pending: PendingCopy) -> Result<(), KernelInitializationError> {
+    /// Applies a commit (when `commit` is set) or a wait that follows `protocol` (i.e., [`None`] for the portable
+    /// wait) to the pending copy of `token`, which the completion input `value` of instruction `id` names. Both must
+    /// follow the protocol of the producer, which is checked before anything changes. A commit only records that it
+    /// observed the token. A wait retires the token and its reservations and publishes the deferred writes of the
+    /// copy, where a write whose selection is not statically known may select any element, so it establishes no
+    /// coverage.
+    fn complete(
+        &mut self,
+        id: InstructionId,
+        value: ValueId,
+        token: ReferenceRoot,
+        protocol: Option<KernelCompletionProtocol>,
+        commit: bool,
+    ) -> Result<(), KernelInitializationError> {
+        let pending =
+            self.pending_copies.get_mut(&token).ok_or(KernelInitializationError::InvalidCopyToken { value })?;
+        if !admits_completion(pending.protocol, pending.committed, protocol, commit) {
+            return Err(KernelInitializationError::IncompatibleCompletion { instruction: id, token });
+        }
+        if commit {
+            pending.committed = true;
+            return Ok(());
+        }
+        let pending = self.pending_copies.remove(&token).unwrap();
+        self.states.remove(&token);
         for (root, axes, mode) in pending.accesses {
             if mode == ReferenceAccessMode::Read {
                 continue;
@@ -803,7 +866,8 @@ impl Initialization<'_> {
         Ok(())
     }
 
-    /// Applies extension timing to canonical reference effects without redefining access windows.
+    /// Applies extension timing to canonical reference effects without redefining access windows. The structural
+    /// declarations of the extension were validated by [`validate_extension_declarations`] before any analysis case.
     fn extension<Extension: KernelExtension>(
         &mut self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
@@ -812,66 +876,17 @@ impl Initialization<'_> {
         bindings: &BTreeMap<ReferenceRoot, ReferenceRoot>,
     ) -> Result<(), KernelInitializationError> {
         let instruction = &region.instructions()[id.index()];
-        let invalid = |message: &str| KernelInitializationError::InvalidExtension {
-            instruction: id,
-            message: message.to_owned(),
-        };
-        if !instruction.regions().is_empty() {
-            return Err(invalid("nested extension regions are unsupported"));
-        }
-        let semantics = operation.memory_semantics().map_err(|error| invalid(&error.to_string()))?;
-        let effects = operation.effects();
-        let declarations = effects.reference_effects();
-        let allocations = declarations
-            .iter()
-            .filter_map(|effect| match effect {
-                ReferenceEffect::Allocate { output_index } => Some(*output_index),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let accesses = declarations
-            .iter()
-            .filter_map(|effect| match effect {
-                ReferenceEffect::Access { input_index, mode } => Some((*input_index, *mode)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let aliases = (0..instruction.outputs().len())
-            .any(|output_index| operation.reference_output_identity_input(output_index).is_some());
+        let (semantics, accesses) = validate_extension_declarations(region, id, operation)?;
         match semantics {
             KernelExtensionMemory::Synchronous => {
-                if !allocations.is_empty() || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume) {
-                    return Err(invalid("synchronous operations cannot allocate or consume references"));
-                }
                 self.accesses(region, id, bindings, None, false)?;
             }
             KernelExtensionMemory::Allocation { output_index }
             | KernelExtensionMemory::Asynchronous { completion_output_index: output_index } => {
-                if allocations != [output_index] || aliases {
-                    return Err(invalid("classification requires exactly its declared allocation and no aliases"));
-                }
-                let asynchronous = matches!(semantics, KernelExtensionMemory::Asynchronous { .. });
-                if (!asynchronous && !accesses.is_empty())
-                    || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume)
-                {
-                    return Err(invalid("allocation accesses do not match its initialization contract"));
-                }
-                let output =
-                    instruction.outputs().get(output_index).ok_or_else(|| invalid("allocation output is absent"))?;
-                let r#type = region.atoms()[output.index()].r#type();
-                let ArrayIrType::Reference(reference) = r#type.as_ref() else {
-                    return Err(invalid("allocation output is not a reference"));
-                };
-                let referent = reference.referent().clone();
-                if asynchronous && referent != ArrayType::scalar(DataType::Token) {
-                    return Err(invalid("completion allocation must reference a scalar token"));
-                }
-                if !asynchronous && referent.data_type() == DataType::Token {
-                    return Err(invalid("ordinary allocations cannot create completion tokens"));
-                }
-                ArrayAddressing::new(referent.clone())?;
+                let r#type = region.atoms()[instruction.outputs()[output_index].index()].r#type();
+                let ArrayIrType::Reference(reference) = r#type.as_ref() else { unreachable!() };
                 let root = ReferenceRoot::Allocation { instruction: id, output_index };
-                if asynchronous {
+                if matches!(semantics, KernelExtensionMemory::Asynchronous { .. }) {
                     self.accesses(region, id, bindings, None, true)?;
                     let reservations = accesses
                         .iter()
@@ -885,43 +900,40 @@ impl Initialization<'_> {
                             .map(|(root, axes)| (root, axes, *mode))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    self.pending_copies.insert(root, PendingCopy { accesses: reservations });
+                    self.pending_copies.insert(
+                        root,
+                        PendingCopy {
+                            accesses: reservations,
+                            protocol: Some(operation.completion_protocol()),
+                            committed: false,
+                        },
+                    );
                 }
-                self.types.insert(root, referent);
+                self.types.insert(root, reference.referent().clone());
                 self.states.insert(root, Vec::new());
             }
             KernelExtensionMemory::Commit { completion_input_index: input_index } => {
-                if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Read)] || aliases {
-                    return Err(invalid("commit must read exactly its declared completion reference"));
-                }
-                let input =
-                    instruction.inputs().get(input_index).ok_or_else(|| invalid("completion input is absent"))?;
-                let value = ValueId::new(region.id(), *input);
+                let value = ValueId::new(region.id(), instruction.inputs()[input_index]);
                 let (root, _) = self.selection(id, input_index, value, bindings)?;
                 if !matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
-                    || !self.pending_copies.contains_key(&root)
                 {
                     return Err(KernelInitializationError::InvalidCopyToken { value });
                 }
+                self.complete(id, value, root, Some(operation.completion_protocol()), true)?;
             }
             KernelExtensionMemory::Wait { completion_input_index: input_index }
             | KernelExtensionMemory::Release { input_index } => {
-                if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Consume)] || aliases {
-                    return Err(invalid("wait or release must consume exactly its declared reference"));
-                }
-                let input = instruction.inputs().get(input_index).ok_or_else(|| invalid("consumed input is absent"))?;
-                let value = ValueId::new(region.id(), *input);
+                let value = ValueId::new(region.id(), instruction.inputs()[input_index]);
                 let (root, _) = self.selection(id, input_index, value, bindings)?;
                 if !matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
                 {
-                    return Err(invalid("wait or release requires an allocation from the current region"));
+                    return Err(KernelInitializationError::InvalidExtension {
+                        instruction: id,
+                        message: "wait or release requires an allocation from the current region".to_owned(),
+                    });
                 }
                 if matches!(semantics, KernelExtensionMemory::Wait { .. }) {
-                    let pending = self
-                        .pending_copies
-                        .remove(&root)
-                        .ok_or(KernelInitializationError::InvalidCopyToken { value })?;
-                    self.complete(pending)?;
+                    self.complete(id, value, root, Some(operation.completion_protocol()), false)?;
                 } else {
                     if self.pending_copies.contains_key(&root) {
                         return Err(KernelInitializationError::InvalidCopyTokenAccess { instruction: id, token: root });
@@ -944,6 +956,11 @@ impl Initialization<'_> {
     /// masks require the complete selected view for reads and establish no definite write coverage, except for the two
     /// provably complete masked stores that [`Self::writes_whole_selection`] recognizes. Selections that are not
     /// statically known require the complete root for reads and establish no write coverage.
+    ///
+    /// Every read of the instruction is checked against the coverage that enters it, and its definite writes are
+    /// published together only after all of its accesses are checked. An instruction may perform its accesses in any
+    /// order (e.g., an extension that copies a reference into itself may write its destination before it reads its
+    /// source), so a write of one access never initializes an element for another access of the same instruction.
     fn accesses<Extension: KernelExtension>(
         &mut self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
@@ -959,6 +976,7 @@ impl Initialization<'_> {
             })
             .transpose()?;
         let instruction = &region.instructions()[id.index()];
+        let mut writes = Vec::new();
         for access in self
             .references
             .analysis()
@@ -1013,15 +1031,17 @@ impl Initialization<'_> {
                 };
                 for range in selected {
                     self.validate_reservations(root, &range, access.mode(), id)?;
-                    let state = self.states.get_mut(&root).unwrap();
-                    if !writes_only && !contains(state, &range) {
+                    if !writes_only && !contains(&self.states[&root], &range) {
                         return Err(KernelInitializationError::UninitializedRead { instruction: id, root });
                     }
                     if establishes_write {
-                        insert(state, range);
+                        writes.push((root, range));
                     }
                 }
             }
+        }
+        for (root, range) in writes {
+            insert(self.states.get_mut(&root).unwrap(), range);
         }
         Ok(())
     }
@@ -1228,6 +1248,112 @@ struct PendingCopy {
     /// Root, root coordinate slice axes, and declared access mode for each outstanding access. Slice axes are [`None`]
     /// for a selection that is not statically known, which reserves its whole root.
     accesses: Vec<(ReferenceRoot, Option<Vec<ArraySliceAxis>>, ReferenceAccessMode)>,
+
+    /// Completion protocol of the producer, which is [`None`] for a portable async copy.
+    protocol: Option<KernelCompletionProtocol>,
+
+    /// Whether a commit has observed the token.
+    committed: bool,
+}
+
+/// Validates the structural memory declarations of every extension operation in `region` and in its attached regions
+/// with [`validate_extension_declarations`]. These declarations do not depend on the grid point or on which
+/// instructions an analysis case reaches, so they are validated once, including for an empty launch and inside a branch
+/// that no analysis case takes.
+fn validate_extensions<Extension: KernelExtension>(
+    region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
+) -> Result<(), KernelInitializationError> {
+    for (index, instruction) in region.instructions().iter().enumerate() {
+        if let KernelOperation::Extension(operation) = instruction.operation() {
+            validate_extension_declarations(region, InstructionId::new(region.id(), index), operation)?;
+        }
+        for &nested in instruction.regions() {
+            validate_extensions(region.with_id(nested).unwrap())?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates that the extension `operation` at instruction `id` of `region` has no attached regions and that its
+/// [`KernelExtension::memory_semantics`] agree with its canonical reference effects, its reference output aliases, and
+/// the types of its declared allocation, and returns those semantics with its declared accesses in declaration order.
+fn validate_extension_declarations<Extension: KernelExtension>(
+    region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
+    id: InstructionId,
+    operation: &Extension,
+) -> Result<(KernelExtensionMemory, Vec<(usize, ReferenceAccessMode)>), KernelInitializationError> {
+    let instruction = &region.instructions()[id.index()];
+    let invalid =
+        |message: &str| KernelInitializationError::InvalidExtension { instruction: id, message: message.to_owned() };
+    if !instruction.regions().is_empty() {
+        return Err(invalid("nested extension regions are unsupported"));
+    }
+    let semantics = operation.memory_semantics().map_err(|error| invalid(&error.to_string()))?;
+    let effects = operation.effects();
+    let declarations = effects.reference_effects();
+    let allocations = declarations
+        .iter()
+        .filter_map(|effect| match effect {
+            ReferenceEffect::Allocate { output_index } => Some(*output_index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let accesses = declarations
+        .iter()
+        .filter_map(|effect| match effect {
+            ReferenceEffect::Access { input_index, mode } => Some((*input_index, *mode)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let aliases = (0..instruction.outputs().len())
+        .any(|output_index| operation.reference_output_identity_input(output_index).is_some());
+    match semantics {
+        KernelExtensionMemory::Synchronous => {
+            if !allocations.is_empty() || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume) {
+                return Err(invalid("synchronous operations cannot allocate or consume references"));
+            }
+        }
+        KernelExtensionMemory::Allocation { output_index }
+        | KernelExtensionMemory::Asynchronous { completion_output_index: output_index } => {
+            if allocations != [output_index] || aliases {
+                return Err(invalid("classification requires exactly its declared allocation and no aliases"));
+            }
+            let asynchronous = matches!(semantics, KernelExtensionMemory::Asynchronous { .. });
+            if (!asynchronous && !accesses.is_empty())
+                || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume)
+            {
+                return Err(invalid("allocation accesses do not match its initialization contract"));
+            }
+            let output =
+                instruction.outputs().get(output_index).ok_or_else(|| invalid("allocation output is absent"))?;
+            let r#type = region.atoms()[output.index()].r#type();
+            let ArrayIrType::Reference(reference) = r#type.as_ref() else {
+                return Err(invalid("allocation output is not a reference"));
+            };
+            let referent = reference.referent().clone();
+            if asynchronous && referent != ArrayType::scalar(DataType::Token) {
+                return Err(invalid("completion allocation must reference a scalar token"));
+            }
+            if !asynchronous && referent.data_type() == DataType::Token {
+                return Err(invalid("ordinary allocations cannot create completion tokens"));
+            }
+            ArrayAddressing::new(referent)?;
+        }
+        KernelExtensionMemory::Commit { completion_input_index: input_index } => {
+            if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Read)] || aliases {
+                return Err(invalid("commit must read exactly its declared completion reference"));
+            }
+            instruction.inputs().get(input_index).ok_or_else(|| invalid("completion input is absent"))?;
+        }
+        KernelExtensionMemory::Wait { completion_input_index: input_index }
+        | KernelExtensionMemory::Release { input_index } => {
+            if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Consume)] || aliases {
+                return Err(invalid("wait or release must consume exactly its declared reference"));
+            }
+            instruction.inputs().get(input_index).ok_or_else(|| invalid("consumed input is absent"))?;
+        }
+    }
+    Ok((semantics, accesses))
 }
 
 /// Returns whether sorted, merged intervals contain every element of `selection`.
@@ -1310,7 +1436,7 @@ mod tests {
         ReferenceViewAnalysisError, ReferenceWriteOperation, RegionId, WhileOperation,
     };
 
-    use crate::calls::KernelParameter;
+    use crate::calls::{KernelDefinition, KernelParameter};
     use crate::grids::{Grid, GridDimension, GridError};
     use crate::mappings::BlockMapping;
     use crate::memory::{
@@ -1488,6 +1614,57 @@ mod tests {
         builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()
     }
 
+    /// Adds the synchronous `copy_into` test extension, which copies `source` into `destination` and takes its source
+    /// as its first input, so that its canonical effects declare the read first, only when `source_first` is set. Each
+    /// operand pairs a reference with an optional start, which selects the two elements of a vector reference that
+    /// begin at it, while [`None`] selects the whole reference.
+    fn add_copy_into(
+        builder: &mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation<TestExtension>>,
+        source_first: bool,
+        destination: (AtomId, Option<usize>),
+        source: (AtomId, Option<usize>),
+    ) {
+        let transforms = |start: Option<usize>| {
+            start
+                .map(|start| ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(start, 2, 1)] })
+                .into_iter()
+                .collect()
+        };
+        let [first, second] = if source_first { [source, destination] } else { [destination, source] };
+        let operation =
+            TestExtension::CopyInto { source_first, transforms: [transforms(first.1), transforms(second.1)] };
+        builder
+            .add_instruction(KernelOperation::Extension(operation), vec![], vec![first.0, second.0], None)
+            .unwrap();
+    }
+
+    /// Starts an asynchronous transfer of `[3, 5]` from an initialized allocation into the write-only output of `call`
+    /// (e.g., `call(2, 2, 1)`), and then applies each of `completions` to its token in order. The producer is the
+    /// portable async copy when `producer` is [`None`], and otherwise the test update of the protocol that
+    /// `Some(strict)` selects.
+    fn completion_body(
+        call: &KernelCallOperation,
+        producer: Option<bool>,
+        completions: &[KernelOperation<TestExtension>],
+    ) -> FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation<TestExtension>>> {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+        let output = builder.add_input(call.parameters()[0].body_type());
+        builder.add_input(call.coordinate_types()[0].clone().into());
+        let contents = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![3i32, 5]).unwrap()));
+        let source = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
+        let (producer, inputs) = match producer {
+            None => (KernelOperation::AsyncCopy(AsyncCopyOperation::new()), vec![source, output]),
+            Some(strict) => {
+                (KernelOperation::Extension(TestExtension::Update { strict }), vec![source, source, output])
+            }
+        };
+        let token = builder.add_instruction(producer, vec![], inputs, None).unwrap()[0];
+        for completion in completions {
+            builder.add_instruction(completion.clone(), vec![], vec![token], None).unwrap();
+        }
+        builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()
+    }
+
     /// Builds a write-only `i32[2, 2]` output whose row windows follow only the first grid axis and a read-only
     /// `i32[2, 2 * extent]` input whose windows follow the first and the last grid axis, where `extent` is the extent
     /// of the last axis. The first axis is parallel with extent 2 and `dimensions` lists the remaining axes.
@@ -1645,6 +1822,11 @@ mod tests {
         assert_eq!(
             KernelInitializationError::InvalidCopyTokenAccess { instruction, token }.to_string(),
             "kernel instruction ^0[2] accesses copy token allocation at ^0[1] output 0 without `wait`",
+        );
+        assert_eq!(
+            KernelInitializationError::IncompatibleCompletion { instruction, token }.to_string(),
+            "kernel instruction ^0[2] does not follow the completion protocol of pending copy allocation at ^0[1] \
+            output 0",
         );
         assert_eq!(
             KernelInitializationError::PendingCopyAccess { instruction, token }.to_string(),
@@ -2949,6 +3131,195 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_kernel_initialization_extension_classification_empty_launch() {
+        // An empty launch runs no body, but its extension declarations are structural, so a misclassified extension
+        // is rejected for an empty grid exactly as for a grid with one point.
+        for programs in [1, 0] {
+            let grid = Grid::new(vec![GridDimension::new(Dimension::Static(programs), GridExecution::Parallel)]);
+            let call = KernelCallOperation::new(grid.unwrap(), vec![]).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+            let operation = KernelOperation::Extension(TestExtension::MisclassifiedAllocation);
+            builder.add_instruction(operation, vec![], vec![], None).unwrap();
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
+                .unwrap();
+            assert_eq!(
+                validate_kernel_initialization(body.entry_region_ref(), &call, 1),
+                Err(KernelInitializationError::InvalidExtension {
+                    instruction: InstructionId::new(body.entry_region_ref().id(), 0),
+                    message: "synchronous operations cannot allocate or consume references".to_owned(),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_reads_precede_instruction_writes() {
+        // Binds the destination and the source of `copy_into` to the same uninitialized write-only scalar, so the copy
+        // reads an uninitialized element whichever access it declares first.
+        let mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+            .build(vec![], Vec::<Placeholder>::new(), Vec::<Placeholder>::new())
+            .unwrap();
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::scalar(DataType::I32),
+                    KernelParameterAccess::WriteOnly,
+                    BlockMapping::new(mapping, vec![], BoundaryPolicy::InBounds).unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for source_first in [false, true] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            let output = builder.add_input(call.parameters()[0].body_type());
+            add_copy_into(&mut builder, source_first, (output, None), (output, None));
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])
+                .unwrap();
+            let region = body.entry_region_ref().id();
+            assert_eq!(
+                validate_kernel_initialization(body.entry_region_ref(), &call, 1),
+                Err(KernelInitializationError::UninitializedRead {
+                    instruction: InstructionId::new(region, 0),
+                    root: ReferenceRoot::RegionInput { region, input_index: 0 },
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_reads_precede_overlapping_instruction_writes() {
+        // Initializes the first `written` elements of the write-only output and then copies its elements `1..3` into
+        // its elements `2..4`, so the copy reads element 2 before it writes it.
+        let call = call(4, 4, 1);
+        let body = |written: usize, source_first: bool| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            let output = builder.add_input(call.parameters()[0].body_type());
+            builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+            let value = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![1i32; written]).unwrap()));
+            let prefix = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, written, 1)] }];
+            builder
+                .add_instruction(
+                    ReferenceWriteOperation::new().with_transforms(prefix),
+                    vec![],
+                    vec![output, value],
+                    None,
+                )
+                .unwrap();
+            add_copy_into(&mut builder, source_first, (output, Some(2)), (output, Some(1)));
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+                .unwrap()
+        };
+        for source_first in [false, true] {
+            let uninitialized = body(2, source_first);
+            let region = uninitialized.entry_region_ref().id();
+            assert_eq!(
+                validate_kernel_initialization(uninitialized.entry_region_ref(), &call, 1),
+                Err(KernelInitializationError::UninitializedRead {
+                    instruction: InstructionId::new(region, 1),
+                    root: ReferenceRoot::RegionInput { region, input_index: 0 },
+                }),
+            );
+
+            // Once the source is initialized, the copy completes the output.
+            let initialized = body(3, source_first);
+            assert_eq!(validate_kernel_initialization(initialized.entry_region_ref(), &call, 1), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_initialized_instruction_reads() {
+        // Copies an initialized allocation into itself and then into the distinct write-only output.
+        let call = call(4, 4, 1);
+        for source_first in [false, true] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+            let output = builder.add_input(call.parameters()[0].body_type());
+            builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+            let contents = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap()));
+            let source =
+                builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
+            add_copy_into(&mut builder, source_first, (source, None), (source, None));
+            add_copy_into(&mut builder, source_first, (output, None), (source, None));
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+                .unwrap();
+            assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 1), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_completion_protocols() {
+        // Every token follows the protocol of its producer, and the host interpreter, which qualifies the body before
+        // replaying it, reports the same outcome. The portable protocol and the default extension protocol admit any
+        // number of commits, and the strict test protocol requires exactly one commit before the wait.
+        let call = call(2, 2, 1);
+        let wait = KernelOperation::<TestExtension>::Wait(WaitOperation);
+        let commit = |strict| KernelOperation::Extension(TestExtension::Commit { strict });
+        let extension_wait = |strict| KernelOperation::Extension(TestExtension::Wait { strict });
+        let region = RegionId::new(0);
+        let incompatible = |index| KernelInitializationError::IncompatibleCompletion {
+            instruction: InstructionId::new(region, index),
+            token: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 1), output_index: 0 },
+        };
+        let cases = [
+            (None, vec![wait.clone()], Ok(())),
+            (Some(false), vec![extension_wait(false)], Ok(())),
+            (Some(false), vec![commit(false), extension_wait(false)], Ok(())),
+            (Some(false), vec![commit(false), commit(false), extension_wait(false)], Ok(())),
+            (Some(true), vec![commit(true), extension_wait(true)], Ok(())),
+            (Some(true), vec![extension_wait(true)], Err(incompatible(2))),
+            (Some(true), vec![commit(true), commit(true), extension_wait(true)], Err(incompatible(3))),
+            (None, vec![extension_wait(false)], Err(incompatible(2))),
+            (None, vec![commit(false), wait.clone()], Err(incompatible(2))),
+            (Some(false), vec![wait.clone()], Err(incompatible(2))),
+            (Some(false), vec![commit(false), wait.clone()], Err(incompatible(3))),
+            (Some(true), vec![commit(false), extension_wait(false)], Err(incompatible(2))),
+            (Some(true), vec![commit(true), extension_wait(false)], Err(incompatible(3))),
+        ];
+        for (producer, completions, expected) in cases {
+            let body = completion_body(&call, producer, &completions);
+            assert_eq!(body.entry_region_ref().id(), region);
+            assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 1), expected);
+            let definition = KernelDefinition::new(call.clone(), body).unwrap();
+            match expected {
+                Ok(()) => assert_eq!(definition.interpret(vec![], 1), Ok(vec![Array::vector(vec![3i32, 5]).unwrap()])),
+                Err(expected) => assert_eq!(
+                    definition.interpret(vec![], 1).unwrap_err().downcast_custom::<KernelInitializationError>(),
+                    Some(&expected),
+                ),
+            }
+        }
+
+        // A wait consumes its token, so the program builder rejects any later use of it.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<TestExtension>>::new();
+        let output = builder.add_input(call.parameters()[0].body_type());
+        builder.add_input(call.coordinate_types()[0].clone().into());
+        let contents = builder.add_constant(contents(&call));
+        let source = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
+        let token = builder
+            .add_instruction(KernelOperation::AsyncCopy(AsyncCopyOperation::new()), vec![], vec![source, output], None)
+            .unwrap()[0];
+        builder.add_instruction(wait.clone(), vec![], vec![token], None).unwrap();
+        assert_eq!(
+            builder.add_instruction(wait, vec![], vec![token], None),
+            Err(ProgramError::MalformedProgram(
+                "`wait` consumes a reference whose alias family `wait` already consumed".to_owned(),
+            )),
+        );
+        assert_eq!(
+            builder.add_instruction(extension_wait(false), vec![], vec![token], None),
+            Err(ProgramError::MalformedProgram(
+                "`test_wait` consumes a reference whose alias family `wait` already consumed".to_owned(),
+            )),
+        );
+    }
+
+    #[test]
     fn test_validate_kernel_initialization_extension_async_update() {
         // Waits for the update, copies its destination into the output, and releases the destination.
         fn finish(
@@ -2958,7 +3329,12 @@ mod tests {
             token: AtomId,
         ) -> FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation<TestExtension>>> {
             builder
-                .add_instruction(KernelOperation::Extension(TestExtension::Wait), vec![], vec![token], None)
+                .add_instruction(
+                    KernelOperation::Extension(TestExtension::Wait { strict: false }),
+                    vec![],
+                    vec![token],
+                    None,
+                )
                 .unwrap();
             let value =
                 builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap()[0];
@@ -2996,14 +3372,19 @@ mod tests {
             }
             let token = builder
                 .add_instruction(
-                    KernelOperation::Extension(TestExtension::Update),
+                    KernelOperation::Extension(TestExtension::Update { strict: false }),
                     vec![],
                     vec![source, source, destination],
                     None,
                 )
                 .unwrap()[0];
             builder
-                .add_instruction(KernelOperation::Extension(TestExtension::Commit), vec![], vec![token], None)
+                .add_instruction(
+                    KernelOperation::Extension(TestExtension::Commit { strict: false }),
+                    vec![],
+                    vec![token],
+                    None,
+                )
                 .unwrap();
             (builder, output, source, destination, token)
         };
@@ -3053,12 +3434,12 @@ mod tests {
         );
 
         // A wait or a release consumes the token, so a later commit is malformed.
+        let commit = KernelOperation::Extension(TestExtension::Commit { strict: false });
         let (mut builder, _, _, _, token) = update(true);
-        builder
-            .add_instruction(KernelOperation::Extension(TestExtension::Wait), vec![], vec![token], None)
-            .unwrap();
+        let wait = KernelOperation::Extension(TestExtension::Wait { strict: false });
+        builder.add_instruction(wait, vec![], vec![token], None).unwrap();
         assert_eq!(
-            builder.add_instruction(KernelOperation::Extension(TestExtension::Commit), vec![], vec![token], None),
+            builder.add_instruction(commit.clone(), vec![], vec![token], None),
             Err(ProgramError::MalformedProgram(
                 "`test_commit` reads a reference whose alias family `test_wait` already consumed".to_owned(),
             )),
@@ -3068,7 +3449,7 @@ mod tests {
             .add_instruction(KernelOperation::Extension(TestExtension::Release), vec![], vec![token], None)
             .unwrap();
         assert_eq!(
-            builder.add_instruction(KernelOperation::Extension(TestExtension::Commit), vec![], vec![token], None),
+            builder.add_instruction(commit.clone(), vec![], vec![token], None),
             Err(ProgramError::MalformedProgram(
                 "`test_commit` reads a reference whose alias family `test_release` already consumed".to_owned(),
             )),
@@ -3488,6 +3869,141 @@ mod tests {
                 }),
             );
         }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_empty_launch() {
+        // The output is carried along `k`, so the late write is rejected once the launch has a point. An empty launch
+        // runs no body, so its body accesses are not analyzed, but a nonempty write-only output is still uncovered.
+        let nonempty = carried_call(&[(1, GridExecution::Parallel), (3, GridExecution::Sequential)]);
+        let early = carried_body(&nonempty, 0, false);
+        assert_eq!(validate_kernel_initialization(early.entry_region_ref(), &nonempty, 0), Ok(()));
+        let late = carried_body(&nonempty, 1, false);
+        let region = late.entry_region_ref().id();
+        assert_eq!(
+            validate_kernel_initialization(late.entry_region_ref(), &nonempty, 0),
+            Err(KernelInitializationError::UninitializedRead {
+                instruction: InstructionId::new(region, 3),
+                root: ReferenceRoot::RegionInput { region, input_index: 0 },
+            }),
+        );
+        let empty = carried_call(&[(0, GridExecution::Parallel), (3, GridExecution::Sequential)]);
+        let late = carried_body(&empty, 1, false);
+        assert_eq!(
+            validate_kernel_initialization(late.entry_region_ref(), &empty, 0),
+            Err(KernelInitializationError::IncompleteOutput { parameter: 0 }),
+        );
+
+        // Reads an unwritten scratch allocation and leaves the empty write-only output alone.
+        for programs in [1, 0] {
+            let call = call(0, 0, programs);
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            builder.add_input(call.parameters()[0].body_type());
+            builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+            let scratch = builder
+                .add_instruction(
+                    KernelOperation::Scratch(
+                        ScratchOperation::new(ArrayType::new_static(DataType::I32, vec![2]), 4).unwrap(),
+                    ),
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), vec![], vec![scratch], None).unwrap();
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+                .unwrap();
+            let region = body.entry_region_ref().id();
+            let expected = if programs == 0 {
+                Ok(())
+            } else {
+                Err(KernelInitializationError::UninitializedRead {
+                    instruction: InstructionId::new(region, 1),
+                    root: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 0), output_index: 0 },
+                })
+            };
+            assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 64), expected);
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_empty_launch_carry_axes() {
+        // Builds a grid whose first axis has extent `first` followed by `usize::BITS` sequential axes with extent 2,
+        // and one write-only output for each of those axes, which is carried along it because its separable windows
+        // follow every other axis with extent 2. Each window is the whole output, whose leading axis has a constant
+        // start and extent 0, except for the first output when `nonempty` is set, whose leading axis has extent 1.
+        let carried = usize::BITS as usize;
+        let carried_axes_call = |first: usize, nonempty: bool| {
+            let parameters = (0..carried)
+                .map(|carry_axis| {
+                    let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                    let coordinates = (0..=carried)
+                        .map(|axis| {
+                            mapping.add_input(
+                                DimensionType::new(
+                                    format!("coordinate_{axis}"),
+                                    DimensionBounds::non_negative(None).unwrap(),
+                                )
+                                .into(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let zero = mapping.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
+                    let starts = std::iter::once(zero)
+                        .chain((1..=carried).filter(|&axis| axis != carry_axis + 1).map(|axis| coordinates[axis]))
+                        .collect::<Vec<_>>();
+                    let rank = starts.len();
+                    let mut shape = vec![1; rank];
+                    if carry_axis != 0 || !nonempty {
+                        shape[0] = 0;
+                    }
+                    let mapping = BlockMapping::new(
+                        mapping.build(starts, vec![Placeholder; carried + 1], vec![Placeholder; rank]).unwrap(),
+                        shape.clone(),
+                        BoundaryPolicy::InBounds,
+                    )
+                    .unwrap();
+                    KernelParameter::new(
+                        ArrayType::new_static(DataType::I32, shape),
+                        KernelParameterAccess::WriteOnly,
+                        mapping,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut grid = vec![GridDimension::new(Dimension::Static(first), GridExecution::Parallel)];
+            grid.extend((0..carried).map(|_| GridDimension::new(Dimension::Static(2), GridExecution::Sequential)));
+            let call = KernelCallOperation::new(Grid::new(grid).unwrap(), parameters).unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            for parameter in call.parameters() {
+                builder.add_input(parameter.body_type());
+            }
+            for coordinate in call.coordinate_types() {
+                builder.add_input(ArrayIrType::Dimension(coordinate.clone()));
+            }
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![],
+                    vec![Placeholder; call.body_input_types().len()],
+                    vec![],
+                )
+                .unwrap();
+            (call, body)
+        };
+        let (call, body) = carried_axes_call(0, false);
+        assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 0), Ok(()));
+        let (call, body) = carried_axes_call(0, true);
+        assert_eq!(
+            validate_kernel_initialization(body.entry_region_ref(), &call, 0),
+            Err(KernelInitializationError::IncompleteOutput { parameter: 0 }),
+        );
+        // A nonempty launch with that many carry axes has more points than a `usize` can count.
+        let (call, body) = carried_axes_call(1, false);
+        assert_eq!(
+            validate_kernel_initialization(body.entry_region_ref(), &call, 0),
+            Err(KernelInitializationError::Call(KernelError::Grid(GridError::ProgramCountOverflow))),
+        );
     }
 
     #[test]

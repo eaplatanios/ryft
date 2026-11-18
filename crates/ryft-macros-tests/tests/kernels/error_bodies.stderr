@@ -65,3 +65,9 @@ error: kernel slices only support `load`, `store`, `accumulate`, and `atomic_acc
    |
 81 |     output.store(input.slice([0..1]).window_mask());
    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: kernel slices cannot be sliced again
+  --> tests/kernels/error_bodies.rs:90:18
+   |
+90 |     output.store(head.slice([0..1]).load());
+   |                  ^^^^^^^^^^^^^^^^^^

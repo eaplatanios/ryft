@@ -1931,13 +1931,13 @@ mod cutile {
                     |input: CompileTracer| {
                         shard_map(
                             |local: ArrayTracer| {
-                                let local_type = local.r#type().into_owned();
+                                // The kernel is physical, and its call accepts the local shard as it is placed.
+                                let physical = local.r#type().into_owned().with_sharding(None::<Sharding>).unwrap();
                                 let definition: KernelDefinition = KernelDefinition::trace(
                                     KernelCallOperation::new(
                                         Grid::new(vec![]).unwrap(),
                                         vec![
-                                            whole_array_parameter(local_type.clone(), KernelParameterAccess::ReadWrite)
-                                                .unwrap(),
+                                            whole_array_parameter(physical, KernelParameterAccess::ReadWrite).unwrap(),
                                         ],
                                     )
                                     .unwrap(),
@@ -1946,7 +1946,10 @@ mod cutile {
                                 .unwrap();
                                 let value = local.into_value();
                                 let output = stage_kernel(value.context(), &definition, &[value.clone()])?.remove(0);
-                                Ok(ProjectedValue::new(output, local_type))
+                                let ArrayIrType::Array(output_type) = output.r#type().into_owned() else {
+                                    unreachable!("kernel results are arrays");
+                                };
+                                Ok(ProjectedValue::new(output, output_type))
                             },
                             input,
                             logical_mesh.clone(),
@@ -2952,8 +2955,8 @@ mod adapters {
         let lowers = || "lowers".to_owned();
         let mosaic_unsupported = |operation: &str| {
             format!(
-                "Compiler(Unsupported {{ operation: {operation:?}, reason: \
-                 \"operation has no baseline GPU lowering\" }})",
+                "Unsupported {{ owner: \"ryft_mosaic::kernels::gpu\", operation: {operation:?}, \
+                 requested: \"operation has no baseline GPU lowering\", capability: \"Mosaic GPU lowering\" }}",
             )
         };
         let triton_unsupported = |operation: &str, requested: &str| {

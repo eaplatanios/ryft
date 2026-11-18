@@ -4,6 +4,7 @@
 extern crate ryft_core as core_alias;
 extern crate ryft_kernels as kernels_alias;
 
+use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use core_alias::{
@@ -11,7 +12,7 @@ use core_alias::{
     ComparisonDirection, Condition, Context, ConvertElementType, Cos, DataType, Erf, Exp, ExpM1, Floor, Ln1p, Log,
     LogAddExp, Logistic, Max, Min, Neg, NestedTracingContext, Pow, ProjectedValue, Reduce, ReductionKind,
     ReferenceAtomicAddUpdate, ReferenceRead, ReferenceWrite, Rem, Round, Rsqrt, Sign, Sin, Sqrt, Tan, Tanh, Tracer,
-    TracingContext,
+    TracingContext, TypeError,
 };
 use kernels_alias::{
     BoundaryPolicy, Grid, GridDimension, GridExecution, KernelDefinition, KernelError, KernelOperation,
@@ -59,6 +60,45 @@ fn tiled_matmul(
         accumulator += left_tile.dot(right_tile);
     }
     output.store(accumulator);
+}
+
+/// Subtracts the tiles of two vectors, with the tiled output declared before both of its inputs.
+#[kernels_alias::kernel(crate = "kernels_alias", requires = left.shape()[0] == right.shape()[0])]
+fn tiled_difference_output_first(
+    #[output(data_type = F32, shape = [left.shape()[0]], tile = [2], boundary = masked)] output: &mut Array,
+    #[input(data_type = F32, rank = 1)] left: &Array,
+    #[input(data_type = F32, rank = 1)] right: &Array,
+) {
+    let [block] = output.tile_index();
+    let left_tiles = left.tiles([2]).pad(0.0);
+    let right_tiles = right.tiles([2]).pad(0.0);
+    output.store(left_tiles.load([block]) - right_tiles.load([block]));
+}
+
+/// Subtracts the tiles of two vectors, with the tiled output declared between its inputs.
+#[kernels_alias::kernel(crate = "kernels_alias", requires = left.shape()[0] == right.shape()[0])]
+fn tiled_difference_output_middle(
+    #[input(data_type = F32, rank = 1)] left: &Array,
+    #[output(data_type = F32, shape = [left.shape()[0]], tile = [2], boundary = masked)] output: &mut Array,
+    #[input(data_type = F32, rank = 1)] right: &Array,
+) {
+    let [block] = output.tile_index();
+    let left_tiles = left.tiles([2]).pad(0.0);
+    let right_tiles = right.tiles([2]).pad(0.0);
+    output.store(left_tiles.load([block]) - right_tiles.load([block]));
+}
+
+/// Subtracts the tiles of two vectors, with the tiled output declared after both of its inputs.
+#[kernels_alias::kernel(crate = "kernels_alias", requires = left.shape()[0] == right.shape()[0])]
+fn tiled_difference_output_last(
+    #[input(data_type = F32, rank = 1)] left: &Array,
+    #[input(data_type = F32, rank = 1)] right: &Array,
+    #[output(data_type = F32, shape = [left.shape()[0]], tile = [2], boundary = masked)] output: &mut Array,
+) {
+    let [block] = output.tile_index();
+    let left_tiles = left.tiles([2]).pad(0.0);
+    let right_tiles = right.tiles([2]).pad(0.0);
+    output.store(left_tiles.load([block]) - right_tiles.load([block]));
 }
 
 /// Constructs a vector without inputs. Its `#[cfg_attr]` attribute applies only to the generated callable.
@@ -316,6 +356,85 @@ fn add_prefix(
     output.slice([0..input.shape()[0]]).accumulate(input.load());
 }
 
+/// Loads the second element of `first` through a slice of a local that is rebound to `second` after the slice is
+/// declared, followed by the second element of `second` through the rebound local.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn rebound_slice_load(
+    #[input(data_type = I32, rank = 1)] first: &Array,
+    #[input(data_type = I32, rank = 1)] second: &Array,
+    #[output(data_type = I32, shape = [2])] output: &mut Array,
+) {
+    let mut source = first;
+    let element = source.slice([1..2]);
+    source = second;
+    output.slice([0..1]).store(element.load());
+    output.slice([1..2]).store(source.slice([1..2]).load());
+}
+
+/// Stores `7` into the first element of `values` through a slice of a local that is rebound to scratch storage after
+/// the slice is declared, then increments that element through `values`. `observed` records the element through
+/// `values` after the store and through the slice after the increment.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn rebound_slice_store(
+    #[inout(data_type = I32, rank = 1)] values: &mut Array,
+    #[output(data_type = I32, shape = [2])] observed: &mut Array,
+) {
+    let mut target = values;
+    let head = target.slice([0..1]);
+    target = scratch::<i32>([2]);
+    target.store(zeros::<i32>([2]));
+    head.store(full([1], 7i32));
+    observed.slice([0..1]).store(values.slice([0..1]).load());
+    values.slice([0..1]).accumulate(ones::<i32>([1]));
+    observed.slice([1..2]).store(head.load());
+}
+
+/// Sums the second elements of `first` and the first elements of `second` twice in a staged loop, through a slice of
+/// a local that is rebound to `second` after the slice is declared and through a slice of the rebound local that the
+/// loop body declares. After the loop, loads through the first slice and through the rebound local.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn rebound_slice_loop(
+    #[input(data_type = I32, rank = 1)] first: &Array,
+    #[input(data_type = I32, rank = 1)] second: &Array,
+    #[output(data_type = I32, shape = [3])] output: &mut Array,
+) {
+    let mut source = first;
+    let element = source.slice([1..2]);
+    source = second;
+    let mut total = zeros::<i32>([1]);
+    for step in 0..2 {
+        let inner = source.slice([0..1]);
+        total += element.load() + inner.load();
+    }
+    output.slice([0..1]).store(total);
+    output.slice([1..2]).store(element.load());
+    output.slice([2..3]).store(source.slice([1..2]).load());
+}
+
+/// Loads the second element of `first` through a slice of a local that is rebound to `second` after the slice is
+/// declared, inside the `true` branch of a staged condition and after it. The `false` branch loads the second element
+/// of `second` through the rebound local instead.
+#[kernels_alias::kernel(crate = "kernels_alias")]
+fn rebound_slice_condition(
+    #[input(data_type = Boolean, rank = 0)] flag: &Array,
+    #[input(data_type = I32, rank = 1)] first: &Array,
+    #[input(data_type = I32, rank = 1)] second: &Array,
+    #[output(data_type = I32, shape = [3])] output: &mut Array,
+) {
+    let mut source = first;
+    let element = source.slice([1..2]);
+    source = second;
+    let mut inside = zeros::<i32>([1]);
+    if flag.load() {
+        inside = element.load();
+    } else {
+        inside = source.slice([1..2]).load();
+    }
+    output.slice([0..1]).store(inside);
+    output.slice([1..2]).store(element.load());
+    output.slice([2..3]).store(source.slice([1..2]).load());
+}
+
 /// Combines constant vectors of 3 elements.
 #[kernels_alias::kernel(crate = "kernels_alias")]
 fn constants(#[output(data_type = I32, shape = [3])] output: &mut Array) {
@@ -340,6 +459,55 @@ fn negated_remainder(
     #[output(data_type = I32, shape = [left.shape()[0]])] output: &mut Array,
 ) {
     output.store(-(left.load() % right.load()));
+}
+
+/// Compares two vectors with each comparison operator, comparing with an integer literal on either side in two cases.
+#[kernels_alias::kernel(crate = "kernels_alias", requires = left.shape()[0] == right.shape()[0])]
+fn comparisons(
+    #[input(data_type = I32, rank = 1)] left: &Array,
+    #[input(data_type = I32, rank = 1)] right: &Array,
+    #[output(data_type = Boolean, shape = [left.shape()[0]])] equal: &mut Array,
+    #[output(data_type = Boolean, shape = [left.shape()[0]])] not_equal: &mut Array,
+    #[output(data_type = Boolean, shape = [left.shape()[0]])] less: &mut Array,
+    #[output(data_type = Boolean, shape = [left.shape()[0]])] less_or_equal: &mut Array,
+    #[output(data_type = Boolean, shape = [left.shape()[0]])] greater: &mut Array,
+    #[output(data_type = Boolean, shape = [left.shape()[0]])] greater_or_equal: &mut Array,
+) {
+    equal.store(left.load() == right.load());
+    not_equal.store(left.load() != right.load());
+    less.store(left.load() < right.load());
+    less_or_equal.store(left.load() <= 2);
+    greater.store(left.load() > right.load());
+    greater_or_equal.store(2 >= right.load());
+}
+
+/// Keeps the elements of `left` that are less than those of `right` and replaces the others with the literal `9`.
+#[kernels_alias::kernel(crate = "kernels_alias", requires = left.shape()[0] == right.shape()[0])]
+fn select_less(
+    #[input(data_type = I32, rank = 1)] left: &Array,
+    #[input(data_type = I32, rank = 1)] right: &Array,
+    #[output(data_type = I32, shape = [left.shape()[0]])] output: &mut Array,
+) {
+    output.store(select(left.load() < right.load(), left.load(), 9));
+}
+
+/// Compares the grid coordinate `i` with constants, with the coordinate on either side, and records each comparison
+/// of every program as `1` or `0` in its element of one output per comparison operator.
+#[kernels_alias::kernel(crate = "kernels_alias", grid(i = 4))]
+fn coordinate_comparisons(
+    #[output(data_type = I32, shape = [4], block = [1], index = [i])] equal: &mut Array,
+    #[output(data_type = I32, shape = [4], block = [1], index = [i])] not_equal: &mut Array,
+    #[output(data_type = I32, shape = [4], block = [1], index = [i])] less: &mut Array,
+    #[output(data_type = I32, shape = [4], block = [1], index = [i])] less_or_equal: &mut Array,
+    #[output(data_type = I32, shape = [4], block = [1], index = [i])] greater: &mut Array,
+    #[output(data_type = I32, shape = [4], block = [1], index = [i])] greater_or_equal: &mut Array,
+) {
+    equal.store(select(i == 1, ones::<i32>([1]), zeros::<i32>([1])));
+    not_equal.store(select(1 != i, ones::<i32>([1]), zeros::<i32>([1])));
+    less.store(select(i < 2, ones::<i32>([1]), zeros::<i32>([1])));
+    less_or_equal.store(select(2 <= i, ones::<i32>([1]), zeros::<i32>([1])));
+    greater.store(select(i > 2, ones::<i32>([1]), zeros::<i32>([1])));
+    greater_or_equal.store(select(2 >= i, ones::<i32>([1]), zeros::<i32>([1])));
 }
 
 /// Kernels that apply one capability function of kernel body values to vectors, each named after that function.
@@ -493,7 +661,43 @@ fn test_kernel_callable_stages() {
         vec![ArrayIrType::Array(r#type.clone()); 2],
     )
     .unwrap();
-    assert!(matches!(program.instructions()[0].operation(), KernelOperation::Call(_)));
+    assert_eq!(
+        program.to_string(),
+        indoc! {"
+            lambda %0:f32[2], %1:f32[2] .
+            let %2:f32[2] = kernel_call [
+                grid=[],
+                parameter_0=read-only f32[2] [2] InBounds,
+                mapping_0={
+                    lambda  .
+                    let %0:dimension<0> = const 0
+                    in (%0)
+                },
+                parameter_1=read-only f32[2] [2] InBounds,
+                mapping_1={
+                    lambda  .
+                    let %0:dimension<0> = const 0
+                    in (%0)
+                },
+                parameter_2=write-only f32[2] [2] InBounds,
+                mapping_2={
+                    lambda  .
+                    let %0:dimension<0> = const 0
+                    in (%0)
+                },
+            ] %0 %1 [
+                body={
+                    lambda %0:ref<f32[2]>, %1:ref<f32[2]>, %2:ref<f32[2]> .
+                    let %3:f32[2] = reference_read %0
+                        %4:f32[2] = reference_read %1
+                        %5:f32[2] = add %3 %4
+                        () = reference_write %2 %5
+                    in ()
+                },
+            ]
+            in (%2)"
+        },
+    );
     assert_eq!(
         program.interpret(vec![
             ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
@@ -550,35 +754,36 @@ fn test_kernel_definition() {
     .unwrap();
     assert_eq!(generated.semantic_key().unwrap(), explicit.semantic_key().unwrap());
 
+    // A reduction capability stages one canonical reduction.
     let definition = sum::definition(&ArrayType::new_static(DataType::F32, [3])).unwrap();
-    let reductions = definition
-        .body()
-        .instructions()
-        .iter()
-        .filter_map(|instruction| match instruction.operation() {
-            KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Reduce(operation))) => Some(operation),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(reductions.len(), 1);
-    assert_eq!(reductions[0].axes(), &[0]);
-    assert_eq!(reductions[0].kind(), ReductionKind::Sum);
+    assert_eq!(
+        definition.body().to_string(),
+        indoc! {"
+            lambda %0:ref<f32[3]>, %1:ref<f32[]> .
+            let %2:f32[3] = reference_read %0
+                %3:f32[] = reduce [kind=sum, axes=[0]] %2
+                () = reference_write %1 %3
+            in ()"
+        },
+    );
 }
 
 #[test]
 fn test_kernel_definition_validation() {
     // Input types are checked against the annotations before the `requires` constraint is evaluated.
-    let error = matmul::definition(&ArrayType::scalar(DataType::F32), &ArrayType::new_static(DataType::F32, [2, 2]))
-        .unwrap_err();
-    assert!(matches!(error, KernelError::Type(_)));
-    assert_eq!(error.to_string(), "kernel input `left` requires data type `F32` and rank `2`");
-    let error = matmul::definition(
-        &ArrayType::new_static(DataType::F32, [2, 3]),
-        &ArrayType::new_static(DataType::F32, [4, 2]),
-    )
-    .unwrap_err();
-    assert!(matches!(error, KernelError::Type(_)));
-    assert_eq!(error.to_string(), "kernel shape requirement is not satisfied");
+    assert_eq!(
+        matmul::definition(&ArrayType::scalar(DataType::F32), &ArrayType::new_static(DataType::F32, [2, 2]))
+            .map(|_| ()),
+        Err(KernelError::Type(TypeError::invalid("kernel input `left` requires data type `F32` and rank `2`"))),
+    );
+    assert_eq!(
+        matmul::definition(
+            &ArrayType::new_static(DataType::F32, [2, 3]),
+            &ArrayType::new_static(DataType::F32, [4, 2])
+        )
+        .map(|_| ()),
+        Err(KernelError::Type(TypeError::invalid("kernel shape requirement is not satisfied"))),
+    );
 }
 
 #[test]
@@ -632,6 +837,31 @@ fn test_kernel_tiled_matmul() {
 }
 
 #[test]
+fn test_kernel_tiled_output_position() {
+    // The tiled output keeps its declared position among the body references. The subtraction and the partial edge
+    // tile make a swapped binding of the inputs or of the output visible.
+    let left = Array::vector(vec![10.0f32, 20.0, 30.0]).unwrap();
+    let right = Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap();
+    let difference = Array::vector(vec![9.0f32, 18.0, 27.0]).unwrap();
+    assert_eq!(tiled_difference_output_first(&left, &right), Ok(difference.clone()));
+    assert_eq!(tiled_difference_output_middle(&left, &right), Ok(difference.clone()));
+    assert_eq!(tiled_difference_output_last(&left, &right), Ok(difference.clone()));
+
+    let r#type = ArrayType::new_static(DataType::F32, [3]);
+    let read = KernelParameterAccess::ReadOnly;
+    let write = KernelParameterAccess::WriteOnly;
+    for (definition, accesses) in [
+        (tiled_difference_output_first::definition(&r#type, &r#type).unwrap(), [write, read, read]),
+        (tiled_difference_output_middle::definition(&r#type, &r#type).unwrap(), [read, write, read]),
+        (tiled_difference_output_last::definition(&r#type, &r#type).unwrap(), [read, read, write]),
+    ] {
+        let parameters = definition.operation().parameters();
+        assert_eq!(parameters.iter().map(|parameter| parameter.access()).collect::<Vec<_>>(), accesses);
+        assert_eq!(definition.interpret(vec![left.clone(), right.clone()], 16), Ok(vec![difference.clone()]));
+    }
+}
+
+#[test]
 fn test_kernel_loops() {
     let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
     assert_eq!(accumulate(&input), Ok(Array::vector(vec![2.0f32, 4.0]).unwrap()));
@@ -641,16 +871,31 @@ fn test_kernel_loops() {
     // Loops stage one `while` operation regardless of their trip count, and they carry every visible binding.
     let definition = accumulate::definition(&ArrayType::new_static(DataType::F32, [1000])).unwrap();
     assert_eq!(
-        definition
-            .body()
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(
-                instruction.operation(),
-                KernelOperation::Portable(ArrayIrOperation::While(_))
-            ))
-            .count(),
-        1,
+        definition.body().to_string(),
+        indoc! {"
+            lambda %0:ref<f32[1000]>, %1:ref<f32[1000]> .
+            let %2:f32[1000] = zero [type=f32[1000]]
+                %3:i64[] = const 0
+                %4:i64[], %5:ref<f32[1000]>, %6:ref<f32[1000]>, %7:f32[1000] = \
+                    while [iteration_bound=1000] %3 %0 %1 %2 [
+                    condition={
+                        lambda %0:i64[], %1:ref<f32[1000]>, %2:ref<f32[1000]>, %3:f32[1000] .
+                        let %4:i64[] = const 1000
+                            %5:bool[] = compare [direction=LessThan] %0 %4
+                        in (%5)
+                    },
+                    body={
+                        lambda %0:i64[], %1:ref<f32[1000]>, %2:ref<f32[1000]>, %3:f32[1000] .
+                        let %4:f32[1000] = reference_read %1
+                            %5:f32[1000] = add %3 %4
+                            %6:i64[] = const 1
+                            %7:i64[] = add %0 %6
+                        in (%7, %1, %2, %5)
+                    },
+                ]
+                () = reference_write %1 %7
+            in ()"
+        },
     );
     let generated = accumulate::definition(&ArrayType::new_static(DataType::F32, [2])).unwrap();
     let explicit: KernelDefinition = KernelDefinition::trace(generated.operation().clone(), |(references, _)| {
@@ -1010,6 +1255,31 @@ fn test_kernel_slices() {
 }
 
 #[test]
+fn test_kernel_slices_rebound_source() {
+    // A slice stays attached to the allocation that its source named where the slice was declared, so rebinding the
+    // source afterwards changes neither its loads nor its stores, while writes to that allocation stay visible.
+    let first = Array::vector(vec![0i32, 8]).unwrap();
+    let second = Array::vector(vec![1i32, 9]).unwrap();
+    assert_eq!(rebound_slice_load(&first, &second), Ok(Array::vector(vec![8i32, 9]).unwrap()));
+    assert_eq!(
+        rebound_slice_store(&Array::vector(vec![8i32, 9]).unwrap()),
+        Ok((Array::vector(vec![8i32, 9]).unwrap(), Array::vector(vec![7i32, 8]).unwrap())),
+    );
+
+    // Staged loops and conditions carry the slice, so it keeps its allocation inside and after them. Staging rejects
+    // a reference that a loop or condition rebinds, so the source is rebound before them.
+    assert_eq!(rebound_slice_loop(&first, &second), Ok(Array::vector(vec![18i32, 8, 9]).unwrap()));
+    assert_eq!(
+        rebound_slice_condition(&Array::scalar(true).unwrap(), &first, &second),
+        Ok(Array::vector(vec![8i32, 8, 9]).unwrap()),
+    );
+    assert_eq!(
+        rebound_slice_condition(&Array::scalar(false).unwrap(), &first, &second),
+        Ok(Array::vector(vec![9i32, 8, 9]).unwrap()),
+    );
+}
+
+#[test]
 fn test_kernel_constants() {
     assert_eq!(constants::<Array>(), Ok(Array::vector(vec![2i32, 3, 4]).unwrap()));
 }
@@ -1023,6 +1293,105 @@ fn test_kernel_logic_and_negation() {
     let left = Array::vector(vec![7i32, -7, 9]).unwrap();
     let right = Array::vector(vec![3i32, 3, 4]).unwrap();
     assert_eq!(negated_remainder(&left, &right), Rem::rem(&left, &right).and_then(|remainder| remainder.neg()));
+}
+
+#[test]
+fn test_kernel_comparisons() {
+    // Each comparison operator stages a `compare` with its direction, and a literal operand broadcasts as a scalar.
+    let left = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+    let right = Array::vector(vec![2i32, 2, 1, 5]).unwrap();
+    let flags = |elements: [bool; 4]| Array::vector(elements.to_vec()).unwrap();
+    assert_eq!(
+        comparisons(&left, &right),
+        Ok((
+            flags([false, true, false, false]),
+            flags([true, false, true, true]),
+            flags([true, false, false, true]),
+            flags([true, true, false, false]),
+            flags([false, false, true, false]),
+            flags([true, true, true, false]),
+        )),
+    );
+
+    let r#type = ArrayType::new_static(DataType::I32, [4]);
+    let generated = comparisons::definition(&r#type, &r#type).unwrap();
+    let explicit: KernelDefinition = KernelDefinition::trace(generated.operation().clone(), |(references, _)| {
+        let context = references[0].context();
+        let two = || context.lift(ArrayIrValue::Array(Array::scalar(2i32).unwrap()));
+        let equal = compare(context, &references[0].read()?, &references[1].read()?, ComparisonDirection::Equal)?;
+        references[2].write(&equal)?;
+        let not_equal =
+            compare(context, &references[0].read()?, &references[1].read()?, ComparisonDirection::NotEqual)?;
+        references[3].write(&not_equal)?;
+        let less = compare(context, &references[0].read()?, &references[1].read()?, ComparisonDirection::LessThan)?;
+        references[4].write(&less)?;
+        let less_or_equal = compare(context, &references[0].read()?, &two()?, ComparisonDirection::LessThanOrEqual)?;
+        references[5].write(&less_or_equal)?;
+        let greater =
+            compare(context, &references[0].read()?, &references[1].read()?, ComparisonDirection::GreaterThan)?;
+        references[6].write(&greater)?;
+        let greater_or_equal =
+            compare(context, &two()?, &references[1].read()?, ComparisonDirection::GreaterThanOrEqual)?;
+        references[7].write(&greater_or_equal)
+    })
+    .unwrap();
+    assert_eq!(generated.semantic_key().unwrap(), explicit.semantic_key().unwrap());
+}
+
+#[test]
+fn test_kernel_select() {
+    // The literal branch broadcasts to the shape of the mask and of the other branch.
+    let left = Array::vector(vec![1i32, 2, 3, 4]).unwrap();
+    let right = Array::vector(vec![2i32, 2, 1, 5]).unwrap();
+    assert_eq!(select_less(&left, &right), Ok(Array::vector(vec![1i32, 9, 9, 4]).unwrap()));
+
+    let r#type = ArrayType::new_static(DataType::I32, [4]);
+    let generated = select_less::definition(&r#type, &r#type).unwrap();
+    let explicit: KernelDefinition = KernelDefinition::trace(generated.operation().clone(), |(references, _)| {
+        let context = references[0].context();
+        let mask = compare(context, &references[0].read()?, &references[1].read()?, ComparisonDirection::LessThan)?;
+        let kept = references[0].read()?;
+        let other = context.lift(ArrayIrValue::Array(Array::scalar(9i32)?))?;
+        references[2].write(&select(context, &mask, &kept, &other)?)
+    })
+    .unwrap();
+    assert_eq!(generated.semantic_key().unwrap(), explicit.semantic_key().unwrap());
+}
+
+#[test]
+fn test_kernel_coordinate_comparisons() {
+    // Comparisons of a grid coordinate with a constant stage `compare_dimension`, which mirrors the direction when
+    // the constant is the left-hand side input, and their rank-0 results broadcast through `select`.
+    let values = |elements: [i32; 4]| Array::vector(elements.to_vec()).unwrap();
+    assert_eq!(
+        coordinate_comparisons::<Array>(),
+        Ok((
+            values([0, 1, 0, 0]),
+            values([1, 0, 1, 1]),
+            values([1, 1, 0, 0]),
+            values([0, 0, 1, 1]),
+            values([0, 0, 0, 1]),
+            values([1, 1, 1, 0]),
+        )),
+    );
+
+    let generated = coordinate_comparisons::definition().unwrap();
+    let explicit: KernelDefinition =
+        KernelDefinition::trace(generated.operation().clone(), |(references, coordinates)| {
+            let context = references[0].context();
+            let flag = |direction, constant| {
+                let mask = compare_dimension(context, &coordinates[0], direction, constant)?;
+                select(context, &mask, &ones::<i32, _>(context, [1])?, &zeros::<i32, _>(context, [1])?)
+            };
+            references[0].write(&flag(ComparisonDirection::Equal, 1)?)?;
+            references[1].write(&flag(ComparisonDirection::NotEqual, 1)?)?;
+            references[2].write(&flag(ComparisonDirection::LessThan, 2)?)?;
+            references[3].write(&flag(ComparisonDirection::GreaterThanOrEqual, 2)?)?;
+            references[4].write(&flag(ComparisonDirection::GreaterThan, 2)?)?;
+            references[5].write(&flag(ComparisonDirection::LessThanOrEqual, 2)?)
+        })
+        .unwrap();
+    assert_eq!(generated.semantic_key().unwrap(), explicit.semantic_key().unwrap());
 }
 
 #[test]

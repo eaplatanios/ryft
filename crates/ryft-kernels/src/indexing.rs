@@ -30,9 +30,11 @@
 //!
 //! In a `#[kernel]` body, `input.tiles(shape).pad(value)` declares a tiled view of an input, which generates no code by
 //! itself. Each `load(indices)` of that view lowers to the [`tile_load`](crate::authoring::tile_load) authoring
-//! function. That function converts integer scalar tile indices into checked dimension values, multiplies each tile
-//! index by the tile extent to obtain an element start, and stages a tile load with [`BoundaryPolicy::Masked`] and the
-//! declared padding value.
+//! function, which accepts every nonnegative tile index. An index at or beyond the number of tiles that cover an axis
+//! selects a tile that lies entirely beyond the source and contains only the padding value, so that function first
+//! clamps every index whose type does not bound it by that number. It then converts integer scalar tile indices into
+//! checked dimension values, which rejects negative indices, multiplies each tile index by the tile extent to obtain
+//! an element start, and stages a tile load with [`BoundaryPolicy::Masked`] and the declared padding value.
 //!
 //! # Advanced Indexing
 //!
@@ -303,7 +305,7 @@ mod tests {
         BroadcastOperation, ConcatenateOperation, Context, DataType, DimensionValue, DotOperation,
         GatherDimensionNumbers, GatherMode, GatherOperation, InstructionId, Placeholder, ProgramBuilder,
         ReferenceReadOperation, ReferenceRoot, ReferenceType, ReferenceWriteOperation, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation,
+        ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation, check_operation_type_inference,
     };
 
     use crate::authoring::{tiled_call, whole_array_parameter};
@@ -469,21 +471,60 @@ mod tests {
 
     #[test]
     fn test_tile_load_operation_type_inference() {
-        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
-        let inputs = vec![
-            ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into(),
-            ArrayIrType::Dimension(DimensionValue::constant(1).unwrap().r#type().into_owned()),
-            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-        ];
-        assert_eq!(
-            operation.infer_output_types(&inputs, &[]),
-            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))]),
+        let source = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        let start = ArrayIrType::Dimension(DimensionValue::constant(1).unwrap().r#type().into_owned());
+        let padding = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let index = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        check_operation_type_inference!(
+            operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap(),
+            cases = [
+                {
+                    input_types = [source.clone(), start.clone(), padding.clone()],
+                    output_types = [ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))],
+                },
+                {
+                    input_types = [source.clone(), start.clone()],
+                    error = "expected 3 inputs but got 2",
+                },
+                {
+                    input_types = [padding.clone(), start.clone(), padding.clone()],
+                    error = format!("`{TILE_LOAD_OPERATION_NAME}` first input must be an array reference"),
+                },
+                {
+                    input_types = [source.clone(), index.clone(), padding.clone()],
+                    error = format!("`{TILE_LOAD_OPERATION_NAME}` starts must be canonical dimensions"),
+                },
+                {
+                    input_types = [source.clone(), start.clone(), start.clone()],
+                    error = format!("`{TILE_LOAD_OPERATION_NAME}` padding value must be a scalar array"),
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 1]))),
+                        start.clone(),
+                        padding.clone(),
+                    ],
+                    error = format!("`{TILE_LOAD_OPERATION_NAME}` source requires a static shape with the block rank"),
+                },
+            ],
         );
-        let mut invalid = inputs;
-        invalid[1] = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
-        assert_eq!(
-            operation.infer_output_types(&invalid, &[]),
-            Err(TypeError::invalid(format!("`{TILE_LOAD_OPERATION_NAME}` starts must be canonical dimensions"))),
+
+        // The transforms select the source view before the tile window, and the result is dense.
+        let matrix = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])));
+        check_operation_type_inference!(
+            operation = TileLoadOperation::new(vec![2], BoundaryPolicy::InBounds).unwrap().with_transforms(vec![
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            ]),
+            cases = [
+                {
+                    input_types = [matrix.clone(), start.clone(), padding.clone(), index],
+                    output_types = [ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]))],
+                },
+                {
+                    input_types = [matrix, start, padding],
+                    error = "expected 4 inputs but got 3",
+                },
+            ],
         );
     }
 
@@ -611,6 +652,7 @@ mod tests {
         let operation = tiled_call(
             &[source_type.clone(), filter_type.clone()],
             output_type.clone(),
+            2,
             vec![1, 1],
             BoundaryPolicy::Masked,
         )

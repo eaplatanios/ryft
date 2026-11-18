@@ -11,6 +11,11 @@
 //! which is equivalent to a store because the read selects only the elements that the swap then overwrites. A
 //! [`WindowMaskOperation`](ryft_kernels::WindowMaskOperation) stores that same validity predicate for every element of
 //! an ordinary memory view without accessing the view.
+//!
+//! The host rejects an in-bounds tile load whose window leaves its source view and any tile load whose window limit
+//! exceeds the canonical dimension width, and the native module cannot report such a failure at run time. Admission
+//! therefore requires the start bounds of every tile load to rule it out, so an admitted in-bounds load reads only
+//! valid elements and lowers like a masked one.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -18,10 +23,14 @@ use std::num::NonZeroU32;
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
     ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atom, AtomId, ComparisonDirection, ConstantOperation,
-    DataType, InstructionId, Operation as CoreOperation, ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed,
-    ValueId, validated_reference_access_descriptors,
+    DataType, InstructionId, MAX_DIMENSION_EXTENT, Operation as CoreOperation, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed, ValueId, infer_reference_view_type,
+    validated_reference_access_descriptors,
 };
-use ryft_kernels::{GridExecution, KernelExtension, KernelOperation, KernelSchedule, VerifiedKernel};
+use ryft_kernels::{
+    BoundaryPolicy, GridExecution, KernelExtension, KernelOperation, KernelSchedule, TILE_LOAD_OPERATION_NAME,
+    TileLoadOperation, VerifiedKernel,
+};
 use ryft_mlir::dialects::{arith, gpu, llvm, memref, nvvm, scf};
 use ryft_mlir::{
     Block, Context, DetachedBlock, DetachedOp, Module, Operation, Type, TypeRef, UnknownLocationRef, Value, ValueRef,
@@ -405,6 +414,38 @@ fn is_whole_slice(axes: &[ArraySliceAxis], shape: &[usize]) -> bool {
             .all(|(axis, extent)| axis.start() == 0 && axis.size() == *extent && axis.stride() == 1)
 }
 
+/// Validates that the start bounds of a tile load with the input types `input_types` prove that the host never rejects
+/// its window, which the native module cannot report at run time. Every window limit must fit the canonical dimension
+/// width, and the window of an in-bounds load must also lie inside the view that its transforms select. The lowering
+/// clips every window to its view, so an in-bounds load that satisfies this check reads only valid elements and lowers
+/// like a masked load.
+fn validate_tile_load(operation: &TileLoadOperation, input_types: &[ArrayIrType]) -> Result<(), Error> {
+    let rank = operation.block_shape().len();
+    let ArrayIrType::Reference(reference) = &input_types[0] else { unreachable!() };
+    let bindings = input_types[rank + 2..].iter().collect::<Vec<_>>();
+    let view =
+        infer_reference_view_type(reference.referent(), operation.transforms(), &bindings, ReferenceAccessMode::Read)?;
+    let shape = view.static_shape().unwrap();
+    let starts = &input_types[1..rank + 1];
+    for ((start, &block), &extent) in starts.iter().zip(operation.block_shape()).zip(shape.dimensions()) {
+        let ArrayIrType::Dimension(start) = start else { unreachable!() };
+        let limit = start.maximum_extent().and_then(|maximum| maximum.checked_add(block));
+        let (bound, reason) = match operation.boundary_policy() {
+            BoundaryPolicy::InBounds => {
+                (extent, "in-bounds tile loads require start bounds that prove the window lies inside the source view")
+            }
+            BoundaryPolicy::Masked => (
+                MAX_DIMENSION_EXTENT,
+                "tile load start bounds must prove that the window limit fits the canonical dimension width",
+            ),
+        };
+        if limit.is_none_or(|limit| limit > bound) {
+            return Err(Error::Unsupported { operation: TILE_LOAD_OPERATION_NAME, reason: reason.to_owned() });
+        }
+    }
+    Ok(())
+}
+
 /// Checks source support before any native module is constructed or an artifact cache is consulted.
 pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
     kernel: &VerifiedKernel<'_, Extension>,
@@ -478,10 +519,12 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                     return Err(unsupported("updates require the element type of their reference".to_owned()));
                 }
                 let addition = ArrayOperation::Add(ryft_core::AddOperation::new());
-                arrays::validate(&addition, &[update.clone(), update.clone()], update).map_err(|error| match error {
-                    Error::Unsupported { reason, .. } => unsupported(reason),
-                    error => error,
-                })?;
+                arrays::validate(&addition, &[update.clone(), update.clone()], update).map_err(
+                    |error| match error {
+                        Error::Unsupported { reason, .. } => unsupported(reason),
+                        error => error,
+                    },
+                )?;
                 true
             }
             KernelOperation::Portable(
@@ -522,8 +565,17 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                     && scalar_predicate
                     && preserved_carries
             }
+            KernelOperation::TileLoad(operation) => {
+                let atoms = kernel.definition().body().regions().get(instruction_id.region()).unwrap().atoms();
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| atoms[input.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                validate_tile_load(operation, &input_types)?;
+                true
+            }
             KernelOperation::Scratch(_)
-            | KernelOperation::TileLoad(_)
             | KernelOperation::MaskedLoad(_)
             | KernelOperation::MaskedStore(_)
             | KernelOperation::MaskedSwap(_)
@@ -555,11 +607,10 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                 // Every copied element is one native 4- or 8-byte transfer. The destination has the same element type,
                 // because copies require exactly matching referent types.
                 if !matches!(atoms[instruction.inputs()[0].index()].r#type().as_ref(),
-                    ArrayIrType::Reference(reference) if matches!(
-                        reference.referent().data_type(),
-                        DataType::I32 | DataType::U32 | DataType::F32 | DataType::I64 | DataType::U64 | DataType::F64
-                    ))
-                {
+                ArrayIrType::Reference(reference) if matches!(
+                    reference.referent().data_type(),
+                    DataType::I32 | DataType::U32 | DataType::F32 | DataType::I64 | DataType::U64 | DataType::F64
+                )) {
                     return Err(Error::Unsupported {
                         operation: operation.name(),
                         reason: "native async copies require matching shapes and 4- or 8-byte elements".to_owned(),
@@ -1617,14 +1668,14 @@ impl<'c, 't> Lowering<'c, 't> {
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, Condition, ConditionOperation, Context as CoreContext, Dimension,
-        NestedTracingContext, Placeholder, ProgramBuilder, ReferenceRead, ReferenceWrite, ReferenceWriteOperation,
-        WhileOperation,
+        AddOperation, ArrayIrType, Condition, ConditionOperation, Context as CoreContext, Dimension, DimensionValue,
+        NestedTracingContext, Placeholder, ProgramBuilder, ProgramError, ReferenceRead, ReferenceWrite,
+        ReferenceWriteOperation, TypeError, WhileOperation,
     };
     use ryft_kernels::{
-        AsyncCopyOperation, BoundaryPolicy, Grid, GridDimension, KernelCallOperation, KernelDefinition,
-        KernelParameterAccess, MappingExpression, MaskedLoadOperation, ParameterWindow, ScratchOperation, WaitOperation,
-        accumulate, compare_dimension, mapped_call, masked_store, whole_array_parameter, window_mask,
+        AsyncCopyOperation, Grid, GridDimension, KernelCallOperation, KernelDefinition, KernelParameterAccess,
+        MappingExpression, MaskedLoadOperation, ParameterWindow, ScratchOperation, WaitOperation, accumulate,
+        compare_dimension, mapped_call, masked_store, whole_array_parameter, window_mask,
     };
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_version;
     use ryft_mlir::{WalkOrder, WalkResult};
@@ -1655,6 +1706,158 @@ mod tests {
         let decoded = module.context().parse_module_from_bytes(&bytes).unwrap();
         assert_eq!(decoded.verify(), Ok(true));
         assert_eq!(mosaic_gpu_serde_version(&decoded), Ok(Some(i64::from(MOSAIC_GPU_SERDE_VERSION))));
+    }
+
+    /// Reason for which admission rejects an in-bounds tile load whose window it cannot prove valid.
+    const IN_BOUNDS_REASON: &str =
+        "in-bounds tile loads require start bounds that prove the window lies inside the source view";
+
+    /// Lowers `definition`, checks that its module serializes, and returns the rendering of that module.
+    fn lowered_module(definition: &KernelDefinition) -> String {
+        let verified = VerifiedKernel::new(definition, 1).unwrap();
+        let context = Context::new();
+        let (module, _, _, _) =
+            module(&context, &verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
+                .unwrap();
+        assert_serializes(&module);
+        module.to_string()
+    }
+
+    /// Returns the operation and reason of the admission failure of `definition`.
+    fn rejection(definition: &KernelDefinition) -> (&'static str, String) {
+        let verified = VerifiedKernel::new(definition, 1).unwrap();
+        match validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()) {
+            Err(Error::Unsupported { operation, reason }) => (operation, reason),
+            Err(error) => panic!("expected an admission failure, got {error:?}"),
+            Ok(_) => panic!("expected an admission failure"),
+        }
+    }
+
+    /// Builds the common tile load fixture, which loads two elements with the padding value −1 at the constant element
+    /// start `start` of the view that `transforms` select from the four element input, and stores them in the two
+    /// element output.
+    fn tile_load_definition(
+        boundary: BoundaryPolicy,
+        start: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [4]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(start).unwrap()));
+        let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+        let operation = TileLoadOperation::new(vec![2], boundary).unwrap().with_transforms(transforms);
+        let tile = builder.add_instruction(operation, vec![], vec![inputs[0], start, other], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
+        KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap()
+    }
+
+    /// Builds two definitions that contain the in-bounds tile load of [`tile_load_definition`] at the start 3, which
+    /// the host never executes. The first runs it over an empty grid, which leaves its read-write output unchanged, and
+    /// the second runs it in the untaken branch of a condition whose other branch returns the padding value.
+    fn unreachable_tile_load_definitions() -> Vec<KernelDefinition> {
+        let source = ArrayType::new_static(DataType::F32, [4]);
+        let empty_grid = mapped_call(
+            Grid::new(vec![GridDimension::new(0usize.into(), GridExecution::Parallel)]).unwrap(),
+            vec![
+                (source.clone(), KernelParameterAccess::ReadOnly, ParameterWindow::WholeArray),
+                (
+                    ArrayType::new_static(DataType::F32, [2]),
+                    KernelParameterAccess::ReadWrite,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![2],
+                        boundary: BoundaryPolicy::Masked,
+                        indices: vec![MappingExpression::GridCoordinate(0)],
+                    },
+                ),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let untaken_branch = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(source.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [2]), KernelParameterAccess::WriteOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let load = |builder: &mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, source| {
+            let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+            let other = builder.add_constant(ArrayIrValue::Array(Array::scalar(-1f32).unwrap()));
+            let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::InBounds).unwrap();
+            builder.add_instruction(operation, vec![], vec![source, start, other], None).unwrap()[0]
+        };
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = empty_grid
+            .body_input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let tile = load(&mut builder, inputs[0]);
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
+        let empty_grid =
+            KernelDefinition::new(empty_grid, builder.build(vec![], vec![Placeholder; 3], vec![]).unwrap()).unwrap();
+
+        let mut taken = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = taken.add_input(untaken_branch.parameters()[0].body_type());
+        let tile = load(&mut taken, reference);
+        let taken = taken
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![tile],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut padding = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        padding.add_input(untaken_branch.parameters()[0].body_type());
+        let fill = padding.add_constant(ArrayIrValue::Array(Array::vector(vec![-1f32, -1.0]).unwrap()));
+        let padding = padding
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![fill],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let inputs = untaken_branch
+            .body_input_types()
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+        let taken = builder.import_region(taken.entry_region_ref());
+        let padding = builder.import_region(padding.entry_region_ref());
+        let tile = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![taken, padding],
+                vec![predicate, inputs[0]],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[1], tile], None)
+            .unwrap();
+        let untaken_branch =
+            KernelDefinition::new(untaken_branch, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap())
+                .unwrap();
+        vec![empty_grid, untaken_branch]
     }
 
     #[test]
@@ -1774,6 +1977,93 @@ mod tests {
     }
 
     #[test]
+    fn test_module_tile_load() {
+        // A masked window at element 3 of `[3, 5, 7, 9]` reads its valid element and takes the padding value for the
+        // element beyond the source view.
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+        let definition = tile_load_definition(BoundaryPolicy::Masked, 3, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![9f32, -1.0]).unwrap()]));
+        lowered_module(&definition);
+
+        // The same window under the in-bounds policy fails on the host. Mosaic GPU cannot report that failure at run
+        // time, so admission rejects every in-bounds load whose start bounds do not prove the window valid.
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 3, vec![]);
+        assert_eq!(
+            definition.interpret(vec![source], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
+        );
+        assert_eq!(rejection(&definition), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+    }
+
+    #[test]
+    fn test_module_tile_load_boundaries() {
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+
+        // An in-bounds load whose start bounds prove a wholly valid window lowers like the masked load of that window.
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 2, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![7f32, 9.0]).unwrap()]));
+        assert_eq!(
+            lowered_module(&definition),
+            lowered_module(&tile_load_definition(BoundaryPolicy::Masked, 2, vec![])),
+        );
+
+        // Bounds apply to the selected view `[5, 7, 9]` rather than to the whole source, so the window at element 2 of
+        // that view fails even though it lies inside the source.
+        let slice = || vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] }];
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 1, slice());
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![7f32, 9.0]).unwrap()]));
+        assert_eq!(
+            lowered_module(&definition),
+            lowered_module(&tile_load_definition(BoundaryPolicy::Masked, 1, slice())),
+        );
+        let definition = tile_load_definition(BoundaryPolicy::InBounds, 2, slice());
+        assert_eq!(
+            definition.interpret(vec![source.clone()], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` in-bounds window exceeds the source extent",
+            )))),
+        );
+        assert_eq!(rejection(&definition), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+
+        // A masked window that starts beyond the view consists entirely of padding.
+        let definition = tile_load_definition(BoundaryPolicy::Masked, 4, vec![]);
+        assert_eq!(definition.interpret(vec![source.clone()], 1), Ok(vec![Array::vector(vec![-1f32, -1.0]).unwrap()]));
+        lowered_module(&definition);
+
+        // A window limit beyond the canonical dimension width fails on the host under either policy, while the clipped
+        // window of Mosaic GPU would be empty, so admission rejects it even for a masked load.
+        let definition = tile_load_definition(BoundaryPolicy::Masked, MAX_DIMENSION_EXTENT - 1, vec![]);
+        assert_eq!(
+            definition.interpret(vec![source], 1),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{TILE_LOAD_OPERATION_NAME}` window limit exceeds the canonical dimension width",
+            )))),
+        );
+        assert_eq!(
+            rejection(&definition),
+            (
+                TILE_LOAD_OPERATION_NAME,
+                "tile load start bounds must prove that the window limit fits the canonical dimension width".to_owned(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_module_tile_load_unreachable() {
+        // Admission cannot tell whether an in-bounds load runs, so it rejects the load even where the host never
+        // executes it.
+        let source = Array::vector(vec![3f32, 5.0, 7.0, 9.0]).unwrap();
+        let [empty_grid, untaken_branch] = unreachable_tile_load_definitions().try_into().ok().unwrap();
+        let output = Array::vector(vec![1f32, 2.0]).unwrap();
+        assert_eq!(empty_grid.interpret(vec![source.clone(), output.clone()], 1), Ok(vec![output]));
+        assert_eq!(rejection(&empty_grid), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+        assert_eq!(untaken_branch.interpret(vec![source], 1), Ok(vec![Array::vector(vec![-1f32, -1.0]).unwrap()]));
+        assert_eq!(rejection(&untaken_branch), (TILE_LOAD_OPERATION_NAME, IN_BOUNDS_REASON.to_owned()));
+    }
+
+    #[test]
     fn test_module_masked_vector_load() {
         let r#type = ArrayType::new_static(DataType::I32, [4]);
         let operation = KernelCallOperation::new(
@@ -1887,7 +2177,9 @@ mod tests {
             let reference = branch.add_input(operation.parameters()[1].body_type());
             if write {
                 let zeros = branch.add_constant(ArrayIrValue::Array(Array::vector(vec![0i32; 2]).unwrap()));
-                branch.add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, zeros], None).unwrap();
+                branch
+                    .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, zeros], None)
+                    .unwrap();
             }
             branch
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder], vec![])

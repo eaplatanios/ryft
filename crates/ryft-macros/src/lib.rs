@@ -249,7 +249,10 @@ pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// `reduce_mean`, `reduce_log_sum_exp`, `reduce_max`, `reduce_min`, `reduce_any`, and `reduce_all`. Parameters,
 /// scratch storage, and slices are references, and every other value is staged. A slice, written inline or declared as
 /// `let tail = param.slice([1..4, ..]);`, selects one static range per axis, where `..` selects a whole axis, and
-/// supports only `load`, `store`, `accumulate`, and `atomic_accumulate`.
+/// supports only `load`, `store`, `accumulate`, and `atomic_accumulate`. Slices cannot be sliced again. A declared
+/// slice and a tile view stay attached to the reference that their source names at the declaration, so assigning
+/// another reference to a mutable local afterwards leaves a slice of that local unchanged, while writes to the
+/// original reference remain visible through the slice.
 ///
 /// Unsuffixed literals take the default Rust types (i.e., `i32` and `f64`) outside of fill values, so arithmetic with
 /// arrays of other data types requires suffixed literals (e.g., `2.0f32`). Every method and function name is matched

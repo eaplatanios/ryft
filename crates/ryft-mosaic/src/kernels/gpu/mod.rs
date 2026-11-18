@@ -341,9 +341,7 @@ impl<Extension: KernelExtension + Into<GpuOperation>> KernelCompiler<Extension> 
         options: &Options,
         schedule: &KernelSchedule,
     ) -> Result<(), KernelCompilationError<Error>> {
-        lowering::validate(kernel, target, options, schedule)
-            .map(|_| ())
-            .map_err(KernelCompilationError::Compiler)
+        lowering::validate(kernel, target, options, schedule).map(|_| ()).map_err(classify)
     }
 
     fn configuration_key(
@@ -383,7 +381,23 @@ impl<Extension: KernelExtension + Into<GpuOperation>> KernelCompiler<Extension> 
                 shared_memory_bytes,
             })
         })();
-        result.map_err(KernelCompilationError::Compiler)
+        result.map_err(classify)
+    }
+}
+
+/// Reports a valid kernel whose semantics this adapter cannot lower as [`KernelCompilationError::Unsupported`] and
+/// retains every other failure (e.g., an invalid configuration or an exceeded shared-memory limit) as a
+/// [`KernelCompilationError::Compiler`] error with its concrete diagnostic. The adapter starts no external tool and
+/// checks no installed version, so it never reports an unavailable or incompatible compiler.
+fn classify(error: Error) -> KernelCompilationError<Error> {
+    match error {
+        Error::Unsupported { operation, reason } => KernelCompilationError::Unsupported {
+            owner: "ryft_mosaic::kernels::gpu".into(),
+            operation,
+            requested: reason,
+            capability: "Mosaic GPU lowering".into(),
+        },
+        error => KernelCompilationError::Compiler(error),
     }
 }
 
@@ -414,6 +428,40 @@ mod tests {
             Ok(())
         })
         .unwrap()
+    }
+
+    /// Valid kernel that takes the square root of a scalar, which has no baseline scalar lowering.
+    fn sqrt_definition() -> KernelDefinition {
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap()],
+        )
+        .unwrap();
+        KernelDefinition::trace(operation, |(references, _)| {
+            let value = references[0].read()?;
+            value.context().bind(
+                ArrayIrOperation::from(ArrayOperation::Sqrt(SqrtOperation::new())),
+                vec![],
+                std::slice::from_ref(&value),
+            )?;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Asserts that `result` reports the unsupported `sqrt` of [`sqrt_definition`].
+    fn assert_unsupported_sqrt<T: std::fmt::Debug>(result: Result<T, KernelCompilationError<Error>>) {
+        assert!(matches!(result,
+            Err(KernelCompilationError::Unsupported { owner, operation: "sqrt", requested, capability })
+                if owner == "ryft_mosaic::kernels::gpu"
+                    && requested == "operation or its metadata has no baseline scalar implementation"
+                    && capability == "Mosaic GPU lowering"));
+    }
+
+    /// Asserts that `result` reports WGMMA on a target that cannot execute it as an invalid configuration.
+    fn assert_invalid_wgmma<T: std::fmt::Debug>(result: Result<T, KernelCompilationError<Error>>) {
+        assert!(matches!(result, Err(KernelCompilationError::Compiler(Error::Invalid { message }))
+            if message == "wgmma requires compute capability 9.0 and exactly 128 threads per block"));
     }
 
     #[test]
@@ -536,25 +584,11 @@ mod tests {
             ),
             Err(KernelCompilationError::Compiler(Error::SharedMemory { required: 16, maximum: 15 }))
         ));
-        let operation = KernelCallOperation::new(
-            Grid::new(vec![]).unwrap(),
-            vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap()],
-        )
-        .unwrap();
-        let unsupported: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
-            let value = references[0].read()?;
-            value.context().bind(
-                ArrayIrOperation::from(ArrayOperation::Sqrt(SqrtOperation::new())),
-                vec![],
-                std::slice::from_ref(&value),
-            )?;
-            Ok(())
-        })
-        .unwrap();
+        let (blackwell, wgmma) = (Target::new(12, 1).unwrap(), Options::default().with_mma(Mma::Wgmma));
+        assert_invalid_wgmma(Compiler.admit(&verified, &blackwell, &wgmma, &KernelSchedule::default()));
+        let unsupported = sqrt_definition();
         let verified = VerifiedKernel::new(&unsupported, 1).unwrap();
-        assert!(matches!(Compiler.admit(&verified, &target, &Options::default(), &KernelSchedule::default()),
-            Err(KernelCompilationError::Compiler(Error::Unsupported { operation: "sqrt", reason }))
-                if reason == "operation or its metadata has no baseline scalar implementation"));
+        assert_unsupported_sqrt(Compiler.admit(&verified, &target, &Options::default(), &KernelSchedule::default()));
     }
 
     #[test]
@@ -638,6 +672,31 @@ mod tests {
         let different = target.with_threads_per_block(64).unwrap();
         assert_eq!(output.target().threads_per_block(), 32);
         assert_ne!(output.target(), &different);
+    }
+
+    #[test]
+    fn test_compiler_compile_errors() {
+        // Direct compilation and `VerifiedKernel::compile` (i.e., admission followed by compilation) classify each
+        // failure like admission does.
+        let target = Target::new(9, 0).unwrap();
+        let definition = scalar_definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let schedule = KernelSchedule::default().with_maximum_scratch_bytes(15);
+        assert!(matches!(
+            Compiler.compile(&verified, &target, &Options::default(), &schedule),
+            Err(KernelCompilationError::Compiler(Error::SharedMemory { required: 16, maximum: 15 }))
+        ));
+        assert!(matches!(
+            verified.compile(&Compiler, &target, &Options::default(), &schedule),
+            Err(KernelCompilationError::Compiler(Error::SharedMemory { required: 16, maximum: 15 }))
+        ));
+        let (blackwell, wgmma) = (Target::new(12, 1).unwrap(), Options::default().with_mma(Mma::Wgmma));
+        assert_invalid_wgmma(Compiler.compile(&verified, &blackwell, &wgmma, &KernelSchedule::default()));
+        assert_invalid_wgmma(verified.compile(&Compiler, &blackwell, &wgmma, &KernelSchedule::default()));
+        let unsupported = sqrt_definition();
+        let verified = VerifiedKernel::new(&unsupported, 1).unwrap();
+        assert_unsupported_sqrt(Compiler.compile(&verified, &target, &Options::default(), &KernelSchedule::default()));
+        assert_unsupported_sqrt(verified.compile(&Compiler, &target, &Options::default(), &KernelSchedule::default()));
     }
 
     #[test]

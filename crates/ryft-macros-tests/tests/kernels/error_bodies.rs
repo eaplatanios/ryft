@@ -81,4 +81,13 @@ fn slice_window_mask(
     output.store(input.slice([0..1]).window_mask());
 }
 
+#[kernel(crate = "ryft_kernels")]
+fn nested_slice(
+    #[input(data_type = F32, rank = 1)] input: &Array,
+    #[output(data_type = F32, shape = [1])] output: &mut Array,
+) {
+    let head = input.slice([0..2]);
+    output.store(head.slice([0..1]).load());
+}
+
 fn main() {}

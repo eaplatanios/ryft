@@ -76,7 +76,7 @@ impl<'c, 't> Lowering<'c, 't> {
 /// operation of a kernel body and of its block mappings, so it rejects exactly the dimension arithmetic that lowering
 /// rejects. Arithmetic that may fail at runtime is rejected until native device failure propagation is supported.
 pub(super) fn validate_dimension(operation: &DimensionOperation<DimensionValue>) -> Result<(), Error> {
-    if !operation.effects().is_pure() {
+    if operation.effects().has_execution_effects() {
         return Err(Error::Unsupported {
             operation: operation.name(),
             reason: "runtime dimension assertions require native failure propagation".to_owned(),

@@ -72,9 +72,11 @@ use crate::validation::KernelParameterAccess;
 /// [`KernelDefinition`].
 ///
 /// Host arrays are interpreted through [`KernelDefinition::interpret`] with
-/// [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`] as the maximum grid size to enumerate when a parameter mapping
-/// lacks a separable tiling proof (i.e., when [`BlockMapping::tiling_axes`] returns `None`). Grid points are otherwise
-/// not capped, and replay has no step limit because kernel bodies admit only bounded loops.
+/// [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`] as the maximum grid size to enumerate during qualification.
+/// Qualification enumerates the grid when the mapping of a parameter is not recognized by
+/// [`BlockMapping::tiling_axes`] or when its recognized axes repeat a grid axis (e.g., the diagonal element starts
+/// `(i, i)`, for which `tiling_axes` returns `Some`). Grid points are otherwise not capped, and replay has no step
+/// limit because kernel bodies admit only bounded loops.
 pub trait KernelCall: Clone + Typed<Type = ArrayType> {
     /// Invokes or stages one portable definition with its ordinary array inputs and results.
     fn call_kernel(definition: &KernelDefinition, inputs: &[Self]) -> Result<Vec<Self>, ProgramError>;
@@ -333,9 +335,10 @@ pub fn mapped_call(
             DimensionType::new(name, DimensionBounds::non_negative(Some(maximum.max(1))).unwrap())
         })
         .collect::<Vec<_>>();
-    input_types.extend((0..prefetch_types.len()).map(|index| {
-        DimensionType::new(format!("prefetch_{index}"), DimensionBounds::non_negative(None).unwrap())
-    }));
+    input_types
+        .extend((0..prefetch_types.len()).map(|index| {
+            DimensionType::new(format!("prefetch_{index}"), DimensionBounds::non_negative(None).unwrap())
+        }));
     let grid_rank = grid.dimensions().len();
     let parameters = parameters
         .into_iter()
@@ -403,14 +406,19 @@ pub fn mapped_call(
 /// windows are their whole arrays and a write-only output whose mapped windows are disjoint. Every mapping consumes the
 /// same canonical grid coordinate signature. Input mappings ignore those coordinates, so the full input references
 /// remain available for dynamically selected loads inside the body. The call is constructed by [`mapped_call`], with
-/// the grid coordinates as the block indices of the output.
+/// the grid coordinates as the block indices of the output. The output is the parameter at `output_index` and the
+/// inputs keep their order around it, so the body references of an annotated kernel follow its declaration order.
 #[doc(hidden)]
 pub fn tiled_call(
     input_types: &[ArrayType],
     output_type: ArrayType,
+    output_index: usize,
     block_shape: Vec<usize>,
     boundary: BoundaryPolicy,
 ) -> Result<KernelCallOperation, KernelError> {
+    if output_index > input_types.len() {
+        return Err(TypeError::invalid("kernel output index exceeds its parameter count").into());
+    }
     let output_shape = output_type
         .static_shape()
         .ok_or_else(|| TypeError::invalid("kernel output tiling requires a static shape"))?;
@@ -430,18 +438,24 @@ pub fn tiled_call(
         .map(|r#type| (r#type.clone(), KernelParameterAccess::ReadOnly, ParameterWindow::WholeArray))
         .collect::<Vec<_>>();
     let indices = (0..extents.len()).map(MappingExpression::GridCoordinate).collect();
-    parameters.push((
-        output_type,
-        KernelParameterAccess::WriteOnly,
-        ParameterWindow::BlockIndices { block_shape, boundary, indices },
-    ));
+    let window = ParameterWindow::BlockIndices { block_shape, boundary, indices };
+    parameters.insert(output_index, (output_type, KernelParameterAccess::WriteOnly, window));
     mapped_call(grid, parameters, vec![])
 }
 
 /// Stages a [`TileLoadOperation`] that loads one masked tile of the reference `source`, translating tile indices into
-/// checked element starts with [`DimensionMulOperation`]s. Integer scalar array indices enter the dimension universe
-/// through a checked [`DimensionFromScalarOperation`], and dimension indices (e.g., grid coordinates) are used
-/// directly. The elements of the tile that lie outside `source` take the value `other`.
+/// checked element starts with [`DimensionMulOperation`]s. The elements of the tile that lie outside `source` take the
+/// value `other`.
+///
+/// Every nonnegative tile index is accepted, whether it is a dimension (e.g., a grid coordinate) or an integer scalar
+/// array (e.g., a loop index), and a tile that lies entirely beyond `source` contains only `other`. Every index at or
+/// beyond the number of tiles that cover an axis selects such a tile, so an index that its type does not bound by
+/// that number is first clamped to it, with a [`DimensionMinOperation`] for a dimension and with a
+/// [`CompareOperation`] and a [`SelectOperation`] for a scalar. Every tile of a physically empty `source` contains only
+/// `other`, so its indices are clamped to zero. The clamp preserves the result, keeps the multiplication by the tile
+/// extent from overflowing, and bounds the element starts so that the window limit provably fits the canonical
+/// dimension width. Scalar indices then enter the dimension universe through a checked
+/// [`DimensionFromScalarOperation`], which rejects negative values.
 pub fn tile_load<T: ArrayElement, C>(
     context: &C,
     source: &C::Value,
@@ -464,19 +478,54 @@ where
         return Err(TypeError::invalid("kernel tile indices and block shape must match the source rank").into());
     }
     let mut inputs = vec![source.clone()];
+    let empty = shape.dimensions().contains(&0);
     for (axis, index) in indices.iter().enumerate() {
+        // Every index at or beyond `limit` selects a tile that lies entirely beyond the source. A zero tile extent
+        // selects an empty window at every index, and every tile of a physically empty source contains only `other`,
+        // so both clamp every index to zero. The latter also keeps the start of the first tile beyond a source axis
+        // whose extent is near the canonical dimension width from exceeding that width.
+        let limit =
+            if block_shape[axis] == 0 || empty { 0 } else { shape.dimensions()[axis].div_ceil(block_shape[axis]) };
         let dimension = match index.r#type().as_ref() {
-            ArrayIrType::Dimension(_) => index.clone(),
-            ArrayIrType::Array(_) => {
-                let upper =
-                    shape_div_ceil(shape.dimensions()[axis], block_shape[axis]).map_err(ProgramError::custom)?.max(1);
-                let variable =
-                    DimensionVariable::new(format!("tile_index_{axis}"), DimensionBounds::new(0, Some(upper))?);
+            ArrayIrType::Dimension(r#type) if r#type.maximum_extent().is_some_and(|maximum| maximum <= limit) => {
+                index.clone()
+            }
+            ArrayIrType::Dimension(r#type) => {
+                let limit = DimensionValue::constant(limit)?;
+                let operation = DimensionMinOperation::new(r#type, limit.r#type().as_ref())?;
+                let limit = context.lift(ArrayIrValue::Dimension(limit))?;
+                context.bind(ArrayIrOperation::from(operation), vec![], &[index.clone(), limit])?.remove(0)
+            }
+            ArrayIrType::Array(r#type) if r#type.rank() == 0 && r#type.data_type().is_integer() => {
+                // The clamp is needed only when `limit` is representable in the index type, which is exactly when it
+                // survives a round trip through that type. The staged limit takes the complete index type, so that
+                // the comparison and the selection see operands with the same placement.
+                let limit_value = Array::scalar(limit as u64)?;
+                let typed_limit = limit_value.converted_to(r#type.data_type())?;
+                let index = if typed_limit.converted_to(DataType::U64)? == limit_value {
+                    let typed_limit = Array::from_logical_bytes(r#type.clone(), &typed_limit.logical_bytes())?;
+                    let typed_limit = context.lift(ArrayIrValue::Array(typed_limit))?;
+                    let below = context
+                        .bind(
+                            ArrayIrOperation::from(ArrayOperation::Compare(CompareOperation::new(
+                                ComparisonDirection::LessThan,
+                            ))),
+                            vec![],
+                            &[index.clone(), typed_limit.clone()],
+                        )?
+                        .remove(0);
+                    let operation = ArrayIrOperation::<Array>::from(ArrayOperation::Select(SelectOperation::new()));
+                    context.bind(operation, vec![], &[below, index.clone(), typed_limit])?.remove(0)
+                } else {
+                    index.clone()
+                };
+                let bounds = DimensionBounds::new(0, limit.checked_add(1))?;
+                let variable = DimensionVariable::new(format!("tile_index_{axis}"), bounds);
                 context
                     .bind(
                         ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(variable.into())),
                         vec![],
-                        std::slice::from_ref(index),
+                        &[index],
                     )?
                     .remove(0)
             }
@@ -513,10 +562,10 @@ where
 }
 
 /// Stages a [`MaskedLoadOperation`] that loads the elements of the reference `reference` that `mask` selects and
-/// returns `other` for every other element. `mask` is a Boolean array with the shape of the referent, and `other`
-/// becomes a constant array of the referent type, so `T` must be the element type of the referent. Under kernel
-/// qualification, the mask is also intersected with the validity of the window, so padding elements of a masked
-/// window take the value `other` as well.
+/// returns `other` for every other element. `mask` is a Boolean array with the shape of the referent, and `other` is
+/// staged as a rank-0 constant that a [`BroadcastOperation`] expands to the referent type, so `T` must be the element
+/// type of the referent and no host tile is allocated while tracing. Under kernel qualification, the mask is also
+/// intersected with the validity of the window, so padding elements of a masked window take the value `other` as well.
 pub fn masked_load<T: ArrayElement, C>(
     context: &C,
     reference: &C::Value,
@@ -527,20 +576,23 @@ where
     C: Context<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = KernelOperation>,
 {
     let referent = static_referent(reference)?;
-    let count = referent.static_shape().unwrap().dimensions().iter().product::<usize>();
-    let other = context.lift(ArrayIrValue::Array(Array::from_elements(referent, &vec![other; count])?))?;
-    Ok(context.bind(MaskedLoadOperation::new(), vec![], &[reference.clone(), mask.clone(), other])?.remove(0))
+    let other = broadcast_scalar(context, Array::scalar(other)?, referent)?;
+    Ok(context
+        .bind(MaskedLoadOperation::new(), vec![], &[reference.clone(), mask.clone(), other])?
+        .remove(0))
 }
 
-/// Stages a [`MaskedLoadOperation`] that loads the whole reference `reference` under a constant mask that selects
-/// every element, which is the load of a window whose padding elements take the value `other`. Under kernel
+/// Stages a [`MaskedLoadOperation`] that loads the whole reference `reference` under a broadcast constant mask that
+/// selects every element, which is the load of a window whose padding elements take the value `other`. Under kernel
 /// qualification, that mask is intersected with the validity of the window, so exactly the valid elements are read.
 /// `T` must be the element type of the referent.
 pub fn masked_load_or<T: ArrayElement, C>(context: &C, reference: &C::Value, other: T) -> Result<C::Value, ProgramError>
 where
     C: Context<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = KernelOperation>,
 {
-    let mask = context.lift(ArrayIrValue::Array(full_mask(&static_referent(reference)?)?))?;
+    let referent = static_referent(reference)?;
+    let mask_type = ArrayType::new(DataType::Boolean, referent.shape().clone());
+    let mask = broadcast_scalar(context, Array::scalar(true)?, mask_type)?;
     masked_load(context, reference, &mask, other)
 }
 
@@ -558,8 +610,9 @@ where
 
 /// Stages a [`MaskedSwapOperation`] that replaces the elements of the reference `reference` that `mask` selects with
 /// the corresponding elements of `value` and returns their previous values, with `other` for every other element.
-/// `value` has exactly the referent type, `mask` is a Boolean array with the referent shape, and `other` becomes a
-/// constant array of the referent type, so `T` must be the element type of the referent.
+/// `value` has exactly the referent type, `mask` is a Boolean array with the referent shape, and `other` is staged as a
+/// rank-0 constant that a [`BroadcastOperation`] expands to the referent type, so `T` must be the element type of the
+/// referent.
 pub fn masked_swap<T: ArrayElement, C>(
     context: &C,
     reference: &C::Value,
@@ -571,8 +624,7 @@ where
     C: Context<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = KernelOperation>,
 {
     let referent = static_referent(reference)?;
-    let count = referent.static_shape().unwrap().dimensions().iter().product::<usize>();
-    let other = context.lift(ArrayIrValue::Array(Array::from_elements(referent, &vec![other; count])?))?;
+    let other = broadcast_scalar(context, Array::scalar(other)?, referent)?;
     let inputs = [reference.clone(), value.clone(), mask.clone(), other];
     Ok(context.bind(MaskedSwapOperation::new(), vec![], &inputs)?.remove(0))
 }
@@ -590,9 +642,13 @@ where
 /// Adds `value` into the window of the reference `reference` in program order. A window with
 /// [`BoundaryPolicy::InBounds`] uses a [`ReferenceAddUpdateOperation`]. A window with [`BoundaryPolicy::Masked`]
 /// may contain padding that an unmasked read rejects, so it is instead loaded through a [`MaskedLoadOperation`] whose
-/// padding elements are zero, added to `value`, and stored back through a [`MaskedStoreOperation`]. Both masks select
-/// every element, and kernel qualification restricts them to the valid elements of the window. `value` has exactly
-/// the referent type in both cases.
+/// padding elements are zero, added to `value`, and stored back through a [`MaskedStoreOperation`]. Both use one
+/// broadcast constant mask that selects every element, and kernel qualification restricts it to the valid elements of
+/// the window. Under either policy, `value` broadcasts and promotes as in an [`AddOperation`] of the window and
+/// `value`, so a rank-0 value, a value with unit extents, or a value with a narrower element type is added to every
+/// element of the window. The sum must have exactly the referent type, and any other sum fails when it is staged, with
+/// the type error of [`ReferenceAddUpdateOperation`] for an in-bounds window and of [`MaskedStoreOperation`] for a
+/// masked window.
 pub fn accumulate<C>(
     context: &C,
     reference: &C::Value,
@@ -607,10 +663,13 @@ where
         return Ok(());
     }
     let referent = static_referent(reference)?;
-    let mask = context.lift(ArrayIrValue::Array(full_mask(&referent)?))?;
+    let mask_type = ArrayType::new(DataType::Boolean, referent.shape().clone());
+    let mask = broadcast_scalar(context, Array::scalar(true)?, mask_type)?;
     let zero = ArrayIrOperation::<Array>::from(ArrayOperation::Zero(ZeroOperation::new(referent)));
     let zero = context.bind(zero, vec![], &[])?.remove(0);
-    let current = context.bind(MaskedLoadOperation::new(), vec![], &[reference.clone(), mask.clone(), zero])?.remove(0);
+    let current = context
+        .bind(MaskedLoadOperation::new(), vec![], &[reference.clone(), mask.clone(), zero])?
+        .remove(0);
     let sum = context
         .bind(ArrayIrOperation::from(ArrayOperation::Add(AddOperation::new())), vec![], &[current, value.clone()])?
         .remove(0);
@@ -879,15 +938,7 @@ pub fn full<T: ArrayElement, C: Context<Type = ArrayIrType>>(
 where
     C::Operation: From<ArrayIrOperation<Array>>,
 {
-    let constant = ArrayIrOperation::<Array>::from(ArrayOperation::Constant(ConstantOperation::new(Array::scalar(
-        value,
-    )?)));
-    let constant = context.bind(constant, Vec::new(), &[])?.remove(0);
-    let broadcast = ArrayIrOperation::<Array>::from(ArrayOperation::Broadcast(BroadcastOperation::new(
-        ArrayType::new_static(T::data_type(), shape),
-        Vec::new(),
-    )));
-    Ok(context.bind(broadcast, Vec::new(), &[constant])?.remove(0))
+    broadcast_scalar(context, Array::scalar(value)?, ArrayType::new_static(T::data_type(), shape))
 }
 
 /// Constructs a statically shaped tile with the canonical element type of `T` whose elements count up from zero along
@@ -956,7 +1007,7 @@ fn lower_mapping_expression(
             return Ok(inputs[*axis]);
         }
         MappingExpression::Prefetch(index) => {
-            return inputs.get(grid_rank + index).copied().ok_or_else(|| {
+            return inputs[grid_rank..].get(*index).copied().ok_or_else(|| {
                 TypeError::invalid(format!(
                     "kernel mapping expression references scalar prefetch {index}, but the call has {} scalar \
                      prefetch values",
@@ -1023,21 +1074,49 @@ fn static_referent<V: Typed<Type = ArrayIrType>>(reference: &V) -> Result<ArrayT
     Ok(reference.referent().clone())
 }
 
-/// Returns a constant Boolean mask with the shape of the statically shaped `referent` that selects every element.
-fn full_mask(referent: &ArrayType) -> Result<Array, ProgramError> {
-    let count = referent.static_shape().unwrap().dimensions().iter().product::<usize>();
-    Array::from_elements(ArrayType::new(DataType::Boolean, referent.shape().clone()), &vec![true; count])
+/// Stages the rank-0 array `value` as a [`ConstantOperation`] and expands it to `type` with a [`BroadcastOperation`],
+/// whose canonical type rules check the data type and memory placement and keep the shape, layout, and sharding of
+/// `type`. The constant takes the memory placement of `type` and a rank-0 sharding with the mesh, reduction state, and
+/// varying manual axes of `type`, because broadcasting cannot introduce variation along a manual mesh axis. Every
+/// element of the result has the exact encoding of `value`. No host array of the shape of `type` is allocated, and an
+/// interpreter that materializes the result checks its storage size.
+fn broadcast_scalar<C: Context<Type = ArrayIrType>>(
+    context: &C,
+    value: Array,
+    r#type: ArrayType,
+) -> Result<C::Value, ProgramError>
+where
+    C::Operation: From<ArrayIrOperation<Array>>,
+{
+    let sharding = r#type
+        .sharding()
+        .map(|sharding| sharding.with_dimensions(Vec::new()))
+        .transpose()
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let value_type = value
+        .r#type()
+        .into_owned()
+        .with_memory(r#type.memory())
+        .with_sharding(sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let value = Array::from_logical_bytes(value_type, &value.logical_bytes())?;
+    let constant = ArrayIrOperation::<Array>::from(ArrayOperation::Constant(ConstantOperation::new(value)));
+    let constant = context.bind(constant, Vec::new(), &[])?.remove(0);
+    let broadcast =
+        ArrayIrOperation::<Array>::from(ArrayOperation::Broadcast(BroadcastOperation::new(r#type, Vec::new())));
+    Ok(context.bind(broadcast, Vec::new(), &[constant])?.remove(0))
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayReference, Condition, ConvertElementType, DataType, Operation, ReferenceAtomicAddUpdate,
-        ReferenceRead, ReferenceType, ReferenceWrite, Shape, TracingContext,
+        ArrayReference, Condition, ConvertElementType, DataType, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory,
+        MeshAxis, MeshAxisType, Operation, Program, ReferenceAtomicAddUpdate, ReferenceRead, ReferenceType,
+        ReferenceWrite, Shape, Sharding, TiledLayout, TracingContext,
     };
 
     use crate::initialization::KernelInitializationError;
@@ -1253,8 +1332,8 @@ mod tests {
         // The input windows run backwards through the input, which no separable tiling proof describes, so
         // qualification enumerates the grid.
         let grid = Grid::new(vec![GridDimension::new(3usize.into(), GridExecution::Parallel)]).unwrap();
-        let reversed = MappingExpression::Constant(4)
-            - MappingExpression::GridCoordinate(0) * MappingExpression::Constant(2);
+        let reversed =
+            MappingExpression::Constant(4) - MappingExpression::GridCoordinate(0) * MappingExpression::Constant(2);
         let operation = mapped_call(
             grid,
             vec![
@@ -1498,21 +1577,63 @@ mod tests {
     }
 
     #[test]
+    fn test_mapped_call_invalid_prefetch_index() {
+        // The prefetch index is checked against the prefetch suffix, so it cannot overflow into the grid coordinates.
+        let grid = Grid::new(vec![GridDimension::new(2usize.into(), GridExecution::Parallel)]).unwrap();
+        let window = ParameterWindow::BlockIndices {
+            block_shape: vec![2],
+            boundary: BoundaryPolicy::InBounds,
+            indices: vec![MappingExpression::Prefetch(usize::MAX)],
+        };
+        assert_eq!(
+            mapped_call(
+                grid,
+                vec![(ArrayType::new_static(DataType::I32, [4]), KernelParameterAccess::ReadOnly, window)],
+                vec![ArrayType::scalar(DataType::I32)],
+            ),
+            Err(KernelError::Type(TypeError::invalid(format!(
+                "kernel mapping expression references scalar prefetch {}, but the call has 1 scalar prefetch values",
+                usize::MAX,
+            )))),
+        );
+    }
+
+    #[test]
     fn test_tiled_call() {
-        let operation = tiled_call(
-            &[ArrayType::new_static(DataType::F32, [3, 5])],
-            ArrayType::new_static(DataType::F32, [3, 7]),
-            vec![2, 4],
-            BoundaryPolicy::Masked,
-        )
-        .unwrap();
+        let input_types = [ArrayType::new_static(DataType::F32, [3, 5]), ArrayType::new_static(DataType::F32, [4])];
+        let output_type = ArrayType::new_static(DataType::F32, [3, 7]);
+        let operation = tiled_call(&input_types, output_type.clone(), 2, vec![2, 4], BoundaryPolicy::Masked).unwrap();
         assert_eq!(operation.grid().points(&[2, 2]).unwrap().len(), 4);
         assert_eq!(operation.parameters()[0].mapping().block_shape(), &[3, 5]);
-        assert_eq!(operation.parameters()[1].mapping().block_shape(), &[2, 4]);
+        assert_eq!(operation.parameters()[1].mapping().block_shape(), &[4]);
+        assert_eq!(operation.parameters()[2].mapping().block_shape(), &[2, 4]);
         assert_eq!(operation.coordinate_types().len(), 2);
+
+        // The output takes its declared position among the parameters, and the inputs keep their order around it.
+        for output_index in 0..=2 {
+            let operation =
+                tiled_call(&input_types, output_type.clone(), output_index, vec![2, 4], BoundaryPolicy::Masked)
+                    .unwrap();
+            let mut expected =
+                vec![(KernelParameterAccess::ReadOnly, vec![3, 5]), (KernelParameterAccess::ReadOnly, vec![4])];
+            expected.insert(output_index, (KernelParameterAccess::WriteOnly, vec![2, 4]));
+            assert_eq!(
+                operation
+                    .parameters()
+                    .iter()
+                    .map(|parameter| (parameter.access(), parameter.mapping().block_shape().to_vec()))
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+        }
+
         assert_eq!(
-            tiled_call(&[], ArrayType::scalar(DataType::F32), vec![2], BoundaryPolicy::Masked).unwrap_err(),
+            tiled_call(&[], ArrayType::scalar(DataType::F32), 0, vec![2], BoundaryPolicy::Masked).unwrap_err(),
             KernelError::Type(TypeError::invalid("kernel output tile rank must equal its array rank")),
+        );
+        assert_eq!(
+            tiled_call(&input_types, output_type, 3, vec![2, 4], BoundaryPolicy::Masked).unwrap_err(),
+            KernelError::Type(TypeError::invalid("kernel output index exceeds its parameter count")),
         );
     }
 
@@ -1541,16 +1662,210 @@ mod tests {
     }
 
     #[test]
+    fn test_tile_load_index_domain() {
+        // Loads one tile of width 2 with the fill -1 at a tile index that is an input of the given type.
+        let program = |index_type: ArrayIrType, extent: usize| {
+            TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+                |inputs: Vec<_>| {
+                    let context = inputs[0].context();
+                    Ok(vec![tile_load(context, &inputs[0], vec![2], &[inputs[1].clone()], -1i32)?])
+                },
+                vec![
+                    ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, [extent]))),
+                    index_type,
+                ],
+            )
+            .unwrap()
+            .1
+        };
+        let load = |program: &Program<_, _, _, _>, source: Vec<i32>, index| {
+            let source = ArrayReference::new(Array::vector(source).unwrap());
+            program.interpret(vec![ArrayIrValue::Reference(source), index])
+        };
+        let tile = |elements: [i32; 2]| Ok(vec![ArrayIrValue::Array(Array::vector(elements.to_vec()).unwrap())]);
+        let scalar = |index: i64| ArrayIrValue::Array(Array::scalar(index).unwrap());
+        let dimension = |index: usize| ArrayIrValue::Dimension(DimensionValue::constant(index).unwrap());
+        let coordinate = |upper: usize| {
+            ArrayIrType::Dimension(DimensionType::new("index", DimensionBounds::non_negative(Some(upper)).unwrap()))
+        };
+        let unbounded =
+            ArrayIrType::Dimension(DimensionType::new("index", DimensionBounds::non_negative(None).unwrap()));
+        let scalar_index = program(ArrayIrType::Array(ArrayType::scalar(DataType::I64)), 2);
+        let dimension_index = program(coordinate(2), 2);
+        let unbounded_index = program(unbounded, 2);
+
+        // A tile that lies entirely beyond its source takes the fill for every index kind.
+        assert_eq!(load(&scalar_index, vec![3, 5], scalar(1)), tile([-1, -1]));
+        assert_eq!(load(&dimension_index, vec![3, 5], dimension(1)), tile([-1, -1]));
+        assert_eq!(load(&unbounded_index, vec![3, 5], dimension(1)), tile([-1, -1]));
+        assert_eq!(load(&scalar_index, vec![3, 5], scalar(7)), tile([-1, -1]));
+        assert_eq!(load(&unbounded_index, vec![3, 5], dimension(7)), tile([-1, -1]));
+
+        // A loop index is a signed scalar, so it selects tiles beyond the source like every other index.
+        let (_, looped) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context().clone();
+                let initial = full::<i32, _>(&context, [2], 0)?;
+                let outputs = for_loop(&context, 1..2, vec![inputs[0].clone(), initial], |index, values| {
+                    let context = index.context().clone();
+                    Ok(vec![values[0].clone(), tile_load(&context, &values[0], vec![2], &[index], -1i32)?])
+                })?;
+                Ok(vec![outputs[1].clone()])
+            },
+            vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, [2])))],
+        )
+        .unwrap();
+        let source = ArrayReference::new(Array::vector(vec![3i32, 5]).unwrap());
+        assert_eq!(looped.interpret(vec![ArrayIrValue::Reference(source)]), tile([-1, -1]));
+
+        // The last valid tile of a length-3 source is partial.
+        let partial_scalar_index = program(ArrayIrType::Array(ArrayType::scalar(DataType::I64)), 3);
+        let partial_dimension_index = program(coordinate(2), 3);
+        assert_eq!(load(&partial_scalar_index, vec![3, 5, 7], scalar(1)), tile([7, -1]));
+        assert_eq!(load(&partial_dimension_index, vec![3, 5, 7], dimension(1)), tile([7, -1]));
+        assert_eq!(load(&partial_dimension_index, vec![3, 5, 7], dimension(0)), tile([3, 5]));
+
+        // Indices whose unclamped element start would overflow the canonical dimension width are clamped first, so
+        // the checked multiplication never overflows and they select a tile beyond the source as well.
+        assert_eq!(load(&scalar_index, vec![3, 5], scalar(i64::MAX)), tile([-1, -1]));
+        assert_eq!(load(&unbounded_index, vec![3, 5], dimension(MAX_DIMENSION_EXTENT)), tile([-1, -1]));
+        let unsigned_index = program(ArrayIrType::Array(ArrayType::scalar(DataType::U64)), 2);
+        assert_eq!(
+            load(&unsigned_index, vec![3, 5], ArrayIrValue::Array(Array::scalar(u64::MAX).unwrap())),
+            tile([-1, -1]),
+        );
+
+        // Negative scalar indices fail their checked conversion.
+        assert_eq!(
+            load(&scalar_index, vec![3, 5], scalar(-1)),
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete `usize` from `i64[]`; value `-1` is out of range".to_string(),
+            }),
+        );
+
+        // Scalar indices are clamped by a comparison and a selection, and an index whose type already bounds it by the
+        // number of tiles is used directly. The element starts of every index kind are bounded.
+        assert_eq!(
+            scalar_index.to_string(),
+            indoc! {"
+                lambda %0:ref<i32[2]>, %1:i64[] .
+                let %2:i64[] = const 1
+                    %3:bool[] = compare [direction=LessThan] %1 %2
+                    %4:i64[] = select %3 %1 %2
+                    %5:dimension<tile_index_0 ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %4
+                    %6:dimension<2> = const 2
+                    %7:dimension<tile_index_0 * 2 ∈ [0, 3)> = dimension_mul %5 %6
+                    %8:i32[] = const -1
+                    %9:i32[2] = tile_load [block_shape=[2], boundary=Masked] %0 %7 %8
+                in (%9)"
+            },
+        );
+        assert_eq!(
+            dimension_index.to_string(),
+            indoc! {"
+                lambda %0:ref<i32[2]>, %1:dimension<index ∈ [0, 2)> .
+                let %2:dimension<2> = const 2
+                    %3:dimension<index * 2 ∈ [0, 3)> = dimension_mul %1 %2
+                    %4:i32[] = const -1
+                    %5:i32[2] = tile_load [block_shape=[2], boundary=Masked] %0 %3 %4
+                in (%5)"
+            },
+        );
+        assert_eq!(
+            unbounded_index.to_string(),
+            indoc! {"
+                lambda %0:ref<i32[2]>, %1:dimension<index ∈ [0, ∞)> .
+                let %2:dimension<1> = const 1
+                    %3:dimension<min(index, 1) ∈ [0, 2)> = dimension_min %1 %2
+                    %4:dimension<2> = const 2
+                    %5:dimension<min(index, 1) * 2 ∈ [0, 3)> = dimension_mul %3 %4
+                    %6:i32[] = const -1
+                    %7:i32[2] = tile_load [block_shape=[2], boundary=Masked] %0 %5 %6
+                in (%7)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_tile_load_index_empty_source() {
+        // An oversized index into a physically empty source of the widest extent selects the empty fill tile, even
+        // though the start of the first tile beyond that extent does not fit the canonical dimension width.
+        let shape = [MAX_DIMENSION_EXTENT, 0];
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let column = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(0)?))?;
+                Ok(vec![tile_load(context, &inputs[0], vec![2, 0], &[inputs[1].clone(), column], -1i32)?])
+            },
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, shape))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
+            ],
+        )
+        .unwrap();
+        let source = Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, shape), &[]).unwrap();
+        let source = ArrayReference::new(source);
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Reference(source),
+                ArrayIrValue::Array(Array::scalar(i64::MAX).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap(),
+            )]),
+        );
+    }
+
+    #[test]
+    fn test_tile_load_index_placement() {
+        // The clamp limit of a scalar index takes the placement of that index, so a host-pinned index traces and loads.
+        let index_type = ArrayType::scalar(DataType::I64).with_memory(Memory::Host { pinned: true });
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let column = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(0)?))?;
+                Ok(vec![tile_load(context, &inputs[0], vec![2, 2], &[inputs[1].clone(), column], -1i32)?])
+            },
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, [9, 11]))),
+                ArrayIrType::Array(index_type.clone()),
+            ],
+        )
+        .unwrap();
+        let source = ArrayReference::new(
+            Array::from_elements(ArrayType::new_static(DataType::I32, [9, 11]), &(0..99i32).collect::<Vec<_>>())
+                .unwrap(),
+        );
+        let index = Array::from_logical_bytes(index_type, &0i64.to_ne_bytes()).unwrap();
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Reference(source), ArrayIrValue::Array(index)]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[0i32, 1, 11, 12]).unwrap(),
+            )]),
+        );
+    }
+
+    #[test]
     fn test_tile_store() {
+        // Each program stores the tile of the input that its coordinate selects plus 10, where the element of the last
+        // tile that lies past the end of the input is `-1`. The private tile of the last program holds `[19, 9]`, and
+        // publication clips it to the output, so only its first element survives.
+        let vector = ArrayType::new_static(DataType::I32, [3]);
         let operation =
-            tiled_call(&[], ArrayType::new_static(DataType::I32, [3]), vec![2], BoundaryPolicy::Masked).unwrap();
-        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            tiled_call(std::slice::from_ref(&vector), vector.clone(), 1, vec![2], BoundaryPolicy::Masked).unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, coordinates)| {
             let context = references[0].context();
-            let value = zeros::<i32, _>(context, [2])?;
-            tile_store(context, &references[0], &value)
+            let tile = tile_load(context, &references[0], vec![2], std::slice::from_ref(&coordinates[0]), -1i32)?;
+            let offset = full::<i32, _>(context, [2], 10)?;
+            let operation = ArrayIrOperation::from(ArrayOperation::Add(AddOperation::new()));
+            let value = context.bind(operation, vec![], &[tile, offset])?.remove(0);
+            tile_store(context, &references[1], &value)
         })
         .unwrap();
-        assert_eq!(definition.interpret(vec![], 2), Ok(vec![Array::vector(vec![0i32, 0, 0]).unwrap()]));
+        assert_eq!(
+            definition.interpret(vec![Array::vector(vec![7i32, 8, 9]).unwrap()], 2),
+            Ok(vec![Array::vector(vec![17i32, 18, 19]).unwrap()]),
+        );
     }
 
     #[test]
@@ -1586,6 +1901,43 @@ mod tests {
         assert_eq!(
             definition.interpret(vec![Array::vector(vec![1i32, 2]).unwrap()], 1),
             Ok(vec![Array::vector(vec![1i32, 7, 7, 7]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_masked_load_placement() {
+        // The fill keeps the exact bits of a NaN payload and the memory placement and layout of the referent.
+        let r#type = ArrayType::new_static(DataType::F32, [3])
+            .with_memory(Memory::Host { pinned: true })
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let mask = context.lift(ArrayIrValue::Array(Array::vector(vec![true, false, true])?))?;
+                Ok(vec![masked_load(context, &inputs[0], &mask, f32::from_bits(0x7fc00001))?])
+            },
+            vec![ArrayIrType::Reference(ReferenceType::new(r#type.clone()))],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[3][layout=tiled{0}]@Host[Pinned]> .
+                let %1:bool[3] = const [true, false, true]
+                    %2:f32[]@Host[Pinned] = constant [value=NaN]
+                    %3:f32[3][layout=tiled{0}]@Host[Pinned] = \
+                        broadcast [output_type=f32[3][layout=tiled{0}]@Host[Pinned], output_axes=[]] %2
+                    %4:f32[3][layout=tiled{0}]@Host[Pinned] = masked_load %0 %1 %3
+                in (%4)"
+            },
+        );
+        let source = Array::from_elements(r#type.clone(), &[1f32, 2.0, 3.0]).unwrap();
+        let outputs = program.interpret(vec![ArrayIrValue::Reference(ArrayReference::new(source))]).unwrap();
+        let [ArrayIrValue::Array(output)] = outputs.as_slice() else { unreachable!() };
+        assert_eq!(output.r#type().as_ref(), &r#type);
+        assert_eq!(
+            output.elements::<f32>().unwrap().iter().map(|element| element.to_bits()).collect::<Vec<_>>(),
+            vec![1f32.to_bits(), 0x7fc00001, 3f32.to_bits()],
         );
     }
 
@@ -1636,6 +1988,53 @@ mod tests {
             Err(KernelError::Program(ProgramError::Type(TypeError::invalid(
                 "kernel memory access requires a reference but got `i32[2]`",
             )))),
+        );
+    }
+
+    #[test]
+    fn test_masked_load_or_manual_variation() {
+        // The compact fill carries the variation of a referent that varies along a manual mesh axis, so the masked
+        // load and the masked swap both trace on that reference.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap();
+        let referent = ArrayType::new_static(DataType::F32, [3]).with_sharding(Some(sharding.clone())).unwrap();
+        let mask = ArrayType::new_static(DataType::Boolean, [3]).with_sharding(Some(sharding)).unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context();
+                let loaded = masked_load_or(context, &inputs[0], -1f32)?;
+                let swapped = masked_swap(context, &inputs[0], &inputs[1], &inputs[2], -2f32)?;
+                Ok(vec![loaded, swapped])
+            },
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(referent.clone())),
+                ArrayIrType::Array(referent),
+                ArrayIrType::Array(mask),
+            ],
+        )
+        .unwrap();
+        let sharded = "[sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]";
+        let scalar = "[sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:ref<f32[3]{sharded}>, %1:f32[3]{sharded}, %2:bool[3]{sharded} .
+                let %3:bool[] = constant [value=true]
+                    %4:bool[3] = broadcast [output_type=bool[3], output_axes=[]] %3
+                    %5:f32[]{scalar} = constant [value=-1.0]
+                    %6:f32[3]{sharded} = broadcast [
+                        output_type=f32[3]{sharded},
+                        output_axes=[],
+                    ] %5
+                    %7:f32[3]{sharded} = masked_load %0 %4 %6
+                    %8:f32[]{scalar} = constant [value=-2.0]
+                    %9:f32[3]{sharded} = broadcast [
+                        output_type=f32[3]{sharded},
+                        output_axes=[],
+                    ] %8
+                    %10:f32[3]{sharded} = masked_swap %0 %1 %2 %9
+                in (%7, %10)"
+            },
         );
     }
 
@@ -1694,10 +2093,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             definition.interpret(vec![Array::vector(vec![1i32, 2, 3, 4, 5]).unwrap()], 2),
-            Ok(vec![
-                Array::vector(vec![9i32, 2, 11, 12, 9]).unwrap(),
-                Array::vector(vec![1i32, -1, 3, 4, 5]).unwrap(),
-            ]),
+            Ok(
+                vec![Array::vector(vec![9i32, 2, 11, 12, 9]).unwrap(), Array::vector(vec![1i32, -1, 3, 4, 5]).unwrap(),]
+            ),
         );
     }
 
@@ -1801,17 +2199,162 @@ mod tests {
                 lambda %0:ref<i32[2]>, %1:dimension<program_0 ∈ [0, 2)> .
                 let %2:i32[] = constant [value=10]
                     %3:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %2
-                    %4:bool[2] = const [true, true]
-                    %5:i32[2] = zero [type=i32[2]]
-                    %6:i32[2] = masked_load %0 %4 %5
-                    %7:i32[2] = add %6 %3
-                    () = masked_store %0 %7 %4
+                    %4:bool[] = constant [value=true]
+                    %5:bool[2] = broadcast [output_type=bool[2], output_axes=[]] %4
+                    %6:i32[2] = zero [type=i32[2]]
+                    %7:i32[2] = masked_load %0 %5 %6
+                    %8:i32[2] = add %7 %3
+                    () = masked_store %0 %8 %5
                 in ()"
             },
         );
         assert_eq!(
             definition.interpret(vec![Array::vector(vec![1i32, 2, 3]).unwrap()], 2),
             Ok(vec![Array::vector(vec![11i32, 12, 13]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_accumulate_broadcasting() {
+        // Adds `value` into a read-write vector through windows of 2 elements on a grid of 2 programs. The in-bounds
+        // vector has 4 elements, and the masked vector has 3, so its second window has one valid element.
+        let accumulate_into = |boundary: BoundaryPolicy, value: Array| {
+            let extent = if boundary == BoundaryPolicy::InBounds { 4 } else { 3 };
+            let operation = mapped_call(
+                Grid::new(vec![GridDimension::new(2usize.into(), GridExecution::Parallel)]).unwrap(),
+                vec![(
+                    ArrayType::new_static(DataType::I32, [extent]),
+                    KernelParameterAccess::ReadWrite,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![2],
+                        boundary,
+                        indices: vec![MappingExpression::GridCoordinate(0)],
+                    },
+                )],
+                vec![],
+            )
+            .unwrap();
+            KernelDefinition::<NoKernelExtension>::trace(operation, |(references, _coordinates)| {
+                let context = references[0].context();
+                let value = context.lift(ArrayIrValue::Array(value.clone()))?;
+                accumulate(context, &references[0], &value, boundary)
+            })
+            .map(|definition| definition.interpret(vec![Array::vector((1..=extent as i32).collect()).unwrap()], 2))
+        };
+
+        // Under both policies, the value broadcasts and promotes like the addition of the window and the value, so a
+        // rank-0 value, a value with unit extents, and a value with a narrower element type are added to every
+        // element of the window.
+        for value in [Array::scalar(10i32).unwrap(), Array::vector(vec![10i32]).unwrap(), Array::scalar(10i8).unwrap()]
+        {
+            assert_eq!(
+                accumulate_into(BoundaryPolicy::InBounds, value.clone()),
+                Ok(Ok(vec![Array::vector(vec![11i32, 12, 13, 14]).unwrap()])),
+            );
+            assert_eq!(
+                accumulate_into(BoundaryPolicy::Masked, value),
+                Ok(Ok(vec![Array::vector(vec![11i32, 12, 13]).unwrap()])),
+            );
+        }
+
+        // A sum whose type differs from the referent type is rejected under both policies, by the operation that
+        // each policy stages to write it.
+        assert_eq!(
+            accumulate_into(BoundaryPolicy::InBounds, Array::scalar(10i64).unwrap()).map(|_| ()),
+            Err(KernelError::Program(ProgramError::Type(TypeError::invalid(
+                "`reference_add_update` addition output type `i64[2]` must exactly match reference referent type \
+                 `i32[2]`",
+            )))),
+        );
+        assert_eq!(
+            accumulate_into(BoundaryPolicy::Masked, Array::scalar(10i64).unwrap()).map(|_| ()),
+            Err(KernelError::Program(ProgramError::Type(TypeError::invalid(
+                "masked memory input `1` type `i64[2]` must exactly match referent type `i32[2]`",
+            )))),
+        );
+        assert_eq!(
+            accumulate_into(BoundaryPolicy::InBounds, Array::matrix(1, 2, vec![10i32, 20]).unwrap()).map(|_| ()),
+            Err(KernelError::Program(ProgramError::Type(TypeError::invalid(
+                "`reference_add_update` addition output type `i32[1, 2]` must exactly match reference referent type \
+                 `i32[2]`",
+            )))),
+        );
+        assert_eq!(
+            accumulate_into(BoundaryPolicy::Masked, Array::matrix(1, 2, vec![10i32, 20]).unwrap()).map(|_| ()),
+            Err(KernelError::Program(ProgramError::Type(TypeError::invalid(
+                "masked memory input `1` type `i32[1, 2]` must exactly match referent type `i32[2]`",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_masked_accesses_shapes() {
+        // Traces a masked load with and without an explicit mask, a masked swap, and a masked accumulation of the
+        // reference with the given shape, whose fills and masks must be staged without host tiles of that shape.
+        let trace = |shape: [usize; 2]| {
+            TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+                |inputs: Vec<_>| {
+                    let context = inputs[0].context();
+                    let loaded = masked_load_or(context, &inputs[0], -1i32)?;
+                    let mask = full::<bool, _>(context, shape, true)?;
+                    let selected = masked_load(context, &inputs[0], &mask, -2i32)?;
+                    let previous = masked_swap(context, &inputs[0], &loaded, &mask, -3i32)?;
+                    accumulate(context, &inputs[0], &selected, BoundaryPolicy::Masked)?;
+                    Ok(vec![loaded, selected, previous])
+                },
+                vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, shape)))],
+            )
+        };
+
+        // Zero extents produce empty results.
+        let (_, program) = trace([0, 3]).unwrap();
+        let empty = Array::from_elements(ArrayType::new_static(DataType::I32, [0, 3]), &[0i32; 0]).unwrap();
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Reference(ArrayReference::new(empty.clone()))]),
+            Ok(vec![ArrayIrValue::Array(empty); 3]),
+        );
+
+        // A large representable shape traces without allocating host tiles of that shape.
+        let (_, program) = trace([1 << 16, 1 << 16]).unwrap();
+        let rendering = indoc! {"
+            lambda %0:ref<i32[65536, 65536]> .
+            let %1:bool[] = constant [value=true]
+                %2:bool[65536, 65536] = broadcast [output_type=bool[65536, 65536], output_axes=[]] %1
+                %3:i32[] = constant [value=-1]
+                %4:i32[65536, 65536] = broadcast [output_type=i32[65536, 65536], output_axes=[]] %3
+                %5:i32[65536, 65536] = masked_load %0 %2 %4
+                %6:bool[] = constant [value=true]
+                %7:bool[65536, 65536] = broadcast [output_type=bool[65536, 65536], output_axes=[]] %6
+                %8:i32[] = constant [value=-2]
+                %9:i32[65536, 65536] = broadcast [output_type=i32[65536, 65536], output_axes=[]] %8
+                %10:i32[65536, 65536] = masked_load %0 %7 %9
+                %11:i32[] = constant [value=-3]
+                %12:i32[65536, 65536] = broadcast [output_type=i32[65536, 65536], output_axes=[]] %11
+                %13:i32[65536, 65536] = masked_swap %0 %5 %7 %12
+                %14:bool[] = constant [value=true]
+                %15:bool[65536, 65536] = broadcast [output_type=bool[65536, 65536], output_axes=[]] %14
+                %16:i32[65536, 65536] = zero [type=i32[65536, 65536]]
+                %17:i32[65536, 65536] = masked_load %0 %15 %16
+                %18:i32[65536, 65536] = add %17 %10
+                () = masked_store %0 %18 %15
+            in (%5, %10, %13)"
+        };
+        assert_eq!(program.to_string(), rendering);
+
+        // A shape whose storage size is unrepresentable traces the same operations, and materializing one of its fills
+        // is a typed error.
+        let (_, program) = trace([MAX_DIMENSION_EXTENT, 4]).unwrap();
+        assert_eq!(program.to_string(), rendering.replace("65536, 65536", &format!("{MAX_DIMENSION_EXTENT}, 4")));
+        let (_, fill) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<_>| Ok(vec![full::<i32, _>(inputs[0].context(), [MAX_DIMENSION_EXTENT, 4], -1i32)?]),
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))],
+        )
+        .unwrap();
+        assert_eq!(
+            fill.interpret(vec![ArrayIrValue::Array(Array::scalar(0i32).unwrap())]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "shape [{MAX_DIMENSION_EXTENT}, 4] element count does not fit in `usize`",
+            )))),
         );
     }
 

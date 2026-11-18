@@ -12,15 +12,15 @@ use ryft_kernels::{
 };
 use ryft_mlir::{Context, StringRef};
 use ryft_rocm::{RocmKernelArtifact, RocmKernelLaunchDimensions};
+use ryft_xla_sys::JAX_COMMIT;
 use ryft_xla_sys::triton::{
     RYFT_XLA_Triton_Compile, RYFT_XLA_Triton_Compile_Args, RYFT_XLA_Triton_Compile_Args_Destroy,
     RYFT_XLA_Triton_Get_Versions, RYFT_XLA_Triton_Versions, RYFT_XLA_Triton_Versions_Destroy,
 };
 use serde_json::{Value, json};
 
-use crate::kernels::lowering;
 use crate::kernels::{
-    Artifact, COMPILER_SCHEMA_VERSION, CompiledKernel, Error, Options, TRITON_VERSION, Target, XLA_VERSION,
+    Artifact, COMPILER_SCHEMA_VERSION, CompiledKernel, Error, Options, TRITON_VERSION, Target, XLA_VERSION, lowering,
 };
 
 /// Linked native compiler and optional caller-owned cancellation signal.
@@ -166,8 +166,7 @@ impl Compiler {
     /// Checks the same linked-source and target toolchain contract for live and recorded configurations.
     fn validate_versions(versions: &Value, target: &Target) -> Result<(), Error> {
         let fixed = json!({
-            "schema": COMPILER_SCHEMA_VERSION, "xla": XLA_VERSION,
-            "jax": "a7606f995e1a92707cbeb257e487fa53e7abe84b", "triton": TRITON_VERSION,
+            "schema": COMPILER_SCHEMA_VERSION, "xla": XLA_VERSION, "jax": JAX_COMMIT, "triton": TRITON_VERSION,
             "rocm_device_libs": "53996464fa8d94b182ac4aaa7dc3a109ab524f45",
         });
         let valid_toolchain = match target {
@@ -539,6 +538,8 @@ fn validate_ptx(source: &str, target: &Target, metadata: &Metadata) -> Result<St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType};
@@ -592,8 +593,7 @@ mod tests {
     /// Produces the fixed source contract used by both the native and recorded paths.
     fn versions() -> Value {
         json!({
-            "schema": COMPILER_SCHEMA_VERSION, "xla": XLA_VERSION,
-            "jax": "a7606f995e1a92707cbeb257e487fa53e7abe84b", "triton": TRITON_VERSION,
+            "schema": COMPILER_SCHEMA_VERSION, "xla": XLA_VERSION, "jax": JAX_COMMIT, "triton": TRITON_VERSION,
             "rocm_device_libs": "53996464fa8d94b182ac4aaa7dc3a109ab524f45",
             "cuda_available": true, "rocm_available": true,
             "cuda_toolkit_version": 13020, "assembler_version": "13.0.88",
@@ -652,6 +652,50 @@ mod tests {
     }
 
     #[test]
+    fn test_compiler_from_configuration_historical_schema() {
+        // The subprocess compiler at `7197043f1` wrote this schema 1 record, including its protocol and executable
+        // hash. The linked compiler reuses schema 1 for a different record until the first release, so the
+        // historical producer must be rejected by its contents rather than by its schema number.
+        let target = Target::Cuda { major: 12, minor: 1 };
+        let historical = json!({
+            "schema": 1,
+            "versions": {
+                "schema": 1, "protocol": 1, "xla": "eb6b90ed013f511eca088c52f541f3c0819f919e",
+                "jax": "a7606f995e1a92707cbeb257e487fa53e7abe84b", "triton": "a77e7c793abc0d0c923a9afb275058e2fe57a198",
+                "rocm_device_libs": "53996464fa8d94b182ac4aaa7dc3a109ab524f45",
+                "cuda_toolkit_version": 13020, "assembler_version": "13.0.88",
+            },
+            "executable_sha256": "a".repeat(64), "target": target, "warp_count": 4,
+            "pipeline_stages": 2, "maximum_scratch_bytes": null,
+        });
+        let fresh = json!({
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "target": target, "warp_count": 4,
+            "pipeline_stages": 2, "maximum_scratch_bytes": null,
+        });
+        assert_eq!(COMPILER_SCHEMA_VERSION, 1);
+        assert_eq!(historical["schema"], fresh["schema"]);
+
+        // Restoration rejects the historical record, and its source versions alone in the current record shape.
+        let historical = serde_json::to_vec(&historical).unwrap();
+        assert!(matches!(Compiler::from_configuration(&historical),
+            Err(Error::Invalid { message }) if message == "invalid recorded compiler configuration"));
+        let mut reshaped = fresh.clone();
+        reshaped["versions"] = serde_json::from_slice::<Value>(&historical).unwrap()["versions"].clone();
+        assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&reshaped).unwrap()),
+            Err(Error::Invalid { message })
+                if message == "compiler installation differs from the qualified source and toolchain contract"));
+
+        // Entries keyed by configuration miss the historical producer and hit the restored current configuration.
+        let fresh = serde_json::to_vec(&fresh).unwrap();
+        let restored = Compiler::from_configuration(&fresh).unwrap();
+        let key = restored.configuration_key(&target, &Options::default(), &KernelSchedule::default()).unwrap();
+        let mut cache = HashMap::from([(historical, "historical")]);
+        assert_eq!(cache.get(&key), None);
+        cache.insert(fresh, "fresh");
+        assert_eq!(cache.get(&key), Some(&"fresh"));
+    }
+
+    #[test]
     fn test_compiler_with_cancellation() {
         let cancellation = Arc::new(AtomicBool::new(true));
         let compiler = Compiler::new().with_cancellation(cancellation);
@@ -667,6 +711,31 @@ mod tests {
             compiler.compile(&kernel, &target, &Options::default(), &KernelSchedule::default()),
             Err(KernelCompilationError::Compiler(Error::Cancelled))
         ));
+    }
+
+    #[test]
+    fn test_compiler_validate_versions() {
+        // The source revisions reported by the linked native query satisfy the expected source contract.
+        let native = NativeVersions(unsafe { RYFT_XLA_Triton_Get_Versions() });
+        let mut versions = versions();
+        for (field, value) in [
+            ("xla", native.0.xla),
+            ("jax", native.0.jax),
+            ("triton", native.0.triton),
+            ("rocm_device_libs", native.0.rocm_device_libs),
+        ] {
+            versions[field] = json!(unsafe { StringRef::from_c_api(value) }.to_string());
+        }
+        let target = Target::Cuda { major: 12, minor: 1 };
+        Compiler::validate_versions(&versions, &target).unwrap();
+
+        // A different 40-character revision of any pinned source is rejected.
+        for field in ["xla", "jax", "triton"] {
+            let mut changed = versions.clone();
+            changed[field] = json!("a77e7c793abc0d0c923a9afb275058e2fe57a198");
+            assert!(matches!(Compiler::validate_versions(&changed, &target), Err(Error::Invalid { message })
+                if message == "compiler installation differs from the qualified source and toolchain contract"));
+        }
     }
 
     #[test]
@@ -686,9 +755,9 @@ mod tests {
             matches!(compiler.key(&target, &Options::default().with_warp_count(8).unwrap(), &KernelSchedule::default()),
             Err(Error::Invalid { message }) if message == "requested options differ from recorded compiler configuration")
         );
-        let mut old = configuration.clone();
-        old["schema"] = json!(1);
-        assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&old).unwrap()),
+        let mut unknown = configuration.clone();
+        unknown["schema"] = json!(2);
+        assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&unknown).unwrap()),
             Err(Error::Invalid { message }) if message == "invalid recorded compiler configuration"));
     }
 

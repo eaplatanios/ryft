@@ -566,7 +566,7 @@ where
         // is batched per device inside a `shard_map` over those axes. Scalar prefetched inputs are not parameters and
         // must be specialized before batching, which the ordinary path reports.
         if call.prefetch_types().is_empty()
-            && let Some((mesh, axes)) = unbound_batch_placement(inputs)?
+            && let Some((mesh, axes)) = unbound_batch_placement(inputs, &context.parent().manual_axes())?
         {
             return batch_in_shard_map(context.parent(), &definition, inputs, &mesh, axes);
         }
@@ -591,12 +591,12 @@ where
 /// local batch of an enclosing manual region, or when the mapped inputs do not agree on the placement (which
 /// [`KernelDefinition::batched_inputs`] then reports).
 ///
-/// A value varies along a manual axis only inside a manual region that binds the axis, so a batch dimension that is
-/// placed on axes along which its value varies is a local shard, and one placed on axes along which it does not vary
-/// is a global value. An enclosing manual region that does not track manual variation leaves no such evidence, so
-/// its local batches are not recognized here.
+/// `bound_axes` are the mesh axes that the enclosing manual regions made manual (refer to
+/// [`MeshContext::manual_axes`]). A batch dimension that is placed on such axes is a local shard, whether or not the
+/// region tracks manual variation, and one that is placed on other axes is a global value.
 fn unbound_batch_placement<V: CoreValue<Type = ArrayIrType>>(
     inputs: &[ArrayIrBatch<V>],
+    bound_axes: &[(String, ryft_core::NamedAxis)],
 ) -> Result<Option<(LogicalMesh, Vec<String>)>, BatchingError> {
     let mut placement = None::<Option<(LogicalMesh, Vec<String>)>>;
     for input in inputs {
@@ -605,7 +605,14 @@ fn unbound_batch_placement<V: CoreValue<Type = ArrayIrType>>(
         let ArrayIrType::Array(r#type) = r#type.as_ref() else { return Ok(None) };
         let current = match r#type.sharding().map(|sharding| (sharding, &sharding.dimensions()[axis])) {
             Some((sharding, ShardingDimension::Sharded(axes))) => {
-                match axes.iter().filter(|axis| sharding.varying_manual_axes().contains(*axis)).count() {
+                let is_bound = |axis: &&String| {
+                    bound_axes.iter().any(|(name, binding)| {
+                        name == *axis
+                            && matches!(binding, ryft_core::NamedAxis::Mesh { mesh, .. }
+                                if mesh.has_same_topology(sharding.mesh()))
+                    })
+                };
+                match axes.iter().filter(is_bound).count() {
                     0 => Some((sharding.mesh().clone(), axes.clone())),
                     bound if bound == axes.len() => None,
                     _ => {

@@ -15,8 +15,16 @@
 //! summary that replay uses to lower each swap whose old value is never used to a store.
 //!
 //! Input arrays remain immutable. Every invocation owns one private reference root per kernel parameter, which starts
-//! from the input array of a read-only or read-write parameter and from zeros for a write-only parameter. Only the
-//! completed roots of writable parameters become results, and a failure never publishes a partially updated array.
+//! from the input array of a read-only or read-write parameter and from uninitialized storage for a write-only
+//! parameter. Only the completed roots of writable parameters become results, and a failure never publishes a
+//! partially updated array.
+//!
+//! Uninitialized storage (i.e., write-only roots, the private tiles of masked windows, and scratch storage) is
+//! allocated by [`Array::uninitialized`] with the checked storage size of its type. Its zero bytes are a valid encoding
+//! of every data type, including types that cannot represent the number zero (e.g., [`DataType::F8E8M0FNU`]), so
+//! allocation never requires a numeric zero. No execution observes these contents, because qualification rejects
+//! every read that does not follow a definite write, the padding of a masked window is never read or published, and
+//! a carried window reloads only the valid elements that the previous step published.
 //!
 //! # Grid Point Replay
 //!
@@ -25,28 +33,36 @@
 //!
 //!   - An in-bounds window is a view of the root through the window's valid transform, so it aliases the root and
 //!     every write to it updates the root directly.
-//!   - A masked window is a private zeroed tile whose type is the referent type of the parameter's body type. The tile
-//!     loads the valid region of the root before the body runs and records which of its elements are valid. Unless its
-//!     parameter is read-only, it publishes its valid region back to the root after the body completes, so private
-//!     padding is never published.
+//!   - A masked window is a private uninitialized tile whose type is the referent type of the parameter's body type.
+//!     The tile loads the valid region of the root before the body runs and records which of its elements are valid.
+//!     Unless its parameter is read-only, it publishes its valid region back to the root after the body completes, so
+//!     private padding is never published.
 //!
 //! The body then receives these windows followed by the grid point's coordinates. Masked loads, stores, and swaps on
 //! a masked window intersect their explicit mask with the validity of the elements that they select. Any other access
 //! that reads a selection of a masked window containing invalid elements fails with
-//! [`KernelMemoryError::UnmaskedWindowAccess`], except a swap that qualification lowered to a store, which reads
-//! nothing. A [`WindowMaskOperation`](crate::memory::WindowMaskOperation) returns the validity of the elements that
-//! its reference selects without accessing storage, and every element of a window without recorded validity (e.g., an
-//! in-bounds window) is valid. A [`ScratchOperation`](crate::memory::ScratchOperation) allocates fresh zeroed storage
-//! on every binding.
+//! [`KernelMemoryError::UnmaskedWindowAccess`]. A swap whose old value is never used is lowered to a store by
+//! qualification, so replay executes it as the equivalent `reference_write` or [`MaskedStoreOperation`], which reads
+//! nothing. Its trace entry records a write, and its unused result is uninitialized storage that the NaN checks never
+//! inspect. A [`WindowMaskOperation`](crate::memory::WindowMaskOperation) returns the validity of the elements that its
+//! reference selects without accessing storage, and every element of a window without recorded validity (e.g., an
+//! in-bounds window) is valid. A [`ScratchOperation`](crate::memory::ScratchOperation) allocates fresh uninitialized
+//! storage on every binding.
 //!
 //! An [`AsyncCopyOperation`](crate::memory::AsyncCopyOperation) captures the initialized source elements when it is
 //! issued and records a pending copy under a fresh completion token. The matching
 //! [`WaitOperation`](crate::memory::WaitOperation) removes that pending copy and only then writes its destination. A
 //! wait on an unknown or consumed token fails with [`KernelInterpretationError::UnknownCopyToken`], and a grid point
 //! that completes with pending copies fails with [`KernelInterpretationError::PendingCopies`] before any of its
-//! windows are published. Ordinary reference effects retain their existing semantics. The host traversal chooses one
-//! admitted order for parallel atomic updates, and it does not promise bitwise agreement across other valid
-//! floating-point orders. [`KernelDefinition::interpret_interleavings`] explores the other orders of small kernels.
+//! windows are published. The token of an asynchronous extension operation is pending under the
+//! [`KernelExtension::completion_protocol`] of that operation until an extension wait of the same protocol consumes it,
+//! while the interpretation rules of the extension perform its data movement. A commit or wait that does not follow
+//! the protocol of the producer of its token, including a portable wait of an extension token and an extension commit
+//! or wait of a portable copy, fails with [`KernelInterpretationError::IncompatibleCompletion`] before it runs, so its
+//! token stays pending and no deferred write is published. Ordinary reference effects retain their existing semantics.
+//! The host traversal chooses one admitted order for parallel atomic updates, and it does not promise bitwise agreement
+//! across other valid floating-point orders. [`KernelDefinition::interpret_interleavings`] explores the other orders of
+//! small kernels.
 //!
 //! Replay binds every operation through a private qualified context. That context records a trace entry when tracing,
 //! charges one replay step, applies the optional NaN checks, and handles the kernel memory operations above. It
@@ -57,22 +73,28 @@
 //! # Entry Points
 //!
 //!   - [`KernelDefinition::interpret`] interprets a definition with no step limit, because kernel bodies admit only
-//!     bounded loops. Its `maximum_programs` argument bounds grid enumeration only for parameter mappings that lack a
-//!     separable tiling proof. Ordinary [`Program::interpret`](ryft_core::Program::interpret) of a `kernel_call` takes
-//!     the same path with [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`].
-//!   - [`KernelDefinition::interpret_with_limits`] caps both the number of grid points and the number of replay steps
-//!     (i.e., operation bindings and region entries) across the whole invocation.
+//!     bounded loops. Its `maximum_programs` argument bounds only the grid enumeration of qualification, which
+//!     evaluates the mapping of a parameter at every grid point when
+//!     [`BlockMapping::tiling_axes`](crate::mappings::BlockMapping::tiling_axes) does not recognize it or when its
+//!     recognized axes repeat a grid axis (e.g., the diagonal element starts `(i, i)`, which are recognized). Ordinary
+//!     [`Program::interpret`](ryft_core::Program::interpret) of a `kernel_call` takes the same path with
+//!     [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`].
+//!   - [`KernelDefinition::interpret_with_limits`] caps both the number of grid points, whether or not qualification
+//!     enumerates them, and the number of replay steps (i.e., operation bindings and region entries) across the whole
+//!     invocation.
 //!   - [`KernelDefinition::interpret_with_trace`] applies the caps of a [`KernelDebugOptions`], which its
 //!     [`KernelDebugOptions::with_maximum_programs`], [`KernelDebugOptions::with_maximum_steps`], and
 //!     [`KernelDebugOptions::with_nan_checks`] builder functions configure, and it records a [`KernelTraceEntry`] for
 //!     every attempted operation binding, with a [`KernelTraceAccess`] for each of its reference accesses.
 //!
-//! Trace entries precede the effects of their operations, so the trace retains the failing binding of a failed
-//! invocation. To investigate a failure, retain the trace before propagating the execution result. Optional NaN checks
-//! inspect ordinary operation inputs and outputs, including complex components and low precision floating-point
-//! formats. They never read reference storage, so they never read uninitialized scratch merely to inspect its
-//! contents. Precision and rounding remain those of the canonical operations, and diagnostics do not substitute an
-//! execution model with wider precision.
+//! Trace entries precede the effects of their operations and the resolution of their reference views, so the trace
+//! retains the failing binding of a failed invocation, even when its view cannot be resolved (e.g., a dynamic index
+//! into an empty axis). Such an entry lists the accesses resolved before the failure, and the binding still consumes
+//! its replay step. To investigate a failure, retain the trace before propagating the execution result. Optional NaN
+//! checks inspect ordinary operation inputs and outputs, including complex components and low precision
+//! floating-point formats. They never read reference storage, so they never read uninitialized scratch merely to
+//! inspect its contents. Precision and rounding remain those of the canonical operations, and diagnostics do not
+//! substitute an execution model with wider precision.
 //!
 //! ```
 //! use ryft_core::{Array, ProgramError};
@@ -97,19 +119,22 @@ use std::rc::Rc;
 
 use num_complex::Complex;
 use ryft_core::{
-    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform,
     ArraySliceAxis, ArrayType, AttachedRegions, Context, DataType, DimensionValue, Domain, EagerContext,
     EagerInterpretationDriver, InstructionId, InterpretableOperation, InterpretationDriver, Operation, ProgramError,
-    Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, RegionDriver, RegionInterpreter,
-    RegionRef, TypeError, Typed, TypedProgram, ValueResolution, Zero, validated_reference_access_descriptors,
+    Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode, ReferenceId, ReferenceWriteOperation,
+    RegionDriver, RegionInterpreter, RegionRef, TypeError, Typed, TypedProgram, ValueResolution,
+    validated_reference_access_descriptors,
 };
 use thiserror::Error;
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
 use crate::initialization::{KernelInitializationError, validated_kernel_references};
 use crate::mappings::BoundaryPolicy;
-use crate::memory::{KernelMemoryError, WINDOW_MASK_OPERATION_NAME};
-use crate::operations::{KernelExtension, KernelOperation};
+use crate::memory::{KernelMemoryError, MaskedStoreOperation, WINDOW_MASK_OPERATION_NAME};
+use crate::operations::{
+    KernelCompletionProtocol, KernelExtension, KernelExtensionMemory, KernelOperation, admits_completion,
+};
 use crate::validation::{KernelParameterAccess, KernelReferenceOperation, KernelReferenceSummary, KernelSwapLowering};
 
 /// Failure of the host interpreter while it replays a qualified kernel body. The replay fails when an enabled NaN
@@ -145,9 +170,21 @@ pub enum KernelInterpretationError {
         provenance: Provenance,
     },
 
-    /// A wait did not identify a pending copy owned by this invocation.
+    /// A commit or wait did not identify a pending copy owned by this invocation.
     #[error("async copy completion token is unknown or already consumed")]
     UnknownCopyToken {
+        /// Canonical allocation identity of the supplied completion token.
+        token: ReferenceId,
+    },
+
+    /// A commit or wait does not follow the completion protocol of the operation that produced its pending token (i.e.,
+    /// it belongs to another protocol, it waits before a commit that the protocol requires, or it repeats a commit
+    /// that the protocol requires exactly once). The token stays pending and no deferred write is published.
+    #[error("`{operation}` does not follow the completion protocol of the producer of its token")]
+    IncompatibleCompletion {
+        /// Canonical commit or wait operation.
+        operation: &'static str,
+
         /// Canonical allocation identity of the supplied completion token.
         token: ReferenceId,
     },
@@ -189,9 +226,11 @@ pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS: usize = 1_000_000;
 
 /// Default grid size bound for host interpretation. Ordinary
 /// [`Program::interpret`](ryft_core::programs::Program::interpret) of a `kernel_call` and
-/// [`KernelCall`](crate::authoring::KernelCall) for host arrays use it as the maximum grid size to enumerate when a
-/// parameter mapping lacks a separable tiling proof, so launches whose mappings all have such proofs are not limited by
-/// it. [`KernelDebugOptions`] uses it as a hard cap on grid points for [`KernelDefinition::interpret_with_trace`].
+/// [`KernelCall`](crate::authoring::KernelCall) for host arrays use it as the maximum grid size that qualification
+/// enumerates. Qualification enumerates the grid only for a parameter whose mapping
+/// [`BlockMapping::tiling_axes`](crate::mappings::BlockMapping::tiling_axes) does not recognize or whose recognized
+/// axes repeat a grid axis, so launches without such a parameter are not limited by it. [`KernelDebugOptions`] uses it
+/// as a hard cap on grid points for [`KernelDefinition::interpret_with_trace`].
 /// [`KernelDefinition::interpret`] and [`KernelDefinition::interpret_with_limits`] accept an explicit bound instead.
 /// This is a host resource limit, not part of a kernel's semantic identity or a device launch limit.
 pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS: usize = 10_000;
@@ -224,8 +263,8 @@ impl Default for KernelDebugOptions {
 
 impl KernelDebugOptions {
     /// Returns these options with `maximum_programs` as the maximum logical grid size admitted before storage is
-    /// allocated. A launch with more grid points fails before qualification, even when every parameter mapping has a
-    /// separable tiling proof. The default is [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`].
+    /// allocated. A launch with more grid points fails before qualification, even when qualification would not
+    /// enumerate them. The default is [`DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS`].
     pub fn with_maximum_programs(mut self, maximum_programs: usize) -> Self {
         self.maximum_programs = maximum_programs;
         self
@@ -267,9 +306,10 @@ impl KernelDebugOptions {
 }
 
 /// One attempted operation binding during host replay, which [`KernelDefinition::interpret_with_trace`] records.
-/// Entries precede effects, so the final entry is retained when its operation fails. Reference identities are numbered
-/// by first observation within this invocation, independent of the allocation IDs of the process. Budget checks for
-/// region entries do not create operation entries.
+/// Entries precede effects and the resolution of reference views, so the final entry is retained when its operation
+/// fails, with the accesses whose views were resolved before the failure. Reference identities are numbered by first
+/// observation within this invocation, independent of the allocation IDs of the process. Budget checks for region
+/// entries do not create operation entries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelTraceEntry {
     /// Logical program coordinate in the declared grid order.
@@ -386,15 +426,19 @@ where
     /// Interprets this definition on host arrays after checking initialization, output coverage, and races. The
     /// inputs and results follow the functional signature, so [`KernelParameterAccess::WriteOnly`] parameters consume
     /// no input and [`KernelParameterAccess::ReadOnly`] parameters produce no result. A failure never publishes a
-    /// partially updated array or mutates an input. Grid points are not capped when every parameter mapping has a
-    /// separable tiling proof, and replay has no step limit because kernel bodies admit only bounded loops. Use
+    /// partially updated array or mutates an input. Qualification enumerates the grid only for a parameter whose
+    /// mapping [`BlockMapping::tiling_axes`](crate::mappings::BlockMapping::tiling_axes) does not recognize or whose
+    /// recognized axes repeat a grid axis. A recognized mapping can still require enumeration (e.g., the diagonal
+    /// element starts `(i, i)`, for which `tiling_axes` returns `Some`). Grid points are not capped when no parameter
+    /// requires enumeration, and replay has no step limit because kernel bodies admit only bounded loops. Use
     /// [`Self::interpret_with_limits`] to bound both.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: arrays in the definition's ordinary input order.
-    ///   - `maximum_programs`: maximum grid size to enumerate when a parameter mapping lacks a separable tiling proof.
-    ///     Qualification rejects such a larger grid before allocating reference storage or replaying a body.
+    ///   - `maximum_programs`: maximum grid size that qualification enumerates. Qualification rejects a larger grid
+    ///     that it must enumerate before allocating reference storage or replaying a body, and it accepts a grid of any
+    ///     size that it need not enumerate.
     ///
     /// # Errors
     ///
@@ -417,8 +461,8 @@ where
     /// # Parameters
     ///
     ///   - `inputs`: arrays in the definition's ordinary input order.
-    ///   - `maximum_programs`: maximum number of grid points allowed before execution begins, even when every
-    ///     parameter mapping has a separable tiling proof.
+    ///   - `maximum_programs`: maximum number of grid points allowed before qualification begins, even when
+    ///     qualification would not enumerate them, and also the enumeration bound of that qualification.
     ///   - `maximum_steps`: maximum operation bindings and region entries across the invocation. Zero permits an
     ///     empty grid but rejects the first body entry of a nonempty launch.
     ///
@@ -462,13 +506,14 @@ where
     }
 
     /// Shares ordinary replay with the bounded orders that the scheduler selects. Only the scheduler supplies an
-    /// explicit order, and it has already checked that the body is a flat region and generated every instruction
-    /// occurrence exactly once.
+    /// explicit order, together with the reference summary of the qualification that it performed once for every
+    /// order, and it has already checked that the body is a flat region and generated every instruction occurrence
+    /// exactly once. Each order still replays with fresh storage and runtime state.
     pub(super) fn interpret_in_order(
         &self,
         inputs: Vec<Array>,
         options: &KernelDebugOptions,
-        order: Option<&[usize]>,
+        order: Option<(&[usize], Rc<KernelReferenceSummary>)>,
         trace: &mut Vec<KernelTraceEntry>,
     ) -> Result<Vec<Array>, ProgramError> {
         trace.clear();
@@ -492,7 +537,7 @@ where
         maximum_programs: usize,
         maximum_steps: Option<usize>,
         trace: Option<Rc<RefCell<KernelTraceState>>>,
-        order: Option<&[usize]>,
+        order: Option<(&[usize], Rc<KernelReferenceSummary>)>,
     ) -> Result<Vec<Array>, ProgramError> {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation<Extension>>::new();
         let regions = AttachedRegions::from(vec![self.body().clone()]);
@@ -558,7 +603,7 @@ impl KernelCallOperation {
         maximum_programs: usize,
         maximum_steps: Option<usize>,
         trace: Option<Rc<RefCell<KernelTraceState>>>,
-        order: Option<&[usize]>,
+        order: Option<(&[usize], Rc<KernelReferenceSummary>)>,
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError>
     where
         EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>: Domain<
@@ -572,7 +617,7 @@ impl KernelCallOperation {
         D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
     {
         let body = driver.region(0)?;
-        self.infer_output_types(
+        let output_types = self.infer_output_types(
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
             std::slice::from_ref(body.interface()),
         )?;
@@ -580,13 +625,14 @@ impl KernelCallOperation {
             let ordinary_count = inputs.len() - self.prefetch_types().len();
             let prefetched = inputs[ordinary_count..]
                 .iter()
-                .map(|value| {
+                .zip(self.prefetch_types())
+                .map(|(value, r#type)| {
                     let ArrayIrValue::Array(array) = value else {
                         unreachable!("the validated prefetch signature contains only arrays");
                     };
-                    array.clone()
+                    Self::with_sharding_of(array.clone(), r#type)
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             let definition = KernelDefinition::new(self.clone(), body.to_program()).map_err(ProgramError::custom)?;
             let specialized = definition.specialize_prefetch(&prefetched).map_err(ProgramError::custom)?;
             let regions = AttachedRegions::from(vec![specialized.body().clone()]);
@@ -618,13 +664,18 @@ impl KernelCallOperation {
                 maximum: maximum_programs,
             }));
         }
-        let references =
-            Rc::new(validated_kernel_references(body, self, maximum_programs).map_err(ProgramError::custom)?);
+        let (order, references) = match order {
+            Some((order, references)) => (Some(order), references),
+            None => {
+                let references =
+                    validated_kernel_references(body, self, maximum_programs).map_err(ProgramError::custom)?;
+                (None, Rc::new(references))
+            }
+        };
         // Kernel bodies admit only bounded loops, so ordinary interpretation needs no step limit and replays with a
         // budget that it cannot exhaust.
         let maximum_steps = maximum_steps.unwrap_or(usize::MAX);
 
-        let array_context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let mut input_values = inputs.iter();
         let roots = self
             .parameters()
@@ -637,9 +688,11 @@ impl KernelCallOperation {
                         };
                         array.clone()
                     }
-                    KernelParameterAccess::WriteOnly => array_context.zero(parameter.r#type().as_ref())?,
+                    KernelParameterAccess::WriteOnly => Array::uninitialized(parameter.r#type().into_owned())?,
                 };
-                Ok(ArrayReference::new(array))
+                // The body sees the physical parameter type. A placed input differs from it only in its sharding and
+                // therefore shares its storage.
+                Ok(ArrayReference::new(Self::with_sharding_of(array, parameter.r#type().as_ref())?))
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let remaining_steps = Rc::new(Cell::new(maximum_steps));
@@ -675,7 +728,7 @@ impl KernelCallOperation {
                     let reference = if parameter.mapping().boundary_policy() == BoundaryPolicy::Masked {
                         let ArrayIrType::Reference(body_type) = parameter.body_type() else { unreachable!() };
                         let tile_type = body_type.referent();
-                        let tile = ArrayReference::new(array_context.zero(tile_type)?);
+                        let tile = ArrayReference::new(Array::uninitialized(tile_type.clone())?);
                         let valid_shape = source.r#type().referent().static_shape().unwrap();
                         let selected = tile.with_transform(ArrayReferenceTransform::Slice {
                             axes: valid_shape
@@ -685,9 +738,9 @@ impl KernelCallOperation {
                                 .collect(),
                         })?;
                         // A carried write-only window holds what the previous step along its carry axis published,
-                        // so every tile loads its valid elements. The root of a write-only parameter starts zeroed, so
-                        // the load is deterministic, and qualification admits no read of any other write-only tile
-                        // before the body writes the elements that it reads.
+                        // so every tile loads its valid elements. The root of a write-only parameter starts with the
+                        // zero bytes of uninitialized storage, so the load is deterministic, and qualification admits
+                        // no read of any other write-only tile before the body writes the elements that it reads.
                         Self::copy_window(&source, &selected)?;
                         let mask_type = tile_type.clone().with_data_type(DataType::Boolean);
                         let addressing = ArrayAddressing::new(mask_type.clone())?;
@@ -784,8 +837,26 @@ impl KernelCallOperation {
             .iter()
             .zip(roots)
             .filter(|(parameter, _)| parameter.access() != KernelParameterAccess::ReadOnly)
-            .map(|(_, root)| root.freeze().map(ArrayIrValue::Array))
+            .zip(&output_types)
+            .map(|((_, root), r#type)| {
+                let ArrayIrType::Array(r#type) = r#type else { unreachable!("kernel results are arrays") };
+                Self::with_sharding_of(root.freeze()?, r#type).map(ArrayIrValue::Array)
+            })
             .collect()
+    }
+
+    /// Returns `array` with the sharding of `type` over the same storage, which moves no data, because a host array
+    /// stores the same bytes under every placement.
+    fn with_sharding_of(array: Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        if array.r#type().sharding() == r#type.sharding() {
+            return Ok(array);
+        }
+        let r#type = array
+            .r#type()
+            .into_owned()
+            .with_sharding(r#type.sharding().cloned())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(Array::new_unchecked(r#type, array.shared_storage_bytes().clone()))
     }
 
     /// Copies only valid selected coordinates between a logical edge tile and the original full array. Physical layout
@@ -932,6 +1003,34 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
         selected.read().map(Some)
     }
 
+    /// Applies a commit (when `commit` is set) or a wait of `operation` that follows `protocol` (i.e., [`None`] for the
+    /// portable wait) to the pending completion of `token`, after checking that it follows the protocol of the
+    /// producer of the token. A commit only records that it observed the token, and a wait removes and returns the
+    /// pending completion, so that the caller can publish its deferred writes.
+    fn complete(
+        &self,
+        operation: &'static str,
+        token: &ArrayReference<Array>,
+        protocol: Option<KernelCompletionProtocol>,
+        commit: bool,
+    ) -> Result<Option<PendingCopy>, ProgramError> {
+        let mut pending_copies = self.pending_copies.borrow_mut();
+        let pending = pending_copies
+            .get_mut(&token.id())
+            .ok_or_else(|| ProgramError::custom(KernelInterpretationError::UnknownCopyToken { token: token.id() }))?;
+        if !admits_completion(pending.protocol, pending.committed, protocol, commit) {
+            return Err(ProgramError::custom(KernelInterpretationError::IncompatibleCompletion {
+                operation,
+                token: token.id(),
+            }));
+        }
+        if commit {
+            pending.committed = true;
+            return Ok(None);
+        }
+        Ok(pending_copies.remove(&token.id()))
+    }
+
     /// Replays `region` one instruction at a time, recording each instruction so that [`Context::bind`] can apply
     /// its validated swap lowering. The enclosing instruction is restored afterwards, because a nested region runs
     /// within the step of the instruction that attaches it.
@@ -998,29 +1097,45 @@ where
     {
         let operation = operation.into();
         let regions = regions.into();
+        // The first swap bound during the replay step of a body instruction takes that instruction to look up its
+        // validated lowering, so a swap that a rule binds on its own behalf never inherits a store lowering.
+        let store = operation.swap_output_index().is_some()
+            && self.instruction.take().and_then(|instruction| self.references.swap_lowering(instruction))
+                == Some(KernelSwapLowering::Store);
         // Qualification and diagnostics inspect the same selection that ordinary access interpretation will apply.
-        // Keep the original inputs for that interpretation so paths are never applied twice.
+        // Keep the original inputs for that interpretation so paths are never applied twice. Resolving a selection
+        // can fail (e.g., for a dynamic index into an empty axis, or for a binding that a rule attempts with a
+        // malformed reference access layout), and that failure is reported only after the attempted binding is traced
+        // with the selections resolved before it and charged one replay step.
         let mut selected_references = BTreeMap::new();
-        for (input_index, descriptor) in
-            validated_reference_access_descriptors(&operation, inputs.len())?.iter().enumerate()
-        {
+        let (descriptors, mut selection) = match validated_reference_access_descriptors(&operation, inputs.len()) {
+            Ok(descriptors) => (descriptors, Ok(())),
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        for (input_index, descriptor) in descriptors.iter().enumerate() {
             let (Some(descriptor), Some(ArrayIrValue::Reference(reference))) = (descriptor, inputs.get(input_index))
             else {
                 continue;
             };
-            selected_references.insert(
-                input_index,
-                reference.with_transforms(descriptor.transforms(), &inputs[descriptor.bindings()])?,
-            );
+            match reference.with_transforms(descriptor.transforms(), &inputs[descriptor.bindings()]) {
+                Ok(reference) => {
+                    selected_references.insert(input_index, reference);
+                }
+                Err(error) => {
+                    selection = Err(error);
+                    break;
+                }
+            }
         }
         if let Some(trace) = &self.trace {
             let mut trace = trace.borrow_mut();
             let mut accesses = Vec::new();
-            for (input, mode) in operation.effects().accesses() {
+            for (input, mode) in operation.effects().reference_accesses() {
                 if let Some(reference) = selected_references.get(&input) {
                     let next = trace.roots.len();
                     let root = *trace.roots.entry(reference.id()).or_insert(next);
                     let path = reference.path().transforms().map(|transform| format!("/{transform}")).collect();
+                    let mode = if store { ReferenceAccessMode::Write } else { mode };
                     accesses.push(KernelTraceAccess { input, mode, root, path });
                 }
             }
@@ -1039,18 +1154,19 @@ where
             });
         }
         self.validate_step(operation.name())?;
+        selection?;
         self.validate_nans(operation.name(), "input", inputs)?;
-        let outputs = (|| {
+        let execute = |operation: &KernelOperation<Extension>, inputs: &[ArrayIrValue<Array>]| {
             operation.validate_region_interfaces(&regions.region_interfaces())?;
-            if let KernelOperation::Scratch(scratch) = &operation {
+            if let KernelOperation::Scratch(scratch) = operation {
                 scratch.infer_output_types(
                     &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
                     &[],
                 )?;
-                let storage = EagerContext::<Array, ArrayOperation<Array>>::new().zero(scratch.referent())?;
+                let storage = Array::uninitialized(scratch.referent().clone())?;
                 return Ok(vec![ArrayIrValue::Reference(ArrayReference::new(storage))]);
             }
-            if let KernelOperation::WindowMask(window_mask) = &operation {
+            if let KernelOperation::WindowMask(window_mask) = operation {
                 // The mask is the recorded validity of the tile that the reference views, restricted to that view,
                 // and every element of a reference without recorded validity is valid. No storage is accessed.
                 let output_types = window_mask.infer_output_types(
@@ -1071,7 +1187,7 @@ where
                 };
                 return Ok(vec![ArrayIrValue::Array(mask)]);
             }
-            let mask_index = match &operation {
+            let mask_index = match operation {
                 KernelOperation::MaskedLoad(_) => Some(1),
                 KernelOperation::MaskedStore(_) | KernelOperation::MaskedSwap(_) => Some(2),
                 _ => None,
@@ -1101,14 +1217,9 @@ where
                 }
             } else {
                 // Writes may fill private padding because only valid coordinates are published. An unmasked read or
-                // read-modify-write must never expose physical padding as initialized full array data. A swap whose
-                // old value is never used lowers to a store, so it reads nothing.
-                let store = operation.swap_output_index().is_some()
-                    && self.instruction.take().and_then(|instruction| self.references.swap_lowering(instruction))
-                        == Some(KernelSwapLowering::Store);
-                for (input_index, mode) in operation.effects().accesses() {
+                // read-modify-write must never expose physical padding as initialized full array data.
+                for (input_index, mode) in operation.effects().reference_accesses() {
                     if mode != ReferenceAccessMode::Write
-                        && !store
                         && let Some(reference) = selected_references.get(&input_index)
                         && let Some(validity) = self.window_validity(reference)?
                         && validity.elements::<bool>()?.iter().any(|valid| !valid)
@@ -1119,7 +1230,7 @@ where
                     }
                 }
             }
-            match &operation {
+            match operation {
                 KernelOperation::AsyncCopy(_) => {
                     operation.infer_output_types(
                         &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
@@ -1129,9 +1240,10 @@ where
                     let destination = selected_references.get(&1).unwrap();
                     let source = source.read()?;
                     let token = ArrayReference::new(Array::new(ArrayType::scalar(DataType::Token), vec![])?);
-                    self.pending_copies
-                        .borrow_mut()
-                        .insert(token.id(), PendingCopy { source, destination: destination.clone() });
+                    self.pending_copies.borrow_mut().insert(
+                        token.id(),
+                        PendingCopy { protocol: None, committed: false, copy: Some((source, destination.clone())) },
+                    );
                     Ok(vec![ArrayIrValue::Reference(token)])
                 }
                 KernelOperation::Wait(_) => {
@@ -1140,16 +1252,58 @@ where
                         &[],
                     )?;
                     let ArrayIrValue::Reference(token) = &inputs[0] else { unreachable!() };
-                    let pending = self.pending_copies.borrow_mut().remove(&token.id()).ok_or_else(|| {
-                        ProgramError::custom(KernelInterpretationError::UnknownCopyToken { token: token.id() })
-                    })?;
-                    let value = Array::from_logical_bytes(
-                        pending.destination.r#type().referent().clone(),
-                        &pending.source.logical_bytes(),
-                    )?;
-                    pending.destination.write(value)?;
+                    let Some(PendingCopy { copy: Some((source, destination)), .. }) =
+                        self.complete(operation.name(), token, None, false)?
+                    else {
+                        unreachable!("a portable wait completes only a portable copy");
+                    };
+                    let value =
+                        Array::from_logical_bytes(destination.r#type().referent().clone(), &source.logical_bytes())?;
+                    destination.write(value)?;
                     token.freeze()?;
                     Ok(vec![])
+                }
+                KernelOperation::Extension(extension) => {
+                    let driver =
+                        QualifiedKernelDriver { context: self, regions: &regions, operation: operation.name() };
+                    let completion = |input_index: usize| match inputs.get(input_index) {
+                        Some(ArrayIrValue::Reference(token)) => Ok(token),
+                        _ => Err(ProgramError::MalformedProgram(format!(
+                            "`{}` has no completion reference input {input_index}",
+                            operation.name(),
+                        ))),
+                    };
+                    match extension.memory_semantics()? {
+                        KernelExtensionMemory::Asynchronous { completion_output_index } => {
+                            let outputs = operation.interpret(&self.eager, &driver, inputs)?;
+                            let Some(ArrayIrValue::Reference(token)) = outputs.get(completion_output_index) else {
+                                return Err(ProgramError::MalformedProgram(format!(
+                                    "`{}` has no completion reference output {completion_output_index}",
+                                    operation.name(),
+                                )));
+                            };
+                            self.pending_copies.borrow_mut().insert(
+                                token.id(),
+                                PendingCopy {
+                                    protocol: Some(extension.completion_protocol()),
+                                    committed: false,
+                                    copy: None,
+                                },
+                            );
+                            Ok(outputs)
+                        }
+                        KernelExtensionMemory::Commit { completion_input_index } => {
+                            let token = completion(completion_input_index)?;
+                            self.complete(operation.name(), token, Some(extension.completion_protocol()), true)?;
+                            operation.interpret(&self.eager, &driver, inputs)
+                        }
+                        KernelExtensionMemory::Wait { completion_input_index } => {
+                            let token = completion(completion_input_index)?;
+                            self.complete(operation.name(), token, Some(extension.completion_protocol()), false)?;
+                            operation.interpret(&self.eager, &driver, inputs)
+                        }
+                        _ => operation.interpret(&self.eager, &driver, inputs),
+                    }
                 }
                 _ => operation.interpret(
                     &self.eager,
@@ -1157,9 +1311,41 @@ where
                     inputs,
                 ),
             }
-        })()?;
-        self.validate_nans(operation.name(), "output", &outputs)?;
-        Ok(outputs)
+        };
+        if !store {
+            let outputs = execute(&operation, inputs)?;
+            self.validate_nans(operation.name(), "output", &outputs)?;
+            return Ok(outputs);
+        }
+
+        // A swap whose old value is never used executes as the equivalent store, so it never reads the reference and
+        // its old value is never checked for NaNs. Its unused result is uninitialized storage of the old value type.
+        let output_types = operation.infer_output_types(
+            &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
+            &regions.region_interfaces(),
+        )?;
+        match &operation {
+            KernelOperation::Portable(ArrayIrOperation::ReferenceSwap(swap)) => {
+                let write = ReferenceWriteOperation::new().with_transforms(swap.transforms().to_vec());
+                execute(&write.into(), inputs)?;
+            }
+            KernelOperation::MaskedSwap(swap) => {
+                // The store takes the inputs of the swap without its `other` input.
+                let store = MaskedStoreOperation::new().with_transforms(swap.transforms().to_vec());
+                let inputs = inputs[..3].iter().chain(&inputs[4..]).cloned().collect::<Vec<_>>();
+                execute(&store.into(), &inputs)?;
+            }
+            _ => unreachable!("only swaps have a validated store lowering"),
+        }
+        output_types
+            .into_iter()
+            .map(|r#type| {
+                let ArrayIrType::Array(r#type) = r#type else {
+                    unreachable!("swap type inference returns the array type of the old value");
+                };
+                Array::uninitialized(r#type).map(ArrayIrValue::Array)
+            })
+            .collect()
     }
 
     fn is_eager(&self) -> bool {
@@ -1183,13 +1369,18 @@ where
     }
 }
 
-/// One deterministic asynchronous copy, whose destination remains unchanged until the matching wait succeeds.
+/// One pending completion token, whose portable copy leaves its destination unchanged until the matching wait succeeds.
 struct PendingCopy {
-    /// Initialized source elements captured when the copy started.
-    source: Array,
+    /// Completion protocol of the producer, which is [`None`] for a portable async copy.
+    protocol: Option<KernelCompletionProtocol>,
 
-    /// Canonical destination view reserved until completion.
-    destination: ArrayReference<Array>,
+    /// Whether a commit has observed the token.
+    committed: bool,
+
+    /// Initialized source elements that a portable copy captured when it started, and its canonical destination view,
+    /// which stays reserved until completion. The interpretation rules of an extension own the data movement of its
+    /// asynchronous operations, so the token of an extension has no copy.
+    copy: Option<(Array, ArrayReference<Array>)>,
 }
 
 /// Adapts unchanged eager higher-order rules to recursive replay in the private qualified context.
@@ -1264,15 +1455,16 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayReferenceTransformIndex, CompareOperation, ComparisonDirection,
-        ConditionOperation, Dimension, DimensionAddOperation, DimensionBounds, DimensionMulOperation,
-        DimensionToScalarOperation, DimensionType, DotOperation, Layout, Memory, NotOperation, Placeholder,
-        ProgramBuilder, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation,
+        AddOperation, ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, CompareOperation,
+        ComparisonDirection, ConditionOperation, Dimension, DimensionAddOperation, DimensionBounds,
+        DimensionMulOperation, DimensionToScalarOperation, DimensionType, DotOperation, Layout, Memory, NotOperation,
+        Placeholder, ProgramBuilder, ReduceOperation, ReductionKind, ReferenceAccessDescriptor,
+        ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceRoot,
+        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, RegionInterface, ScaledDotOperation,
         StridedLayout, TracingContext, WhileOperation,
     };
 
-    use crate::authoring::whole_array_parameter;
+    use crate::authoring::{MappingExpression, ParameterWindow, mapped_call, whole_array_parameter};
     use crate::calls::KernelParameter;
     use crate::grids::{Grid, GridDimension, GridExecution};
     use crate::mappings::BlockMapping;
@@ -1542,6 +1734,10 @@ mod tests {
         assert_eq!(
             KernelInterpretationError::UnknownCopyToken { token }.to_string(),
             "async copy completion token is unknown or already consumed",
+        );
+        assert_eq!(
+            KernelInterpretationError::IncompatibleCompletion { operation: "test_wait", token }.to_string(),
+            "`test_wait` does not follow the completion protocol of the producer of its token",
         );
         assert_eq!(
             KernelInterpretationError::PendingCopies { count: 2, coordinate: vec![3] }.to_string(),
@@ -2023,6 +2219,55 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_budget_repeated_axes() {
+        // Copies the diagonal of a 3 by 3 matrix into a 3 by 1 matrix. The diagonal element starts `(i, i)` are a
+        // recognized tiling, but they repeat the grid axis, so qualification enumerates the 3 grid points.
+        let operation = mapped_call(
+            Grid::new(vec![GridDimension::new(Dimension::Static(3), GridExecution::Parallel)]).unwrap(),
+            vec![
+                (
+                    ArrayType::new_static(DataType::I32, [3, 3]),
+                    KernelParameterAccess::ReadOnly,
+                    ParameterWindow::ElementStarts {
+                        block_shape: vec![1, 1],
+                        boundary: BoundaryPolicy::InBounds,
+                        starts: vec![MappingExpression::GridCoordinate(0), MappingExpression::GridCoordinate(0)],
+                    },
+                ),
+                (
+                    ArrayType::new_static(DataType::I32, [3, 1]),
+                    KernelParameterAccess::WriteOnly,
+                    ParameterWindow::BlockIndices {
+                        block_shape: vec![1, 1],
+                        boundary: BoundaryPolicy::InBounds,
+                        indices: vec![MappingExpression::GridCoordinate(0), MappingExpression::Constant(0)],
+                    },
+                ),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let parameters = operation.parameters();
+        assert_eq!(parameters[0].mapping().tiling_axes(), Some(vec![Some(0), Some(0)]));
+        assert_eq!(parameters[1].mapping().tiling_axes(), Some(vec![Some(0), None]));
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            references[1].write(&references[0].read()?)
+        })
+        .unwrap();
+
+        // The grid is accepted at the bound and rejected below it.
+        let input = Array::matrix(3, 3, vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+        assert_eq!(
+            definition.interpret(vec![input.clone()], 3),
+            Ok(vec![Array::matrix(3, 1, vec![1i32, 5, 9]).unwrap()]),
+        );
+        assert_eq!(
+            definition.interpret(vec![input], 2),
+            Err(ProgramError::custom(KernelInitializationError::QualificationLimit { programs: 3, maximum: 2 })),
+        );
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_without_step_limit() {
         let definition = definition(false, false);
         let input = Array::scalar(17i32).unwrap();
@@ -2110,6 +2355,60 @@ mod tests {
         assert_eq!(
             definition.interpret(vec![Array::scalar(31i32).unwrap()], 1),
             Ok(vec![Array::scalar(31i32).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_storage_without_zero() {
+        // `f8e8m0fnu` cannot represent zero, so its write-only output and scratch storage must not be zero filled.
+        let r#type = ArrayType::new_static(DataType::F8E8M0FNU, [2]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(r#type.clone(), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::<NoKernelExtension>::trace(operation.clone(), |(references, _)| {
+            let scratch = references[0]
+                .context()
+                .bind(ScratchOperation::new(r#type.clone(), 1).unwrap(), vec![], &[])?
+                .remove(0);
+            scratch.write(&references[0].read()?)?;
+            references[1].write(&scratch.read()?)
+        })
+        .unwrap();
+        let input = Array::new(r#type.clone(), vec![0x7f, 0x83]).unwrap();
+        assert_eq!(definition.interpret(vec![input.clone()], 1), Ok(vec![input.clone()]));
+        let mut trace = Vec::new();
+        assert_eq!(
+            definition.interpret_with_trace(vec![input.clone()], &KernelDebugOptions::default(), &mut trace),
+            Ok(vec![input.clone()]),
+        );
+
+        // Reading an element of the scratch storage that was never written still fails qualification.
+        let definition = KernelDefinition::<NoKernelExtension>::trace(operation, |(references, _)| {
+            let context = references[0].context();
+            let scratch = context.bind(ScratchOperation::new(r#type.clone(), 1).unwrap(), vec![], &[])?.remove(0);
+            let value = Array::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![0x7f])?;
+            let value = context.lift(ArrayIrValue::Array(value))?;
+            let write = ReferenceWriteOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Static(0),
+            }]);
+            context.bind(write, vec![], &[scratch.clone(), value])?;
+            references[1].write(&scratch.read()?)
+        })
+        .unwrap();
+        let region = definition.body().entry_region_ref().id();
+        let error = definition.interpret(vec![input], 1).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInitializationError>(),
+            Some(&KernelInitializationError::UninitializedRead {
+                instruction: InstructionId::new(region, 2),
+                root: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 0), output_index: 0 },
+            }),
         );
     }
 
@@ -2243,6 +2542,42 @@ mod tests {
         let input = Array::from_elements(r#type, &(0..15i32).collect::<Vec<_>>()).unwrap();
         assert_eq!(definition.interpret(vec![input.clone()], 6), Ok(vec![input.clone()]));
         assert_eq!(input.elements::<i32>().unwrap(), (0..15i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_masked_edges_without_zero() {
+        // The private edge tiles of the `f8e8m0fnu` input and of its write-only copy cannot be zero filled. The
+        // explicit fill of the masked load is the only padding value that reaches the second output.
+        let masked = tiled_mapping(vec![2]);
+        let in_bounds = BlockMapping::new(masked.program().clone(), vec![2], BoundaryPolicy::InBounds).unwrap();
+        let r#type = ArrayType::new_static(DataType::F8E8M0FNU, [3]);
+        let padded_type = ArrayType::new_static(DataType::F8E8M0FNU, [4]);
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap(),
+            vec![
+                KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadOnly, masked.clone()).unwrap(),
+                KernelParameter::new(r#type.clone(), KernelParameterAccess::WriteOnly, masked).unwrap(),
+                KernelParameter::new(padded_type.clone(), KernelParameterAccess::WriteOnly, in_bounds).unwrap(),
+            ],
+        )
+        .unwrap();
+        let tile_type = ArrayType::new_static(DataType::F8E8M0FNU, [2]);
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let mask = context.lift(ArrayIrValue::Array(Array::vector(vec![true, true])?))?;
+            let other = context.lift(ArrayIrValue::Array(Array::new(tile_type.clone(), vec![0x81, 0x81])?))?;
+            let value = context
+                .bind(MaskedLoadOperation::new(), vec![], &[references[0].clone(), mask.clone(), other])?
+                .remove(0);
+            context.bind(MaskedStoreOperation::new(), vec![], &[references[1].clone(), value.clone(), mask])?;
+            references[2].write(&value)
+        })
+        .unwrap();
+        let input = Array::new(r#type, vec![0x7f, 0x80, 0x83]).unwrap();
+        assert_eq!(
+            definition.interpret(vec![input.clone()], 2),
+            Ok(vec![input, Array::new(padded_type, vec![0x7f, 0x80, 0x83, 0x81]).unwrap()]),
+        );
     }
 
     #[test]
@@ -2816,6 +3151,95 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_definition_interpret_with_trace_nan_skips_dead_swaps() {
+        // Each program swaps a finite value into one element of a read-write vector whose first element is NaN. When
+        // the old value is dead, the swap is a store that never reads the NaN, so ordinary, traced, and interleaved
+        // execution agree. When the old value is copied to a second output, the swap reads it and reports the NaN.
+        let mapping =
+            BlockMapping::new(tiled_mapping(vec![1]).program().clone(), vec![1], BoundaryPolicy::InBounds).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
+        let swap_definition = |masked: bool, live: bool| {
+            let mut parameters =
+                vec![KernelParameter::new(r#type.clone(), KernelParameterAccess::ReadWrite, mapping.clone()).unwrap()];
+            if live {
+                let output = KernelParameter::new(r#type.clone(), KernelParameterAccess::WriteOnly, mapping.clone());
+                parameters.push(output.unwrap());
+            }
+            let operation = KernelCallOperation::new(grid.clone(), parameters).unwrap();
+            KernelDefinition::<NoKernelExtension>::trace(operation, |(references, _coordinates)| {
+                let context = references[0].context();
+                let value = context.lift(ArrayIrValue::Array(Array::vector(vec![3f32])?))?;
+                let old = if masked {
+                    let mask = context.lift(ArrayIrValue::Array(Array::vector(vec![true])?))?;
+                    let other = context.lift(ArrayIrValue::Array(Array::vector(vec![0f32])?))?;
+                    let inputs = [references[0].clone(), value, mask, other];
+                    context.bind(MaskedSwapOperation::new(), vec![], &inputs)?.remove(0)
+                } else {
+                    context.bind(ReferenceSwapOperation::new(), vec![], &[references[0].clone(), value])?.remove(0)
+                };
+                if live { references[1].write(&old) } else { Ok(()) }
+            })
+            .unwrap()
+        };
+        let input = Array::vector(vec![f32::NAN, 1f32]).unwrap();
+        let updated = Array::vector(vec![3f32, 3f32]).unwrap();
+        let options = KernelDebugOptions::default().with_nan_checks(true);
+        for (masked, operation) in [(false, "reference_swap"), (true, "masked_swap")] {
+            // Dead swaps are traced as writes.
+            let definition = swap_definition(masked, false);
+            assert_eq!(definition.interpret(vec![input.clone()], 2), Ok(vec![updated.clone()]));
+            let mut trace = Vec::new();
+            assert_eq!(
+                definition.interpret_with_trace(vec![input.clone()], &options, &mut trace),
+                Ok(vec![updated.clone()]),
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .map(|entry| {
+                        let modes = entry.accesses().iter().map(|access| access.mode()).collect::<Vec<_>>();
+                        (entry.coordinate().to_vec(), entry.operation(), modes)
+                    })
+                    .collect::<Vec<_>>(),
+                vec![
+                    (vec![0], operation, vec![ReferenceAccessMode::Write]),
+                    (vec![1], operation, vec![ReferenceAccessMode::Write]),
+                ],
+            );
+            let executions = definition.interpret_interleavings(vec![input.clone()], &options, 2).unwrap();
+            assert_eq!(executions.len(), 2);
+            for execution in executions {
+                assert_eq!(execution.result(), &Ok(vec![updated.clone()]));
+                assert_eq!(execution.trace().len(), 2);
+            }
+
+            // A live old value is read, so the NaN check still reports it.
+            let definition = swap_definition(masked, true);
+            let outputs = definition.interpret(vec![input.clone()], 2).unwrap();
+            assert_eq!(outputs[0], updated);
+            assert_eq!(
+                outputs[1].elements::<f32>().unwrap().iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                vec![f32::NAN.to_bits(), 1f32.to_bits()],
+            );
+            let error = definition.interpret_with_trace(vec![input.clone()], &options, &mut trace).unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<KernelInterpretationError>(),
+                Some(&KernelInterpretationError::Nan {
+                    operation,
+                    position: "output",
+                    value: 0,
+                    element: 0,
+                    data_type: DataType::F32,
+                    coordinate: vec![0],
+                    provenance: Provenance::unknown(),
+                }),
+            );
+            assert_eq!(trace.last().unwrap().accesses()[0].mode(), ReferenceAccessMode::ReadWrite);
+        }
+    }
+
+    #[test]
     fn test_kernel_definition_interpret_with_trace_failure() {
         let definition = definition(false, false);
         let input = Array::scalar(17i32).unwrap();
@@ -2841,6 +3265,66 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "kernel qualification requires 1 programs, exceeding the limit 0");
         assert_eq!(trace, Vec::<KernelTraceEntry>::new());
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_with_trace_failed_selection() {
+        // The second read selects an element of `f32[0]` at a dynamic index that the first read loads, so resolving
+        // its reference view fails after the attempted binding is traced and charged.
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::F32, [0]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::I64), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let scope = ProvenanceScope::new("select element");
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
+            let context = references[0].context();
+            let index = references[1].read()?;
+            let read = ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]);
+            let value = context.invoke_with_provenance_scope(scope.clone(), || {
+                Ok::<_, ProgramError>(context.bind(read, vec![], &[references[0].clone(), index])?.remove(0))
+            })?;
+            references[2].write(&value)
+        })
+        .unwrap();
+        let inputs = vec![Array::vector(Vec::<f32>::new()).unwrap(), Array::scalar(0i64).unwrap()];
+        let expected = ProgramError::from(TypeError::invalid("cannot dynamically index an empty reference axis"));
+        assert_eq!(definition.interpret(inputs.clone(), 1), Err(expected.clone()));
+        let mut trace = Vec::new();
+        assert_eq!(
+            definition.interpret_with_trace(inputs.clone(), &KernelDebugOptions::default(), &mut trace),
+            Err(expected),
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .map(|entry| (entry.coordinate().to_vec(), entry.operation(), entry.provenance().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec![], "reference_read", Provenance::unknown()),
+                (vec![], "reference_read", Provenance::scope(scope.clone(), Provenance::unknown())),
+            ],
+        );
+
+        // The body entry, the first read, and the failing read each consume one replay step.
+        let error = definition.interpret_with_limits(inputs, 1, 2).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<KernelInterpretationError>(),
+            Some(&KernelInterpretationError::StepLimit {
+                maximum_steps: 2,
+                coordinate: vec![],
+                operation: "reference_read",
+                provenance: Provenance::scope(scope, Provenance::unknown()),
+            }),
+        );
     }
 
     #[test]
@@ -2903,6 +3387,96 @@ mod tests {
                 coordinate: vec![],
                 provenance: Provenance::unknown(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_kernel_definition_interpret_with_trace_malformed_rule_binding() {
+        // Binds a `reference_read` without its reference input through its interpretation driver, which fails the
+        // validation of its reference access layout.
+        #[derive(Clone, Debug)]
+        struct MalformedExtension;
+
+        impl Operation for MalformedExtension {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "test_malformed"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(vec![])
+            }
+        }
+
+        impl ReferenceAccessOperation for MalformedExtension {
+            type Transform = ArrayReferenceTransform;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<ArrayReferenceTransform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "test extension has no reference accesses".to_owned(),
+                })
+            }
+        }
+
+        impl KernelExtension for MalformedExtension {
+            fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+                Ok(KernelExtensionMemory::Synchronous)
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<MalformedExtension>>>
+            for MalformedExtension
+        {
+            fn interpret<
+                D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<MalformedExtension>>>,
+            >(
+                &self,
+                context: &EagerContext<ArrayIrValue<Array>, KernelOperation<MalformedExtension>>,
+                driver: &D,
+                _inputs: &[ArrayIrValue<Array>],
+            ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+                let operation = KernelOperation::Portable(ArrayIrOperation::from(ReferenceReadOperation::new()));
+                driver.bind(context, operation, AttachedRegions::Empty, &[])
+            }
+        }
+
+        let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<MalformedExtension>>::new();
+        builder
+            .add_instruction(KernelOperation::Extension(MalformedExtension), vec![], vec![], None)
+            .unwrap();
+        let body = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![], vec![]).unwrap();
+        let definition = KernelDefinition::new(call, body).unwrap();
+        let mut trace = Vec::new();
+        assert_eq!(
+            definition.interpret_with_trace(vec![], &KernelDebugOptions::default(), &mut trace),
+            Err(ProgramError::MalformedProgram(
+                "operation `reference_read` declares reference access at input 0 but has only 0 inputs".to_owned(),
+            )),
+        );
+        assert_eq!(
+            trace.iter().map(KernelTraceEntry::operation).collect::<Vec<_>>(),
+            vec!["test_malformed", "reference_read"],
         );
     }
 
@@ -3012,6 +3586,81 @@ mod tests {
         assert_eq!(destination.read(), Ok(Array::matrix(3, 2, vec![0i32; 6]).unwrap()));
         assert_eq!(context.bind(WaitOperation, vec![], &[token]), Ok(vec![]));
         assert_eq!(destination.read(), Ok(Array::matrix(3, 2, vec![0i32, 0, 0, 0, 11, 13]).unwrap()));
+    }
+
+    #[test]
+    fn test_qualified_kernel_context_bind_completion_protocols() {
+        // Construct the private context directly to verify the runtime defense independently of qualification, which
+        // rejects the same pairings before replay. A commit or wait of another protocol leaves its token pending.
+        let context = QualifiedKernelContext::<TestExtension> {
+            eager: EagerContext::new(),
+            validity: BTreeMap::new(),
+            references: Rc::new(definition(false, false).references().clone()),
+            instruction: Rc::new(Cell::new(None)),
+            coordinate: vec![],
+            maximum_steps: 100,
+            remaining_steps: Rc::new(Cell::new(100)),
+            provenance: Rc::new(ProvenanceState::new()),
+            trace: None,
+            pending_copies: Rc::new(RefCell::new(BTreeMap::new())),
+        };
+        let bind = |operation: KernelOperation<TestExtension>, inputs: &[ArrayIrValue<Array>]| {
+            context.bind(operation, vec![], inputs)
+        };
+        let error = |operation: KernelOperation<TestExtension>, token: &ArrayIrValue<Array>| {
+            let error = bind(operation, std::slice::from_ref(token)).unwrap_err();
+            error.downcast_custom::<KernelInterpretationError>().cloned()
+        };
+        let incompatible = |operation: &'static str, token: &ArrayIrValue<Array>| {
+            let ArrayIrValue::Reference(token) = token else { unreachable!() };
+            Some(KernelInterpretationError::IncompatibleCompletion { operation, token: token.id() })
+        };
+        let source = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![3i32, 5]).unwrap()));
+        let destination = ArrayReference::new(Array::vector(vec![0i32, 0]).unwrap());
+        let wait = || KernelOperation::<TestExtension>::Wait(WaitOperation);
+        let commit = |strict| KernelOperation::Extension(TestExtension::Commit { strict });
+        let extension_wait = |strict| KernelOperation::Extension(TestExtension::Wait { strict });
+
+        // An extension commit or wait cannot complete a portable copy, which the portable wait still completes.
+        let token = bind(
+            KernelOperation::AsyncCopy(AsyncCopyOperation::new()),
+            &[source.clone(), ArrayIrValue::Reference(destination.clone())],
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(error(commit(false), &token), incompatible("test_commit", &token));
+        assert_eq!(error(extension_wait(false), &token), incompatible("test_wait", &token));
+        assert_eq!(destination.read(), Ok(Array::vector(vec![0i32, 0]).unwrap()));
+        assert_eq!(bind(wait(), std::slice::from_ref(&token)), Ok(vec![]));
+        assert_eq!(destination.read(), Ok(Array::vector(vec![3i32, 5]).unwrap()));
+
+        // The portable wait cannot complete an extension token, which the extension wait still completes after any
+        // number of commits, and a token cannot be completed again after its wait.
+        let update = |strict| {
+            let inputs = [source.clone(), source.clone(), ArrayIrValue::Reference(destination.clone())];
+            bind(KernelOperation::Extension(TestExtension::Update { strict }), &inputs).unwrap().remove(0)
+        };
+        let token = update(false);
+        assert_eq!(error(wait(), &token), incompatible("wait", &token));
+        assert_eq!(bind(commit(false), std::slice::from_ref(&token)), Ok(vec![]));
+        assert_eq!(bind(commit(false), std::slice::from_ref(&token)), Ok(vec![]));
+        assert_eq!(bind(extension_wait(false), std::slice::from_ref(&token)), Ok(vec![]));
+        let ArrayIrValue::Reference(reference) = &token else { unreachable!() };
+        assert_eq!(
+            error(extension_wait(false), &token),
+            Some(KernelInterpretationError::UnknownCopyToken { token: reference.id() }),
+        );
+
+        // The strict protocol requires exactly one commit of its own protocol before the wait.
+        let token = update(true);
+        assert_eq!(error(extension_wait(true), &token), incompatible("test_wait", &token));
+        assert_eq!(error(commit(false), &token), incompatible("test_commit", &token));
+        assert_eq!(bind(commit(true), std::slice::from_ref(&token)), Ok(vec![]));
+        assert_eq!(error(commit(true), &token), incompatible("test_commit", &token));
+        assert_eq!(error(extension_wait(false), &token), incompatible("test_wait", &token));
+        assert_eq!(context.pending_copies.borrow().len(), 1);
+        assert_eq!(bind(extension_wait(true), std::slice::from_ref(&token)), Ok(vec![]));
+        assert_eq!(context.pending_copies.borrow().len(), 0);
     }
 
     #[test]

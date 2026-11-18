@@ -1081,7 +1081,9 @@ fn interpret_masked_memory(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayReferenceTransformIndex, Context, Dimension, DimensionBounds, Shape};
+    use ryft_core::{
+        ArrayReferenceTransformIndex, Context, Dimension, DimensionBounds, Shape, check_operation_type_inference,
+    };
 
     use crate::operations::KernelOperation;
 
@@ -1157,17 +1159,22 @@ mod tests {
     #[test]
     fn test_scratch_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
-        let operation = ScratchOperation::new(referent.clone(), 4).unwrap();
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ReferenceType::new(referent).into()]));
+        check_operation_type_inference!(
+            operation = ScratchOperation::new(referent.clone(), 4).unwrap(),
+            cases = [{
+                input_types = [],
+                output_types = [ArrayIrType::Reference(ReferenceType::new(referent.clone()))],
+            }],
+        );
     }
 
     #[test]
     fn test_scratch_operation_type_inference_rejects_nonzero_arity() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
         let operation = ScratchOperation::new(referent.clone(), 4).unwrap();
-        assert_eq!(
-            operation.infer_output_types(&[referent.into()], &[]),
-            Err(TypeError::invalid("expected 0 inputs but got 1")),
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [{ input_types = [ArrayIrType::Array(referent)], error = "expected 0 inputs but got 1" }],
         );
         assert_eq!(
             operation.infer_output_types(&[], &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
@@ -1246,13 +1253,57 @@ mod tests {
     #[test]
     fn test_masked_load_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
-        let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
-        assert_eq!(
-            MaskedLoadOperation::new().infer_output_types(
-                &[ReferenceType::new(referent.clone()).into(), mask.into(), referent.clone().into()],
-                &[],
-            ),
-            Ok(vec![referent.into()]),
+        let reference = ArrayIrType::Reference(ReferenceType::new(referent.clone()));
+        let mask = ArrayIrType::Array(ArrayType::new_static(DataType::Boolean, vec![2]));
+        let other = ArrayIrType::Array(referent.clone());
+        check_operation_type_inference!(
+            operation = MaskedLoadOperation::new(),
+            cases = [
+                {
+                    input_types = [reference.clone(), mask.clone(), other.clone()],
+                    output_types = [other.clone()],
+                },
+                {
+                    input_types = [reference.clone(), mask.clone()],
+                    error = "expected 3 inputs but got 2",
+                },
+                {
+                    input_types = [other.clone(), mask.clone(), other.clone()],
+                    error = "expected reference type but got array type",
+                },
+                {
+                    input_types = [reference.clone(), other.clone(), other.clone()],
+                    error = "masked memory mask type `i32[2]` must be Boolean with referent shape `[2]`",
+                },
+                {
+                    input_types = [
+                        reference.clone(),
+                        mask.clone(),
+                        ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+                    ],
+                    error = "masked memory input `2` type `i32[]` must exactly match referent type `i32[2]`",
+                },
+            ],
+        );
+
+        // The transforms select the referent view that the mask and the fill must match.
+        let matrix = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![3, 2])));
+        let index = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        check_operation_type_inference!(
+            operation = MaskedLoadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]),
+            cases = [
+                {
+                    input_types = [matrix.clone(), mask.clone(), other.clone(), index],
+                    output_types = [other.clone()],
+                },
+                {
+                    input_types = [matrix, mask, other],
+                    error = "expected 4 inputs but got 3",
+                },
+            ],
         );
     }
 
@@ -1383,11 +1434,29 @@ mod tests {
     #[test]
     fn test_masked_store_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
-        let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
-        assert_eq!(
-            MaskedStoreOperation::new()
-                .infer_output_types(&[ReferenceType::new(referent.clone()).into(), referent.into(), mask.into()], &[]),
-            Ok(vec![]),
+        let reference = ArrayIrType::Reference(ReferenceType::new(referent.clone()));
+        let mask = ArrayIrType::Array(ArrayType::new_static(DataType::Boolean, vec![2]));
+        let value = ArrayIrType::Array(referent);
+        check_operation_type_inference!(
+            operation = MaskedStoreOperation::new(),
+            cases = [
+                {
+                    input_types = [reference.clone(), value.clone(), mask.clone()],
+                    output_types = [],
+                },
+                {
+                    input_types = [reference.clone(), value.clone()],
+                    error = "expected 3 inputs but got 2",
+                },
+                {
+                    input_types = [reference.clone(), mask.clone(), mask.clone()],
+                    error = "masked memory input `1` type `bool[2]` must exactly match referent type `i32[2]`",
+                },
+                {
+                    input_types = [reference, value.clone(), ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+                    error = "masked memory mask type `bool[]` must be Boolean with referent shape `[2]`",
+                },
+            ],
         );
     }
 
@@ -1470,18 +1539,34 @@ mod tests {
     #[test]
     fn test_masked_swap_operation_type_inference() {
         let referent = ArrayType::new_static(DataType::I32, vec![2]);
-        let mask = ArrayType::new_static(DataType::Boolean, vec![2]);
-        assert_eq!(
-            MaskedSwapOperation::new().infer_output_types(
-                &[
-                    ReferenceType::new(referent.clone()).into(),
-                    referent.clone().into(),
-                    mask.into(),
-                    referent.clone().into(),
-                ],
-                &[],
-            ),
-            Ok(vec![referent.into()]),
+        let reference = ArrayIrType::Reference(ReferenceType::new(referent.clone()));
+        let mask = ArrayIrType::Array(ArrayType::new_static(DataType::Boolean, vec![2]));
+        let value = ArrayIrType::Array(referent);
+        let wide = ArrayIrType::Array(ArrayType::new_static(DataType::I64, vec![2]));
+        check_operation_type_inference!(
+            operation = MaskedSwapOperation::new(),
+            cases = [
+                {
+                    input_types = [reference.clone(), value.clone(), mask.clone(), value.clone()],
+                    output_types = [value.clone()],
+                },
+                {
+                    input_types = [reference.clone(), value.clone(), mask.clone()],
+                    error = "expected 4 inputs but got 3",
+                },
+                {
+                    input_types = [reference.clone(), wide.clone(), mask.clone(), value.clone()],
+                    error = "masked memory input `1` type `i64[2]` must exactly match referent type `i32[2]`",
+                },
+                {
+                    input_types = [reference.clone(), value.clone(), value.clone(), value.clone()],
+                    error = "masked memory mask type `i32[2]` must be Boolean with referent shape `[2]`",
+                },
+                {
+                    input_types = [reference, value.clone(), mask, wide],
+                    error = "masked memory input `3` type `i64[2]` must exactly match referent type `i32[2]`",
+                },
+            ],
         );
     }
 
@@ -1583,13 +1668,31 @@ mod tests {
     #[test]
     fn test_window_mask_operation_type_inference() {
         let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![2, 3])));
-        assert_eq!(
-            WindowMaskOperation.infer_output_types(std::slice::from_ref(&reference), &[]),
-            Ok(vec![ArrayType::new_static(DataType::Boolean, vec![2, 3]).into()]),
-        );
-        assert_eq!(
-            WindowMaskOperation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid("expected 1 input but got 0")),
+        let dimension =
+            Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::non_negative(Some(4)).unwrap()));
+        let dynamic = ArrayType::new(DataType::I32, Shape::new(vec![dimension]));
+        check_operation_type_inference!(
+            operation = WindowMaskOperation,
+            cases = [
+                {
+                    input_types = [reference.clone()],
+                    output_types = [ArrayIrType::Array(ArrayType::new_static(DataType::Boolean, vec![2, 3]))],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayIrType::Array(ArrayType::new_static(DataType::I32, vec![2]))],
+                    error = format!("`{WINDOW_MASK_OPERATION_NAME}` input type `i32[2]` must be an array reference"),
+                },
+                {
+                    input_types = [ArrayIrType::Reference(ReferenceType::new(dynamic.clone()))],
+                    error = format!(
+                        "`{WINDOW_MASK_OPERATION_NAME}` referent type `{dynamic}` must have a static shape",
+                    ),
+                },
+            ],
         );
         assert_eq!(
             WindowMaskOperation.infer_output_types(
@@ -1597,22 +1700,6 @@ mod tests {
                 &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
-        );
-        let array = ArrayIrType::Array(ArrayType::new_static(DataType::I32, vec![2]));
-        assert_eq!(
-            WindowMaskOperation.infer_output_types(std::slice::from_ref(&array), &[]),
-            Err(TypeError::invalid(format!(
-                "`{WINDOW_MASK_OPERATION_NAME}` input type `{array}` must be an array reference",
-            ))),
-        );
-        let dimension =
-            Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::non_negative(Some(4)).unwrap()));
-        let referent = ArrayType::new(DataType::I32, Shape::new(vec![dimension]));
-        assert_eq!(
-            WindowMaskOperation.infer_output_types(&[ReferenceType::new(referent.clone()).into()], &[]),
-            Err(TypeError::invalid(format!(
-                "`{WINDOW_MASK_OPERATION_NAME}` referent type `{referent}` must have a static shape",
-            ))),
         );
     }
 
@@ -1673,49 +1760,56 @@ mod tests {
     fn test_async_copy_operation_type_inference() {
         let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![2])));
         let token = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
-        assert_eq!(
-            AsyncCopyOperation::new().infer_output_types(&[reference.clone(), reference.clone()], &[]),
-            Ok(vec![token.clone()]),
-        );
-        assert_eq!(
-            AsyncCopyOperation::new().infer_output_types(&[token.clone(), token], &[]),
-            Err(TypeError::invalid(format!("`{ASYNC_COPY_OPERATION_NAME}` cannot copy effect tokens"))),
-        );
         let different = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, vec![3])));
-        assert_eq!(
-            AsyncCopyOperation::new().infer_output_types(&[reference, different], &[]),
-            Err(TypeError::invalid(format!(
-                concat!(
-                    "`{}` source type `i32[2]` and destination type `i32[3]` ",
-                    "must have identical shapes, element types, and sharding",
-                ),
-                ASYNC_COPY_OPERATION_NAME,
-            ))),
+        check_operation_type_inference!(
+            operation = AsyncCopyOperation::new(),
+            cases = [
+                {
+                    input_types = [reference.clone(), reference.clone()],
+                    output_types = [token.clone()],
+                },
+                {
+                    input_types = [token.clone(), token],
+                    error = format!("`{ASYNC_COPY_OPERATION_NAME}` cannot copy effect tokens"),
+                },
+                {
+                    input_types = [reference, different],
+                    error = format!(
+                        "`{ASYNC_COPY_OPERATION_NAME}` source type `i32[2]` and destination type `i32[3]` must have \
+                         identical shapes, element types, and sharding",
+                    ),
+                },
+            ],
         );
     }
 
     #[test]
     fn test_async_copy_operation_type_inference_transforms() {
-        let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![ArrayReferenceTransform::Index {
-                axis: 0,
-                index: ArrayReferenceTransformIndex::Dynamic,
-            }])
-            .with_destination_transforms(vec![ArrayReferenceTransform::Slice {
-                axes: vec![ArraySliceAxis::new(1, 3, 1)],
-            }]);
-        let inputs = vec![
-            ReferenceType::new(ArrayType::new_static(DataType::I32, [2, 3])).into(),
-            ReferenceType::new(ArrayType::new_static(DataType::I32, [5])).into(),
-            ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
-        ];
-        assert_eq!(
-            operation.infer_output_types(&inputs, &[]),
-            Ok(vec![ReferenceType::new(ArrayType::scalar(DataType::Token)).into()]),
-        );
-        assert_eq!(
-            operation.infer_output_types(&inputs[..2], &[]),
-            Err(TypeError::invalid("expected 3 inputs but got 2")),
+        let source = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, [2, 3])));
+        let destination = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::I32, [5])));
+        check_operation_type_inference!(
+            operation = AsyncCopyOperation::new()
+                .with_source_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Dynamic,
+                }])
+                .with_destination_transforms(vec![ArrayReferenceTransform::Slice {
+                    axes: vec![ArraySliceAxis::new(1, 3, 1)],
+                }]),
+            cases = [
+                {
+                    input_types = [
+                        source.clone(),
+                        destination.clone(),
+                        ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
+                    ],
+                    output_types = [ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
+                },
+                {
+                    input_types = [source, destination],
+                    error = "expected 3 inputs but got 2",
+                },
+            ],
         );
     }
 
@@ -1818,11 +1912,19 @@ mod tests {
     #[test]
     fn test_wait_operation_type_inference() {
         let token = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)));
-        assert_eq!(WaitOperation.infer_output_types(std::slice::from_ref(&token), &[]), Ok(vec![]));
         let invalid = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)));
-        assert_eq!(
-            WaitOperation.infer_output_types(std::slice::from_ref(&invalid), &[]),
-            Err(TypeError::invalid(format!("`{WAIT_OPERATION_NAME}` input type `{invalid}` must be `{token}`"))),
+        check_operation_type_inference!(
+            operation = WaitOperation,
+            cases = [
+                {
+                    input_types = [token.clone()],
+                    output_types = [],
+                },
+                {
+                    input_types = [invalid.clone()],
+                    error = format!("`{WAIT_OPERATION_NAME}` input type `{invalid}` must be `{token}`"),
+                },
+            ],
         );
     }
 

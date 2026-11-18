@@ -805,12 +805,15 @@ impl KernelCodeGenerator {
             let Window::Tiled(Tiling { tile, boundary }) = &output.window else { unreachable!() };
             let inputs = self.arguments().map(|parameter| &parameter.name);
             let output_type = r#type(output);
+            // The output keeps its declared position among the references, which the body binds in declaration order.
+            let output_index = self.references().position(|parameter| parameter.name == output.name).unwrap();
             let tile = self.generate_shape(tile, false)?;
             let boundary = boundary.generate(kernels);
             return Ok(quote!(
                 #kernels::__private::tiled_call(
                     &[#(#inputs.clone()),*],
                     #output_type,
+                    #output_index,
                     (#tile).to_vec(),
                     #boundary,
                 )?
@@ -1139,7 +1142,12 @@ impl KernelCodeGenerator {
     }
 
     /// Generates the lowering of a `let` statement, which either binds a staged value or declares a [`TileView`] or a
-    /// [`SliceView`]. View declarations generate no code, because their accesses are lowered directly.
+    /// [`SliceView`]. A view is bound to the reference that its source names at its declaration. Tile views read
+    /// inputs, which cannot be rebound, and a slice of an immutable binding names the same reference wherever it is
+    /// visible, so these declarations generate no code and their accesses are lowered directly. A slice of a mutable
+    /// local instead binds that reference to a hidden immutable binding, so that rebinding the local later leaves the
+    /// slice attached to the original reference while writes to that reference stay visible through the slice.
+    /// Staged loops and conditions carry the hidden binding like any other.
     fn generate_local(&self, local: &syn::Local, scope: &mut Scope) -> syn::Result<TokenStream> {
         let syn::Pat::Ident(pattern) = &local.pat else {
             return Err(syn::Error::new_spanned(&local.pat, "unsupported kernel local pattern"));
@@ -1157,10 +1165,17 @@ impl KernelCodeGenerator {
                 return Ok(TokenStream::new());
             }
             if call.method == "slice" {
-                let view = self.extract_slice_view(call, scope)?;
+                let mut view = self.extract_slice_view(call, scope)?;
                 let name = scope.validate_new_name(pattern, "slices", false)?.clone();
+                let mut declaration = TokenStream::new();
+                if scope.bindings.iter().any(|binding| binding.name == view.source && binding.mutable) {
+                    let source = std::mem::replace(&mut view.source, format_ident!("__kernel_{}_source", name));
+                    let binding = &view.source;
+                    declaration = quote!(let #binding = #source.clone(););
+                    scope.bindings.push(Binding { name: binding.clone(), mutable: false });
+                }
                 scope.slices.push((name, view));
-                return Ok(TokenStream::new());
+                return Ok(declaration);
             }
         }
         let name = scope.validate_new_name(pattern, "locals", true)?.clone();
@@ -1204,10 +1219,15 @@ impl KernelCodeGenerator {
     }
 
     /// Extracts a [`SliceView`] from `reference.slice([ranges])`, where `reference` names a binding and every range is
-    /// either `start..end` with shape metadata bounds or `..`, which selects a whole axis.
+    /// either `start..end` with shape metadata bounds or `..`, which selects a whole axis. Slices of slices are
+    /// unsupported.
     fn extract_slice_view(&self, call: &syn::ExprMethodCall, scope: &Scope) -> syn::Result<SliceView> {
+        if identifier(&call.receiver).is_some_and(|name| scope.slice(&name).is_some()) {
+            return Err(syn::Error::new_spanned(call, "kernel slices cannot be sliced again"));
+        }
         let source = identifier(&call.receiver).filter(|name| {
-            scope.bindings.iter().any(|binding| &binding.name == name)
+            !name.to_string().starts_with(RESERVED_PREFIX)
+                && scope.bindings.iter().any(|binding| &binding.name == name)
                 && call.args.len() == 1
                 && call.turbofish.is_none()
         });
@@ -1606,8 +1626,7 @@ impl KernelCodeGenerator {
     ) -> syn::Result<TokenStream> {
         let Self { kernels, core, .. } = self;
         let SliceView { source, ranges } = view;
-        let source = self.generate_value(&syn::parse_quote!(#source), scope)?;
-        let view = quote!(#kernels::reference_slice(&(#source), &[#(#ranges),*])?);
+        let view = quote!(#kernels::reference_slice(&#source, &[#(#ranges),*])?);
         let capability = match call.method.to_string().as_str() {
             "load" => return Ok(quote!(#core::operations::ReferenceRead::read(&(#view))?)),
             "store" => quote!(ReferenceWrite::write),
@@ -2159,7 +2178,7 @@ struct TileView {
     /// Name of the tile view.
     name: syn::Ident,
 
-    /// Name of the input that the tile view loads from.
+    /// Name of the input that the tile view loads from, which cannot be rebound.
     source: syn::Ident,
 
     /// Rank of the input that the tile view loads from.
@@ -2179,7 +2198,8 @@ struct TileView {
 /// `ReferenceView` that `reference_slice` returns. A slice stages nothing until it is accessed.
 #[derive(Clone)]
 struct SliceView {
-    /// Name of the binding of the sliced reference.
+    /// Name of the immutable binding of the sliced reference, which is either the binding that the slice was taken from
+    /// or the hidden binding that [`KernelCodeGenerator::generate_local`] declares for a slice of a mutable local.
     source: syn::Ident,
 
     /// Generated `Option<Range<usize>>` per axis of the reference, where `None` selects the whole axis.
@@ -3118,6 +3138,7 @@ mod tests {
                 kernels::__private::tiled_call(
                     &[left.clone(), indices.clone()],
                     __kernel_output_type,
+                    2usize,
                     ([8, 32]).to_vec(),
                     kernels::BoundaryPolicy::Masked,
                 )?
@@ -3437,14 +3458,32 @@ mod tests {
         );
         assert!(scope.tile(&format_ident!("tiles")).is_some());
 
-        // Slice declarations generate no code either.
+        // Slices of immutable bindings generate no code either.
         assert!(
             generator
                 .generate_statement(&parse_quote!(let head = left.slice([0..1, ..]);), &mut scope)
                 .unwrap()
                 .is_empty()
         );
-        assert!(scope.slice(&format_ident!("head")).is_some());
+        assert!(matches!(scope.slice(&format_ident!("head")), Some(SliceView { source, .. }) if source == "left"));
+
+        // Slices of mutable locals bind the reference that the local names at the declaration to a hidden immutable
+        // binding, which the slice accesses and staged regions carry.
+        assert_eq!(
+            generator
+                .generate_statement(&parse_quote!(let saved = accumulator.slice([0..1]);), &mut scope)
+                .unwrap()
+                .to_string(),
+            quote!(let __kernel_saved_source = accumulator.clone();).to_string(),
+        );
+        assert!(matches!(
+            scope.slice(&format_ident!("saved")),
+            Some(SliceView { source, .. }) if source == "__kernel_saved_source",
+        ));
+        assert!(matches!(
+            scope.bindings.last(),
+            Some(Binding { name, mutable: false }) if name == "__kernel_saved_source",
+        ));
 
         let error = |statement| generator.generate_statement(&statement, &mut scope.clone()).unwrap_err().to_string();
         assert_eq!(error(parse_quote!(let row = left.load();)), "kernel locals cannot shadow an existing binding");
@@ -3550,6 +3589,22 @@ mod tests {
         assert_eq!(error(parse_quote!(left.slice([0..=1]))), "kernel slice ranges must be `start..end` or `..`");
         assert_eq!(error(parse_quote!(left.slice([1..]))), "kernel slice ranges must be `start..end` or `..`");
         assert_eq!(error(parse_quote!(left.slice([0..host()]))), "unsupported shape metadata expression");
+
+        // Slices cannot be sliced again, and they cannot name the hidden bindings of other slices.
+        let mut scope = scope.clone();
+        scope.bindings.push(Binding { name: format_ident!("__kernel_head_source"), mutable: false });
+        scope
+            .slices
+            .push((format_ident!("head"), SliceView { source: format_ident!("left"), ranges: vec![] }));
+        let error = |expression| {
+            let syn::Expr::MethodCall(call) = expression else { panic!("expected a method call") };
+            generator.extract_slice_view(&call, &scope).err().unwrap().to_string()
+        };
+        assert_eq!(error(parse_quote!(head.slice([..]))), "kernel slices cannot be sliced again");
+        assert_eq!(
+            error(parse_quote!(__kernel_head_source.slice([..]))),
+            "expected `reference.slice([ranges])` with a named reference",
+        );
     }
 
     #[test]
@@ -3974,8 +4029,7 @@ mod tests {
                 .map(|access| access.to_string())
                 .map_err(|error| error.to_string())
         };
-        let left = scoped(quote!(left.clone()));
-        let reference = quote!(kernels::reference_slice(&(#left), &[::core::option::Option::None])?);
+        let reference = quote!(kernels::reference_slice(&left, &[::core::option::Option::None])?);
         let accumulator = scoped(quote!(accumulator.clone()));
         assert_eq!(
             access(parse_quote!(head.load())),
