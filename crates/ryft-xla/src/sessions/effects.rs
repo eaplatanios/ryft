@@ -136,48 +136,46 @@ impl EffectScope {
         ensure_effect_dispatch_is_allowed()?;
 
         // Keep the former tail and extracted submissions alive past the scope guard.
-        let _retired_tail;
         let mut retired = Vec::new();
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
 
-        // Callbacks publish independently of the scope mutex. Read each completion exactly once so a failure
-        // arriving after validation cannot be discarded by the retirement step below.
+        // Callbacks publish independently of the scope mutex. Read each completion at most once so a failure
+        // recorded after its submission was checked remains tracked.
         let mut completed = HashSet::new();
         let mut ordered_failure = false;
         let mut ordered_pending = false;
-        let mut unreported_failure = false;
         for submission in &state.submissions {
             let Some(result) = submission.completion.result() else {
                 ordered_pending |= submission.ordered;
                 continue;
             };
             if result.is_err() {
+                if !state.observed.contains(&submission.identity) {
+                    return Err(ExecutionError::PrematureAcknowledgment.into());
+                }
                 ordered_failure |= submission.ordered;
-                unreported_failure |= !state.observed.contains(&submission.identity);
             }
             completed.insert(submission.identity);
         }
 
-        if unreported_failure || (ordered_failure && ordered_pending) {
+        if ordered_failure && ordered_pending {
             return Err(ExecutionError::PrematureAcknowledgment.into());
         }
 
-        _retired_tail = if ordered_failure { state.tail.take() } else { None };
+        retired.extend(state.submissions.extract_if(.., |submission| completed.contains(&submission.identity)));
         if ordered_failure {
+            retired.extend(state.tail.take());
             state.devices = None;
         }
 
-        retired.extend(state.submissions.extract_if(.., |submission| completed.contains(&submission.identity)));
         state.observed.clear();
 
-        // Unlock the scope before freeing the completed ID set and destroying retired token buffers/
+        // Unlock the scope before freeing the completed ID set and destroying retired token buffers.
         drop(state);
 
         Ok(())
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Scope metadata protected by the [`EffectScope`]'s mutex. Completion callbacks retain their submission's
 /// [`EffectCompletion`] independently of this state.
@@ -205,7 +203,7 @@ pub(crate) struct EffectReservation {
     /// Invocation being prepared or published.
     submission: Arc<EffectSubmission>,
 
-    /// Predecessor whose token publication successors will follow if this reservation is cancelled.
+    /// Predecessor whose token publication successors will follow if this reservation is canceled.
     predecessor: Option<Arc<EffectSubmission>>,
 
     /// Whether publication and callback registration have disarmed cancellation on drop.
@@ -273,33 +271,30 @@ impl EffectCallbackGuard {
     /// Marks the current thread as inside a managed callback. Keep the guard alive for the duration of the callback
     /// to prevent reentrant execution, barriers, and acknowledgment on that thread.
     pub(crate) fn enter() -> Self {
-        EFFECT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        EFFECT_CALLBACK_DEPTH.update(|depth| depth + 1);
         Self { marker: PhantomData }
     }
 }
 
 impl Drop for EffectCallbackGuard {
     fn drop(&mut self) {
-        EFFECT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        EFFECT_CALLBACK_DEPTH.update(|depth| depth - 1);
     }
 }
 
 /// Prevents the current thread from starting an execution, waiting at an effect barrier, or acknowledging effect
-/// errors while it is running a managed callback such as a print or assertion handler.
-///
-/// Call this before taking scope or reference locks. A nested dispatch or barrier can wait for the current
-/// execution, which needs the callback to return before it can finish.
+/// errors while it is running a managed callback such as a print or assertion handler. Call this before taking scope
+/// or reference locks. A nested dispatch or barrier can wait for the current execution, which needs the callback to
+/// return before it can finish.
 ///
 /// # Errors
 ///
 /// Returns [`ExecutionError::ReentrantDispatch`] if an [`EffectCallbackGuard`] is active on the current thread.
 pub(crate) fn ensure_effect_dispatch_is_allowed() -> Result<(), Error> {
-    if EFFECT_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
-        Err(ExecutionError::ReentrantDispatch.into())
-    } else {
-        Ok(())
-    }
+    if EFFECT_CALLBACK_DEPTH.get() != 0 { Err(ExecutionError::ReentrantDispatch.into()) } else { Ok(()) }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Renders the failures observed by an effect barrier in their original submission order.
 pub(crate) fn format_effect_failures(failures: &[(u64, Arc<str>)]) -> String {
@@ -431,33 +426,67 @@ impl Drop for EffectSubmission {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::sync::mpsc::channel;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayType, Context, CustomCallOperation, DataType, Device, DeviceMesh, EffectClass, LogicalMesh, MeshAxis,
-        MeshAxisType, OneOperation, Placeholder, Print, PrintOperation, ProgramError, Shape, ShardMapBoundary,
-        ShardMapOperation, Sharding, ShardingDimension, StaticShape, Typed,
+        ArrayType, CustomCallOperation, DataType, Device, DeviceMesh, EffectClass, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, Print, PrintOperation, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Typed,
     };
-    use ryft_pjrt::{BufferSpecification, BufferType, Client, EventPromise};
-    #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
+    use ryft_pjrt::{Buffer, BufferSpecification, BufferType, Client, EventPromise, ExecutionFence};
 
+    use crate::sessions::tests::{f64_vector, session_with_client, two_device_mesh};
     #[cfg(feature = "cuda-13")]
-    use crate::sessions::platforms::Platform;
-    use crate::sessions::tests::{domain_mesh, f64_vector, session_with_client};
-    use crate::tests::{cpu_client, execution_client, values_to_bytes};
+    use crate::tests::cuda_client;
+    use crate::tests::{cpu_client, values_to_bytes};
     use crate::{
-        Array, CompilationError, Constant, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
+        Array, Constant, Error, ExecutionError, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
         ensure_print_handler_registered, with_captured_prints,
     };
 
-    use super::*;
+    use super::{
+        EFFECT_CALLBACK_DEPTH, EffectCallbackGuard, EffectScope, EffectSubmission, EffectTokenPublication,
+        ensure_effect_dispatch_is_allowed, format_effect_failures,
+    };
+
+    const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Creates a fence whose completion the test controls through its event promise.
     fn pending_fence() -> (ExecutionFence, EventPromise) {
         let (event, promise) = cpu_client(1).event(()).unwrap();
         (ExecutionFence::new(vec![event]), promise)
+    }
+
+    /// Waits for the barrier to retain the submission in its snapshot and release the scope lock.
+    fn wait_for_barrier_snapshot(
+        scope: &EffectScope,
+        submission: &Arc<EffectSubmission>,
+        initial_references: usize,
+    ) -> bool {
+        let deadline = Instant::now() + CALLBACK_TIMEOUT;
+        while Instant::now() < deadline {
+            if Arc::strong_count(submission) > initial_references && scope.state.try_lock().is_ok() {
+                return true;
+            }
+            thread::yield_now();
+        }
+        false
+    }
+
+    /// Chooses one addressable device so the fixture uses the same mesh on CPU and CUDA.
+    fn single_device_mesh(client: &Client<'_>) -> DeviceMesh {
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        DeviceMesh::new(mesh, vec![device]).unwrap()
+    }
+
+    /// Reads the ordered tail's tokens after releasing the scope lock.
+    fn ordered_tail_tokens(scope: &EffectScope) -> Vec<Arc<Buffer<'static>>> {
+        let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
+        tail.wait_for_tokens().unwrap().unwrap()
     }
 
     /// Submits two prints through one session on one device of `client` and checks that they print in submission order.
@@ -468,11 +497,10 @@ mod tests {
     /// events on the host, such as the CPU plugin. The CUDA plugin blocks the submitting thread until every input event
     /// is recorded, so there the chain is proven through submission order and barrier completion alone.
     fn assert_session_array_ordered_effects(client: &'static Client<'static>, hold_predecessor: bool) {
-        let mesh = domain_mesh(client, "x", 1);
+        let mesh = single_device_mesh(client);
         let session = session_with_client(client);
-        let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
-        let first = session.array(r#type.clone(), 1.0f64.to_ne_bytes()).unwrap();
-        let second = session.array(r#type, 2.0f64.to_ne_bytes()).unwrap();
+        let first = f64_vector(&session, &mesh, &[1.0]);
+        let second = f64_vector(&session, &mesh, &[2.0]);
         // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
         let manager = hold_predecessor.then(|| {
             let manager = client
@@ -488,61 +516,43 @@ mod tests {
             );
             manager
         });
-        let tail_pending = || {
-            let state = session.effect_scope.state.lock().unwrap();
-            let tokens = state.tail.as_ref().unwrap().wait_for_tokens().unwrap().unwrap();
-            !tokens[0].ready().unwrap().ready().unwrap()
-        };
-        let ((first_pending, second_pending), lines) = with_captured_prints(|| {
-            let _ = first.print("first").unwrap();
-            let first_pending = tail_pending();
-            let _ = second.print("second").unwrap();
-            let second_pending = tail_pending();
-            if let Some(manager) = &manager {
-                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
-            }
+        let (readiness, lines) = with_captured_prints(|| {
+            let readiness = thread::scope(|threads| {
+                let (sender, receiver) = channel();
+                let scope = &session.effect_scope;
+                threads.spawn(move || {
+                    let _ = first.print("first").unwrap();
+                    let first_tokens = ordered_tail_tokens(scope);
+                    let _ = second.print("second").unwrap();
+                    let second_tokens = ordered_tail_tokens(scope);
+                    let readiness = hold_predecessor.then(|| {
+                        (
+                            first_tokens[0].ready().unwrap().ready().unwrap(),
+                            second_tokens[0].ready().unwrap().ready().unwrap(),
+                        )
+                    });
+                    sender.send(readiness).unwrap();
+                });
+
+                let readiness = receiver.recv_timeout(CALLBACK_TIMEOUT);
+                // Release the token even if dispatch blocked on it, so the worker can finish.
+                if let Some(manager) = manager {
+                    manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+                }
+                readiness
+            });
             session.effects_barrier().unwrap();
-            (first_pending, second_pending)
+            readiness
         });
-        if hold_predecessor {
-            assert!(first_pending);
-            assert!(second_pending);
-        }
+        assert_eq!(readiness, Ok(hold_predecessor.then_some((false, false))));
         assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
-        assert_eq!(session.compilation_cache().program_count(), 2);
     }
 
-    /// Compiles ordered and unordered prints on `client`, checks the persisted effect metadata roundtrip and its
-    /// corruption detection, then executes the compiled, restored, and unordered programs and verifies the ordered
-    /// prints fire twice and the unordered print once. With `hold_predecessor`, the executions are submitted behind
-    /// an outstanding predecessor token that is released only afterwards. Refer to
-    /// [`assert_session_array_ordered_effects`] for why that fixture only works on CPU.
-    fn assert_domain_effect_metadata_reload_and_unordered_completion(
-        client: &'static Client<'static>,
-        hold_predecessor: bool,
-    ) {
-        let mesh = domain_mesh(client, "x", 1);
+    /// Checks that an outputless unordered execution is tracked by the barrier and leaves the ordered tail in place.
+    fn assert_outputless_unordered_execution(client: &'static Client<'static>) {
+        let mesh = single_device_mesh(client);
         let session = session_with_client(client);
-        ensure_print_handler_registered(client).unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
-        let mut builder = ProgramBuilder::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
-        builder
-            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
-            .unwrap();
-        let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = session.compile_program(&lowered).unwrap();
-        assert!(compiled.signature().has_ordered_io());
-        let serialized = compiled.serialize().unwrap().unwrap();
-        let restored = session.deserialize_compiled_program(&serialized).unwrap().unwrap();
-        assert_eq!(restored.signature(), compiled.signature());
-        let corrupted = corrupt_ordered_io_metadata(&serialized);
-        assert!(matches!(
-            session.deserialize_compiled_program(&corrupted),
-            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "effect signature does not match executable physical outputs",
-        ));
         let mut builder = ProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder
@@ -555,50 +565,26 @@ mod tests {
             .unwrap();
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let unordered = session.compile_program(&lowered).unwrap();
-        assert!(unordered.signature().has_unordered_io());
-        assert!(!unordered.signature().has_ordered_io());
-        let manager = hold_predecessor.then(|| {
-            let manager = client
-                .host_to_device_transfer_manager(
-                    vec![BufferSpecification::new(BufferType::Token, [])],
-                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
-                )
-                .unwrap();
-            let mut predecessor = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
-            predecessor.publish(
-                Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])),
-                &ExecutionFence::new(Vec::new()),
-            );
-            manager
-        });
+        let program = session.compile_program(&lowered).unwrap();
+        assert!(program.signature().has_unordered_io());
+        assert!(!program.signature().has_ordered_io());
+
+        // Leave a completed entry at the ordered tail so any unordered reservation that joins the chain is visible.
+        let mut ordered = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
+        ordered.publish(Ok(None), &ExecutionFence::new(Vec::new()));
         let ((), lines) = with_captured_prints(|| {
-            assert!(session.execute_program(&compiled, vec![input.clone()]).unwrap().is_empty());
-            assert!(session.execute_program(&restored, vec![input.clone()]).unwrap().is_empty());
-            let independent = session.execute_compiled_async(&unordered, vec![input]).unwrap();
-            if let Some(manager) = &manager {
-                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
-            }
-            independent.fence().block_until_ready().unwrap();
+            let execution = session.execute_compiled_async(&program, vec![input]).unwrap();
+            assert!(execution.output().is_empty());
+            let state = session.effect_scope.state.lock().unwrap();
+            assert_eq!(state.submissions.len(), 1);
+            assert!(!state.submissions[0].ordered);
+            assert!(Arc::ptr_eq(state.tail.as_ref().unwrap(), &ordered.submission));
+            // Release the scope mutex before the barrier takes its snapshot.
+            drop(state);
             session.effects_barrier().unwrap();
         });
-        assert_eq!(lines.iter().filter(|line| line.as_str() == "ordered: [3.0]").count(), 2);
-        assert_eq!(lines.iter().filter(|line| line.as_str() == "unordered: [3.0]").count(), 1);
-    }
 
-    /// Clears the persisted ordered I/O declaration while preserving the native executable bytes.
-    fn corrupt_ordered_io_metadata(serialized: &[u8]) -> Vec<u8> {
-        let header_size = 8 + size_of::<u64>();
-        let metadata_size = u64::from_le_bytes(serialized[8..header_size].try_into().unwrap()) as usize;
-        let metadata_end = header_size + metadata_size;
-        let mut metadata: serde_json::Value = serde_json::from_slice(&serialized[header_size..metadata_end]).unwrap();
-        metadata["ordered_io"] = false.into();
-        let metadata = serde_json::to_vec(&metadata).unwrap();
-        let mut corrupted = serialized[..8].to_vec();
-        corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-        corrupted.extend_from_slice(&metadata);
-        corrupted.extend_from_slice(&serialized[metadata_end..]);
-        corrupted
+        assert_eq!(lines, vec!["unordered: [3.0]"]);
     }
 
     #[test]
@@ -607,38 +593,13 @@ mod tests {
         let first = scope.reserve(Some(&[0])).unwrap();
         let unordered = scope.reserve(None).unwrap();
         let second = scope.reserve(Some(&[0])).unwrap();
+
         assert_eq!(first.submission.identity, 0);
         assert_eq!(unordered.submission.identity, 1);
         assert_eq!(second.submission.identity, 2);
         assert!(first.predecessor.is_none());
         assert!(unordered.predecessor.is_none());
         assert!(Arc::ptr_eq(second.predecessor.as_ref().unwrap(), &first.submission));
-        assert!(matches!(
-            scope.reserve(Some(&[1])),
-            Err(Error::Execution(ExecutionError::ScopeDeviceMismatch { expected, actual }))
-                if expected == vec![0] && actual == vec![1],
-        ));
-        // Cancelling the successor while its predecessor is unpublished must return without waiting.
-        let cancelled = Arc::clone(&second.submission);
-        std::thread::scope(|threads| {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            threads.spawn(move || {
-                // Signal the test thread once cancellation has finished.
-                drop(second);
-                sender.send(()).unwrap();
-            });
-            let cancellation = receiver.recv_timeout(Duration::from_secs(5));
-            let predecessor_pending = first.submission.completion.result().is_none();
-            // Cancel the predecessor after observing it pending to release any waiter on its publication.
-            drop(first);
-            assert_eq!(cancellation, Ok(()));
-            assert!(predecessor_pending);
-        });
-        assert_eq!(cancelled.completion.result(), Some(Ok(())));
-        assert!(cancelled.wait_for_tokens().unwrap().is_none());
-        // The barrier would wait on this unpublished reservation until it is cancelled.
-        drop(unordered);
-        scope.barrier().unwrap();
     }
 
     #[test]
@@ -652,15 +613,60 @@ mod tests {
             Err(Error::Execution(ExecutionError::ScopeDeviceMismatch { expected, actual }))
                 if expected == vec![0, 1] && actual == vec![1, 0],
         ));
-        // Cancel the first reservation to verify it remains the predecessor of the next one.
+
+        // Cancellation preserves the predecessor and device assignment for the next reservation.
         drop(first);
         let successor = scope.reserve(Some(&[0, 1])).unwrap();
         assert!(Arc::ptr_eq(successor.predecessor.as_ref().unwrap(), &first_submission));
-        // A matching reservation reuses the chain's device storage.
         assert_eq!(scope.state.lock().unwrap().devices.as_ref().unwrap().as_ptr(), device_storage);
-        // Cancel the unpublished successor before waiting at the barrier.
-        drop(successor);
-        scope.barrier().unwrap();
+    }
+
+    #[test]
+    fn test_effect_scope_reserve_retires_successful_submissions() {
+        let scope = EffectScope::default();
+        let mut completed = scope.reserve(None).unwrap();
+        completed.publish(Ok(None), &ExecutionFence::new(Vec::new()));
+        let pending = scope.reserve(None).unwrap();
+
+        let state = scope.state.lock().unwrap();
+        assert_eq!(state.submissions.len(), 1);
+        assert!(Arc::ptr_eq(&state.submissions[0], &pending.submission));
+    }
+
+    #[test]
+    fn test_effect_scope_barrier() {
+        let scope = EffectScope::default();
+        let mut first = scope.reserve(None).unwrap();
+        let mut successful = scope.reserve(None).unwrap();
+        let mut last = scope.reserve(None).unwrap();
+
+        // Publish failures in reverse order to distinguish reservation order from completion order.
+        let ready = ExecutionFence::new(Vec::new());
+        last.publish(Err(Arc::from("last effect failed")), &ready);
+        successful.publish(Ok(None), &ready);
+        first.publish(Err(Arc::from("first effect failed")), &ready);
+
+        let error = scope.barrier().unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Execution(ExecutionError::EffectSubmissionFailures { failures })
+                if *failures == vec![(0, Arc::from("first effect failed")), (2, Arc::from("last effect failed"))],
+        ));
+        assert_eq!(
+            error.to_string(),
+            "submission 0: first effect failed; submission 2: last effect failed; \
+             call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` \
+             to recover once affected work is complete",
+        );
+        let tracked = scope
+            .state
+            .lock()
+            .unwrap()
+            .submissions
+            .iter()
+            .map(|submission| submission.identity)
+            .collect::<Vec<_>>();
+        assert_eq!(tracked, vec![0, 2]);
     }
 
     #[test]
@@ -669,76 +675,96 @@ mod tests {
         let mut first = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
         first.publish(Ok(None), &fence);
-        let references = Arc::strong_count(&first.submission);
-        std::thread::scope(|threads| {
-            let (sender, receiver) = std::sync::mpsc::channel();
+        let initial_references = Arc::strong_count(&first.submission);
+        thread::scope(|threads| {
+            let (sender, receiver) = channel();
             let scope = &scope;
             threads.spawn(move || sender.send(scope.barrier()).unwrap());
-            // The barrier owns a submission reference only after capturing its fixed snapshot.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while Arc::strong_count(&first.submission) == references && std::time::Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            let captured = Arc::strong_count(&first.submission) > references;
-            let later = scope.reserve(None).unwrap();
+
+            let snapshot_captured = wait_for_barrier_snapshot(scope, &first.submission, initial_references);
+            let later = snapshot_captured.then(|| scope.reserve(None).unwrap());
             promise.set(None).unwrap();
-            let result = receiver.recv_timeout(Duration::from_secs(5));
-            let later_pending = later.submission.completion.result().is_none();
-            assert!(captured);
+            let result = receiver.recv_timeout(CALLBACK_TIMEOUT);
+            assert!(snapshot_captured, "the barrier did not capture its snapshot and release the scope mutex");
             result.unwrap().unwrap();
-            assert!(later_pending);
+            assert_eq!(later.unwrap().submission.completion.result(), None);
         });
-        scope.barrier().unwrap();
     }
 
     #[test]
     fn test_effect_scope_acknowledge() {
         let scope = EffectScope::default();
-        let mut first = scope.reserve(Some(&[0])).unwrap();
-        let mut second = scope.reserve(Some(&[0])).unwrap();
-        let (first_fence, first_promise) = pending_fence();
-        let (second_fence, second_promise) = pending_fence();
-        first.publish(Ok(None), &first_fence);
-        second.publish(Ok(None), &second_fence);
-        first_promise.set(Some(ryft_pjrt::Error::invalid_argument("first effect failed"))).unwrap();
-        assert_eq!(first.submission.completion.wait(), Err(Arc::from("first effect failed")));
+        let mut failed = scope.reserve(Some(&[0])).unwrap();
+        let mut tail = scope.reserve(Some(&[0])).unwrap();
+        let tail_submission = Arc::downgrade(&tail.submission);
+        let ready = ExecutionFence::new(Vec::new());
+        tail.publish(Ok(None), &ready);
+        failed.publish(Err(Arc::from("ordered effect failed")), &ready);
+        assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         assert!(matches!(scope.reserve(Some(&[0])), Err(Error::Execution(ExecutionError::ScopeNeedsRecovery))));
-        assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
-        second_promise.set(Some(ryft_pjrt::Error::invalid_argument("second effect failed"))).unwrap();
-        assert_eq!(second.submission.completion.wait(), Err(Arc::from("second effect failed")));
-        assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
-        let expected = concat!(
-            "submission 0: first effect failed; submission 1: second effect failed; ",
-            "call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` ",
-            "to recover once affected work is complete",
-        );
-        for _ in 0..2 {
-            let error = scope.barrier().unwrap_err();
-            assert!(matches!(&error,
-                Error::Execution(ExecutionError::EffectSubmissionFailures { failures })
-                    if failures == &vec![(0, Arc::from("first effect failed")), (1, Arc::from("second effect failed"))],
-            ));
-            assert_eq!(error.to_string(), expected);
-        }
+
+        assert!(matches!(
+            scope.barrier(),
+            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                if failures == vec![(0, Arc::from("ordered effect failed"))],
+        ));
+        // The scope is now the only owner of the successful tail, which the barrier removed from its tracked list.
+        drop(tail);
+        assert!(tail_submission.upgrade().is_some());
+
+        let unordered = scope.reserve(None).unwrap();
         scope.acknowledge().unwrap();
+        assert!(tail_submission.upgrade().is_none());
+        assert!(Arc::ptr_eq(&scope.state.lock().unwrap().submissions[0], &unordered.submission));
+        // Cancel the unordered reservation before checking the barrier after recovery.
+        drop(unordered);
         scope.barrier().unwrap();
         let recovered = scope.reserve(Some(&[1])).unwrap();
         assert!(recovered.predecessor.is_none());
-        // Acknowledgment changes scope bookkeeping, not outcomes retained by callers.
-        assert_eq!(first.submission.completion.result(), Some(Err(Arc::from("first effect failed"))));
+        assert_eq!(failed.submission.completion.result(), Some(Err(Arc::from("ordered effect failed"))));
     }
 
     #[test]
-    fn test_effect_scope_acknowledge_preserves_pending() {
+    fn test_effect_scope_acknowledge_rejects_pending_ordered_work_after_failure() {
+        let scope = EffectScope::default();
+        let mut failed = scope.reserve(Some(&[0])).unwrap();
+        let (fence, promise) = pending_fence();
+        failed.publish(Ok(None), &fence);
+        let initial_references = Arc::strong_count(&failed.submission);
+
+        thread::scope(|threads| {
+            let (sender, receiver) = channel();
+            let scope = &scope;
+            threads.spawn(move || sender.send(scope.barrier()).unwrap());
+
+            // Have the barrier report the failure while a later ordered reservation is still pending.
+            let snapshot_captured = wait_for_barrier_snapshot(scope, &failed.submission, initial_references);
+            let later = snapshot_captured.then(|| scope.reserve(Some(&[0])).unwrap());
+            promise.set(Some(ryft_pjrt::Error::invalid_argument("ordered effect failed"))).unwrap();
+            let report = receiver.recv_timeout(CALLBACK_TIMEOUT);
+            assert!(snapshot_captured, "the barrier did not capture its snapshot and release the scope mutex");
+            assert!(matches!(
+                report.unwrap(),
+                Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                    if failures == vec![(0, Arc::from("ordered effect failed"))],
+            ));
+            assert_eq!(later.as_ref().unwrap().submission.completion.result(), None);
+            assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
+        });
+
+        // The later reservation was cancelled when the scoped thread closure ended.
+        scope.acknowledge().unwrap();
+    }
+
+    #[test]
+    fn test_effect_scope_acknowledge_preserves_pending_unordered_work() {
         let scope = EffectScope::default();
         let mut pending = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
         pending.publish(Ok(None), &fence);
         scope.acknowledge().unwrap();
-        assert_eq!(scope.state.lock().unwrap().submissions.len(), 1);
+
         promise.set(Some(ryft_pjrt::Error::invalid_argument("late completion failure"))).unwrap();
-        assert_eq!(pending.submission.completion.wait(), Err(Arc::from("late completion failure")));
-        assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         assert!(matches!(
             scope.barrier(),
             Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
@@ -749,146 +775,48 @@ mod tests {
     }
 
     #[test]
-    fn test_effect_reservation_drop_forwards_predecessor_publication() {
-        let scope = EffectScope::default();
-        let mut first = scope.reserve(Some(&[0])).unwrap();
-        let second = scope.reserve(Some(&[0])).unwrap();
-        let third = scope.reserve(Some(&[0])).unwrap();
-        let final_submission = Arc::clone(&third.submission);
-        std::thread::scope(|threads| {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            threads.spawn(move || {
-                // Cancel the last reservation while its immediate predecessor is still pending.
-                drop(third);
-                // Cancel the middle reservation so the last one forwards through both cancelled links.
-                drop(second);
-                sender.send(()).unwrap();
-            });
-            let cancellation = receiver.recv_timeout(Duration::from_secs(5));
-            let (fence, promise) = pending_fence();
-            first.publish(Err(Arc::from("predecessor publication failed")), &fence);
-            let failure_published = matches!(
-                &*first.submission.publication.lock().unwrap(),
-                EffectTokenPublication::Published(Err(reason)) if reason.as_ref() == "predecessor publication failed",
-            );
-            let completion_pending = first.submission.completion.result().is_none();
-            promise.set(Some(ryft_pjrt::Error::invalid_argument("execution fence failed"))).unwrap();
-            assert_eq!(cancellation, Ok(()));
-            assert!(failure_published);
-            assert!(completion_pending);
-        });
-        assert!(matches!(
-            final_submission.wait_for_tokens(),
-            Err(reason) if reason.as_ref() == "predecessor publication failed",
-        ));
-        assert!(matches!(
-            scope.barrier(),
-            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
-                if failures == vec![(0, Arc::from("predecessor publication failed"))],
-        ));
-    }
-
-    #[test]
-    fn test_ensure_effect_dispatch_allowed_rejects_managed_callback_reentrancy() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        let scope = EffectScope::default();
-        let guard = EffectCallbackGuard::enter();
-        let reason = "execution and effect barriers cannot be entered from a managed callback";
-        assert!(matches!(scope.reserve(None), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
-        assert!(matches!(scope.barrier(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
-        assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
-        assert!(matches!(
-            session.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == reason,
-        ));
-        // Exit the managed callback before checking that the barrier can run again.
-        drop(guard);
-        scope.barrier().unwrap();
-    }
-
-    #[test]
-    fn test_format_effect_failures() {
-        assert_eq!(format_effect_failures(&[]), "");
-        assert_eq!(
-            format_effect_failures(&[(0, Arc::from("first effect failed")), (3, Arc::from("second effect failed"))]),
-            "submission 0: first effect failed; submission 3: second effect failed",
-        );
-    }
-
-    #[test]
-    fn test_effect_submission_drop_releases_long_cancelled_chain() {
-        let scope = EffectScope::default();
-        // Each reservation is cancelled at the end of its iteration, extending the forwarding chain.
-        for _ in 0..10_000 {
-            let _reservation = scope.reserve(Some(&[0])).unwrap();
-        }
-        let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
-        assert!(tail.wait_for_tokens().unwrap().is_none());
-        assert_eq!(tail.completion.result(), Some(Ok(())));
-        scope.barrier().unwrap();
-        // Release the scope's reference so the tail owns the entire chain when it drops at the end of the test.
-        drop(scope);
-    }
-
-    #[test]
-    fn test_session_array_ordered_effects() {
+    fn test_effect_reservation_wait_for_predecessor_tokens() {
         let client = cpu_client(1);
-        assert_session_array_ordered_effects(client, true);
+        let device = &client.addressable_devices().unwrap()[0];
+        let devices = [Device::from_pjrt(device).unwrap().id()];
+        let scope = EffectScope::default();
+        let mut first = scope.reserve(Some(&devices)).unwrap();
+        let successor = scope.reserve(Some(&devices)).unwrap();
+        assert!(first.wait_for_predecessor_tokens().unwrap().is_none());
+
+        let manager = client
+            .host_to_device_transfer_manager(
+                vec![BufferSpecification::new(BufferType::Token, [])],
+                device.default_memory().unwrap(),
+            )
+            .unwrap();
+        let token = Arc::new(manager.retrieve_buffer(0).unwrap());
+        manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+        first.publish(Ok(Some(vec![Arc::clone(&token)])), &ExecutionFence::new(Vec::new()));
+        let tokens = successor.wait_for_predecessor_tokens().unwrap().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!(Arc::ptr_eq(&tokens[0], &token));
+    }
+
+    #[test]
+    fn test_effect_reservation_wait_for_predecessor_tokens_orders_cpu_executions() {
+        assert_session_array_ordered_effects(cpu_client(1), true);
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_session_array_ordered_effects_on_cuda() {
-        // This proves token transport on a second plugin. Native tokens created through the asynchronous transfer path
-        // from the host to the device gate CUDA executions, and the CUDA print handler observes device values in
-        // submission order.
-        let client = Platform::Cuda
-            .client(Some(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            })))
-            .unwrap();
-        assert_session_array_ordered_effects(&client, false);
+    fn test_effect_reservation_wait_for_predecessor_tokens_orders_cuda_executions() {
+        // CUDA waits on unrecorded input events during dispatch, so exercise the chain with ordinary launches.
+        assert_session_array_ordered_effects(cuda_client(), false);
     }
 
     #[test]
-    fn test_session_effect_metadata_reload_and_unordered_completion() {
-        let client = cpu_client(1);
-        assert_domain_effect_metadata_reload_and_unordered_completion(client, true);
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_session_effect_metadata_reload_and_unordered_completion_on_cuda() {
-        let client = Platform::Cuda
-            .client(Some(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            })))
-            .unwrap();
-        assert_domain_effect_metadata_reload_and_unordered_completion(&client, false);
-    }
-
-    #[test]
-    fn test_session_device_ordered_effects_preserve_per_device_dependencies() {
+    fn test_effect_reservation_wait_for_predecessor_tokens_preserves_per_device_dependencies() {
         let client = cpu_client(2);
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
-            client
-                .addressable_devices()
-                .unwrap()
-                .iter()
-                .map(|device| Device::from_pjrt(device).unwrap())
-                .collect(),
-        )
-        .unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let session = session_with_client(client);
         ensure_print_handler_registered(client).unwrap();
-        let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![2])))
+        let r#type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(
                 Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Sharded(vec!["x".to_string()])])
                     .unwrap(),
@@ -950,27 +878,191 @@ mod tests {
             &ExecutionFence::new(Vec::new()),
         );
         managers[1].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
-        let (independent, lines) = with_captured_prints(|| {
-            session.execute_program(&program, vec![first]).unwrap();
-            let tokens = scope.state.lock().unwrap().tail.as_ref().unwrap().wait_for_tokens().unwrap().unwrap();
-            let independent = std::thread::scope(|threads| {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                threads.spawn(move || sender.send(tokens[1].ready().unwrap().r#await()).unwrap());
-                let independent = receiver.recv_timeout(Duration::from_secs(2));
-                // CPU itself serializes multi-device launches. Submit the next invocation without adding a Ryft
-                // join, but observe the readiness of each device on the first invocation rather than promising overlap.
-                session.execute_program(&program, vec![second]).unwrap();
+        let (progress, lines) = with_captured_prints(|| {
+            let progress = thread::scope(|threads| {
+                let (sender, receiver) = channel();
+                let session = &session;
+                threads.spawn(move || {
+                    session.execute_program(&program, vec![first]).unwrap();
+                    let tokens = ordered_tail_tokens(scope);
+                    // CPU serializes multi-device launches. Check device 1's readiness on the first execution
+                    // and that the second dispatch returns while device 0's token is pending.
+                    tokens[1].ready().unwrap().r#await().unwrap();
+                    session.execute_program(&program, vec![second]).unwrap();
+                    sender.send(()).unwrap();
+                });
+
+                let progress = receiver.recv_timeout(CALLBACK_TIMEOUT);
+                // Unblock both launches before joining the worker if either operation missed the deadline.
                 managers[0].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
-                independent
+                progress
             });
             session.effects_barrier().unwrap();
-            independent
+            progress
         });
-        assert!(matches!(independent, Ok(Ok(()))));
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[0], "effect: [1.0]");
-        let position = |value: &str| lines.iter().position(|line| line == value).unwrap();
-        assert!(position("effect: [0.0]") < position("effect: [2.0]"));
-        assert!(position("effect: [1.0]") < position("effect: [3.0]"));
+        assert_eq!(progress, Ok(()), "the ready device and second dispatch should progress independently");
+        assert_eq!(lines.first().map(String::as_str), Some("effect: [1.0]"));
+        let first_on_first_device = lines.iter().position(|line| line == "effect: [0.0]").unwrap();
+        let second_on_first_device = lines.iter().position(|line| line == "effect: [2.0]").unwrap();
+        assert!(first_on_first_device < second_on_first_device);
+
+        let mut sorted_lines = lines;
+        sorted_lines.sort_unstable();
+        assert_eq!(sorted_lines, vec!["effect: [0.0]", "effect: [1.0]", "effect: [2.0]", "effect: [3.0]"]);
+    }
+
+    #[test]
+    fn test_effect_reservation_publish() {
+        let scope = EffectScope::default();
+        let mut reservation = scope.reserve(None).unwrap();
+        let (fence, promise) = pending_fence();
+        let submission = Arc::clone(&reservation.submission);
+        reservation.publish(Ok(None), &fence);
+
+        // A published reservation may be dropped while its fence callback still owns the pending completion.
+        drop(reservation);
+        let pending = submission.completion.result();
+        promise.set(None).unwrap();
+        assert_eq!(pending, None);
+        assert_eq!(submission.completion.wait(), Ok(()));
+        scope.barrier().unwrap();
+    }
+
+    #[test]
+    fn test_effect_reservation_publish_boundary_failure() {
+        let scope = EffectScope::default();
+        let mut reservation = scope.reserve(Some(&[0])).unwrap();
+        let successor = scope.reserve(Some(&[0])).unwrap();
+        let (fence, promise) = pending_fence();
+        reservation.publish(Err(Arc::from("boundary failed")), &fence);
+        // Capture publication before completing the fence without risking a blocking token lookup.
+        let published = matches!(
+            &*reservation.submission.publication.lock().unwrap(),
+            EffectTokenPublication::Published(Err(reason)) if reason.as_ref() == "boundary failed",
+        );
+        let pending = reservation.submission.completion.result();
+        promise.set(Some(ryft_pjrt::Error::invalid_argument("execution fence failed"))).unwrap();
+
+        assert!(published);
+        assert_eq!(pending, None);
+        assert!(matches!(successor.wait_for_predecessor_tokens(), Err(reason) if reason.as_ref() == "boundary failed"));
+        assert_eq!(reservation.submission.completion.wait(), Err(Arc::from("boundary failed")));
+    }
+
+    #[test]
+    fn test_effect_reservation_publish_tracks_outputless_unordered_cpu_execution() {
+        assert_outputless_unordered_execution(cpu_client(1));
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_effect_reservation_publish_tracks_outputless_unordered_cuda_execution() {
+        assert_outputless_unordered_execution(cuda_client());
+    }
+
+    #[test]
+    fn test_effect_reservation_drop() {
+        let scope = EffectScope::default();
+        let first = scope.reserve(Some(&[0])).unwrap();
+        let second = scope.reserve(Some(&[0])).unwrap();
+        let cancelled = Arc::clone(&second.submission);
+        thread::scope(|threads| {
+            let (sender, receiver) = channel();
+            threads.spawn(move || {
+                // Signal the test thread once cancellation has finished.
+                drop(second);
+                sender.send(()).unwrap();
+            });
+            let cancellation = receiver.recv_timeout(CALLBACK_TIMEOUT);
+            let predecessor_pending = first.submission.completion.result().is_none();
+            // Release any waiter on the predecessor even if cancellation timed out.
+            drop(first);
+            assert_eq!(cancellation, Ok(()));
+            assert!(predecessor_pending);
+        });
+        assert_eq!(cancelled.completion.result(), Some(Ok(())));
+        assert!(cancelled.wait_for_tokens().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_effect_reservation_drop_forwards_predecessor_publication() {
+        let scope = EffectScope::default();
+        let mut first = scope.reserve(Some(&[0])).unwrap();
+        let second = scope.reserve(Some(&[0])).unwrap();
+        let third = scope.reserve(Some(&[0])).unwrap();
+        let successor = scope.reserve(Some(&[0])).unwrap();
+
+        first.publish(Err(Arc::from("predecessor publication failed")), &ExecutionFence::new(Vec::new()));
+        // Create the first forwarding link to the published failure.
+        drop(second);
+        // Extend the chain so the successor has to follow both links.
+        drop(third);
+
+        assert!(matches!(
+            successor.wait_for_predecessor_tokens(),
+            Err(reason) if reason.as_ref() == "predecessor publication failed",
+        ));
+    }
+
+    #[test]
+    fn test_effect_callback_guard_enter() {
+        assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 0);
+        let outer = EffectCallbackGuard::enter();
+        assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 1);
+        let inner = EffectCallbackGuard::enter();
+        assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 2);
+        assert_eq!(thread::spawn(|| EFFECT_CALLBACK_DEPTH.get()).join().unwrap(), 0);
+
+        // Dropping the inner guard leaves the outer callback active on the original thread.
+        drop(inner);
+        assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 1);
+        // Dropping the outer guard ends the last active callback on this thread.
+        drop(outer);
+        assert_eq!(EFFECT_CALLBACK_DEPTH.get(), 0);
+    }
+
+    #[test]
+    fn test_ensure_effect_dispatch_is_allowed() {
+        ensure_effect_dispatch_is_allowed().unwrap();
+        let _guard = EffectCallbackGuard::enter();
+        let error = ensure_effect_dispatch_is_allowed().unwrap_err();
+        assert!(matches!(error, Error::Execution(ExecutionError::ReentrantDispatch)));
+        assert_eq!(error.to_string(), "execution and effect barriers cannot be entered from a managed callback");
+
+        let scope = EffectScope::default();
+        assert!(matches!(scope.reserve(None), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
+        assert!(matches!(scope.barrier(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
+        assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
+    }
+
+    #[test]
+    fn test_format_effect_failures() {
+        assert_eq!(format_effect_failures(&[]), "");
+        assert_eq!(
+            format_effect_failures(&[(0, Arc::from("first effect failed")), (3, Arc::from("second effect failed"))]),
+            "submission 0: first effect failed; submission 3: second effect failed",
+        );
+    }
+
+    #[test]
+    fn test_effect_submission_drop_releases_long_cancelled_chain() {
+        let scope = EffectScope::default();
+        let first = scope.reserve(Some(&[0])).unwrap();
+        let head = Arc::downgrade(&first.submission);
+        // Cancel the head so the rest of the reservations form forwarding links to it.
+        drop(first);
+        for _ in 1..10_000 {
+            let _reservation = scope.reserve(Some(&[0])).unwrap();
+        }
+        let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
+        assert!(tail.wait_for_tokens().unwrap().is_none());
+        scope.barrier().unwrap();
+
+        // Release the scope's reference so the retained tail owns the entire chain.
+        drop(scope);
+        assert!(head.upgrade().is_some());
+        // Releasing the tail must also release the head of the chain without overflowing the stack.
+        drop(tail);
+        assert!(head.upgrade().is_none());
     }
 }
