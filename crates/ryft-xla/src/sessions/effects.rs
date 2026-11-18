@@ -41,6 +41,8 @@ impl EffectScope {
     pub(super) fn reserve(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
         ensure_effect_dispatch_is_allowed()?;
 
+        // Hold extracted submissions until after the scope guard is released, even if reading a completion panics.
+        let mut retired = Vec::new();
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         if devices.is_some()
             && state
@@ -74,26 +76,26 @@ impl EffectScope {
         });
         state.next_identity += 1;
         let predecessor = if devices.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
-        let mut retired = Vec::new();
-        state.submissions.retain(|submission| {
-            if matches!(submission.completion.result(), Some(Ok(()))) {
-                retired.push(Arc::clone(submission));
-                false
-            } else {
-                true
-            }
-        });
+        retired.extend(
+            state
+                .submissions
+                .extract_if(.., |submission| matches!(submission.completion.result(), Some(Ok(())))),
+        );
         state.submissions.push(Arc::clone(&submission));
-
-        // Unlock the scope before retired submissions can destroy their PJRT token buffers.
-        drop(state);
 
         Ok(EffectReservation { submission, predecessor, committed: false })
     }
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Waits for the executions in a snapshot of existing reservations and reports failures in reservation order.
+    /// Takes a snapshot of the scope's current reservations, then waits for each one to finish or be cancelled.
+    /// This includes reservations still preparing device work. Later reservations are handled by a subsequent
+    /// barrier. Reported failures remain in the scope until [`Self::acknowledge`] clears them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::EffectSubmissionFailures`] with all failures from the snapshot in reservation
+    /// order. Returns [`ExecutionError::ReentrantDispatch`] from within a managed effect callback.
     pub(super) fn barrier(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
         let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
@@ -107,23 +109,36 @@ impl EffectScope {
                 Err(error) => failures.push((submission.identity, error)),
             }
         }
+
         {
             let mut state = self.state.lock().expect("effect scope mutex poisoned");
             state.observed.extend(failures.iter().map(|(identity, _)| *identity));
+
             // The snapshot retains each removed submission until after the scope mutex is released.
             state.submissions.retain(|submission| !successful.contains(&submission.identity));
         }
+
         if failures.is_empty() {
             return Ok(());
         }
+
         Err(ExecutionError::EffectSubmissionFailures { failures }.into())
     }
 
-    /// Clears failures reported by a barrier without waiting for execution. Every failure must have been reported.
-    /// When there is an ordered failure, all ordered work must finish before acknowledgment can reset the chain and
-    /// its device assignment. Pending unordered work remains tracked.
+    /// Clears failures reported by [`Self::barrier`] without waiting for pending work. If an ordered execution
+    /// failed, this also resets the ordered chain so the next ordered reservation can choose a new device list.
+    /// Pending unordered work remains tracked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::PrematureAcknowledgment`] if any recorded failure has yet to be reported by a
+    /// barrier, or if an ordered failure has been recorded and any ordered reservation is still pending. Returns
+    /// [`ExecutionError::ReentrantDispatch`] from within a managed effect callback.
     pub(super) fn acknowledge(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
+        // Keep the former tail and extracted submissions alive past the scope guard.
+        let _retired_tail;
+        let mut retired = Vec::new();
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
         // Callbacks publish independently of the scope mutex. Read each completion exactly once so a failure
         // arriving after validation cannot be discarded by the retirement step below.
@@ -143,21 +158,13 @@ impl EffectScope {
             .iter()
             .filter_map(|(identity, _, result)| result.as_ref().map(|_| *identity))
             .collect::<HashSet<_>>();
-        let _retired_tail = if ordered_failure { state.tail.take() } else { None };
+        _retired_tail = if ordered_failure { state.tail.take() } else { None };
         if ordered_failure {
             state.devices = None;
         }
-        let mut retired = Vec::new();
-        state.submissions.retain(|submission| {
-            if completed.contains(&submission.identity) {
-                retired.push(Arc::clone(submission));
-                false
-            } else {
-                true
-            }
-        });
+        retired.extend(state.submissions.extract_if(.., |submission| completed.contains(&submission.identity)));
         state.observed.clear();
-        // Unlock the scope before the retired submissions and the former tail can destroy PJRT token buffers.
+        // Unlock the scope before freeing the completion snapshot and destroying retired token buffers.
         drop(state);
         Ok(())
     }
