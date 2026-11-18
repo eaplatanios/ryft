@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Poll, Waker};
 
@@ -1406,7 +1407,13 @@ impl ExecutionFenceState {
             };
             self.ready.notify_all();
             for callback in callbacks {
-                callback(result.clone());
+                // Catch each panic before it can skip later callbacks or reach PJRT's native callback boundary.
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| callback(result.clone())))
+                    && let Err(drop_panic) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
+                {
+                    // A custom panic payload can panic on drop. Forget the second payload to keep unwinding contained.
+                    std::mem::forget(drop_panic);
+                }
             }
         }
     }
@@ -1541,7 +1548,10 @@ impl ExecutionFence {
             Ok(true) => Poll::Ready(Ok(())),
             Err(error) => Poll::Ready(Err(error)),
             Ok(false) => {
-                *waker.lock().expect("execution fence waker mutex poisoned") = Some(context.waker().clone());
+                let task_waker = context.waker().clone();
+                let previous = waker.lock().unwrap_or_else(PoisonError::into_inner).replace(task_waker);
+                // A waker's destructor can run executor code. Drop it after releasing the slot mutex.
+                drop(previous);
                 if !registered {
                     registered = true;
                     let waker = Arc::clone(&waker);
@@ -1549,8 +1559,10 @@ impl ExecutionFence {
                     // A fence that completed since the readiness check runs this callback inline, which wakes the
                     // task so that it is polled again and observes the terminal result.
                     self.on_ready(move |_| {
-                        if let Some(waker) = waker.lock().expect("execution fence waker mutex poisoned").take() {
-                            waker.wake();
+                        // Take the stored waker before invoking executor code outside the mutex.
+                        let task_waker = waker.lock().unwrap_or_else(PoisonError::into_inner).take();
+                        if let Some(task_waker) = task_waker {
+                            task_waker.wake();
                         }
                     });
                 }
@@ -1567,6 +1579,9 @@ impl ExecutionFence {
     /// which the native event callbacks themselves keep alive, so delivery survives dropping every public
     /// [`ExecutionFence`] handle. The callback must therefore own its captured state for the full asynchronous
     /// lifetime and be safe to send between threads.
+    ///
+    /// During fence completion, each queued callback's unwinding panic is caught so the remaining callbacks can
+    /// run. Panics from callbacks invoked inline by this function propagate to the caller.
     pub fn on_ready(&self, callback: impl FnOnce(Result<(), Error>) + Send + 'static) {
         let Some(state) = &self.state else {
             return callback(Ok(()));
@@ -4636,6 +4651,41 @@ mod tests {
     }
 
     #[test]
+    fn test_execution_fence_ready_delivers_callbacks_after_a_replaced_waker_panics() {
+        /// Waker whose last owner panics when dropped.
+        struct PanickingWaker;
+
+        impl Wake for PanickingWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        impl Drop for PanickingWaker {
+            fn drop(&mut self) {
+                panic!("fixture waker panicked on drop");
+            }
+        }
+
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let mut ready = pin!(fence.ready());
+        let task_waker = Waker::from(Arc::new(PanickingWaker));
+        assert_eq!(ready.as_mut().poll(&mut Context::from_waker(&task_waker)), Poll::Pending);
+
+        // Leave the stored waker as the last owner, so replacing it on the next poll runs its destructor.
+        drop(task_waker);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ready.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        assert_eq!(panic.unwrap_err().downcast_ref::<&str>(), Some(&"fixture waker panicked on drop"));
+
+        let (finished, completed) = mpsc::channel();
+        fence.on_ready(move |result| finished.send(result).unwrap());
+        promise.set(None).unwrap();
+        assert_eq!(completed.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+    }
+
+    #[test]
     fn test_execution_fence_notifies_callbacks_before_and_after_completion() {
         let client = test_cpu_client();
         let (event, promise) = client.event(()).unwrap();
@@ -4648,6 +4698,53 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         fence.on_ready(move |result| sender.send(result).unwrap());
         assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+
+        let panic = catch_unwind(AssertUnwindSafe(|| fence.on_ready(|_| panic!("fixture inline callback panicked"))));
+        assert_eq!(panic.unwrap_err().downcast_ref::<&str>(), Some(&"fixture inline callback panicked"));
+    }
+
+    #[test]
+    fn test_execution_fence_on_ready_continues_after_queued_callbacks_panic() {
+        /// Records the wake attempt before panicking.
+        struct PanickingWaker(AtomicBool);
+
+        impl Wake for PanickingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+                panic!("fixture waker panicked");
+            }
+        }
+
+        /// Panic payload whose destructor also panics.
+        struct PanickingPayload(Arc<AtomicBool>);
+
+        impl Drop for PanickingPayload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+                panic!("fixture panic payload panicked on drop");
+            }
+        }
+
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let wake_attempt = Arc::new(PanickingWaker(AtomicBool::new(false)));
+        let task_waker = Waker::from(Arc::clone(&wake_attempt));
+        let mut context = Context::from_waker(&task_waker);
+        let mut ready = pin!(fence.ready());
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Pending);
+
+        let payload_dropped = Arc::new(AtomicBool::new(false));
+        let payload = PanickingPayload(Arc::clone(&payload_dropped));
+        fence.on_ready(move |_| std::panic::panic_any(payload));
+        let (finished, completed) = mpsc::channel();
+        fence.on_ready(move |result| finished.send(result).unwrap());
+
+        promise.set(None).unwrap();
+        assert_eq!(completed.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        assert!(wake_attempt.0.load(Ordering::SeqCst));
+        assert!(payload_dropped.load(Ordering::SeqCst));
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Ready(Ok(())));
     }
 
     #[test]

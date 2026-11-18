@@ -843,6 +843,7 @@ fn validate_identifier(identifier: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, PoisonError, Weak};
@@ -851,20 +852,13 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{CustomCallAttribute, CustomCallOperation, DeviceMesh};
-    use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiTypeInformation, FfiUserData};
-    use ryft_pjrt::{Client, ExecutionFence};
 
-    use crate::Error;
+    use ryft_pjrt::extensions::ffi::FfiTypeInformation;
+
     use crate::sessions::tests::domain_mesh;
     use crate::tests::execution_client;
 
-    use super::{
-        CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES,
-        RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeInitializationGuard,
-        RuntimeInitializationSlot, RuntimeInitializationState, RuntimeProvider, RuntimeRegistry, RuntimeRequirement,
-        normalize_runtime_requirements,
-    };
+    use super::*;
 
     /// Provider that counts initialization attempts and can fail the next attempt.
     struct CountingProvider {
@@ -926,7 +920,7 @@ mod tests {
 
     /// Poisons `mutex` by unwinding while holding its lock.
     fn poison_mutex<T>(mutex: &Mutex<T>) {
-        let panic = std::panic::catch_unwind(|| {
+        let panic = catch_unwind(|| {
             let _guard = mutex.lock().unwrap();
             panic!("fixture poisoned the mutex");
         });
@@ -940,7 +934,7 @@ mod tests {
         assert_eq!(requirement.identifier(), "test.provider");
         assert_eq!(requirement.abi_version(), 2);
 
-        // Runtime contract identifiers must be non-empty and contain no NUL.
+        // Runtime contract identifiers must be non-empty, fit within the metadata limit, and contain no NUL.
         assert!(matches!(
             RuntimeRequirement::new("", 1),
             Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
@@ -951,7 +945,6 @@ mod tests {
             Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
                 if reason == "identifier must be non-empty and contain no NUL",
         ));
-
         assert!(matches!(
             RuntimeRequirement::new("x".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1), 1),
             Err(Error::SizeLimitExceeded { message })
@@ -992,6 +985,18 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "invalid runtime requirement: identifier must be non-empty and contain no NUL",
+        );
+
+        // Serialized contracts carry only an identifier and an ABI version.
+        assert_eq!(
+            serde_json::from_value::<RuntimeRequirement>(serde_json::json!({
+                "identifier": "test.provider",
+                "abi_version": 2,
+                "configuration": [],
+            }))
+            .unwrap_err()
+            .to_string(),
+            "unknown field `configuration`, expected `identifier` or `abi_version`",
         );
     }
 
@@ -1105,6 +1110,75 @@ mod tests {
     }
 
     #[test]
+    fn test_execution_resources_client() {
+        let client = execution_client();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let resources = prepare_without_requirements(&registry);
+        assert!(std::ptr::eq(resources.client(), client));
+    }
+
+    #[test]
+    fn test_execution_resources_retain() {
+        let registry = RuntimeRegistry::new(execution_client(), RuntimeExtensions::empty());
+        let mut resources = prepare_without_requirements(&registry);
+        let drops = Arc::new(AtomicUsize::new(0));
+        resources.retain(DropCounter(Arc::clone(&drops)));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(resources);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_execution_resources_add_ffi_user_data() {
+        let client = execution_client();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let mut resources = prepare_without_requirements(&registry);
+        let name = "ryft.test.execution_resources";
+        let type_id = FfiTypeId::from_name(name);
+        assert_eq!(client.register_ffi_type(name, type_id, FfiTypeInformation::new(None)).unwrap(), type_id);
+        assert!(resources.context.is_none());
+
+        let value = Arc::new(42i32);
+        let pointer = Arc::as_ptr(&value).cast_mut().cast();
+        resources.retain(value);
+        // SAFETY: The retained Arc keeps the registered value alive at a stable address.
+        unsafe { resources.add_ffi_user_data(FfiUserData::new(type_id, pointer)) }.unwrap();
+        assert!(resources.context.is_some());
+        // SAFETY: The same Arc still owns the value for this duplicate binding attempt.
+        assert!(matches!(
+            unsafe { resources.add_ffi_user_data(FfiUserData::new(type_id, pointer)) },
+            Err(Error::Runtime(RuntimeError::DuplicateUserData { type_id: actual })) if actual == i64::from(type_id),
+        ));
+    }
+
+    #[test]
+    fn test_execution_resources_into_parts() {
+        let client = execution_client();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let (context, retained) = prepare_without_requirements(&registry).into_parts();
+        assert!(context.is_none());
+        assert!(retained.is_none());
+
+        // An execution context can borrow from an extension even without an additional resource.
+        let mut resources = prepare_without_requirements(&registry);
+        resources.context = Some(client.execution_context().unwrap());
+        let (context, retained) = resources.into_parts();
+        assert!(context.is_some());
+        assert!(retained.unwrap().is_empty());
+
+        let mut resources = prepare_without_requirements(&registry);
+        let drops = Arc::new(AtomicUsize::new(0));
+        resources.retain(DropCounter(Arc::clone(&drops)));
+        let (context, retained) = resources.into_parts();
+        assert!(context.is_none());
+        let retained = retained.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(retained);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn test_runtime_extensions_new() {
         let expected = [
             "ryft.assert",
@@ -1133,6 +1207,11 @@ mod tests {
             configuration.with_provider(provider),
             Err(Error::Runtime(RuntimeError::DuplicateProvider { identifier })) if identifier == "test.provider",
         ));
+        assert!(matches!(
+            RuntimeExtensions::empty().with_provider(Arc::new(CountingProvider::new(""))),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "identifier must be non-empty and contain no NUL",
+        ));
     }
 
     #[test]
@@ -1146,6 +1225,11 @@ mod tests {
         assert!(matches!(
             RuntimeExtensions::empty().with_replaced_provider(replacement),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.provider",
+        ));
+        assert!(matches!(
+            RuntimeExtensions::empty().with_replaced_provider(Arc::new(CountingProvider::new(""))),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "identifier must be non-empty and contain no NUL",
         ));
     }
 
@@ -1168,51 +1252,6 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_resources_client() {
-        let client = execution_client();
-        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
-        let resources = prepare_without_requirements(&registry);
-        assert!(std::ptr::eq(resources.client(), client));
-    }
-
-    #[test]
-    fn test_execution_resources_retain() {
-        let registry = RuntimeRegistry::new(execution_client(), RuntimeExtensions::empty());
-        let mut resources = prepare_without_requirements(&registry);
-        let drops = Arc::new(AtomicUsize::new(0));
-        resources.retain(DropCounter(Arc::clone(&drops)));
-        let (context, retained) = resources.into_parts();
-        assert!(context.is_none());
-        assert!(retained.is_some());
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        drop(retained);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_execution_resources_add_ffi_user_data() {
-        let client = execution_client();
-        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
-        let mut resources = prepare_without_requirements(&registry);
-        let name = "ryft.test.execution_resources";
-        let type_id = FfiTypeId::from_name(name);
-        assert_eq!(client.register_ffi_type(name, type_id, FfiTypeInformation::new(None)).unwrap(), type_id);
-        assert!(resources.context.is_none());
-
-        let value = Arc::new(42i32);
-        let pointer = Arc::as_ptr(&value).cast_mut().cast();
-        resources.retain(value);
-        // SAFETY: The retained Arc keeps the registered value alive at a stable address.
-        unsafe { resources.add_ffi_user_data(FfiUserData::new(type_id, pointer)) }.unwrap();
-        assert!(resources.context.is_some());
-        // SAFETY: The same Arc still owns the value for this duplicate binding attempt.
-        assert!(matches!(
-            unsafe { resources.add_ffi_user_data(FfiUserData::new(type_id, pointer)) },
-            Err(Error::Runtime(RuntimeError::DuplicateUserData { type_id: actual })) if actual == i64::from(type_id),
-        ));
-    }
-
-    #[test]
     fn test_runtime_registry_ensure() {
         let client = execution_client();
         let provider = Arc::new(CountingProvider::new("test.provider"));
@@ -1225,8 +1264,13 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         first.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        // Each registry keeps its own instance, and each instance implements one ABI version.
         second.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        first.ensure(&[RuntimeRequirement::new("test.provider", 2).unwrap()]).unwrap();
+        first.ensure(&requirements).unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -1237,8 +1281,11 @@ mod tests {
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = RuntimeRegistry::new(client, configuration);
         let requirements = [RuntimeRequirement::builtin("test.provider")];
-        let error = registry.ensure(&requirements).unwrap_err();
-        assert_eq!(error.downcast_custom::<std::io::Error>().unwrap().to_string(), "fixture initialization failed",);
+        assert!(matches!(
+            registry.ensure(&requirements),
+            Err(error) if error.downcast_custom::<std::io::Error>()
+                .is_some_and(|error| error.to_string() == "fixture initialization failed"),
+        ));
         registry.ensure(&requirements).unwrap();
         registry.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
@@ -1279,9 +1326,9 @@ mod tests {
 
         let client = execution_client();
         let (started, initializing) = mpsc::channel();
-        let (publish, permission) = mpsc::channel();
+        let (publish, publication) = mpsc::channel();
         let provider =
-            Arc::new(BlockingProvider { calls: AtomicUsize::new(0), started, publish: Mutex::new(permission) });
+            Arc::new(BlockingProvider { calls: AtomicUsize::new(0), started, publish: Mutex::new(publication) });
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = Arc::new(RuntimeRegistry::new(client, configuration));
         let start = Arc::new(Barrier::new(2));
@@ -1295,10 +1342,12 @@ mod tests {
         };
         let first = spawn();
         let second = spawn();
-        initializing.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = completed.recv_timeout(Duration::from_millis(100));
+        let started = initializing.recv_timeout(Duration::from_secs(5));
+        // The barrier lets both callers start. Sample their results while the provider is still blocked.
+        let before_publication = completed.recv_timeout(Duration::from_millis(100));
         publish.send(()).unwrap();
-        assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+        started.unwrap();
+        assert!(matches!(before_publication, Err(RecvTimeoutError::Timeout)));
         completed.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         completed.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         first.join().unwrap();
@@ -1349,7 +1398,7 @@ mod tests {
             ensure(),
             Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier })) if identifier == "test.recursive",
         ));
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ensure)).unwrap_err();
+        let panic = catch_unwind(AssertUnwindSafe(ensure)).unwrap_err();
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"fixture initializer unwound"));
         ensure().unwrap();
         ensure().unwrap();
@@ -1370,7 +1419,7 @@ mod tests {
             registry: OnceLock<Weak<RuntimeRegistry>>,
 
             /// Rendezvous ensuring both outer initializers have started before either reenters.
-            started: Arc<std::sync::Barrier>,
+            started: Arc<Barrier>,
 
             /// Dependencies are requested once so a rejected attempt can be retried independently.
             reenter: AtomicBool,
@@ -1536,6 +1585,9 @@ mod tests {
         let (event, promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![event]);
 
+        registry.retain(&fence, None);
+        let pending_without_resources = registry.pending.lock().unwrap().len();
+
         // A submission can still be running when its resources reach a poisoned pending list.
         poison_mutex(&registry.pending);
         registry.retain(&fence, retained);
@@ -1543,6 +1595,7 @@ mod tests {
         let drops_before_completion = drops.load(Ordering::SeqCst);
         promise.set(None).unwrap();
         fence.block_until_ready().unwrap();
+        assert_eq!(pending_without_resources, 0);
         assert_eq!(pending_before_completion, 1);
         assert_eq!(drops_before_completion, 0);
 
@@ -1561,8 +1614,7 @@ mod tests {
         let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         let mut resources = prepare_without_requirements(&registry);
         resources.context = Some(client.execution_context().unwrap());
-        let (context, retained) = resources.into_parts();
-        assert!(context.is_some());
+        let (_context, retained) = resources.into_parts();
 
         let (event, promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![event]);
@@ -1571,20 +1623,6 @@ mod tests {
         promise.set(None).unwrap();
         fence.block_until_ready().unwrap();
         assert_eq!(pending_before_completion, 1);
-    }
-
-    #[test]
-    fn test_runtime_registry_retain_skips_submissions_without_resources() {
-        let client = execution_client();
-        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
-        let (_, retained) = prepare_without_requirements(&registry).into_parts();
-        let (event, promise) = client.event(()).unwrap();
-        let fence = ExecutionFence::new(vec![event]);
-        registry.retain(&fence, retained);
-        let pending_before_completion = registry.pending.lock().unwrap().len();
-        promise.set(None).unwrap();
-        fence.block_until_ready().unwrap();
-        assert_eq!(pending_before_completion, 0);
     }
 
     #[test]
@@ -1612,13 +1650,13 @@ mod tests {
             released.send(()).unwrap();
         });
         let started = waiting.recv_timeout(Duration::from_secs(5));
-        let early = completed.recv_timeout(Duration::from_millis(100));
+        let before_completion = completed.recv_timeout(Duration::from_millis(100));
         let drops_before_completion = drops.load(Ordering::SeqCst);
         // Release the last event even if teardown finished early, so a failing assertion cannot strand a waiter.
         second_promise.set(None).unwrap();
 
         started.unwrap();
-        assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+        assert_eq!(before_completion, Err(RecvTimeoutError::Timeout));
         assert_eq!(drops_before_completion, 0);
         completed.recv_timeout(Duration::from_secs(5)).unwrap();
         teardown.join().unwrap();
