@@ -2524,7 +2524,8 @@ mod tests {
         assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
         let compiled = session.compile_program(&lowered).unwrap();
         let input = |value: i64| {
-            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, value.to_ne_bytes().as_slice())
+                .unwrap()
         };
 
         let (output, lines) = with_captured_prints(|| {
@@ -2613,7 +2614,8 @@ mod tests {
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 5, "{}", lowered.stable_hlo());
         let compiled = session.compile_program(&lowered).unwrap();
         let input = |value: i64| {
-            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, value.to_ne_bytes().as_slice())
+                .unwrap()
         };
 
         let error = session.execute_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
@@ -2733,8 +2735,14 @@ mod tests {
             let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             let compiled = session.compile_program(&lowered).unwrap();
             let input = |value: i64| {
-                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                    .unwrap()
+                Array::from_host_buffer(
+                    &session,
+                    input_type.clone(),
+                    mesh.clone(),
+                    None,
+                    value.to_ne_bytes().as_slice(),
+                )
+                .unwrap()
             };
             let error = session.execute_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
             let expected = if right_value == 0 {
@@ -2915,7 +2923,7 @@ mod tests {
             let compiled = session.compile_program(&lowered).unwrap();
             for passed in [true, false] {
                 let mut inputs = vec![
-                    Array::from_host_buffer(&session, predicate_type.clone(), mesh.clone(), [u8::from(passed)])
+                    Array::from_host_buffer(&session, predicate_type.clone(), mesh.clone(), None, [u8::from(passed)])
                         .unwrap(),
                 ];
                 for (_, data_type, bytes, _) in &observations {
@@ -2924,6 +2932,7 @@ mod tests {
                             &session,
                             replicated_scalar_type(&mesh, *data_type),
                             mesh.clone(),
+                            None,
                             bytes,
                         )
                         .unwrap(),
@@ -3036,7 +3045,7 @@ mod tests {
                 let inputs = [size, limit]
                     .into_iter()
                     .map(|value| {
-                        Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes())
+                        Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, value.to_ne_bytes())
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
@@ -3045,7 +3054,8 @@ mod tests {
             let inputs = [3i64, 1i64]
                 .into_iter()
                 .map(|value| {
-                    Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes()).unwrap()
+                    Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, value.to_ne_bytes())
+                        .unwrap()
                 })
                 .collect::<Vec<_>>();
             let error = session.execute_program(&compiled, inputs).unwrap_err();
@@ -3117,10 +3127,10 @@ mod tests {
             let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             let compiled = session.compile_program(&lowered).unwrap();
             let empty =
-                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 0i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, 0i64.to_ne_bytes()).unwrap();
             assert!(session.execute_program(&compiled, vec![empty]).unwrap().is_empty());
             let nonempty =
-                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 3i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, 3i64.to_ne_bytes()).unwrap();
             let error = session.execute_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
                 ryft_core::AssertionError::FailedElements {

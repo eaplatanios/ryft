@@ -1770,7 +1770,8 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [1, 3, 2, 2])
                 .with_sharding(Sharding::new(explicit_mesh.clone(), placements).unwrap())
                 .unwrap();
-            Array::from_host_buffer(&session, r#type, explicit_device_mesh.clone(), values_to_bytes(values)).unwrap()
+            Array::from_host_buffer(&session, r#type, explicit_device_mesh.clone(), None, values_to_bytes(values))
+                .unwrap()
         };
         for configuration in [
             AttentionConfiguration::new().with_scale(0.5),
@@ -1864,7 +1865,7 @@ mod tests {
                 .with_sharding(Sharding::new(logical_mesh.clone(), placements).unwrap())
                 .unwrap();
             let bytes = values_to_bytes(values(start, dimensions.iter().product()).as_slice());
-            Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap()
         };
         let reference = |dimensions: &[usize], start: f32| {
             CoreArray::from_elements(

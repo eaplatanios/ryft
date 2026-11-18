@@ -252,7 +252,7 @@ mod tests {
             {
                 assert!(!available);
                 assert!(matches!(
-                    Array::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
+                    Array::from_host_buffer(&engine, host_type, mesh.clone(), None, values_to_bytes(&values).as_slice()),
                     Err(Error::Array(error)) if matches!(error.as_ref(),
                         ArrayError::UnsupportedMemory { device_id: actual_device, memory: actual_memory }
                             if *actual_device == device_id && *actual_memory == memory,
@@ -261,9 +261,14 @@ mod tests {
                 continue;
             }
             assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
-            let source =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
-                    .unwrap();
+            let source = Array::from_host_buffer(
+                &engine,
+                input_type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes(&values).as_slice(),
+            )
+            .unwrap();
 
             // A compiled host result must occupy the requested host memory, not just carry host metadata on a device
             // buffer.

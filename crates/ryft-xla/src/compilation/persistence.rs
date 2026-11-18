@@ -1577,6 +1577,7 @@ mod tests {
             &session,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
@@ -1668,6 +1669,7 @@ mod tests {
             &session,
             input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -1973,6 +1975,7 @@ mod tests {
             &session,
             replicated_vector_type(&mesh, 3),
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice(),
         )
         .unwrap();

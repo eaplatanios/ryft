@@ -3453,7 +3453,8 @@ mod tests {
         let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let values = vec![1f64, 2., 3., 4., 5., 6.];
         let input =
-            Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+            Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), None, values_to_bytes(&values))
+                .unwrap();
         let target = input.r#type().into_owned().with_layout(layout.clone());
         let consumer = crate::compile::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
@@ -3488,6 +3489,7 @@ mod tests {
                 &session,
                 output.r#type().into_owned().with_layout(None),
                 mesh.clone(),
+                None,
                 vec![
                     output
                         .addressable_shards()
@@ -3510,7 +3512,7 @@ mod tests {
         // appends hidden extent results. Check the actual buffers rather than trusting their reconstructed types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
-        let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), []).unwrap();
+        let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), None, []).unwrap();
         for source_type in [actual_type, ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]))] {
             for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
                 let mut builder = ArrayIrProgramBuilder::new();
@@ -3592,6 +3594,7 @@ mod tests {
                 &session,
                 ArrayType::new_static(DataType::F64, [rows, 3]),
                 mesh.clone(),
+                None,
                 values_to_bytes(&values),
             )
             .unwrap();
@@ -3599,6 +3602,7 @@ mod tests {
                 &session,
                 ArrayType::scalar(DataType::F64),
                 mesh.clone(),
+                None,
                 values_to_bytes(&[1f64]),
             )
             .unwrap();
@@ -3640,8 +3644,8 @@ mod tests {
             )
             .unwrap();
         let values = (1..=12).map(|value| value as f64).collect::<Vec<_>>();
-        let input =
-            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let input = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, values_to_bytes(&values))
+            .unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let target = input_type.with_layout(layout.clone());
         let output = input.cast(target, &[]).unwrap();

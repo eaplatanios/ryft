@@ -509,7 +509,7 @@ fn upload_bounded_input_host_copy(
         pending.physical_type.data_type(),
     )?;
     report.host_padding_payload_allocations += padding_payload_allocations;
-    let physical = Array::from_host_buffer(session, pending.physical_type, input.mesh().clone(), padded_bytes)?;
+    let physical = Array::from_host_buffer(session, pending.physical_type, input.mesh().clone(), None, padded_bytes)?;
     report.host_to_device_shard_uploads += physical.shards().iter().filter(|shard| shard.buffer().is_some()).count();
     Ok(PendingBoundedInputPublication {
         physical_input_index: pending.physical_input_index,
@@ -825,6 +825,7 @@ mod tests {
             &session,
             exact_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.0; 8]).as_slice(),
         )
         .unwrap();
@@ -868,6 +869,7 @@ mod tests {
             &session,
             smaller_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -930,6 +932,7 @@ mod tests {
             &session,
             actual_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -937,6 +940,7 @@ mod tests {
             &session,
             actual_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
         )
         .unwrap();
@@ -1016,6 +1020,7 @@ mod tests {
             &session,
             actual_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -1076,7 +1081,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let source = Array::from_addressable_buffers(&session, actual_type.clone(), mesh, buffers).unwrap();
+        let source = Array::from_addressable_buffers(&session, actual_type.clone(), mesh, None, buffers).unwrap();
         let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
         let Err(error) =
             materialize_bounded_dynamic_inputs(&session, &signature, &[declared_type], &[actual_type], vec![source])
@@ -1107,6 +1112,7 @@ mod tests {
             &session,
             actual_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -1164,7 +1170,7 @@ mod tests {
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, None, []).unwrap();
 
         // A zero-space input below its bound has an empty dense host copy, so it takes neither the retained cache
         // nor the padding tier, and only its hidden extent scalar is uploaded.
@@ -1199,6 +1205,7 @@ mod tests {
             &session,
             actual_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -1206,6 +1213,7 @@ mod tests {
             &session,
             actual_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
         )
         .unwrap();

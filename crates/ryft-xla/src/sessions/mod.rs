@@ -188,10 +188,10 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 ///
 /// ```
 /// # use ryft_core::{ArrayType, DataType, Print};
-/// # use ryft_xla::{Platform, Session};
+/// # use ryft_xla::{Array, Platform, Session};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let session = Session::builder().platform(Platform::Cpu).build()?;
-/// let value = session.array(ArrayType::scalar(DataType::F64), 1.0f64.to_ne_bytes())?;
+/// let value = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F64), None, None, 1.0f64.to_ne_bytes())?;
 /// value.print("value");
 /// session.effects_barrier()?;
 /// # Ok(())
@@ -380,45 +380,52 @@ impl Session {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Uploads the dense row-major host bytes in `buffer` into a new [`Array`] of type `r#type` that belongs to this
-    /// session. Refer to the documentation of [`Array::from_host_buffer`] for information on how the bytes are
-    /// distributed over the devices.
+    /// Reserves a place in this handle's effect scope before submitting a program with effects to PJRT. The
+    /// reservation is visible to [`Self::effects_barrier`] during submission setup.
     ///
-    /// The array is placed like every other eager value that is created from no array inputs (e.g., constants and
-    /// zeros). It lives on the mesh of this handle, if the handle has one, so
-    /// `session.with_device_mesh(mesh).array(..)` uploads to a specific mesh. Otherwise, a sharding of `r#type`
-    /// supplies a logical mesh that is laid over the addressable devices of the client, in the order in which the
-    /// client reports them. A type without a sharding is placed on the first addressable device alone, on a mesh with
-    /// the single axis `x`. In all cases, a type without a sharding is replicated over the resulting mesh.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError::InvalidArgument`] if the addressable devices of the client cannot be queried or are
-    /// fewer than the mesh of `r#type` requires, and the errors of [`Array::from_host_buffer`] otherwise.
-    #[inline]
-    pub fn array<B: AsRef<[u8]>>(&self, r#type: ArrayType, buffer: B) -> Result<Array, Error> {
-        let mesh = self.eager_mesh(&[], std::slice::from_ref(&r#type))?;
-        Array::from_host_buffer(self, r#type, mesh, buffer)
-    }
-
-    /// Reserves an execution in this handle's effect scope. Pass the participating device IDs in PJRT's device
-    /// order to join its ordered I/O chain, or [`None`] to track completion alone.
+    /// See [`EffectScope::reserve`] for device ordering and errors. Before submitting ordered I/O, check for input
+    /// tokens with [`EffectReservation::wait_for_predecessor_tokens`]. Once PJRT accepts the submission, finish the
+    /// handoff with [`EffectReservation::publish`]. Dropping the reservation before handoff cancels it.
     pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
         self.effect_scope.reserve(devices)
     }
 
-    /// Waits for the previously reserved effects of this handle's scope, including unordered I/O and local assertions.
-    /// The backend may execute work inline, and this function waits only for work that is still pending. Later
-    /// reservations and other scopes (e.g., those of [`Self::with_new_effect_scope`] handles) are excluded. Failures
-    /// are reported in submission order and retained until explicitly acknowledged. Call this function before the
-    /// process exits to ensure that effects are observed.
+    /// Waits for the executions already reserved in this handle's effect scope to finish or be canceled. This
+    /// includes ordered and unordered I/O, local assertions, and submissions still being prepared. Call this
+    /// function before exiting the process or whenever the host needs those effects to finish, even if there are no
+    /// output arrays to wait on. A subsequent barrier covers later reservations. Handles created with
+    /// [`Self::with_new_effect_scope`] have independent barriers.
+    ///
+    /// If ordered I/O fails, inspect the failures reported by this function, then call
+    /// [`Self::acknowledge_effect_errors`] on the same scope before resuming ordered submissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectSubmissionFailures`](crate::ExecutionError::EffectSubmissionFailures) with failures in
+    /// reservation order. These failures remain in the scope until acknowledged. Returns
+    /// [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
     pub fn effects_barrier(&self) -> Result<(), Error> {
         self.effect_scope.barrier()
     }
 
-    /// Acknowledges failures that a barrier reported after the affected work has completed, without waiting or
-    /// repairing references. If work is pending or unreported, call [`Self::effects_barrier`] and retry this function.
-    /// This never changes errors retained by existing arrays or executions.
+    /// Clears completed failures from this handle's effect scope after [`Self::effects_barrier`] has reported them.
+    /// To recover from an ordered I/O failure, first call the barrier on the same scope and inspect the failures it
+    /// returns. Then call this function to clear them and reset the failed ordered chain. After acknowledgment
+    /// succeeds, the next ordered submission starts a new chain with fresh tokens.
+    ///
+    /// Existing arrays and executions retain their errors. Account for any effects or reference mutations that
+    /// already occurred before retrying the failed execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrematureAcknowledgment`](crate::ExecutionError::PrematureAcknowledgment) if a recorded failure
+    /// has yet to be reported or if the scope has both a recorded ordered failure and pending ordered work.
+    /// This can happen even after [`Self::effects_barrier`] returns. The barrier waits for the reservations in its
+    /// snapshot. Work reserved afterward can fail before acknowledgment and still need to be reported, or later
+    /// ordered work can still be pending when the barrier reports an earlier ordered failure. Call the barrier
+    /// again on the same scope and retry acknowledgment.
+    ///
+    /// Returns [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
     pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.effect_scope.acknowledge()
     }
@@ -486,11 +493,11 @@ impl Session {
     /// Uploads a replicated scalar with the provided host `bytes` and `data_type`, placed through [`Self::eager_mesh`].
     fn eager_scalar(&self, data_type: DataType, bytes: &[u8]) -> Result<Array, ProgramError> {
         let output_type = ArrayType::scalar(data_type);
-        let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
+        let mesh = self.eager_mesh(&[], None)?;
         let output_type = output_type
             .replicated(&mesh)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Array::from_host_buffer(self, output_type, mesh, bytes)
+        Array::from_host_buffer(self, output_type, mesh, None, bytes)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
     }
 
@@ -816,7 +823,8 @@ impl Session {
             .map(<&ArrayType>::try_from)
             .map(|result| result.cloned())
             .collect::<Result<Vec<_>, _>>()?;
-        let mesh = self.eager_mesh(array_inputs, output_types.as_slice())?;
+        let logical_mesh = output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
+        let mesh = self.eager_mesh(array_inputs, logical_mesh)?;
         let mut options = Options::new(mesh);
         // Arguments are placed as their runtime arrays are, including over the auto mesh axes that types never record.
         if array_inputs.iter().any(|array| array.sharding().references_auto_axis()) {
@@ -870,15 +878,19 @@ impl Session {
         Ok(())
     }
 
-    /// Returns the concrete [`DeviceMesh`] used for eager execution of an operation using the provided input values and
-    /// specified output types, preferring the first input's mesh and then the default mesh of this handle, so that an
-    /// operation executes where its inputs live. Without either, the first sharded output supplies a logical mesh,
-    /// which is assembled over the client's addressable devices in enumeration order. If no output supplies a mesh,
-    /// the client's first addressable device forms a mesh with a single device. Deriving placement from output sharding
-    /// supports operations without inputs on recovered sessions without a mesh, including nullary constants synthesized
-    /// by transforms through [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and
-    /// [`Iota`](ryft_core::Iota).
-    fn eager_mesh(&self, inputs: &[Array], output_types: &[ArrayType]) -> Result<DeviceMesh, ProgramError> {
+    /// Resolves the concrete [`DeviceMesh`] for eager execution. The first input's mesh takes precedence over the
+    /// mesh configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in
+    /// enumeration order. If all three are absent, the first addressable device forms a mesh with a single device.
+    ///
+    /// Eager operations derive `logical_mesh` from the first sharded output. This lets transforms place nullary
+    /// constants through [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on
+    /// sessions without a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller
+    /// omits the mesh.
+    pub(crate) fn eager_mesh(
+        &self,
+        inputs: &[Array],
+        logical_mesh: Option<&LogicalMesh>,
+    ) -> Result<DeviceMesh, ProgramError> {
         if let Some(input) = inputs.first() {
             return Ok(input.mesh().clone());
         }
@@ -891,11 +903,7 @@ impl Session {
             .client()
             .addressable_devices()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        if let Some(logical_mesh) =
-            output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh().clone()))
-        {
-            // An operation without inputs and with sharded outputs has no concrete placement to inherit, so materialize
-            // its declared logical mesh over the client's addressable devices in enumeration order.
+        if let Some(logical_mesh) = logical_mesh {
             let device_count = logical_mesh.device_count();
             if devices.len() < device_count {
                 return Err(ProgramError::InvalidArgument {
@@ -918,7 +926,7 @@ impl Session {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            return DeviceMesh::new(logical_mesh, devices)
+            return DeviceMesh::new(logical_mesh.clone(), devices)
                 .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() });
         }
 
@@ -1639,13 +1647,13 @@ pub(crate) mod tests {
     /// Uploads a replicated rank-1 `f32` test array.
     pub(crate) fn f32_vector(session: &Session, mesh: &DeviceMesh, values: &[f32]) -> Array {
         let r#type = replicated_vector_type(mesh, values.len());
-        Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), None, values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
     /// Uploads a replicated `f32` test scalar.
     pub(crate) fn f32_scalar(session: &Session, mesh: &DeviceMesh, value: f32) -> Array {
         let r#type = replicated_scalar_type(mesh, DataType::F32);
-        Array::from_host_buffer(session, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), None, value.to_ne_bytes().as_slice()).unwrap()
     }
 
     /// Uploads a replicated rank-1 `f64` test array.
@@ -1653,7 +1661,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), None, values_to_bytes::<f64>(values).as_slice()).unwrap()
     }
 
     /// Uploads a replicated rank-1 Boolean test array using one byte per element.
@@ -1662,13 +1670,13 @@ pub(crate) mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
-        Array::from_host_buffer(session, r#type, mesh.clone(), values.as_slice()).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), None, values.as_slice()).unwrap()
     }
 
     /// Uploads a replicated Boolean test scalar using one byte per element.
     pub(crate) fn boolean_scalar(session: &Session, mesh: &DeviceMesh, value: bool) -> Array {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
-        Array::from_host_buffer(session, r#type, mesh.clone(), [u8::from(value)]).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), None, [u8::from(value)]).unwrap()
     }
 
     /// Reads the first addressable shard as native-endian `f32` values.
@@ -1989,50 +1997,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_array() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
-        let bytes = values_to_bytes::<f32>(&[1.0, 2.0]);
-
-        // With neither a handle mesh nor a sharding, the array is replicated over the first addressable device.
-        let mesh = domain_mesh(client, "x", 1);
-        let array = session.array(r#type.clone(), bytes.as_slice()).unwrap();
-        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
-        assert_eq!(array.mesh(), &mesh);
-        assert!(array.session().is_same_session(&session));
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
-
-        // Without a handle mesh, a sharding supplies the logical mesh, which is laid over the addressable devices.
-        let mesh = domain_mesh(client, "y", 1);
-        let array = session.array(replicated_vector_type(&mesh, 2), bytes.as_slice()).unwrap();
-        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
-        assert_eq!(array.mesh(), &mesh);
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
-
-        // A handle with a mesh uploads to that mesh.
-        let mesh = domain_mesh(client, "z", 1);
-        let array = session.with_device_mesh(mesh.clone()).array(r#type.clone(), bytes.as_slice()).unwrap();
-        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&mesh, 2));
-        assert_eq!(array.mesh(), &mesh);
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
-
-        // A sharding over more devices than the client has cannot be placed.
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let r#type = r#type.with_sharding(Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
-        assert!(matches!(
-            session.array(r#type, bytes.as_slice()),
-            Err(Error::Core(error))
-                if *error == CoreError::Program(ProgramError::InvalidArgument {
-                    message: format!(
-                        "eager XLA placement of a value without array inputs over mesh {logical_mesh:?} requires 2 \
-                         addressable device(s) but the client only has 1",
-                    ),
-                }),
-        ));
-    }
-
-    #[test]
     fn test_session_effects_barrier() {
         let client = execution_client();
         let session = session_with_client(client);
@@ -2078,7 +2042,8 @@ pub(crate) mod tests {
     fn test_session_retained_constant() {
         let client = execution_client();
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
         let handle = session.retain_constant(&array);
 
         // The resolved array shares the retained storage and belongs to the resolving handle.
@@ -2110,7 +2075,8 @@ pub(crate) mod tests {
     fn test_session_retain_constant() {
         let client = execution_client();
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
 
         // Retaining one array twice yields equal handles, and the handles keep the array alive after the array itself
         // is dropped.
@@ -2665,7 +2631,7 @@ pub(crate) mod tests {
             promise.set(Some(ryft_pjrt::Error::invalid_argument("cast witness failed"))).unwrap();
             let bytes = if data_type.is_zero() { Vec::new() } else { values_to_bytes::<f32>(&[1.0, 2.0]) };
             let witness = Value::Array(
-                Array::from_host_buffer(&session, ArrayType::new_static(data_type, [2]), mesh.clone(), bytes)
+                Array::from_host_buffer(&session, ArrayType::new_static(data_type, [2]), mesh.clone(), None, bytes)
                     .unwrap()
                     .with_execution_fence(ExecutionFence::new(vec![event])),
             );
@@ -2745,14 +2711,14 @@ pub(crate) mod tests {
             .unwrap();
         negate(
             &session,
-            Array::from_host_buffer(&session, f64_type, mesh.clone(), values_to_bytes(&[1f64; 4])).unwrap(),
+            Array::from_host_buffer(&session, f64_type, mesh.clone(), None, values_to_bytes(&[1f64; 4])).unwrap(),
         );
         assert_eq!(misses(&session), 3);
-        let sharded = Array::from_host_buffer_with_sharding(
+        let sharded = Array::from_host_buffer(
             &session,
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])),
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
             mesh.clone(),
+            Some(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
             values_to_bytes(&[1f32; 4]),
         )
         .unwrap();
@@ -2999,11 +2965,11 @@ pub(crate) mod tests {
         // each device adds its own shard of 2 elements.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let input = Array::from_host_buffer_with_sharding(
+        let input = Array::from_host_buffer(
             domain.parent(),
             input_type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3031,11 +2997,11 @@ pub(crate) mod tests {
         let input_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]));
         let values =
             [Complex::new(3f32, 4.0), Complex::new(5.0, 12.0), Complex::new(8.0, 15.0), Complex::new(7.0, 24.0)];
-        let input = Array::from_host_buffer_with_sharding(
+        let input = Array::from_host_buffer(
             domain.parent(),
             input_type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             values_to_bytes(&values).as_slice(),
         )
         .unwrap();
@@ -3390,7 +3356,8 @@ pub(crate) mod tests {
             (true, usize::MAX, 0),
         ] {
             let initial =
-                Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), (-1i64).to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), None, (-1i64).to_ne_bytes())
+                    .unwrap();
             let scan = ScanOperation::new(1, 4).with_reverse(reverse).with_unroll(unroll).unwrap();
             let outputs = session.bind(Operation::Scan(scan), [body.clone()], &[Value::Array(initial)]).unwrap();
             assert_eq!(read_i64s(client, program_array(&outputs[0])), vec![last_index]);
@@ -3495,11 +3462,11 @@ pub(crate) mod tests {
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let xs = Array::from_host_buffer_with_sharding(
+        let xs = Array::from_host_buffer(
             &session,
             xs_type,
-            sharding,
             mesh.clone(),
+            Some(sharding),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3596,6 +3563,7 @@ pub(crate) mod tests {
             &session,
             input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3634,7 +3602,7 @@ pub(crate) mod tests {
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let upload = |sharding: &Sharding, values: &[f32]| {
             let r#type = ArrayType::new_static(DataType::F32, [values.len()]).with_sharding(sharding.clone()).unwrap();
-            Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(values)).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(values)).unwrap()
         };
         let left = upload(&sharded, &[1.0, 2.0, 3.0, 4.0]);
         let right = upload(&replicated, &[10.0, 20.0]);
@@ -3707,7 +3675,7 @@ pub(crate) mod tests {
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
         let input =
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
                 .unwrap();
         let doubled = shard_map(
             |x: ProjectedValue<ArrayType, DomainTracer<Session>>| {
@@ -3742,7 +3710,7 @@ pub(crate) mod tests {
         // can omit the mesh, as under JAX's `jax.set_mesh`.
         let meshed_session = session.with_device_mesh(mesh.clone());
         let input =
-            Array::from_host_buffer(&meshed_session, r#type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+            Array::from_host_buffer(&meshed_session, r#type, mesh, None, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let doubled = shard_map(
             |x: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(x.clone() + x),
             input,
@@ -4006,19 +3974,19 @@ pub(crate) mod tests {
         let session = session_with_client(client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let primal = Array::from_host_buffer_with_sharding(
+        let primal = Array::from_host_buffer(
             &session,
             r#type.clone(),
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             values_to_bytes(&[1f32, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let capture = Array::from_host_buffer_with_sharding(
+        let capture = Array::from_host_buffer(
             &session,
             r#type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             values_to_bytes(&[4f32, 5.0, 6.0, 7.0]).as_slice(),
         )
         .unwrap();
@@ -4127,8 +4095,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0]);
         let x =
-            Array::from_host_buffer_with_sharding(&session, r#type, sharding.clone(), mesh.clone(), bytes.as_slice())
-                .unwrap();
+            Array::from_host_buffer(&session, r#type, mesh.clone(), Some(sharding.clone()), bytes.as_slice()).unwrap();
         let jacobian = differentiate_at(x).jacobian_forward(|x| x.mul(&x)).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
@@ -4143,7 +4110,7 @@ pub(crate) mod tests {
         // Half-precision primals produce exact half-precision Jacobians.
         let r#type = ArrayType::new(DataType::F16, Shape::new(vec![CoreDimension::Static(4)]));
         let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0].map(f16::from_f32));
-        let x = Array::from_host_buffer_with_sharding(&session, r#type, sharding, mesh, bytes.as_slice()).unwrap();
+        let x = Array::from_host_buffer(&session, r#type, mesh, Some(sharding), bytes.as_slice()).unwrap();
         let jacobian = differentiate_at(x).jacobian_forward(|x| x.mul(&x)).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().data_type(), DataType::F16);
@@ -4164,7 +4131,7 @@ pub(crate) mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0]);
-        let x = Array::from_host_buffer_with_sharding(&session, r#type, sharding, mesh, bytes.as_slice()).unwrap();
+        let x = Array::from_host_buffer(&session, r#type, mesh, Some(sharding), bytes.as_slice()).unwrap();
 
         // The one-hot cotangent basis replays through the pullback on the sharded primal.
         let jacobian = differentiate_at(x).jacobian_reverse(|x| x.mul(&x)).unwrap();
@@ -4429,7 +4396,8 @@ pub(crate) mod tests {
         // Renaming keeps the storage of a handle and only renames its type.
         let client = execution_client();
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
         let handle = session.retain_constant(&array);
         let renamed = handle.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
         assert_eq!(renamed, handle);
@@ -4441,9 +4409,14 @@ pub(crate) mod tests {
         let client = execution_client();
         let session = session_with_client(client);
         let other_session = session_with_client(client);
-        let first = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
-        let second = session.array(ArrayType::scalar(DataType::F32), 2f32.to_ne_bytes()).unwrap();
-        let other = other_session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        let second =
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
+                .unwrap();
+        let other =
+            Array::from_host_buffer(&other_session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+                .unwrap();
         let handle = session.retain_constant(&first);
 
         // Handles are equal when they refer to the same retained array of the same session with the same type.
@@ -4457,8 +4430,11 @@ pub(crate) mod tests {
     fn test_session_constant_hash() {
         let client = execution_client();
         let session = session_with_client(client);
-        let first = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
-        let second = session.array(ArrayType::scalar(DataType::F32), 2f32.to_ne_bytes()).unwrap();
+        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        let second =
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
+                .unwrap();
         let handle = session.retain_constant(&first);
         let other = session.retain_constant(&second);
         assert_eq!(hash_of(&handle), hash_of(&session.retain_constant(&first)));
@@ -4472,7 +4448,8 @@ pub(crate) mod tests {
     fn test_session_constant_display() {
         let client = execution_client();
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
         let handle = session.retain_constant(&array);
         assert_eq!(handle.to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
     }
@@ -4482,7 +4459,14 @@ pub(crate) mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let array = session.array(replicated_scalar_type(&mesh, DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(
+            &session,
+            replicated_scalar_type(&mesh, DataType::F32),
+            None,
+            None,
+            1f32.to_ne_bytes(),
+        )
+        .unwrap();
         assert_eq!(session.retain_constant(&array).r#type().into_owned(), replicated_scalar_type(&mesh, DataType::F32));
     }
 
@@ -4490,7 +4474,8 @@ pub(crate) mod tests {
     fn test_session_constant() {
         let client = execution_client();
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
 
         // Arrays are retained by their session and become handles to their retained storage.
         let Ok(Constant::Session(handle)) = session_constant(Value::Array(array.clone())) else {
@@ -4658,7 +4643,7 @@ pub(crate) mod tests {
         assert!(lowered.kernel_execution_facts().is_some());
         assert!(!lowered.signature().has_effects());
         let compiled = session.compile_program(&lowered).unwrap();
-        let input = session.array(scalar, 42i32.to_ne_bytes()).unwrap();
+        let input = Array::from_host_buffer(&session, scalar, None, None, 42i32.to_ne_bytes()).unwrap();
         let outputs = session.execute_program(&compiled, vec![input.clone()]).unwrap();
         let bytes = compiled.serialize().unwrap().unwrap();
         let restored_session = session_with_client(&client);

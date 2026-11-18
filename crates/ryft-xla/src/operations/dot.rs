@@ -2231,7 +2231,9 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [4, 4]);
             reference_inputs.push(CoreArray::from_elements(r#type.clone(), &values).unwrap());
             let r#type = r#type.with_sharding(sharding.clone()).unwrap();
-            inputs.push(Array::from_host_buffer(&session, r#type, mesh.clone(), &values_to_bytes(&values)).unwrap());
+            inputs.push(
+                Array::from_host_buffer(&session, r#type, mesh.clone(), None, &values_to_bytes(&values)).unwrap(),
+            );
         }
         let specification = "ij,jk,kl->il".parse::<EinsumSpecification>().unwrap();
         let options = EinsumOptions::new()

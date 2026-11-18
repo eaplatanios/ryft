@@ -2322,7 +2322,8 @@ mod tests {
 
         let input_type = replicated_vector_type(&mesh, 1);
         let source =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes::<f32>(&[0.5]).as_slice())
+                .unwrap();
 
         let sine = function.execute(true, source.clone()).unwrap();
         let warm_sine = function.execute(true, source.clone()).unwrap();
@@ -2348,22 +2349,12 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]);
         let bytes = values_to_bytes::<f32>(&[0.0, 0.5, 1.0, 1.5]);
-        let sharded_input = Array::from_host_buffer_with_sharding(
-            &engine,
-            input_type.clone(),
-            sharded.clone(),
-            mesh.clone(),
-            bytes.as_slice(),
-        )
-        .unwrap();
-        let replicated_input = Array::from_host_buffer_with_sharding(
-            &engine,
-            input_type,
-            replicated.clone(),
-            mesh.clone(),
-            bytes.as_slice(),
-        )
-        .unwrap();
+        let sharded_input =
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), Some(sharded.clone()), bytes.as_slice())
+                .unwrap();
+        let replicated_input =
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), Some(replicated.clone()), bytes.as_slice())
+                .unwrap();
         assert_eq!(sharded_input.r#type(), replicated_input.r#type());
 
         // Inputs whose types agree but whose placements over auto mesh axes differ get their own executables, which
@@ -2400,6 +2391,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.5, -1.0]).as_slice(),
         )
         .unwrap();
@@ -2422,6 +2414,7 @@ mod tests {
             &engine,
             vector_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0]).as_slice(),
         )
         .unwrap();
@@ -2511,6 +2504,7 @@ mod tests {
             &engine,
             matrix_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.0; 6]).as_slice(),
         )
         .unwrap();
@@ -2538,7 +2532,8 @@ mod tests {
         )
         .unwrap();
         let input =
-            Array::from_host_buffer(&engine, matrix_type, mesh, values_to_bytes::<f32>(&[0.0; 6]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, matrix_type, mesh, None, values_to_bytes::<f32>(&[0.0; 6]).as_slice())
+                .unwrap();
         assert_eq!(read_f32s(client, &outer.executable().execute(&engine, input).unwrap()), vec![0.0, 1.0, 2.0]);
     }
 
@@ -2557,14 +2552,19 @@ mod tests {
             mesh.clone(),
         );
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
 
         for expected in [3.0f32, 5.0] {
-            let update =
-                Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
-                    .unwrap();
+            let update = Array::from_host_buffer(
+                &session,
+                array_type.clone(),
+                mesh.clone(),
+                None,
+                2.0f32.to_ne_bytes().as_slice(),
+            )
+            .unwrap();
             let output = function
                 .execute_statefully_and_wait(
                     (),
@@ -2594,10 +2594,11 @@ mod tests {
             Options::new(mesh.clone()),
         );
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let output = function
             .execute_statefully(
                 (),
@@ -2650,13 +2651,13 @@ mod tests {
         )
         .unwrap();
         let initial =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert_eq!(initial.r#type().as_ref(), &replicated_scalar_type(&mesh, DataType::F32));
         let reference = ArrayReference::new(initial);
         let retained_snapshot = reference.read().unwrap();
         let rejected_update =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
             compiled.executable().execute(
@@ -2668,9 +2669,14 @@ mod tests {
         assert_eq!(read_f32s(client, &reference.read().unwrap()), vec![1.0]);
 
         for expected in [3.0f32, 5.0] {
-            let update =
-                Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
-                    .unwrap();
+            let update = Array::from_host_buffer(
+                &session,
+                array_type.clone(),
+                mesh.clone(),
+                None,
+                2.0f32.to_ne_bytes().as_slice(),
+            )
+            .unwrap();
             let output = compiled
                 .execute_statefully_and_wait(
                     &session,
@@ -2727,7 +2733,8 @@ mod tests {
         // Both references are committed after the call. The primal holder accumulates the update, the tangent holder
         // accumulates the tangent update, and the outputs read the committed states.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, value.to_ne_bytes().as_slice())
+                .unwrap()
         };
         let reference = ArrayReference::new(scalar(1.0));
         let tangent_reference = ArrayReference::new(scalar(10.0));
@@ -2789,7 +2796,8 @@ mod tests {
         // The read accumulates `ȳ` into the destination and the accumulation hands the accumulated cotangent to `x̄`
         // while leaving the destination unchanged, so both end at `5 + 2`.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, value.to_ne_bytes().as_slice())
+                .unwrap()
         };
         let cotangent_reference = ArrayReference::new(scalar(5.0));
         let input_cotangent = compiled
@@ -2824,7 +2832,7 @@ mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&session, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, array_type, mesh, None, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.execute_statefully_and_wait(&session, Value::Array(input)).unwrap();
         let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
@@ -2845,7 +2853,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type, mesh, None, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         for _ in 0..2 {
             let output = compiled
@@ -2879,7 +2887,7 @@ mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&session, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, array_type, mesh, None, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.execute_statefully(&session, Value::Array(input)).r#await().unwrap();
         let Value::Array(output) = output else { panic!("stateful all-array output must be an array") };
@@ -2895,8 +2903,14 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &session,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
         };
         let bind = |reference: &ArrayReference<_>| Value::Reference(Reference::new(reference.clone(), session.clone()));
         let read = |value: Value| {
@@ -3007,7 +3021,8 @@ mod tests {
             },
         );
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes::<f32>(values))
+                .unwrap()
         };
         let input = Value::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
         let (_, pullback) = session.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
@@ -3123,7 +3138,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type, mesh, None, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let output = outer
             .execute_statefully_and_wait(&session, Value::Reference(Reference::new(reference.clone(), session.clone())))
@@ -3215,6 +3230,7 @@ mod tests {
                     &session,
                     actual_type,
                     mesh.clone(),
+                    None,
                     values_to_bytes(expected.as_slice()).as_slice(),
                 )
                 .unwrap(),
@@ -3240,7 +3256,7 @@ mod tests {
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -3254,7 +3270,8 @@ mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let output = compiled.execute_statefully_and_wait(&session, Value::Array(update)).unwrap();
         let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32s(client, &output), vec![3.0]);
@@ -3268,7 +3285,7 @@ mod tests {
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -3305,6 +3322,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.25]).as_slice(),
         )
         .unwrap();
@@ -3327,6 +3345,7 @@ mod tests {
             &engine,
             input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
         )
         .unwrap();
@@ -3363,6 +3382,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
             )
             .unwrap();
@@ -3380,7 +3400,8 @@ mod tests {
         let session = session_with_client(client);
         let array_type = ArrayType::scalar(DataType::F32);
         let capture = Value::Array(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 7f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 7f32.to_ne_bytes().as_slice())
+                .unwrap(),
         );
         let inner = CoreStagedFunction::<Session, (), ArrayIrType>::stage(
             |_, mut captures, ()| Ok(captures.remove(0)),
@@ -3414,8 +3435,9 @@ mod tests {
         )
         .unwrap();
         let compiled = outer.lower(&session).unwrap().compile(&session).unwrap();
-        let input =
-            Value::Array(Array::from_host_buffer(&session, array_type, mesh, 1f32.to_ne_bytes().as_slice()).unwrap());
+        let input = Value::Array(
+            Array::from_host_buffer(&session, array_type, mesh, None, 1f32.to_ne_bytes().as_slice()).unwrap(),
+        );
         let (Value::Array(typed), Value::Array(flat)) = compiled.executable().execute(&session, input).unwrap() else {
             panic!("capture-only calls must return arrays");
         };
@@ -3445,9 +3467,14 @@ mod tests {
             compile(|input| input.sin().unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap()
                 .into_executable();
-        let input =
-            Array::from_host_buffer(&session, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
-                .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            input_type.clone(),
+            mesh,
+            None,
+            values_to_bytes::<f32>(&[0.5]).as_slice(),
+        )
+        .unwrap();
 
         let output = executable.execute(&session, input).unwrap();
 
@@ -3474,7 +3501,8 @@ mod tests {
                 .unwrap()
                 .into_executable();
         let input =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes::<f32>(&[0.5]).as_slice())
+                .unwrap();
 
         assert!(matches!(
             executable.execute(&other_session, input.clone()),
@@ -3513,7 +3541,8 @@ mod tests {
                 .unwrap()
                 .into_executable();
         let input =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes::<f32>(&[0.5]).as_slice())
+                .unwrap();
 
         let output =
             std::thread::scope(|scope| scope.spawn(move || executable.execute(&session, input)).join().unwrap())
@@ -3542,6 +3571,7 @@ mod tests {
             &engine,
             replicated_input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -3588,7 +3618,7 @@ mod tests {
         // than enqueueing an execution whose hidden final state outputs nothing would publish.
         let executable: ExecutableFunction<ArrayType, ArrayType> =
             ExecutableFunction { function: compiled.executable().clone() };
-        let input = Array::from_host_buffer(&session, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, array_type, mesh, None, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             executable.execute_async(&session, input),
             Err(Error::Execution(ExecutionError::StatefulInvocationRequired)),
@@ -3604,8 +3634,8 @@ mod tests {
         let input_type = replicated_vector_type(&mesh, 1);
         let compiled: CompiledFunction<ArrayType, ()> =
             compile(|_| (), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&[1.0]).as_slice())
+            .unwrap();
 
         let execution = compiled.executable().execute_async(&engine, input).unwrap();
         assert_eq!(execution.output(), &());
@@ -3646,6 +3676,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
             )
             .unwrap()
@@ -3687,6 +3718,7 @@ mod tests {
                     &session,
                     array_type.clone(),
                     mesh.clone(),
+                    None,
                     values_to_bytes::<f32>(values).as_slice(),
                 )
                 .unwrap(),
@@ -3732,6 +3764,7 @@ mod tests {
                 &session,
                 array_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&values).as_slice(),
             )
             .unwrap()
@@ -3826,6 +3859,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -3849,6 +3883,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
@@ -3869,6 +3904,7 @@ mod tests {
             &engine,
             input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3890,6 +3926,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
@@ -3897,6 +3934,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[10.0, 10.0, 10.0, 10.0]).as_slice(),
         )
         .unwrap();
@@ -3930,6 +3968,7 @@ mod tests {
             &engine,
             input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3950,8 +3989,14 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(1)).unwrap();
         let matrix_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(replicated(2)).unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &engine,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
         };
         let assert_close = |actual: Vec<f32>, expected: Vec<f32>| {
             assert_eq!(actual.len(), expected.len());
@@ -4041,6 +4086,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.0, 0.5, 1.0, 1.5]).as_slice(),
         )
         .unwrap();
@@ -4090,6 +4136,7 @@ mod tests {
             &engine,
             vector_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -4142,9 +4189,14 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
         let matrix_values = [0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
-        let matrix =
-            Array::from_host_buffer(&engine, matrix_type.clone(), mesh.clone(), values_to_bytes::<f32>(&matrix_values))
-                .unwrap();
+        let matrix = Array::from_host_buffer(
+            &engine,
+            matrix_type.clone(),
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&matrix_values),
+        )
+        .unwrap();
         let batched = batch(
             |x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()),
             Value::Array(matrix),
@@ -4168,8 +4220,14 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &engine,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
         };
         let read = |value: Value| read_f32s(client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
 
@@ -4222,6 +4280,7 @@ mod tests {
                 &engine,
                 vector_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(values).as_slice(),
             )
             .unwrap()
@@ -4291,6 +4350,7 @@ mod tests {
                 &engine,
                 vector_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(values).as_slice(),
             )
             .unwrap()
@@ -4367,8 +4427,14 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &engine,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
         };
         let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, x| x * captures[0].clone(),
@@ -4421,6 +4487,7 @@ mod tests {
                 &engine,
                 vector_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(values).as_slice(),
             )
             .unwrap()
@@ -4462,6 +4529,7 @@ mod tests {
                 &engine,
                 matrix_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(values).as_slice(),
             )
             .unwrap()
@@ -4557,11 +4625,12 @@ mod tests {
             &engine,
             concrete_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let live =
-            Array::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+        let live = Array::from_host_buffer(&engine, scalar_type, mesh, None, values_to_bytes::<f32>(&[7.0]).as_slice())
+            .unwrap();
         let (zero, one) = gradient.executable().execute(&engine, (disconnected, live)).unwrap();
         assert_eq!(read_f32s(client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32s(client, &one), vec![1.0]);
@@ -4644,6 +4713,7 @@ mod tests {
             &engine,
             concrete_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -4652,6 +4722,7 @@ mod tests {
                 &engine,
                 scalar_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[value]).as_slice(),
             )
             .unwrap();
@@ -4750,11 +4821,13 @@ mod tests {
             &engine,
             concrete_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice(),
         )
         .unwrap();
         let initial =
-            Array::from_host_buffer(&engine, scalar_type, mesh, values_to_bytes::<f32>(&[7.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, scalar_type, mesh, None, values_to_bytes::<f32>(&[7.0]).as_slice())
+                .unwrap();
         let (zero, derivative) = gradient.executable().execute(&engine, (elements, initial)).unwrap();
         assert_eq!(read_f32s(client, &zero), vec![0.0; 3]);
         assert_eq!(read_f32s(client, &derivative), vec![8.0]);
@@ -4823,8 +4896,14 @@ mod tests {
 
         let concrete_type = replicated_vector_type(&mesh, 3);
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &engine,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
         };
         let x = array(&concrete_type, &[2.0, 3.0, 4.0]);
         let s = array(&scalar_type, &[3.0]);
@@ -4867,6 +4946,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
@@ -4882,8 +4962,8 @@ mod tests {
 
         assert_eq!(gradient.source_program().captures().len(), 1);
 
-        let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&[3.0]).as_slice())
+            .unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
 
         assert_eq!(read_f32s(client, &output), vec![2.0]);
@@ -4918,6 +4998,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
             )
             .unwrap();
@@ -4991,6 +5072,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
@@ -4998,6 +5080,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
             )
             .unwrap();
@@ -5053,6 +5136,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
@@ -5073,11 +5157,12 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[3.0]).as_slice(),
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), None, values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) = jvp_compiled.executable().execute(&engine, (primal, tangent)).unwrap();
 
@@ -5134,8 +5219,8 @@ mod tests {
             expected_gradient *= derivative;
         }
         expected_gradient *= expected_value.cos();
-        let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&[0.5]).as_slice())
+            .unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
         assert!((read_f32s(client, &output)[0] as f64 - expected_gradient).abs() < 1e-3);
     }
@@ -5165,11 +5250,13 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[3.0]).as_slice(),
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&[4.0]).as_slice())
+                .unwrap();
         let (primal_output, tangent_output) = second.executable().execute(&engine, (primal, tangent)).unwrap();
         assert_eq!(read_f32s(client, &primal_output), vec![9.0]);
         assert_eq!(read_f32s(client, &tangent_output), vec![24.0]);
@@ -5190,8 +5277,8 @@ mod tests {
         let zero_identity: CompiledFunction<ArrayType, ArrayType> =
             compile(|value| value, tangent_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
-        let tangent_input = Array::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
+        let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), None, [1u8]).unwrap();
+        let tangent_input = Array::from_host_buffer(&engine, tangent_type.clone(), mesh, None, []).unwrap();
         let (primal_output, tangent_output) = jvp.executable().execute(&engine, (primal_input, tangent_input)).unwrap();
 
         assert_eq!(primal_output.r#type().as_ref(), &primal_type);
@@ -5211,7 +5298,8 @@ mod tests {
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
         let vector_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated(1)).unwrap();
         let array = |r#type: ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&engine, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+            Array::from_host_buffer(&engine, r#type, mesh.clone(), None, values_to_bytes::<f32>(values).as_slice())
+                .unwrap()
         };
 
         // `f(x, y) = x * y + c` with a captured `c`, so the batched function also inherits a capture.
@@ -5282,6 +5370,7 @@ mod tests {
             &engine,
             matrix_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.0, 0.5, 1.0, 1.5, 2.0, 2.5]).as_slice(),
         )
         .unwrap();
@@ -5342,9 +5431,14 @@ mod tests {
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&engine, source).unwrap();
 
         let observed = read_f32s(client, &output);
@@ -5363,7 +5457,8 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
         let value =
-            Array::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, scalar_type, mesh.clone(), None, values_to_bytes(&[4f32]).as_slice())
+                .unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, exemplar| captures[0].broadcast(exemplar.r#type().into_owned(), &[]).unwrap(),
             vec![value],
@@ -5380,7 +5475,8 @@ mod tests {
                 let %2:f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}] = broadcast [output_type=f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}], output_axes=[]] %0
                 in (%2)"},
         );
-        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
+        let input =
+            Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
         let output = compiled.executable().execute(&engine, input).unwrap();
         assert_eq!(read_f32s(client, &output), vec![4f32; 6]);
     }
@@ -5409,7 +5505,8 @@ mod tests {
         assert_eq!(executable.output_types(), std::slice::from_ref(&input_type));
 
         let input =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes::<f32>(&[3.0]).as_slice())
+                .unwrap();
         let output = executable.execute(&session, input).unwrap();
         assert_eq!(read_f32s(client, &output), vec![6.0]);
     }
@@ -5459,6 +5556,7 @@ mod tests {
                 &session,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[initial]).as_slice(),
             )
             .unwrap();
@@ -5615,9 +5713,14 @@ mod tests {
             // A larger root exercises repeated updates through the same compiled loop and nested call.
             let values = (1..=length).map(|value| value as f32).collect::<Vec<_>>();
             let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
-            let input =
-                Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                    .unwrap();
+            let input = Array::from_host_buffer(
+                &session,
+                input_type,
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(&values).as_slice(),
+            )
+            .unwrap();
             let (outputs, frozen) = compiled.executable().execute(&session, input).unwrap();
             assert_eq!(read_f32s(client, &outputs), expected);
             assert_eq!(read_f32s(client, &frozen), expected);
@@ -5691,6 +5794,7 @@ mod tests {
                 &engine,
                 vector_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(values).as_slice(),
             )
             .unwrap()
@@ -5780,8 +5884,9 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let x = Array::from_host_buffer(&engine, vector_type, mesh, values_to_bytes::<f32>(&[1.0, -2.0]).as_slice())
-            .unwrap();
+        let x =
+            Array::from_host_buffer(&engine, vector_type, mesh, None, values_to_bytes::<f32>(&[1.0, -2.0]).as_slice())
+                .unwrap();
         let (forward, reverse, hessian) = function.executable().execute(&engine, x).unwrap();
         assert_eq!(read_f32s(client, &forward), vec![3.0, 0.0, 0.0, 12.0]);
         assert_eq!(read_f32s(client, &reverse), vec![3.0, 0.0, 0.0, 12.0]);
@@ -5904,6 +6009,7 @@ mod tests {
                 &session,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[3.0]).as_slice(),
             )
             .unwrap();
@@ -5913,7 +6019,8 @@ mod tests {
         }
 
         let input =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes::<f32>(&[3.0]).as_slice())
+                .unwrap();
         let hessian: Hessian<ArrayType, Array, ArrayType, ArrayType> =
             second.executable().execute(&session, input).unwrap();
         assert_eq!(read_f32s(client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
@@ -5947,11 +6054,16 @@ mod tests {
         )
         .unwrap();
 
-        let scalar =
-            Array::from_host_buffer(&session, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
-                .unwrap();
+        let scalar = Array::from_host_buffer(
+            &session,
+            scalar_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&[2.0]).as_slice(),
+        )
+        .unwrap();
         let vector =
-            Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
+            Array::from_host_buffer(&session, vector_type, mesh, None, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
         let jacobian: Jacobian<ArrayType, Array, (ArrayType, ArrayType), ArrayType> =
             forward.executable().execute(&session, (scalar, vector)).unwrap();
@@ -6000,15 +6112,22 @@ mod tests {
             &session,
             vector_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes(&[9.0f32, -9.0, -9.0]),
         )
         .unwrap();
-        let labels = Array::from_host_buffer(&session, label_type, mesh.clone(), values_to_bytes(&[0i32])).unwrap();
-        let student =
-            Array::from_host_buffer(&session, vector_type.clone(), mesh.clone(), values_to_bytes(&student_values))
-                .unwrap();
+        let labels =
+            Array::from_host_buffer(&session, label_type, mesh.clone(), None, values_to_bytes(&[0i32])).unwrap();
+        let student = Array::from_host_buffer(
+            &session,
+            vector_type.clone(),
+            mesh.clone(),
+            None,
+            values_to_bytes(&student_values),
+        )
+        .unwrap();
         let teacher =
-            Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
+            Array::from_host_buffer(&session, vector_type, mesh, None, values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
         let (loss, hard_gradient, soft_gradient) =
             compiled.executable().execute(&session, (logits, labels, student, teacher)).unwrap();
 
@@ -6059,8 +6178,9 @@ mod tests {
         )
         .unwrap();
         let values = [9.0f32, -9.0, 1.0, -9.0];
-        let logits = Array::from_host_buffer(&engine, logits_type, mesh.clone(), values_to_bytes(&values)).unwrap();
-        let labels = Array::from_host_buffer(&engine, label_type, mesh, values_to_bytes(&[2i32])).unwrap();
+        let logits =
+            Array::from_host_buffer(&engine, logits_type, mesh.clone(), None, values_to_bytes(&values)).unwrap();
+        let labels = Array::from_host_buffer(&engine, label_type, mesh, None, values_to_bytes(&[2i32])).unwrap();
         let (probabilities, loss, gradient) = compiled.executable().execute(&engine, (logits, labels)).unwrap();
         assert_eq!(probabilities.sharding(), &sharding);
         assert_eq!(gradient.sharding(), &sharding);
@@ -6129,6 +6249,7 @@ mod tests {
                 &session,
                 replicated(ArrayType::new_static(DataType::F32, [rows, columns])),
                 mesh.clone(),
+                None,
                 values_to_bytes(&values),
             )
             .unwrap();
@@ -6136,6 +6257,7 @@ mod tests {
                 &session,
                 replicated(ArrayType::new_static(DataType::I32, [rows])),
                 mesh.clone(),
+                None,
                 values_to_bytes(&label_values),
             )
             .unwrap();
@@ -6175,6 +6297,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
@@ -6219,11 +6342,12 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[3.0]).as_slice(),
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), None, values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) = jvp_compiled.executable().execute(&engine, (primal, tangent)).unwrap();
 
@@ -6249,12 +6373,18 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&a_values).as_slice(),
         )
         .unwrap();
-        let b =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
-                .unwrap();
+        let b = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&b_values).as_slice(),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&engine, (a, b)).unwrap();
 
         let observed = read_f32s(client, &output);
@@ -6327,8 +6457,14 @@ mod tests {
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &engine,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
         };
         let read = |value: Value| read_f32s(client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
 
@@ -6437,10 +6573,22 @@ mod tests {
             .execute(
                 &engine,
                 (
-                    Array::from_host_buffer(&engine, vector_type, mesh.clone(), values_to_bytes::<f32>(&x).as_slice())
-                        .unwrap(),
-                    Array::from_host_buffer(&engine, matrix_type, mesh, values_to_bytes::<f32>(&tangents).as_slice())
-                        .unwrap(),
+                    Array::from_host_buffer(
+                        &engine,
+                        vector_type,
+                        mesh.clone(),
+                        None,
+                        values_to_bytes::<f32>(&x).as_slice(),
+                    )
+                    .unwrap(),
+                    Array::from_host_buffer(
+                        &engine,
+                        matrix_type,
+                        mesh,
+                        None,
+                        values_to_bytes::<f32>(&tangents).as_slice(),
+                    )
+                    .unwrap(),
                 ),
             )
             .unwrap();
@@ -6465,6 +6613,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
@@ -6491,6 +6640,7 @@ mod tests {
             &engine,
             input_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -6507,7 +6657,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let capture = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
+        let capture = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), None, []).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
             |captures, _| captures[0].clone(),
             vec![capture],
@@ -6516,7 +6666,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&[1.0])).unwrap();
 
         let output = compiled.executable().execute(&engine, input).unwrap();
 
@@ -6534,15 +6684,15 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
         let bytes = values_to_bytes::<f32>(&[0.0, 0.5, 1.0, 1.5]);
-        let captured = Array::from_host_buffer_with_sharding(
+        let captured = Array::from_host_buffer(
             &engine,
             ArrayType::new_static(DataType::F32, [4]),
-            sharded.clone(),
             mesh.clone(),
+            Some(sharded.clone()),
             bytes.as_slice(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), None, bytes.as_slice()).unwrap();
 
         // The captured array enters the executable at its runtime placement over the auto mesh axis rather than at
         // the replicated placement of its type, so it needs no gathering and the compiler shards the sum like it.
@@ -6571,9 +6721,14 @@ mod tests {
             compile_with_options(|x| x.sin().unwrap(), input_type.clone(), &engine, options).unwrap();
 
         let values = [0.0f32, 0.5, 1.0];
-        let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&engine, source).unwrap();
 
         // The output remains independently readable after the donating call returns. Donation is opaque from the host
@@ -6621,11 +6776,11 @@ mod tests {
 
         // Build the input array under the overridden sharding so it matches the executable's expected layout.
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = Array::from_host_buffer_with_sharding(
+        let source = Array::from_host_buffer(
             &engine,
             ArrayType::new(DataType::F32, shape),
-            sharded,
             mesh.clone(),
+            Some(sharded),
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -6689,9 +6844,14 @@ mod tests {
         assert_eq!(compiled.output_types()[0].sharding(), Some(&replicated));
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&engine, source).unwrap();
         assert_eq!(output.sharding(), &sharded);
         assert_eq!(output.r#type().sharding(), Some(&replicated));

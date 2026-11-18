@@ -267,7 +267,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::new(data_type, StaticShape::new(dimensions.to_vec()).into())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
             .unwrap();
-        Array::from_host_buffer(session, r#type, mesh.clone(), bytes).unwrap()
+        Array::from_host_buffer(session, r#type, mesh.clone(), None, bytes).unwrap()
     }
 
     /// Returns the native-endian bytes of `values`, in order.

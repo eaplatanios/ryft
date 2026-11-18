@@ -529,11 +529,14 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
 mod tests {
     #[cfg(feature = "cuda-13")]
     use std::fs::File;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::pin::pin;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -605,6 +608,15 @@ mod tests {
     /// and for two processes that address one device each, as JAX's multi-controller model requires. Every process of
     /// a job must call this function, because each scenario executes collectives over both devices.
     fn check_shard_map_multi_host_scenarios(client: &'static Client<'static>) {
+        /// Wakes the thread polling upload readiness when a PJRT event completes.
+        struct TransferWaker(thread::Thread);
+
+        impl Wake for TransferWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
         let process_index = client.process_index().unwrap();
         let devices = client
             .devices()
@@ -626,15 +638,24 @@ mod tests {
         let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(manual_mesh.clone(), 1);
 
-        // Each process uploads only its own tiles of `[1, 2, 3, 4]` and reads them back.
+        // Each rank packs only its local tiles and uses the same global type and mesh as its peers.
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let input =
-            Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
-        let tiles = [vec![1.0, 2.0], vec![3.0, 4.0]];
-        assert_eq!(
-            read_addressable_f32s(&input),
-            local_positions.iter().map(|&position| tiles[position].clone()).collect::<Vec<_>>(),
-        );
+        let tiles = [[1f32, 2.0], [3.0, 4.0]];
+        let local_tiles = local_positions
+            .iter()
+            .map(|&position| (devices[position].id(), Arc::<[u8]>::from(values_to_bytes(&tiles[position]))))
+            .collect::<Vec<_>>();
+        let input = Array::from_host_shards(
+            &session,
+            input_type.clone(),
+            mesh.clone(),
+            None,
+            local_tiles.iter().map(|(device, bytes)| (*device, bytes.as_ref())),
+        )
+        .unwrap();
+        input.block_until_ready().unwrap();
+        let expected_local_tiles = local_positions.iter().map(|&position| tiles[position].to_vec()).collect::<Vec<_>>();
+        assert_eq!(read_addressable_f32s(&input), expected_local_tiles);
 
         // Dense host materialization of a sharded array needs every tile, so it succeeds only in a process that
         // addresses both devices and otherwise names a shard of the other process before issuing any copy, as JAX
@@ -654,14 +675,35 @@ mod tests {
             ));
         }
 
+        // Move the host buffers into the second upload so PJRT can retain them until the transfer finishes.
+        let asynchronous_input =
+            Array::from_host_shards(&session, input_type, mesh.clone(), None, local_tiles).unwrap();
+        let mut ready = pin!(asynchronous_input.ready());
+        let waker = Waker::from(Arc::new(TransferWaker(thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match ready.as_mut().poll(&mut context) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    break;
+                }
+                Poll::Pending => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "asynchronous host shard upload timed out");
+                    thread::park_timeout(remaining);
+                }
+            }
+        }
+        assert_eq!(read_addressable_f32s(&asynchronous_input), expected_local_tiles);
+
         // An unchecked map returns each tile as its candidate for an output that is unreduced along `x`, and a checked
-        // map completes it with an all-reduce of the matching kind, so every device holds the sum `[4, 6]` (or the
-        // maximum `[3, 4]`).
-        let complete = |kind: UnreducedKind, reduction: ReductionKind| {
+        // map completes it with an all-reduce of the matching kind. Both uploads feed a reduction over both devices.
+        let complete = |input: Array, kind: UnreducedKind, reduction: ReductionKind| {
             let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
             let candidates = shard_map(
                 Ok,
-                input.clone(),
+                input,
                 manual_mesh.clone(),
                 sharded.clone(),
                 unreduced.clone(),
@@ -681,9 +723,9 @@ mod tests {
             )
             .unwrap()
         };
-        let sum = complete(UnreducedKind::Sum, ReductionKind::Sum);
+        let sum = complete(input, UnreducedKind::Sum, ReductionKind::Sum);
         assert_eq!(read_addressable_f32s(&sum), vec![vec![4.0, 6.0]; local_positions.len()]);
-        let maximum = complete(UnreducedKind::Max, ReductionKind::Max);
+        let maximum = complete(asynchronous_input.clone(), UnreducedKind::Max, ReductionKind::Max);
         assert_eq!(read_addressable_f32s(&maximum), vec![vec![3.0, 4.0]; local_positions.len()]);
 
         // A replicated array spans every process, but each process holds its whole value, so dense host reads succeed
@@ -730,9 +772,14 @@ mod tests {
         .unwrap()
         .into_inner();
         let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
-        let items =
-            Array::from_host_buffer(&session, items_type, explicit_mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]))
-                .unwrap();
+        let items = Array::from_host_buffer(
+            &session,
+            items_type,
+            explicit_mesh,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
         let Value::Array(doubled) = compiled.executable().execute(&session, Value::Array(items)).unwrap() else {
             panic!("the compiled function returned a dimension");
         };
@@ -759,7 +806,8 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
+            Array::from_host_buffer(&session, referent_type, mesh, None, values_to_bytes(&[1f32, 2.0]).as_slice())
+                .unwrap(),
         );
         compiled
             .execute_statefully_and_wait(
@@ -806,18 +854,15 @@ mod tests {
         };
         let array = |mesh: &DeviceMesh, sharding: Sharding, values: [f32; 4]| {
             let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
-            Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&values)).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&values)).unwrap()
         };
         let process_0_mesh = mesh(vec![devices[0]]);
         let forward_mesh = mesh(devices.clone());
         let reversed_mesh = mesh(vec![devices[1], devices[0]]);
 
-        // A replicated array on the device of process 0 is copied whole to the device of process 1 when the
-        // destination is replicated, and a sharded destination is resharded after that copy. A sharded array on both
-        // devices swaps its shards between the processes for the reversed device order, and a replicated destination
-        // on that order is resharded after gathering the array on its source devices. Because CUDA pairs the
-        // cross-host sends and receives between two devices by their order rather than by their transfer keys, a
-        // final copy from process 0 to process 1 receives the values of an earlier send that no receive matched.
+        // This checks whole-shard copies, slicing a region before sending it, and joining local and received
+        // regions on each destination. CUDA pairs sends with receives in issue order for each pair of devices.
+        // The last copy exposes an unmatched send from an earlier placement by receiving its old bytes.
         let placements = [
             (
                 "sharded_to_reversed_sharded",
@@ -1691,6 +1736,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 &session,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes(&[1f32, 2., 3., 4.]),
             )
             .unwrap();

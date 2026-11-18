@@ -515,11 +515,12 @@ mod tests {
         assert!(compiled.requires_assertion_handler());
 
         let valid =
-            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, 4i64.to_ne_bytes().as_slice())
+                .unwrap();
         let valid = session.execute_program(&compiled, vec![valid]).unwrap();
         assert_eq!(read_i64s(client, &valid[0]), vec![4]);
 
-        let invalid = Array::from_host_buffer(&session, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
+        let invalid = Array::from_host_buffer(&session, input_type, mesh, None, 9i64.to_ne_bytes().as_slice()).unwrap();
         let error = session.execute_program(&compiled, vec![invalid]).unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -885,8 +886,14 @@ mod tests {
             assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
             let compiled = session.compile_program(&lowered).unwrap();
             let input = |value: i64| {
-                Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                    .unwrap()
+                Array::from_host_buffer(
+                    &session,
+                    input_type.clone(),
+                    mesh.clone(),
+                    None,
+                    value.to_ne_bytes().as_slice(),
+                )
+                .unwrap()
             };
 
             let output =

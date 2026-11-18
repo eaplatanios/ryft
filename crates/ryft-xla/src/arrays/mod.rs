@@ -11,9 +11,9 @@
 //! options that operations on the array use. Arrays implement the `ryft-core` value capabilities by binding each
 //! operation through that session, which executes it eagerly, op by op, as a cached single-operation program.
 //!
-//! [`Array::from_host_buffer`] constructs an array by uploading dense row-major host bytes, and
-//! [`Array::from_addressable_buffers`] wraps existing PJRT [`Buffer`]s after validating them against the type and
-//! placement of the array. Their `_with_sharding` variants also place the array over auto mesh axes.
+//! [`Array::from_host_buffer`] uploads a dense host value, [`Array::from_host_shards`] uploads the host shards
+//! owned by this process, and [`Array::from_addressable_buffers`] wraps existing PJRT [`Buffer`]s. These
+//! constructors support placement over auto mesh axes when the caller supplies runtime sharding.
 //! [`Array::copy_to_host`] and [`ArrayShard::copy_to_host`] read values back to the host, which the `host` module
 //! implements, including the combination of the separate values that devices hold along unreduced mesh axes.
 //! [`Array::to_placement`], [`Array::into_placement`], and [`Session::device_put`] move arrays and host values to other
@@ -36,7 +36,10 @@ use ryft_core::{
     Value as CoreValue, ValueDomainDispatch, WhilePredicate, Xor, check_sharding,
 };
 use ryft_macros::Parameter;
-use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
+use ryft_pjrt::{
+    Buffer, BufferType, Client, Device as PjrtDevice, Error as PjrtError, ExecutionFence, HostBuffer,
+    Memory as PjrtMemory,
+};
 
 use crate::arrays::materialization::{
     BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
@@ -136,6 +139,18 @@ pub enum ArrayError {
     #[error("expected {expected} byte(s) but got {actual}")]
     ByteCountMismatch { expected: usize, actual: usize },
 
+    /// Multiple host shards were supplied for one device.
+    #[error("got multiple host shards for device {device_id}")]
+    MultipleHostShardsOnDevice { device_id: DeviceId },
+
+    /// No host shard was supplied for a required local device.
+    #[error("missing host shard for device {device_id}")]
+    MissingHostShard { device_id: DeviceId },
+
+    /// The bytes supplied for a host shard do not match the size implied by its shape and element type.
+    #[error("host shard on device {device_id} needs {expected} byte(s) but got {actual}")]
+    HostShardByteCountMismatch { device_id: DeviceId, expected: usize, actual: usize },
+
     /// A shard slice has a different rank than its array shape.
     #[error("shape rank {shape_rank} does not match shard slice rank {slice_rank}")]
     ShardSliceRankMismatch { shape_rank: usize, slice_rank: usize },
@@ -223,10 +238,17 @@ pub struct Array {
 impl Array {
     /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
     /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the
-    /// addressable buffers. The provided [`ArrayType`] describes the global logical array. Its
-    /// [`Shape`] must be static, and it must normally contain [`Sharding`] metadata whose logical mesh matches `mesh`.
-    /// As a convenience for unsharded arrays, callers may omit the sharding information only when exactly one
-    /// addressable buffer is provided, in which case the array is treated as replicated over the provided `mesh`.
+    /// addressable buffers. The provided [`ArrayType`] describes the global logical array and must have a static
+    /// [`Shape`].
+    ///
+    /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and defaults to
+    /// replication over `mesh` otherwise. Each buffer in a replicated placement must have the full logical shape,
+    /// and callers are responsible for supplying the same value in each replica.
+    ///
+    /// A supplied sharding can place the array over auto mesh axes. After removing its auto axes with
+    /// [`Sharding::without_auto_axes`], it must match any sharding in the type, or the function returns
+    /// [`ArrayError::PlacementTypeMismatch`]. The type of the resulting array records that projection, and
+    /// [`Self::sharding`] returns the full runtime placement.
     ///
     /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. Failures use
     /// [`Error::Array`] with [`ArrayError::MultipleBuffersOnDevice`] when multiple buffers belong to the same device,
@@ -245,34 +267,20 @@ impl Array {
     ///
     ///   - `session`: [`Session`] the new [`Array`] belongs to. Its client must own every provided buffer, and it is
     ///     what eager execution and free transforms recover through [`CoreValue::domain`](ryft_core::Value::domain).
-    ///     Metadata-only arrays whose shards all live on other processes pass the local session with no buffers.
     ///   - `r#type`: Global [`ArrayType`] for the new [`Array`].
     ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
-    ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process.
+    ///   - `sharding`: Optional runtime [`Sharding`] over `mesh`.
+    ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process. An empty
+    ///     list creates an array with only shard metadata.
     pub fn from_addressable_buffers(
         session: &Session,
         r#type: ArrayType,
         mesh: DeviceMesh,
+        sharding: Option<Sharding>,
         buffers: Vec<Buffer<'static>>,
     ) -> Result<Self, Error> {
         let buffers = buffers.into_iter().map(Arc::new).collect();
-        Self::from_addressable_buffers_internal(session, r#type, None, mesh, buffers, true)
-    }
-
-    /// Creates an [`Array`] like [`Self::from_addressable_buffers`], but placed according to `sharding`, which may
-    /// also place the array over auto mesh axes. Types never record placement over auto mesh axes, so the type of the
-    /// new array carries `sharding` without its auto mesh axes (refer to [`Sharding::without_auto_axes`]), while
-    /// [`Self::sharding`] returns `sharding` itself. A sharding of `r#type`, if any, must equal that projection, and
-    /// [`ArrayError::PlacementTypeMismatch`] reports one that does not.
-    pub fn from_addressable_buffers_with_sharding(
-        session: &Session,
-        r#type: ArrayType,
-        sharding: Sharding,
-        mesh: DeviceMesh,
-        buffers: Vec<Buffer<'static>>,
-    ) -> Result<Self, Error> {
-        let buffers = buffers.into_iter().map(Arc::new).collect();
-        Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, buffers, true)
+        Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, buffers, true)
     }
 
     /// Creates an [`Array`] from buffers produced by the backend whose zero-space carriers are known to be canonical.
@@ -312,9 +320,7 @@ impl Array {
         buffers: Vec<Arc<Buffer<'static>>>,
         validate_zero_carriers: bool,
     ) -> Result<Self, Error> {
-        // Normalize the provided `r#type` before deriving shard placement. A single buffer with no sharding metadata
-        // is treated as an unsharded replicated array over the mesh that the caller provided.
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh, buffers.len() == 1)?;
+        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
 
         // Compute the global `ShardLayout` implied by the runtime placement and concrete device mesh.
         let shape = r#type
@@ -387,7 +393,7 @@ impl Array {
             ))
             .into());
         }
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh, true)?;
+        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
@@ -435,6 +441,16 @@ impl Array {
     /// addressable by that client, and returns an [`Array`] that belongs to `session` and whose global shard metadata
     /// covers the full mesh.
     ///
+    /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and replicates the array
+    /// across the selected mesh otherwise. A supplied sharding can place the array over auto mesh axes. After
+    /// removing its auto axes with [`Sharding::without_auto_axes`], it must match any sharding in the type, or the
+    /// function returns [`ArrayError::PlacementTypeMismatch`]. The type of the resulting array records that projection,
+    /// and [`Self::sharding`] returns the full runtime placement.
+    ///
+    /// Passing [`None`] for `mesh` uses the mesh configured on `session` if present. Otherwise, the logical mesh
+    /// from the runtime or type sharding is laid out over the client's addressable devices in enumeration order.
+    /// Without sharding, the first addressable device forms a mesh with a single axis `x`.
+    ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
     /// default memory, and host placements select its `pinned_host` or `unpinned_host` memory. A device without the
     /// requested host space produces [`ArrayError::UnsupportedMemory`]. Bufferless zero-space arrays require no
@@ -450,43 +466,29 @@ impl Array {
     ///   - `session`: [`Session`] the constructed array belongs to. Its client transfers the local addressable shard
     ///     buffers.
     ///   - `r#type`: Global [`ArrayType`] of the constructed array.
-    ///   - `mesh`: Destination [`DeviceMesh`] describing the device topology.
+    ///   - `mesh`: Destination [`DeviceMesh`], or [`None`] to use eager placement.
+    ///   - `sharding`: Optional runtime [`Sharding`] over the destination mesh.
     ///   - `buffer`: Dense row-major host bytes for the full logical array.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placement cannot be resolved, the bytes do not match the type, or a device upload fails.
     pub fn from_host_buffer<B: AsRef<[u8]>>(
         session: &Session,
         r#type: ArrayType,
-        mesh: DeviceMesh,
-        buffer: B,
-    ) -> Result<Self, Error> {
-        Self::from_host_buffer_internal(session, r#type, None, mesh, buffer.as_ref())
-    }
-
-    /// Creates an [`Array`] like [`Self::from_host_buffer`], but placed according to `sharding`, which may also place
-    /// the array over auto mesh axes, like `jax.device_put(x, sharding)` does. The type of the new array carries
-    /// `sharding` without its auto mesh axes (refer to [`Sharding::without_auto_axes`]), while [`Self::sharding`]
-    /// returns `sharding` itself. A sharding of `r#type`, if any, must equal that projection, and
-    /// [`ArrayError::PlacementTypeMismatch`] reports one that does not.
-    pub fn from_host_buffer_with_sharding<B: AsRef<[u8]>>(
-        session: &Session,
-        r#type: ArrayType,
-        sharding: Sharding,
-        mesh: DeviceMesh,
-        buffer: B,
-    ) -> Result<Self, Error> {
-        Self::from_host_buffer_internal(session, r#type, Some(sharding), mesh, buffer.as_ref())
-    }
-
-    /// Implements [`Self::from_host_buffer`] and [`Self::from_host_buffer_with_sharding`].
-    fn from_host_buffer_internal(
-        session: &Session,
-        r#type: ArrayType,
+        mesh: impl Into<Option<DeviceMesh>>,
         sharding: Option<Sharding>,
-        mesh: DeviceMesh,
-        buffer: &[u8],
+        buffer: B,
     ) -> Result<Self, Error> {
+        let logical_mesh = sharding.as_ref().or(r#type.sharding()).map(Sharding::mesh);
+        let mesh = match mesh.into() {
+            Some(mesh) => mesh,
+            None => session.eager_mesh(&[], logical_mesh)?,
+        };
+        let buffer = buffer.as_ref();
         // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
         // sharding is interpreted as one replicated logical array over the provided mesh.
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh, true)?;
+        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
 
         // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
         let expected_byte_count = r#type.size_in_bytes()?;
@@ -549,22 +551,7 @@ impl Array {
 
             // Resolve the requested space explicitly, because passing the device itself would always upload to its
             // default memory and could silently mislabel a host-resident array as pinned or unpinned memory.
-            let memory = match r#type.memory() {
-                Memory::Device => device.default_memory()?,
-                requested @ Memory::Host { pinned } => {
-                    let kind = if pinned { "pinned_host" } else { "unpinned_host" };
-                    let mut selected = None;
-                    for candidate in device.addressable_memories()? {
-                        if candidate.kind()? == kind {
-                            selected = Some(candidate);
-                            break;
-                        }
-                    }
-                    selected.ok_or_else(|| {
-                        Error::from(ArrayError::UnsupportedMemory { device_id: shard_device_id, memory: requested })
-                    })?
-                }
-            };
+            let memory = Self::host_upload_memory(device, r#type.memory())?;
 
             // Upload the local shard bytes to the PJRT device using the static shape of the shard. For non-scalar
             // shards, the host pointer is moved to the shard's first element in the dense source buffer, and PJRT's
@@ -678,6 +665,99 @@ impl Array {
         Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, addressable_buffers)
     }
 
+    /// Creates an [`Array`] by uploading the dense row-major bytes for each shard owned by this process. The type
+    /// describes the global array. Every process supplies bytes only for its own devices and uses the same global
+    /// type, mesh, and placement. Each replica needs its own entry, and along unreduced axes the bytes represent
+    /// the partial value of that device. Shards of [`DataType::Zero`] take empty buffers and require no upload.
+    ///
+    /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and replicates the
+    /// array across `mesh` otherwise. A supplied sharding can place the array over auto mesh axes. After
+    /// removing its auto axes with [`Sharding::without_auto_axes`], it must match any sharding in the type.
+    ///
+    /// The result may contain pending device buffers. Use [`Self::block_until_ready`] to wait synchronously or
+    /// [`Self::ready`] to wait asynchronously for the local uploads. A borrowed byte slice can be reused once
+    /// this function returns. Pass an [`Arc<[u8]>`] to let PJRT retain the host allocation until it finishes
+    /// reading it. Processes can enqueue their uploads independently.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] whose PJRT client uploads the host shards.
+    ///   - `r#type`: Global static [`ArrayType`] of the new array.
+    ///   - `mesh`: Global [`DeviceMesh`] over which the array is placed.
+    ///   - `sharding`: Optional runtime [`Sharding`] over `mesh`.
+    ///   - `shards`: One pair of device ID and host bytes per local device in `mesh`, in any order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Array`] if the type has a dynamic shape, the type and runtime sharding disagree, or the
+    /// host shards have missing or duplicate entries, unexpected devices, or incorrect byte counts. Other
+    /// placement and PJRT errors propagate from the layout and upload.
+    pub fn from_host_shards<B: AsRef<[u8]> + HostBuffer>(
+        session: &Session,
+        r#type: ArrayType,
+        mesh: DeviceMesh,
+        sharding: Option<Sharding>,
+        shards: impl IntoIterator<Item = (DeviceId, B)>,
+    ) -> Result<Self, Error> {
+        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
+        let shape = r#type
+            .static_shape()
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+        let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
+        let client = session.client();
+        let process_index = client.process_index()?;
+        let mut devices = HashMap::new();
+        for device in client.addressable_devices()? {
+            devices.insert(device.id()?, device);
+        }
+        let mut host_shards = HashMap::new();
+        for (device_id, bytes) in shards {
+            let index =
+                layout.shard_index_by_device().get(&device_id).ok_or(ArrayError::DeviceNotInMesh { device_id })?;
+            let descriptor = &layout.descriptors()[*index];
+            if descriptor.device().process_index() != process_index || !devices.contains_key(&device_id) {
+                return Err(ArrayError::NonAddressableDevice { device_id, process_index }.into());
+            }
+            if host_shards.insert(device_id, bytes).is_some() {
+                return Err(ArrayError::MultipleHostShardsOnDevice { device_id }.into());
+            }
+        }
+
+        let data_type = r#type.data_type();
+        let mut uploads = Vec::new();
+        for descriptor in layout.descriptors() {
+            if descriptor.device().process_index() != process_index {
+                continue;
+            }
+            let device_id = descriptor.device().id();
+            let device =
+                devices.get(&device_id).ok_or(ArrayError::NonAddressableDevice { device_id, process_index })?;
+            let bytes = host_shards.remove(&device_id).ok_or(ArrayError::MissingHostShard { device_id })?;
+            let shape = descriptor.shape();
+            let expected = ArrayType::new(data_type, shape.clone().into()).size_in_bytes()?;
+            let actual = bytes.as_ref().len();
+            if actual != expected {
+                return Err(ArrayError::HostShardByteCountMismatch { device_id, expected, actual }.into());
+            }
+            if !data_type.is_zero() {
+                let memory = Self::host_upload_memory(device, r#type.memory())?;
+                uploads.push((bytes, shape, memory));
+            }
+        }
+        if data_type.is_zero() {
+            return Self::from_zero_space(session, r#type, Some(sharding), mesh);
+        }
+
+        let buffer_type = Self::physical_buffer_type(data_type);
+        let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
+        let mut buffers = Vec::with_capacity(uploads.len());
+        for (bytes, shape, memory) in uploads {
+            let dimensions = shape.as_slice().iter().map(|&extent| extent as u64).collect::<Vec<_>>();
+            buffers.push(client.buffer(bytes, buffer_type, dimensions, None, memory, device_layout.clone())?);
+        }
+        Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)
+    }
+
     /// Creates an [`Array`] of `r#type` over `mesh` whose elements all have the value that `kind` selects, without
     /// allocating the whole array in host memory. Every shard that the client of `session` can address is uploaded
     /// from a host buffer that has the shape of that shard. `r#type` must have a static shape and a sharding, and an
@@ -708,7 +788,7 @@ impl Array {
         // selection of the host upload, which takes the bytes of the whole array.
         if r#type.memory() != Memory::Device {
             let element_count = Shape::from(&shape).element_count()?.unwrap();
-            return Self::from_host_buffer(session, r#type, mesh, element.repeat(element_count));
+            return Self::from_host_buffer(session, r#type, mesh, None, element.repeat(element_count));
         }
         let (descriptors, _) = ShardLayout::new(&shape, &mesh, sharding)?.into_parts();
         let mut devices = HashMap::new();
@@ -960,7 +1040,7 @@ impl Array {
 
         let scalar_type =
             ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))?;
-        let scalar = Array::from_host_buffer(session, scalar_type, self.mesh().clone(), extent.to_ne_bytes())?;
+        let scalar = Array::from_host_buffer(session, scalar_type, self.mesh().clone(), None, extent.to_ne_bytes())?;
         let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
             let entry = scalars.remove(index).unwrap();
@@ -1094,12 +1174,11 @@ impl Array {
     /// Returns the [`ArrayType`] and runtime placement of an array of type `r#type` that is constructed on `mesh` with
     /// the optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type
     /// carries the placement without its auto mesh axes. Without `sharding`, the placement is the sharding of
-    /// `r#type`, or, when it has none and `implicit_replication` holds, the replicated placement over `mesh`.
+    /// `r#type` if present and replication over `mesh` otherwise.
     fn resolve_placement(
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: &DeviceMesh,
-        implicit_replication: bool,
     ) -> Result<(ArrayType, Sharding), Error> {
         let sharding = match (sharding, r#type.sharding()) {
             (Some(sharding), Some(type_sharding)) if *type_sharding != sharding.without_auto_axes() => {
@@ -1110,11 +1189,26 @@ impl Array {
             }
             (Some(sharding), _) => sharding,
             (None, Some(type_sharding)) => type_sharding.clone(),
-            (None, None) if implicit_replication => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
-            (None, None) => return Err(Error::from(ArrayError::MissingSharding)),
+            (None, None) => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
         };
         let r#type = r#type.with_sharding(sharding.without_auto_axes())?;
         Ok((r#type, sharding))
+    }
+
+    /// Resolves the destination memory of a host upload on `device`.
+    fn host_upload_memory<'d>(device: &'d PjrtDevice<'_>, memory: Memory) -> Result<PjrtMemory<'d>, Error> {
+        match memory {
+            Memory::Device => Ok(device.default_memory()?),
+            Memory::Host { pinned } => {
+                let kind = if pinned { "pinned_host" } else { "unpinned_host" };
+                for candidate in device.addressable_memories()? {
+                    if candidate.kind()? == kind {
+                        return Ok(candidate);
+                    }
+                }
+                Err(ArrayError::UnsupportedMemory { device_id: device.id()?, memory }.into())
+            }
+        }
     }
 
     /// Validates one addressable `buffer` of an array of type `r#type` whose shards are described by `descriptors` and
@@ -1713,7 +1807,7 @@ impl ArrayOutputLayout {
         mesh: Arc<DeviceMesh>,
         addressable_device_ids: &[DeviceId],
     ) -> Result<Self, Error> {
-        let (r#type, sharding) = Array::resolve_placement(r#type, sharding, &mesh, true)?;
+        let (r#type, sharding) = Array::resolve_placement(r#type, sharding, &mesh)?;
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
@@ -2330,7 +2424,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
-    use crate::sessions::tests::{domain_mesh, session_with_client, shares_effect_scope};
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client, shares_effect_scope};
     use crate::tests::{
         assert_send_sync, cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, other_cpu_client,
         replicated_array, values_from_bytes, values_to_bytes,
@@ -2373,7 +2467,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        Array::from_addressable_buffers(session, r#type, mesh, buffers).unwrap()
+        Array::from_addressable_buffers(session, r#type, mesh, None, buffers).unwrap()
     }
 
     #[test]
@@ -2389,28 +2483,51 @@ mod tests {
     }
 
     #[test]
-    fn test_array_from_addressable_buffers_accepts_unsharded_type_with_single_buffer() {
+    fn test_array_from_addressable_buffers() {
         let client = cpu_client(2);
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 2);
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
-        let device = client.addressable_devices().unwrap().into_iter().next().unwrap();
-        let buffer = client
-            .buffer(values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(), BufferType::F32, [2u64], None, device, None)
-            .unwrap();
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let devices = client.addressable_devices().unwrap();
+        let bytes = values_to_bytes(&[1.0f32, 2.0]);
+        let upload = |device| client.buffer(bytes.as_slice(), BufferType::F32, [2u64], None, device, None).unwrap();
 
-        let array = Array::from_addressable_buffers(&session, array_type, mesh.clone(), vec![buffer]).unwrap();
-
+        let buffer = upload(devices[0].clone());
+        let array =
+            Array::from_addressable_buffers(&session, array_type.clone(), mesh.clone(), None, vec![buffer]).unwrap();
         assert_eq!(array.shape(), StaticShape::new(vec![2]));
         assert_eq!(array.data_type(), DataType::F32);
-        assert_eq!(array.sharding(), &Sharding::replicated(mesh.logical_mesh().clone(), 1));
+        assert_eq!(array.sharding(), &sharding);
         assert_eq!(array.shards().len(), 2);
         assert_eq!(array.addressable_shards().count(), 1);
         assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2])));
+
+        let buffers = devices.iter().cloned().map(&upload).collect();
+        let array = Array::from_addressable_buffers(&session, array_type.clone(), mesh.clone(), None, buffers).unwrap();
+        assert_eq!(array.sharding(), &sharding);
+        assert_eq!(
+            array.addressable_shards().map(|shard| shard.copy_to_host().unwrap()).collect::<Vec<_>>(),
+            vec![bytes.clone(), bytes.clone()],
+        );
+
+        // Replication requires each buffer to hold the full logical value.
+        let global_type = ArrayType::new_static(DataType::F32, [4]);
+        let buffers = devices.into_iter().map(upload).collect();
+        let error =
+            Array::from_addressable_buffers(&session, global_type.clone(), mesh, None, buffers).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(
+                error.as_ref(), ArrayError::BufferTypeMismatch { expected, actual }
+                    if expected == &global_type && actual == &array_type
+            ),
+        ));
+        assert_eq!(error.to_string(), format!("buffer has type `{array_type}`, but expected `{global_type}`"));
     }
 
     #[test]
-    fn test_array_from_addressable_buffers_requires_sharding_without_single_buffer() {
+    fn test_array_from_addressable_buffers_without_local_buffers() {
         let client = cpu_client(1);
         let session = session_with_client(client);
         let mesh = DeviceMesh::new(
@@ -2418,12 +2535,13 @@ mod tests {
             vec![Device::new(0, 1)],
         )
         .unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let array_type = ArrayType::new_static(DataType::F32, [8]);
 
-        assert!(matches!(
-            Array::from_addressable_buffers(&session, array_type, mesh, Vec::new()),
-            Err(Error::Array(error)) if matches!(error.as_ref(), ArrayError::MissingSharding),
-        ));
+        let array = Array::from_addressable_buffers(&session, array_type, mesh.clone(), None, Vec::new()).unwrap();
+        assert_eq!(array.sharding(), &Sharding::replicated(mesh.logical_mesh().clone(), 1));
+        assert_eq!(array.shards().len(), 1);
+        assert_eq!(array.shards()[0].shape(), StaticShape::new(vec![8]));
+        assert_eq!(array.addressable_shards().count(), 0);
     }
 
     #[test]
@@ -2442,7 +2560,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            Array::from_addressable_buffers(&session, array_type, mesh, Vec::new()),
+            Array::from_addressable_buffers(&session, array_type, mesh, None, Vec::new()),
             Err(Error::Array(error)) if matches!(error.as_ref(),
                 ArrayError::DynamicShape { shape } if shape == &Shape::new(vec![CoreDimension::Dynamic(dynamic)]),
             ),
@@ -2467,6 +2585,7 @@ mod tests {
                 &session,
                 r#type.with_memory(Memory::Host { pinned: true }),
                 mesh,
+                None,
                 vec![buffer],
             ),
             Err(Error::Array(error)) if matches!(error.as_ref(),
@@ -2489,7 +2608,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
         let buffer = client.buffer(&[0u8, 1u8, 0u8], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
-        let error = Array::from_addressable_buffers(&session, r#type, mesh, vec![buffer]).unwrap_err();
+        let error = Array::from_addressable_buffers(&session, r#type, mesh, None, vec![buffer]).unwrap_err();
 
         assert!(matches!(
             &error,
@@ -2512,7 +2631,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
         let buffer = client.buffer(&[0u8; 3], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
-        let array = Array::from_addressable_buffers(&session, r#type, mesh, vec![buffer]).unwrap();
+        let array = Array::from_addressable_buffers(&session, r#type, mesh, None, vec![buffer]).unwrap();
 
         assert_eq!(array.addressable_shards().count(), 1);
         assert!(array.addressable_shards().next().unwrap().buffer().is_none());
@@ -2531,7 +2650,7 @@ mod tests {
                 .unwrap();
             let buffer = client.buffer(&[1], data_type.to_pjrt(), [], None, device.clone(), None).unwrap();
             assert!(matches!(
-                Array::from_addressable_buffers(&session, array_type, mesh.clone(), vec![buffer]),
+                Array::from_addressable_buffers(&session, array_type, mesh.clone(), None, vec![buffer]),
                 Err(Error::Array(error)) if matches!(error.as_ref(),
                     ArrayError::BufferTypeMismatch { expected, actual }
                         if expected == &ArrayType::scalar(DataType::Boolean) && actual == &ArrayType::scalar(data_type),
@@ -2542,7 +2661,7 @@ mod tests {
 
     // TODO(eaplatanios): Review this test.
     #[test]
-    fn test_array_from_addressable_buffers_with_sharding() {
+    fn test_array_from_addressable_buffers_with_runtime_sharding() {
         let client = cpu_client(4);
         let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
@@ -2565,13 +2684,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // Construct via `Array::from_addressable_buffers_with_sharding` and exercise every canonical `Array` accessor.
-        // The placement over the auto mesh axes is runtime state only, so the type of the array records none of it.
-        let array = Array::from_addressable_buffers_with_sharding(
+        // Placement over auto mesh axes is runtime state. The array type records the projection onto explicit and
+        // manual axes.
+        let array = Array::from_addressable_buffers(
             &session,
             array_type.clone(),
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             shard_buffers,
         )
         .unwrap();
@@ -2607,14 +2726,9 @@ mod tests {
         // Layout metadata stored on the underlying array type is exposed verbatim by `Array::layout`.
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
         let layout_type = array_type.clone().with_layout(layout.clone());
-        let layout_array = Array::from_addressable_buffers_with_sharding(
-            &session,
-            layout_type,
-            sharding.clone(),
-            mesh.clone(),
-            Vec::new(),
-        )
-        .unwrap();
+        let layout_array =
+            Array::from_addressable_buffers(&session, layout_type, mesh.clone(), Some(sharding.clone()), Vec::new())
+                .unwrap();
         assert_eq!(layout_array.layout(), Some(&layout));
         assert_eq!(layout_array.addressable_shards().count(), 0);
         assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
@@ -2628,11 +2742,11 @@ mod tests {
         .unwrap();
         let replicated_type = array_type.clone().with_sharding(Sharding::replicated(explicit_mesh.clone(), 2)).unwrap();
         let explicit_device_mesh = DeviceMesh::new(explicit_mesh, devices.clone()).unwrap();
-        let error = Array::from_addressable_buffers_with_sharding(
+        let error = Array::from_addressable_buffers(
             &session,
             replicated_type.clone(),
-            explicit_sharding.clone(),
             explicit_device_mesh,
+            Some(explicit_sharding.clone()),
             Vec::new(),
         )
         .unwrap_err();
@@ -2649,15 +2763,14 @@ mod tests {
              `{mesh<['x'=4:explicit]>, [{'x'}, {}]}` over the non-auto mesh axes",
         );
 
-        // Construct via `Array::from_host_buffer_with_sharding` and verify that it partitions the dense row-major host
-        // bytes over the shard layout implied by the mesh and sharding. With a `[4, 4]` `F32` array sharded over both
-        // mesh axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
+        // A dense row-major upload uses the same shard layout. With a `[4, 4]` `F32` array sharded over both mesh
+        // axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
-        let host_array = Array::from_host_buffer_with_sharding(
+        let host_array = Array::from_host_buffer(
             &session,
             array_type,
-            sharding.clone(),
             mesh,
+            Some(sharding.clone()),
             values_to_bytes::<f32>(values.as_slice()).as_slice(),
         )
         .unwrap();
@@ -2679,6 +2792,56 @@ mod tests {
     }
 
     #[test]
+    fn test_array_from_host_buffer() {
+        let client = cpu_client(1);
+        let session = session_with_client(client);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes::<f32>(&[1.0, 2.0]);
+
+        // Without a configured mesh or sharding, the first addressable device forms the default mesh.
+        let default_mesh = domain_mesh(client, "x", 1);
+        let array = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
+        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&default_mesh, 2));
+        assert_eq!(array.mesh(), &default_mesh);
+        assert!(array.session().is_same_session(&session));
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+
+        // Without a configured mesh, the type's sharding supplies the logical mesh.
+        let inferred_mesh = domain_mesh(client, "y", 1);
+        let sharded_type = replicated_vector_type(&inferred_mesh, 2);
+        let array = Array::from_host_buffer(&session, sharded_type.clone(), None, None, bytes.as_slice()).unwrap();
+        assert_eq!(array.r#type().into_owned(), sharded_type);
+        assert_eq!(array.mesh(), &inferred_mesh);
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+
+        // An explicit mesh takes precedence over the session's configured mesh.
+        let configured_mesh = domain_mesh(client, "z", 1);
+        let configured_session = session.with_device_mesh(configured_mesh.clone());
+        let array = Array::from_host_buffer(&configured_session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
+        assert_eq!(array.r#type().into_owned(), replicated_vector_type(&configured_mesh, 2));
+        assert_eq!(array.mesh(), &configured_mesh);
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+        let array =
+            Array::from_host_buffer(&configured_session, r#type.clone(), default_mesh.clone(), None, bytes.as_slice())
+                .unwrap();
+        assert_eq!(array.mesh(), &default_mesh);
+
+        // A sharding over more devices than the client has cannot be inferred.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let r#type = r#type.with_sharding(Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
+        assert!(matches!(
+            Array::from_host_buffer(&session, r#type, None, None, bytes.as_slice()),
+            Err(Error::Core(error))
+                if *error == CoreError::Program(ProgramError::InvalidArgument {
+                    message: format!(
+                        "eager XLA placement of a value without array inputs over mesh {logical_mesh:?} requires 2 \
+                         addressable device(s) but the client only has 1",
+                    ),
+                }),
+        ));
+    }
+
+    #[test]
     #[allow(deprecated)] // PJRT currently exposes actual buffer layout only through this query.
     fn test_array_from_host_buffer_layout() {
         let client = execution_client();
@@ -2690,6 +2853,7 @@ mod tests {
             &session,
             ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone()),
             mesh.clone(),
+            None,
             values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]),
         )
         .unwrap();
@@ -2713,6 +2877,7 @@ mod tests {
             &session,
             ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout),
             mesh,
+            None,
             vec![wrong_buffer],
         )
         .unwrap_err();
@@ -2739,7 +2904,8 @@ mod tests {
             for shape in [Shape::new(vec![]), Shape::new(vec![CoreDimension::Static(2)])] {
                 let count = if shape.rank() == 0 { 1 } else { 2 };
                 let r#type = ArrayType::new(DataType::I64, shape).with_memory(memory);
-                let array = Array::from_host_buffer(&session, r#type, mesh.clone(), &values[..count * 8]).unwrap();
+                let array =
+                    Array::from_host_buffer(&session, r#type, mesh.clone(), None, &values[..count * 8]).unwrap();
                 assert_eq!(array.r#type().memory(), memory);
                 let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
                 let actual = buffer.memory().unwrap();
@@ -2789,7 +2955,7 @@ mod tests {
         let materialize = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
 
         let uploaded =
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
                 .unwrap();
         assert_eq!(device_values(&uploaded), vec![vec![1., 2.], vec![3., 4.], vec![0., 0.], vec![0., 0.]]);
         assert_eq!(materialize(&uploaded), vec![1., 2., 3., 4.]);
@@ -2803,7 +2969,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let summands = Array::from_addressable_buffers(&session, r#type, mesh.clone(), buffers).unwrap();
+        let summands = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap();
         assert_eq!(materialize(&summands), vec![11., 22., 33., 44.]);
 
         // With kind `max` or `min`, the devices along `x` hold candidates whose maximum or minimum, respectively, is
@@ -2813,9 +2979,14 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [4])
                 .with_sharding(sharding.clone().with_unreduced_kind(kind).unwrap())
                 .unwrap();
-            let uploaded =
-                Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[-1f32, -2., 3., 4.]))
-                    .unwrap();
+            let uploaded = Array::from_host_buffer(
+                &session,
+                r#type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes(&[-1f32, -2., 3., 4.]),
+            )
+            .unwrap();
             assert_eq!(device_values(&uploaded), vec![vec![-1., -2.], vec![3., 4.], vec![-1., -2.], vec![3., 4.]]);
             assert_eq!(materialize(&uploaded), vec![-1., -2., 3., 4.]);
             let buffers = [[1f32, 2.], [3., 4.], [10., -20.], [30., 40.]]
@@ -2827,7 +2998,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let candidates = Array::from_addressable_buffers(&session, r#type, mesh.clone(), buffers).unwrap();
+            let candidates = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap();
             assert_eq!(materialize(&candidates), expected.to_vec());
         }
 
@@ -2852,7 +3023,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
 
-        let array = Array::from_host_buffer(&session, r#type, mesh, []).unwrap();
+        let array = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
         assert_eq!(array.size_in_bytes().unwrap(), 0);
         let shard = array.addressable_shards().next().unwrap();
@@ -2861,7 +3032,7 @@ mod tests {
         assert_eq!(array.copy_to_host().unwrap(), Vec::<u8>::new());
 
         let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(0)]));
-        let zero_sized = Array::from_host_buffer(&session, zero_sized_type, array.mesh().clone(), []).unwrap();
+        let zero_sized = Array::from_host_buffer(&session, zero_sized_type, array.mesh().clone(), None, []).unwrap();
         assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
         assert!(zero_sized.addressable_shards().next().unwrap().buffer().is_none());
     }
@@ -2876,7 +3047,7 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
 
-        let array = Array::from_host_buffer(&session, r#type, mesh, []).unwrap();
+        let array = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
 
         assert_eq!(array.shards().len(), 2);
         assert!(array.shards()[0].is_addressable());
@@ -2886,7 +3057,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_from_host_buffer_with_sharding_uneven_1d_partitioning() {
+    fn test_array_from_host_buffer_uneven_1d_partitioning() {
         let client = cpu_client(2);
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 2);
@@ -2894,14 +3065,15 @@ mod tests {
         let values = [0.0f32, 1.0, 2.0, 3.0, 4.0];
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(5)]));
 
-        let array = Array::from_host_buffer_with_sharding(
+        let array = Array::from_host_buffer(
             &session,
             r#type,
-            sharding,
-            mesh,
+            None,
+            Some(sharding),
             values_to_bytes::<f32>(values.as_slice()).as_slice(),
         )
         .unwrap();
+        assert_eq!(array.mesh(), &mesh);
 
         // The first partition receives the extra element of the uneven dimension.
         assert_eq!(array.addressable_shards().count(), 2);
@@ -2927,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_from_host_buffer_with_sharding_2d_partitioning() {
+    fn test_array_from_host_buffer_2d_partitioning() {
         let client = cpu_client(4);
         let session = session_with_client(client);
         let devices = client
@@ -2946,11 +3118,11 @@ mod tests {
         let r#type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(6)]));
 
-        let array = Array::from_host_buffer_with_sharding(
+        let array = Array::from_host_buffer(
             &session,
             r#type,
-            sharding,
             mesh,
+            Some(sharding),
             values_to_bytes::<f32>(values.as_slice()).as_slice(),
         )
         .unwrap();
@@ -2987,6 +3159,117 @@ mod tests {
                 vec![27.0, 28.0, 29.0, 33.0, 34.0, 35.0, 39.0, 40.0, 41.0, 45.0, 46.0, 47.0],
             ],
         );
+    }
+
+    #[test]
+    fn test_array_from_host_shards() {
+        let client = cpu_client(2);
+        let session = session_with_client(client);
+        let mut devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let first = devices[0].id();
+        let second = devices[1].id();
+        let remote = Device::new(first.max(second) + 1, devices[0].process_index() + 1);
+        devices.push(remote);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [5]).with_sharding(sharding).unwrap();
+        let first_bytes = [1, 2].as_slice();
+        let second_bytes = [3, 4].as_slice();
+
+        let array = Array::from_host_shards(
+            &session,
+            r#type.clone(),
+            mesh.clone(),
+            None,
+            [(second, second_bytes), (first, first_bytes)],
+        )
+        .unwrap();
+        array.block_until_ready().unwrap();
+        assert_eq!(array.shape(), StaticShape::new(vec![5]));
+        assert_eq!(array.addressable_shards().count(), 2);
+        assert_eq!(array.shards()[0].copy_to_host().unwrap(), first_bytes);
+        assert_eq!(array.shards()[1].copy_to_host().unwrap(), second_bytes);
+        assert!(!array.shards()[2].is_addressable());
+
+        let missing =
+            Array::from_host_shards(&session, r#type.clone(), mesh.clone(), None, [(first, first_bytes)]).unwrap_err();
+        assert!(matches!(
+            &missing,
+            Error::Array(error) if matches!(error.as_ref(), ArrayError::MissingHostShard { device_id } if *device_id == second)
+        ));
+        assert_eq!(missing.to_string(), format!("missing host shard for device {second}"));
+
+        let duplicate = Array::from_host_shards(
+            &session,
+            r#type.clone(),
+            mesh.clone(),
+            None,
+            [(first, first_bytes), (first, first_bytes), (second, second_bytes)],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &duplicate,
+            Error::Array(error) if matches!(error.as_ref(), ArrayError::MultipleHostShardsOnDevice { device_id } if *device_id == first)
+        ));
+        assert_eq!(duplicate.to_string(), format!("got multiple host shards for device {first}"));
+
+        let wrong_size = Array::from_host_shards(
+            &session,
+            r#type.clone(),
+            mesh.clone(),
+            None,
+            [(first, first_bytes), (second, &second_bytes[..1])],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &wrong_size,
+            Error::Array(error) if matches!(
+                error.as_ref(),
+                ArrayError::HostShardByteCountMismatch { device_id, expected: 2, actual: 1 } if *device_id == second
+            )
+        ));
+        assert_eq!(wrong_size.to_string(), format!("host shard on device {second} needs 2 byte(s) but got 1"));
+
+        assert!(matches!(
+            Array::from_host_shards(
+                &session,
+                r#type,
+                mesh,
+                None,
+                [(first, first_bytes), (second, second_bytes), (remote.id(), [5].as_slice())],
+            ),
+            Err(Error::Array(error)) if matches!(error.as_ref(), ArrayError::NonAddressableDevice { device_id, .. }
+                if *device_id == remote.id()),
+        ));
+    }
+
+    #[test]
+    fn test_array_from_host_shards_with_auto_axis() {
+        let client = cpu_client(2);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [3]);
+        let first = mesh.devices()[0].id();
+        let second = mesh.devices()[1].id();
+        let array = Array::from_host_shards(
+            &session,
+            r#type,
+            mesh,
+            Some(sharding.clone()),
+            [(first, Arc::<[u8]>::from([1, 2])), (second, Arc::<[u8]>::from([3]))],
+        )
+        .unwrap();
+        array.block_until_ready().unwrap();
+        assert_eq!(array.sharding(), &sharding);
+        assert_eq!(array.r#type().sharding(), Some(&sharding.without_auto_axes()));
+        assert_eq!(array.copy_to_host().unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -3067,11 +3350,11 @@ mod tests {
 
         // Planned outputs describe the same placement as the validating constructor, and every output built from one
         // layout shares its metadata. Their types record none of the placement over the auto mesh axes.
-        let expected = Array::from_addressable_buffers_with_sharding(
+        let expected = Array::from_addressable_buffers(
             &session,
             array_type.clone(),
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             shard_buffers(),
         )
         .unwrap();
@@ -3139,7 +3422,7 @@ mod tests {
 
         // Attaching the fence of pending sends never waits, and clones and retained copies share that fence.
         let (event, promise) = client.event(()).unwrap();
-        let array = Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2.]))
+        let array = Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
             .unwrap()
             .with_send_fence(ExecutionFence::new(vec![event]));
         let clone = array.clone();
@@ -3176,7 +3459,7 @@ mod tests {
         // Pending sends leave the asynchronous readiness functions pending without blocking the thread,
         // and successful sends leave every readiness function successful.
         let (event, promise) = client.event(()).unwrap();
-        let array = Array::from_host_buffer(&session, r#type, mesh, values_to_bytes(&[1f32, 2.]))
+        let array = Array::from_host_buffer(&session, r#type, mesh, None, values_to_bytes(&[1f32, 2.]))
             .unwrap()
             .with_send_fence(ExecutionFence::new(vec![event]));
         assert!(matches!(pin!(array.ready()).poll(&mut context), Poll::Pending));
@@ -3193,7 +3476,8 @@ mod tests {
         let client = cpu_client(1);
         let other_client = other_cpu_client(1);
         let session = session_with_client(client);
-        let array = session.array(ArrayType::scalar(DataType::F32), 1f32.to_ne_bytes()).unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
         let original = array.clone();
 
         // Associating with a handle of the same session that has a new effect scope switches the effect scope while
@@ -3226,7 +3510,8 @@ mod tests {
         // Association rejects a session of a different client, even when no numerical buffer could establish
         // ownership (e.g., for bufferless zero-space arrays).
         let other_client_session = session_with_client(other_client);
-        for array in [original, session.array(ArrayType::scalar(DataType::Zero), []).unwrap()] {
+        let zero = Array::from_host_buffer(&session, ArrayType::scalar(DataType::Zero), None, None, []).unwrap();
+        for array in [original, zero] {
             assert!(matches!(
                 array.associate(&other_client_session),
                 Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))
@@ -3254,11 +3539,11 @@ mod tests {
         let session = session_with_client(client);
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let bytes = values_to_bytes::<f32>(values.as_slice());
-        let array = Array::from_host_buffer_with_sharding(
+        let array = Array::from_host_buffer(
             &session,
             array_type.clone(),
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             bytes.as_slice(),
         )
         .unwrap();
@@ -3280,11 +3565,11 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let array = Array::from_addressable_buffers_with_sharding(
+        let array = Array::from_addressable_buffers(
             &session,
             array_type.clone(),
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             shard_buffers(),
         )
         .unwrap();
@@ -3295,11 +3580,11 @@ mod tests {
         // created from the same plugin with identical options.
         let other_client = other_cpu_client(4);
         let other_session = session_with_client(other_client);
-        let error = Array::from_addressable_buffers_with_sharding(
+        let error = Array::from_addressable_buffers(
             &other_session,
             array_type.clone(),
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             shard_buffers(),
         )
         .unwrap_err();
@@ -3316,8 +3601,7 @@ mod tests {
         // Metadata-only arrays with no addressable buffers carry no storage to validate, and still belong to the
         // provided session and live on its client.
         let array =
-            Array::from_addressable_buffers_with_sharding(&other_session, array_type, sharding, mesh, Vec::new())
-                .unwrap();
+            Array::from_addressable_buffers(&other_session, array_type, mesh, Some(sharding), Vec::new()).unwrap();
         assert_eq!(array.addressable_shards().count(), 0);
         assert!(std::ptr::eq(array.client(), other_client));
     }
@@ -3338,13 +3622,13 @@ mod tests {
         // Sharded and replicated arrays read back as the dense row-major bytes of their whole value.
         for sharding in [sharded.clone(), replicated.clone()] {
             let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
-            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), values.as_slice()).unwrap();
+            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), None, values.as_slice()).unwrap();
             assert_eq!(array.copy_to_host().unwrap(), values);
         }
 
         // An array with no elements produces no bytes.
         let r#type = ArrayType::new_static(DataType::F32, [0]).with_sharding(sharded.clone()).unwrap();
-        let empty = Array::from_host_buffer(&session, r#type, mesh, []).unwrap();
+        let empty = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
         assert_eq!(empty.copy_to_host().unwrap(), Vec::<u8>::new());
 
         // When the second mesh device lives in another process, the current process holds a replicated value in full,
@@ -3358,7 +3642,7 @@ mod tests {
             let bytes = values_to_bytes(local_values);
             let buffer =
                 client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, client_devices[0].clone(), None);
-            Array::from_addressable_buffers(&session, r#type, remote_mesh.clone(), vec![buffer.unwrap()]).unwrap()
+            Array::from_addressable_buffers(&session, r#type, remote_mesh.clone(), None, vec![buffer.unwrap()]).unwrap()
         };
         assert_eq!(with_remote_shard(replicated, &[1., 2., 3., 4.]).copy_to_host().unwrap(), values);
         for (sharding, local_values) in [(sharded, [1f32, 2.].as_slice()), (unreduced, [1f32, 2., 3., 4.].as_slice())] {
@@ -3382,11 +3666,11 @@ mod tests {
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array = Array::from_host_buffer_with_sharding(
+        let array = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [4]),
-            sharding,
             mesh,
+            Some(sharding),
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();
@@ -3409,8 +3693,9 @@ mod tests {
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 1);
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
-        let array = Array::from_host_buffer(&session, array_type, mesh, values_to_bytes::<f32>(&[1.0, 2.0]).as_slice())
-            .unwrap();
+        let array =
+            Array::from_host_buffer(&session, array_type, mesh, None, values_to_bytes::<f32>(&[1.0, 2.0]).as_slice())
+                .unwrap();
 
         // Clones share their storage, so a shared array is never donatable while a uniquely held one is.
         assert!(array.has_unique_shard_buffers());
@@ -3433,8 +3718,7 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, shape);
         let array =
-            Array::from_addressable_buffers_with_sharding(&session, array_type, sharding, device_mesh, Vec::new())
-                .unwrap();
+            Array::from_addressable_buffers(&session, array_type, device_mesh, Some(sharding), Vec::new()).unwrap();
 
         // The type records no placement over the auto mesh axis, while the runtime placement does.
         assert_eq!(
@@ -3475,7 +3759,7 @@ mod tests {
             .with_sharding(Sharding::replicated(logical_mesh, 1))
             .unwrap();
         let remote_array =
-            || Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), Vec::new()).unwrap();
+            || Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), None, Vec::new()).unwrap();
         let (left, right) = (remote_array(), remote_array());
         assert_eq!(left, left.clone());
         assert_ne!(left, right);
@@ -3678,11 +3962,11 @@ mod tests {
 
         // The extent of an unevenly sharded axis is the greatest end of the slices of its shards.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let sharded = Array::from_host_buffer_with_sharding(
+        let sharded = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [5]),
-            sharding,
             mesh,
+            Some(sharding),
             values_to_bytes(&[0f32; 5]),
         )
         .unwrap();
@@ -3769,11 +4053,11 @@ mod tests {
 
         // A buffer-backed shard holds only its own tile of the array.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array = Array::from_host_buffer_with_sharding(
+        let array = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [4]),
-            sharding,
             mesh.clone(),
+            Some(sharding),
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();

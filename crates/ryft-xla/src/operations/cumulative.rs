@@ -481,6 +481,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&values).as_slice(),
             )
             .unwrap()
@@ -655,6 +656,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&values).as_slice(),
             )
             .unwrap()
@@ -1168,6 +1170,7 @@ mod tests {
                 &session,
                 ArrayType::new_static(DataType::F32, [rows, 5]).with_sharding(sharding.clone()).unwrap(),
                 mesh.clone(),
+                None,
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();

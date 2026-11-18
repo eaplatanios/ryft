@@ -4145,8 +4145,10 @@ mod tests {
                 ]
                 in (%2, %3)"},
         );
-        let carry = Array::from_host_buffer(&session, scalar_type, mesh.clone(), values_to_bytes(&[0f64])).unwrap();
-        let inputs = Array::from_host_buffer(&session, inputs_type, mesh, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
+        let carry =
+            Array::from_host_buffer(&session, scalar_type, mesh.clone(), None, values_to_bytes(&[0f64])).unwrap();
+        let inputs =
+            Array::from_host_buffer(&session, inputs_type, mesh, None, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
         let (sum, prefixes) = compiled.executable().execute(&session, (carry, inputs)).unwrap();
         assert_eq!(read_f64s(client, &sum), vec![6.0]);
         assert_eq!(read_f64s(client, &prefixes), vec![1.0, 3.0, 6.0]);

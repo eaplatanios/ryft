@@ -180,9 +180,14 @@ mod tests {
         assert_eq!(engine.cached_program_count(), 1, "three staged reshards should compile into one program");
 
         let values = [0.1f32, 0.2, 0.3, 0.4];
-        let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&engine, source).unwrap();
 
         // The last constraint replicates the final output, so every device sees the full vector.
@@ -214,6 +219,7 @@ mod tests {
             &session,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         )
         .unwrap();
@@ -272,6 +278,7 @@ mod tests {
             &session,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         )
         .unwrap();
@@ -327,6 +334,7 @@ mod tests {
             &session,
             input_type.clone(),
             mesh,
+            None,
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         )
         .unwrap();
@@ -368,11 +376,11 @@ mod tests {
         let mesh = device_mesh(client, logical_mesh.clone());
         let input_placement = sharding(&logical_mesh, &[Some("x"), Some("y")]);
         let input_type = ArrayType::new_static(DataType::F32, [4, 2]);
-        let input = Array::from_host_buffer_with_sharding(
+        let input = Array::from_host_buffer(
             &session,
             input_type.clone(),
-            input_placement.clone(),
             mesh.clone(),
+            Some(input_placement.clone()),
             values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
         )
         .unwrap();

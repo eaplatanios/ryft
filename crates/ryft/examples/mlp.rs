@@ -310,7 +310,7 @@ mod xla_backend {
         let shape = Shape::new(dimensions.iter().copied().map(Dimension::Static).collect());
         let r#type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-        Ok(Array::from_host_buffer(session, r#type, mesh.clone(), values_to_bytes(values))?)
+        Ok(Array::from_host_buffer(session, r#type, mesh.clone(), None, values_to_bytes(values))?)
     }
 
     /// Copies a replicated `f32` XLA array back to the host.

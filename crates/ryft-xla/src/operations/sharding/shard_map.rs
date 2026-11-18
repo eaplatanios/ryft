@@ -923,7 +923,7 @@ pub(crate) mod tests {
         let inputs = input_types
             .into_iter()
             .zip(input_bytes)
-            .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
+            .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap())
             .collect();
         let lowered = session.lower_program(&xla_program, 0, &Options::new(mesh)).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
@@ -1002,7 +1002,9 @@ pub(crate) mod tests {
             types
                 .iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| {
+                    Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, bytes).unwrap()
+                })
                 .collect::<Vec<_>>()
         };
         let execute = |program: &FlatProgram, inputs: Vec<_>| {
@@ -1504,6 +1506,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();
@@ -2769,6 +2772,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[8, 4], left_sharding.clone()),
             device_mesh.clone(),
+            None,
             left_buffers,
         )
         .unwrap();
@@ -2776,6 +2780,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[4, 2], right_sharding),
             device_mesh,
+            None,
             right_buffers,
         )
         .unwrap();
@@ -2894,7 +2899,8 @@ pub(crate) mod tests {
         let compiled = session.compile_program(&lowered).unwrap();
         let inputs = [0.25f32, 0.5, 1.0, 2.0];
         let input =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes::<f32>(&inputs).as_slice()).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes::<f32>(&inputs).as_slice())
+                .unwrap();
         let outputs = session.execute_program(&compiled, vec![input]).unwrap();
         let shards = |array: &Array| {
             array
@@ -2976,6 +2982,7 @@ pub(crate) mod tests {
             &session,
             cotangent_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).as_slice(),
         )
         .unwrap();
@@ -3063,6 +3070,7 @@ pub(crate) mod tests {
             &session,
             input_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).as_slice(),
         )
         .unwrap();
@@ -3133,8 +3141,14 @@ pub(crate) mod tests {
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &session,
+                array_type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes(values).as_slice(),
+            )
+            .unwrap()
         };
         let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
         let tangent_reference = ArrayReference::new(array(&[23.0, 29.0, 31.0, 37.0]));
@@ -3195,7 +3209,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(values).as_slice())
+                .unwrap()
         };
         let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
         let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
@@ -3273,8 +3288,14 @@ pub(crate) mod tests {
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
-                .unwrap()
+            Array::from_host_buffer(
+                &session,
+                array_type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes(values).as_slice(),
+            )
+            .unwrap()
         };
         let destination = ArrayReference::new(array(&[5.0, 7.0]));
         compiled
@@ -3310,7 +3331,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, referent_type, mesh, values_to_bytes(&[1f32, 2.0]).as_slice()).unwrap(),
+            Array::from_host_buffer(&session, referent_type, mesh, None, values_to_bytes(&[1f32, 2.0]).as_slice())
+                .unwrap(),
         );
         compiled
             .execute_statefully_and_wait(
@@ -3346,7 +3368,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let destination = ArrayReference::new(
-            Array::from_host_buffer(&session, cotangent_type, mesh, values_to_bytes(&[5f32, 7.0]).as_slice()).unwrap(),
+            Array::from_host_buffer(&session, cotangent_type, mesh, None, values_to_bytes(&[5f32, 7.0]).as_slice())
+                .unwrap(),
         );
         compiled
             .execute_statefully_and_wait(
@@ -3426,6 +3449,7 @@ pub(crate) mod tests {
                 &session,
                 sharded_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
             )
             .unwrap(),
@@ -3434,6 +3458,7 @@ pub(crate) mod tests {
             &session,
             sharded_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
@@ -3529,6 +3554,7 @@ pub(crate) mod tests {
                 &session,
                 replicated_type,
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[100.0, 200.0]).as_slice(),
             )
             .unwrap(),
@@ -3537,6 +3563,7 @@ pub(crate) mod tests {
             &session,
             sharded_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3883,6 +3910,7 @@ pub(crate) mod tests {
                     &session,
                     static_sharded_array_type(DataType::F32, &[], replicated),
                     device_mesh.clone(),
+                    None,
                     shared_buffers,
                 )
                 .unwrap(),
@@ -3890,6 +3918,7 @@ pub(crate) mod tests {
                     &session,
                     static_sharded_array_type(DataType::F32, &[device_count], sharded),
                     device_mesh,
+                    None,
                     weight_buffers,
                 )
                 .unwrap(),
@@ -4050,6 +4079,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[], replicated),
                 device_mesh.clone(),
+                None,
                 shared_buffers,
             )
             .unwrap(),
@@ -4057,6 +4087,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[4], global),
                 device_mesh,
+                None,
                 weight_buffers,
             )
             .unwrap(),
@@ -4182,6 +4213,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[2], shared_sharding),
                 device_mesh.clone(),
+                None,
                 shared_buffers,
             )
             .unwrap(),
@@ -4189,6 +4221,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[2, 2], global),
                 device_mesh,
+                None,
                 weight_buffers,
             )
             .unwrap(),
@@ -4342,6 +4375,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[3], replicated),
                 device_mesh.clone(),
+                None,
                 data_buffers,
             )
             .unwrap(),
@@ -4349,6 +4383,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
+                None,
                 index_buffers,
             )
             .unwrap(),
@@ -4356,6 +4391,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[4], sharded),
                 device_mesh,
+                None,
                 seed_buffers,
             )
             .unwrap(),
@@ -4494,6 +4530,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[2], replicated.clone()),
                 device_mesh.clone(),
+                None,
                 data_buffers,
             )
             .unwrap(),
@@ -4501,6 +4538,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
+                None,
                 index_buffers,
             )
             .unwrap(),
@@ -4508,6 +4546,7 @@ pub(crate) mod tests {
                 &session,
                 static_sharded_array_type(DataType::F32, &[2], replicated),
                 device_mesh,
+                None,
                 seed_buffers,
             )
             .unwrap(),
@@ -4637,12 +4676,19 @@ pub(crate) mod tests {
             .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let inputs = vec![
-            Array::from_host_buffer(&session, query_type, device_mesh.clone(), values_to_bytes(&[0.0f32])).unwrap(),
-            Array::from_host_buffer(&session, key_type, device_mesh.clone(), values_to_bytes(&[0.0f32, 1.0, 0.0, 3.0]))
+            Array::from_host_buffer(&session, query_type, device_mesh.clone(), None, values_to_bytes(&[0.0f32]))
                 .unwrap(),
-            Array::from_host_buffer(&session, value_type, device_mesh.clone(), values_to_bytes(&[2.0f32, 6.0]))
+            Array::from_host_buffer(
+                &session,
+                key_type,
+                device_mesh.clone(),
+                None,
+                values_to_bytes(&[0.0f32, 1.0, 0.0, 3.0]),
+            )
+            .unwrap(),
+            Array::from_host_buffer(&session, value_type, device_mesh.clone(), None, values_to_bytes(&[2.0f32, 6.0]))
                 .unwrap(),
-            Array::from_host_buffer(&session, seed_type, device_mesh, values_to_bytes(&[2.0f32, 5.0])).unwrap(),
+            Array::from_host_buffer(&session, seed_type, device_mesh, None, values_to_bytes(&[2.0f32, 5.0])).unwrap(),
         ];
         let device_ids = executable
             .addressable_devices()
@@ -4799,6 +4845,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
+            None,
             buffers,
         )
         .unwrap();
@@ -4928,6 +4975,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[3, 8], batched_sharding),
             device_mesh,
+            None,
             buffers,
         )
         .unwrap();
@@ -5079,6 +5127,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[4, 8], batched_sharding),
             device_mesh,
+            None,
             buffers,
         )
         .unwrap();
@@ -5387,7 +5436,7 @@ pub(crate) mod tests {
         let unreduced = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let options = ShardMapOptions::new().with_check_manual_variation(false);
         let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap();
-        let input = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes(&[1f32, 2.])).unwrap();
         let summands = shard_map(Ok, input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
         let squares = shard_map(
             |summand: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(summand.clone() * summand),
@@ -5458,7 +5507,8 @@ pub(crate) mod tests {
         .into_inner();
         let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
         let input =
-            Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.])).unwrap();
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]))
+                .unwrap();
         let Value::Array(output) = compiled.executable().execute(&session, Value::Array(input)).unwrap() else {
             panic!("the compiled function returned a dimension");
         };
@@ -5525,7 +5575,8 @@ pub(crate) mod tests {
         .unwrap()
         .into_inner();
         let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
-        let input = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let Value::Array(output) = compiled.executable().execute(&session, Value::Array(input)).unwrap() else {
             panic!("the compiled function returned a dimension");
         };
@@ -5607,8 +5658,8 @@ pub(crate) mod tests {
 
         // Maps over meshes with the same axis order agree on the coordinates of every device.
         let compiled = compile_maps(&mesh, device_mesh(&mesh)).unwrap();
-        let input =
-            Array::from_host_buffer(&session, input_type.clone(), device_mesh(&mesh), 0f32.to_ne_bytes()).unwrap();
+        let input = Array::from_host_buffer(&session, input_type.clone(), device_mesh(&mesh), None, 0f32.to_ne_bytes())
+            .unwrap();
         let (first, second) = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(values_from_bytes::<u64>(&first.copy_to_host().unwrap()), vec![0, 1]);
         assert_eq!(values_from_bytes::<u64>(&second.copy_to_host().unwrap()), vec![0, 1]);
@@ -5681,7 +5732,7 @@ pub(crate) mod tests {
             device_mesh(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&session, input_type, device_mesh(), 0f32.to_ne_bytes()).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, device_mesh(), None, 0f32.to_ne_bytes()).unwrap();
         let (unplaced, replicated) = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(values_from_bytes::<u64>(&unplaced.copy_to_host().unwrap()), vec![0, 1]);
         assert_eq!(values_from_bytes::<u64>(&replicated.copy_to_host().unwrap()), vec![0, 1]);

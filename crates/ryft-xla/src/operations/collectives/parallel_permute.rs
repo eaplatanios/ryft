@@ -165,6 +165,7 @@ mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[4], sharding.clone()),
             device_mesh.clone(),
+            None,
             input_buffers,
         )
         .unwrap();

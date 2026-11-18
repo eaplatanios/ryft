@@ -1331,9 +1331,9 @@ unsafe impl Send for FrozenExecutionContext {}
 /// Callback invoked once with an [`ExecutionFence`]'s terminal result.
 type ExecutionFenceCallback = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 
-/// Mutable joined-completion state driven by the native callbacks of every device event.
+/// Mutable state for the dependencies of an [`ExecutionFence`].
 struct ExecutionFenceCompletion {
-    /// Number of device events that have not completed or failed callback registration yet.
+    /// Number of dependencies that have yet to report their terminal result.
     remaining: usize,
 
     /// First observed asynchronous execution or callback-registration failure.
@@ -1362,13 +1362,28 @@ struct ExecutionFenceState {
 }
 
 impl ExecutionFenceState {
+    /// Creates shared completion state for `remaining` dependencies.
+    fn new(remaining: usize, keepalive: Option<Box<dyn Send>>) -> Self {
+        Self {
+            keepalive: Mutex::new(keepalive),
+            events: Mutex::new(Vec::new()),
+            completion: Mutex::new(ExecutionFenceCompletion {
+                remaining,
+                error: None,
+                result: (remaining == 0).then_some(Ok(())),
+                callbacks: Vec::new(),
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
     /// Locks the recorded completion state even if the mutex was poisoned. Native cleanup and callbacks run outside
     /// this lock, and callers still use the result published by [`Self::record`] after cleanup finishes.
     fn lock_completion(&self) -> MutexGuard<'_, ExecutionFenceCompletion> {
         self.completion.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records one device event result and invokes terminal callbacks after releasing the state lock.
+    /// Records one dependency's result and invokes terminal callbacks after releasing the state lock.
     fn record(&self, error: Option<Error>) {
         let result = {
             let mut completion = self.lock_completion();
@@ -1393,10 +1408,9 @@ impl ExecutionFenceState {
             // state` cycle. A fence whose events never complete retains that cycle deliberately, like a bare pending
             // event (refer to the ownership-cycle explanation on `EventState::waker`).
             //
-            // This transition runs inside the final native `PJRT_Event_OnReady` callback. Native event destruction
-            // from that callback is sanctioned PJRT usage: the upstream `ConvertCEventToCppFuture` bridge likewise
-            // calls `PJRT_Event_Destroy` as its callback's final action (refer to `pjrt_c_api_helpers.cc`). Plugins
-            // must tolerate event destruction overlapping callback-dispatch teardown. Destruction runs outside locks.
+            // For native events, this transition can run inside the final `PJRT_Event_OnReady` callback. The upstream
+            // `ConvertCEventToCppFuture` bridge likewise calls `PJRT_Event_Destroy` as its callback's final action
+            // (refer to `pjrt_c_api_helpers.cc`). Destruction runs outside locks.
             let events = std::mem::take(&mut *self.events.lock().unwrap_or_else(PoisonError::into_inner));
             drop(events);
 
@@ -1410,8 +1424,10 @@ impl ExecutionFenceState {
                 // Catch each panic before it can skip later callbacks or reach PJRT's native callback boundary.
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| callback(result.clone())))
                     && let Err(drop_panic) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
+                    && !drop_panic.is::<&'static str>()
+                    && !drop_panic.is::<String>()
                 {
-                    // A custom panic payload can panic on drop. Forget the second payload to keep unwinding contained.
+                    // Ordinary panic messages drop safely. A custom payload could start another unwind, so forget it.
                     std::mem::forget(drop_panic);
                 }
             }
@@ -1419,8 +1435,9 @@ impl ExecutionFenceState {
     }
 }
 
-/// Shared completion state for one asynchronous PJRT execution across all participating addressable devices. PJRT
-/// execution is enqueued before this value is constructed. Creation is asynchronous when native callback registration
+/// Shared completion state for asynchronous PJRT work. A fence can observe the events of one launch across all
+/// participating devices or join fences for several launches and transfers. PJRT execution is enqueued before this
+/// value is constructed. Creation is asynchronous when native callback registration
 /// succeeds while registration failure waits for the affected event before publishing its terminal error. Cloning never
 /// waits. Native event callbacks join device completion into one immutable terminal result shared by blocking waiters,
 /// readiness queries, and callbacks registered through [`Self::on_ready`]. Call [`Self::block_until_ready`] only
@@ -1450,6 +1467,21 @@ impl ExecutionFence {
         Self::with_keepalive(events, None)
     }
 
+    /// Returns a fence that completes when every input fence completes and reports the first error it observes.
+    /// This function registers callbacks without waiting for pending work.
+    pub fn join<F: IntoIterator<Item = Self>>(fences: F) -> Self {
+        let mut fences = fences.into_iter().filter(|fence| fence.state.is_some()).collect::<Vec<_>>();
+        if fences.len() <= 1 {
+            return fences.pop().unwrap_or(Self { state: None });
+        }
+        let state = Arc::new(ExecutionFenceState::new(fences.len(), None));
+        for fence in fences {
+            let state = Arc::clone(&state);
+            fence.on_ready(move |result| state.record(result.err()));
+        }
+        Self { state: Some(state) }
+    }
+
     /// Joins native completion while retaining launch owners through the terminal transition.
     fn with_keepalive(events: Vec<Event<()>>, keepalive: Option<Box<dyn Send>>) -> Self {
         if events.iter().all(|event| event.ready().unwrap_or(false) && event.ready_error().is_none()) {
@@ -1457,20 +1489,8 @@ impl ExecutionFence {
             return Self { state: None };
         }
 
-        let event_count = events.len();
-        let state = Arc::new(ExecutionFenceState {
-            keepalive: Mutex::new(keepalive),
-            events: Mutex::new(Vec::new()),
-            completion: Mutex::new(ExecutionFenceCompletion {
-                remaining: event_count,
-                error: None,
-                result: (event_count == 0).then_some(Ok(())),
-                callbacks: Vec::new(),
-            }),
-            ready: Condvar::new(),
-        });
-
-        let mut retained_events = Vec::with_capacity(event_count);
+        let state = Arc::new(ExecutionFenceState::new(events.len(), keepalive));
+        let mut retained_events = Vec::with_capacity(events.len());
         for event in events {
             let callback_state = Arc::clone(&state);
             if let Err(error) = event.on_ready(move |error| callback_state.record(error)) {
@@ -1522,7 +1542,7 @@ impl ExecutionFence {
         state.lock_completion().result.clone().map_or(Ok(false), |result| result.map(|_| true))
     }
 
-    /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
+    /// Blocks until every dependency completes and returns the first observed error, if any.
     pub fn block_until_ready(&self) -> Result<(), Error> {
         let Some(state) = &self.state else {
             return Ok(());
@@ -1535,11 +1555,9 @@ impl ExecutionFence {
         completion.result.clone().unwrap()
     }
 
-    /// Waits asynchronously until every participating [`Event`] is completed and returns the first execution error, if
-    /// any. Unlike [`Self::block_until_ready`], this function never parks the calling thread: a pending fence suspends
-    /// the task and wakes it from the thread that completes the last participating event (refer to [`Self::on_ready`]).
-    /// Use it from asynchronous code, where a fence may stay pending for a long time (e.g., a fence over transfers that
-    /// complete only once another process receives them).
+    /// Waits asynchronously until every dependency completes and returns the first observed error, if any. A
+    /// pending fence suspends the task and wakes it from the thread that completes the last dependency (refer to
+    /// [`Self::on_ready`]). A fence can stay pending while another process is preparing to receive a transfer.
     pub async fn ready(&self) -> Result<(), Error> {
         // The completion callback wakes the most recent waker of the task, which each pending poll replaces.
         let waker = Arc::new(Mutex::new(None::<Waker>));
@@ -4400,6 +4418,23 @@ mod tests {
     }
 
     #[test]
+    fn test_execution_fence_join() {
+        let client = test_cpu_client();
+        let (first, first_promise) = client.event(()).unwrap();
+        let (second, second_promise) = client.event(()).unwrap();
+        let joined = ExecutionFence::join([ExecutionFence::new(vec![first]), ExecutionFence::new(vec![second])]);
+        let expected = Error::aborted("first execution failed");
+        first_promise.set(Some(expected.clone())).unwrap();
+        assert_eq!(joined.is_ready(), Ok(false));
+
+        second_promise.set(None).unwrap();
+        let error = joined.block_until_ready().unwrap_err();
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.message(), expected.message());
+        assert_eq!(ExecutionFence::join([]).is_ready(), Ok(true));
+    }
+
+    #[test]
     fn test_execution_fence_new_waits_after_failed_callback_registration() {
         let client = test_cpu_client();
         let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
@@ -4715,12 +4750,30 @@ mod tests {
             }
         }
 
-        /// Panic payload whose destructor also panics.
-        struct PanickingPayload(Arc<AtomicBool>);
+        /// Custom second panic payload that records whether its destructor runs.
+        struct SecondPanicPayload(Arc<AtomicBool>);
+
+        impl Drop for SecondPanicPayload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// Panic payload whose destructor panics with either a string or a custom payload.
+        struct PanickingPayload {
+            /// Number of initial panic payloads dropped in this test.
+            drops: Arc<AtomicUsize>,
+
+            /// Custom payload to panic with, or `None` to panic with a string.
+            second_payload: Option<SecondPanicPayload>,
+        }
 
         impl Drop for PanickingPayload {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                if let Some(payload) = self.second_payload.take() {
+                    std::panic::panic_any(payload);
+                }
                 panic!("fixture panic payload panicked on drop");
             }
         }
@@ -4734,8 +4787,15 @@ mod tests {
         let mut ready = pin!(fence.ready());
         assert_eq!(ready.as_mut().poll(&mut context), Poll::Pending);
 
-        let payload_dropped = Arc::new(AtomicBool::new(false));
-        let payload = PanickingPayload(Arc::clone(&payload_dropped));
+        let initial_payload_drops = Arc::new(AtomicUsize::new(0));
+        let payload = PanickingPayload { drops: Arc::clone(&initial_payload_drops), second_payload: None };
+        fence.on_ready(move |_| std::panic::panic_any(payload));
+
+        let second_payload_dropped = Arc::new(AtomicBool::new(false));
+        let payload = PanickingPayload {
+            drops: Arc::clone(&initial_payload_drops),
+            second_payload: Some(SecondPanicPayload(Arc::clone(&second_payload_dropped))),
+        };
         fence.on_ready(move |_| std::panic::panic_any(payload));
         let (finished, completed) = mpsc::channel();
         fence.on_ready(move |result| finished.send(result).unwrap());
@@ -4743,7 +4803,8 @@ mod tests {
         promise.set(None).unwrap();
         assert_eq!(completed.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
         assert!(wake_attempt.0.load(Ordering::SeqCst));
-        assert!(payload_dropped.load(Ordering::SeqCst));
+        assert_eq!(initial_payload_drops.load(Ordering::SeqCst), 2);
+        assert!(!second_payload_dropped.load(Ordering::SeqCst));
         assert_eq!(ready.as_mut().poll(&mut context), Poll::Ready(Ok(())));
     }
 

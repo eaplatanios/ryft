@@ -862,9 +862,11 @@ mod tests {
             )
             .unwrap();
         let first =
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(&[0.0f64, 1.0]))
+                .unwrap();
         let second =
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(&[2.0f64, 3.0]))
+                .unwrap();
         let boundary = ShardMapBoundary::new(
             mesh.logical_mesh().clone(),
             vec![r#type.sharding().unwrap().clone()],

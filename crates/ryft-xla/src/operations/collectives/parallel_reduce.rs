@@ -279,6 +279,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(data_type, &[4 * shard_size], sharding),
             device_mesh,
+            None,
             buffers,
         )
         .unwrap();
@@ -381,6 +382,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();
@@ -572,6 +574,7 @@ pub(crate) mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
+            None,
             buffers,
         )
         .unwrap();

@@ -1,13 +1,13 @@
-//! Placement of an [`Array`] on another sharding or device mesh, by copying exact shards, by a compiled reshard, or
-//! through host memory.
+//! Placement of an [`Array`] on another sharding or device mesh by moving whole shards or their required regions,
+//! by a compiled reshard, or through host memory.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Parameter, Sharding, StaticShape, Typed,
-    check_sharding,
+    ArrayType, Cast, Concatenate, DataType, Device, DeviceMesh, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+    Parameter, Sharding, Slice, StaticShape, Typed, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
@@ -16,7 +16,7 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-use crate::{CompiledFunction, Error, Options, Session, ToPjrt};
+use crate::{CompiledFunction, Error, FromPjrt, Options, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 
@@ -94,15 +94,20 @@ impl Array {
     ///
     /// `target` is resolved to a concrete [`DeviceMesh`] and [`Sharding`] by `DevicePutTarget::resolve`. When the
     /// resolved placement matches the array's current placement, this function returns a cheap clone of `self`.
-    /// Otherwise, it tries three strategies in order.
+    /// Otherwise, it tries the following strategies in order.
     ///
     ///   1. **Exact Shards:** When every destination shard has the slices of one source shard, each destination shard
     ///      shares the buffer of its source shard on the same device, or is filled by a copy between devices or by a
     ///      PJRT cross-host transfer for a source shard on a remote host.
-    ///   2. **Compiled Reshard:** An `identity(x) = x` program with input and output sharding constraints is lowered
+    ///   2. **Shard Regions:** On different meshes, when both shardings hold one value per slice, the source devices
+    ///      slice out regions needed by each destination shard. The destination devices receive those regions
+    ///      and join them locally. This path uses default device memory and needs the PJRT cross-host transfers
+    ///      extension and default layouts if a region crosses processes. Each participating process issues the same
+    ///      placements in the same order.
+    ///   3. **Compiled Reshard:** An `identity(x) = x` program with input and output sharding constraints is lowered
     ///      to StableHLO and Shardy, compiled through the compilation cache of `session`, and executed.
-    ///   3. **Host Fallback:** The global array is copied to the host with [`Array::copy_to_host`] and uploaded again
-    ///      with [`Array::from_host_buffer_with_sharding`]. This is used only when the device work fails (e.g., for
+    ///   4. **Host Fallback:** The global array is copied to the host with [`Array::copy_to_host`] and uploaded again
+    ///      with [`Array::from_host_buffer`]. This is used only when the device work fails (e.g., for
     ///      `Manual` mesh axes) and both the source array and the destination mesh are fully addressable from this
     ///      process, which is the same restriction that the host round trip of JAX has.
     ///
@@ -132,8 +137,7 @@ impl Array {
     /// observable to the caller after this function returns. Rust ownership therefore enforces the same invariant that
     /// the `donate=True` flag carries in JAX, without exposing a runtime hazard.
     ///
-    /// The strategies are identical to those of [`Self::to_placement`] (i.e., exact shards, a compiled reshard, and a
-    /// host fallback), and only the donation flag differs.
+    /// The strategies follow [`Self::to_placement`], enabling donation for the compiled reshard on the source mesh.
     ///
     /// # Parameters
     ///
@@ -210,10 +214,9 @@ impl Array {
                 Err((error, None)) => return Err(error),
             };
 
-        // Host fallback, which copies the value of the source array to the host and uploads it again with
-        // `from_host_buffer_with_sharding`. It only applies when both the source array and the destination mesh are
-        // fully addressable from this process, which is the same restriction that the host round trip of JAX has. If
-        // any condition fails, the error of the device work is surfaced as the more informative diagnostic.
+        // Host fallback copies the source array to the host and uploads it again with `from_host_buffer`. Both the
+        // source array and the destination mesh must be fully addressable from this process, as in JAX. If the
+        // fallback fails, surface the original device error.
         let local_process = session.client().process_index()?;
         let destination_fully_addressable =
             target_mesh.devices().iter().all(|device| device.process_index() == local_process);
@@ -225,11 +228,11 @@ impl Array {
             Err(_) => return Err(compiled_error),
         };
         let host_type = ArrayType::new(source.data_type(), source.shape().into());
-        match Self::from_host_buffer_with_sharding(
+        match Self::from_host_buffer(
             session,
             host_type,
-            target_sharding.clone(),
             target_mesh,
+            Some(target_sharding.clone()),
             host_bytes.as_slice(),
         ) {
             Ok(array) => Ok(array),
@@ -352,8 +355,8 @@ impl Array {
                     })
                 })?
                 .buffer()
-                .map(|buffer| buffer.as_ref())
-                .unwrap();
+                .unwrap()
+                .clone();
             transfers.push(CrossHostTransfer::Send {
                 source: send_plan.source_device_id(),
                 destination: send_plan.destination_device_id(),
@@ -378,7 +381,7 @@ impl Array {
             });
         }
         let (send_events, received_buffers) = issue_cross_host_transfers(client, transfers)?;
-        addressable_buffers.extend(received_buffers.into_iter().map(|(_, buffer)| Arc::new(buffer)));
+        addressable_buffers.extend(received_buffers.into_iter().map(|received| Arc::new(received.buffer)));
         let send_fence = (!send_events.is_empty()).then(|| ExecutionFence::new(send_events));
 
         Ok(Some((addressable_buffers, send_fence)))
@@ -398,8 +401,6 @@ impl Array {
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<Option<ExactShardPutPlan>, Error> {
-        let holds_one_value_per_slice =
-            |sharding: &Sharding| sharding.unreduced_axes().is_empty() && sharding.varying_manual_axes().is_empty();
         if !holds_one_value_per_slice(self.sharding()) || !holds_one_value_per_slice(sharding) {
             return Ok(None);
         }
@@ -420,7 +421,7 @@ impl Array {
                 Some(source_shards) => source_shards,
                 None => return Ok(None),
             };
-            let source_shard = preferred_exact_source_shard(source_shards.as_slice(), destination_shard);
+            let source_shard = preferred_source_shard(source_shards.as_slice(), destination_shard);
             let source_device = source_shard.device();
             let source_shard_index = source_shard.index();
             let source_process_index = source_device.process_index();
@@ -469,12 +470,334 @@ impl Array {
         Ok(Some(ExactShardPutPlan::new(local_copies, cross_host_sends, cross_host_receives)))
     }
 
+    /// Places an array on a different mesh by slicing on the source devices and joining the received regions on
+    /// the destination devices. Each process derives the same region plan before filtering it to its own devices.
+    ///
+    /// Returns `None` when the shardings can assign different values to the same slice, the type requires a
+    /// nondefault layout or memory, a destination is empty, compilation artifacts are exchanged across processes,
+    /// or the plugin lacks the cross-host APIs required by the plan.
+    fn reshard_shard_regions(
+        &self,
+        session: &Session,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+    ) -> Result<Option<Self>, Error> {
+        if !holds_one_value_per_slice(self.sharding())
+            || !holds_one_value_per_slice(sharding)
+            || self.r#type().memory() != Memory::Device
+            || self.r#type().layout().is_some()
+            || !std::ptr::eq(self.client(), session.client())
+        {
+            return Ok(None);
+        }
+
+        // Each process compiles different slices and joins for its own devices. An artifact exchange assumes
+        // that every participant requests the same compilations as the leader.
+        let cache = session.compilation_cache();
+        if cache.artifact_exchange_policy().timeout().is_some()
+            && cache.artifact_exchange().is_some_and(|exchange| exchange.process_count() > 1)
+        {
+            return Ok(None);
+        }
+
+        let layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
+        let regions = self.plan_shard_regions(&layout);
+        if regions.iter().any(Vec::is_empty) {
+            return Ok(None);
+        }
+        let destinations = layout.descriptors();
+        let client = session.client();
+        let process_index = client.process_index()?;
+        let Some(remote_layouts) = self.cross_host_region_layouts(client, destinations, &regions)? else {
+            return Ok(None);
+        };
+
+        let devices = client
+            .addressable_devices()?
+            .into_iter()
+            .map(|device| Ok((device.id()?, device)))
+            .collect::<Result<HashMap<_, _>, PjrtError>>()?;
+        let data_type = self.data_type();
+        let mut execution_fences = self.execution_fence().cloned().into_iter().collect::<Vec<_>>();
+        let mut transfers = Vec::new();
+        let mut destination_buffers = HashMap::new();
+        for (destination, pieces) in destinations.iter().zip(&regions) {
+            let device = destination.device();
+            let destination_local = device.process_index() == process_index;
+            for piece in pieces {
+                let source = &self.shards()[piece.source];
+                let source_local = source.device().process_index() == process_index;
+                let transfer_key = exact_shard_transfer_key(piece.source, destination.index(), destinations.len())?;
+                let buffer = source_local
+                    .then(|| {
+                        let remote_layout = (!destination_local).then(|| &remote_layouts[&piece.shape()]);
+                        Self::prepare_shard_region(
+                            session,
+                            data_type,
+                            source,
+                            piece,
+                            remote_layout,
+                            &mut execution_fences,
+                        )
+                    })
+                    .transpose()?;
+                match (buffer, destination_local) {
+                    (Some(buffer), true) => {
+                        let buffer = if source.device() == device {
+                            buffer
+                        } else {
+                            let destination_device = devices
+                                .get(&device.id())
+                                .ok_or(ArrayError::NonAddressableDevice { device_id: device.id(), process_index })?;
+                            Arc::new(buffer.copy_to_device(destination_device.clone())?)
+                        };
+                        destination_buffers.insert(transfer_key, buffer);
+                    }
+                    (Some(buffer), false) => transfers.push(CrossHostTransfer::Send {
+                        source: source.device().id(),
+                        destination: device.id(),
+                        transfer_key,
+                        buffer,
+                    }),
+                    (None, true) => {
+                        let destination_device = devices
+                            .get(&device.id())
+                            .ok_or(ArrayError::NonAddressableDevice { device_id: device.id(), process_index })?;
+                        transfers.push(CrossHostTransfer::Receive {
+                            source: source.device().id(),
+                            destination: device.id(),
+                            transfer_key,
+                            device: destination_device,
+                            element_type: Self::physical_buffer_type(data_type),
+                            dimensions: cross_host_shape(destination.index(), &piece.shape())?,
+                        });
+                    }
+                    (None, false) => {}
+                }
+            }
+        }
+        let (send_events, received_buffers) = issue_cross_host_transfers(client, transfers)?;
+        destination_buffers
+            .extend(received_buffers.into_iter().map(|received| (received.transfer_key, Arc::new(received.buffer))));
+
+        let mut buffers = Vec::new();
+        for (destination, regions) in destinations.iter().zip(&regions) {
+            let device = destination.device();
+            if device.process_index() != process_index {
+                continue;
+            }
+            let pieces = regions
+                .iter()
+                .map(|region| {
+                    let key = exact_shard_transfer_key(region.source, destination.index(), destinations.len())?;
+                    // Every region of a local destination has exactly one local copy or cross-host receive.
+                    let buffer = destination_buffers.remove(&key).ok_or(ArrayError::MissingShardBuffer {
+                        shard_index: destination.index(),
+                        device_id: device.id(),
+                    })?;
+                    Ok((region, buffer))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            buffers.push(Self::assemble_shard_regions(session, data_type, destination, pieces, &mut execution_fences)?);
+        }
+        let r#type = self.r#type().into_owned().with_sharding(None)?;
+        let mut output =
+            Self::from_shared_addressable_buffers(session, r#type, sharding.clone(), mesh.clone(), buffers)?;
+        if !execution_fences.is_empty() {
+            output = output.with_execution_fence(ExecutionFence::join(execution_fences));
+        }
+        if !send_events.is_empty() {
+            output = output.with_send_fence(ExecutionFence::new(send_events));
+        }
+        Ok(Some(output))
+    }
+
+    /// Finds a source for each nonempty intersection with a destination shard. Identical source slices are replicas.
+    /// The chosen replica prefers the destination device, then another device on the same process.
+    fn plan_shard_regions(&self, layout: &ShardLayout) -> Vec<Vec<ShardRegion>> {
+        let mut replicas = HashMap::<&[Range<usize>], Vec<&ArrayShard>>::new();
+        for shard in self.shards() {
+            replicas.entry(shard.slice()).or_default().push(shard);
+        }
+        layout
+            .descriptors()
+            .iter()
+            .map(|destination| {
+                let mut regions = Vec::new();
+                for (source_slice, source_shards) in &replicas {
+                    if !source_slice.iter().zip(destination.slice()).all(|(source, destination)| {
+                        source.start.max(destination.start) < source.end.min(destination.end)
+                    }) {
+                        continue;
+                    }
+                    let slice = source_slice
+                        .iter()
+                        .zip(destination.slice())
+                        .map(|(source, destination)| {
+                            source.start.max(destination.start)..source.end.min(destination.end)
+                        })
+                        .collect::<Vec<_>>();
+                    let source = preferred_source_shard(source_shards, destination);
+                    regions.push(ShardRegion { source: source.index(), slice });
+                }
+                regions.sort_unstable_by(|left, right| {
+                    left.slice.iter().map(|range| range.start).cmp(right.slice.iter().map(|range| range.start))
+                });
+                regions
+            })
+            .collect()
+    }
+
+    /// Resolves each remote region's default layout on every rank before the first cross-host rendezvous.
+    /// Returns `None` when the client lacks the cross-host transfer or default layout API.
+    fn cross_host_region_layouts(
+        &self,
+        client: &Client<'_>,
+        destinations: &[ShardDescriptor],
+        regions: &[Vec<ShardRegion>],
+    ) -> Result<Option<HashMap<StaticShape, ryft_pjrt::Layout>>, Error> {
+        let mut layouts = HashMap::new();
+        let element_type = Self::physical_buffer_type(self.data_type());
+        for (destination, regions) in destinations.iter().zip(regions) {
+            for region in regions {
+                let source = self.shards()[region.source].device();
+                if source.process_index() == destination.device().process_index() {
+                    continue;
+                }
+                if layouts.is_empty() {
+                    match client.cross_host_transfers_extension() {
+                        Ok(_) => {}
+                        Err(PjrtError::Unimplemented { .. }) => return Ok(None),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                cross_host_global_device_id(source.id())?;
+                cross_host_global_device_id(destination.device().id())?;
+                if let std::collections::hash_map::Entry::Vacant(entry) = layouts.entry(region.shape()) {
+                    let dimensions = cross_host_shape(destination.index(), entry.key())?
+                        .into_iter()
+                        .map(|dimension| dimension as u64)
+                        .collect::<Vec<_>>();
+                    let layout = match client.default_layout(element_type, dimensions).and_then(|layout| layout.proto())
+                    {
+                        Ok(layout) => layout,
+                        Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => return Ok(None),
+                        Err(error) => return Err(error.into()),
+                    };
+                    entry.insert(ryft_pjrt::Layout::from_proto(layout)?);
+                }
+            }
+        }
+        Ok(Some(layouts))
+    }
+
+    /// Produces the requested region on the source device, using the default PJRT layout for a remote transfer.
+    fn prepare_shard_region(
+        session: &Session,
+        data_type: DataType,
+        source: &ArrayShard,
+        region: &ShardRegion,
+        remote_layout: Option<&ryft_pjrt::Layout>,
+        fences: &mut Vec<ExecutionFence>,
+    ) -> Result<Arc<Buffer<'static>>, Error> {
+        let source_buffer = source
+            .buffer()
+            .ok_or(ArrayError::MissingShardBuffer { shard_index: source.index(), device_id: source.device().id() })?;
+        let mut buffer = if source.slice() == region.slice {
+            Arc::clone(source_buffer)
+        } else {
+            let input = Self::wrap_region_buffer(
+                session,
+                data_type,
+                source.device(),
+                source.shape(),
+                Arc::clone(source_buffer),
+            )?;
+            let starts = source
+                .slice()
+                .iter()
+                .zip(&region.slice)
+                .map(|(shard, region)| region.start - shard.start)
+                .collect::<Vec<_>>();
+            let limits = starts.iter().zip(&region.slice).map(|(start, range)| start + range.len()).collect::<Vec<_>>();
+            let output = input.slice(&starts, &limits, &vec![1; starts.len()])?;
+            fences.extend(output.execution_fence().cloned());
+            Arc::clone(output.shards()[0].buffer().unwrap())
+        };
+        // A receive declares the region's shape and uses the plugin's default device layout.
+        if let Some(layout) = remote_layout
+            && buffer.specification()?.layout != *layout
+        {
+            let input =
+                Self::wrap_region_buffer(session, data_type, source.device(), region.shape(), Arc::clone(&buffer))?;
+            let r#type = input.r#type().into_owned().with_layout(Layout::from_pjrt(layout.clone())?);
+            let output = input.cast(r#type, &[])?;
+            fences.extend(output.execution_fence().cloned());
+            buffer = Arc::clone(output.shards()[0].buffer().unwrap());
+        }
+        Ok(buffer)
+    }
+
+    /// Concatenates the transferred regions of a shard on its destination device.
+    fn assemble_shard_regions(
+        session: &Session,
+        data_type: DataType,
+        destination: &ShardDescriptor,
+        mut pieces: Vec<(&ShardRegion, Arc<Buffer<'static>>)>,
+        fences: &mut Vec<ExecutionFence>,
+    ) -> Result<Arc<Buffer<'static>>, Error> {
+        if pieces.len() == 1 {
+            return Ok(pieces.pop().unwrap().1);
+        }
+        let mut values = pieces
+            .into_iter()
+            .map(|(region, buffer)| {
+                let value = Self::wrap_region_buffer(session, data_type, destination.device(), region.shape(), buffer)?;
+                Ok((region, value))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        // The intersections form a Cartesian grid, sorted by their starting coordinates. Join the innermost
+        // dimension first so that the pieces agree along every other dimension for each concatenation.
+        for axis in (0..destination.slice().len()).rev() {
+            let mut joined = Vec::new();
+            for group in values.chunk_by(|(left, _), (right, _)| left.slice[..axis] == right.slice[..axis]) {
+                let value = if group.len() == 1 {
+                    group[0].1.clone()
+                } else {
+                    let value = Self::concatenate(group.iter().map(|(_, value)| value), axis)?;
+                    fences.extend(value.execution_fence().cloned());
+                    value
+                };
+                joined.push((group[0].0, value));
+            }
+            values = joined;
+        }
+        Ok(Arc::clone(values[0].1.shards()[0].buffer().unwrap()))
+    }
+
+    /// Wraps one buffer with its physical layout so a compiled operation can consume it directly on its device.
+    fn wrap_region_buffer(
+        session: &Session,
+        data_type: DataType,
+        device: Device,
+        shape: StaticShape,
+        buffer: Arc<Buffer<'static>>,
+    ) -> Result<Self, Error> {
+        let (mesh, sharding) = DevicePutTarget::Device(device).resolve(shape.rank())?;
+        let layout = Layout::from_pjrt(buffer.specification()?.layout)?;
+        let r#type = ArrayType::new(data_type, shape.into()).with_layout(layout);
+        Self::from_shared_addressable_buffers(session, r#type, sharding, mesh, vec![buffer])
+    }
+
     /// Places this array on `mesh` according to `sharding` with device work only, and on failure also returns this
     /// array when a host fallback may still place it. It tries the following strategies in order.
     ///
     ///   1. **Exact Shards:** [`Self::place_exact_shards`] shares or copies whole shards and compiles nothing. Its
     ///      errors are final, so they come without this array.
-    ///   2. **Compiled Reshard:** The `ryft` analogue of how JAX's `jax.device_put(arr, new_sharding)` lowers a
+    ///   2. **Shard Regions:** [`Self::reshard_shard_regions`] transfers the parts that each destination needs across
+    ///      different meshes.
+    ///   3. **Compiled Reshard:** The `ryft` analogue of how JAX's `jax.device_put(arr, new_sharding)` lowers a
     ///      reshard of a committed `jax.Array`, which is an `identity(x) = x` program with input and output sharding
     ///      constraints that is lowered to StableHLO and Shardy, compiled, and executed on the devices. When this
     ///      array already is on `mesh`, one such program reshards it. Otherwise,
@@ -513,6 +836,11 @@ impl Array {
                 Err(error) => Err((error, Some(self))),
             }
         } else {
+            match self.reshard_shard_regions(session, mesh, sharding) {
+                Ok(Some(output)) => return Ok(output),
+                Ok(None) => {}
+                Err(error) => return Err((error, Some(self))),
+            }
             let output = if self.sharding().is_replicated() {
                 self.reshard_replicated_across_meshes(session, mesh, sharding)
             } else {
@@ -687,7 +1015,7 @@ impl Array {
                     source: canonical_source_device.id(),
                     destination: destination_device_id,
                     transfer_key,
-                    buffer: local_source.as_ref(),
+                    buffer: Arc::clone(local_source),
                 });
             }
             // Otherwise, another process serves this remote destination, and there is nothing to do here.
@@ -702,7 +1030,7 @@ impl Array {
         // Waiting for the sends here could deadlock, because a send completes only once its receiver issues the
         // matching receive, so the returned array retains their completion fence instead.
         let (send_events, received_buffers) = issue_cross_host_transfers(client, transfers)?;
-        local_buffers.extend(received_buffers);
+        local_buffers.extend(received_buffers.into_iter().map(|received| (received.destination, received.buffer)));
         let send_fence = (!send_events.is_empty()).then(|| ExecutionFence::new(send_events));
 
         // Assemble the buffers of the devices in the device order of `destination_mesh`. Only locally addressable
@@ -720,7 +1048,7 @@ impl Array {
         let replicated_on_destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), shape.rank());
         let intermediate_type = ArrayType::new(element_type, shape.into()).with_sharding(replicated_on_destination)?;
         let intermediate =
-            Array::from_addressable_buffers(session, intermediate_type, destination_mesh.clone(), buffers)?;
+            Array::from_addressable_buffers(session, intermediate_type, destination_mesh.clone(), None, buffers)?;
 
         // The intermediate is owned exclusively by this function and is never observed by callers.
         // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.
@@ -753,6 +1081,22 @@ impl Array {
         // `Self::reshard_replicated_across_meshes`.
         let gathered = self.clone().reshard_on_same_mesh(session, source_mesh, &replicated_on_source, false)?;
         gathered.reshard_replicated_across_meshes(session, destination_mesh, destination_sharding)
+    }
+}
+
+/// Intersection of one source shard and a destination shard, in global array coordinates.
+struct ShardRegion {
+    /// Index of the selected source shard.
+    source: ShardIndex,
+
+    /// Slice covered by the region.
+    slice: Vec<Range<usize>>,
+}
+
+impl ShardRegion {
+    /// Returns the static shape of this region.
+    fn shape(&self) -> StaticShape {
+        StaticShape::new(self.slice.iter().map(Range::len).collect::<Vec<_>>())
     }
 }
 
@@ -962,23 +1306,7 @@ impl CrossHostShardReceivePlan {
 
     /// Returns the PJRT cross-host shape of the destination shard.
     fn cross_host_shape(&self) -> Result<Vec<i64>, Error> {
-        self.destination_shape()
-            .as_slice()
-            .iter()
-            .enumerate()
-            .map(|(dimension, &size)| {
-                i64::try_from(size).map_err(|_| {
-                    Error::from(ArrayError::InvalidShardDimension {
-                        shard_index: self.destination_shard_index(),
-                        dimension,
-                        source: ryft_core::DimensionError::ExtentExceedsBackendWidth {
-                            value: size,
-                            maximum: i64::MAX as usize,
-                        },
-                    })
-                })
-            })
-            .collect()
+        cross_host_shape(self.destination_shard_index(), self.destination_shape())
     }
 }
 
@@ -997,7 +1325,7 @@ enum CrossHostTransfer<'b> {
         transfer_key: CrossHostTransferKey,
 
         /// Buffer to send.
-        buffer: &'b Buffer<'static>,
+        buffer: Arc<Buffer<'static>>,
     },
 
     /// Receive of a buffer of `element_type` and `dimensions` from the device `source` of another process onto
@@ -1034,7 +1362,40 @@ impl CrossHostTransfer<'_> {
     }
 }
 
-/// Returns the deterministic cross-host transfer key for moving the source shard `source_shard_index` to the
+/// A buffer returned by one cross-host receive and the placement that requested it.
+struct ReceivedShardBuffer {
+    /// Key of the matching transfer.
+    transfer_key: CrossHostTransferKey,
+
+    /// Device that owns the buffer.
+    destination: DeviceId,
+
+    /// Pending buffer returned by PJRT.
+    buffer: Buffer<'static>,
+}
+
+/// Returns the cross-host shape, attaching the destination shard and dimension to any encoding failure.
+fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<i64>, Error> {
+    shape
+        .as_slice()
+        .iter()
+        .enumerate()
+        .map(|(dimension, &size)| {
+            i64::try_from(size).map_err(|_| {
+                Error::from(ArrayError::InvalidShardDimension {
+                    shard_index,
+                    dimension,
+                    source: ryft_core::DimensionError::ExtentExceedsBackendWidth {
+                        value: size,
+                        maximum: i64::MAX as usize,
+                    },
+                })
+            })
+        })
+        .collect()
+}
+
+/// Returns the deterministic cross-host transfer key for moving data from `source_shard_index` to the
 /// destination shard `destination_shard_index`, which is `source_shard_index * destination_shard_count +
 /// destination_shard_index`, so that every pair of source and destination shards gets a unique key.
 ///
@@ -1073,7 +1434,7 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
 }
 
 /// Issues `transfers`, which are the cross-host transfers that the current process takes part in for one placement,
-/// and returns the completion events of the sends and the received buffers with the IDs of their devices.
+/// and returns completion events for the sends and the received buffers with their transfer keys and device IDs.
 ///
 /// The transfers are issued one at a time in the order of their source and then destination device IDs, keeping the
 /// given order of the transfers between the same two devices. The CUDA plugin carries the transfers between two
@@ -1085,7 +1446,7 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
 fn issue_cross_host_transfers(
     client: &'static Client<'_>,
     mut transfers: Vec<CrossHostTransfer<'_>>,
-) -> Result<(Vec<Event<()>>, Vec<(DeviceId, Buffer<'static>)>), Error> {
+) -> Result<(Vec<Event<()>>, Vec<ReceivedShardBuffer>), Error> {
     transfers.sort_by_key(CrossHostTransfer::devices);
     let mut send_events = Vec::new();
     let mut received_buffers = Vec::new();
@@ -1093,7 +1454,7 @@ fn issue_cross_host_transfers(
         match transfer {
             CrossHostTransfer::Send { destination, transfer_key, buffer, .. } => {
                 let destination = cross_host_global_device_id(destination)?;
-                send_events.extend(client.cross_host_send_buffers(&[buffer], &[destination], &[transfer_key], &[])?);
+                send_events.extend(client.cross_host_send_buffers(&[&buffer], &[destination], &[transfer_key], &[])?);
             }
             CrossHostTransfer::Receive { source, destination, transfer_key, device, element_type, dimensions } => {
                 let source = cross_host_global_device_id(source)?;
@@ -1105,22 +1466,28 @@ fn issue_cross_host_transfers(
                     &[transfer_key],
                     &[],
                 )?;
-                received_buffers.extend(buffers.into_iter().map(|buffer| (destination, buffer)));
+                received_buffers.extend(buffers.into_iter().map(|buffer| ReceivedShardBuffer {
+                    transfer_key,
+                    destination,
+                    buffer,
+                }));
             }
         }
     }
     Ok((send_events, received_buffers))
 }
 
-/// Returns the preferred source shard among the `source_shards` whose slices exactly match `destination_shard`.
+/// Returns whether replicas of each shard slice hold one value across the mesh.
+fn holds_one_value_per_slice(sharding: &Sharding) -> bool {
+    sharding.unreduced_axes().is_empty() && sharding.varying_manual_axes().is_empty()
+}
+
+/// Returns the preferred replica among `source_shards` that cover the same slice.
 ///
 /// The preference is deterministic and depends only on global shard metadata, so that every process chooses the same
 /// source shard for a given destination shard. It prefers a source shard on the process of the destination shard,
 /// then a source shard on the device of the destination shard, and finally breaks ties by device ID and shard index.
-fn preferred_exact_source_shard<'o>(
-    source_shards: &[&'o ArrayShard],
-    destination_shard: &ShardDescriptor,
-) -> &'o ArrayShard {
+fn preferred_source_shard<'o>(source_shards: &[&'o ArrayShard], destination_shard: &ShardDescriptor) -> &'o ArrayShard {
     source_shards
         .iter()
         .min_by_key(|source_shard| {
@@ -1240,6 +1607,7 @@ mod tests {
             &session,
             source_type,
             source_mesh,
+            None,
             values_to_bytes::<f32>(source_values.as_slice()).as_slice(),
         )
         .unwrap();
@@ -1283,11 +1651,11 @@ mod tests {
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let source_array = Array::from_addressable_buffers_with_sharding(
+        let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             vec![local_source_buffer],
         )
         .unwrap();
@@ -1317,11 +1685,11 @@ mod tests {
         let source_sharding =
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let source_array = Array::from_addressable_buffers_with_sharding(
+        let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
-            source_sharding,
             source_mesh,
+            Some(source_sharding),
             Vec::new(),
         )
         .unwrap();
@@ -1375,7 +1743,7 @@ mod tests {
             })
             .collect();
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(unreduced.clone()).unwrap();
-        let summands = Array::from_addressable_buffers(&session, r#type, mesh.clone(), buffers).unwrap();
+        let summands = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap();
         let reduced = summands
             .to_placement(&session, DevicePutTarget::placement(mesh.clone(), tiled.clone()).unwrap())
             .unwrap();
@@ -1384,8 +1752,8 @@ mod tests {
 
         // In the other direction, a copy of every shard would hold the logical value once per device along `x`.
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(tiled).unwrap();
-        let value =
-            Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let value = Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
+            .unwrap();
         let summands =
             value.to_placement(&session, DevicePutTarget::placement(mesh, unreduced.clone()).unwrap()).unwrap();
         assert_eq!(summands.sharding(), &unreduced);
@@ -1404,7 +1772,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true })
             .with_sharding(source_sharding)
             .unwrap();
-        let source = Array::from_host_buffer(&session, source_type, mesh.clone(), []).unwrap();
+        let source = Array::from_host_buffer(&session, source_type, mesh.clone(), None, []).unwrap();
         let target_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
@@ -1442,10 +1810,15 @@ mod tests {
 
         for fails in [false, true] {
             let (event, promise) = client.event(()).unwrap();
-            let source =
-                Array::from_host_buffer(&session, ArrayType::new_static(DataType::Zero, [2]), source_mesh.clone(), [])
-                    .unwrap()
-                    .with_execution_fence(ExecutionFence::new(vec![event]));
+            let source = Array::from_host_buffer(
+                &session,
+                ArrayType::new_static(DataType::Zero, [2]),
+                source_mesh.clone(),
+                None,
+                [],
+            )
+            .unwrap()
+            .with_execution_fence(ExecutionFence::new(vec![event]));
             let outputs = [
                 source.to_placement(&session, target.clone()).unwrap(),
                 source.clone().into_placement(&session, target.clone()).unwrap(),
@@ -1492,9 +1865,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            source_mesh,
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
 
         // The target is replicated on the full 4-device mesh. The exact shard path matches every destination shard to
         // the single source shard, which covers the full array. The destination shard on the source device shares the
@@ -1523,9 +1901,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
 
         let sharded_target =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1547,11 +1930,11 @@ mod tests {
         let sharded_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
-        let source_array = Array::from_host_buffer_with_sharding(
+        let source_array = Array::from_host_buffer(
             &session,
             source_type,
-            sharded_sharding,
             mesh.clone(),
+            Some(sharded_sharding),
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -1588,11 +1971,11 @@ mod tests {
         .unwrap();
         let source_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
-        let source_array = Array::from_host_buffer_with_sharding(
+        let source_array = Array::from_host_buffer(
             &session,
             source_type,
-            sharded_along_x,
             mesh.clone(),
+            Some(sharded_along_x),
             values_to_bytes::<f32>(&row_values).as_slice(),
         )
         .unwrap();
@@ -1646,6 +2029,7 @@ mod tests {
             &session,
             source_type,
             explicit_mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -1660,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
+    fn test_array_to_placement_cross_mesh_replicated_source_to_sharded_destination() {
         let client = cpu_client(4);
         let session = session_with_client(client);
         let client_devices = client.addressable_devices().unwrap();
@@ -1676,9 +2060,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            source_mesh,
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
 
         // Reshard onto the full 4-device mesh, sharded along "x".
         let target_mesh = four_device_mesh_x(client);
@@ -1693,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
+    fn test_array_to_placement_cross_mesh_sharded_source_to_replicated_destination() {
         let client = cpu_client(4);
         let session = session_with_client(client);
 
@@ -1703,11 +2092,11 @@ mod tests {
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [70.0f32, 71.0, 72.0, 73.0];
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
-        let source_array = Array::from_host_buffer_with_sharding(
+        let source_array = Array::from_host_buffer(
             &session,
             source_type,
-            source_sharding,
             source_mesh,
+            Some(source_sharding),
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -1726,7 +2115,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
+    fn test_array_to_placement_cross_mesh_sharded_source_to_sharded_destination() {
         let client = cpu_client(4);
         let session = session_with_client(client);
 
@@ -1736,11 +2125,11 @@ mod tests {
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [80.0f32, 81.0, 82.0, 83.0];
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
-        let source_array = Array::from_host_buffer_with_sharding(
+        let source_array = Array::from_host_buffer(
             &session,
             source_type,
-            source_sharding,
             source_mesh,
+            Some(source_sharding),
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -1759,35 +2148,57 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
+    fn test_array_to_placement_moves_only_required_cross_mesh_regions() {
         let client = cpu_client(4);
         let session = session_with_client(client);
-
         let source_mesh = two_device_sub_mesh_x(client);
-        let source_sharding =
-            Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let values = [90.0f32, 91.0, 92.0, 93.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
-        let source_array = Array::from_host_buffer_with_sharding(
-            &session,
-            source_type,
-            source_sharding,
-            source_mesh,
-            values_to_bytes::<f32>(&values).as_slice(),
+        let source_sharding = Sharding::new(
+            source_mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
         .unwrap();
-
+        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let source = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4, 4]),
+            source_mesh,
+            Some(source_sharding),
+            values_to_bytes(&values),
+        )
+        .unwrap();
         let target_mesh = four_device_mesh_x(client);
-        let target_sharding =
-            Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(session.cached_program_count(), 0);
-        let _ = source_array
+        let target_sharding = Sharding::new(
+            target_mesh.logical_mesh().clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let layout = ShardLayout::new(&source.shape(), &target_mesh, &target_sharding).unwrap();
+        let regions = source.plan_shard_regions(&layout);
+        // Each column needs two regions. Two of the eight regions are already on their destination devices.
+        let copied_bytes = layout
+            .descriptors()
+            .iter()
+            .zip(&regions)
+            .flat_map(|(destination, regions)| {
+                regions
+                    .iter()
+                    .filter(|region| source.shards()[region.source].device() != destination.device())
+                    .map(|region| region.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
+            })
+            .sum::<usize>();
+        assert_eq!(copied_bytes, 48);
+
+        let output = source
             .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding })
             .unwrap();
-
-        // A sharded source on another mesh compiles two executables, which are an all-gather on the source mesh and a
-        // reshard from the replicated sharding to the requested sharding on the destination mesh.
-        assert_eq!(session.cached_program_count(), 2);
+        output.block_until_ready().unwrap();
+        assert_ne!(session.eager_dispatch_statistics().misses, 0);
+        assert!(output.execution_fence().is_some());
+        assert_eq!(
+            shard_values(&output),
+            vec![vec![0., 4., 8., 12.], vec![1., 5., 9., 13.], vec![2., 6., 10., 14.], vec![3., 7., 11., 15.]],
+        );
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), values);
     }
 
     #[test]
@@ -1801,9 +2212,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
 
         let sharded_target =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1838,9 +2254,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
         let target_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
@@ -1883,9 +2304,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            source_mesh,
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
 
         // Sending to the remote destination requires the extension even though local copies are possible.
         assert!(matches!(client.cross_host_transfers_extension(), Err(PjrtError::Unimplemented { .. })));
@@ -1896,6 +2322,19 @@ mod tests {
         .unwrap();
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
+        let result = source_array.to_placement(
+            &session,
+            DevicePutTarget::Placement { mesh: target_mesh.clone(), sharding: target_sharding },
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
+                if message == "the cross-host transfers extension is not provided by the PJRT plugin",
+        ));
+
+        // Moving a proper region also requires the extension, even when the source device can slice it locally.
+        let target_sharding =
+            Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let result = source_array
             .to_placement(&session, DevicePutTarget::Placement { mesh: target_mesh, sharding: target_sharding });
         assert!(matches!(
@@ -1919,7 +2358,7 @@ mod tests {
         let source_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let source = Array::from_addressable_buffers(&session, source_type, source_mesh, Vec::new()).unwrap();
+        let source = Array::from_addressable_buffers(&session, source_type, source_mesh, None, Vec::new()).unwrap();
         assert_eq!(source.addressable_shards().count(), 0);
         let target_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("destination", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1963,6 +2402,7 @@ mod tests {
             &session,
             source_type,
             manual_mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -2005,11 +2445,11 @@ mod tests {
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let source_array = Array::from_addressable_buffers_with_sharding(
+        let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             vec![local_source_buffer],
         )
         .unwrap();
@@ -2038,9 +2478,14 @@ mod tests {
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
-        let source_array =
-            Array::from_host_buffer(&session, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source_array = Array::from_host_buffer(
+            &session,
+            source_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
 
         // `Array::into_placement` consumes the source array and donates its buffers to the compiled SPMD reshard. PJRT
         // may reuse the memory of those buffers for the output. The donated source is not readable after this call
@@ -2084,9 +2529,10 @@ mod tests {
         // completion of the execution that produced the array.
         let (event, promise) = client.event(()).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(tiled.clone()).unwrap();
-        let source = Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
-            .unwrap()
-            .with_execution_fence(ExecutionFence::new(vec![event]));
+        let source =
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap()
+                .with_execution_fence(ExecutionFence::new(vec![event]));
         let reduced = tiled.clone().with_reduced_axes(["x"]).unwrap();
         let output = source.clone().reshard_on_devices(&session, &mesh, &reduced, false).unwrap();
         let pending = matches!(output.execution_fence().map(ExecutionFence::is_ready), Some(Ok(false)));
@@ -2105,7 +2551,7 @@ mod tests {
         .unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [4]);
         let source =
-            Array::from_host_buffer(&session, r#type, single_device_mesh, values_to_bytes(&[1f32, 2., 3., 4.]))
+            Array::from_host_buffer(&session, r#type, single_device_mesh, None, values_to_bytes(&[1f32, 2., 3., 4.]))
                 .unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let output = source.clone().reshard_on_devices(&session, &mesh, &replicated, false).unwrap();
@@ -2161,11 +2607,11 @@ mod tests {
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let source_array = Array::from_addressable_buffers_with_sharding(
+        let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
-            source_sharding,
             source_mesh,
+            Some(source_sharding),
             vec![local_source_buffer],
         )
         .unwrap();

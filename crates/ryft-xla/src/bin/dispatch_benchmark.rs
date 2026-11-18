@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?;
     let bytes = (0..8).flat_map(|index| (index as f32).to_ne_bytes()).collect::<Vec<_>>();
-    let input = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), bytes.as_slice())?;
+    let input = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, bytes.as_slice())?;
     input.block_until_ready()?;
 
     let mut results = HashMap::new();
@@ -184,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
     };
     let predicate_type = ArrayType::scalar(DataType::Boolean).replicated(&mesh)?;
-    let predicate = Array::from_host_buffer(&session, predicate_type, mesh.clone(), [1u8])?;
+    let predicate = Array::from_host_buffer(&session, predicate_type, mesh.clone(), None, [1u8])?;
     let condition_inputs = [Value::Array(predicate), Value::Array(input.clone())];
     if arguments.selects("eager_condition") {
         results.insert(

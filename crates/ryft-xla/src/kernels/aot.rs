@@ -504,7 +504,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::scalar(data_type);
         let captures = if capture {
             vec![crate::Value::Array(
-                Array::from_host_buffer(session, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
+                Array::from_host_buffer(session, r#type.clone(), mesh.clone(), None, 7i32.to_ne_bytes()).unwrap(),
             )]
         } else {
             vec![]
@@ -731,9 +731,14 @@ pub(crate) mod tests {
         let original = executable_bundle(&session, &mesh, DataType::I32, false, &binding(1));
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
         let loaded = decoded.load(&session, &binding(1), &mesh).unwrap();
-        let input =
-            Array::from_host_buffer(&session, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
-                .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::scalar(DataType::I32),
+            mesh.clone(),
+            None,
+            23i32.to_ne_bytes(),
+        )
+        .unwrap();
         let execution = loaded.call(vec![input]).unwrap();
         execution.fence().block_until_ready().unwrap();
         assert_eq!(execution.output().len(), 1);

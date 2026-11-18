@@ -78,7 +78,7 @@ mod tests {
         let inputs = input_types
             .into_iter()
             .zip(bytes)
-            .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
+            .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap())
             .collect::<Vec<_>>();
         let outputs = compiled.executable().execute(&session, inputs).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[3, 2]);
@@ -159,7 +159,7 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap())
                 .collect::<Vec<_>>();
             compiled
                 .executable()
@@ -554,7 +554,9 @@ mod tests {
                 let inputs = input_types
                     .into_iter()
                     .zip(bytes)
-                    .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
+                    .map(|(r#type, bytes)| {
+                        Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap()
+                    })
                     .collect();
                 let outputs = compiled.executable().execute(&session, inputs).unwrap();
                 assert_eq!(outputs.len(), 2);

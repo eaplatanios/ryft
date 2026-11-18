@@ -598,10 +598,8 @@ mod tests {
             .map(|(r#type, sharding, values)| {
                 let (r#type, mesh, bytes) = ((*r#type).clone(), mesh.clone(), values_to_bytes(values));
                 match sharding {
-                    Some(sharding) => {
-                        Array::from_host_buffer_with_sharding(&session, r#type, (*sharding).clone(), mesh, bytes)
-                    }
-                    None => Array::from_host_buffer(&session, r#type, mesh, bytes),
+                    Some(sharding) => Array::from_host_buffer(&session, r#type, mesh, Some((*sharding).clone()), bytes),
+                    None => Array::from_host_buffer(&session, r#type, mesh, None, bytes),
                 }
                 .unwrap()
             })

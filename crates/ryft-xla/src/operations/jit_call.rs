@@ -3817,7 +3817,7 @@ mod tests {
             )
             .unwrap();
         let array = |r#type: &ArrayType, bytes: Vec<u8>| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, bytes).unwrap()
         };
         let (previous, extent, state) = compiled
             .executable()
@@ -4175,7 +4175,7 @@ mod tests {
 
         let array = |values: &[f64]| {
             let bytes = values_to_bytes::<f64>(values);
-            Value::Array(Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), bytes).unwrap())
+            Value::Array(Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, bytes).unwrap())
         };
         let read = |value: &Value| {
             let Value::Array(array) = value else {
@@ -6652,6 +6652,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
@@ -6659,6 +6660,7 @@ mod tests {
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
             )
             .unwrap();

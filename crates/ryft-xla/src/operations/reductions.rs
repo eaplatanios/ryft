@@ -1177,7 +1177,8 @@ mod tests {
             ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
         ] {
             let input =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), None, values_to_bytes(&values))
+                    .unwrap();
             let output = compiled.executable().execute(&engine, input.clone()).unwrap();
             assert_eq!(read_f32s(client, &output), vec![expected]);
             let output = gradient.executable().execute(&engine, input).unwrap();
@@ -1201,7 +1202,8 @@ mod tests {
             [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
         {
             let input =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), None, values_to_bytes(&values))
+                    .unwrap();
             let output = gradient.executable().execute(&engine, input).unwrap();
             assert_eq!(output.sharding(), input_type.sharding().unwrap());
             let mut observed = Vec::new();
@@ -1292,7 +1294,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&engine, input_type, mesh, []).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, None, []).unwrap();
         let output = compiled.executable().execute(&engine, input).unwrap();
         assert!(read_f32s(client, &output)[0].is_nan());
     }
@@ -1328,7 +1330,7 @@ mod tests {
             )
             .unwrap();
             let input =
-                Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&vec![input; count]))
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), None, values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32s(client, &output), vec![expected]);
@@ -1393,7 +1395,7 @@ mod tests {
         let sharded = |data_type: DataType, bytes: Vec<u8>| {
             let sharding = Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
             let r#type = ArrayType::new_static(data_type, [4]).with_sharding(sharding).unwrap();
-            Array::from_host_buffer(&session, r#type, device_mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type, device_mesh.clone(), None, bytes).unwrap()
         };
         let reduce = |input: &Array, kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap();
         let floats = sharded(DataType::F32, values_to_bytes(&[-0f32, -1.0, 0.0, -2.0]));
@@ -1757,7 +1759,7 @@ mod tests {
             let compiled: CompiledFunction<ArrayType, ArrayType> =
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
-                Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&components)).unwrap();
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), None, values_to_bytes(&components)).unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32s(client, &output), expected);
         }
@@ -1873,6 +1875,7 @@ mod tests {
             &session,
             ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding).unwrap(),
             DeviceMesh::new(explicit_mesh, mesh.devices().to_vec()).unwrap(),
+            None,
             values_to_bytes(&logits),
         )
         .unwrap();
@@ -1903,7 +1906,7 @@ mod tests {
             let r#type = ArrayType::new_static(data_type, dimensions.to_vec())
                 .with_sharding(Sharding::new(logical_mesh.clone(), placements).unwrap())
                 .unwrap();
-            Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap()
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap()
         };
         let reduce = |values: [f32; 4], kind: ReductionKind| {
             let input = sharded(DataType::F32, &[4], 0, values_to_bytes(&values));
@@ -1997,11 +2000,11 @@ mod tests {
         // also keep their results for an input that only such a placement shards.
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let placed = |data_type: DataType, bytes: Vec<u8>| {
-            Array::from_host_buffer_with_sharding(
+            Array::from_host_buffer(
                 &session,
                 ArrayType::new_static(data_type, [4]),
-                Sharding::new(auto_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
                 DeviceMesh::new(auto_mesh.clone(), mesh.devices().to_vec()).unwrap(),
+                Some(Sharding::new(auto_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
                 bytes,
             )
             .unwrap()
@@ -2347,13 +2350,14 @@ mod tests {
 
         // Rounding the primal output at a large offset must not erase the derivative's normalization.
         let input =
-            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&[1e20f64, 1e20]))
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), None, values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
         assert_eq!(read_f32s(client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled guard for finite shifts must retain the undefined weight at an infinite input.
-        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let input =
+            Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
         let values = read_f32s(client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
@@ -2374,7 +2378,7 @@ mod tests {
         let differentiated = compiled.jvp(&engine).unwrap();
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
         let (_, tangent) = differentiated.executable().execute(&engine, (input.clone(), input)).unwrap();
         assert_eq!(read_f32s(client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }

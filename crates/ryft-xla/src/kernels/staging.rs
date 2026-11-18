@@ -1859,7 +1859,7 @@ pub(crate) mod tests {
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
                 crate::Value::Array(
-                    crate::Array::from_host_buffer(&session, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
+                    crate::Array::from_host_buffer(&session, r#type, mesh.clone(), None, value.to_ne_bytes()).unwrap(),
                 )
             })
             .collect::<Vec<_>>();

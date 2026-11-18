@@ -894,6 +894,7 @@ mod tests {
             &session_with_client(client),
             input_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -964,9 +965,14 @@ mod tests {
                 in (%2)"},
         );
         assert_eq!(compiled.source_program().captures().len(), 0);
-        let input =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
-                .unwrap();
+        let input = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3.]).as_slice(),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&engine, input).unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = output

@@ -300,13 +300,7 @@ impl Array {
                 Some(device_layout.clone()),
             )?);
         }
-        Array::from_addressable_buffers_with_sharding(
-            session,
-            r#type,
-            self.sharding().clone(),
-            self.mesh().clone(),
-            buffers,
-        )
+        Array::from_addressable_buffers(session, r#type, self.mesh().clone(), Some(self.sharding().clone()), buffers)
     }
 
     /// Rejects a dense host round trip of this array for `purpose` (i.e., materializing its logical value on the host
@@ -629,9 +623,10 @@ mod tests {
         for data_type in [DataType::F32, DataType::Zero] {
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
-            let array = Array::from_host_buffer(&session, ArrayType::new_static(data_type, [0]), mesh.clone(), [])
-                .unwrap()
-                .with_execution_fence(ExecutionFence::new(vec![event]));
+            let array =
+                Array::from_host_buffer(&session, ArrayType::new_static(data_type, [0]), mesh.clone(), None, [])
+                    .unwrap()
+                    .with_execution_fence(ExecutionFence::new(vec![event]));
             let copy = array.begin_copy_to_host().unwrap();
             assert_eq!(copy.shard_copy_count(), 0);
             assert_eq!(copy.finish().unwrap_err().to_string(), "empty producer failed");
@@ -661,7 +656,8 @@ mod tests {
         let materialize = |dimensions: Vec<ShardingDimension>| {
             let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
             let r#type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
-            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), values_to_bytes(&values)).unwrap();
+            let array =
+                Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&values)).unwrap();
             let copy = array.begin_copy_to_host().unwrap();
             let shard_copy_count = copy.shard_copy_count();
             let (bytes, merged) = copy.finish_with_measurements().unwrap();

@@ -1724,6 +1724,7 @@ mod tests {
             &session,
             replicated_f32_type(&mesh, &[2, 3]).with_layout(column_major.clone()),
             mesh.clone(),
+            None,
             values.as_slice(),
         )
         .unwrap();
@@ -1954,6 +1955,7 @@ mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();

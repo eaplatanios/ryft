@@ -249,6 +249,7 @@ mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();
@@ -375,6 +376,7 @@ mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[6, 2], input_sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();

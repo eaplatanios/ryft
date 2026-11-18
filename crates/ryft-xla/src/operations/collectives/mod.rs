@@ -474,6 +474,7 @@ mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[16], sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();

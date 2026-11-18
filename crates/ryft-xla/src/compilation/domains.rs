@@ -984,6 +984,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -1312,11 +1313,11 @@ mod tests {
 
         // A prefix sum depends on the order of the shards, so it is only correct when each partition runs on the
         // device that holds its shard.
-        let input = Array::from_host_buffer_with_sharding(
+        let input = Array::from_host_buffer(
             &session,
             input_type,
-            sharding,
             mesh,
+            Some(sharding),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -1437,6 +1438,7 @@ mod tests {
             &session,
             static_vector_type,
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
         )
         .unwrap();
@@ -1548,11 +1550,13 @@ mod tests {
 
         let compiled = session.compile_program(&lowered).unwrap();
         let size =
-            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), 3i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, 3i64.to_ne_bytes().as_slice())
+                .unwrap();
         let value = Array::from_host_buffer(
             &session,
             value_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[2.0]).as_slice(),
         )
         .unwrap();
@@ -1839,6 +1843,7 @@ mod tests {
             &session,
             host_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -1846,6 +1851,7 @@ mod tests {
             &session,
             device_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
@@ -2643,7 +2649,7 @@ mod tests {
         // Provenance does not affect numeric results.
         let compiled = session.compile_program(&lowered).unwrap();
         let value =
-            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), 3.0f64.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, 3.0f64.to_ne_bytes().as_slice())
                 .unwrap();
         let outputs = session.execute_program(&compiled, vec![value]).unwrap();
         assert_eq!(read_f64s(client, &outputs[0]), vec![-9.0]);

@@ -1224,7 +1224,7 @@ mod tests {
         };
         let (left, right, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
         let device = |data_type: DataType, shape: &[usize], bytes: Vec<u8>| {
-            Array::from_host_buffer(&session, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
+            Array::from_host_buffer(&session, placed(data_type, shape), mesh.clone(), None, bytes.as_slice()).unwrap()
         };
         let outputs = compiled
             .executable()

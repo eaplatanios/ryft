@@ -91,7 +91,8 @@ mod tests {
         let constructed_baseline = constructed_array_count();
         let arrays: Vec<Array> = (0..200)
             .map(|_| {
-                Array::from_addressable_buffers(&session, array_type.clone(), device_mesh.clone(), Vec::new()).unwrap()
+                Array::from_addressable_buffers(&session, array_type.clone(), device_mesh.clone(), None, Vec::new())
+                    .unwrap()
             })
             .collect();
         let after_construct = constructed_array_count();

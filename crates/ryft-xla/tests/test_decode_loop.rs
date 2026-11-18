@@ -539,7 +539,7 @@ fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
     .unwrap();
 
     let device_input = |index: usize, bytes: Vec<u8>| {
-        Array::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
+        Array::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), None, bytes.as_slice()).unwrap()
     };
     let mut device_inputs = vec![
         device_input(0, values_to_bytes::<i32>(&[0])),

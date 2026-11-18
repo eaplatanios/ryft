@@ -150,7 +150,7 @@ mod tests {
         use crate::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
         use crate::sessions::tests::domain_mesh;
         use crate::tests::execution_client;
-        use crate::{Options, Session, Value};
+        use crate::{Array, Options, Session, Value};
 
         /// Writes a workgroup tile and copies a slice whose elements are assigned to different lanes.
         #[kernel(crate = "ryft_kernels", requires = input.shape()[0] == 256)]
@@ -182,9 +182,14 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [256]);
             let definition = read_written_slice::definition(&r#type).unwrap();
             let values = (0..256).map(|value| value as f32).collect::<Vec<_>>();
-            let input = session
-                .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
-                .unwrap();
+            let input = Array::from_host_buffer(
+                &session,
+                r#type.clone(),
+                None,
+                None,
+                values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+            )
+            .unwrap();
 
             for stages in [1, 2, 3] {
                 let schedule = KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(stages).unwrap());

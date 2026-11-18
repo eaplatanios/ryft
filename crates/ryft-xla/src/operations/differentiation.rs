@@ -181,6 +181,7 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
@@ -211,11 +212,12 @@ mod tests {
             &engine,
             input_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
         let second =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
         let (first, second) = variadic.executable().execute(&engine, (first, second)).unwrap();
         assert_eq!(read_f32s(client, &first), values);

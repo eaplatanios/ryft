@@ -492,7 +492,7 @@ impl<'o> DistributedKernel<'o> {
             if Sha256::digest(&bytes).as_slice() != manifest.checksum {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
-            let value = Array::from_host_buffer(session, r#type.clone(), mesh.clone(), bytes)?;
+            let value = Array::from_host_buffer(session, r#type.clone(), mesh.clone(), None, bytes)?;
             value.block_until_ready()?;
             arguments.push(value);
         }
@@ -962,6 +962,7 @@ mod tests {
             &session,
             ryft_core::ArrayType::scalar(ryft_core::DataType::I32),
             mesh.clone(),
+            None,
             (10 + process as i32).to_ne_bytes(),
         )
         .unwrap();

@@ -1024,7 +1024,7 @@ mod tests {
         let compiled = session.compile_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
                 .interpret_in_context(&session, vec![Value::Array(input.clone())])
@@ -1158,7 +1158,7 @@ mod tests {
         let compiled = session.compile_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
                 .interpret_in_context(&session, vec![Value::Array(input.clone())])
@@ -1234,7 +1234,8 @@ mod tests {
         );
 
         let zero =
-            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, 0i64.to_ne_bytes().as_slice())
+                .unwrap();
         let error = session.execute_program(&compiled, vec![zero]).unwrap_err();
         assert!(
             error.to_string().contains(
@@ -1254,7 +1255,7 @@ mod tests {
             DataType::F32,
             AttentionImplementation::Fused,
         );
-        let input = Array::from_host_buffer(&session, size_type, mesh, 2i64.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&session, size_type, mesh, None, 2i64.to_ne_bytes().as_slice()).unwrap();
         let error = fused.interpret_in_context(&session, vec![Value::Array(input)]).unwrap_err();
         assert!(matches!(
             error,
@@ -1283,7 +1284,7 @@ mod tests {
         let compiled = session.compile_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, size.to_ne_bytes().as_slice())
                     .unwrap();
             session.execute_program(&compiled, vec![input]).unwrap()
         };
@@ -1363,9 +1364,14 @@ mod tests {
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
             let compiled = session.compile_program(&lowered).unwrap();
             let execute = |size: i64| {
-                let input =
-                    Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                        .unwrap();
+                let input = Array::from_host_buffer(
+                    &session,
+                    size_type.clone(),
+                    mesh.clone(),
+                    None,
+                    size.to_ne_bytes().as_slice(),
+                )
+                .unwrap();
                 session.execute_program(&compiled, vec![input]).unwrap()
             };
 
@@ -1405,8 +1411,8 @@ mod tests {
                 assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
             });
 
-            let zero =
-                Array::from_host_buffer(&session, size_type, mesh.clone(), 0i64.to_ne_bytes().as_slice()).unwrap();
+            let zero = Array::from_host_buffer(&session, size_type, mesh.clone(), None, 0i64.to_ne_bytes().as_slice())
+                .unwrap();
             let error = session.execute_program(&compiled, vec![zero]).unwrap_err();
             assert!(
                 error.to_string().contains(

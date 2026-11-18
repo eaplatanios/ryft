@@ -1212,8 +1212,14 @@ mod tests {
         let session = session_with_client(client);
         let input = Value::Array(f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]));
         let index = Value::Array(
-            Array::from_host_buffer(&session, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
-                .unwrap(),
+            Array::from_host_buffer(
+                &session,
+                ArrayType::scalar(DataType::U64),
+                mesh.clone(),
+                None,
+                u64::MAX.to_ne_bytes(),
+            )
+            .unwrap(),
         );
 
         // An unsigned index larger than `i64::MAX` selects the last valid slice, rather than wrapping negative.
@@ -1328,7 +1334,7 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap())
                 .collect();
             let outputs = compiled.executable().execute(&session, inputs).unwrap();
             assert_eq!(outputs.len(), 2, "n={size}, row={row}");
@@ -1715,6 +1721,7 @@ mod tests {
             &session,
             input_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
         )
         .unwrap();
@@ -1783,16 +1790,21 @@ mod tests {
             .unwrap();
         let lowered = session.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
-        let input =
-            Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes(&[0f32, 1., 2., 3., 4., 5.]))
-                .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes(&[0f32, 1., 2., 3., 4., 5.]),
+        )
+        .unwrap();
         let size =
-            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), values_to_bytes(&[2i64])).unwrap();
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, values_to_bytes(&[2i64])).unwrap();
         let outputs = session.execute_program(&compiled, vec![input.clone(), size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2]);
         assert_eq!(read_f32s(client, &outputs[0]), vec![3., 5.]);
         assert_eq!(read_f32s(client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
-        let size = Array::from_host_buffer(&session, size_type, mesh, values_to_bytes(&[0i64])).unwrap();
+        let size = Array::from_host_buffer(&session, size_type, mesh, None, values_to_bytes(&[0i64])).unwrap();
         let outputs = session.execute_program(&compiled, vec![input, size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0]);
         assert_eq!(read_f32s(client, &outputs[1]), vec![0f32; 6]);
@@ -1888,11 +1900,13 @@ mod tests {
             f32::NAN,
             f32::NAN,
         ];
-        let input = Array::from_host_buffer(&session, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
-        let rows =
-            Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3i64])).unwrap();
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&values)).unwrap();
+        let rows = Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), None, values_to_bytes(&[3i64]))
+            .unwrap();
         let columns =
-            Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4i64])).unwrap();
+            Array::from_host_buffer(&session, scalar_type.clone(), mesh.clone(), None, values_to_bytes(&[4i64]))
+                .unwrap();
         let outputs = session.execute_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
         assert_eq!(read_f32s(client, &outputs[0]), vec![0., 2., 10., 12.]);
@@ -1900,7 +1914,7 @@ mod tests {
             read_f32s(client, &outputs[1]),
             vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
         );
-        let rows = Array::from_host_buffer(&session, scalar_type, mesh, values_to_bytes(&[0i64])).unwrap();
+        let rows = Array::from_host_buffer(&session, scalar_type, mesh, None, values_to_bytes(&[0i64])).unwrap();
         let outputs = session.execute_program(&compiled, vec![input, rows, columns]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
         assert_eq!(read_f32s(client, &outputs[1]), vec![0f32; 20]);
@@ -1957,8 +1971,9 @@ mod tests {
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
         let compiled = session.compile_program(&lowered).unwrap();
-        let scalar =
-            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&session, r#type, mesh.clone(), bytes).unwrap();
+        let scalar = |r#type: ArrayType, bytes: &[u8]| {
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap()
+        };
         let inputs = |input_size: i64, result_size: i64| {
             vec![
                 scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),

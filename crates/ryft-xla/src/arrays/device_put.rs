@@ -158,7 +158,7 @@ impl<T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf for T {
         };
         let r#type =
             ArrayType::new(element_type, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
-        Array::from_host_buffer_with_sharding(session, r#type, sharding, mesh, bytes.as_slice())
+        Array::from_host_buffer(session, r#type, mesh, Some(sharding), bytes.as_slice())
     }
 }
 
@@ -502,6 +502,7 @@ mod tests {
             &session,
             first_source_type,
             source_mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0]).as_slice(),
         )
         .unwrap();
@@ -512,6 +513,7 @@ mod tests {
             &session,
             second_source_type,
             source_mesh,
+            None,
             values_to_bytes::<f32>(&[10.0, 11.0, 12.0, 13.0]).as_slice(),
         )
         .unwrap();
@@ -582,6 +584,7 @@ mod tests {
             &session,
             ArrayType::new_static(DataType::F32, [4]),
             source_mesh,
+            None,
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();
@@ -640,11 +643,11 @@ mod tests {
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let source_array = Array::from_addressable_buffers_with_sharding(
+        let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             vec![local_source_buffer],
         )
         .unwrap();
@@ -674,6 +677,7 @@ mod tests {
             &session,
             source_type,
             source_mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(),
         )
         .unwrap();

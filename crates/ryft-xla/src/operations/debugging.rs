@@ -583,6 +583,7 @@ mod tests {
             domain.parent(),
             r#type,
             mesh.clone(),
+            None,
             values_to_bytes::<f64>(&[1.5, 2.5]).as_slice(),
         )
         .unwrap();
@@ -860,9 +861,14 @@ mod tests {
         .unwrap();
 
         let values = [1.5f64, 2.5];
-        let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
-                .unwrap();
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type,
+            mesh.clone(),
+            None,
+            values_to_bytes::<f64>(&values).as_slice(),
+        )
+        .unwrap();
         let (output, lines) = with_captured_prints(|| compiled.executable().execute(&engine, source).unwrap());
 
         // Both prints fire in program order, and the printed values are the forwarded operands.

@@ -677,10 +677,16 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let first =
-            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), values_to_bytes(&[1i64, 2, 3, 4]))
-                .unwrap();
-        let second = Array::from_host_buffer(&session, input_type, mesh, values_to_bytes(&[5i64, 6, 7, 8])).unwrap();
+        let first = Array::from_host_buffer(
+            &session,
+            input_type.clone(),
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1i64, 2, 3, 4]),
+        )
+        .unwrap();
+        let second =
+            Array::from_host_buffer(&session, input_type, mesh, None, values_to_bytes(&[5i64, 6, 7, 8])).unwrap();
         let output = compiled.executable().execute(&session, (first, second)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&sharding));
         for (index, device) in devices.iter().enumerate() {

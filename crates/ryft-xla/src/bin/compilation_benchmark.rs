@@ -264,7 +264,7 @@ fn input_array(
     for index in 0..size {
         bytes.extend_from_slice(&((index % 1024) as f32 / 1024.0).to_ne_bytes());
     }
-    Ok(Array::from_host_buffer(session, r#type, mesh.clone(), bytes.as_slice())?)
+    Ok(Array::from_host_buffer(session, r#type, mesh.clone(), None, bytes.as_slice())?)
 }
 
 /// Stages the workload `sin(x * x + x)` for inputs of type `r#type` over `mesh`.
@@ -381,7 +381,7 @@ fn jit_eager_gradient(
         mesh.clone(),
     );
     session.compilation_cache().clear_statistics();
-    let input = |value: f32| Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), value.to_ne_bytes());
+    let input = |value: f32| Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, value.to_ne_bytes());
 
     let mut samples = Vec::with_capacity(iterations + 1);
     let mut cold_statistics = None;
@@ -640,7 +640,7 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // Every input element is the bf16 encoding of one.
     let element_count = dimensions.iter().product::<usize>();
     let bytes = 0x3f80u16.to_ne_bytes().repeat(element_count);
-    let input = Array::from_host_buffer(&session, r#type, mesh, bytes.as_slice())?;
+    let input = Array::from_host_buffer(&session, r#type, mesh, None, bytes.as_slice())?;
     input.block_until_ready()?;
     let inputs = vec![Value::Array(input); 3];
     let execute = || -> Result<(), Box<dyn std::error::Error>> {

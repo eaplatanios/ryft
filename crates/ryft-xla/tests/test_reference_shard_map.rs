@@ -139,9 +139,10 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         (0..3).flat_map(|item| (1..=4).map(move |column| (10 * item + column) as f32)).collect::<Vec<_>>();
     let update_values = (0..3).flat_map(|item| [(100 * (item + 1)) as f32; 4]).collect::<Vec<_>>();
     let reference = ArrayReference::new(
-        Array::from_host_buffer(&session, batched_type.clone(), mesh.clone(), to_bytes(&reference_values)).unwrap(),
+        Array::from_host_buffer(&session, batched_type.clone(), mesh.clone(), None, to_bytes(&reference_values))
+            .unwrap(),
     );
-    let update = Array::from_host_buffer(&session, batched_type, mesh, to_bytes(&update_values)).unwrap();
+    let update = Array::from_host_buffer(&session, batched_type, mesh, None, to_bytes(&update_values)).unwrap();
     let Value::Array(output) = compiled
         .execute_statefully_and_wait(
             &session,

@@ -14,7 +14,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
-    CustomCallOperationExtension, Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension,
+    Array, CustomCallOperationExtension, Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension,
     RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, Value,
 };
 
@@ -246,7 +246,8 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     assert_eq!(left.initialized.load(Ordering::SeqCst), 1);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 1);
 
-    let input = first.array(ArrayType::scalar(DataType::I32), 7i32.to_ne_bytes()).unwrap();
+    let input =
+        Array::from_host_buffer(&first, ArrayType::scalar(DataType::I32), None, None, 7i32.to_ne_bytes()).unwrap();
     let output = compiled.executable().execute(&first, Value::Array(input.clone())).unwrap();
     assert_eq!(scalar(&output), 30);
     let output = compiled.executable().execute(&first, Value::Array(input)).unwrap();
@@ -267,7 +268,8 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     // Loading resolves the receiving session's providers before its first invocation.
     assert_eq!(left.initialized.load(Ordering::SeqCst), 2);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 2);
-    let input = second.array(ArrayType::scalar(DataType::I32), 7i32.to_ne_bytes()).unwrap();
+    let input =
+        Array::from_host_buffer(&second, ArrayType::scalar(DataType::I32), None, None, 7i32.to_ne_bytes()).unwrap();
     let output = second.execute(&restored, vec![Value::Array(input)]).unwrap().remove(0);
     assert_eq!(scalar(&output), 53);
     assert_eq!(left.called.load(Ordering::SeqCst), 3);
@@ -295,7 +297,8 @@ fn test_runtime_extensions_reject_missing_provider_before_compilation_and_cached
     assert_eq!(left.initialized.load(Ordering::SeqCst), 0);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 0);
     let compiled = lowered.compile(&first).unwrap();
-    let input = missing.array(ArrayType::scalar(DataType::I32), 7i32.to_ne_bytes()).unwrap();
+    let input =
+        Array::from_host_buffer(&missing, ArrayType::scalar(DataType::I32), None, None, 7i32.to_ne_bytes()).unwrap();
     assert!(matches!(missing.execute(compiled.compiled_program(), vec![Value::Array(input)]),
         Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == LEFT));
     assert_eq!(left.called.load(Ordering::SeqCst), 0);
@@ -313,7 +316,8 @@ fn test_runtime_extensions_reject_duplicate_native_binding_before_submission() {
         .build()
         .unwrap();
     let compiled = staged(mesh.clone(), requirements()).lower(&session).unwrap().compile(&session).unwrap();
-    let input = session.array(ArrayType::scalar(DataType::I32), 7i32.to_ne_bytes()).unwrap();
+    let input =
+        Array::from_host_buffer(&session, ArrayType::scalar(DataType::I32), None, None, 7i32.to_ne_bytes()).unwrap();
     let type_id = FfiTypeId::from_name(LEFT);
     assert!(matches!(compiled.executable().execute(&session, Value::Array(input)),
         Err(Error::Runtime(RuntimeError::DuplicateUserData { type_id: actual })) if actual == i64::from(type_id)));

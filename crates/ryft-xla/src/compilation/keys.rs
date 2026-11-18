@@ -927,6 +927,7 @@ mod tests {
                 &session,
                 ArrayType::new_static(DataType::F32, [3]),
                 mesh.clone(),
+                None,
                 values_to_bytes(&[1f32, 2.0, 3.0]),
             )
             .unwrap(),
@@ -968,21 +969,21 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let tiled = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated_input = Value::Array(
-            Array::from_host_buffer_with_sharding(
+            Array::from_host_buffer(
                 &session,
                 ArrayType::new_static(DataType::F32, [4]),
-                replicated.clone(),
                 mesh.clone(),
+                Some(replicated.clone()),
                 values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
             )
             .unwrap(),
         );
         let tiled_input = Value::Array(
-            Array::from_host_buffer_with_sharding(
+            Array::from_host_buffer(
                 &session,
                 ArrayType::new_static(DataType::F32, [4]),
-                tiled.clone(),
                 mesh.clone(),
+                Some(tiled.clone()),
                 values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
             )
             .unwrap(),
@@ -1034,12 +1035,22 @@ mod tests {
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
 
         let call = |size: i64| {
-            let size =
-                Array::from_host_buffer(&session, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            let value =
-                Array::from_host_buffer(&session, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
-                    .unwrap();
+            let size = Array::from_host_buffer(
+                &session,
+                scalar_i64.clone(),
+                mesh.clone(),
+                None,
+                size.to_ne_bytes().as_slice(),
+            )
+            .unwrap();
+            let value = Array::from_host_buffer(
+                &session,
+                scalar_f32.clone(),
+                mesh.clone(),
+                None,
+                2.0f32.to_ne_bytes().as_slice(),
+            )
+            .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)]).unwrap()
         };
 
@@ -1089,6 +1100,7 @@ mod tests {
                 &session,
                 input_type,
                 mesh.clone(),
+                None,
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
@@ -1119,12 +1131,22 @@ mod tests {
         let function: CompiledFunctionDispatcher<Session, (), Vec<ArrayIrType>, ArrayIrType, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
         let call = |size: i64| {
-            let size =
-                Array::from_host_buffer(&session, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
-                    .unwrap();
-            let value =
-                Array::from_host_buffer(&session, scalar_f32.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
-                    .unwrap();
+            let size = Array::from_host_buffer(
+                &session,
+                scalar_i64.clone(),
+                mesh.clone(),
+                None,
+                size.to_ne_bytes().as_slice(),
+            )
+            .unwrap();
+            let value = Array::from_host_buffer(
+                &session,
+                scalar_f32.clone(),
+                mesh.clone(),
+                None,
+                2.0f32.to_ne_bytes().as_slice(),
+            )
+            .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)])
         };
         assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);

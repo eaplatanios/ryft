@@ -740,7 +740,7 @@ fn execute_aot_case(
     use sha2::{Digest, Sha256};
 
     use ryft_xla::kernels::{KernelAotBundle, KernelExecutionFacts};
-    use ryft_xla::{FromPjrt, Options, Session};
+    use ryft_xla::{Array as XlaArray, FromPjrt, Options, Session};
 
     /// Uses the portable source codec's whole-array subset with no hidden captures or runtime references.
     #[kernel]
@@ -780,10 +780,14 @@ fn execute_aot_case(
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
         .map(|value| {
-            runtime
-                .with_device_mesh(mesh.clone())
-                .array(r#type.clone(), value.to_ne_bytes().repeat(64))
-                .unwrap()
+            XlaArray::from_host_buffer(
+                &runtime.with_device_mesh(mesh.clone()),
+                r#type.clone(),
+                None,
+                None,
+                value.to_ne_bytes().repeat(64),
+            )
+            .unwrap()
         })
         .collect();
     let iterations = std::env::var("RYFT_KERNEL_AOT_ITERATIONS")
@@ -883,10 +887,14 @@ fn execute_aot_case(
         let inputs = [10.0 + process as f32, 20.0 + process as f32]
             .into_iter()
             .map(|value| {
-                runtime
-                    .with_device_mesh(mesh.clone())
-                    .array(r#type.clone(), value.to_ne_bytes().repeat(64))
-                    .unwrap()
+                XlaArray::from_host_buffer(
+                    &runtime.with_device_mesh(mesh.clone()),
+                    r#type.clone(),
+                    None,
+                    None,
+                    value.to_ne_bytes().repeat(64),
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -944,7 +952,9 @@ mod gpu {
     use ryft_kernels::{KernelExtension as PortableKernelExtension, KernelOperation, KernelSchedule};
     use ryft_mosaic::kernels::gpu::{Compiler, GpuOperation, Options as MosaicOptions, Target};
     use ryft_xla::kernels::{KernelCompilerBinding, KernelExtension, MosaicGpuEmbedding, stage_kernel};
-    use ryft_xla::{CompileTracer, CompiledFunction, Error, FromPjrt, Options, Session, compile_with_options};
+    use ryft_xla::{
+        Array as XlaArray, CompileTracer, CompiledFunction, Error, FromPjrt, Options, Session, compile_with_options,
+    };
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1065,7 +1075,9 @@ mod gpu {
         let inputs = input_types
             .into_iter()
             .zip(input_bytes)
-            .map(|(r#type, bytes)| session.with_device_mesh(mesh.clone()).array(r#type, bytes).unwrap())
+            .map(|(r#type, bytes)| {
+                XlaArray::from_host_buffer(&session.with_device_mesh(mesh.clone()), r#type, None, None, bytes).unwrap()
+            })
             .collect::<Vec<_>>();
         let warmup = usize::from(iterations > 1);
         let mut start = Instant::now();
@@ -1629,7 +1641,7 @@ mod cutile {
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options as CuTileOptions, Target};
     use ryft_kernels::{KernelSchedule, VerifiedKernel};
     use ryft_xla::kernels::{CuTileEmbedding, KernelCompilerBinding, stage_kernel};
-    use ryft_xla::{Error, FromPjrt, Session, Value};
+    use ryft_xla::{Array as XlaArray, Error, FromPjrt, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1758,10 +1770,14 @@ mod cutile {
             .iter()
             .zip(&case.inputs)
             .map(|(r#type, values)| {
-                runtime_session
-                    .with_device_mesh(mesh.clone())
-                    .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
-                    .unwrap()
+                XlaArray::from_host_buffer(
+                    &runtime_session.with_device_mesh(mesh.clone()),
+                    r#type.clone(),
+                    None,
+                    None,
+                    values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         if repeated_input {
@@ -1981,10 +1997,14 @@ mod cutile {
                 .unwrap();
                 let values = (0..17).map(|value| value as f32 - 8.0).collect::<Vec<_>>();
                 let expected = values.iter().map(|value| value + 1.0).collect::<Vec<_>>();
-                let input = session
-                    .with_device_mesh(mesh)
-                    .array(r#type, values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
-                    .unwrap();
+                let input = XlaArray::from_host_buffer(
+                    &session.with_device_mesh(mesh),
+                    r#type,
+                    None,
+                    None,
+                    values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                )
+                .unwrap();
                 let output = compiled.executable().execute(&session, input).unwrap();
                 let bytes = output
                     .device_shard(device.id().unwrap())
@@ -2091,7 +2111,7 @@ mod tuning {
         KernelCompilerBinding, KernelExecutionFacts, KernelOutputEmbedding, KernelTarget, KernelTuner,
         KernelTuningBudget, KernelTuningError, KernelTuningRequest, KernelTuningRunner, stage_kernel,
     };
-    use ryft_xla::{FromPjrt, Options, Session, Value};
+    use ryft_xla::{Array as XlaArray, FromPjrt, Options, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -2251,10 +2271,14 @@ mod tuning {
             .zip(&case.inputs)
             .map(|(r#type, values)| {
                 Value::Array(
-                    session
-                        .with_device_mesh(mesh.clone())
-                        .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
-                        .unwrap(),
+                    XlaArray::from_host_buffer(
+                        &session.with_device_mesh(mesh.clone()),
+                        r#type.clone(),
+                        None,
+                        None,
+                        values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
                 )
             })
             .collect();
@@ -2638,7 +2662,7 @@ mod triton {
     use ryft_kernels::{KernelCompiler, KernelSchedule};
     use ryft_triton::kernels::{Compiler, Options as TritonOptions, Target};
     use ryft_xla::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
-    use ryft_xla::{FromPjrt, Options, Session, Value};
+    use ryft_xla::{Array as XlaArray, FromPjrt, Options, Session, Value};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -2697,10 +2721,14 @@ mod triton {
             .iter()
             .zip(&case.inputs)
             .map(|(r#type, values)| {
-                session
-                    .with_device_mesh(mesh.clone())
-                    .array(r#type.clone(), values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
-                    .unwrap()
+                XlaArray::from_host_buffer(
+                    &session.with_device_mesh(mesh.clone()),
+                    r#type.clone(),
+                    None,
+                    None,
+                    values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         for _ in 0..3 {

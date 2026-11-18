@@ -1186,6 +1186,7 @@ mod tests {
                     &session,
                     static_sharded_array_type(DataType::I32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
+                    None,
                     buffers,
                 )
                 .unwrap()
@@ -1306,6 +1307,7 @@ mod tests {
                     &session,
                     static_sharded_array_type(DataType::F32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
+                    None,
                     buffers,
                 )
                 .unwrap()
@@ -1338,6 +1340,7 @@ mod tests {
                 &session,
                 static_sharded_array_type(DataType::I32, &[4], sharding.clone()),
                 device_mesh.clone(),
+                None,
                 buffers,
             )
             .unwrap()

@@ -318,11 +318,11 @@ mod tests {
         .unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = Array::from_host_buffer_with_sharding(
+        let source = Array::from_host_buffer(
             &engine,
             input_type,
-            sharded.clone(),
             mesh.clone(),
+            Some(sharded.clone()),
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();

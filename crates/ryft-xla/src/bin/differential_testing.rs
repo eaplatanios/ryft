@@ -280,6 +280,7 @@ fn execute_collective_inputs(
             &Session::builder().client(client).build()?,
             input_type,
             device_mesh.clone(),
+            None,
             buffers,
         )?);
     }

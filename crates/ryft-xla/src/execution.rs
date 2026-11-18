@@ -618,6 +618,7 @@ impl Session {
                         self,
                         input.r#type().into_owned().with_layout(expected.clone()),
                         input.mesh().clone(),
+                        None,
                         bytes,
                     )?;
                 }
@@ -1260,7 +1261,7 @@ impl Session {
                 input.block_until_ready()?;
                 let carrier_type = physical_type.clone().with_data_type(DataType::Boolean);
                 let element_count = carrier_type.element_count()?.unwrap();
-                Array::from_host_buffer(self, carrier_type, input.mesh().clone(), vec![0u8; element_count])
+                Array::from_host_buffer(self, carrier_type, input.mesh().clone(), None, vec![0u8; element_count])
             })
             .collect()
     }
@@ -1734,6 +1735,7 @@ mod tests {
             &session,
             ArrayType::new_static(DataType::F64, [2, 3]),
             mesh,
+            None,
             values_to_bytes(&values),
         )
         .unwrap();
@@ -1744,6 +1746,7 @@ mod tests {
             ArrayType::new_static(DataType::F64, [2, 3])
                 .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]))),
             compiled.mesh().clone(),
+            None,
             values_to_bytes(&values),
         )
         .unwrap();
@@ -1775,11 +1778,11 @@ mod tests {
         // Outputs are built from the program's planned layouts, which place every shard like the validating
         // constructors do and are shared by the outputs of every execution.
         let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
-        let input = Array::from_host_buffer_with_sharding(
+        let input = Array::from_host_buffer(
             &session,
             input_type,
-            sharding.clone(),
             mesh.clone(),
+            Some(sharding.clone()),
             values_to_bytes(values.as_slice()).as_slice(),
         )
         .unwrap();
@@ -1919,19 +1922,14 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)]));
         let right_array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)]));
-        let left_array = Array::from_addressable_buffers_with_sharding(
-            &session,
-            left_array_type,
-            left_sharding,
-            mesh.clone(),
-            left_buffers,
-        )
-        .unwrap();
-        let right_array = Array::from_addressable_buffers_with_sharding(
+        let left_array =
+            Array::from_addressable_buffers(&session, left_array_type, mesh.clone(), Some(left_sharding), left_buffers)
+                .unwrap();
+        let right_array = Array::from_addressable_buffers(
             &session,
             right_array_type,
-            right_sharding,
             mesh.clone(),
+            Some(right_sharding),
             right_buffers,
         )
         .unwrap();
@@ -2119,6 +2117,7 @@ mod tests {
             &session,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
+            None,
             input_buffers,
         )
         .unwrap();
@@ -2311,7 +2310,7 @@ mod tests {
             session.compilation_key(boolean_lowered.lowered_program()).unwrap(),
         );
 
-        let input = Array::from_host_buffer(&session, input_type, mesh, []).unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh, None, []).unwrap();
         let output = compiled.executable().execute(&session, Value::Array(input)).unwrap();
         let Value::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
@@ -2351,10 +2350,11 @@ mod tests {
             &session,
             value_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
         )
         .unwrap();
-        let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh, None, []).unwrap();
 
         let (zero_output, value_output) =
             compiled.executable().execute(&session, (Value::Array(value), Value::Array(zero))).unwrap();
@@ -2428,6 +2428,7 @@ mod tests {
                 &session,
                 actual_type,
                 mesh.clone(),
+                None,
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
@@ -2679,13 +2680,14 @@ mod tests {
             let compiled = session.compile_program(&lowered).unwrap();
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
-            let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), [])
+            let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), None, [])
                 .unwrap()
                 .with_execution_fence(ExecutionFence::new(vec![event]));
             let value = Array::from_host_buffer(
                 &session,
                 ArrayType::new_static(DataType::F32, [2]),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[1.0, 2.0]),
             )
             .unwrap();
@@ -2756,11 +2758,11 @@ mod tests {
         // another device, so its shards are moved to the devices that the program expects them on.
         let reversed_mesh =
             DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().copied().collect()).unwrap();
-        let reversed_input = Array::from_host_buffer_with_sharding(
+        let reversed_input = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [4]),
-            sharded.clone(),
             reversed_mesh.clone(),
+            Some(sharded.clone()),
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();
@@ -2787,7 +2789,7 @@ mod tests {
         let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&session, runtime_zero_type, mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, runtime_zero_type, mesh, None, []).unwrap();
 
         let carriers = session.materialize_zero_space_carriers(&[physical_zero_type], vec![zero]).unwrap();
 
@@ -2823,7 +2825,7 @@ mod tests {
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, None, []).unwrap();
 
         // The input of the zero data type below its bounds must bypass the retained cache and byte padding tiers,
         // because its dense host copy is empty, and rely on the carrier materialization to synthesize the predicate
@@ -2930,7 +2932,7 @@ mod tests {
         )
         .unwrap();
         let root = ArrayReference::new(
-            Array::from_host_buffer(&session, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
+            Array::from_host_buffer(&session, vector_type, mesh, None, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
         );
         let view = root
@@ -2979,6 +2981,7 @@ mod tests {
                 &session,
                 alternate_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(),
             )
             .unwrap(),
@@ -3007,6 +3010,7 @@ mod tests {
             &session,
             replicated_type.clone(),
             mesh,
+            None,
             values_to_bytes::<f32>(&[3.0, 4.0]).as_slice(),
         )
         .unwrap();
@@ -3052,6 +3056,7 @@ mod tests {
                 &session,
                 array_type.clone(),
                 mesh.clone(),
+                None,
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
             )
             .unwrap(),
@@ -3060,6 +3065,7 @@ mod tests {
             &session,
             array_type.clone(),
             mesh.clone(),
+            None,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
@@ -3084,6 +3090,7 @@ mod tests {
                 &session,
                 array_type.clone(),
                 reversed_mesh,
+                None,
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
             )
             .unwrap(),
@@ -3092,6 +3099,7 @@ mod tests {
             &session,
             array_type,
             mesh,
+            None,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
@@ -3120,7 +3128,7 @@ mod tests {
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&session, array_type, mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, public_reference| {
@@ -3170,16 +3178,17 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
-        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let (higher_output, lower_output) = compiled
             .execute_statefully_and_wait(
@@ -3219,20 +3228,20 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
         let higher_first_update =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let lower_first_update =
-            Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         // The two calls present the same holders in opposite argument order and start together. Both must finish,
         // because internal identity ordering serializes their retained guard windows without creating a lock cycle.
@@ -3292,8 +3301,14 @@ mod tests {
         .unwrap();
         let reference_new = |value: f32| {
             ArrayReference::new(
-                Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                    .unwrap(),
+                Array::from_host_buffer(
+                    &session,
+                    array_type.clone(),
+                    mesh.clone(),
+                    None,
+                    value.to_ne_bytes().as_slice(),
+                )
+                .unwrap(),
             )
         };
 
@@ -3303,7 +3318,7 @@ mod tests {
         let pre_handoff_read_only = reference_new(20.0);
         let wrong_update_type = replicated_scalar_type(&mesh, DataType::F64);
         let wrong_update =
-            Array::from_host_buffer(&session, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, wrong_update_type, mesh.clone(), None, 2.0f64.to_ne_bytes().as_slice())
                 .unwrap();
         let declared_update_type = <&ArrayType>::try_from(&compiled.executable().input_types()[3]).unwrap();
         let expected_error = format!(
@@ -3335,7 +3350,7 @@ mod tests {
         let pre_submission_second = reference_new(10.0);
         let pre_submission_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
@@ -3361,7 +3376,7 @@ mod tests {
         let post_handoff_second = reference_new(10.0);
         let post_handoff_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
@@ -3395,7 +3410,7 @@ mod tests {
         let pre_commit_second = reference_new(10.0);
         let pre_commit_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
@@ -3426,7 +3441,8 @@ mod tests {
         let committed_first = reference_new(1.0);
         let committed_second = reference_new(10.0);
         let committed_read_only = reference_new(20.0);
-        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         inject_stateful_failure(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.execute_statefully_and_wait(
@@ -3465,15 +3481,16 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let frozen = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         frozen.freeze().unwrap();
-        let update = Array::from_host_buffer(&session, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 3.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             compiled.execute_statefully_and_wait(
                 &session,
@@ -3513,7 +3530,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
@@ -3535,7 +3552,7 @@ mod tests {
             let mutate = &mutate;
             scope.spawn(move || {
                 let update =
-                    Array::from_host_buffer(session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                    Array::from_host_buffer(session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
                 mutation_finished
                     .send(mutate.execute_statefully_and_wait(
                         session,
@@ -3571,10 +3588,11 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
             .execute_statefully(
                 &session,
@@ -3599,20 +3617,20 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let predecessor = ControlledReferenceCompletion::new();
         inject_stateful_completion(CoreReferenceCompletion::new(predecessor.clone()));
         let first_update =
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let first = compiled.execute_statefully(
             &session,
             (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(first_update)),
         );
         let second_update =
-            Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let second = compiled.execute_statefully(
             &session,
             (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(second_update)),
@@ -3647,12 +3665,13 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let completion = ControlledReferenceCompletion::new();
         inject_stateful_completion(CoreReferenceCompletion::new(completion.clone()));
-        let update = Array::from_host_buffer(&session, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update =
+            Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         drop(compiled.execute_statefully(
             &session,
             (Value::Reference(Reference::new(reference.clone(), session.clone())), Value::Array(update)),

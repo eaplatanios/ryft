@@ -245,7 +245,7 @@ fn array(session: &Session, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, m
             ((2.0 * unit - 1.0) * scale).to_ne_bytes()
         })
         .collect::<Vec<_>>();
-    Array::from_host_buffer(session, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
+    Array::from_host_buffer(session, replicated_array_type(mesh, shape), mesh.clone(), None, bytes.as_slice()).unwrap()
 }
 
 /// Returns the values of `array`.

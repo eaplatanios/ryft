@@ -348,7 +348,7 @@ mod benchmark {
         /// Uploads `bytes` as a replicated array of type `data_type` and shape `dimensions`.
         fn upload(&self, data_type: DataType, dimensions: &[usize], bytes: &[u8]) -> BenchmarkResult<Array> {
             let r#type = ArrayType::new_static(data_type, dimensions.to_vec()).replicated(&self.mesh)?;
-            Ok(Array::from_host_buffer(self.session, r#type, self.mesh.clone(), bytes)?)
+            Ok(Array::from_host_buffer(self.session, r#type, self.mesh.clone(), None, bytes)?)
         }
 
         /// Uploads a deterministic uniform `f32` parameter of shape `dimensions`.
