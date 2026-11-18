@@ -1084,16 +1084,16 @@ impl Session {
                 return Err(ExecutionError::MissingDeviceOrderedEffect.into());
             }
         }
-        let device = ordered.then(|| arguments.addressable_device_ids().to_vec());
+        let ordered_devices = ordered.then(|| arguments.addressable_device_ids().to_vec());
         let mut reservation =
-            if program.signature().has_effects() { Some(self.effect_scope().reserve(device)?) } else { None };
+            if program.signature().has_effects() { Some(self.effect_scope().reserve(ordered_devices)?) } else { None };
         if let Some(reservation) = &reservation
             && ordered
         {
-            let predecessor = reservation
-                .predecessor_carrier()
+            let predecessor_tokens = reservation
+                .wait_for_predecessor_tokens()
                 .map_err(|reason| Error::Execution(ExecutionError::AsynchronousFailure { reason }))?;
-            let tokens = match predecessor {
+            let tokens = match predecessor_tokens {
                 Some(tokens) => tokens,
                 None => {
                     let client = self.client();
@@ -1112,8 +1112,8 @@ impl Session {
                             selected.default_memory()?,
                         )?;
                         let token = manager.retrieve_buffer(0)?;
-                        // Only the initial creation of empty tokens is awaited. Predecessor carriers remain pending
-                        // inputs.
+                        // Only the initial creation of empty tokens is awaited. Predecessor token buffers can be used
+                        // as pending inputs.
                         manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true)?.r#await()?;
                         tokens.push(Arc::new(token));
                     }
@@ -1163,7 +1163,7 @@ impl Session {
                 let complete = reservation.publish(Err(Arc::clone(&reason)));
                 fence.on_ready(move |_| complete(Err(reason)));
             } else {
-                let carrier = if ordered {
+                let tokens = if ordered {
                     Some(
                         device_outputs
                             .iter_mut()
@@ -1175,7 +1175,7 @@ impl Session {
                 } else {
                     None
                 };
-                let complete = reservation.publish(Ok(carrier));
+                let complete = reservation.publish(Ok(tokens));
                 // As above, the fence callback owns the published completion for its whole asynchronous lifetime.
                 fence.on_ready(move |result| complete(result.map_err(|error| Arc::from(error.to_string()))));
             }

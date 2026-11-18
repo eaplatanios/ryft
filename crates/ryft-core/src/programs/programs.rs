@@ -6075,7 +6075,7 @@ mod tests {
             assert_eq!(liveness.used_region_inputs(0, &[true]), Err(expected));
         }
 
-        // Querying a valid static region must still validate the inferred boundary of a nonqueried sibling.
+        // Querying a valid static region must still validate the inferred boundary of a non-queried sibling.
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let single =

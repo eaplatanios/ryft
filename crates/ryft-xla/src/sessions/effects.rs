@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex};
 
 use ryft_core::DeviceId;
@@ -6,32 +7,33 @@ use ryft_pjrt::Buffer;
 
 use crate::{Error, ExecutionError};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Tracks executions with effects and keeps ordered I/O in submission order.
-///
-/// Cloning a [`Session`](crate::Session) shares its effect scope. Use
-/// [`Session::with_new_effect_scope`](crate::Session::with_new_effect_scope) to give a handle independent ordering and
-/// completion tracking. The same compiled program can run in either scope.
-///
-/// Each execution with effects reserves a place in the scope before dispatch. Ordered executions pass device tokens
-/// from one execution to the next, preserving effect order even when device work runs asynchronously. The scope also
-/// tracks completion of unordered executions.
-///
-/// [`Self::barrier`] waits for work already reserved when the barrier starts and reports failures in submission
-/// order. [`Self::acknowledge`] clears reported failures once the affected work has completed.
+/// Tracks executions with effects and keeps ordered I/O in reservation order. Cloning a [`Session`](crate::Session)
+/// shares its effect scope. Use [`Session::with_new_effect_scope`](crate::Session::with_new_effect_scope) to give a
+/// handle independent ordering and completion tracking. The same compiled program can run in either scope. Each
+/// execution with effects reserves a place in the scope before dispatch. Ordered executions pass device tokens from
+/// one execution to the next, preserving effect order even when device work runs asynchronously. The scope also tracks
+/// completion of unordered executions. [`Self::barrier`] waits for work already reserved when the barrier takes its
+/// snapshot and reports failures in reservation order. [`Self::acknowledge`] clears reported failures once the
+/// affected work has completed.
 #[derive(Default)]
-pub(crate) struct EffectScope {
+pub(super) struct EffectScope {
     /// Reservation, observation, and recovery state, which is never held across PJRT calls or device waits.
     state: Mutex<EffectScopeState>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl EffectScope {
-    /// Reserves a position and snapshots the predecessor atomically before releasing the scope mutex.
-    pub(crate) fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation, Error> {
+    /// Reserves an execution and captures its predecessor while holding the scope mutex.
+    ///
+    /// Use [`None`] for `ordered_devices` to track completion only. A device list joins the ordered I/O chain.
+    /// The first ordered reservation selects the list, and later reservations must match it in the same order.
+    /// Once an ordered execution records a failure, further ordered reservations require
+    /// [acknowledgment](Self::acknowledge).
+    pub(crate) fn reserve(&self, ordered_devices: Option<Vec<DeviceId>>) -> Result<EffectReservation, Error> {
         ensure_effect_dispatch_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
-        if device.is_some()
+        if ordered_devices.is_some()
             && state
                 .submissions
                 .iter()
@@ -39,25 +41,27 @@ impl EffectScope {
         {
             return Err(ExecutionError::ScopeNeedsRecovery.into());
         }
-        if let Some(device) = &device {
-            if let Some(previous) = &state.device
-                && previous != device
+        if let Some(devices) = &ordered_devices {
+            if let Some(previous) = &state.ordered_devices
+                && previous != devices
             {
-                return Err(
-                    ExecutionError::ScopeDeviceMismatch { expected: previous.clone(), actual: device.clone() }.into()
-                );
+                return Err(ExecutionError::ScopeDeviceMismatch {
+                    expected: previous.clone(),
+                    actual: devices.clone(),
+                }
+                .into());
             }
-            state.device = Some(device.clone());
+            state.ordered_devices = Some(devices.clone());
         }
         let submission = Arc::new(EffectSubmission {
             identity: state.next_identity,
-            ordered: device.is_some(),
+            ordered: ordered_devices.is_some(),
             completion: Arc::new(EffectCompletion::default()),
-            carrier: Mutex::new(EffectCarrier::Pending),
-            published: Condvar::new(),
+            publication: Mutex::new(EffectTokenPublication::Pending),
+            publication_ready: Condvar::new(),
         });
         state.next_identity += 1;
-        let predecessor = if device.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
+        let predecessor = if ordered_devices.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
         let mut retired = Vec::new();
         state.submissions.retain(|submission| {
             if matches!(submission.completion.result(), Some(Ok(()))) {
@@ -70,10 +74,10 @@ impl EffectScope {
         state.submissions.push(Arc::clone(&submission));
         drop(state);
         drop(retired);
-        Ok(EffectReservation { submission, predecessor, published: false })
+        Ok(EffectReservation { submission, predecessor, committed: false })
     }
 
-    /// Waits for a fixed snapshot and reports its failures in submission order.
+    /// Waits for the executions in a snapshot of existing reservations and reports failures in reservation order.
     pub(super) fn barrier(&self) -> Result<(), Error> {
         ensure_effect_dispatch_allowed()?;
         let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
@@ -106,7 +110,9 @@ impl EffectScope {
         Err(ExecutionError::EffectSubmissionFailures { failures }.into())
     }
 
-    /// Clears only observed failures after affected invocations have completed, without waiting.
+    /// Clears failures reported by a barrier without waiting for execution. Every failure must have been reported.
+    /// When there is an ordered failure, all ordered work must finish before acknowledgment can reset the chain and
+    /// its device assignment. Pending unordered work remains tracked.
     pub(super) fn acknowledge(&self) -> Result<(), Error> {
         ensure_effect_dispatch_allowed()?;
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
@@ -130,7 +136,7 @@ impl EffectScope {
             .collect::<HashSet<_>>();
         let retired_tail = if ordered_failure { state.tail.take() } else { None };
         if ordered_failure {
-            state.device = None;
+            state.ordered_devices = None;
         }
         let mut retired = Vec::new();
         state.submissions.retain(|submission| {
@@ -149,50 +155,72 @@ impl EffectScope {
     }
 }
 
+/// Scope metadata protected by the [`EffectScope`]'s mutex. Completion callbacks retain their submission's
+/// [`EffectCompletion`] independently of this state.
+#[derive(Default)]
+struct EffectScopeState {
+    /// Identity of the next reserved invocation.
+    next_identity: u64,
+
+    /// Latest ordered invocation, retained even after its successful completion is retired.
+    tail: Option<Arc<EffectSubmission>>,
+
+    /// Outstanding invocations and unacknowledged failures, in reservation order.
+    submissions: Vec<Arc<EffectSubmission>>,
+
+    /// Failures reported by completed barriers.
+    observed: HashSet<u64>,
+
+    /// Device list in token order for the current ordered chain. Acknowledging an ordered failure clears the list.
+    ordered_devices: Option<Vec<DeviceId>>,
+}
+
 /// Reservation for an execution with effects. Dropping an uncommitted reservation cancels it and lets its successors
-/// inherit its predecessor's carrier. Cancellation can proceed without waiting for the predecessor to publish.
+/// follow its predecessor's token publication. Cancellation can proceed without waiting for the predecessor.
 pub(crate) struct EffectReservation {
     /// Invocation being prepared or published.
     submission: Arc<EffectSubmission>,
 
-    /// Predecessor whose carrier will be forwarded if submission fails before handoff.
+    /// Predecessor whose token publication successors will follow if this reservation is cancelled.
     predecessor: Option<Arc<EffectSubmission>>,
 
-    /// Whether device work and its carrier have been published.
-    published: bool,
+    /// Whether the caller has committed the reservation and disarmed cancellation on drop.
+    committed: bool,
 }
 
 impl EffectReservation {
-    /// Waits for the predecessor of this reservation to publish and returns its ordered carrier, which this submission
-    /// must consume. Returns [`None`] when the reservation has no predecessor or the predecessor carries no tokens.
-    pub(crate) fn predecessor_carrier(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
-        self.predecessor.as_ref().map_or(Ok(None), |previous| previous.carrier())
+    /// Waits for the predecessor's token publication on the host, following any cancelled reservations. Use the
+    /// returned token buffers as inputs even if they are still pending on their devices. Returns [`None`] when there
+    /// are no predecessor tokens and propagates any failure published by the predecessor.
+    pub(crate) fn wait_for_predecessor_tokens(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
+        self.predecessor.as_ref().map_or(Ok(None), |previous| previous.wait_for_tokens())
     }
 
-    /// Publishes the ordered carrier or the boundary failure of this submission to its successors. The returned
-    /// callback owns the completion state. Call it once the submitted device work finishes.
+    /// Publishes this submission's ordered I/O token buffers or its execution boundary failure to its successors.
+    /// Pass `Ok(None)` for a successful submission without ordered tokens. The returned callback owns the completion
+    /// state. Call it once the submitted device work finishes.
     pub(crate) fn publish(
         &self,
-        carrier: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
+        tokens: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
     ) -> impl FnOnce(Result<(), Arc<str>>) + Send + 'static + use<> {
-        self.submission.publish(carrier);
+        self.submission.publish(tokens);
         let completion = Arc::clone(&self.submission.completion);
         move |result| completion.complete(result)
     }
 
-    /// Marks this reservation as published, so that dropping it no longer cancels its submission.
+    /// Disarms cancellation on drop. Call this after publishing the submission and registering its completion callback.
     pub(crate) fn commit(&mut self) {
-        self.published = true;
+        self.committed = true;
     }
 }
 
 impl Drop for EffectReservation {
     fn drop(&mut self) {
-        if !self.published {
+        if !self.committed {
             // Cancellation must not wait, because the predecessor may still be prepared on this same calling thread.
-            *self.submission.carrier.lock().expect("effect publication mutex poisoned") =
-                EffectCarrier::Forward(self.predecessor.take());
-            self.submission.published.notify_all();
+            *self.submission.publication.lock().expect("effect publication mutex poisoned") =
+                EffectTokenPublication::Forward(self.predecessor.take());
+            self.submission.publication_ready.notify_all();
             self.submission.completion.complete(Ok(()));
         }
     }
@@ -204,14 +232,19 @@ thread_local! {
     static EFFECT_CALLBACK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Restores managed callback depth even when a callback returns an error or unwinds.
-pub(crate) struct EffectCallbackGuard;
+/// Tracks a managed callback on the thread that entered it. Dropping the guard restores the thread's callback depth,
+/// including when the callback returns an error or unwinds.
+pub(crate) struct EffectCallbackGuard {
+    /// Keeps the guard on the thread whose callback depth it will restore.
+    marker: PhantomData<*mut ()>,
+}
 
 impl EffectCallbackGuard {
-    /// Enters a managed callback, preventing reentrant submission and barriers on its PJRT thread.
+    /// Marks the current thread as inside a managed callback. Keep the guard alive for the duration of the callback
+    /// to prevent reentrant execution, barriers, and acknowledgment on that thread.
     pub(crate) fn enter() -> Self {
         EFFECT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        Self
+        Self { marker: PhantomData }
     }
 }
 
@@ -276,21 +309,21 @@ impl EffectCompletion {
     }
 }
 
-/// Host publication state for an effect carrier, including cancellation forwarding without a host wait.
+/// Host publication state for a submission's per-device ordered I/O token buffers.
 #[derive(Clone, Default)]
-enum EffectCarrier {
-    /// The invocation has not published its physical result yet.
+enum EffectTokenPublication {
+    /// The submission is still preparing its publication.
     #[default]
     Pending,
 
-    /// The invocation published its physical result or submission failure.
+    /// The submission published its token buffers, a result without tokens, or a failure at the execution boundary.
     Published(Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>),
 
-    /// Preparation was cancelled, so successors inherit the eventual carrier of the preceding invocation.
+    /// The reservation was cancelled, so successors follow its predecessor's publication.
     Forward(Option<Arc<EffectSubmission>>),
 }
 
-/// One reserved invocation. Carrier ownership remains tied to the client lifetime through ordinary buffers.
+/// One reserved execution with effects. Its ordered I/O tokens are stored as PJRT buffers.
 struct EffectSubmission {
     /// Monotonically increasing submission identity, local to its scope.
     identity: u64,
@@ -301,40 +334,43 @@ struct EffectSubmission {
     /// State without buffers that the completion observer retains.
     completion: Arc<EffectCompletion>,
 
-    /// Physical carrier publication or nonblocking forwarding of a cancelled reservation.
-    carrier: Mutex<EffectCarrier>,
+    /// Token publication or forwarding link for a cancelled reservation.
+    publication: Mutex<EffectTokenPublication>,
 
-    /// Wakes submitting threads once the predecessor's physical result is available.
-    published: Condvar,
+    /// Wakes successors when this submission publishes a result or forwards its predecessor.
+    publication_ready: Condvar,
 }
 
 impl EffectSubmission {
-    /// Waits only for host publication, following cancelled reservations without recursion or device waits.
-    pub(super) fn carrier(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
-        let mut carrier = self.publication();
+    /// Waits for token publication on the host and follows cancelled reservations iteratively. The returned buffers
+    /// may still be pending on their devices.
+    fn wait_for_tokens(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
+        let mut publication = self.wait_for_publication();
         loop {
-            match carrier {
-                EffectCarrier::Published(result) => return result,
-                EffectCarrier::Forward(None) => return Ok(None),
-                EffectCarrier::Forward(Some(predecessor)) => carrier = predecessor.publication(),
-                EffectCarrier::Pending => unreachable!("publication waits for a terminal host state"),
+            match publication {
+                EffectTokenPublication::Pending => unreachable!("publication waits for a terminal host state"),
+                EffectTokenPublication::Published(result) => return result,
+                EffectTokenPublication::Forward(None) => return Ok(None),
+                EffectTokenPublication::Forward(Some(predecessor)) => publication = predecessor.wait_for_publication(),
             }
         }
     }
 
-    /// Publishes a carrier after execution handoff, or forwards the predecessor after a cancelled submission.
-    pub(super) fn publish(&self, carrier: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>) {
-        *self.carrier.lock().expect("effect publication mutex poisoned") = EffectCarrier::Published(carrier);
-        self.published.notify_all();
+    /// Publishes this submission's token result or failure after execution handoff and wakes its successors.
+    fn publish(&self, tokens: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>) {
+        *self.publication.lock().expect("effect publication mutex poisoned") =
+            EffectTokenPublication::Published(tokens);
+        self.publication_ready.notify_all();
     }
 
-    /// Waits for this reservation's publication state, without following forwarding links under its mutex.
-    fn publication(&self) -> EffectCarrier {
-        let mut carrier = self.carrier.lock().expect("effect publication mutex poisoned");
-        while matches!(*carrier, EffectCarrier::Pending) {
-            carrier = self.published.wait(carrier).expect("effect publication mutex poisoned");
+    /// Waits for this submission to publish or provide a forwarding link. The caller can follow the link after the
+    /// function releases the mutex.
+    fn wait_for_publication(&self) -> EffectTokenPublication {
+        let mut publication = self.publication.lock().expect("effect publication mutex poisoned");
+        while matches!(*publication, EffectTokenPublication::Pending) {
+            publication = self.publication_ready.wait(publication).expect("effect publication mutex poisoned");
         }
-        carrier.clone()
+        publication.clone()
     }
 }
 
@@ -342,35 +378,17 @@ impl Drop for EffectSubmission {
     fn drop(&mut self) {
         // Cancelled reservations can form a long forwarding chain. Detach uniquely owned links before dropping
         // each node so scope teardown does not consume one stack frame per cancelled submission.
-        let mut carrier = std::mem::take(self.carrier.get_mut().expect("effect publication mutex poisoned"));
-        while let EffectCarrier::Forward(Some(predecessor)) = carrier {
+        let mut publication = std::mem::take(self.publication.get_mut().expect("effect publication mutex poisoned"));
+        while let EffectTokenPublication::Forward(Some(predecessor)) = publication {
             match Arc::try_unwrap(predecessor) {
                 Ok(mut predecessor) => {
-                    carrier = std::mem::take(predecessor.carrier.get_mut().expect("effect publication mutex poisoned"));
+                    publication =
+                        std::mem::take(predecessor.publication.get_mut().expect("effect publication mutex poisoned"));
                 }
                 Err(_) => break,
             }
         }
     }
-}
-
-/// Synchronized scope metadata. Callbacks never acquire this mutex or own this state.
-#[derive(Default)]
-struct EffectScopeState {
-    /// Identity of the next reserved invocation.
-    next_identity: u64,
-
-    /// Latest ordered invocation, retained even after its successful completion is retired.
-    tail: Option<Arc<EffectSubmission>>,
-
-    /// Outstanding invocations and unacknowledged failures, in reservation order.
-    submissions: Vec<Arc<EffectSubmission>>,
-
-    /// Failures reported by completed barriers.
-    observed: HashSet<u64>,
-
-    /// Ordered device assignment selected by the chain. Changing it requires a new scope.
-    device: Option<Vec<DeviceId>>,
 }
 
 #[cfg(test)]
@@ -420,17 +438,15 @@ mod tests {
                 )
                 .unwrap();
             let mut predecessor = session.effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-            predecessor.submission.completion.complete(Ok(()));
-            predecessor.published = true;
+            let complete = predecessor.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+            complete(Ok(()));
+            predecessor.commit();
             manager
         });
         let tail_pending = || {
-            !session.effect_scope().state.lock().unwrap().tail.as_ref().unwrap().carrier().unwrap().unwrap()[0]
-                .ready()
-                .unwrap()
-                .ready()
-                .unwrap()
+            let state = session.effect_scope().state.lock().unwrap();
+            let tokens = state.tail.as_ref().unwrap().wait_for_tokens().unwrap().unwrap();
+            !tokens[0].ready().unwrap().ready().unwrap()
         };
         let ((first_pending, second_pending), lines) = with_captured_prints(|| {
             drop(first.print("first").unwrap());
@@ -505,9 +521,9 @@ mod tests {
                 )
                 .unwrap();
             let mut predecessor = session.effect_scope().reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-            predecessor.submission.completion.complete(Ok(()));
-            predecessor.published = true;
+            let complete = predecessor.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+            complete(Ok(()));
+            predecessor.commit();
             manager
         });
         let ((), lines) = with_captured_prints(|| {
@@ -571,7 +587,7 @@ mod tests {
             assert!(predecessor_pending);
         });
         assert_eq!(cancelled.completion.result(), Some(Ok(())));
-        assert!(cancelled.carrier().unwrap().is_none());
+        assert!(cancelled.wait_for_tokens().unwrap().is_none());
         drop(unordered);
         scope.barrier().unwrap();
     }
@@ -597,7 +613,8 @@ mod tests {
     fn test_effect_scope_barrier_waits_for_fixed_snapshot() {
         let scope = EffectScope::default();
         let mut first = scope.reserve(None).unwrap();
-        first.published = true;
+        let complete = first.publish(Ok(None));
+        first.commit();
         let references = Arc::strong_count(&first.submission);
         std::thread::scope(|threads| {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -610,7 +627,7 @@ mod tests {
             }
             let captured = Arc::strong_count(&first.submission) > references;
             let later = scope.reserve(None).unwrap();
-            first.submission.completion.complete(Ok(()));
+            complete(Ok(()));
             let result = receiver.recv_timeout(Duration::from_secs(5));
             let later_pending = later.submission.completion.result().is_none();
             drop(later);
@@ -626,14 +643,14 @@ mod tests {
         let scope = EffectScope::default();
         let mut first = scope.reserve(Some(vec![0])).unwrap();
         let mut second = scope.reserve(Some(vec![0])).unwrap();
-        first.published = true;
-        second.published = true;
-        first.submission.publish(Ok(None));
-        second.submission.publish(Ok(None));
-        first.submission.completion.complete(Err(Arc::from("first effect failed")));
+        let complete_first = first.publish(Ok(None));
+        first.commit();
+        let complete_second = second.publish(Ok(None));
+        second.commit();
+        complete_first(Err(Arc::from("first effect failed")));
         assert!(matches!(scope.reserve(Some(vec![0])), Err(Error::Execution(ExecutionError::ScopeNeedsRecovery))));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
-        second.submission.completion.complete(Err(Arc::from("second effect failed")));
+        complete_second(Err(Arc::from("second effect failed")));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         let expected = concat!(
             "submission 0: first effect failed; submission 1: second effect failed; ",
@@ -661,10 +678,11 @@ mod tests {
     fn test_effect_scope_acknowledge_preserves_pending() {
         let scope = EffectScope::default();
         let mut pending = scope.reserve(None).unwrap();
-        pending.published = true;
+        let complete = pending.publish(Ok(None));
+        pending.commit();
         scope.acknowledge().unwrap();
         assert_eq!(scope.state.lock().unwrap().submissions.len(), 1);
-        pending.submission.completion.complete(Err(Arc::from("late completion failure")));
+        complete(Err(Arc::from("late completion failure")));
         assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         assert!(matches!(
             scope.barrier(),
@@ -676,10 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn test_effect_reservation_drop_forwards_predecessor_carrier() {
+    fn test_effect_reservation_drop_forwards_predecessor_publication() {
         let scope = EffectScope::default();
         let mut first = scope.reserve(Some(vec![0])).unwrap();
-        first.published = true;
         let second = scope.reserve(Some(vec![0])).unwrap();
         let third = scope.reserve(Some(vec![0])).unwrap();
         let final_submission = Arc::clone(&third.submission);
@@ -691,12 +708,14 @@ mod tests {
                 sender.send(()).unwrap();
             });
             let cancellation = receiver.recv_timeout(Duration::from_secs(5));
-            first.submission.publish(Err(Arc::from("predecessor publication failed")));
-            first.submission.completion.complete(Err(Arc::from("predecessor publication failed")));
+            let reason: Arc<str> = Arc::from("predecessor publication failed");
+            let complete = first.publish(Err(Arc::clone(&reason)));
+            first.commit();
+            complete(Err(reason));
             assert_eq!(cancellation, Ok(()));
         });
         assert!(matches!(
-            final_submission.carrier(),
+            final_submission.wait_for_tokens(),
             Err(reason) if reason.as_ref() == "predecessor publication failed",
         ));
         assert!(matches!(
@@ -741,7 +760,7 @@ mod tests {
             drop(scope.reserve(Some(vec![0])).unwrap());
         }
         let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
-        assert!(tail.carrier().unwrap().is_none());
+        assert!(tail.wait_for_tokens().unwrap().is_none());
         assert_eq!(tail.completion.result(), Some(Ok(())));
         scope.barrier().unwrap();
         drop(scope);
@@ -863,15 +882,14 @@ mod tests {
         let mut predecessor = scope
             .reserve(Some(devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect()))
             .unwrap();
-        predecessor
-            .submission
+        let complete = predecessor
             .publish(Ok(Some(managers.iter().map(|manager| Arc::new(manager.retrieve_buffer(0).unwrap())).collect())));
-        predecessor.submission.completion.complete(Ok(()));
-        predecessor.published = true;
+        complete(Ok(()));
+        predecessor.commit();
         managers[1].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
         let (independent, lines) = with_captured_prints(|| {
             session.execute_program(&program, vec![first]).unwrap();
-            let tokens = scope.state.lock().unwrap().tail.as_ref().unwrap().carrier().unwrap().unwrap();
+            let tokens = scope.state.lock().unwrap().tail.as_ref().unwrap().wait_for_tokens().unwrap().unwrap();
             let independent = std::thread::scope(|threads| {
                 let (sender, receiver) = std::sync::mpsc::channel();
                 threads.spawn(move || sender.send(tokens[1].ready().unwrap().r#await()).unwrap());
