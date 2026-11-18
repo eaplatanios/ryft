@@ -55,9 +55,11 @@ pub const MAX_RUNTIME_REQUIREMENTS_BYTES: usize = 1024 * 1024;
 /// NUL characters. Each provider defines the invocation contract of every ABI version it supports. Compiled programs
 /// retain only these requirements. The invoking [`Session`](crate::Session) resolves them through its configured
 /// [`RuntimeProvider`]s, so cached executables retain no producing session or initialized extensions.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeRequirement {
     /// Namespaced identity of the runtime contract.
+    #[serde(deserialize_with = "RuntimeRequirement::deserialize_identifier")]
     identifier: String,
 
     /// Version of the extension's invocation ABI.
@@ -84,36 +86,18 @@ impl RuntimeRequirement {
     pub fn abi_version(&self) -> u32 {
         self.abi_version
     }
-}
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<'de> Deserialize<'de> for RuntimeRequirement {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        /// Serialized fields validated through the public constructor.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Fields {
-            /// Namespaced identity to validate before publication.
-            identifier: String,
-
-            /// Version of the extension's invocation ABI.
-            abi_version: u32,
-
-            /// Legacy annotations and executables may contain an empty configuration. Non-empty values would
-            /// lose runtime setup data during conversion, so the decoder rejects them.
-            #[serde(default, rename = "configuration")]
-            _legacy_configuration: [u8; 0],
-        }
-
-        let fields = Fields::deserialize(deserializer)?;
-        Self::new(fields.identifier, fields.abi_version).map_err(serde::de::Error::custom)
+    /// Deserializes a runtime identifier and applies the same validation as [`Self::new`].
+    fn deserialize_identifier<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+        let identifier = String::deserialize(deserializer)?;
+        validate_identifier(&identifier).map_err(serde::de::Error::custom)?;
+        Ok(identifier)
     }
 }
 
-/// Sorts and deduplicates requirements, rejecting incompatible declarations for one identifier.
-pub fn normalize_runtime_requirements(
-    requirements: impl IntoIterator<Item = RuntimeRequirement>,
+/// Sorts and deduplicates the provided [`RuntimeRequirement`]s, rejecting incompatible declarations for one identifier.
+pub fn normalize_runtime_requirements<R: IntoIterator<Item = RuntimeRequirement>>(
+    requirements: R,
 ) -> Result<Vec<RuntimeRequirement>, Error> {
     let mut canonical = BTreeMap::new();
     for requirement in requirements {
@@ -132,39 +116,36 @@ pub fn normalize_runtime_requirements(
 /// Encoding version emitted by [`CustomCallOperationExtension::with_runtime_requirements`].
 const RUNTIME_REQUIREMENTS_ENCODING_VERSION: u32 = 1;
 
-/// XLA runtime requirement annotations on a [`CustomCallOperation`].
+/// XLA runtime requirement annotations for a [`CustomCallOperation`].
 pub trait CustomCallOperationExtension: Sized {
     /// Declares the native runtime contracts a custom call needs by encoding its [`RuntimeRequirement`]s in the
-    /// [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] for XLA lowering.
-    ///
-    /// Identical requirements deduplicate. An empty list skips annotation. XLA lowering consumes the annotation
-    /// and excludes it from the attributes passed to the native FFI handler.
+    /// [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] for XLA lowering. Identical requirements deduplicate. An empty list skips
+    /// annotation. XLA lowering consumes the annotation and excludes it from the attributes passed to the native
+    /// Foreign Function Interface (FFI) handler.
     ///
     /// # Errors
     ///
     /// Returns an error if the operation already has an annotation, if requirements conflict, or if the encoded
     /// annotation exceeds [`MAX_RUNTIME_REQUIREMENTS_BYTES`].
-    fn with_runtime_requirements(
+    fn with_runtime_requirements<R: IntoIterator<Item = RuntimeRequirement>>(
         self,
-        requirements: impl IntoIterator<Item = RuntimeRequirement>,
+        requirements: R,
     ) -> Result<Self, Error>;
 
     /// Reads and validates the [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] of a custom call and returns its canonical
     /// [`RuntimeRequirement`]s. Returns an empty list when the attribute is absent.
     ///
-    /// Earlier annotations can be read when their runtime configuration fields are empty.
-    ///
     /// # Errors
     ///
-    /// Returns an error for duplicate annotations, invalid or unsupported encodings, conflicting requirements, or
-    /// annotations that exceed [`MAX_RUNTIME_REQUIREMENTS_BYTES`].
+    /// Returns an error for duplicate annotations, invalid or unsupported encodings, conflicting requirements,
+    /// or annotations that exceed [`MAX_RUNTIME_REQUIREMENTS_BYTES`].
     fn runtime_requirements(&self) -> Result<Vec<RuntimeRequirement>, Error>;
 }
 
 impl CustomCallOperationExtension for CustomCallOperation {
-    fn with_runtime_requirements(
+    fn with_runtime_requirements<R: IntoIterator<Item = RuntimeRequirement>>(
         self,
-        requirements: impl IntoIterator<Item = RuntimeRequirement>,
+        requirements: R,
     ) -> Result<Self, Error> {
         /// Writer that stops serialization before an oversized annotation can allocate its complete encoded form.
         struct Annotation {
@@ -195,10 +176,12 @@ impl CustomCallOperationExtension for CustomCallOperation {
                 RuntimeError::InvalidRequirement { reason: "duplicate runtime-requirement annotation".into() }.into()
             );
         }
+
         let requirements = normalize_runtime_requirements(requirements)?;
         if requirements.is_empty() {
             return Ok(self);
         }
+
         let mut encoded = Annotation { bytes: Vec::new(), exceeded: false };
         if let Err(error) = serde_json::to_writer(&mut encoded, &(RUNTIME_REQUIREMENTS_ENCODING_VERSION, requirements))
         {
@@ -209,6 +192,7 @@ impl CustomCallOperationExtension for CustomCallOperation {
             }
             return Err(RuntimeError::InvalidRequirement { reason: error.to_string() }.into());
         }
+
         Ok(self.with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, String::from_utf8(encoded.bytes).unwrap()))
     }
 
@@ -217,22 +201,26 @@ impl CustomCallOperationExtension for CustomCallOperation {
         let Some((_, attribute)) = annotations.next() else {
             return Ok(Vec::new());
         };
+
         if annotations.next().is_some() {
             return Err(
                 RuntimeError::InvalidRequirement { reason: "duplicate runtime-requirement annotation".into() }.into()
             );
         }
+
         let CustomCallAttribute::String(encoded) = attribute else {
             return Err(RuntimeError::InvalidRequirement {
                 reason: "runtime requirements must be encoded as a string".into(),
             }
             .into());
         };
+
         if encoded.len() > MAX_RUNTIME_REQUIREMENTS_BYTES {
             return Err(Error::SizeLimitExceeded {
                 message: "runtime requirements exceed the metadata size limit".into(),
             });
         }
+
         let (version, requirements): (u32, Vec<RuntimeRequirement>) = serde_json::from_str(encoded)
             .map_err(|error| RuntimeError::InvalidRequirement { reason: error.to_string() })?;
         if version != RUNTIME_REQUIREMENTS_ENCODING_VERSION {
@@ -241,9 +229,12 @@ impl CustomCallOperationExtension for CustomCallOperation {
             }
             .into());
         }
+
         normalize_runtime_requirements(requirements)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns a deterministic native FFI type ID for the user data type called `name` that a provider owns.
 ///
@@ -933,13 +924,6 @@ mod tests {
                 .to_string(),
             "invalid runtime requirement: identifier must be non-empty and contain no NUL",
         );
-
-        // Older records can be converted when their configuration field carries no setup data.
-        let mut legacy = encoded;
-        legacy["configuration"] = serde_json::json!([]);
-        assert_eq!(serde_json::from_value::<RuntimeRequirement>(legacy.clone()).unwrap(), requirement);
-        legacy["configuration"] = serde_json::json!([1]);
-        assert!(serde_json::from_value::<RuntimeRequirement>(legacy).is_err());
     }
 
     #[test]
@@ -1018,20 +1002,6 @@ mod tests {
             annotated.runtime_requirements().unwrap(),
             vec![builtin_requirement("test.a"), RuntimeRequirement::new("test.b", 2).unwrap()],
         );
-
-        let legacy = call.clone().with_attribute(
-            RUNTIME_REQUIREMENTS_ATTRIBUTE,
-            r#"[1,[{"identifier":"test.a","abi_version":1,"configuration":[]}]]"#,
-        );
-        assert_eq!(legacy.runtime_requirements().unwrap(), vec![builtin_requirement("test.a")]);
-        let configured_legacy = call.clone().with_attribute(
-            RUNTIME_REQUIREMENTS_ATTRIBUTE,
-            r#"[1,[{"identifier":"test.a","abi_version":1,"configuration":[1]}]]"#,
-        );
-        assert!(matches!(
-            configured_legacy.runtime_requirements(),
-            Err(Error::Runtime(RuntimeError::InvalidRequirement { .. })),
-        ));
 
         // The annotation must be a JSON string with a supported encoding version.
         assert!(matches!(
