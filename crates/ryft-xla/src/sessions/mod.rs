@@ -115,9 +115,9 @@ pub mod targets;
 
 pub use platforms::Platform;
 pub use runtimes::{
-    ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension,
-    RuntimeExtensions, RuntimeProvider, RuntimeRequirement, named_ffi_type_id, normalize_runtime_requirements,
-    runtime_requirements, with_runtime_requirements,
+    CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, RUNTIME_REQUIREMENTS_ATTRIBUTE,
+    RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement,
+    normalize_runtime_requirements,
 };
 pub use targets::{Target, TargetDevice};
 

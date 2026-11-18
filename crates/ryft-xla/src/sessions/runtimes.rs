@@ -236,26 +236,6 @@ impl CustomCallOperationExtension for CustomCallOperation {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Returns a deterministic native FFI type ID for the user data type called `name` that a provider owns.
-///
-/// Registering a type with an explicit ID through [`Client::register_ffi_type`] is idempotent for the same name and
-/// ID, so providers can register on every initialization, and native handlers can look up their user data with the
-/// same constant. XLA assigns its own IDs sequentially starting from one, while every ID returned here lies in
-/// `[2^62, 2^63)`, so the two never collide. XLA does not reject one ID registered under two different names, so
-/// `name` should be namespaced (e.g., `"my_crate.runtime"`) to keep accidental collisions negligible.
-pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
-    // 64-bit FNV-1a, folded into the range that XLA's sequential type ID assignment never reaches.
-    let bytes = name.as_bytes();
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        index += 1;
-    }
-    FfiTypeId::new(((hash >> 2) | (1 << 62)) as i64)
-}
-
 /// Factory for one named runtime contract, configured before a session is constructed.
 ///
 /// Initialization receives the invoking client's target. Providers must validate their settings, the requested ABI,
@@ -264,7 +244,7 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 /// Reentry into an unfinished initializer is rejected. A nested initialization also cannot wait for another thread's
 /// initializer in the same session, which prevents dependency cycles between concurrent providers.
 ///
-/// Providers register native types with explicit IDs from [`named_ffi_type_id`] and handlers through PJRT during
+/// Providers register native types with explicit IDs from [`FfiTypeId::from_name`] and handlers through PJRT during
 /// initialization. Type registration is idempotent, and XLA accepts re-registration of an identical handler. Each
 /// session's providers can therefore register again without bookkeeping that is global to the process, while native
 /// handlers look up their user data with the same constant ID.
@@ -821,7 +801,7 @@ mod tests {
     use super::{
         CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES,
         RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
-        RuntimeRegistry, RuntimeRequirement, builtin_requirement, named_ffi_type_id, normalize_runtime_requirements,
+        RuntimeRegistry, RuntimeRequirement, builtin_requirement, normalize_runtime_requirements,
         validate_builtin_requirement,
     };
 
@@ -1036,22 +1016,6 @@ mod tests {
     }
 
     #[test]
-    fn test_named_ffi_type_id() {
-        const FIRST: FfiTypeId = named_ffi_type_id("test.runtime.first");
-        let second = named_ffi_type_id("test.runtime.second");
-        let empty = named_ffi_type_id("");
-
-        // Equal names produce equal IDs, including across compile-time and runtime evaluation.
-        assert_eq!(named_ffi_type_id("test.runtime.first"), FIRST);
-        assert_ne!(FIRST, second);
-
-        // The high range reserves all lower IDs for XLA's sequential allocation.
-        for id in [FIRST, second, empty] {
-            assert!(i64::from(id) >= 1 << 62);
-        }
-    }
-
-    #[test]
     fn test_runtime_extensions_new() {
         #[cfg(feature = "rocm")]
         let expected = vec!["ryft.assert", "ryft.kernel.cuda", "ryft.kernel.rocm", "ryft.ordered-io", "ryft.print"];
@@ -1137,7 +1101,7 @@ mod tests {
         let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         let mut resources = prepare_without_requirements(&registry);
         let name = "ryft.test.execution_resources";
-        let type_id = named_ffi_type_id(name);
+        let type_id = FfiTypeId::from_name(name);
         assert_eq!(client.register_ffi_type(name, type_id, FfiTypeInformation::new(None)).unwrap(), type_id);
         assert!(resources.context.is_none());
 

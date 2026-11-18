@@ -21,6 +21,24 @@ impl FfiTypeId {
         Self(type_id)
     }
 
+    /// Derives a deterministic explicit type ID from a name for
+    /// [`Client::register_ffi_type`](crate::Client::register_ffi_type). The same name yields the same ID, so
+    /// registration and native handlers can share a constant for looking up user data. These IDs occupy `[2^62, 2^63)`,
+    /// well above XLA's sequentially allocated IDs. Use a namespaced name (e.g., `"my_crate.runtime"`) to reduce the
+    /// risk of collisions with other explicitly assigned IDs.
+    pub const fn from_name(name: &str) -> Self {
+        // 64-bit FNV-1a, folded into the high positive range reserved by this constructor.
+        let bytes = name.as_bytes();
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut index = 0;
+        while index < bytes.len() {
+            hash ^= bytes[index] as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            index += 1;
+        }
+        Self::new(((hash >> 2) | (1 << 62)) as i64)
+    }
+
     /// Returns `true` if and only if this [`FfiTypeId`] is equal to [`FfiTypeId::UNKNOWN`].
     pub const fn is_unknown(self) -> bool {
         self.0 == 0
@@ -159,6 +177,15 @@ mod tests {
         assert!(!type_id.is_unknown());
         assert_eq!(unsafe { type_id.to_c_api() }.type_id, 42);
         assert!(FfiTypeId::UNKNOWN.is_unknown());
+    }
+
+    #[test]
+    fn test_ffi_type_id_from_name() {
+        const FIRST: FfiTypeId = FfiTypeId::from_name("test.runtime.first");
+        assert_eq!(FIRST, FfiTypeId::new(0x6587_5db4_72be_a0c3));
+        assert_eq!(FfiTypeId::from_name("test.runtime.first"), FIRST);
+        assert_eq!(FfiTypeId::from_name("test.runtime.second"), FfiTypeId::new(0x5178_6756_833a_2bb0));
+        assert_eq!(FfiTypeId::from_name(""), FfiTypeId::new(0x72fc_a739_2108_88c9));
     }
 
     #[test]
