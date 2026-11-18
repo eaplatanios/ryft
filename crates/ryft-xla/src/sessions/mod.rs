@@ -68,8 +68,8 @@
 //! their identities.
 //!
 //! Array readiness observes completion of the work that produced that array. [`Session::synchronize`] waits for
-//! computations and transfers across the session's handles, including work whose outputs were discarded.
-//! [`Session::effects_barrier`] observes and reports effects in the calling handle's scope for recovery with
+//! computations, their effects, and transfers across all handles of the session, even if their outputs were discarded.
+//! [`Session::effects_barrier`] waits for effects and reports failures in the calling handle's scope for recovery with
 //! [`Session::acknowledge_effect_errors`]. The client of a session lives for the rest of the process, as in JAX,
 //! so sessions and their values carry no lifetime and can be stored and moved across threads freely.
 
@@ -175,10 +175,11 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 ///
 /// Ordered I/O dependencies gate the successor computation's entire launch, including its pure work. The backend may
 /// execute inline or asynchronously. Use unordered printing when debugging code whose throughput matters and whose
-/// ordering does not. [`Self::effects_barrier`] also observes unordered I/O and local assertion failures, so it is
-/// broader than flushing prints. Call it before the process exits when its effects must be observed. Destruction of the
-/// last handle waits for launches borrowing extension resources before releasing those resources. Ordinary execution
-/// adds no implicit destruction barrier, and backend behavior with unfinished device work is specific to each plugin.
+/// ordering does not. Before the process exits, finish submitting work and call [`Self::synchronize`] to wait for
+/// registered work, including effects across all handles of the session. Use [`Self::effects_barrier`] to wait for
+/// effects in one scope and inspect its failures. Destruction of the last handle waits for launches borrowing
+/// extension resources before releasing those resources. Ordinary execution adds no implicit destruction barrier,
+/// and backend behavior with unfinished device work is specific to each plugin.
 ///
 /// Custom calls and prints declaring [`EffectClass::DeviceOrderedIo`] may execute separately on each device inside
 /// manual computation regions on CPU, while occurrences of [`EffectClass::OrderedIo`] keep the program on one device.
@@ -196,7 +197,7 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// let session = Session::builder().platform(Platform::Cpu).build()?;
 /// let value = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F64), None, None, 1.0f64.to_ne_bytes())?;
 /// value.print("value");
-/// session.effects_barrier()?;
+/// session.synchronize()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -208,7 +209,7 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// fn escaped(client: ryft_pjrt::Client<'_>) {
 ///     let session = Session::builder().client(&client).build().unwrap();
 ///     drop(client);
-///     session.effects_barrier().unwrap();
+///     session.synchronize().unwrap();
 /// }
 /// ```
 pub struct Session {
@@ -382,15 +383,16 @@ impl Session {
     }
 
     /// Blocks until the work registered with this session when the call takes its snapshot has finished. This includes
-    /// compiled executions and array transfers that Ryft issues on the calling process, across all handles of the
-    /// session, including handles with independent effect scopes. Later registrations are handled by a subsequent
-    /// synchronization. Cross-host transfers may still need another process to issue a matching operation.
+    /// compiled executions, their effects, and array transfers that Ryft issues on the calling process. It covers all
+    /// handles of the session, including handles with independent effect scopes. Later registrations are handled by a
+    /// subsequent synchronization. Cross-host transfers may still need another process to issue a matching operation.
     /// Independently built sessions have their own tracker even when they use the same PJRT client. Direct PJRT
     /// submissions, imported buffer readiness, and standalone shard readbacks use their own completion APIs.
     ///
-    /// Use this function to wait for a batch of submissions or before shutting down the session. Recover from an
-    /// ordered I/O failure with [`Self::effects_barrier`] and [`Self::acknowledge_effect_errors`] on the affected
-    /// scope.
+    /// Use this function to wait for a batch of submissions. At process exit, finish submitting work and call it
+    /// once per independently built session to wait for all of its registered work. To inspect failures in one
+    /// effect scope, use [`Self::effects_barrier`] on that scope. Its report is required before recovery with
+    /// [`Self::acknowledge_effect_errors`].
     ///
     /// # Errors
     ///
@@ -406,10 +408,11 @@ impl Session {
     }
 
     /// Waits for the executions already reserved in this handle's effect scope to finish or be canceled. This includes
-    /// ordered and unordered I/O, local assertions, and submissions still being prepared. Call this function before
-    /// exiting the process or whenever the host needs those effects to finish, even if there are no output arrays to
-    /// wait on. A subsequent barrier covers later reservations. Handles created with [`Self::with_new_effect_scope`]
-    /// have independent barriers.
+    /// ordered and unordered I/O, local assertions, and submissions still being prepared. Use this function when
+    /// the host needs those effects to finish, even if there are no output arrays to wait on. A subsequent barrier
+    /// covers later reservations. Handles created with [`Self::with_new_effect_scope`] have independent barriers.
+    /// For process exit, [`Self::synchronize`] waits for all registered session work and its effects after submissions
+    /// have stopped.
     ///
     /// If ordered I/O fails, inspect the failures reported by this function, then call
     /// [`Self::acknowledge_effect_errors`] on the same scope before resuming ordered submissions.
@@ -424,30 +427,29 @@ impl Session {
         self.effect_scope.barrier()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Clears completed failures from this handle's effect scope after [`Self::effects_barrier`] has reported them.
     /// To recover from an ordered I/O failure, first call the barrier on the same scope and inspect the failures it
     /// returns. Then call this function to clear them and reset the failed ordered chain. After acknowledgment
     /// succeeds, the next ordered submission starts a new chain with fresh tokens.
     ///
-    /// Existing arrays and executions retain their errors. Account for any effects or reference mutations that
-    /// already occurred before retrying the failed execution.
+    /// Existing arrays and executions retain their errors. Account for any effects or reference mutations that already
+    /// occurred before retrying the failed execution.
     ///
     /// # Errors
     ///
-    /// Returns [`PrematureAcknowledgment`](crate::ExecutionError::PrematureAcknowledgment) if a recorded failure
-    /// has yet to be reported or if the scope has both a recorded ordered failure and pending ordered work.
-    /// This can happen even after [`Self::effects_barrier`] returns. The barrier waits for the reservations in its
-    /// snapshot. Work reserved afterward can fail before acknowledgment and still need to be reported, or later
-    /// ordered work can still be pending when the barrier reports an earlier ordered failure. Call the barrier
-    /// again on the same scope and retry acknowledgment.
-    ///
-    /// Returns [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
+    /// Returns [`PrematureAcknowledgment`](crate::ExecutionError::PrematureAcknowledgment) if a recorded failure has
+    /// yet to be reported or if the scope has both a recorded ordered failure and pending ordered work. This can happen
+    /// even after [`Self::effects_barrier`] returns. The barrier waits for the reservations in its snapshot. Work
+    /// reserved afterward can fail before acknowledgment and still need to be reported, or later ordered work can still
+    /// be pending when the barrier reports an earlier ordered failure. Call the barrier again on the same scope and
+    /// retry acknowledgment. Returns [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a
+    /// managed effect callback.
     #[inline]
     pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.effect_scope.acknowledge()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Reserves a place in this handle's effect scope before submitting a program with effects to PJRT. The
     /// reservation is visible to [`Self::effects_barrier`] during submission setup.
@@ -1604,8 +1606,8 @@ pub(crate) mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, KernelCompilerBinding, Options, stage_kernel};
     use crate::{
-        CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt, JitCallOperation,
-        ProgramBuilder, Reference, jit,
+        CompileTracer, CompiledFunctionDispatcher, DevicePutTarget, Dimension, ExecutionError, FlatProgram, FromPjrt,
+        JitCallOperation, ProgramBuilder, Reference, jit,
     };
 
     use super::*;
@@ -2077,6 +2079,40 @@ pub(crate) mod tests {
 
         let _callback = EffectCallbackGuard::enter();
         assert!(matches!(session.synchronize(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
+    }
+
+    #[test]
+    fn test_session_synchronize_tracks_execution_and_transfers() {
+        let client = cpu_client(2);
+        let session = session_with_client(client);
+        let mesh = domain_mesh(client, "x", 2);
+        let (source_mesh, _) = DevicePutTarget::device(mesh.devices()[0]).resolve(1).unwrap();
+        let scoped = session.with_new_effect_scope().with_device_mesh(source_mesh);
+
+        let input = Array::from_host_buffer(
+            &scoped,
+            ArrayType::new_static(DataType::F32, [2]),
+            None,
+            None,
+            values_to_bytes(&[1.0f32, 2.0]),
+        )
+        .unwrap();
+        assert_eq!(session.state.work.snapshot(), 1);
+
+        let output = Neg::neg(&input).unwrap();
+        assert_eq!(session.state.work.snapshot(), 2);
+
+        let placed = output.into_placement(&scoped, DevicePutTarget::device(mesh.devices()[1])).unwrap();
+        assert_eq!(session.state.work.snapshot(), 3);
+
+        let copy = placed.begin_copy_to_host().unwrap();
+        assert_eq!(session.state.work.snapshot(), 4);
+        drop((input, placed));
+
+        // The original handle can wait for the submissions made through the scoped handle.
+        session.synchronize().unwrap();
+        assert!(session.state.work.lock().pending.is_empty());
+        assert_eq!(copy.finish().unwrap(), values_to_bytes(&[-1.0f32, -2.0]));
     }
 
     #[test]
