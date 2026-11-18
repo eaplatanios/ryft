@@ -1,23 +1,18 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ryft_pjrt::{Buffer, Error as PjrtError, Event, ExecutionFence};
 
 use crate::{Error, ExecutionError};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Tracks submissions from the moment they are registered until they complete. An owner registers each submission
-/// before its first native enqueue, so a wait over a snapshot of the registered identities also covers submissions
-/// that are still being prepared. Successful submissions are retired as soon as they complete, while failures are
-/// kept in registration order until the owner removes them.
-///
-/// A [`Session`](crate::Session) owns one tracker for the work of all of its handles and reports each failure once.
-/// Each [`EffectScope`](crate::sessions::effects::EffectScope) owns another one for its executions with effects and
-/// keeps their failures until they are acknowledged. `T` is a tag that the owner stores with each submission, and `E`
-/// is the failure that a submission may record.
+/// before its first native enqueue, so a wait over a snapshot of the registered identities also covers submissions that
+/// are still being prepared. Successful submissions are retired as soon as they complete, while failures are kept in
+/// registration order until the owner removes them. A [`Session`](crate::Session) owns one tracker for the work of all
+/// of its handles and reports each failure once. Each [`EffectScope`](crate::sessions::effects::EffectScope) owns
+/// another one for its executions with effects and keeps their failures until they are acknowledged. `T` is a tag
+/// that the owner stores with each submission, and `E` is the failure that a submission may record.
 pub(super) struct WorkTracker<T, E> {
     /// Registration order, pending submissions, and failures that the owner has yet to remove.
     state: Mutex<WorkTrackerState<T, E>>,
@@ -28,18 +23,14 @@ pub(super) struct WorkTracker<T, E> {
 
 impl<T, E> WorkTracker<T, E> {
     /// Registers a submission with the provided `tag` and returns its identity. The submission stays pending until
-    /// [`Self::complete`] has been called once for it and once for each dependency that was added to it.
+    /// [`Self::complete`] has been called as many times as it has outstanding completion notifications, which is
+    /// once for a newly registered submission.
     pub(super) fn register(&self, tag: T) -> u64 {
         let mut state = self.lock();
         let identity = state.next_identity;
         state.next_identity += 1;
         state.pending.insert(identity, PendingWork { tag, remaining: 1, error: None });
         identity
-    }
-
-    /// Records a copy that the pending submission `identity` will observe through its own event callback.
-    fn add_dependency(&self, identity: u64) {
-        self.lock().pending.get_mut(&identity).unwrap().remaining += 1;
     }
 
     /// Records the result of one completion notification of the submission `identity`, keeping the first failure,
@@ -50,20 +41,25 @@ impl<T, E> WorkTracker<T, E> {
         let Entry::Occupied(mut entry) = state.pending.entry(identity) else {
             return;
         };
+
         let pending = entry.get_mut();
         if pending.error.is_none() {
             pending.error = error;
         }
+
         pending.remaining -= 1;
         if pending.remaining != 0 {
             return;
         }
+
         let PendingWork { tag, error, .. } = entry.remove();
         if let Some(error) = error {
             state.failures.insert(identity, (tag, error));
         }
+
         // Publish the result before waking any waiting callers.
         drop(state);
+
         self.completed.notify_all();
     }
 
@@ -114,6 +110,7 @@ impl WorkTracker<(), Error> {
         let mut state = self.wait(end);
         let later_failures = state.failures.split_off(&end);
         let failures = std::mem::replace(&mut state.failures, later_failures);
+
         // Convert errors after releasing the tracker mutex.
         drop(state);
 
@@ -129,6 +126,24 @@ impl WorkTracker<(), Error> {
 impl<T, E> Default for WorkTracker<T, E> {
     fn default() -> Self {
         Self { state: Mutex::new(WorkTrackerState::default()), completed: Condvar::new() }
+    }
+}
+
+/// Identities and results of the submissions of a [`WorkTracker`].
+pub(super) struct WorkTrackerState<T, E> {
+    /// Identity to use for the next registration.
+    pub(super) next_identity: u64,
+
+    /// Submissions that still have work to publish or finish.
+    pub(super) pending: BTreeMap<u64, PendingWork<T, E>>,
+
+    /// Failures of completed submissions, with the tags of those submissions, that the owner has yet to remove.
+    pub(super) failures: BTreeMap<u64, (T, E)>,
+}
+
+impl<T, E> Default for WorkTrackerState<T, E> {
+    fn default() -> Self {
+        Self { next_identity: 0, pending: BTreeMap::new(), failures: BTreeMap::new() }
     }
 }
 
@@ -161,7 +176,7 @@ impl WorkReservation {
     }
 
     /// Tracks native send or transfer events.
-    pub(crate) fn track_events(&mut self, events: impl IntoIterator<Item = Event<()>>) {
+    pub(crate) fn track_events<E: IntoIterator<Item = Event<()>>>(&mut self, events: E) {
         self.events.extend(events);
     }
 
@@ -183,21 +198,25 @@ impl WorkReservation {
             return HostCopy(HostCopyCompletion::Ready(result));
         }
 
+        // A reservation normally completes once, when its fence is ready. This copy cannot join that fence, because the
+        // caller still needs the event to read the copied bytes out of it. The copy therefore reports its completion
+        // through a callback on its own event, and the submission is made to wait for that one additional notification.
+        // It is retired only after the fence and every such copy have reported, and it records the first failure among
+        // them.
         let identity = self.identity.unwrap();
-        self.work.add_dependency(identity);
+        self.work.lock().pending.get_mut(&identity).unwrap().remaining += 1;
         let work = Arc::downgrade(&self.work);
-        let event_slot = Arc::new(Mutex::new(None));
-        let retained_event = Arc::clone(&event_slot);
-        let (ready, completion) = channel();
+        let copy = Arc::new(PendingHostCopy::new());
+
+        // The callback holds its own reference so an abandoned readback retains the event through completion.
+        let callback_copy = Arc::clone(&copy);
         let registration = event.on_ready(move |error| {
             if let Some(work) = work.upgrade() {
                 work.complete(identity, error.map(Error::from));
             }
-            // A caller may discard its copy handle before completion. Keep the event alive through this callback.
-            drop(retained_event);
-            // A disconnected receiver means the caller discarded its copy.
-            ready.send(()).unwrap_or(());
+            callback_copy.complete();
         });
+
         if let Err(registration_error) = registration {
             let result = event.r#await();
             let error = result.as_ref().err().cloned().unwrap_or(registration_error);
@@ -206,8 +225,8 @@ impl WorkReservation {
         }
 
         // Registration can invoke the callback inline. Keep the event on this stack until registration returns.
-        *event_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(event);
-        HostCopy(HostCopyCompletion::Pending { event: event_slot, completion })
+        copy.install_event(event);
+        HostCopy(HostCopyCompletion::Pending(copy))
     }
 
     /// Records a failure discovered after native enqueue. Any attached work still has to complete.
@@ -250,31 +269,15 @@ impl Drop for WorkReservation {
     }
 }
 
-/// Identities and results of the submissions of a [`WorkTracker`].
-pub(super) struct WorkTrackerState<T, E> {
-    /// Identity to use for the next registration.
-    next_identity: u64,
-
-    /// Submissions that still have work to publish or finish.
-    pub(super) pending: BTreeMap<u64, PendingWork<T, E>>,
-
-    /// Failures of completed submissions, with the tags of those submissions, that the owner has yet to remove.
-    pub(super) failures: BTreeMap<u64, (T, E)>,
-}
-
-impl<T, E> Default for WorkTrackerState<T, E> {
-    fn default() -> Self {
-        Self { next_identity: 0, pending: BTreeMap::new(), failures: BTreeMap::new() }
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// A pending submission and its outstanding completion notifications.
 pub(super) struct PendingWork<T, E> {
     /// Tag that the owner stored with the submission.
     pub(super) tag: T,
 
-    /// One notification for the submission itself and one for each dependency that was added to it (e.g., each
-    /// subscribed host copy of a [`WorkReservation`]).
+    /// Number of completion notifications that the submission still waits for. It starts at one, for the
+    /// submission itself, and a [`WorkReservation`] adds one for each pending host copy that it tracks.
     remaining: usize,
 
     /// First failure reported by a notification.
@@ -289,9 +292,19 @@ impl<O> HostCopy<O> {
     pub(crate) fn wait(self) -> Result<O, PjrtError> {
         match self.0 {
             HostCopyCompletion::Ready(result) => result,
-            HostCopyCompletion::Pending { event, completion } => {
-                completion.recv().map_err(|_| PjrtError::internal("host copy callback dropped before completion"))?;
-                let event = event.lock().unwrap_or_else(PoisonError::into_inner).take().unwrap();
+            HostCopyCompletion::Pending(copy) => {
+                // Await consumes the event and can return before the callback runs. Wait for the callback first
+                // so the event stays alive until it reports the copy's result.
+                let mut state = copy.state.lock().unwrap_or_else(PoisonError::into_inner);
+                while matches!(*state, HostCopyState::Pending(_)) {
+                    state = copy.completed.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+                let HostCopyState::Ready(event) = std::mem::replace(&mut *state, HostCopyState::CompletedWithoutEvent)
+                else {
+                    unreachable!("a readback must have its event installed before waiting");
+                };
+                // Release the state lock before calling into PJRT.
+                drop(state);
                 event.r#await()
             }
         }
@@ -300,17 +313,65 @@ impl<O> HostCopy<O> {
 
 /// Payload access for a session-tracked host copy.
 enum HostCopyCompletion<O> {
-    /// The callback holds a share of the event slot until it has reported completion.
-    Pending {
-        /// Event carrying the payload, consumed only by the caller.
-        event: Arc<Mutex<Option<Event<O>>>>,
-
-        /// Notifies the caller that it can take the event and read its payload.
-        completion: Receiver<()>,
-    },
+    /// The event and its callback are pending when tracking starts.
+    Pending(Arc<PendingHostCopy<O>>),
 
     /// Output of an already completed copy or of a synchronous fallback after callback registration failed.
     Ready(Result<O, PjrtError>),
+}
+
+/// Holds the native event until its callback reports completion and the caller can consume the payload.
+struct PendingHostCopy<O> {
+    /// Event ownership and callback completion, accessed under the same lock.
+    state: Mutex<HostCopyState<O>>,
+
+    /// Wakes the caller after the callback records completion.
+    completed: Condvar,
+}
+
+impl<O> PendingHostCopy<O> {
+    /// Creates shared state before registering the event's callback.
+    fn new() -> Self {
+        Self { state: Mutex::new(HostCopyState::Registering), completed: Condvar::new() }
+    }
+
+    /// Stores the event after registration, preserving any completion that arrived inline.
+    fn install_event(&self, event: Event<O>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = match *state {
+            HostCopyState::Registering => HostCopyState::Pending(event),
+            HostCopyState::CompletedWithoutEvent => HostCopyState::Ready(event),
+            HostCopyState::Pending(_) | HostCopyState::Ready(_) => unreachable!("host copy event already installed"),
+        };
+    }
+
+    /// Records callback completion and wakes the caller if it is waiting for the event.
+    fn complete(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = match std::mem::replace(&mut *state, HostCopyState::CompletedWithoutEvent) {
+            HostCopyState::Registering => HostCopyState::CompletedWithoutEvent,
+            HostCopyState::Pending(event) => HostCopyState::Ready(event),
+            completed @ (HostCopyState::CompletedWithoutEvent | HostCopyState::Ready(_)) => completed,
+        };
+        // Release the state lock before waking the reader.
+        drop(state);
+        self.completed.notify_one();
+    }
+}
+
+/// Event ownership and callback completion for a [`PendingHostCopy`].
+enum HostCopyState<O> {
+    /// The submitting thread holds the event while it registers the callback.
+    Registering,
+
+    /// The event is installed and its callback has yet to report completion.
+    Pending(Event<O>),
+
+    /// The callback reported completion before event installation, or the reader has taken the completed event.
+    CompletedWithoutEvent,
+
+    /// The event is installed and its callback has reported completion. The reader can take the event.
+    Ready(Event<O>),
 }
 
 #[cfg(test)]
@@ -328,7 +389,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, values_to_bytes};
     use crate::{Array, DevicePutTarget, Error, ExecutionError};
 
-    use super::WorkTracker;
+    use super::{HostCopy, HostCopyCompletion, HostCopyState, PendingHostCopy, WorkTracker};
 
     #[test]
     fn test_work_tracker_register() {
@@ -358,8 +419,8 @@ mod tests {
         assert_eq!(tracker.lock().pending.keys().copied().collect::<Vec<_>>(), vec![dependent]);
         assert_eq!(tracker.lock().failures.iter().collect::<Vec<_>>(), vec![(&failed, &(true, "failed"))]);
 
-        // A submission with a dependency waits for both notifications and keeps the first failure among them.
-        tracker.add_dependency(dependent);
+        // A submission that waits for two notifications is retired by the second and keeps the first failure.
+        tracker.lock().pending.get_mut(&dependent).unwrap().remaining += 1;
         tracker.complete(dependent, Some("first"));
         assert_eq!(tracker.lock().pending.keys().copied().collect::<Vec<_>>(), vec![dependent]);
         tracker.complete(dependent, Some("second"));
@@ -482,12 +543,16 @@ mod tests {
         let client = execution_client();
         let work = Arc::new(WorkTracker::default());
         let (event, promise) = client.event(vec![1, 2, 3]).unwrap();
-        let (abandoned_event, abandoned_promise) = client.event(vec![4]).unwrap();
+        let abandoned_payload = Arc::new(vec![4]);
+        let retained_payload = Arc::downgrade(&abandoned_payload);
+        let (abandoned_event, abandoned_promise) = client.event(abandoned_payload).unwrap();
         let mut reservation = work.reserve();
         let copy = reservation.track_host_copy(event);
         let abandoned = reservation.track_host_copy(abandoned_event);
         drop(reservation);
         drop(abandoned);
+        // The callback retains the abandoned copy's event and payload while the copy is pending.
+        assert_eq!(retained_payload.strong_count(), 1);
         assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(2));
 
         // The held copy can complete without its consumer, and its payload stays available after synchronization.
@@ -530,5 +595,18 @@ mod tests {
         assert_eq!(session.state.work.snapshot(), 4);
         drop((input, placed, copy));
         session.synchronize().unwrap();
+    }
+
+    #[test]
+    fn test_host_copy_wait_after_inline_completion() {
+        let (event, promise) = execution_client().event(42).unwrap();
+        let copy = Arc::new(PendingHostCopy::new());
+        promise.set(None).unwrap();
+
+        // Simulate an inline callback by reporting completion before installing the event.
+        copy.complete();
+        assert!(matches!(*copy.state.lock().unwrap(), HostCopyState::CompletedWithoutEvent));
+        copy.install_event(event);
+        assert_eq!(HostCopy(HostCopyCompletion::Pending(copy)).wait(), Ok(42));
     }
 }
