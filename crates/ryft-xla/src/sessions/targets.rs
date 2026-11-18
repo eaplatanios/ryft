@@ -5,11 +5,10 @@ use ryft_pjrt::{Client, Value as PjrtValue, Version as PjrtVersion};
 
 use crate::{CompilationError, Error, FromPjrt};
 
-/// Owned snapshot of the platform, plugin, and devices used for compilation and execution by a
-/// [`Session`](crate::Session). Lowering reads the platform and device capabilities to select implementations.
-/// The metadata of compiled programs records target facts for cache identity and compatibility checks when loading
-/// persisted executables. Execution also uses the captured process and device addressability to validate placements
-/// for reference state and ordered effects.
+/// Snapshot of the platform, plugin, and devices used for compilation and execution by a [`Session`](crate::Session).
+/// Lowering reads the platform and device capabilities to select implementations. The metadata of compiled programs
+/// records target facts for cache identity and compatibility checks when loading persisted executables. Execution also
+/// uses the captured process and device addressability to validate placements for reference state and ordered effects.
 ///
 /// Create a snapshot with [`Self::from_client`], or obtain the one retained by a session through
 /// [`Session::target`](crate::Session::target). All strings, attributes, and device descriptions are owned, so a
@@ -29,10 +28,10 @@ pub struct Target {
     pjrt_version: PjrtVersion,
 
     /// Availability of the PJRT FFI extension when the snapshot was captured.
-    has_pjrt_ffi_extension: bool,
+    has_ffi_extension: bool,
 
     /// Owned PJRT plugin attributes, ordered by attribute name.
-    pjrt_attributes: BTreeMap<String, PjrtValue>,
+    attributes: BTreeMap<String, PjrtValue>,
 
     /// Process index reported by the capturing client.
     process_index: usize,
@@ -41,40 +40,16 @@ pub struct Target {
     devices: Vec<TargetDevice>,
 }
 
-// TODO(eaplatanios): Review this module.
-
-/// Owned snapshot of one device's identity, capabilities, and addressability within a [`Target`].
-///
-/// The embedded [`Device`] supplies the identity used in meshes, which is independent of the backend. The remaining
-/// fields capture the PJRT device kind, typed capabilities, and addressability from that client. A [`TargetDevice`]
-/// retains these facts without a live [`ryft_pjrt::Device`] handle, so reading them requires no further runtime
-/// queries. Devices visible on another process can be included even when the capturing client cannot address them.
-#[derive(Clone, Debug)]
-pub struct TargetDevice {
-    /// Device identity and owning process, independent of the backend, used to match mesh entries.
-    device: Device,
-
-    /// PJRT device kind, defined by the implementation and used in hardware compatibility checks.
-    kind: String,
-
-    /// Owned device attributes, ordered by name, including hardware capabilities exposed by the plugin.
-    attributes: BTreeMap<String, PjrtValue>,
-
-    /// Whether the capturing client listed this device among its addressable devices.
-    addressable: bool,
-}
-
 impl Target {
-    /// Captures a live PJRT [`Client`]'s platform, plugin capabilities, and all visible devices.
-    ///
-    /// Device order follows [`Client::devices`], and addressability is determined by membership in
+    /// Creates a new [`Target`] by capturing a live PJRT [`Client`]'s platform, plugin capabilities, and all visible
+    /// devices. Device order follows [`Client::devices`], and addressability is determined by membership in
     /// [`Client::addressable_devices`]. All returned metadata is owned and retains no client or device handles.
     /// An unavailable PJRT FFI extension is recorded as `false` in [`Self::has_ffi_extension`].
     ///
     /// # Errors
     ///
-    /// Returns the first PJRT error, as [`Error::Pjrt`], encountered while querying platform information, plugin
-    /// attributes, process identity, or device descriptions and addressability.
+    /// Returns the first PJRT error, as [`Error::Pjrt`], encountered while querying platform information,
+    /// plugin attributes, process identity, or device descriptions and addressability.
     pub fn from_client(client: &Client<'_>) -> Result<Self, Error> {
         let addressable_device_ids =
             client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
@@ -99,8 +74,8 @@ impl Target {
             platform_name: client.platform_name()?.into_owned(),
             platform_version: client.platform_version()?.into_owned(),
             pjrt_version: client.version(),
-            has_pjrt_ffi_extension: client.ffi_extension().is_ok(),
-            pjrt_attributes: client.attributes()?.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
+            has_ffi_extension: client.ffi_extension().is_ok(),
+            attributes: client.attributes()?.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
             process_index: client.process_index()?,
             devices,
         })
@@ -127,13 +102,13 @@ impl Target {
     /// Returns whether the PJRT FFI extension was available when this snapshot was captured.
     #[inline]
     pub fn has_ffi_extension(&self) -> bool {
-        self.has_pjrt_ffi_extension
+        self.has_ffi_extension
     }
 
-    /// Returns the captured plugin attributes, ordered by attribute name.
+    /// Returns the captured PJRT plugin attributes, ordered by attribute name.
     #[inline]
     pub fn attributes(&self) -> &BTreeMap<String, PjrtValue> {
-        &self.pjrt_attributes
+        &self.attributes
     }
 
     /// Returns the process index reported by the client that this snapshot describes.
@@ -151,6 +126,7 @@ impl Target {
 
     /// Returns the captured device with identifier `device_id`, or [`None`] if that identifier was not visible to
     /// the client. The device can belong to another process and need not be addressable by the capturing client.
+    #[inline]
     pub fn device(&self, device_id: DeviceId) -> Option<&TargetDevice> {
         self.devices.iter().find(|device| device.device.id() == device_id)
     }
@@ -162,7 +138,7 @@ impl Target {
     ///
     /// Returns [`CompilationError::InvalidPersistentExecutable`] if a mesh device identifier is absent from the
     /// snapshot.
-    pub(crate) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, CompilationError> {
+    pub fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, CompilationError> {
         mesh.devices()
             .iter()
             .map(|mesh_device| {
@@ -186,8 +162,8 @@ impl Target {
         })
     }
 
-    /// Returns whether this target's process participates in executions over `mesh`. Every device in `mesh` must be a
-    /// captured device with the process index that the mesh assigns it, the devices of this process must be
+    /// Returns whether this target's process participates in executions over `mesh`. Every device in `mesh` must
+    /// be a captured device with the process index that the mesh assigns it, the devices of this process must be
     /// addressable while those of other processes are not, and at least one device must belong to this process. An
     /// unknown device identifier, a mismatched process index, or a mesh entirely of other processes makes the result
     /// `false`. Execution with reference state uses this check, because each process binds, executes, and commits only
@@ -206,6 +182,26 @@ impl Target {
     }
 }
 
+/// Snapshot of one device's identity, capabilities, and addressability within a [`Target`]. The embedded [`Device`]
+/// supplies the identity used in meshes, which is independent of the backend. The remaining fields capture the PJRT
+/// device kind, typed capabilities, and addressability from that client. A [`TargetDevice`] retains these facts without
+/// a live [`ryft_pjrt::Device`] handle, so reading them requires no further runtime queries. Devices visible on other
+/// processes can be included even when the capturing client cannot address them.
+#[derive(Clone, Debug)]
+pub struct TargetDevice {
+    /// Device identity and owning process, independent of the backend, used to match mesh entries.
+    device: Device,
+
+    /// PJRT device kind, defined by the implementation and used in hardware compatibility checks.
+    kind: String,
+
+    /// PJRT device attributes, ordered by name, including hardware capabilities exposed by the plugin.
+    attributes: BTreeMap<String, PjrtValue>,
+
+    /// Whether the capturing client listed this device among its addressable devices.
+    addressable: bool,
+}
+
 impl TargetDevice {
     /// Returns the identity and owning process, independent of the backend, used to place this device in a
     /// [`DeviceMesh`].
@@ -220,7 +216,7 @@ impl TargetDevice {
         self.kind.as_str()
     }
 
-    /// Returns the captured device attributes, ordered by attribute name. Hardware capability attributes depend on
+    /// Returns the captured PJRT device attributes, ordered by attribute name. Hardware capability attributes depend on
     /// the PJRT plugin and the device kind.
     #[inline]
     pub fn attributes(&self) -> &BTreeMap<String, PjrtValue> {
@@ -246,15 +242,15 @@ mod tests {
 
     use super::*;
 
-    /// Builds a target of process 0 over `devices`, each given as its identifier, owning process, and kind. A device
-    /// is addressable when it belongs to process 0.
+    /// Builds a target of process 0 over `devices`, each given as its identifier, owning process, and kind.
+    /// A device is addressable when it belongs to process 0.
     fn target(devices: &[(DeviceId, usize, &str)]) -> Target {
         Target {
             platform_name: "test".into(),
             platform_version: "test".into(),
             pjrt_version: PjrtVersion { major: 0, minor: 0 },
-            has_pjrt_ffi_extension: false,
-            pjrt_attributes: BTreeMap::new(),
+            has_ffi_extension: false,
+            attributes: BTreeMap::new(),
             process_index: 0,
             devices: devices
                 .iter()
@@ -318,16 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn test_target_device() {
-        // Devices of other processes are found too, while unknown identifiers are not.
-        let target = target(&[(7, 0, "local"), (9, 1, "remote")]);
-        assert_eq!(target.device(7).map(TargetDevice::kind), Some("local"));
-        assert_eq!(target.device(9).map(TargetDevice::device), Some(Device::new(9, 1)));
-        assert_eq!(target.device(9).map(TargetDevice::is_addressable), Some(false));
-        assert!(target.device(8).is_none());
-    }
-
-    #[test]
     fn test_target_mesh_device_kinds() {
         let target = target(&[(7, 0, "first"), (9, 0, "second")]);
         assert_eq!(
@@ -366,5 +352,15 @@ mod tests {
         assert!(!target.is_participating_mesh(&mesh(vec![remote])));
         assert!(!target.is_participating_mesh(&mesh(vec![local, Device::new(2048, 0)])));
         assert!(!target.is_participating_mesh(&mesh(vec![local, Device::new(usize::MAX, 1)])));
+    }
+
+    #[test]
+    fn test_target_device() {
+        // Devices of other processes are found too, while unknown identifiers are not.
+        let target = target(&[(7, 0, "local"), (9, 1, "remote")]);
+        assert_eq!(target.device(7).map(TargetDevice::kind), Some("local"));
+        assert_eq!(target.device(9).map(TargetDevice::device), Some(Device::new(9, 1)));
+        assert_eq!(target.device(9).map(TargetDevice::is_addressable), Some(false));
+        assert!(target.device(8).is_none());
     }
 }
