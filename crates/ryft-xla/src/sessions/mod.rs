@@ -356,11 +356,9 @@ impl Session {
         self.state.eager_dispatch_cache.clear();
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Creates a [`DeviceMesh`] with the provided `axes` over the devices of this session's client, like
-    /// `jax.make_mesh`. The mesh takes as many devices as its axes require, in the order in which the client reports
-    /// them. In a program with multiple processes, these include devices that other processes own.
+    /// Creates a [`DeviceMesh`] with the provided `axes` over the devices of this session's client. The mesh takes as
+    /// many devices as its axes require, in the order in which the client reports them. In a program with multiple
+    /// processes, these include devices that other processes own.
     ///
     /// # Errors
     ///
@@ -379,6 +377,8 @@ impl Session {
             .collect();
         Ok(DeviceMesh::new(logical_mesh, devices)?)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Uploads the dense row-major host bytes in `buffer` into a new [`Array`] of type `r#type` that belongs to this
     /// session. Refer to the documentation of [`Array::from_host_buffer`] for information on how the bytes are
