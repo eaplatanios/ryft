@@ -434,8 +434,7 @@ mod tests {
     /// (i.e., a token buffer whose transfer from the host has not happened yet) and must stay pending until it is
     /// released. That fixture only works on plugins that submit executables without waiting for unrecorded input
     /// definition events on the host, such as the CPU plugin. The CUDA plugin blocks the submitting thread until
-    /// every input event is recorded, so there the chain is proven through submission order and barrier completion
-    /// alone.
+    /// every input event is recorded, so that case checks print order after session synchronization.
     fn assert_session_array_ordered_effects(client: &'static Client<'static>, hold_predecessor: bool) {
         let mesh = single_device_mesh(client);
         let session = session_with_client(client);
@@ -483,7 +482,7 @@ mod tests {
                 }
                 readiness
             });
-            session.effects_barrier().unwrap();
+            session.synchronize().unwrap();
             readiness
         });
 
@@ -491,7 +490,7 @@ mod tests {
         assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
     }
 
-    /// Checks that an outputless unordered execution is tracked by the barrier and leaves the ordered tail in place.
+    /// Checks that an outputless unordered execution registers with the effect scope and preserves the ordered tail.
     fn assert_outputless_unordered_execution(client: &'static Client<'static>) {
         let mesh = single_device_mesh(client);
         let session = session_with_client(client);
@@ -525,7 +524,7 @@ mod tests {
             assert_eq!(scope.work.snapshot(), 2);
             assert!(Arc::ptr_eq(scope.state.lock().unwrap().tail.as_ref().unwrap(), &ordered_submission));
 
-            session.effects_barrier().unwrap();
+            session.synchronize().unwrap();
         });
 
         assert_eq!(lines, vec!["unordered: [3.0]"]);
@@ -830,7 +829,7 @@ mod tests {
                 managers[0].transfer_data(0, Arc::new([]), 0, true).unwrap().r#await().unwrap();
                 progress
             });
-            session.effects_barrier().unwrap();
+            session.synchronize().unwrap();
             progress
         });
 

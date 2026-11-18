@@ -449,22 +449,26 @@ impl Session {
         self.effect_scope.acknowledge()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Reserves a place in this handle's effect scope before submitting a program with effects to PJRT. The
-    /// reservation is visible to [`Self::effects_barrier`] during submission setup.
-    ///
-    /// See [`EffectScope::reserve`] for device ordering and errors. Before submitting ordered I/O, check for input
-    /// tokens with [`EffectReservation::wait_for_predecessor_tokens`]. Once PJRT accepts the submission, finish the
+    /// Reserves a place in this handle's effect scope before submitting a program with effects to PJRT. The reservation
+    /// is visible to [`Self::effects_barrier`] during submission setup. Refer to [`EffectScope::reserve`] for device
+    /// ordering and errors. Before submitting ordered I/O, check for input tokens with
+    /// [`EffectReservation::wait_for_predecessor_tokens`]. Once PJRT accepts the submission, finish the
     /// handoff with [`EffectReservation::publish`]. Dropping the reservation before handoff cancels it.
     pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
         self.effect_scope.reserve(devices)
     }
 
-    /// Registers work with the session before enqueuing it. The reservation publishes any attached work on drop.
+    /// Registers a PJRT execution or batch of transfers with the session and returns a [`WorkReservation`]. Call this
+    /// before the first PJRT enqueue so a concurrent [`Self::synchronize`] includes the submission in its snapshot
+    /// even if the submitting thread is still collecting completion fences or events. Attach each fence or event as
+    /// soon as its work is enqueued. Dropping the reservation hands off completion tracking to the session, including
+    /// when the submitting function returns early. The submission stays pending until the attached work finishes.
+    /// If no work was attached, the reservation completes as soon as it is dropped.
     pub(crate) fn reserve_work(&self) -> WorkReservation {
         self.state.work.reserve()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns a new [`Array`] that belongs to this handle and shares the storage that `constant` retains.
     ///
@@ -1885,10 +1889,8 @@ pub(crate) mod tests {
         assert_eq!(fork.device_mesh().unwrap(), &mesh);
 
         // A barrier of the new scope does not wait for effects that are pending in the scope of the original handle.
-        let pending = session.reserve_effects(None).unwrap();
+        let _pending = session.reserve_effects(None).unwrap();
         fork.effects_barrier().unwrap();
-        drop(pending);
-        session.effects_barrier().unwrap();
     }
 
     #[test]
