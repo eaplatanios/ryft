@@ -1,5 +1,5 @@
 //! XLA sessions and the shared resources used to stage, compile, and execute array programs. A [`Session`] implements
-//! [`Domain`] over [`ArrayIrType`], with [`Value`]s that hold device arrays, checked dimensions, or mutable references.
+//! [`Domain`] over [`Type`], with [`Value`]s that hold device arrays, checked dimensions, or mutable references.
 //! Values retain their session, so eager operations and transforms recover the execution context from their inputs.
 //! [`Constant`] and [`Operation`] provide the corresponding families of stored constants and operations for traced
 //! programs.
@@ -83,15 +83,15 @@ use std::sync::{Arc, OnceLock};
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext,
-    CastType, Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType,
-    Device, DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType,
-    DimensionValue, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext,
+    ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext, CastType,
+    Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device,
+    DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
+    DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
     NestedTracingContext, Operation as CoreOperation, OperationProvider, Parameter, Placeholder, ProgramError,
     Provenance, ProvenanceScope, RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry,
-    SpecializationCacheStatistics, TracingContext, Type, TypeError, TypeIdentityRenaming, Typed, TypedProgram, Zero,
-    ZeroOperation,
+    SpecializationCacheStatistics, TracingContext, Type as CoreType, TypeError, TypeIdentityRenaming, Typed,
+    TypedProgram, Zero, ZeroOperation,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::protos::CompilationOptions;
@@ -106,7 +106,7 @@ use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{WorkReservation, WorkTracker};
 use crate::{
     Array, ArrayError, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LowerableOperation,
-    Operation, Options, ProgramBuilder, Value,
+    Operation, Options, ProgramBuilder, Type, Value,
 };
 
 pub mod effects;
@@ -578,44 +578,47 @@ impl Clone for Session {
 }
 
 impl Domain for Session {
-    type Type = ArrayIrType;
+    type Type = Type;
     type Value = Value;
     type Constant = Constant;
     type Operation = Operation;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl NamedAxes for Session {
+    // A session is the root eager context. Its default mesh supplies placement, and transforms such as
+    // `batch` and `shard_map` introduce named-axis bindings in their own scopes.
+
+    #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         let _ = name;
         None
     }
 
+    #[inline]
     fn named_axes(&self) -> Vec<(String, NamedAxis)> {
         Vec::new()
     }
 }
 
 impl MeshContext for Session {
+    #[inline]
     fn default_mesh(&self) -> Option<LogicalMesh> {
         // A session handle that was given a device mesh through `Session::with_device_mesh` owns the logical view of
-        // that mesh as its default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), as
-        // under JAX's `jax.set_mesh`. A handle without a mesh has no default.
+        // that mesh as its default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), same
+        // as under JAX's `jax.set_mesh`. A handle without a mesh has no default.
         self.mesh.as_ref().map(|mesh| mesh.logical_mesh().clone())
     }
 }
 
 impl Context for Session {
-    // Immediate dimension extents materialize directly, Boolean literals upload a replicated scalar, and a
-    // `Constant::Session` handle resolves to the array that it retains. A
-    // `Constant::Captured` payload is a symbolic index into a compiled function's capture table carrying only a type
-    // and no data, so there is nothing to materialize without the surrounding capture table and lifting it is always
-    // rejected.
     fn lift(&self, constant: Constant) -> Result<Value, ProgramError> {
+        // Immediate dimension extents materialize directly, Boolean literals upload a replicated scalar, and a
+        // `Constant::Session` handle resolves to the array that it retains. A `Constant::Captured` payload is a
+        // symbolic index into a compiled function's capture table carrying only a type and no data, so there is
+        // nothing to materialize without the surrounding capture table and lifting it is always rejected.
         match constant {
             Constant::Captured(constant) => Err(TypeError::invalid(format!(
-                "XLA captured constant `{constant}` requires a captured program capture table"
+                "XLA captured constant `{constant}` requires a captured program capture table",
             ))
             .into()),
             Constant::Session(constant) => Ok(Value::Array(constant.to_array(self)?)),
@@ -629,26 +632,6 @@ impl Context for Session {
         }
     }
 
-    // Eagerly executes `operation` on concrete inputs, mirroring JAX's op-by-op dispatch.
-    //
-    // An application is first looked up in the session's eager dispatch cache, keyed by the operation, the structure of
-    // its attached regions, its inputs, and the lowering mesh, which together form an `EagerDispatchKey`. A hit
-    // validates the input placement and executes the cached program directly, skipping program construction, lowering,
-    // and compilation key construction. On a miss, the operation is built into a flat program with a single instruction
-    // over the physical array types of the inputs, including their shardings, compiled through this session's
-    // compilation cache, and executed on this session's PJRT client. The compilation cache key contains the complete
-    // lowered computation, its effective compilation options, and the derived mesh, so repeated eager binds of the same
-    // lowering reuse one compiled executable without conflating distinct computations. Higher-order operations (e.g.,
-    // `condition`, `while`, `scan`, `jit_call`, and `shard_map`) receive their nested programs as attached regions and
-    // flow through this same path, and the compiler handles their control flow, so no host interpreter loops are
-    // needed.
-    //
-    // Work that involves no device computation never reaches the compilation cache. Reference operations act on handles
-    // on the host, while dimension operations, dimension casts and comparisons, and conversions between dimensions and
-    // scalars are decided on the host. Only their array results are uploaded, as replicated scalars with eager
-    // placement. A literal constant is host data already, so it is uploaded as well. Reference operands of any other
-    // operation, and reference state carried by attached regions, are rejected because XLA eager execution lowers each
-    // operation.
     fn bind<'r, P, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
         &self,
         operation: P,
@@ -660,8 +643,29 @@ impl Context for Session {
         Self::Constant: 'r,
         Self::Operation: 'r,
     {
+        // Eagerly executes `operation` on the provided concrete inputs. An application is first looked up in the
+        // session's eager dispatch cache, keyed by the operation, the structure of its attached regions, its inputs,
+        // and the lowering mesh, which together form an `EagerDispatchKey`. A hit validates the input placement and
+        // executes the cached program directly, skipping program construction, lowering, and compilation key
+        // construction. On a miss, the operation is built into a flat program with a single instruction over the
+        // physical array types of the inputs, including their shardings, compiled through this session's compilation
+        // cache, and executed on this session's PJRT client. The compilation cache key contains the complete lowered
+        // computation, its effective compilation options, and the derived mesh, so repeated eager binds of the same
+        // lowering reuse one compiled executable without conflating distinct computations. Higher-order operations
+        // (e.g., `condition`, `while`, `scan`, `jit_call`, and `shard_map`) receive their nested programs as attached
+        // regions and flow through this same path, and the compiler handles their control flow, so no host interpreter
+        // loops are needed.
+        //
+        // Work that involves no device computation never reaches the compilation cache. Reference operations act on
+        // handles on the host, while dimension operations, dimension casts and comparisons, and conversions between
+        // dimensions and scalars are decided on the host. Only their array results are uploaded, as replicated scalars
+        // with eager placement. A literal constant is host data already, so it is uploaded as well. Reference operands
+        // of any other operation, and reference state carried by attached regions, are rejected because XLA eager
+        // execution lowers each operation.
+
         ensure_effect_dispatch_is_allowed()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+
         let operation = operation.into();
         let regions = regions.into();
         operation.validate_region_interfaces(&regions.region_interfaces())?;
@@ -696,6 +700,7 @@ impl Context for Session {
             }
             _ => None,
         };
+
         if let Some(outputs) = host_outputs {
             // The outputs are associated with this session, including the references that the operation created.
             return outputs?.into_iter().map(|output| Ok(Value::from_array_ir_value(output, self)?)).collect();
@@ -704,32 +709,36 @@ impl Context for Session {
         // Every other operation is lowered, and lowering cannot bind reference operands.
         if inputs.iter().any(|input| matches!(input, Value::Reference(_))) {
             return Err(ProgramError::UnsupportedOperation {
-                message: "eager XLA execution lowers each operation and cannot bind a reference operand; discharge \
-                          references before lowering"
+                message: "eager XLA execution lowers each operation and cannot bind a reference operand; \
+                          discharge references before lowering"
                     .to_string(),
             });
         }
+
         // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone would
         // miss a pure pass-through or capture of a reference type. The borrowed closure scan covers dormant rule
         // regions too without cloning their program graphs. Although those rules do not execute in this eager bind,
-        // ordinary XLA rejects unresolved references across the whole artifact, so accepting one here would only defer
-        // failure to compilation with a less targeted diagnostic.
+        // ordinary XLA rejects unresolved references across the whole artifact, so accepting one here would only
+        // defer failure to compilation with a less targeted diagnostic.
         if operation.effects().classes().contains(EffectClass::OrderedState)
             || regions.regions().any(|region| {
                 region.contains_effect_in_closure(EffectClass::OrderedState)
-                    || region.contains_atom_type_in_closure(Type::is_reference)
+                    || region.contains_atom_type_in_closure(CoreType::is_reference)
             })
         {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{}` carries reference state that XLA eager execution cannot lower; discharge references before \
-                     lowering",
+                    "`{}` carries reference state that XLA eager execution cannot lower; \
+                     discharge references before lowering",
                     operation.name(),
                 ),
             });
         }
-        // `Context::bind` has already rejected attached regions for the operations that declare no region slots, which
-        // includes every operation that is executed on the host below.
+
+        // TODO(eaplatanios): Review from here onwards.
+
+        // `Context::bind` has already rejected attached regions for the operations that declare no region slots,
+        // which includes every operation that is executed on the host below.
         if let Operation::Dimension(operation) = &operation {
             let inputs = inputs
                 .iter()
@@ -748,6 +757,7 @@ impl Context for Session {
                 .map(|output| Value::Dimension(Dimension::new(output, self.clone())))
                 .collect());
         }
+
         if let Operation::DimensionSize(operation) = &operation {
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
@@ -858,7 +868,7 @@ impl Context for Session {
             .collect::<Vec<_>>();
 
         if let Operation::Cast(operation) = &operation
-            && matches!(operation.output_type(), ArrayIrType::Dimension(_))
+            && matches!(operation.output_type(), Type::Dimension(_))
         {
             // `Context::bind` rejects attached regions. Validate the original declaration before observing every
             // array witness producer, because the host dimension has no buffer that could retain those dependencies.
@@ -866,7 +876,7 @@ impl Context for Session {
             // leaves a check to a backend.
             let values = inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
             let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-            let (_, interpreted) = ArrayIrType::infer_cast_output_type(operation, &input_types)?;
+            let (_, interpreted) = Type::infer_cast_output_type(operation, &input_types)?;
             if interpreted.is_none() {
                 return Err(ProgramError::Concretization {
                     message: format!(
@@ -938,7 +948,7 @@ impl Context for Session {
                                 .iter()
                                 .map(|input| match input {
                                     Value::Array(array) => {
-                                        Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned())))
+                                        Ok(builder.add_input(Type::Array(array.r#type().into_owned())))
                                     }
                                     Value::Dimension(dimension) => {
                                         let dimension = dimension.value();
@@ -977,7 +987,7 @@ impl Context for Session {
                             .iter()
                             .map(|atom| -> Result<_, ProgramError> {
                                 Ok(match builder.atoms()[atom.index()].r#type().as_ref() {
-                                    ArrayIrType::Dimension(r#type) if let Some(extent) = r#type.extent() => {
+                                    Type::Dimension(r#type) if let Some(extent) = r#type.extent() => {
                                         EagerOutput::Dimension(
                                             DimensionValue::constant(extent).map_err(TypeError::from)?,
                                         )
@@ -1095,7 +1105,7 @@ impl Context for Session {
 // compiled for the first zero of each type and reused afterwards. Dynamic array zeros are intentionally not available
 // through this capability, because it receives only a type and they require explicit first-class extent operands.
 impl Zero<Value> for Session {
-    fn zero(&self, r#type: &ArrayIrType) -> Result<Value, ProgramError> {
+    fn zero(&self, r#type: &Type) -> Result<Value, ProgramError> {
         let mut outputs = self.bind(Operation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -1372,7 +1382,7 @@ impl SessionConstant {
     /// Returns this handle with the identities of its type renamed by `renaming`.
     pub(crate) fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<ArrayType as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self {
             r#type: self.r#type.rename_identities(renaming)?,
@@ -1624,7 +1634,7 @@ pub(crate) mod tests {
     /// Builds a flat program that reads and returns one externally supplied reference.
     pub(crate) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram {
         let mut builder = ProgramBuilder::new();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(referent_type)));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(referent_type)));
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
@@ -2169,7 +2179,7 @@ pub(crate) mod tests {
         assert_eq!(session.cached_program_count(), 0);
 
         // A captured constant carries only a type, so it cannot be lifted without its capture table.
-        let capture = CaptureReference::new(0, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let capture = CaptureReference::new(0, Type::Array(ArrayType::scalar(DataType::F32)));
         assert_eq!(
             session.lift(Constant::Captured(capture)),
             Err(TypeError::invalid(
@@ -2210,7 +2220,7 @@ pub(crate) mod tests {
         let session = session_with_client(client).with_device_mesh(mesh);
         let array_type = ArrayType::scalar(DataType::F32);
         let operations = [
-            Operation::provide(ZeroOperation::new(ArrayIrType::Array(array_type.clone())), &[]).unwrap(),
+            Operation::provide(ZeroOperation::new(Type::Array(array_type.clone())), &[]).unwrap(),
             OneOperation::new(array_type).into(),
         ];
 
@@ -2329,7 +2339,7 @@ pub(crate) mod tests {
             let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
             builder.add_constant(Constant::Captured(CaptureReference::new(
                 0,
-                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
             )));
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(
@@ -2526,7 +2536,7 @@ pub(crate) mod tests {
         let session = session_with_client(client);
         let selected = session.with_new_effect_scope();
         let value = Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), session.clone()));
-        let output_type = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(2)));
+        let output_type = Type::Dimension(DimensionType::from(CoreDimension::Static(2)));
         for checked in [true, false] {
             let output = if checked {
                 value.cast(output_type.clone(), &[])
@@ -2556,7 +2566,7 @@ pub(crate) mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let value = Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), session.clone()));
-        let output_type = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(2)));
+        let output_type = Type::Dimension(DimensionType::from(CoreDimension::Static(2)));
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let declared_types = vec![
             DimensionType::from(extent.clone()).into(),
@@ -2582,7 +2592,7 @@ pub(crate) mod tests {
                 session.bind(operation, Vec::new(), std::slice::from_ref(&value)),
                 Err(TypeError::invalid("expected 2 inputs but got 1").into()),
             );
-            let mismatch = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(3)));
+            let mismatch = Type::Dimension(DimensionType::from(CoreDimension::Static(3)));
             assert_eq!(
                 session.bind(
                     constructor(mismatch, vec![output_type.clone()]).unwrap(),
@@ -2615,7 +2625,7 @@ pub(crate) mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let value = Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), session.clone()));
-        let output_type = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(2)));
+        let output_type = Type::Dimension(DimensionType::from(CoreDimension::Static(2)));
         for data_type in [DataType::F32, DataType::Zero] {
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(ryft_pjrt::Error::invalid_argument("cast witness failed"))).unwrap();
@@ -3803,7 +3813,7 @@ pub(crate) mod tests {
         measure("JIT add (warm dispatch)", &mut || {
             function.execute((), input.clone()).unwrap();
         });
-        let vector_type = ArrayIrType::Array(input.r#type().into_owned());
+        let vector_type = Type::Array(input.r#type().into_owned());
         let branch = |operation: Operation| {
             let mut builder = ProgramBuilder::new();
             let value = builder.add_input(vector_type.clone());
@@ -3821,7 +3831,7 @@ pub(crate) mod tests {
             session.bind(Operation::Condition(ConditionOperation::new()), branches, &condition_inputs).unwrap();
         });
 
-        let array_type = ArrayIrType::Array(input.r#type().into_owned());
+        let array_type = Type::Array(input.r#type().into_owned());
         let build_program = || -> FlatProgram {
             let mut builder = ProgramBuilder::new();
             let left = builder.add_input(array_type.clone());
@@ -3868,7 +3878,7 @@ pub(crate) mod tests {
                     different PJRT client than this session's client",
         ));
         // Casts that produce dimensions execute on the host but still require array witnesses from the selected client.
-        let dimension_type = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(2)));
+        let dimension_type = Type::Dimension(DimensionType::from(CoreDimension::Static(2)));
         let dimension = Value::Dimension(Dimension::new(DimensionValue::constant(2).unwrap(), domain.parent().clone()));
         assert_eq!(
             domain.parent().bind(
@@ -3892,7 +3902,7 @@ pub(crate) mod tests {
     fn test_session_zero() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let r#type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let r#type = Type::Array(ArrayType::new_static(DataType::F32, [2]));
 
         // A zero is an ordinary eager operation with or without a mesh, so one program is compiled for each type.
         for session in [session_with_client(client).with_device_mesh(mesh), session_with_client(client)] {
@@ -3902,7 +3912,7 @@ pub(crate) mod tests {
             assert_eq!(session.cached_program_count(), 1);
 
             // A zero of the structural zero data type needs no storage.
-            let zero = session.zero(&ArrayIrType::Array(ArrayType::new_static(DataType::Zero, [3]))).unwrap();
+            let zero = session.zero(&Type::Array(ArrayType::new_static(DataType::Zero, [3]))).unwrap();
             assert!(program_array(&zero).addressable_shards().next().unwrap().buffer().is_none());
         }
     }

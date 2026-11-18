@@ -234,11 +234,12 @@ impl TargetDevice {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayIrType, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
+
+    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
 
     use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client};
     use crate::tests::cpu_client;
-    use crate::{FlatProgram, Operation, Options, ProgramBuilder};
+    use crate::{FlatProgram, Operation, Options, ProgramBuilder, Type};
 
     use super::*;
 
@@ -300,7 +301,7 @@ mod tests {
         // Lowering over a mesh of the captured devices records the target facts.
         let mesh = domain_mesh(client, "x", 2);
         let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(ArrayIrType::Array(replicated_vector_type(&mesh, 2)));
+        let input = builder.add_input(Type::Array(replicated_vector_type(&mesh, 2)));
         let output = builder
             .add_instruction(Operation::Array(NegOperation::new().into()), Vec::new(), vec![input], None)
             .unwrap()
