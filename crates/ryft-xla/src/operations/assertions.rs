@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AssertOperation, AssertionError, AssertionFailure, ComparisonDirection,
-    DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension as CoreDimension, DimensionType, DimensionVariable, EffectClass,
-    GUARD_OPERATION_NAME, GuardOperation, Operation as CoreOperation,
+    ArrayType, AssertOperation, AssertionError, AssertionFailure, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME,
+    DataType, Dimension as CoreDimension, DimensionType, DimensionVariable, EffectClass, GUARD_OPERATION_NAME,
+    GuardOperation, Operation as CoreOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DictionaryAttributeRef, LocationRef,
-    Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue, ValueRef,
+    Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef,
 };
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
@@ -28,7 +28,7 @@ use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
-    RuntimeProvider, RuntimeRequirement,
+    RuntimeProvider, RuntimeRequirement, Type,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -205,7 +205,7 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
     name: &str,
     declared_types: &[ArrayType],
     input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayIrType],
+    input_types: &[Type],
     output_types: &[ArrayType],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -260,8 +260,8 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
 ///   - `output_types`: Refined output types, which correspond to `declared_types`.
 pub(crate) fn validates_output_extents(
     declared_types: &[ArrayType],
-    input_types: &[ArrayIrType],
-    output_types: &[ArrayIrType],
+    input_types: &[Type],
+    output_types: &[Type],
 ) -> Result<bool, Error> {
     let dynamic_count = declared_types
         .iter()
@@ -296,9 +296,9 @@ pub(crate) fn validates_output_extents(
 ///   - `actual_types`: Actual types of `values`, which refine `declared_types`.
 pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
     boundary: &str,
-    declared_types: &[ArrayIrType],
+    declared_types: &[Type],
     values: &[ValueRef<'b, 'c, 't>],
-    actual_types: &[ArrayIrType],
+    actual_types: &[Type],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -359,9 +359,9 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
 pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     actor: &str,
     site: &str,
-    declared_types: &[ArrayIrType],
+    declared_types: &[Type],
     values: &[ValueRef<'b, 'c, 't>],
-    actual_types: &[ArrayIrType],
+    actual_types: &[Type],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -401,7 +401,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     let mut static_checks = Vec::<(usize, &CoreDimension, (ValueRef<'b, 'c, 't>, Option<usize>))>::new();
     for ((declared, &value), actual) in declared_types.iter().zip(values).zip(actual_types) {
         match (declared, actual) {
-            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if declared.rank() == actual.rank() => {
+            (Type::Array(declared), Type::Array(actual)) if declared.rank() == actual.rank() => {
                 for (axis, (declared, actual)) in
                     declared.shape().dimensions().iter().zip(actual.shape().dimensions()).enumerate()
                 {
@@ -426,7 +426,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                     }
                 }
             }
-            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
+            (Type::Dimension(declared), Type::Dimension(actual)) => {
                 match (declared.variable(), declared.extent(), actual.extent()) {
                     (Some(variable), _, extent) => {
                         occurrences.push((variable, actual.dimension(), extent.ok_or((value, None))));
@@ -593,20 +593,20 @@ impl LowerableOperation for GuardOperation<ArrayType> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let declared_types = self.declared_types().iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
-        let input_types = input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
-        let output_types = output_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
+        let declared_types = self.declared_types().iter().cloned().map(Type::from).collect::<Vec<_>>();
+        let input_types = input_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
+        let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
         lower_guard_with_outputs(self.boundary(), &declared_types, input_values, &input_types, &output_types, lowerer)
     }
 }
 
-impl LowerableOperation for GuardOperation<ArrayIrType> {
+impl LowerableOperation for GuardOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_guard_with_outputs(
             self.boundary(),
@@ -646,13 +646,13 @@ impl LowerableOperation for AssertOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for AssertOperation<ArrayIrType> {
+impl LowerableOperation for AssertOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
         lowerer.require_runtime(RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET))?;
@@ -668,9 +668,9 @@ impl LowerableOperation for AssertOperation<ArrayIrType> {
             &input_types
                 .iter()
                 .map(|input| match input {
-                    ArrayIrType::Array(array) => array.clone(),
-                    ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
-                    ArrayIrType::Reference(_) => {
+                    Type::Array(array) => array.clone(),
+                    Type::Dimension(_) => ArrayType::scalar(DataType::I64),
+                    Type::Reference(_) => {
                         unreachable!("assertion validation rejects reference observations")
                     }
                 })
@@ -827,7 +827,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
 /// the refined extent.
 fn output_extent_checks<'o>(
     declared_types: &'o [ArrayType],
-    input_types: &[ArrayIrType],
+    input_types: &[Type],
     output_types: &[ArrayType],
 ) -> Result<Vec<(usize, &'o DimensionVariable, usize)>, Error> {
     check_count!("output", output_types, declared_types.len(), ProgramError);
@@ -862,10 +862,10 @@ fn output_extent_checks<'o>(
 /// [retained](GuardOperation::retained_identities) identity. Guards preserve their inputs' layout and sharding.
 fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     boundary: &str,
-    declared_types: &[ArrayIrType],
+    declared_types: &[Type],
     input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayIrType],
-    output_types: &[ArrayIrType],
+    input_types: &[Type],
+    output_types: &[Type],
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, input_values.len(), ProgramError);
@@ -1642,8 +1642,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, AndOperation, ArrayIrBatch, ArrayIrType, ArrayReferenceDischarge, Assert, AssertOperation,
-        BatchAxis, BatchableOperation, BatchingContext, CompareOperation, Context, ConvertElementType, DimensionBounds,
+        AddOperation, AndOperation, ArrayIrBatch, ArrayReferenceDischarge, Assert, AssertOperation, BatchAxis,
+        BatchableOperation, BatchingContext, CompareOperation, Context, ConvertElementType, DimensionBounds,
         DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionPow, DimensionRemOperation,
         DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, Div, DynamicBroadcastOperation,
         EmptyRegionDriver, IotaOperation, PartialValue, Placeholder, PrintOperation, ProgramError,
@@ -1661,7 +1661,7 @@ mod tests {
         boolean_vector, domain_mesh, f32_vector, read_i64s, replicated_scalar_type, session_with_client,
     };
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, Options, to_mlir_module_for_program};
+    use crate::{Array, Constant, Options, Type, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1672,10 +1672,10 @@ mod tests {
             DataType::F32,
             Shape::new(vec![DimensionType::new("n", bounds).simplified_dimension()]),
         )];
-        let symbolic = ArrayIrType::from(DimensionType::new("m", bounds));
-        let exact = ArrayIrType::from(DimensionType::from(CoreDimension::Static(3)));
-        let refined = vec![ArrayIrType::from(ArrayType::new_static(DataType::F32, [3]))];
-        let unrefined = vec![ArrayIrType::from(declared_types[0].clone())];
+        let symbolic = Type::from(DimensionType::new("m", bounds));
+        let exact = Type::from(DimensionType::from(CoreDimension::Static(3)));
+        let refined = vec![Type::from(ArrayType::new_static(DataType::F32, [3]))];
+        let unrefined = vec![Type::from(declared_types[0].clone())];
 
         // A symbolic extent operand of an axis that type inference refined to a static extent needs a runtime check,
         // also when other instruction inputs precede the extent operands.
@@ -1696,7 +1696,7 @@ mod tests {
         // check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
-        let declared: Vec<ArrayIrType> =
+        let declared: Vec<Type> =
             vec![n.clone().into(), ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into()];
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let mut builder = ArrayIrProgramBuilder::new();
@@ -1768,7 +1768,7 @@ mod tests {
         let n = DimensionType::new("n", wide);
         let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
         let k = DimensionType::new("k", wide);
-        let vector = |dimension: &DimensionType| -> ArrayIrType {
+        let vector = |dimension: &DimensionType| -> Type {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
         let mut builder = ArrayIrProgramBuilder::new();
@@ -1812,7 +1812,7 @@ mod tests {
         let n = DimensionType::new("n", wide);
         let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
         let k = DimensionType::new("k", wide);
-        let vector = |dimension: &DimensionType| -> ArrayIrType {
+        let vector = |dimension: &DimensionType| -> Type {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
         let mut builder = ArrayIrProgramBuilder::new();
@@ -1861,7 +1861,7 @@ mod tests {
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                CompareOperation::<Type>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![left_dimension, right_dimension],
                 None,
@@ -1869,7 +1869,7 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`left_dimension` <= `right_dimension`"),
+                AssertOperation::<Type>::new("`left_dimension` <= `right_dimension`"),
                 Vec::new(),
                 vec![predicate],
                 None,
@@ -1877,7 +1877,7 @@ mod tests {
             .unwrap();
         let guarded = builder
             .add_instruction(
-                GuardOperation::new("region", vec![ArrayIrType::from(array_type.clone())]),
+                GuardOperation::new("region", vec![Type::from(array_type.clone())]),
                 Vec::new(),
                 vec![value],
                 None,
@@ -1968,7 +1968,7 @@ mod tests {
                 })
                 .collect();
             let guard: Operation = if array_ir {
-                GuardOperation::<ArrayIrType>::new("region", vec![vector(&declared).into(), vector(&declared).into()])
+                GuardOperation::<Type>::new("region", vec![vector(&declared).into(), vector(&declared).into()])
                     .with_retained_identities(vec![retained.to_variable()])
                     .into()
             } else {
@@ -2280,19 +2280,14 @@ mod tests {
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                CompareOperation::<Type>::new(ComparisonDirection::Equal),
                 Vec::new(),
                 vec![left_dimension, right_dimension],
                 None,
             )
             .unwrap()[0];
         builder
-            .add_instruction(
-                AssertOperation::<ArrayIrType>::new("dimensions must agree"),
-                Vec::new(),
-                vec![predicate],
-                None,
-            )
+            .add_instruction(AssertOperation::<Type>::new("dimensions must agree"), Vec::new(), vec![predicate], None)
             .unwrap();
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder, Placeholder], vec![])
@@ -2373,7 +2368,7 @@ mod tests {
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                CompareOperation::<Type>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![left_dimension, right_dimension],
                 None,
@@ -2381,7 +2376,7 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`left_dimension` <= `right_dimension`")
+                AssertOperation::<Type>::new("`left_dimension` <= `right_dimension`")
                     .with_labels(vec!["left_dimension".to_owned(), "right_dimension".to_owned()]),
                 Vec::new(),
                 vec![predicate, left_dimension, right_dimension],
@@ -2393,7 +2388,7 @@ mod tests {
             .unwrap();
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                CompareOperation::<Type>::new(ComparisonDirection::Equal),
                 Vec::new(),
                 vec![left_dimension, right_dimension],
                 None,
@@ -2401,7 +2396,7 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`left_dimension` == `right_dimension`")
+                AssertOperation::<Type>::new("`left_dimension` == `right_dimension`")
                     .with_labels(vec!["left_dimension".to_owned(), "right_dimension".to_owned()]),
                 Vec::new(),
                 vec![predicate, left_dimension, right_dimension],
@@ -2496,7 +2491,7 @@ mod tests {
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                CompareOperation::<Type>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![left, right],
                 None,
@@ -2504,7 +2499,7 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`left` <= `right`")
+                AssertOperation::<Type>::new("`left` <= `right`")
                     .with_labels(vec!["left".to_owned(), "right".to_owned()]),
                 Vec::new(),
                 vec![predicate, left, right],
@@ -2570,7 +2565,7 @@ mod tests {
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                CompareOperation::<Type>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![first, second],
                 None,
@@ -2578,7 +2573,7 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`first` <= `second`")
+                AssertOperation::<Type>::new("`first` <= `second`")
                     .with_labels(vec!["first".to_owned(), "second".to_owned()]),
                 Vec::new(),
                 vec![predicate, first, second],
@@ -2587,7 +2582,7 @@ mod tests {
             .unwrap();
         let predicate = builder
             .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                CompareOperation::<Type>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![second, third],
                 None,
@@ -2595,7 +2590,7 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`second` <= `third`")
+                AssertOperation::<Type>::new("`second` <= `third`")
                     .with_labels(vec!["second".to_owned(), "third".to_owned()]),
                 Vec::new(),
                 vec![predicate, second, third],
@@ -2657,7 +2652,7 @@ mod tests {
                 let one = builder.add_constant(Constant::Dimension(DimensionValue::constant(1).unwrap()));
                 let positive = builder
                     .add_instruction(
-                        CompareOperation::<ArrayIrType>::new(ComparisonDirection::GreaterThan),
+                        CompareOperation::<Type>::new(ComparisonDirection::GreaterThan),
                         Vec::new(),
                         vec![right, zero],
                         None,
@@ -2665,8 +2660,7 @@ mod tests {
                     .unwrap()[0];
                 builder
                     .add_instruction(
-                        AssertOperation::<ArrayIrType>::new("divisor must be positive")
-                            .with_labels(vec!["right".to_owned()]),
+                        AssertOperation::<Type>::new("divisor must be positive").with_labels(vec!["right".to_owned()]),
                         Vec::new(),
                         vec![positive, right],
                         None,
@@ -2697,7 +2691,7 @@ mod tests {
                 (
                     builder
                         .add_instruction(
-                            CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                            CompareOperation::<Type>::new(ComparisonDirection::Equal),
                             Vec::new(),
                             vec![remainder, zero],
                             None,
@@ -2709,7 +2703,7 @@ mod tests {
                 (
                     builder
                         .add_instruction(
-                            CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                            CompareOperation::<Type>::new(ComparisonDirection::Equal),
                             Vec::new(),
                             vec![left, right],
                             None,
@@ -2720,8 +2714,7 @@ mod tests {
             };
             builder
                 .add_instruction(
-                    AssertOperation::<ArrayIrType>::new(message)
-                        .with_labels(vec!["left".to_owned(), "right".to_owned()]),
+                    AssertOperation::<Type>::new(message).with_labels(vec!["left".to_owned(), "right".to_owned()]),
                     Vec::new(),
                     vec![predicate, left, right],
                     None,
@@ -2909,7 +2902,7 @@ mod tests {
             }
             builder
                 .add_instruction(
-                    AssertOperation::<ArrayIrType>::new("scalar check")
+                    AssertOperation::<Type>::new("scalar check")
                         .with_labels(observations.iter().map(|(label, _, _, _)| (*label).to_owned()).collect()),
                     Vec::new(),
                     inputs,

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationTracer, DeviceMesh,
-    EffectClass, StagedFunction as CoreStagedFunction,
+    AnalyzableCompilationDomain, ArrayType, CompilationCacheDomain, CompilationTracer, DeviceMesh, EffectClass,
+    StagedFunction as CoreStagedFunction,
 };
 use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::staging::{KernelCompilerBinding, KernelExecutionFacts, stage_kernel};
-use crate::{Array, CompilationAnalysis, CompiledProgram, Error, Options, Session};
+use crate::{Array, CompilationAnalysis, CompiledProgram, Error, Options, Session, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -180,7 +180,7 @@ impl KernelAotBundle {
         let facts = KernelExecutionFacts::from_target(session.target()?, options.mesh())?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+        let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, _, inputs: Vec<CompilationTracer<Session>>| Ok(stage_kernel(inputs[0].context(), definition, &inputs)?),
             vec![],
             definition.operation().input_types(),
@@ -509,13 +509,13 @@ pub(crate) mod tests {
         } else {
             vec![]
         };
-        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+        let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, captures: Vec<CompilationTracer<Session>>, inputs| {
                 // Returning the capture retains a real capture slot without introducing unrelated operations.
                 Ok(if captures.is_empty() { inputs } else { captures })
             },
             captures,
-            vec![ArrayIrType::Array(r#type)],
+            vec![Type::Array(r#type)],
             Options::new(mesh.clone()),
         )
         .unwrap();

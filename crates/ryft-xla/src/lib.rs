@@ -89,7 +89,7 @@ pub use sessions::{
 pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
 pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
-pub use values::{ArrayConstant, Constant, Dimension, Reference, Value};
+pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};
 
 // TODO(eaplatanios): Review this module.
 

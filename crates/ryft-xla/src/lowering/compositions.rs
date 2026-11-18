@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, AtomId, CompositeKey, Parameterized, ProgramError, RegionId, RegionRef, RegionRole,
+    ArrayType, AtomId, CompositeKey, Parameterized, ProgramError, RegionId, RegionRef, RegionRole,
     RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, SymbolVisibility, Type,
-    TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, SymbolVisibility,
+    Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
 use crate::lowering::regions::lower_nested_program_inline;
@@ -17,7 +17,7 @@ use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
-use crate::{Constant, Error, FlatProgram, Program};
+use crate::{Constant, Error, FlatProgram, Program, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -28,7 +28,7 @@ use crate::{Constant, Error, FlatProgram, Program};
 /// already determined the explicit transitions and adjoints of the enclosing program, so it must not trigger new
 /// transitions when expanding these functions. Retain mesh placement and reduction state, and keep the original types
 /// in the [`NamedCompositionKey`] so the external operation contract remains unchanged.
-pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<ArrayIrType>, Error> {
+pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<Type>, Error> {
     input_types
         .iter()
         .map(|input| {
@@ -36,7 +36,7 @@ pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result
                 .sharding()
                 .map(|sharding| sharding.clone().with_varying_manual_axes(Vec::<String>::new()))
                 .transpose()?;
-            Ok(ArrayIrType::from(input.clone().with_sharding(sharding)?))
+            Ok(Type::from(input.clone().with_sharding(sharding)?))
         })
         .collect()
 }
@@ -359,7 +359,7 @@ mod tests {
 
         assert_eq!(
             named_composition_input_types(&[boundary, unsharded.clone()]).unwrap(),
-            vec![ArrayIrType::from(local), ArrayIrType::from(unsharded)],
+            vec![Type::from(local), Type::from(unsharded)],
         );
     }
 
@@ -370,7 +370,7 @@ mod tests {
         let boundary_type = ArrayType::scalar(DataType::F32);
         let (_, program) = DomainTracingContext::<Session>::trace(
             |inputs: Vec<Tracer>| Ok(inputs),
-            vec![ArrayIrType::from(boundary_type.clone())],
+            vec![Type::from(boundary_type.clone())],
         )
         .unwrap();
         let program = program.into_simplified().unwrap();
@@ -412,7 +412,7 @@ mod tests {
         for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
             let (_, program) = DomainTracingContext::<Session>::trace(
                 |inputs: Vec<Tracer>| Ok(inputs),
-                vec![ArrayIrType::from(boundary_type.clone())],
+                vec![Type::from(boundary_type.clone())],
             )
             .unwrap();
             let key = NamedCompositionKey::new(composite.clone(), vec![boundary_type.clone()], vec![boundary_type]);

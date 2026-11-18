@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 
 use pretty_assertions::assert_eq;
 use ryft_core::{
-    Add, ArgMax, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, Broadcast, Compare, ComparisonDirection,
-    Context, CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, Div,
+    Add, ArgMax, Array as CoreArray, ArrayOperation, ArrayType, Broadcast, Compare, ComparisonDirection, Context,
+    CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, Div,
     DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, Iota,
     LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Random, Reduce,
     ReductionKind, Reshape, Select, Shape, Sharding, Sub, Tanh, TopK, Typed, Value as CoreValue, ValueProjection,
@@ -20,7 +20,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
-    Array, CompileTracer, CompiledFunction, FromPjrt, Operation, Session, StatefulCompileTracer, Value, compile,
+    Array, CompileTracer, CompiledFunction, FromPjrt, Operation, Session, StatefulCompileTracer, Type, Value, compile,
 };
 
 /// Shape and sampling hyperparameters of the tiny decode loop demo model.
@@ -291,7 +291,7 @@ fn build_decode_loop(
     attention: DecodeAttention,
 ) -> Vec<CompileTracer> {
     let context = inputs[0].value().context().clone();
-    let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayIrType>>();
+    let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<Type>>();
     let steps = configuration.steps;
 
     // The `While` condition and body region programs are staged in the XLA domain universe. Their tracers are

@@ -186,8 +186,8 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Batch, BatchAxis, BatchAxisSpecification, BatchingError,
-    BatchingTracer, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
+    ArrayIrBatchingPolicy, ArrayType, Batch, BatchAxis, BatchAxisSpecification, BatchingError, BatchingTracer,
+    ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, ConstrainSharding, Context, ContextProjection,
     DeviceMesh, DifferentiableType, Dimension as CoreDimension, DimensionValue, DispatcherStatistics,
     DomainTracingContext, ExecutableFunction as CoreExecutableFunction, ForwardModeDifferentiate, ImportingContext,
@@ -204,7 +204,7 @@ use crate::compilation::options::Options;
 use crate::compilation::profile_guided::{AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions};
 use crate::compilation::programs::CompiledProgram;
 use crate::execution::{validate_input_type, validate_runtime_outputs};
-use crate::{Array, Constant, Error, ExecutionError, Operation, Session, Value};
+use crate::{Array, Constant, Error, ExecutionError, Operation, Session, Type, Value};
 
 /// Array IR tracer retained by the experimental stateful XLA program.
 ///
@@ -245,8 +245,8 @@ pub struct CompiledFunctionDispatcher<
     Out: Parameterized<ArrayType>,
 > where
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Array IR domain dispatcher hidden behind the public array projection boundary.
     function: CoreCompiledFunctionDispatcher<Session, Static, ProgramParameters<In>, ProgramParameters<Out>, F>,
@@ -257,9 +257,9 @@ where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     CoreCompiledFunctionDispatcher<Session, Static, ProgramParameters<In>, ProgramParameters<Out>, F>: Clone,
 {
     #[inline]
@@ -273,13 +273,13 @@ where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType>
+    In::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<Array>
         + ParameterizedFamily<StatefulValue>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType>
+    Out::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<Array>
         + ParameterizedFamily<StatefulValue>
@@ -293,13 +293,12 @@ where
             Static,
             ProgramParameterValues<In, StatefulCompileTracer>,
         ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
-        ProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = ProgramParameters<In>>,
-        ProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = ProgramParameters<Out>>,
-        ProgramParameterValues<In, StatefulValue>:
-            Parameterized<StatefulValue, To<ArrayIrType> = ProgramParameters<In>>,
+        ProgramParameters<In>: Parameterized<Type, To<Type> = ProgramParameters<In>>,
+        ProgramParameters<Out>: Parameterized<Type, To<Type> = ProgramParameters<Out>>,
+        ProgramParameterValues<In, StatefulValue>: Parameterized<StatefulValue, To<Type> = ProgramParameters<In>>,
         ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
                 StatefulCompileTracer,
-                To<ArrayIrType> = ProgramParameters<Out>,
+                To<Type> = ProgramParameters<Out>,
                 To<Constant> = ProgramConstants<Out>,
             >,
     {
@@ -328,7 +327,7 @@ where
             ProgramParameterValues<In, StatefulCompileTracer>,
         ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+        C: Context<Type = Type, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
             + ImportingContext<Session, Path>
             + NamedAxes
@@ -365,7 +364,7 @@ where
             Static,
             ProgramParameterValues<In, StatefulCompileTracer>,
         ) -> Result<ProgramParameterValues<Out, StatefulCompileTracer>, Error>,
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+        C: Context<Type = Type, Constant = Constant, Operation = Operation>
             + ImportingContext<Session, Path>
             + NamedAxes
             + MeshContext,
@@ -401,9 +400,9 @@ where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
     #[inline]
@@ -436,12 +435,12 @@ where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType>
+    In::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>
         + ParameterizedFamily<CompileTracer>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType>
+    Out::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>
         + ParameterizedFamily<CompileTracer>,
@@ -479,12 +478,12 @@ where
     Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
     In::ParameterStructure: Eq + Hash,
-    In::Family: ParameterizedFamily<ArrayIrType>
+    In::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>
         + ParameterizedFamily<CompileTracer>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType>
+    Out::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>
         + ParameterizedFamily<CompileTracer>,
@@ -509,8 +508,8 @@ where
 pub struct StatefulCompiledFunctionDispatcher<
     F,
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayIrType>,
-    Out: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
+    Out: Parameterized<Type>,
 > where
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<Constant>,
@@ -523,10 +522,10 @@ pub struct StatefulCompiledFunctionDispatcher<
 impl<F, Static, In, Out> Clone for StatefulCompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<Constant>,
-    Out: Parameterized<ArrayIrType>,
+    Out: Parameterized<Type>,
     Out::Family: ParameterizedFamily<Constant>,
     CoreCompiledFunctionDispatcher<Session, Static, In, Out, F>: Clone,
 {
@@ -539,23 +538,19 @@ where
 impl<F, Static, In, Out> StatefulCompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
     In::ParameterStructure: Eq + Hash,
     In::Family:
         ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue> + ParameterizedFamily<StatefulCompileTracer>,
-    In::To<StatefulValue>: Parameterized<
-            StatefulValue,
-            Family = In::Family,
-            ParameterStructure = In::ParameterStructure,
-            To<ArrayIrType> = In,
-        >,
-    Out: Parameterized<ArrayIrType>,
+    In::To<StatefulValue>:
+        Parameterized<StatefulValue, Family = In::Family, ParameterStructure = In::ParameterStructure, To<Type> = In>,
+    Out: Parameterized<Type>,
     Out::Family:
         ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue> + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<StatefulValue>:
         Parameterized<StatefulValue, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     Out::To<StatefulCompileTracer>:
-        Parameterized<StatefulCompileTracer, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
+        Parameterized<StatefulCompileTracer, To<Type> = Out, To<Constant> = Out::To<Constant>>,
 {
     /// Executes one specialization statefully, compiling it on the first call and reusing it on warm calls.
     ///
@@ -597,10 +592,10 @@ where
 impl<F, Static, In, Out> StatefulCompiledFunctionDispatcher<F, Static, In, Out>
 where
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<Constant>,
-    Out: Parameterized<ArrayIrType>,
+    Out: Parameterized<Type>,
     Out::Family: ParameterizedFamily<Constant>,
 {
     /// Returns a snapshot of this dispatcher's frontend activity (refer to [`DispatcherStatistics`]).
@@ -631,9 +626,9 @@ pub fn jit_statefully_with_options<F, Static, In, Out>(
 where
     F: Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
+    In: Parameterized<Type, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
     In::ParameterStructure: Eq + Hash,
-    Out: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
+    Out: Parameterized<Type, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
 {
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
     let function = move |static_parameters, inputs| {
@@ -665,9 +660,9 @@ pub fn jit_statefully<F, Static, In, Out>(
 where
     F: Fn(Static, In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
     Static: Clone + Debug + Eq + Hash,
-    In: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
+    In: Parameterized<Type, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
     In::ParameterStructure: Eq + Hash,
-    Out: Parameterized<ArrayIrType, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
+    Out: Parameterized<Type, Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>>,
 {
     jit_statefully_with_options(function, session, Options::new(mesh))
 }
@@ -684,7 +679,7 @@ where
 ///
 /// This external state surface is experimental. Ordinary [`CompiledFunction`] calls remain the stable boundary over
 /// arrays.
-pub struct StatefulCompiledFunction<In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
+pub struct StatefulCompiledFunction<In: Parameterized<Type>, Out: Parameterized<Type>>
 where
     In::Family: ParameterizedFamily<Constant>,
     Out::Family: ParameterizedFamily<Constant>,
@@ -695,8 +690,8 @@ where
 
 impl<In, Out> StatefulCompiledFunction<In, Out>
 where
-    In: Parameterized<ArrayIrType>,
-    Out: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
+    Out: Parameterized<Type>,
     In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue>,
     Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulValue>,
     In::To<StatefulValue>: Parameterized<StatefulValue>,
@@ -712,7 +707,7 @@ where
     /// Returns the public flat output types, excluding the hidden final state output suffix that reference
     /// discharge appends for mutated external references.
     #[inline]
-    pub fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
+    pub fn output_types(&self) -> Cow<'_, [Type]> {
         self.function.executable().output_types()
     }
 
@@ -755,13 +750,13 @@ pub fn compile_statefully<F, In, Out>(
 ) -> Result<StatefulCompiledFunction<In, Out>, Error>
 where
     F: FnOnce(In::To<StatefulCompileTracer>) -> Result<Out::To<StatefulCompileTracer>, Error>,
-    In: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
     In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
-    Out: Parameterized<ArrayIrType>,
+    Out: Parameterized<Type>,
     Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<StatefulCompileTracer>:
-        Parameterized<StatefulCompileTracer, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
+        Parameterized<StatefulCompileTracer, To<Type> = Out, To<Constant> = Out::To<Constant>>,
 {
     compile_statefully_with_captures(move |_, inputs| function(inputs), Vec::new(), input_types, session, options)
 }
@@ -784,13 +779,13 @@ where
         Vec<StatefulCompileTracer>,
         In::To<StatefulCompileTracer>,
     ) -> Result<Out::To<StatefulCompileTracer>, Error>,
-    In: Parameterized<ArrayIrType>,
+    In: Parameterized<Type>,
     In::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
-    Out: Parameterized<ArrayIrType>,
+    Out: Parameterized<Type>,
     Out::Family: ParameterizedFamily<Constant> + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<StatefulCompileTracer>:
-        Parameterized<StatefulCompileTracer, To<ArrayIrType> = Out, To<Constant> = Out::To<Constant>>,
+        Parameterized<StatefulCompileTracer, To<Type> = Out, To<Constant> = Out::To<Constant>>,
 {
     let input_types = with_input_shardings(input_types, &options)?;
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
@@ -816,8 +811,8 @@ where
 /// when they were produced at different Rust call sites.
 pub struct StagedFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral staged function carrying the source program, captures, structures, and retained options.
     function: CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>,
@@ -825,8 +820,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone() }
@@ -835,8 +830,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat staged source [`Program`](ryft_core::Program) together with its captured runtime values.
     /// Use it for program transforms (e.g., transposition or partial evaluation of the program itself) and for
@@ -871,7 +866,7 @@ where
     pub fn call<L, C, Path>(&self, inputs: In::To<L>) -> Result<Out::To<L>, ProgramError>
     where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+        C: Context<Type = Type, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
             + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
@@ -898,7 +893,7 @@ where
         inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
     ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
+        C: Context<Type = Type, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -918,8 +913,8 @@ where
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
     From<CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>> for StagedFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     #[inline]
     fn from(function: CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>) -> Self {
@@ -935,8 +930,8 @@ where
 /// derived from its backend state, and no unsafe blanket implementation is used.
 pub struct ExecutableFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral executable function retaining the compiled program, the captured runtime values, and the
     /// runtime signature.
@@ -945,8 +940,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -956,8 +951,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat output [`ArrayType`]s in executor order.
     #[inline]
@@ -984,14 +979,14 @@ where
     where
         In: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayIrType>
+                Family: ParameterizedFamily<Type>
                             + ParameterizedFamily<Constant>
                             + ParameterizedFamily<Array>
                             + ParameterizedFamily<StatefulValue>,
             >,
         Out: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayIrType>
+                Family: ParameterizedFamily<Type>
                             + ParameterizedFamily<Constant>
                             + ParameterizedFamily<Array>
                             + ParameterizedFamily<StatefulValue>,
@@ -1018,14 +1013,14 @@ where
     where
         In: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayIrType>
+                Family: ParameterizedFamily<Type>
                             + ParameterizedFamily<Constant>
                             + ParameterizedFamily<Array>
                             + ParameterizedFamily<StatefulValue>,
             >,
         Out: Parameterized<
                 ArrayType,
-                Family: ParameterizedFamily<ArrayIrType>
+                Family: ParameterizedFamily<Type>
                             + ParameterizedFamily<Constant>
                             + ParameterizedFamily<Array>
                             + ParameterizedFamily<StatefulValue>,
@@ -1071,9 +1066,9 @@ impl Session {
     ) -> Result<CompiledFunction<In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
-        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
         Out: Parameterized<ArrayType>,
-        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     {
         let function = staged.function.lower(self)?.compile(self)?;
         Ok(CompiledFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
@@ -1087,9 +1082,9 @@ impl Session {
     ) -> Result<ExecutableFunction<In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
-        In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
         Out: Parameterized<ArrayType>,
-        Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     {
         self.validate_replacement(executable.function.compiled_program(), &program)?;
         Ok(ExecutableFunction { function: executable.function.with_compiled_program(program) })
@@ -1107,9 +1102,9 @@ impl Session {
     ) -> Result<AdaptiveProfileGuidedFunction<In, Out>, Error>
     where
         In: Parameterized<ArrayType>,
-        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
         Out: Parameterized<ArrayType>,
-        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     {
         AdaptiveProfileGuidedFunction::new(
             self.clone(),
@@ -1137,8 +1132,8 @@ impl Session {
 /// printed IR, instruction counts, and graph rendering).
 pub struct CompiledFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
@@ -1151,8 +1146,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone(), derived: Arc::clone(&self.derived) }
@@ -1161,8 +1156,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
@@ -1208,7 +1203,7 @@ where
     pub fn call<L, C, Path>(&self, inputs: In::To<L>) -> Result<Out::To<L>, ProgramError>
     where
         L: CoreValue<Type = ArrayType, Domain = ProjectedContext<C, ArrayType>>,
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>
+        C: Context<Type = Type, Constant = Constant, Operation = Operation>
             + ContextProjection<ArrayType>
             + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
@@ -1232,7 +1227,7 @@ where
         inputs: In::To<<C::Value as ValueProjection<ArrayType>>::Projected>,
     ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
+        C: Context<Type = Type, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -1282,7 +1277,7 @@ where
 impl<In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledFunction<In, ArrayType>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Debug + Hash + PartialEq,
@@ -1320,11 +1315,8 @@ where
                 To<ArrayType> = In,
                 To<Constant> = In::To<Constant>,
             >,
-        ProgramParameterValues<In, StatefulCompileTracer>: Parameterized<
-                StatefulCompileTracer,
-                To<ArrayIrType> = ProgramParameters<In>,
-                To<Constant> = ProgramConstants<In>,
-            >,
+        ProgramParameterValues<In, StatefulCompileTracer>:
+            Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<In>, To<Constant> = ProgramConstants<In>>,
     {
         {
             let slot = self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned");
@@ -1394,12 +1386,12 @@ where
 impl<In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Debug + Hash + PartialEq,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<StatefulCompileTracer>,
 {
@@ -1436,7 +1428,7 @@ where
             >,
         ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
                 StatefulCompileTracer,
-                To<ArrayIrType> = ProgramParameters<Out>,
+                To<Type> = ProgramParameters<Out>,
                 To<Constant> = ProgramConstants<Out>,
             >,
     {
@@ -1510,7 +1502,7 @@ where
 impl<In: Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<BatchAxis>
         + ParameterizedFamily<CompileTracer>
@@ -1518,18 +1510,15 @@ where
         + ParameterizedFamily<CompileBatchTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<BatchAxis>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>
         + ParameterizedFamily<CompileBatchTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     /// Returns a new compiled function that runs `self` once over a whole batch of `batch_axis.extent()` items instead
     /// of once per item. Mirrors `jax.jit(jax.vmap(f))`. The returned function stages [`batch`](ryft_core::batch)
@@ -1669,22 +1658,19 @@ pub fn compile<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
 where
     F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     compile_with_options(function, input_types, session, Options::new(mesh))
 }
@@ -1705,22 +1691,19 @@ pub fn compile_with_captures<F, In: Parameterized<ArrayType>, Out: Parameterized
 where
     F: FnOnce(Vec<CompileTracer>, In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     compile_with_flat_captures(
         |_, capture_tracers, inputs| Ok(function(capture_tracers, inputs)),
@@ -1742,22 +1725,19 @@ pub fn compile_with_options<F, In: Parameterized<ArrayType>, Out: Parameterized<
 where
     F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     compile_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, session, options)
 }
@@ -1779,22 +1759,19 @@ pub fn stage<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
 where
     F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     stage_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options)
 }
@@ -1814,22 +1791,19 @@ pub fn stage_with_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<A
 where
     F: FnOnce(Vec<CompileTracer>, In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     stage_with_flat_captures(
         |_, capture_tracers, inputs| Ok(function(capture_tracers, inputs)),
@@ -1849,22 +1823,20 @@ pub fn infer_output_types<F, In: Parameterized<ArrayType>, Out: Parameterized<Ar
 where
     F: FnOnce(In::To<CompileTracer>) -> Out::To<CompileTracer>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out>,
 {
     let input_structure = input_types.parameter_structure();
-    let input_types = ProgramParameters::<In>::from_parameters(
-        input_structure,
-        input_types.into_parameters().map(ArrayIrType::from),
-    )?;
+    let input_types =
+        ProgramParameters::<In>::from_parameters(input_structure, input_types.into_parameters().map(Type::from))?;
     let output_types = DomainTracingContext::<Session, StatefulValue>::infer_output_type(
         |tracers| {
             let input_structure = tracers.parameter_structure();
@@ -1892,10 +1864,10 @@ where
 }
 
 /// Internal reparameterization of one public array parameter tree into the production array IR type family.
-type ProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
+type ProgramParameters<P> = <P as Parameterized<ArrayType>>::To<Type>;
 
 /// Internal value tree corresponding to one public array parameter tree.
-type ProgramParameterValues<P, V> = <ProgramParameters<P> as Parameterized<ArrayIrType>>::To<V>;
+type ProgramParameterValues<P, V> = <ProgramParameters<P> as Parameterized<Type>>::To<V>;
 
 /// Tree of captured constants corresponding to one public array parameter tree.
 type ProgramConstants<P> = ProgramParameterValues<P, Constant>;
@@ -1970,10 +1942,10 @@ fn project_values<P, V>(
 ) -> Result<P::To<<V as ValueProjection<ArrayType>>::Projected>, ProgramError>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayIrType>
+    P::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<V>
         + ParameterizedFamily<<V as ValueProjection<ArrayType>>::Projected>,
-    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Parameter>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: Parameter>,
 {
     let structure = values.parameter_structure();
     let parameters = values
@@ -1990,10 +1962,10 @@ fn lift_values<P, V>(
 ) -> Result<ProgramParameterValues<P, V>, ProgramError>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<ArrayIrType>
+    P::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<V>
         + ParameterizedFamily<<V as ValueProjection<ArrayType>>::Projected>,
-    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Parameter>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: Parameter>,
 {
     let structure = values.parameter_structure();
     let parameters = values.into_parameters().map(<V as ValueProjection<ArrayType>>::from_projected);
@@ -2007,7 +1979,7 @@ where
 /// mesh axes, which is also the type that the corresponding input or output of the compiled function has.
 fn place<V>(value: V, sharding: &Sharding) -> Result<V, ProgramError>
 where
-    V: CoreValue<Type = ArrayIrType> + Reshard + ConstrainSharding,
+    V: CoreValue<Type = Type> + Reshard + ConstrainSharding,
 {
     let current = <&ArrayType>::try_from(value.r#type().as_ref())?.sharding().cloned();
     let tracked = sharding.without_auto_axes();
@@ -2040,7 +2012,7 @@ where
 /// executions return. Outputs that are not arrays are left for lowering to reject.
 fn place_outputs<V, P>(outputs: P, shardings: Option<&[Sharding]>) -> Result<P, Error>
 where
-    V: CoreValue<Type = ArrayIrType> + Reshard + ConstrainSharding,
+    V: CoreValue<Type = Type> + Reshard + ConstrainSharding,
     P: Parameterized<V>,
 {
     let Some(shardings) = shardings else {
@@ -2059,8 +2031,8 @@ where
         .into_iter()
         .zip(shardings)
         .map(|(output, sharding)| match output.r#type().as_ref() {
-            ArrayIrType::Array(_) => place(output, sharding),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Ok(output),
+            Type::Array(_) => place(output, sharding),
+            Type::Dimension(_) | Type::Reference(_) => Ok(output),
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(P::from_parameters(structure, outputs).map_err(ProgramError::from)?)
@@ -2072,25 +2044,21 @@ where
 /// The call thereby constrains its inputs to the placement of the called function in the context of the caller, which
 /// composes with transforms, much like an execution reshards concrete inputs. Other inputs are returned unchanged, so
 /// that binding the call reports any other mismatch.
-fn place_inputs<V>(
-    inputs: Vec<V>,
-    input_types: &[ArrayIrType],
-    overrides: Option<&[Sharding]>,
-) -> Result<Vec<V>, ProgramError>
+fn place_inputs<V>(inputs: Vec<V>, input_types: &[Type], overrides: Option<&[Sharding]>) -> Result<Vec<V>, ProgramError>
 where
-    V: CoreValue<Type = ArrayIrType> + Reshard + ConstrainSharding,
+    V: CoreValue<Type = Type> + Reshard + ConstrainSharding,
 {
     inputs
         .into_iter()
         .enumerate()
         .map(|(index, input)| {
             if let Some(sharding) = overrides.and_then(|overrides| overrides.get(index))
-                && matches!(input.r#type().as_ref(), ArrayIrType::Array(_))
+                && matches!(input.r#type().as_ref(), Type::Array(_))
             {
                 return place(input, sharding);
             }
             let target = match (input.r#type().as_ref(), input_types.get(index)) {
-                (ArrayIrType::Array(actual), Some(ArrayIrType::Array(expected))) if actual != expected => {
+                (Type::Array(actual), Some(Type::Array(expected))) if actual != expected => {
                     expected.sharding().filter(|&sharding| {
                         actual.clone().with_sharding(sharding.clone()).is_ok_and(|actual| &actual == expected)
                     })
@@ -2116,16 +2084,16 @@ fn call_staged_in_context<In, Out, C, Path>(
 ) -> Result<Out::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ProgramError>
 where
     In: Parameterized<ArrayType>,
-    In::Family: ParameterizedFamily<ArrayIrType>
+    In::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<C::Value>
         + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
     Out: Parameterized<ArrayType>,
-    Out::Family: ParameterizedFamily<ArrayIrType>
+    Out::Family: ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<C::Value>
         + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation> + ImportingContext<Session, Path>,
     C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
 {
     let input_structure = inputs.parameter_structure();
@@ -2160,22 +2128,19 @@ fn compile_with_flat_captures<F, In: Parameterized<ArrayType>, Out: Parameterize
 where
     F: FnOnce(Vec<Constant>, Vec<CompileTracer>, In::To<CompileTracer>) -> Result<Out::To<CompileTracer>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     let staged = stage_with_flat_captures::<F, In, Out>(function, captures, input_types, options)?;
     session.compile_staged_function(staged)
@@ -2202,27 +2167,24 @@ fn stage_with_flat_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<
 where
     F: FnOnce(Vec<Constant>, Vec<CompileTracer>, In::To<CompileTracer>) -> Result<Out::To<CompileTracer>, Error>,
     In::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<Type>
         + ParameterizedFamily<Constant>
         + ParameterizedFamily<CompileTracer>
         + ParameterizedFamily<StatefulCompileTracer>,
     Out::To<CompileTracer>: Parameterized<CompileTracer, To<ArrayType> = Out, To<Constant> = Out::To<Constant>>,
-    ProgramParameterValues<Out, StatefulCompileTracer>: Parameterized<
-            StatefulCompileTracer,
-            To<ArrayIrType> = ProgramParameters<Out>,
-            To<Constant> = ProgramConstants<Out>,
-        >,
+    ProgramParameterValues<Out, StatefulCompileTracer>:
+        Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
     let captures = captures.into_iter().map(Value::Array).collect();
     let input_structure = input_types.parameter_structure();
     let input_types =
-        ProgramParameters::<In>::from_parameters(input_structure, input_types.into_parameters().map(ArrayIrType::from))
+        ProgramParameters::<In>::from_parameters(input_structure, input_types.into_parameters().map(Type::from))
             .map_err(ProgramError::from)?;
     let output_shardings = options.output_shardings().map(<[Sharding]>::to_vec);
     let function = move |capture_references,
@@ -2255,21 +2217,21 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, Array as CoreArray, ArrayIrType, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis,
-        BatchAxisSpecification, Broadcast, CaptureReference, Compare, ComparisonDirection, Condition, Context,
-        ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, DataType, DifferentiableType,
-        Differentiate, DifferentiationError, Dimension as CoreDimension, DimensionBounds, DimensionSize,
-        DimensionSizeOperation, DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable,
-        ErasedOperation, Error as CoreError, ForwardModeDifferentiate, Hessian, ImportingContext, Jacobian, MaybeZero,
-        Memory, MeshAxisType, Mul, Parameter, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError,
-        ProjectedContext, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, ReshapeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError,
-        ResidualRejection, ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation, ScanOptions, Shape, Sharding,
-        ShardingDimension, Sin, Slice, Softmax, StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation,
-        Trace, Tracer, TracingContext, TranspositionContext, Typed, TypedProgram, Value as CoreValue, ValueProjection,
-        batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
+        Add, AddOperation, Array as CoreArray, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
+        ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis, BatchAxisSpecification, Broadcast,
+        CaptureReference, Compare, ComparisonDirection, Condition, Context, ConvertElementType, Cos,
+        CotangentAccumulator, CotangentDestinationKind, DataType, DifferentiableType, Differentiate,
+        DifferentiationError, Dimension as CoreDimension, DimensionBounds, DimensionSize, DimensionSizeOperation,
+        DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable, ErasedOperation, Error as CoreError,
+        ForwardModeDifferentiate, Hessian, ImportingContext, Jacobian, MaybeZero, Memory, MeshAxisType, Mul, Parameter,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, ReshapeOperation,
+        ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualRejection, ResidualStorage,
+        SaveAndOffloadOnlyTheseNames, ScanOperation, ScanOptions, Shape, Sharding, ShardingDimension, Sin, Slice,
+        Softmax, StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation, Trace, Tracer, TracingContext,
+        TranspositionContext, Typed, TypedProgram, Value as CoreValue, ValueProjection, batch, batch_in_parent,
+        composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
         softmax_cross_entropy_with_target_logits,
     };
     use ryft_macros::Parameterized;
@@ -2286,7 +2248,7 @@ mod tests {
     };
     use crate::{
         Array, Constant, Error, ExecutionError, JitCallOperation, Operation, RaggedDotLoweringStrategy, Reference,
-        Session, ThroughSession, Value,
+        Session, ThroughSession, Type, Value,
     };
 
     use super::*;
@@ -2295,7 +2257,7 @@ mod tests {
     /// the XLA program universe, so that program transforms of a program with references can be replayed into a
     /// stateful compilation.
     fn accumulate_and_read_program(
-        reference_type: &ArrayIrType,
+        reference_type: &Type,
         array_type: &ArrayType,
     ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
         let (_, program) = <Session>::trace(
@@ -2303,7 +2265,7 @@ mod tests {
                 reference.add_update(&update)?;
                 reference.read()
             },
-            (reference_type.clone(), ArrayIrType::Array(array_type.clone())),
+            (reference_type.clone(), Type::Array(array_type.clone())),
         )
         .unwrap();
         program.into_flat_program()
@@ -2543,7 +2505,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let function = jit_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let function = jit_statefully::<_, (), (Type, Type), Type>(
             |(), (reference, update): (StatefulCompileTracer, StatefulCompileTracer)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
@@ -2585,7 +2547,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let function = jit_statefully_with_options::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let function = jit_statefully_with_options::<_, (), (Type, Type), Type>(
             |(), (reference, update): (StatefulCompileTracer, StatefulCompileTracer)| {
                 reference.add_update(&update)?;
                 Ok(reference.read()?)
@@ -2618,19 +2580,19 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(reference, update)| {
                 reference.add_update(&update)?;
                 reference.read().map_err(Into::into)
             },
-            (reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh),
         )
         .unwrap();
-        assert_eq!(compiled.output_types().as_ref(), &[ArrayIrType::Array(array_type.clone())]);
-        assert_eq!(compiled.executable().output_types().as_ref(), &[ArrayIrType::Array(array_type)]);
+        assert_eq!(compiled.output_types().as_ref(), &[Type::Array(array_type.clone())]);
+        assert_eq!(compiled.executable().output_types().as_ref(), &[Type::Array(array_type)]);
     }
 
     #[test]
@@ -2639,13 +2601,13 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(reference, update)| {
                 reference.add_update(&update)?;
                 reference.read().map_err(Into::into)
             },
-            (reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -2696,7 +2658,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
 
         // The program transform derives `[r, x, ṫr, ẋ] ↦ [y, ẏ]`, and replaying it into the stateful trace makes
         // both the reference and its tangent reference public holders of the compiled function.
@@ -2705,30 +2667,24 @@ mod tests {
             jvp.input_types(),
             vec![
                 reference_type.clone(),
-                ArrayIrType::Array(array_type.clone()),
+                Type::Array(array_type.clone()),
                 reference_type.clone(),
-                ArrayIrType::Array(array_type.clone()),
+                Type::Array(array_type.clone()),
             ],
         );
-        let compiled =
-            compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType, ArrayIrType), (ArrayIrType, ArrayIrType)>(
-                |(reference, update, tangent_reference, tangent_update)| {
-                    let context = reference.context().clone();
-                    let mut outputs =
-                        jvp.interpret_in_context(&context, vec![reference, update, tangent_reference, tangent_update])?;
-                    let tangent = outputs.remove(1);
-                    Ok((outputs.remove(0), tangent))
-                },
-                (
-                    reference_type.clone(),
-                    ArrayIrType::Array(array_type.clone()),
-                    reference_type,
-                    ArrayIrType::Array(array_type.clone()),
-                ),
-                &session,
-                Options::new(mesh.clone()),
-            )
-            .unwrap();
+        let compiled = compile_statefully::<_, (Type, Type, Type, Type), (Type, Type)>(
+            |(reference, update, tangent_reference, tangent_update)| {
+                let context = reference.context().clone();
+                let mut outputs =
+                    jvp.interpret_in_context(&context, vec![reference, update, tangent_reference, tangent_update])?;
+                let tangent = outputs.remove(1);
+                Ok((outputs.remove(0), tangent))
+            },
+            (reference_type.clone(), Type::Array(array_type.clone()), reference_type, Type::Array(array_type.clone())),
+            &session,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
 
         // Both references are committed after the call. The primal holder accumulates the update, the tangent holder
         // accumulates the tangent update, and the outputs read the committed states.
@@ -2763,7 +2719,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
 
         // The program pullback of `y = { r += x; read(r) }` under a `Reference` destination for `r` consumes
         // `[ȳ, r̄]` and returns `[r̄, x̄]`, where the destination is returned by identity. The stateful ABI cannot
@@ -2778,16 +2734,16 @@ mod tests {
                 &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return],
             )
             .unwrap();
-        assert_eq!(pullback.input_types(), vec![ArrayIrType::Array(array_type.clone()), reference_type.clone()]);
-        assert_eq!(pullback.output_types(), vec![reference_type.clone(), ArrayIrType::Array(array_type.clone())]);
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        assert_eq!(pullback.input_types(), vec![Type::Array(array_type.clone()), reference_type.clone()]);
+        assert_eq!(pullback.output_types(), vec![reference_type.clone(), Type::Array(array_type.clone())]);
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(cotangent_reference, output_cotangent)| {
                 let context = cotangent_reference.context().clone();
                 let mut outputs =
                     pullback.interpret_in_context(&context, vec![output_cotangent, cotangent_reference])?;
                 Ok(outputs.remove(1))
             },
-            (reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -2822,12 +2778,12 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully::<_, Type, Type>(
             |input| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 Ok((input.clone() + input).into_value())
             },
-            ArrayIrType::Array(array_type.clone()),
+            Type::Array(array_type.clone()),
             &session,
             Options::new(mesh.clone()),
         )
@@ -2845,9 +2801,9 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully::<_, Type, Type>(
             |reference| reference.read().map_err(Into::into),
-            ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
+            Type::Reference(ReferenceType::new(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -2877,12 +2833,12 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully::<_, Type, Type>(
             |input| {
                 let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
                 Ok((input.clone() + input).into_value())
             },
-            ArrayIrType::Array(array_type.clone()),
+            Type::Array(array_type.clone()),
             &session,
             Options::new(mesh.clone()),
         )
@@ -2901,7 +2857,7 @@ mod tests {
         let session = session_with_client(client);
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(scalar_type.clone()));
         let array = |r#type: &ArrayType, values: &[f32]| {
             Array::from_host_buffer(
                 &session,
@@ -2934,7 +2890,7 @@ mod tests {
         let (value, gradient) = differentiate_at(bind(&eager_reference))
             .value_and_gradient(|reference| square_after_doubling!(reference))
             .unwrap();
-        let compiled = compile_statefully::<_, ArrayIrType, (ArrayIrType, ArrayIrType)>(
+        let compiled = compile_statefully::<_, Type, (Type, Type)>(
             |reference| {
                 Ok(differentiate_at(reference)
                     .value_and_gradient(|reference| square_after_doubling!(reference))
@@ -2966,7 +2922,7 @@ mod tests {
             BatchAxisSpecification::default(),
         )
         .unwrap_err();
-        let compiled_error = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let compiled_error = compile_statefully::<_, (Type, Type), Type>(
             |(reference, updates)| {
                 Ok(batch(
                     |(reference, update)| {
@@ -2980,7 +2936,7 @@ mod tests {
                 )
                 .map_err(ProgramError::from)?)
             },
-            (reference_type, ArrayIrType::Array(vector_type)),
+            (reference_type, Type::Array(vector_type)),
             &session,
             Options::new(mesh),
         )
@@ -3028,8 +2984,8 @@ mod tests {
         let (_, pullback) = session.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert!(pullback.residuals().is_empty());
         let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap().into_program();
-        let [seed_type, buffer_type] = <[ArrayIrType; 2]>::try_from(pullback.input_types().into_owned()).unwrap();
-        assert!(matches!(&buffer_type, ArrayIrType::Reference(_)));
+        let [seed_type, buffer_type] = <[Type; 2]>::try_from(pullback.input_types().into_owned()).unwrap();
+        assert!(matches!(&buffer_type, Type::Reference(_)));
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -3040,7 +2996,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+        let compiled = compile_statefully::<_, (Type, Type), ()>(
             |(buffer, seed)| {
                 let context = buffer.context().clone();
                 pullback.interpret_in_context(&context, vec![seed, buffer])?;
@@ -3072,9 +3028,9 @@ mod tests {
         let array_type = ArrayType::scalar(DataType::F32);
 
         // A reference allocated inside the program has no host identity the ABI could hand back.
-        let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let error = compile_statefully::<_, Type, Type>(
             |input| input.reference_new().map_err(Into::into),
-            ArrayIrType::Array(array_type.clone()),
+            Type::Array(array_type.clone()),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3089,9 +3045,9 @@ mod tests {
 
         // A forwarded external reference is rejected as well, because the ABI commits holders in place and returns no
         // reference outputs.
-        let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let error = compile_statefully::<_, Type, Type>(
             Ok,
-            ArrayIrType::Reference(ReferenceType::new(array_type)),
+            Type::Reference(ReferenceType::new(array_type)),
             &session,
             Options::new(mesh),
         )
@@ -3111,7 +3067,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
 
         fn forward(
             _: Vec<Constant>,
@@ -3123,14 +3079,14 @@ mod tests {
 
         // A nested call may return the external reference that it receives, because that reference never crosses the
         // ABI as an output of the enclosing program.
-        let inner = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session, Type, Type>::stage(
             forward,
             Vec::new(),
             reference_type.clone(),
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let outer = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let outer = compile_statefully::<_, Type, Type>(
             move |reference| inner.call(reference)?.read().map_err(Into::into),
             reference_type,
             &session,
@@ -3165,16 +3121,16 @@ mod tests {
 
         // A reference that a nested call allocates has no caller allocation that could receive it, so embedding the
         // call is rejected with a diagnostic that names the offending output.
-        let inner = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session, Type, Type>::stage(
             allocate_reference,
             Vec::new(),
-            ArrayIrType::Array(array_type.clone()),
+            Type::Array(array_type.clone()),
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let error = compile_statefully::<_, Type, Type>(
             move |input| inner.call(input)?.freeze().map_err(Into::into),
-            ArrayIrType::Array(array_type),
+            Type::Array(array_type),
             &session,
             Options::new(mesh),
         )
@@ -3201,16 +3157,16 @@ mod tests {
         let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let read = compile_statefully::<_, Type, Type>(
             |reference| reference.read().map_err(Into::into),
-            ArrayIrType::Reference(ReferenceType::new(declared_type.clone())),
+            Type::Reference(ReferenceType::new(declared_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let mutation = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+        let mutation = compile_statefully::<_, (Type, Type), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
-            (ArrayIrType::Reference(ReferenceType::new(declared_type.clone())), ArrayIrType::Array(declared_type)),
+            (Type::Reference(ReferenceType::new(declared_type.clone())), Type::Array(declared_type)),
             &session,
             Options::new(mesh.clone()),
         );
@@ -3259,13 +3215,13 @@ mod tests {
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully_with_captures::<_, Type, Type>(
             |captures, update| {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
             vec![Value::Reference(Reference::new(reference.clone(), session.clone()))],
-            ArrayIrType::Array(array_type.clone()),
+            Type::Array(array_type.clone()),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3288,13 +3244,13 @@ mod tests {
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+        let result = compile_statefully_with_captures::<_, Type, Type>(
             |captures, _| captures[0].read().map_err(Into::into),
             vec![
                 Value::Reference(Reference::new(reference.clone(), session.clone())),
                 Value::Reference(Reference::new(reference, session.clone())),
             ],
-            ArrayIrType::Array(array_type),
+            Type::Array(array_type),
             &session,
             Options::new(mesh),
         );
@@ -3403,7 +3359,7 @@ mod tests {
             Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, 7f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let inner = CoreStagedFunction::<Session, (), ArrayIrType>::stage(
+        let inner = CoreStagedFunction::<Session, (), Type>::stage(
             |_, mut captures, ()| Ok(captures.remove(0)),
             vec![capture],
             (),
@@ -3417,7 +3373,7 @@ mod tests {
                 in (%0)"},
         );
 
-        let outer = CoreStagedFunction::<Session, ArrayIrType, (ArrayIrType, ArrayIrType)>::stage(
+        let outer = CoreStagedFunction::<Session, Type, (Type, Type)>::stage(
             |_, _, input| {
                 // No input leaf can recover the enclosing trace when the callee has no public inputs.
                 assert!(matches!(
@@ -3430,7 +3386,7 @@ mod tests {
                 Ok((typed, flat.remove(0)))
             },
             Vec::new(),
-            ArrayIrType::Array(array_type.clone()),
+            Type::Array(array_type.clone()),
             Options::new(mesh.clone()),
         )
         .unwrap();
@@ -3605,9 +3561,9 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully::<_, Type, Type>(
             |reference| reference.read().map_err(Into::into),
-            ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
+            Type::Reference(ReferenceType::new(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3751,7 +3707,7 @@ mod tests {
             let dot = x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.tag("dot")?;
             Ok(dot.sin()?.into_value())
         }
-        fn value_and_gradient<P: Clone + ResidualPolicy<ArrayIrType>>(
+        fn value_and_gradient<P: Clone + ResidualPolicy<Type>>(
             session: &Session,
             input: Array,
             policy: P,
@@ -5501,7 +5457,7 @@ mod tests {
         )
         .unwrap();
         let executable = compiled.executable();
-        assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
+        assert_eq!(executable.function.input_types(), &[Type::Array(input_type.clone())]);
         assert_eq!(executable.output_types(), std::slice::from_ref(&input_type));
 
         let input =
@@ -5544,7 +5500,7 @@ mod tests {
         )
         .unwrap();
         let executable = compiled.executable();
-        assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
+        assert_eq!(executable.function.input_types(), &[Type::Array(input_type.clone())]);
         assert_eq!(executable.output_types(), &[input_type.clone(), input_type.clone(), input_type.clone()]);
 
         // Reusing one executable must start each invocation's cotangent state at zero. In particular, returning to
@@ -5574,7 +5530,7 @@ mod tests {
         let session = session_with_client(client);
         for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]));
-            let reference_type = ArrayIrType::Reference(ReferenceType::new(input_type.clone()));
+            let reference_type = Type::Reference(ReferenceType::new(input_type.clone()));
 
             // The callee captures the complete root and receives the scan index as an ordinary input. It forms its
             // scalar view locally, so no view crosses the call boundary. Capture 0 must still resolve to that same root
@@ -5734,20 +5690,20 @@ mod tests {
         #[derive(Clone, Debug)]
         struct ReshapeStorage;
 
-        impl ResidualStorage<ArrayIrType> for ReshapeStorage {
+        impl ResidualStorage<Type> for ReshapeStorage {
             fn name(&self) -> String {
                 "reshape".to_owned()
             }
 
-            fn store_payloads(&self, residual_type: &ArrayIrType) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+            fn store_payloads(&self, residual_type: &Type) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
                 let _ = residual_type;
                 Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8], vec![8, 1]))])
             }
 
             fn restore_payloads(
                 &self,
-                stored_type: &ArrayIrType,
-                residual_type: &ArrayIrType,
+                stored_type: &Type,
+                residual_type: &Type,
             ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
                 let _ = (stored_type, residual_type);
                 Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8, 1], vec![8]))])
@@ -5759,7 +5715,7 @@ mod tests {
         #[derive(Clone)]
         struct SaveTaggedThroughReshape;
 
-        impl ResidualPolicy<ArrayIrType> for SaveTaggedThroughReshape {
+        impl ResidualPolicy<Type> for SaveTaggedThroughReshape {
             type Storage = ReshapeStorage;
 
             fn name(&self) -> &str {
@@ -5768,7 +5724,7 @@ mod tests {
 
             fn classify(
                 &self,
-                candidate: &ResidualCandidate<'_, ArrayIrType>,
+                candidate: &ResidualCandidate<'_, Type>,
             ) -> Result<ResidualDecision<ReshapeStorage>, ResidualRejection> {
                 let saved = candidate
                     .producers()
@@ -6904,7 +6860,7 @@ mod tests {
 
         let options = Options::new(mesh).with_input_shardings(vec![sharding.clone()]);
         let staged: StagedFunction<ArrayType, ArrayType> = stage(|x| x.sin().unwrap(), input_type, options).unwrap();
-        let ArrayIrType::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
+        let Type::Array(staged_input_type) = &staged.source_program().program().input_types()[0] else {
             panic!("public staged input should remain an array");
         };
         assert_eq!(staged_input_type.sharding(), Some(&sharding));

@@ -31,12 +31,18 @@ use ryft_core::{
     Add, Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, CaptureConstant,
     CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context, DataType, DimensionType,
     DimensionValue, Div, EagerContext, LiteralIdentity, Mul, Neg, Parameter, ProgramError, ProjectedContext,
-    ProjectedValue, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed, Value as CoreValue,
-    ValueDirectDispatch, ValueDomainDispatch, ValueProjection, WhilePredicate,
+    ProjectedValue, ReferenceId, ReferenceType, Sub, Type as CoreType, TypeError, TypeIdentityRenaming, Typed,
+    Value as CoreValue, ValueDirectDispatch, ValueDomainDispatch, ValueProjection, WhilePredicate,
 };
 use ryft_macros::Parameter;
 
 use crate::{Array, Session, SessionConstant};
+
+/// Type of an XLA [`Value`], which is the [`ArrayIrType`] of `ryft-core` used as it is. XLA defines its own values,
+/// constants, and operations, but it adds no types of its own, so this alias only gives the type universe of
+/// [`Session`] the name that this crate uses for its other members. Being an alias, it is interchangeable with
+/// [`ArrayIrType`] everywhere, including in patterns and in the paths of its variants (e.g., `Type::Array`).
+pub type Type = ArrayIrType;
 
 /// First-class runtime dimension bound to the [`Session`] session in which array results derived from it are
 /// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`].
@@ -118,7 +124,7 @@ impl Typed for Dimension {
 impl Compare<Value, DimensionType> for Dimension {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Value, ProgramError> {
         let inputs = [Value::Dimension(self.clone()), Value::Dimension(other.clone())];
-        Ok(self.session.bind(CompareOperation::<ArrayIrType>::new(direction), Vec::new(), &inputs)?.remove(0))
+        Ok(self.session.bind(CompareOperation::<Type>::new(direction), Vec::new(), &inputs)?.remove(0))
     }
 }
 
@@ -135,7 +141,7 @@ impl CoreValue for Dimension {
 
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<Self::Type as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self::new(self.value.rename_type_identities(renaming)?, self.session.clone()))
     }
@@ -313,13 +319,13 @@ impl Display for Value {
 }
 
 impl Typed for Value {
-    type Type = ArrayIrType;
+    type Type = Type;
 
-    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+    fn r#type(&self) -> Cow<'_, Type> {
         Cow::Owned(match self {
-            Self::Array(value) => ArrayIrType::Array(value.r#type().into_owned()),
-            Self::Dimension(value) => ArrayIrType::Dimension(value.r#type().into_owned()),
-            Self::Reference(value) => ArrayIrType::Reference(value.r#type().into_owned()),
+            Self::Array(value) => Type::Array(value.r#type().into_owned()),
+            Self::Dimension(value) => Type::Dimension(value.r#type().into_owned()),
+            Self::Reference(value) => Type::Reference(value.r#type().into_owned()),
         })
     }
 }
@@ -344,7 +350,7 @@ impl CoreValue for Value {
 
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<Self::Type as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         match self {
             Self::Array(value) => Ok(Self::Array(value.rename_type_identities(renaming)?)),
@@ -623,7 +629,7 @@ impl CoreValue for ArrayConstant {
 
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<ArrayType as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         match self {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
@@ -714,7 +720,7 @@ impl AssertionValue for ArrayConstant {
 ///
 ///   - **Captured runtime values:** array buffers and external references stay in the surrounding
 ///     compiled function's capture table, while the program stores only a lifetime-free [`CaptureReference`] carrying
-///     its index and structural [`ArrayIrType`]. This keeps runtime storage out of literal IR payloads. A captured
+///     its index and structural [`Type`]. This keeps runtime storage out of literal IR payloads. A captured
 ///     reference remains metadata only and must be validated and discharged before ordinary XLA lowering.
 ///   - **Immediate first-class dimensions:** a [`DimensionValue`] is a checked host integer, so embedding it costs
 ///     nothing and it lowers to a scalar `stablehlo.constant`. Unlike a capture reference, it also stays usable inside
@@ -729,7 +735,7 @@ impl AssertionValue for ArrayConstant {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum Constant {
     /// Reference to a value held in the surrounding compiled function's capture table.
-    Captured(CaptureReference<ArrayIrType>),
+    Captured(CaptureReference<Type>),
 
     /// Handle that retains an array.
     Session(SessionConstant),
@@ -768,14 +774,14 @@ impl LiteralIdentity for Constant {
 }
 
 impl Typed for Constant {
-    type Type = ArrayIrType;
+    type Type = Type;
 
     #[inline]
-    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+    fn r#type(&self) -> Cow<'_, Type> {
         match self {
             Self::Captured(value) => value.r#type(),
-            Self::Session(value) => Cow::Owned(ArrayIrType::Array(value.r#type().into_owned())),
-            Self::Dimension(value) => Cow::Owned(ArrayIrType::Dimension(value.r#type().into_owned())),
+            Self::Session(value) => Cow::Owned(Type::Array(value.r#type().into_owned())),
+            Self::Dimension(value) => Cow::Owned(Type::Dimension(value.r#type().into_owned())),
             Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean).into()),
         }
     }
@@ -793,7 +799,7 @@ impl CoreValue for Constant {
     #[inline]
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<Type as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         match self {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
@@ -889,9 +895,9 @@ impl ValueProjection<DimensionType> for Constant {
     }
 }
 
-impl From<CaptureReference<ArrayIrType>> for Constant {
+impl From<CaptureReference<Type>> for Constant {
     #[inline]
-    fn from(value: CaptureReference<ArrayIrType>) -> Self {
+    fn from(value: CaptureReference<Type>) -> Self {
         Self::Captured(value)
     }
 }
@@ -954,9 +960,9 @@ impl AssertionValue for Constant {
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AxisError,
-        BatchAxis, CaptureReference, Compare, ComparisonDirection, Concretizable, Context, ConvertElementType,
-        DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionOperation, DimensionSize,
+        Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AxisError, BatchAxis,
+        CaptureReference, Compare, ComparisonDirection, Concretizable, Context, ConvertElementType, DataType, Device,
+        DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionOperation, DimensionSize,
         DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation, DimensionType, DimensionValue,
         DimensionVariable, Gather, GatherMode, LogicalMesh, Max, Memory, MeshAxis, MeshAxisType, Min, OneOperation,
         OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind, ReferenceAddUpdate,
@@ -1342,8 +1348,8 @@ mod tests {
     fn test_value_singleton() {
         // A static function cannot attach a session, so even a singleton dimension type has no singleton value.
         let singleton_type = DimensionValue::constant(3).unwrap().r#type().into_owned();
-        assert_eq!(Value::singleton(&ArrayIrType::Dimension(singleton_type)), None);
-        assert_eq!(Value::singleton(&ArrayIrType::Array(ArrayType::scalar(DataType::F32))), None);
+        assert_eq!(Value::singleton(&Type::Dimension(singleton_type)), None);
+        assert_eq!(Value::singleton(&Type::Array(ArrayType::scalar(DataType::F32))), None);
     }
 
     #[test]
@@ -1579,7 +1585,7 @@ mod tests {
         let scalar = dimension(&session, 2).to_scalar().unwrap();
         assert!(matches!(
             scalar.r#type().as_ref(),
-            ArrayIrType::Array(r#type) if r#type.data_type() == DataType::I64 && r#type.rank() == 0,
+            Type::Array(r#type) if r#type.data_type() == DataType::I64 && r#type.rank() == 0,
         ));
         assert_eq!(read::<i64>(&scalar), vec![2]);
         assert_eq!(session.cached_program_count(), program_count);
@@ -1661,7 +1667,7 @@ mod tests {
 
         // `dimension_size(x, 0) + 2` followed by `dimension_to_scalar`, with the `2` stored as a program constant.
         let mut builder = ProgramBuilder::new();
-        let x = builder.add_input(ArrayIrType::Array(input.r#type().into_owned()));
+        let x = builder.add_input(Type::Array(input.r#type().into_owned()));
         let size_operation = DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap();
         let size_type = size_operation.output_type().clone();
         let size = builder.add_instruction(size_operation, Vec::new(), vec![x], None).unwrap()[0];
@@ -1741,7 +1747,7 @@ mod tests {
         let client = execution_client();
         let session = session_with_client(client);
         let mesh = mesh_on(client, 0);
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let condition = {
             let mut builder = ProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone());
@@ -1881,7 +1887,7 @@ mod tests {
     #[test]
     fn test_constant() {
         let array_type = vector_type();
-        let capture = CaptureReference::new(2, ArrayIrType::Array(array_type.clone()));
+        let capture = CaptureReference::new(2, Type::Array(array_type.clone()));
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let extent = DimensionValue::new(extent_type, 4).unwrap();
 
@@ -1891,14 +1897,14 @@ mod tests {
         let immediate = Constant::from(extent.clone());
         assert_eq!(captured, Constant::Captured(capture));
         assert_eq!(immediate, Constant::Dimension(extent.clone()));
-        assert_eq!(captured.r#type().into_owned(), ArrayIrType::Array(array_type.clone()));
-        assert_eq!(immediate.r#type().into_owned(), ArrayIrType::Dimension(extent.r#type().into_owned()));
+        assert_eq!(captured.r#type().into_owned(), Type::Array(array_type.clone()));
+        assert_eq!(immediate.r#type().into_owned(), Type::Dimension(extent.r#type().into_owned()));
         assert_eq!(captured.to_string(), "capture#2:f64[4]");
         assert_eq!(immediate.to_string(), extent.to_string());
 
         let predicate = Constant::try_from(true).unwrap();
         assert_eq!(predicate, Constant::Boolean(true));
-        assert_eq!(predicate.r#type().into_owned(), ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        assert_eq!(predicate.r#type().into_owned(), Type::Array(ArrayType::scalar(DataType::Boolean)));
         assert_eq!(predicate.to_string(), "true");
         assert_eq!(predicate.concretize(), Ok(true));
         assert_eq!(predicate.capture_index(), None);
@@ -1916,7 +1922,7 @@ mod tests {
         assert_eq!(immediate.capture_index(), None);
         assert_eq!(
             captured.map_capture_index(|index| index + 3),
-            Constant::Captured(CaptureReference::new(5, ArrayIrType::Array(array_type.clone()))),
+            Constant::Captured(CaptureReference::new(5, Type::Array(array_type.clone()))),
         );
         assert_eq!(immediate.map_capture_index(|_| 7), immediate);
 
@@ -1951,7 +1957,7 @@ mod tests {
         let target = DimensionVariable::new("target", DimensionBounds::positive(Some(8)).unwrap());
         let reference_type =
             ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(source.clone())])));
-        let reference = Constant::Captured(CaptureReference::new(7, ArrayIrType::Reference(reference_type.clone())));
+        let reference = Constant::Captured(CaptureReference::new(7, Type::Reference(reference_type.clone())));
         assert_eq!(reference.capture_index(), Some(7));
         assert_eq!(
             <Constant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
@@ -1967,7 +1973,7 @@ mod tests {
         assert_eq!(renamed_reference.capture_index(), Some(7));
         assert_eq!(
             renamed_reference.r#type().into_owned(),
-            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            Type::Reference(ReferenceType::new(ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![CoreDimension::Dynamic(target)]),
             ))),
@@ -1993,7 +1999,7 @@ mod tests {
         let predicate = Constant::Boolean(true);
         assert_eq!(predicate.assertion_array(), Ok(Some(CoreArray::scalar(true).unwrap())));
         assert_eq!(predicate.assertion_observation(), Ok("true".to_string()));
-        let captured = Constant::Captured(CaptureReference::new(2, ArrayIrType::Array(vector_type())));
+        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())));
         assert_eq!(
             captured.assertion_array(),
             Err(ProgramError::Concretization {

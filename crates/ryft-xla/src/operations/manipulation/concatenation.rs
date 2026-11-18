@@ -1,11 +1,11 @@
 use ryft_core::{
-    ArrayIrType, ArrayType, ConcatenateOperation, DataType, Dimension as CoreDimension, DimensionAddOperation,
+    ArrayType, ConcatenateOperation, DataType, Dimension as CoreDimension, DimensionAddOperation,
     DimensionSizeOperation, DimensionType, EffectClass, Operation as CoreOperation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::EffectTokens;
@@ -17,7 +17,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for ConcatenateOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -32,13 +32,13 @@ impl LowerableOperation for ConcatenateOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
+impl LowerableOperation for ConcatenateOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -225,7 +225,7 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh,
+        ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh,
         Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation,
         DimensionType, DimensionValue, DimensionVariable, EffectClasses, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, Shape, Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
@@ -242,7 +242,7 @@ mod tests {
     use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, ToPjrt, compile, to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, ToPjrt, Type, compile, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -304,7 +304,7 @@ mod tests {
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
         let result_extent = DimensionValue::constant(4).unwrap();
-        let operation = ConcatenateOperation::<ArrayIrType>::new(
+        let operation = ConcatenateOperation::<Type>::new(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
         )
@@ -367,7 +367,7 @@ mod tests {
             DimensionAddOperation::new(first_size_operation.output_type(), second_size_operation.output_type())
                 .unwrap();
         let result_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
-        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
+        let concatenate_operation = ConcatenateOperation::<Type>::new(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
         )
@@ -462,7 +462,7 @@ mod tests {
                 let first_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("first", Some(5))]));
                 let second_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("second", Some(5))]));
                 let extent_type = extent.r#type().into_owned();
-                let operation = ConcatenateOperation::<ArrayIrType>::new(
+                let operation = ConcatenateOperation::<Type>::new(
                     0,
                     &[first_type.clone().into(), second_type.clone().into(), extent_type.into()],
                 )

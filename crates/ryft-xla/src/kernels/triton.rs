@@ -143,14 +143,14 @@ mod tests {
 
         use pretty_assertions::assert_eq;
 
-        use ryft_core::{ArrayIrType, ArrayType, CompilationTracer, DataType, StagedFunction};
+        use ryft_core::{ArrayType, CompilationTracer, DataType, StagedFunction};
         use ryft_kernels::{KernelSchedule, kernel};
         use ryft_triton::kernels::{Compiler, Options as TritonOptions, Target};
 
         use crate::kernels::{KernelCompilerBinding, TritonEmbedding, stage_kernel};
         use crate::sessions::tests::domain_mesh;
         use crate::tests::execution_client;
-        use crate::{Array, Options, Session, Value};
+        use crate::{Array, Options, Session, Type, Value};
 
         /// Writes a workgroup tile and copies a slice whose elements are assigned to different lanes.
         #[kernel(crate = "ryft_kernels", requires = input.shape()[0] == 256)]
@@ -202,12 +202,12 @@ mod tests {
                     1024,
                 )
                 .unwrap();
-                let staged = StagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+                let staged = StagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
                     |_, _, inputs: Vec<CompilationTracer<Session>>| {
                         Ok(stage_kernel(inputs[0].context(), &definition, &inputs)?)
                     },
                     vec![],
-                    vec![ArrayIrType::Array(r#type.clone())],
+                    vec![Type::Array(r#type.clone())],
                     Options::new(mesh.clone()).with_kernel_compiler(binding),
                 )
                 .unwrap();

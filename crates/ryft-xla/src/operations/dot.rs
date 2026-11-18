@@ -611,8 +611,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayOperation, Complex, Dimension as CoreDimension, DimensionBounds,
-        DimensionVariable, Dot, DotAlgorithm, DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep,
+        Array as CoreArray, ArrayOperation, Complex, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
+        Dot, DotAlgorithm, DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep,
         EinsumPathStrategy, EinsumSpecification, MeshAxisType, Operation as CoreOperation, Placeholder,
         ProjectedContext, RaggedDot, RaggedDotDimensionNumbers, Sharding, ShardingDimension, Typed, bf16,
         differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
@@ -628,7 +628,7 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, session_with_client, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, Options, Session, ToPjrt, TracedProgram,
+        Array, ArrayConstant, ArrayTracer, Constant, Options, Session, ToPjrt, TracedProgram, Type,
         to_mlir_module_for_program, trace,
     };
 
@@ -1450,9 +1450,9 @@ mod tests {
         let right_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
         let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
         let mut builder = ArrayIrProgramBuilder::new();
-        let left = builder.add_input(ArrayIrType::Array(left_type));
-        let right = builder.add_input(ArrayIrType::Array(right_type));
-        let group_sizes = builder.add_input(ArrayIrType::Array(group_sizes_type));
+        let left = builder.add_input(Type::Array(left_type));
+        let right = builder.add_input(Type::Array(right_type));
+        let group_sizes = builder.add_input(Type::Array(group_sizes_type));
         let output = builder
             .add_instruction(
                 RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),

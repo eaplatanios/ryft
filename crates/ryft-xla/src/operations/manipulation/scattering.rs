@@ -407,12 +407,12 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
-        BatchableOperation, BatchingContext, ConstantOperation, DataType, Dimension as CoreDimension, DimensionBounds,
-        DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, Scatter, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Shape, TypeError, TypedProgram,
-        ValueProjection, differentiate_at, i1, u1,
+        Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
+        BatchingContext, ConstantOperation, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSize,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, Scatter, ScatterDimensionNumbers, ScatterMode,
+        ScatterOperation, ScatterOptions, ScatterReductionKind, Shape, TypeError, TypedProgram, ValueProjection,
+        differentiate_at, i1, u1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -423,7 +423,7 @@ mod tests {
     use crate::operations::{FlatProgram, Operation};
     use crate::sessions::tests::{domain_mesh, read_f64s, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, Constant, Options, ToPjrt, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Constant, Options, ToPjrt, Type, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1072,9 +1072,9 @@ mod tests {
                 .primal()
                 .as_ref()
                 .clone()
-                .specialize(&input_types[..3].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                .specialize(&input_types[..3].iter().cloned().map(Type::from).collect::<Vec<_>>())
                 .unwrap_or_else(|error| panic!("n={size} specialization: {error}\n{}", linearization.primal()));
-            assert_eq!(specialized.output_types()[0], ArrayIrType::from(input_types[0].clone()), "n={size}");
+            assert_eq!(specialized.output_types()[0], Type::from(input_types[0].clone()), "n={size}");
             let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();

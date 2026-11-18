@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
-    ArrayIrType, ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DispatchInputs,
+    ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DispatchInputs,
     ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, Parameterized, ProgramError,
-    ReferenceDischargeResult, Sharding, ShardingDimension, StagedProgram, Type, TypeError, Typed, TypedProgram,
+    ReferenceDischargeResult, Sharding, ShardingDimension, StagedProgram, Type as CoreType, TypeError, Typed,
+    TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -26,7 +27,7 @@ use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredP
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::{collect_session_constants, contains_unresolved_references, contains_unresolved_state};
-use crate::{Constant, Error, ExecutionError, FlatProgram, OpShardingExtension, Operation, Session, Value};
+use crate::{Constant, Error, ExecutionError, FlatProgram, OpShardingExtension, Operation, Session, Type, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -40,7 +41,7 @@ impl CompilationDomain for Session {
     fn dispatch_signature(
         inputs: DispatchInputs<'_, '_, Self::Value>,
         options: &Self::Options,
-    ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>, Option<Self::Options>), Self::Error> {
+    ) -> Result<(Self::DispatchKey, Arc<[Type]>, Option<Self::Options>), Self::Error> {
         dispatch_signature(inputs, options)
     }
 
@@ -54,7 +55,7 @@ impl CompilationDomain for Session {
         let session_arrays = program
             .session_constants()
             .iter()
-            .map(|constant| Ok(Value::Array(self.retained_constant(constant)?)))
+            .map(|constant| Ok(Value::Array(constant.to_array(self)?)))
             .collect::<Result<Vec<_>, Error>>()?;
         let compiled = self.compilation_cache().compile(self, program)?;
 
@@ -342,7 +343,7 @@ impl Session {
                     options.capture_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 } else if index < lowered_capture_count {
                     let constant = &session_constants[index - source_capture_count];
-                    Some(self.retained_constant(constant)?.sharding().clone())
+                    Some(constant.to_array(self)?.sharding().clone())
                 } else {
                     let index = index - lowered_capture_count;
                     options.input_shardings().and_then(|shardings| shardings.get(index).cloned()).or_else(|| {
@@ -631,10 +632,7 @@ impl CompilationCacheDomain for Session {
 /// points of this crate apply them through [`with_input_shardings`], and lowering rejects staged functions whose input
 /// types do not carry them. External reference inputs are rejected when overrides are present, because holder state
 /// derives its effective sharding from the compiled reference ABI.
-pub(super) fn apply_input_shardings(
-    input_types: Vec<ArrayIrType>,
-    options: &Options,
-) -> Result<Vec<ArrayIrType>, Error> {
+pub(super) fn apply_input_shardings(input_types: Vec<Type>, options: &Options) -> Result<Vec<Type>, Error> {
     let Some(input_shardings) = options.input_shardings() else {
         return Ok(input_types);
     };
@@ -663,7 +661,7 @@ pub(super) fn apply_input_shardings(
 ///
 /// ```
 /// use ryft_core::{
-///     ArrayIrType, ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
+///     Type, ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
 ///     ShardingDimension,
 /// };
 /// use ryft_xla::Options;
@@ -674,12 +672,12 @@ pub(super) fn apply_input_shardings(
 /// let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])])?;
 /// let options = Options::new(mesh).with_input_shardings(vec![sharding.clone()]);
 /// let input_type = ArrayType::new_static(DataType::F32, [4]);
-/// let input_types = (ArrayIrType::Array(input_type.clone()),);
+/// let input_types = (Type::Array(input_type.clone()),);
 /// let input_types = with_input_shardings(input_types, &options)?;
-/// assert_eq!(input_types, (ArrayIrType::Array(input_type.with_sharding(sharding)?),));
+/// assert_eq!(input_types, (Type::Array(input_type.with_sharding(sharding)?),));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn with_input_shardings<In: Parameterized<ArrayIrType>>(input_types: In, options: &Options) -> Result<In, Error> {
+pub fn with_input_shardings<In: Parameterized<Type>>(input_types: In, options: &Options) -> Result<In, Error> {
     if options.input_shardings().is_none() {
         return Ok(input_types);
     }
@@ -741,7 +739,7 @@ pub(crate) fn jit_compilation_options(
 /// [`ArrayType::with_sharding`] documents, so only the placement over the other mesh axes is compared, and lowering
 /// then places the outputs over auto mesh axes as the overrides request. Outputs that are not arrays are left for the
 /// later array-only conversions to reject.
-fn validate_output_shardings(output_types: &[ArrayIrType], options: &Options) -> Result<(), Error> {
+fn validate_output_shardings(output_types: &[Type], options: &Options) -> Result<(), Error> {
     let Some(output_shardings) = options.output_shardings() else {
         return Ok(());
     };
@@ -753,7 +751,7 @@ fn validate_output_shardings(output_types: &[ArrayIrType], options: &Options) ->
         }));
     }
     for (index, (r#type, sharding)) in output_types.iter().zip(output_shardings).enumerate() {
-        let ArrayIrType::Array(array_type) = r#type else {
+        let Type::Array(array_type) = r#type else {
             continue;
         };
         if array_type.sharding() != Some(&sharding.without_auto_axes()) {
@@ -777,7 +775,7 @@ fn validate_output_shardings(output_types: &[ArrayIrType], options: &Options) ->
 fn validate_reference_outputs(
     program: &CoreFlatProgram<Session>,
     capture_count: usize,
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
 ) -> Result<(), Error> {
     let Some(output_index) = output_types.iter().position(|r#type| r#type.is_reference()) else {
         return Ok(());
@@ -802,7 +800,7 @@ fn validate_reference_outputs(
 }
 
 /// Validates backend output arity and refinement of the declared logical array types.
-fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Result<(), Error> {
+fn validate_output_types(declared: &[Type], actual: &[ArrayType]) -> Result<(), Error> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
     }
@@ -826,10 +824,10 @@ fn validate_output_types(declared: &[ArrayIrType], actual: &[ArrayType]) -> Resu
 /// overrides the signature passes through unchecked here. Boundary leaves that are not arrays are then rejected by the
 /// later array-only conversions on the compile path.
 fn apply_signature_shardings(
-    mut types: Vec<ArrayIrType>,
+    mut types: Vec<Type>,
     shardings: Option<&[Sharding]>,
     kind: &'static str,
-) -> Result<Vec<ArrayIrType>, Error> {
+) -> Result<Vec<Type>, Error> {
     let Some(shardings) = shardings else {
         return Ok(types);
     };
@@ -842,8 +840,8 @@ fn apply_signature_shardings(
     }
     for (r#type, sharding) in types.iter_mut().zip(shardings) {
         *r#type = match r#type {
-            ArrayIrType::Array(array_type) => array_type.clone().with_sharding(sharding.without_auto_axes())?.into(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => {
+            Type::Array(array_type) => array_type.clone().with_sharding(sharding.without_auto_axes())?.into(),
+            Type::Dimension(_) | Type::Reference(_) => {
                 return Err(ProgramError::from(TypeError::invalid(format!(
                     "cannot apply an array sharding to type `{type}`",
                 )))
@@ -861,12 +859,12 @@ fn apply_signature_shardings(
 fn has_only_static_array_types(program: &FlatProgram) -> bool {
     program.regions().iter().all(|region| {
         region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
-            ArrayIrType::Array(array_type) => array_type.static_shape().is_some(),
-            ArrayIrType::Dimension(_) => true,
+            Type::Array(array_type) => array_type.static_shape().is_some(),
+            Type::Dimension(_) => true,
             // The predicate answers its own question rather than relying on the reference rejection during lowering
             // firing first. A dynamically shaped referent counts as dynamic so that partitioner selection and its
             // guards stay correct even for programs whose only dynamic type is a reference referent.
-            ArrayIrType::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
+            Type::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
         })
     })
 }
@@ -934,8 +932,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array as CoreArray, ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArraySliceAxis, ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
+        AddOperation, Array as CoreArray, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
+        ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
         CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain, CompilationTracer,
         ConditionOperation, ConstantOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation, DataType,
         Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
@@ -957,7 +955,8 @@ mod tests {
     };
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Error, FlatProgram, FromPjrt, JitCallOperation, Operation, ProgramBuilder, Session, Value,
+        Array, Constant, Error, FlatProgram, FromPjrt, JitCallOperation, Operation, ProgramBuilder, Session, Type,
+        Value,
     };
 
     use super::*;
@@ -975,7 +974,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
         // Round-trip a small input through the `CompilationDomain` pipeline.
@@ -1019,7 +1018,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let _: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+            let _: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
                 staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
@@ -1035,7 +1034,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
         // Reference inputs are structurally valid for stateful staging, but input sharding overrides that users provide
         // are not, because holder state derives its effective sharding from the compiled reference ABI. Lowering
@@ -1048,7 +1047,7 @@ mod tests {
             Ok(input)
         }
         assert!(matches!(
-            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(forward,
+            CoreStagedFunction::<Session, Type, Type>::stage(forward,
                 Vec::new(),
                 reference_type.clone(),
                 Options::new(mesh.clone()).with_input_shardings(vec![scalar_sharding.clone()]),
@@ -1069,9 +1068,9 @@ mod tests {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
-            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(allocate,
+            CoreStagedFunction::<Session, Type, Type>::stage(allocate,
                 Vec::new(),
-                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                Type::Array(ArrayType::scalar(DataType::F32)),
                 Options::new(mesh.clone()).with_output_shardings(vec![scalar_sharding]),
             )
             .and_then(|staged| staged.lower(&session))
@@ -1085,7 +1084,7 @@ mod tests {
         // Forwarding an external reference through an output is rejected by the same contract when lowered, because
         // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
-            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(forward,
+            CoreStagedFunction::<Session, Type, Type>::stage(forward,
                 Vec::new(),
                 reference_type,
                 Options::new(mesh.clone()),
@@ -1115,10 +1114,10 @@ mod tests {
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
             allocate_reference,
             Vec::new(),
-            ArrayIrType::Array(array_type),
+            Type::Array(array_type),
             Options::new(mesh),
         )
         .unwrap();
@@ -1136,7 +1135,7 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let options = Options::new(mesh.clone())
             .with_input_shardings(vec![Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap()]);
 
@@ -1150,13 +1149,9 @@ mod tests {
 
         // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
         // did not receive the requested input shardings before staging.
-        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
-            forward,
-            Vec::new(),
-            scalar_type.clone(),
-            options.clone(),
-        )
-        .unwrap();
+        let staged =
+            CoreStagedFunction::<Session, Type, Type>::stage(forward, Vec::new(), scalar_type.clone(), options.clone())
+                .unwrap();
         assert!(matches!(
             staged.lower(&session).map(|_| ()),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
@@ -1166,8 +1161,7 @@ mod tests {
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
         let staged =
-            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(forward, Vec::new(), input_types, options)
-                .unwrap();
+            CoreStagedFunction::<Session, Type, Type>::stage(forward, Vec::new(), input_types, options).unwrap();
         staged.lower(&session).unwrap();
     }
 
@@ -1187,7 +1181,7 @@ mod tests {
         };
         let input_type = |mesh: &DeviceMesh| {
             let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated).unwrap())
+            Type::Array(ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated).unwrap())
         };
         let options = |mesh: &DeviceMesh| {
             let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1214,7 +1208,7 @@ mod tests {
         // Lowering checks rather than overwrites the placement that staged types track, so that calls of a staged
         // function return the output types of its executions.
         let mesh_explicit = mesh(MeshAxisType::Explicit);
-        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1228,7 +1222,7 @@ mod tests {
                               not carry the sharding `{mesh<['x'=2:explicit]>, [{'x'}]}` requested by \
                               `output_shardings`; reshard the outputs to their overrides before staging them",
         ));
-        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
             reshard,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1240,7 +1234,7 @@ mod tests {
         // Staged types cannot record placement over auto mesh axes, so lowering applies it to the executable outputs,
         // whose types keep the staged placement while their runtime placements carry the override.
         let mesh_auto = mesh(MeshAxisType::Auto);
-        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_auto),
@@ -2257,7 +2251,7 @@ mod tests {
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
-                ConditionOperation::<ArrayIrType>::new(),
+                ConditionOperation::<Type>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference, replacement],
                 None,
@@ -2366,7 +2360,7 @@ mod tests {
         let initial = builder.add_input(scalar_type.clone().into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
+        let operation = WhileOperation::<Type>::new().with_iteration_bound(3).unwrap();
         let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
         let output =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -2570,7 +2564,7 @@ mod tests {
         let session = session_with_client(client);
 
         let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let input = builder.add_input(Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program: FlatProgram = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -2723,7 +2717,7 @@ mod tests {
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
             .add_instruction(
-                ConditionOperation::<ArrayIrType>::new(),
+                ConditionOperation::<Type>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference],
                 None,
@@ -2834,7 +2828,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let foreign: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let foreign: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 

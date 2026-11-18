@@ -4,13 +4,13 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayIrType, ArrayType, DataType, Operation as CoreOperation, Placeholder,
-    ProgramBuilder as CoreProgramBuilder, RegionInterface, TypeError,
+    AddOperation, ArrayType, DataType, Operation as CoreOperation, Placeholder, ProgramBuilder as CoreProgramBuilder,
+    RegionInterface, TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 use ryft_xla::{
-    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, Operation, lower_operation_variants,
+    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, Operation, Type, lower_operation_variants,
     to_mlir_module_for_program,
 };
 
@@ -19,7 +19,7 @@ use ryft_xla::{
 struct TwiceOperation;
 
 impl CoreOperation for TwiceOperation {
-    type Type = ArrayIrType;
+    type Type = Type;
 
     fn name(&self) -> &'static str {
         "twice"
@@ -27,9 +27,9 @@ impl CoreOperation for TwiceOperation {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
+    ) -> Result<Vec<Type>, TypeError> {
         let _ = region_interfaces;
         Ok(input_types.to_vec())
     }
@@ -40,8 +40,8 @@ impl LowerableOperation for TwiceOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         let doubled =
@@ -54,7 +54,7 @@ impl LowerableOperation for TwiceOperation {
 
 /// Downstream operation family that extends the backend-owned XLA operations with [`TwiceOperation`].
 #[derive(Clone, Debug, ryft_macros::Operation)]
-#[ryft(crate = "ryft_core", type(ArrayIrType), constant(Constant))]
+#[ryft(crate = "ryft_core", type(Type), constant(Constant))]
 enum ExtendedOperation {
     Xla(Box<Operation>),
     Twice(TwiceOperation),
@@ -65,8 +65,8 @@ impl LowerableOperation for ExtendedOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_operation_variants!(
             self, ExtendedOperation, lowerer, input_values, input_types, output_types;

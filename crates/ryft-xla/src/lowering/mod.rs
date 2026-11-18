@@ -30,20 +30,20 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation,
-    CastOperation, CollectiveAxes, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType,
-    DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses,
-    ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation,
-    LogicalMesh, Memory, OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection,
-    Parameterized, ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
+    Array as CoreArray, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation, CastOperation,
+    CollectiveAxes, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType, DimensionValue,
+    DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
+    FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation, LogicalMesh, Memory,
+    OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized,
+    ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
     ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType,
     TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
-    Module, Operation as MlirOperation, OperationPrintingFlags, Region, Type, TypeAndAttributes, Value as MlirValue,
-    ValueRef,
+    Module, Operation as MlirOperation, OperationPrintingFlags, Region, Type as MlirType, TypeAndAttributes,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::compositions::{
@@ -63,7 +63,7 @@ use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sharding::ShardyTensorSharding;
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, FlatProgram, Operation, Program, RaggedDotLoweringStrategy,
-    RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, SessionConstant, ToMlir, normalize_runtime_requirements,
+    RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, SessionConstant, ToMlir, Type, normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -546,11 +546,11 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Each operation type implements this trait at the type universe of its [`CoreOperation`](ryft_core::Operation)
-/// contract. Homogeneous array operations implement it at [`ArrayType`], array IR operations at [`ArrayIrType`], and
+/// contract. Homogeneous array operations implement it at [`ArrayType`], array IR operations at [`Type`], and
 /// first-class dimension operations at [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and
 /// [`Operation`]) implement this trait by dispatching each variant to its payload through
 /// [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that a family stores as
-/// projected or mixed members. A family whose type universe is [`ArrayIrType`] and that implements
+/// projected or mixed members. A family whose type universe is [`Type`] and that implements
 /// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`to_mlir_module_for_program`]
 /// lowers, so downstream crates extend lowering by implementing this trait for their own operations and families, just
 /// like they extend the transformation traits of `ryft-core`.
@@ -586,17 +586,17 @@ pub trait LowerableOperation: CoreOperation {
     }
 }
 
-/// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`ArrayIrType`],
+/// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`Type`],
 /// and its payloads can be recognized through [`OperationPayloadProjection`] by the module-level lowering passes
 /// (e.g., the `jit_call` deduplication and the Shardy mesh declaration passes). Every type that satisfies these bounds
 /// is an operation family, so downstream families only need to implement [`LowerableOperation`].
-pub trait LowerableOperationFamily: LowerableOperation<Type = ArrayIrType> + OperationPayloadProjection {}
+pub trait LowerableOperationFamily: LowerableOperation<Type = Type> + OperationPayloadProjection {}
 
-impl<O: LowerableOperation<Type = ArrayIrType> + OperationPayloadProjection> LowerableOperationFamily for O {}
+impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> LowerableOperationFamily for O {}
 
 /// Operations whose own type universe is a member universe of an enclosing operation family that lowers them at the
 /// family's parent universe `T` (e.g., [`ZeroOperation<ArrayType>`](ryft_core::ZeroOperation) stored in an
-/// [`ArrayIrType`] family receives first-class dimension inputs that size its dynamic output axes).
+/// [`Type`] family receives first-class dimension inputs that size its dynamic output axes).
 ///
 /// This is the lowering counterpart of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their
 /// mixed member variants to it through [`lower_operation_variants`](crate::lower_operation_variants).
@@ -653,7 +653,7 @@ where
 ///
 ///   - A bare variant lowers its payload at the family's own type universe.
 ///   - `projected(U)` first projects the instruction types to the member universe `U` (e.g., an `Array` variant that
-///     stores an [`ArrayOperation`] in an [`ArrayIrType`] family).
+///     stores an [`ArrayOperation`] in an [`Type`] family).
 ///   - `member` lowers a payload of a member universe at the family's universe through [`MemberLowerableOperation`].
 ///   - `boxed` lowers a boxed payload at the family's universe.
 ///
@@ -670,8 +670,8 @@ where
 ///         &self,
 ///         lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ///         input_values: &[ValueRef<'b, 'c, 't>],
-///         input_types: &[ArrayIrType],
-///         output_types: &[ArrayIrType],
+///         input_types: &[Type],
+///         output_types: &[Type],
 ///     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
 ///         ryft_xla::lower_operation_variants!(
 ///             self, MyOperation, lowerer, input_values, input_types, output_types;
@@ -812,8 +812,8 @@ impl LowerableOperation for Operation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // Every variant, including the projected array operations, has its local output placement validated here
         // exactly once. A nested `shard_map` instead validates its boundary shardings against the enclosing
@@ -1411,7 +1411,7 @@ where
 /// Returns the distinct [`SessionConstant`]s that `program` references in any of its regions, in the order of their
 /// first occurrence in the region arena. Lowering passes their arrays as hidden entry arguments that follow the lifted
 /// captures, in this order, and so the caller that assembles the executable arguments must use the same order.
-pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = ArrayIrType>>(
+pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = Type>>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> Vec<SessionConstant>
 where
@@ -1625,7 +1625,7 @@ where
                     let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
                     let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
                     broadcast_changes_explicit_sharding(input_type, output_type, output_axes)
-                } else if operation.projected_payload::<CastOperation<ArrayIrType>>().is_some()
+                } else if operation.projected_payload::<CastOperation<Type>>().is_some()
                     || operation.projected_payload::<CastOperation<ArrayType>>().is_some()
                 {
                     // Casts of first-class dimensions carry no placement, and array casts constrain placement only
@@ -1773,13 +1773,13 @@ pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Err
 /// First-class dimensions and references carry no placement of their own.
 fn validate_local_output_placement(
     operation_name: &str,
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
     bound_manual_axes: &[String],
 ) -> Result<(), Error> {
     let assigns_bound_manual_axis = output_types.iter().any(|output_type| {
         let sharding = match output_type {
-            ArrayIrType::Array(output_type) => output_type.sharding(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+            Type::Array(output_type) => output_type.sharding(),
+            Type::Dimension(_) | Type::Reference(_) => None,
         };
         sharding.into_iter().flat_map(Sharding::dimensions).any(|dimension| match dimension {
             ShardingDimension::Sharded(axes) => axes.iter().any(|axis| bound_manual_axes.contains(axis)),
@@ -2682,10 +2682,10 @@ pub(crate) mod tests {
         extents: &[i32],
     ) -> Result<Vec<MixedValue>, Error> {
         // First-class dimensions cross the executable boundary as `i64` scalars.
-        let boundary_type = |r#type: &ArrayIrType| match r#type {
-            ArrayIrType::Array(r#type) => r#type.clone(),
-            ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
-            ArrayIrType::Reference(_) => panic!("reshape execution fixtures have no reference values"),
+        let boundary_type = |r#type: &Type| match r#type {
+            Type::Array(r#type) => r#type.clone(),
+            Type::Dimension(_) => ArrayType::scalar(DataType::I64),
+            Type::Reference(_) => panic!("reshape execution fixtures have no reference values"),
         };
         let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
@@ -3620,7 +3620,7 @@ pub(crate) mod tests {
         // threading, so two representative reference operations are enough to pin the diagnostic.
         let array_type = ArrayType::scalar(DataType::F32);
         let mut builder = crate::operations::ProgramBuilder::new();
-        let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let input = builder.add_input(Type::Array(array_type.clone()));
         let reference = builder
             .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![input], None)
             .unwrap()[0];
@@ -3667,7 +3667,7 @@ pub(crate) mod tests {
     fn test_lower_mlir_module_for_program_rejects_preserved_reference_entries() {
         let mut builder = ArrayIrProgramBuilder::new();
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let snapshot =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
@@ -3696,9 +3696,9 @@ pub(crate) mod tests {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
         let state_type = ArrayType::new_static(DataType::F32, [4]);
         let mut builder = crate::operations::ProgramBuilder::new();
-        let _zero = builder.add_input(ArrayIrType::Array(zero_type.clone()));
-        let mutated = builder.add_input(ArrayIrType::Array(state_type.clone()));
-        let _read_only = builder.add_input(ArrayIrType::Array(state_type.clone()));
+        let _zero = builder.add_input(Type::Array(zero_type.clone()));
+        let mutated = builder.add_input(Type::Array(state_type.clone()));
+        let _read_only = builder.add_input(Type::Array(state_type.clone()));
         let program: FlatProgram = builder.build(vec![mutated], vec![Placeholder; 3], vec![Placeholder]).unwrap();
         let input_types = vec![zero_type.clone(), state_type.clone(), state_type.clone()];
         let output_types = vec![state_type.clone()];
@@ -3821,7 +3821,7 @@ pub(crate) mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 1);
         let mut builder = crate::operations::ProgramBuilder::new();
-        let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
+        let state = builder.add_input(Type::Array(state_type.clone()));
         let program: FlatProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
         let reference_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0));
 
@@ -4372,7 +4372,7 @@ pub(crate) mod tests {
         let input_type = test_vector_type(4);
         let output_type = input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
         for operation in [
-            CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.clone().into()])
+            CastOperation::<Type>::checked(output_type.clone().into(), vec![input_type.clone().into()])
                 .unwrap()
                 .into(),
             Operation::Array(ArrayOperation::Cast(
@@ -4509,7 +4509,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_local_output_placement() {
-        // An array IR `Operation::Cast` (i.e., a `CastOperation<ArrayIrType>` rather than a projected
+        // An array IR `Operation::Cast` (i.e., a `CastOperation<Type>` rather than a projected
         // `ArrayOperation::Cast`) lowers without passing through `ArrayOperation::lower`, so only the validation of the
         // family in `Operation::lower` sees its output placement. Its first output requests a mesh that redefines the bound
         // manual axis `x` as explicit and shards a local dimension over it, which only the region boundary may do.

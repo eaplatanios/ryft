@@ -1,6 +1,6 @@
 //! Lowering of [`ScanOperation`] to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 //!
-//! A scan lowers only from the [`ArrayIrType`] operation family, which stores its body region. The homogeneous
+//! A scan lowers only from the [`Type`] operation family, which stores its body region. The homogeneous
 //! [`ArrayType`] payload carries no region and is rejected. StableHLO has no scan primitive, so a scan lowers to a
 //! `stablehlo.while` over the loop state `[counter, carries..., stacks..., stacked_output_values...]`, which holds an
 //! `i64` counter, the carries, the stacked inputs, and one zero accumulator per stacked output, preallocated at the
@@ -22,14 +22,13 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, EffectClasses,
-    Operation as CoreOperation, ProgramError, RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation,
-    Shape, TypedProgram,
+    ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, EffectClasses, Operation as CoreOperation,
+    ProgramError, RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Type, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::regions::lower_nested_program_inline;
@@ -46,7 +45,7 @@ use crate::operations::control_flow::{
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ScanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -67,13 +66,13 @@ impl LowerableOperation for ScanOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for ScanOperation<ArrayIrType> {
+impl LowerableOperation for ScanOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A scan's inputs are its carries and its stacked inputs, followed by the runtime length when its length is
         // dynamic, and its body receives the iteration index, which the loop supplies, before the carries and the
@@ -129,7 +128,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
                         .map(|(index, r#type)| ("output", index, r#type)),
                 );
             for (role, index, slice_type) in slice_types {
-                if let ArrayIrType::Array(slice_type) = slice_type
+                if let Type::Array(slice_type) = slice_type
                     && slice_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none())
                 {
                     return Err(Error::Lowering(LoweringError::UnsupportedOperation {
@@ -156,7 +155,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
                 reason: format!("`{SCAN_OPERATION_NAME}` unroll factor {unroll} must be at most {}", i64::MAX),
             }));
         }
-        let array_types = |types: &[ArrayIrType]| {
+        let array_types = |types: &[Type]| {
             types
                 .iter()
                 .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
@@ -324,7 +323,7 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O> {
     stacked_output_types: Vec<ArrayType>,
 
     /// Types of the loop state `[counter, carries..., stacks..., stacked_output_values...]`, excluding effect tokens.
-    state_types: Vec<ArrayIrType>,
+    state_types: Vec<Type>,
 
     /// Trip count of the scan.
     length: ScanLoopLength<'b, 'c, 't>,
@@ -845,7 +844,7 @@ mod tests {
         // An array IR scan needs exactly one body region.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
         assert!(matches!(
-            ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
+            ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::MalformedProgram(message))
@@ -856,7 +855,7 @@ mod tests {
         // It also needs one input per carry and per stacked input.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
         assert!(matches!(
-            ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
+            ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -865,9 +864,8 @@ mod tests {
 
         // A dynamic length without an upper bound leaves no physical extent at which to allocate the stacked outputs.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, None).unwrap());
-        let input_types: Vec<ArrayIrType> =
-            vec![scalar_type.clone().into(), DimensionType::from(length.clone()).into()];
-        let output_types: Vec<ArrayIrType> = vec![
+        let input_types: Vec<Type> = vec![scalar_type.clone().into(), DimensionType::from(length.clone()).into()];
+        let output_types: Vec<Type> = vec![
             scalar_type.clone().into(),
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into(),
         ];
@@ -880,7 +878,7 @@ mod tests {
         let input_values = (0..2).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body]);
         assert!(matches!(
-            ScanOperation::<ArrayIrType>::new(1, CoreDimension::Dynamic(length)).lower(
+            ScanOperation::<Type>::new(1, CoreDimension::Dynamic(length)).lower(
                 &mut lowerer,
                 &input_values,
                 &input_types,
@@ -923,7 +921,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            assert_eq!(program.output_types(), vec![ArrayIrType::Array(stacked_type.clone())]);
+            assert_eq!(program.output_types(), vec![Type::Array(stacked_type.clone())]);
             let stacked_types = [stacked_type];
             to_mlir_module_for_program(&program, &[], &stacked_types, &stacked_types, "main", None, None)
         };
@@ -971,7 +969,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let state_types: Vec<ArrayIrType> =
+        let state_types: Vec<Type> =
             vec![ArrayType::scalar(DataType::I64).into(), stack_type.clone().into(), stack_type.clone().into()];
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
@@ -1067,7 +1065,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 program.output_types(),
-                vec![ArrayIrType::Array(static_type.clone()), ArrayIrType::Array(static_type.clone())],
+                vec![Type::Array(static_type.clone()), Type::Array(static_type.clone())],
                 "length {length}, unroll factor {unroll}",
             );
             let inputs = [
@@ -1952,7 +1950,7 @@ mod tests {
         let session = session_with_client(client);
         // Staging succeeds, so the error comes from the discharge that precedes lowering.
         let mut staged = false;
-        let error = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+        let error = compile_statefully::<_, (Type, Type, Type), Type>(
             |(sum, elements, runtime_length)| {
                 let context = sum.context().clone();
                 let sum = program.interpret_in_context(&context, vec![sum, elements, runtime_length])?.remove(0);
@@ -2458,7 +2456,7 @@ mod tests {
             .unwrap()[0];
         body_builder
             .add_instruction(
-                AssertOperation::<ArrayIrType>::new("scan value must equal carry")
+                AssertOperation::<Type>::new("scan value must equal carry")
                     .with_labels(vec!["value".to_owned(), "carry".to_owned()]),
                 Vec::new(),
                 vec![predicate, value, carry],
@@ -2614,7 +2612,7 @@ mod tests {
             let is_positive = positive(&mut builder, item);
             builder
                 .add_instruction(
-                    AssertOperation::<ArrayIrType>::new("item must be positive").with_labels(vec!["item".to_owned()]),
+                    AssertOperation::<Type>::new("item must be positive").with_labels(vec!["item".to_owned()]),
                     Vec::new(),
                     vec![is_positive, item],
                     None,
@@ -3728,7 +3726,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let value_and_gradient = |scan: ScanOperation<ArrayIrType>, items_type: ArrayType| {
+        let value_and_gradient = |scan: ScanOperation<Type>, items_type: ArrayType| {
             let mut builder = ArrayIrProgramBuilder::new();
             let body_region = builder.import_region(body.entry_region_ref());
             let carry = builder.add_input(scalar_type.clone().into());
@@ -3995,8 +3993,8 @@ mod tests {
     fn test_scan_operation_lower_frontend_execution() {
         // Tuple carries and output slices retain their parameter order through frontend tracing and XLA lowering.
         // Reversed scans stack suffix sums/products at the original input positions, including the unrolled tail.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let inputs_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
+        let inputs_type = Type::Array(ArrayType::new_static(DataType::F64, [3]));
         let client = execution_client();
         for (reverse, sums, products) in
             [(false, vec![1.0, 3.0, 6.0], vec![1.0, 2.0, 6.0]), (true, vec![6.0, 5.0, 3.0], vec![6.0, 6.0, 3.0])]
@@ -4070,7 +4068,7 @@ mod tests {
                 )?;
                 Ok(outputs)
             },
-            ArrayIrType::Dimension(count_type),
+            Type::Dimension(count_type),
         )
         .unwrap();
         let program = program.into_flat_program();

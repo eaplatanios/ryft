@@ -9,11 +9,11 @@ use std::collections::HashSet;
 
 use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use ryft_core::{
-    ArrayIrType, ArrayOperation, DimensionVariable, Operation as CoreOperation, ProgramError, ReductionKind,
-    ScatterMode, ScatterReductionKind, SortDirection, Type, Typed,
+    ArrayOperation, DimensionVariable, Operation as CoreOperation, ProgramError, ReductionKind, ScatterMode,
+    ScatterReductionKind, SortDirection, Type as CoreType, Typed,
 };
 
-use crate::{Error, FlatProgram, Operation};
+use crate::{Error, FlatProgram, Operation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -70,7 +70,7 @@ pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Resu
                 }
                 for output in instruction.outputs() {
                     // A static output defines no identity, like the static output of `dimension_from_scalar` above.
-                    if let ArrayIrType::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref()
+                    if let Type::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref()
                         && let Some(variable) = r#type.variable()
                     {
                         variables.insert(variable.clone());
@@ -378,7 +378,7 @@ fn data_dependent_padding_discipline(operation: &Operation) -> DataDependentPadd
 }
 
 /// Returns whether `r#type` carries an identity derived from `dimension_from_scalar`.
-fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<DimensionVariable>) -> bool {
+fn references_data_derived_dimension(r#type: &Type, variables: &HashSet<DimensionVariable>) -> bool {
     r#type.identities().any(|(_, identity)| variables.contains(identity))
 }
 
@@ -387,7 +387,7 @@ mod tests {
     use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType,
+        AddOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayOperation, ArrayType,
         AttentionConfiguration, AttentionImplementation, AttentionInputs, CompareOperation, ComparisonDirection,
         ConstantOperation, Context, ConvertElementTypeOperation, CumulativeKind, CumulativeOperation,
         CustomCallOperation, DataType, Differentiate, Dimension as CoreDimension, DimensionAddOperation,
@@ -408,7 +408,9 @@ mod tests {
         domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type, session_with_client,
     };
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
-    use crate::{Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Value};
+    use crate::{
+        Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Type, Value,
+    };
 
     use super::*;
 
@@ -695,7 +697,7 @@ mod tests {
                 let cotangents = pullback.apply_materialized(output_cotangent)?;
                 Ok(vec![scaled_dot, output, cotangents.query, cotangents.key, cotangents.value])
             },
-            vec![ArrayIrType::from(size_type)],
+            vec![Type::from(size_type)],
         )
         .unwrap();
         program.into_flat_program()
@@ -827,7 +829,7 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type),
+                RngBitGeneratorOperation::<Type>::new(RandomAlgorithm::ThreeFry, bits_type),
                 Vec::new(),
                 vec![state, dimension],
                 None,
@@ -922,7 +924,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             program.regions()[0].atoms()[sum.index()].r#type().as_ref(),
-            &ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(8))),
+            &Type::Dimension(DimensionType::from(CoreDimension::Static(8))),
         );
         assert_eq!(validate_data_dependent_compilation(&program).map_err(|error| error.to_string()), Ok(()));
     }

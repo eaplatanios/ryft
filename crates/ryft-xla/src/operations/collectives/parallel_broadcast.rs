@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DomainTracingContext, EmptyRegionDriver, InterpretableOperation, NamedAxis,
-    Operation as CoreOperation, PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ParallelBroadcastSource,
-    ProgramError, RematerializationOptimizationBarrier, Value as CoreValue, ValueProjection,
+    ArrayType, DomainTracingContext, EmptyRegionDriver, InterpretableOperation, NamedAxis, Operation as CoreOperation,
+    PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ParallelBroadcastSource, ProgramError,
+    RematerializationOptimizationBarrier, Value as CoreValue, ValueProjection,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
@@ -10,7 +10,7 @@ use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value 
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::operations::collectives::collective_replica_groups;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
 impl LowerableOperation for ParallelBroadcastOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -68,7 +68,7 @@ impl LowerableOperation for ParallelBroadcastOperation {
                     let outputs = self.interpret(&inputs[0].domain(), &EmptyRegionDriver, &inputs)?;
                     Ok(outputs.into_iter().map(|value| value.into_value()).collect::<Vec<_>>())
                 },
-                input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+                input_types.iter().cloned().map(Type::from).collect::<Vec<_>>(),
                 axes,
             )?;
             let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
@@ -186,7 +186,7 @@ mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(global_type.clone())],
+            vec![Type::Array(global_type.clone())],
         )
         .unwrap();
         let types = [global_type];
@@ -269,7 +269,7 @@ mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+            input_types.iter().cloned().map(Type::from).collect::<Vec<_>>(),
         )
         .unwrap();
         let module = to_mlir_module_for_program(
@@ -390,7 +390,7 @@ mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(global_type.clone())],
+            vec![Type::Array(global_type.clone())],
         )
         .unwrap();
         let types = [global_type];

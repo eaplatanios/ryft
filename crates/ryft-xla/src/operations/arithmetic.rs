@@ -5,7 +5,7 @@ use ryft_core::{
     SqrtOperation, SubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
-use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue, ValueRef};
+use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::types::{lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type};
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};

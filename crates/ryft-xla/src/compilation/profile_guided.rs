@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ryft_core::{ArrayIrType, ArrayType, CompilationCacheDomain, Parameterized, ParameterizedFamily};
+use ryft_core::{ArrayType, CompilationCacheDomain, Parameterized, ParameterizedFamily};
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile as PjrtFeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
@@ -18,7 +18,7 @@ use crate::compilation::CompilationError;
 use crate::compilation::functions::ExecutableFunction;
 use crate::compilation::options::{FeedbackDirectedProfile, Options};
 use crate::compilation::programs::LoweredProgram;
-use crate::{Array, Constant, Error, Session, Value};
+use crate::{Array, Constant, Error, Session, Type, Value};
 
 /// Namespace of the auxiliary disk cache entries that persist aggregated adaptive profiles.
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
@@ -293,8 +293,8 @@ impl AdaptiveProfileGuidedStatistics {
 /// executable or records a permanent failure while continuing to serve the baseline.
 pub struct AdaptiveProfileGuidedFunction<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// State shared by all clones of this function.
     inner: Arc<AdaptiveProfileGuidedFunctionInner<In, Out>>,
@@ -302,8 +302,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for AdaptiveProfileGuidedFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -313,8 +313,8 @@ where
 
 impl<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedFunction<In, Out>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Creates an adaptive function over `baseline`, the executable compiled from `lowered_program`, and installs an
     /// executable compiled with a persisted profile right away when the disk cache holds one.
@@ -841,8 +841,8 @@ impl AdaptiveProfileGuidedStateMachine {
 /// the state under one hold as well. A call therefore always executes the executable that its dispatch names.
 struct AdaptiveProfileGuidedFunctionInner<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
-    In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
-    Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Constant>,
+    In::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    Out::Family: ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
 {
     /// Domain that executes and recompiles the function.
     session: Session,

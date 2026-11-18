@@ -1,11 +1,11 @@
 use ryft_core::{
-    ArrayIrType, ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation as CoreOperation, ProgramError,
+    ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation as CoreOperation, ProgramError,
     REMATERIALIZE_OPERATION_NAME, RematerializationOptimizationBarrier, RematerializeOperation, StopGradientOperation,
 };
 use ryft_mlir::ValueRef;
 
 use crate::lowering::regions::lower_nested_program_inline;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for StopGradientOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -58,13 +58,13 @@ impl LowerableOperation for LinearCallOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for RematerializeOperation<ArrayIrType> {
+impl LowerableOperation for RematerializeOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         let [_] = lowerer.regions() else {
@@ -102,13 +102,13 @@ impl LowerableOperation for RematerializeOperation<ArrayIrType> {
     }
 }
 
-impl LowerableOperation for LinearCallOperation<ArrayIrType> {
+impl LowerableOperation for LinearCallOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         // The forward region is traced as a nested program, so it shares the enclosing capture scope. The transpose
@@ -229,7 +229,7 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
-        let operation = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable));
+        let operation = RematerializeOperation::<Type>::new(ResidualPolicyReference::new(NothingSavable));
 
         // The plain array family cannot carry the body region.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
@@ -316,8 +316,8 @@ mod tests {
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
-            let captured = builder
-                .add_constant(Constant::Captured(CaptureReference::new(0, ArrayIrType::Array(scalar_type.clone()))));
+            let captured =
+                builder.add_constant(Constant::Captured(CaptureReference::new(0, Type::Array(scalar_type.clone()))));
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, captured], None).unwrap()[0];
             builder
@@ -366,7 +366,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let lower = |operation: RematerializeOperation<ArrayIrType>| {
+        let lower = |operation: RematerializeOperation<Type>| {
             let mut builder = ArrayIrProgramBuilder::new();
             let body = builder.import_region(body.entry_region_ref());
             let input = builder.add_input(scalar_type.clone().into());
@@ -426,7 +426,7 @@ mod tests {
             .with_optimization_barrier(optimization_barrier);
             let (_, program) = DomainTracingContext::<Session>::trace(
                 |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
-                ArrayIrType::from(scalar_type.clone()),
+                Type::from(scalar_type.clone()),
             )
             .unwrap();
             to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
@@ -505,12 +505,12 @@ mod tests {
         });
         let (_, gradient) = DomainTracingContext::<Session>::trace(
             |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
-            ArrayIrType::from(scalar_type.clone()),
+            Type::from(scalar_type.clone()),
         )
         .unwrap();
         let gradient = gradient.into_flat_program();
         let lower = |program: &Program<Vec<Constant>, Vec<Constant>>| {
-            let array_types = |types: Vec<ArrayIrType>| {
+            let array_types = |types: Vec<Type>| {
                 types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
             };
             let input_types = array_types(program.input_types().into_owned());
@@ -600,7 +600,7 @@ mod tests {
         .with_policy(EverythingSavable);
         let (_, gradient) = DomainTracingContext::<Session>::trace(
             |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
-            ArrayIrType::from(scalar_type.clone()),
+            Type::from(scalar_type.clone()),
         )
         .unwrap();
         assert_eq!(
@@ -641,7 +641,7 @@ mod tests {
         );
         let (_, gradient) = DomainTracingContext::<Session>::trace(
             |x: Tracer| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
-            ArrayIrType::from(scalar_type.clone()),
+            Type::from(scalar_type.clone()),
         )
         .unwrap();
         assert_eq!(
@@ -750,7 +750,7 @@ mod tests {
 
         // An array IR call needs exactly its forward and transpose regions.
         assert!(matches!(
-            LinearCallOperation::<ArrayIrType>::new(1).lower(&mut lowerer, &[], &[], &[]),
+            LinearCallOperation::<Type>::new(1).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
                 if operation == "linear_call" && reason == "`linear_call` expected 2 attached regions but got 0",
         ));

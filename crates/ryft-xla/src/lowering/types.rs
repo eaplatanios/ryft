@@ -1,19 +1,19 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CaptureReference, ComparisonDirection, DataType, Dimension as CoreDimension,
-    DimensionValue, Layout, ProgramError, Shape, Type as RyftType,
+    ArrayType, CaptureReference, ComparisonDirection, DataType, Dimension as CoreDimension, DimensionValue, Layout,
+    ProgramError, Shape, Type as RyftType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef,
-    IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef, Type, TypeRef,
-    Value as MlirValue, ValueRef,
+    IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef,
+    Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::manipulation::memory::annotate_output_memory;
-use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt};
+use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -794,14 +794,14 @@ pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Error
 
 /// Lowers an array IR type to its physical StableHLO tensor type.
 pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
-    r#type: &ArrayIrType,
+    r#type: &Type,
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
     match r#type {
-        ArrayIrType::Array(r#type) => lower_tensor_type(r#type, context, location),
-        ArrayIrType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
-        ArrayIrType::Reference(_) => {
+        Type::Array(r#type) => lower_tensor_type(r#type, context, location),
+        Type::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
+        Type::Reference(_) => {
             Err(Error::Lowering(LoweringError::UnresolvedReference { construct: r#type.to_string() }))
         }
     }
@@ -1019,7 +1019,7 @@ mod tests {
     fn test_lower_array_ir_type() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         assert!(matches!(
             lower_array_ir_type(&reference_type, &context, location),
             Err(Error::Lowering(LoweringError::UnresolvedReference { construct }))

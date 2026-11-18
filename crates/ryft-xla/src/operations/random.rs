@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension as CoreDimension, DropoutOperation,
+    ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension as CoreDimension, DropoutOperation,
     Operation as CoreOperation, ProgramError, RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm,
     RngBitGeneratorOperation,
 };
@@ -11,7 +11,7 @@ use ryft_mlir::{
 
 use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -33,13 +33,13 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
+impl LowerableOperation for RngBitGeneratorOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -231,10 +231,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType,
-        ConvertElementTypeOperation, DataType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Dropout, DropoutOperation, Placeholder, ProgramError, Random,
-        RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram, ZeroOperation,
+        Array as CoreArray, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType, ConvertElementTypeOperation,
+        DataType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Dropout, DropoutOperation, Placeholder, ProgramError, Random, RandomAlgorithm,
+        RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram, ZeroOperation,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
@@ -245,7 +245,7 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, Session,
+        Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, Session, Type,
         to_mlir_module_for_program,
     };
 
@@ -322,7 +322,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let bits_type = ArrayType::new_static(DataType::U32, [3]);
-        assert_eq!(program.output_types()[1], ArrayIrType::Array(bits_type.clone()));
+        assert_eq!(program.output_types()[1], Type::Array(bits_type.clone()));
         let input_types = vec![state_type.clone()];
         let output_types = vec![state_type, bits_type];
         let module =
@@ -438,7 +438,7 @@ mod tests {
     fn test_rng_bit_generator_operation_lower_rejects_missing_input_types() {
         // Input types are validated before they are split into the state type and the extent operand types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let operation = RngBitGeneratorOperation::<ArrayIrType>::new(
+        let operation = RngBitGeneratorOperation::<Type>::new(
             RandomAlgorithm::ThreeFry,
             ArrayType::new(DataType::U32, Shape::new(vec![extent.into()])),
         );
@@ -467,7 +467,7 @@ mod tests {
         // whose refined type remains dynamic cannot be lowered.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![extent.into()]));
-        let operation = RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type.clone());
+        let operation = RngBitGeneratorOperation::<Type>::new(RandomAlgorithm::ThreeFry, bits_type.clone());
         let state_type = RandomAlgorithm::ThreeFry.state_type();
         let context = MlirContext::new();
         let location = context.unknown_location();

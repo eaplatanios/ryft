@@ -9,21 +9,21 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, AtomId,
-    AttachedRegions, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    CaptureConstant, CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation,
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero,
-    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayType, AtomId, AttachedRegions,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
+    CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation as CoreOperation,
+    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PartitionedProgram, Program as CoreProgram, ProgramBatchingOutputAxesPolicy,
     ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId,
     RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier,
     ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, StagedCallOperation,
     TangentActivity, Tracer as CoreTracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
-    TypedProgram, Value as CoreValue, ValueProjection, Zero,
+    TranspositionContext, TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements,
+    Typed, TypedProgram, Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -37,7 +37,9 @@ use crate::lowering::{CollectiveLoweringState, EffectTokens, collect_session_con
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::{FlatProgram, Operation, Program};
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Value};
+use crate::{
+    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Type, Value,
+};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -55,11 +57,11 @@ pub(crate) struct JitCallProgramKey {
     rendered: String,
 
     /// Flat input types, which together with the rendering pin the full callee signature.
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
 
     /// Flat output types, completing the callee signature when output-only placement metadata is not visible
     /// in the rendered body.
-    output_types: Vec<ArrayIrType>,
+    output_types: Vec<Type>,
 }
 
 /// One deduplicated callee emitted as a shared private `func.func`.
@@ -72,10 +74,10 @@ pub(crate) struct JitCallFunction<O = Operation> {
     program: FlatProgram<O>,
 
     /// Flat input types of the callee, also the emitted function's argument types.
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
 
     /// Flat output types of the callee, also the emitted function's result types.
-    output_types: Vec<ArrayIrType>,
+    output_types: Vec<Type>,
 }
 
 impl<O> JitCallFunction<O> {
@@ -87,13 +89,13 @@ impl<O> JitCallFunction<O> {
 
     /// Returns the flat input types of the callee, also the emitted function's argument types.
     #[inline]
-    pub(crate) fn input_types(&self) -> &[ArrayIrType] {
+    pub(crate) fn input_types(&self) -> &[Type] {
         &self.input_types
     }
 
     /// Returns the flat output types of the callee, also the emitted function's result types.
     #[inline]
-    pub(crate) fn output_types(&self) -> &[ArrayIrType] {
+    pub(crate) fn output_types(&self) -> &[Type] {
         &self.output_types
     }
 }
@@ -138,8 +140,8 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     pub(crate) fn named(
         &self,
         key: &CompositeKey,
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Option<&NamedFunction> {
         self.named
             .get(key)?
@@ -163,10 +165,10 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
 /// Shared function that implements the body of the named composite calls with one boundary.
 pub(crate) struct NamedFunction {
     /// Input types of the calls.
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
 
     /// Output types of the calls, which are also the results of the function.
-    output_types: Vec<ArrayIrType>,
+    output_types: Vec<Type>,
 
     /// Symbol of the function.
     symbol: String,
@@ -175,7 +177,7 @@ pub(crate) struct NamedFunction {
 impl NamedFunction {
     /// Returns the output types of the calls, which are also the results of the function.
     #[inline]
-    pub(crate) fn output_types(&self) -> &[ArrayIrType] {
+    pub(crate) fn output_types(&self) -> &[Type] {
         &self.output_types
     }
 
@@ -338,7 +340,7 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
 /// returns its results, typed by `output_types`.
 pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
     symbol: &str,
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -388,7 +390,7 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
 /// while separate calls receive independent local result identities.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct JitCallOperation<T: Type> {
+pub struct JitCallOperation<T: CoreType> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
     capture_count: usize,
 
@@ -399,7 +401,7 @@ pub struct JitCallOperation<T: Type> {
     output_types: Option<CallTypeBindings<T>>,
 }
 
-impl<T: Type> JitCallOperation<T> {
+impl<T: CoreType> JitCallOperation<T> {
     /// Creates a staged `jit_call` operation. The flat callee program is supplied as a shared region attachment to
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
@@ -480,8 +482,8 @@ impl<T: Type> JitCallOperation<T> {
         }
         if callee_outputs
             .iter()
-            .flat_map(Type::identities)
-            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+            .flat_map(CoreType::identities)
+            .any(|(_, identity)| !inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == identity))
         {
             return Err(TypeError::invalid(
                 "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
@@ -499,14 +501,14 @@ impl StagedCallOperation<Constant> for Operation {
 
     fn staged_call_with_types(
         capture_count: usize,
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Self, TypeError> {
         Ok(Self::JitCall(JitCallOperation::new(capture_count).with_callee_type_signature(input_types, output_types)?))
     }
 }
 
-impl<T: Type> CoreOperation for JitCallOperation<T> {
+impl<T: CoreType> CoreOperation for JitCallOperation<T> {
     type Type = T;
 
     #[inline]
@@ -633,7 +635,7 @@ impl<T: Type> CoreOperation for JitCallOperation<T> {
 // signature.
 impl<T, C, P> ReferenceDischargeableOperation<C, P> for JitCallOperation<T>
 where
-    T: Type + From<P::Referent>,
+    T: CoreType + From<P::Referent>,
     C: Context<Type = T, Operation: From<JitCallOperation<T>>>,
     P: ReferenceDischargePolicy<C>,
 {
@@ -697,14 +699,14 @@ where
 // and a callee with nominal type identities is split per call when its inputs are mixed. Effectful mixed calls also
 // share their splits, keyed by the driver's repeated-residual mode because that mode determines effect placement.
 // Effectful and identity-bearing all-known calls remain whole on residual demand.
-impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayIrType>
+impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<Type>
 where
     V: PartialEq
-        + CoreValue<Type = ArrayIrType>
+        + CoreValue<Type = Type>
         + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
         + CaptureConstant
         + Concretizable<bool>,
-    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
+    C: Context<Type = Type, Constant = V, Operation = Operation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -744,7 +746,7 @@ where
         // that neither side retains, so it does not pin the boundary, but an allocation that escapes through a
         // reference output is live state whose later accesses are unknown to the callee, so it does.
         let accesses_references = inputs.iter().any(|input| input.r#type().is_reference())
-            || callee.output_types().iter().any(Type::is_reference)
+            || callee.output_types().iter().any(CoreType::is_reference)
             || callee
                 .instructions_in_closure()
                 .any(|(_, instruction)| instruction.operation().effects().has_reference_accesses());
@@ -826,9 +828,9 @@ where
 // attached again. An eager client-backed parent (e.g., [`Session`](crate::Session)) compiles and executes the batched
 // call immediately, a staging parent stages it into the enclosing program, and a differentiation parent dispatches it
 // through its own `jit_call` JVP rule, which is what serves `vmap` nested inside `gradient` and `linearize` closures.
-impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<Type>
 where
-    C: Context<Type = ArrayIrType>,
+    C: Context<Type = Type>,
     C::Operation: From<Self>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -981,11 +983,11 @@ where
 //   - `context`: Active evaluation or staging context used to bind the differentiated calls.
 //   - `driver`: Call-scoped access to the attached callee region.
 //   - `inputs`: Primal and tangent values for the call operands.
-impl<C, V> DifferentiableOperation<C> for JitCallOperation<ArrayIrType>
+impl<C, V> DifferentiableOperation<C> for JitCallOperation<Type>
 where
-    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>> + Zero<C::Value>,
+    C: Context<Type = Type, Constant = V, Operation = Operation<V>> + Zero<C::Value>,
     V: PartialEq
-        + CoreValue<Type = ArrayIrType>
+        + CoreValue<Type = Type>
         + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
         + CaptureConstant
         + Concretizable<bool>,
@@ -1207,10 +1209,10 @@ where
 ///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
 ///     slot in the transposed callee at all.
 pub fn transpose_primal_jit_call<
-    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
     D: TranspositionDriver<V, Operation<V>>,
 >(
-    _operation: &JitCallOperation<ArrayIrType>,
+    _operation: &JitCallOperation<Type>,
     context: &mut TracingContext<V, Operation<V>>,
     driver: &D,
     inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
@@ -1318,9 +1320,9 @@ pub fn transpose_primal_jit_call<
 // enclosing [`TranspositionContext`]. The callee transposition happens on the concretely [`Constant`]-keyed
 // [`FlatProgram`], so the recursion is resolved once at definition time and instantiating this implementation
 // introduces no recursive [`TransposableOperation`] obligation on [`Operation`].
-impl<V> TransposableOperation<V, Operation<V>> for JitCallOperation<ArrayIrType>
+impl<V> TransposableOperation<V, Operation<V>> for JitCallOperation<Type>
 where
-    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
 {
     fn transpose<D: TranspositionDriver<V, Operation<V>>>(
         &self,
@@ -1354,7 +1356,7 @@ where
 // executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
 // entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
 // through this same session.
-impl InterpretableOperation<Session> for JitCallOperation<ArrayIrType> {
+impl InterpretableOperation<Session> for JitCallOperation<Type> {
     fn interpret<D: InterpretationDriver<Session>>(
         &self,
         context: &Session,
@@ -1371,13 +1373,13 @@ impl InterpretableOperation<Session> for JitCallOperation<ArrayIrType> {
     }
 }
 
-impl LowerableOperation for JitCallOperation<ArrayIrType> {
+impl LowerableOperation for JitCallOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         self.validate_region_count(lowerer.regions().len())?;
@@ -1407,10 +1409,10 @@ struct NamedFunctionKey {
     key: CompositeKey,
 
     /// Input types of the calls.
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
 
     /// Output types of the calls.
-    output_types: Vec<ArrayIrType>,
+    output_types: Vec<Type>,
 }
 
 /// Named composite calls found by [`count_jit_calls`], grouped by the interned body region, the key, and the boundary
@@ -1433,10 +1435,10 @@ struct NamedRegionCall {
     composite: CompositeKey,
 
     /// Input types of the calls.
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
 
     /// Output types of the calls.
-    output_types: Vec<ArrayIrType>,
+    output_types: Vec<Type>,
 
     /// Number of calls.
     count: usize,
@@ -1463,7 +1465,7 @@ struct NamedRegionCall {
 /// one fresh caller identity. Another call receives a different identity for `m`, even though its diagnostic name can
 /// remain `m`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CallTypeBindings<T: Type> {
+struct CallTypeBindings<T: CoreType> {
     /// Formal input namespace used when instantiating forwarded result identities.
     inputs: Arc<[T]>,
 
@@ -1471,7 +1473,7 @@ struct CallTypeBindings<T: Type> {
     outputs: Arc<[T]>,
 }
 
-impl<T: Type> CallTypeBindings<T> {
+impl<T: CoreType> CallTypeBindings<T> {
     /// Freshens callee-local result identities, returning no metadata when all result identities are forwarded.
     ///
     /// # Errors
@@ -1480,21 +1482,21 @@ impl<T: Type> CallTypeBindings<T> {
     fn fresh(inputs: &[T], outputs: &[T]) -> Result<Option<Self>, TypeError> {
         if !outputs
             .iter()
-            .flat_map(Type::identities)
-            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+            .flat_map(CoreType::identities)
+            .any(|(_, identity)| !inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == identity))
         {
             return Ok(None);
         }
         let mut unavailable = inputs
             .iter()
             .chain(outputs)
-            .flat_map(Type::identities)
+            .flat_map(CoreType::identities)
             .map(|(_, identity)| identity.clone())
             .collect::<Vec<_>>();
         let mut renaming = TypeIdentityRenaming::new();
-        for (_, identity) in outputs.iter().flat_map(Type::identities) {
+        for (_, identity) in outputs.iter().flat_map(CoreType::identities) {
             if renaming.target(identity).is_none()
-                && !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+                && !inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == identity)
             {
                 unavailable.push(renaming.insert_fresh(identity.clone(), &unavailable)?);
             }
@@ -1522,8 +1524,8 @@ impl<T: Type> CallTypeBindings<T> {
         if callee_outputs == outputs {
             if callee_outputs
                 .iter()
-                .flat_map(Type::identities)
-                .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+                .flat_map(CoreType::identities)
+                .any(|(_, identity)| !inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == identity))
             {
                 return Err(TypeError::invalid("call local result declarations must use fresh identities"));
             }
@@ -1542,8 +1544,8 @@ impl<T: Type> CallTypeBindings<T> {
     /// Returns the caller-owned identities defined by this call, once each in result occurrence order.
     fn definitions(&self) -> Vec<T::Identity> {
         let mut definitions = Vec::new();
-        for (_, identity) in self.outputs.iter().flat_map(Type::identities) {
-            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+        for (_, identity) in self.outputs.iter().flat_map(CoreType::identities) {
+            if !self.inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == identity)
                 && !definitions.contains(identity)
             {
                 definitions.push(identity.clone());
@@ -1588,9 +1590,9 @@ impl<T: Type> CallTypeBindings<T> {
     fn renaming(&self, inputs: &[T], callee_outputs: &[T]) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
         let outputs = self.instantiated(inputs)?;
         let renaming = T::derive_identity_renaming(callee_outputs, &outputs)?;
-        for (_, identity) in callee_outputs.iter().flat_map(Type::identities) {
+        for (_, identity) in callee_outputs.iter().flat_map(CoreType::identities) {
             let target = renaming.target(identity).unwrap_or(identity);
-            let forwarded = inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity);
+            let forwarded = inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == identity);
             if forwarded && target != identity {
                 return Err(TypeError::invalid("call result declarations must preserve forwarded input identities"));
             }
@@ -1599,7 +1601,7 @@ impl<T: Type> CallTypeBindings<T> {
                     || inputs
                         .iter()
                         .chain(callee_outputs)
-                        .flat_map(Type::identities)
+                        .flat_map(CoreType::identities)
                         .any(|(_, original)| original == target))
             {
                 return Err(TypeError::invalid("call local result declarations must use fresh identities"));
@@ -1616,7 +1618,7 @@ impl<T: Type> CallTypeBindings<T> {
     fn renamed(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
         let mut owned = TypeIdentityRenaming::new();
         for (source, target) in renaming.replacements() {
-            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == source) {
+            if !self.inputs.iter().flat_map(CoreType::identities).any(|(_, input)| input == source) {
                 owned.insert(source.clone(), target.clone())?;
             }
         }
@@ -1657,9 +1659,7 @@ impl<T: Type> CallTypeBindings<T> {
 /// call). Binding that copy instead of a fresh copy of the region lets every call of one callee share one region.
 struct JitCallCalleeTransform;
 
-impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
-    for JitCallCalleeTransform
-{
+impl<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>> Transform<CoreRegion<V, O>> for JitCallCalleeTransform {
     type Arguments = ();
     type Artifact = TransformArtifact<V, O, ()>;
 
@@ -1673,9 +1673,7 @@ impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Tra
 /// call partial evaluation rules share one split per callee, knownness, and policy through their caches.
 struct JitCallSplitTransform;
 
-impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
-    for JitCallSplitTransform
-{
+impl<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>> Transform<CoreRegion<V, O>> for JitCallSplitTransform {
     type Arguments = JitCallSplitArguments;
     type Artifact = TransformArtifact<V, O, Arc<JitCallSplit>>;
 
@@ -1702,7 +1700,7 @@ struct JitCallSplitArguments {
 
     /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
     /// definition identity, or [`None`] when partial evaluation has no residual policy.
-    policy: Option<ResidualPolicyReference<ArrayIrType>>,
+    policy: Option<ResidualPolicyReference<Type>>,
 
     /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
     /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
@@ -1920,7 +1918,7 @@ where
                 });
                 continue;
             }
-            if instruction.operation().projected_payload::<JitCallOperation<ArrayIrType>>().is_some() {
+            if instruction.operation().projected_payload::<JitCallOperation<Type>>().is_some() {
                 let Some(&callee_region) = instruction.regions().first() else {
                     continue;
                 };
@@ -1989,7 +1987,7 @@ where
 
 /// Validates that `input_types` match `expected_types` exactly, in count and position, and reports the first mismatch
 /// as a type error naming `operation_name`.
-fn validate_call_input_types<T: Type>(
+fn validate_call_input_types<T: CoreType>(
     operation_name: &'static str,
     expected_types: &[T],
     input_types: &[T],
@@ -2014,7 +2012,7 @@ fn validate_call_input_types<T: Type>(
 /// Returns the callee of a `jit_call` bound over `callee` as a shared program, which is the program that `callee` was
 /// interned from, if any, and otherwise a copy of `callee` that the region transform cache of `callee` retains (refer
 /// to [`JitCallCalleeTransform`]).
-fn shared_jit_call_callee<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>>(
+fn shared_jit_call_callee<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>>(
     callee: RegionRef<'_, V, O>,
 ) -> Result<Arc<CoreProgram<V, O, Vec<V>, Vec<V>>>, ProgramError> {
     if let Some(callee) = callee.interned_callee() {
@@ -2030,16 +2028,14 @@ fn shared_jit_call_callee<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Typ
 /// The callee is bound as a shared program (refer to [`shared_jit_call_callee`]), so that repeated calls of one callee
 /// keep sharing one region in the known-side context and in the residual program.
 fn fold_or_residualize_jit_call<V, C, D>(
-    operation: &JitCallOperation<ArrayIrType>,
+    operation: &JitCallOperation<Type>,
     context: &PartialEvaluationContext<C>,
     driver: &D,
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    V: CoreValue<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
-        + CaptureConstant,
-    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>> + CaptureConstant,
+    C: Context<Type = Type, Constant = V, Operation = Operation<V>>,
     D: PartialEvaluationDriver<C>,
 {
     let callee = shared_jit_call_callee(driver.region(0)?)?;
@@ -2054,12 +2050,12 @@ where
 /// case when `callee` has effects, references, nominal type identities, or capture constants. Splitting such a call on
 /// residual demand, or forwarding its outputs, would move effects, reference accesses, nominally scoped types, or
 /// captures that name its capture prefix across the boundary that validates them.
-fn keeps_jit_call_boundary<V: CoreValue<Type = ArrayIrType> + CaptureConstant, O, W: CoreValue>(
+fn keeps_jit_call_boundary<V: CoreValue<Type = Type> + CaptureConstant, O, W: CoreValue>(
     callee: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<W>],
 ) -> bool
 where
-    O: CoreOperation<Type = ArrayIrType>,
+    O: CoreOperation<Type = Type>,
 {
     !callee.effects().classes().is_empty() || !can_cache_jit_call_split(callee, inputs)
 }
@@ -2068,12 +2064,12 @@ where
 /// includes their partition configuration, whereas references, captures, and nominal identities require the original
 /// boundary or call-local identities. All-known replay additionally excludes effects (refer to
 /// [`keeps_jit_call_boundary`]).
-fn can_cache_jit_call_split<V: CoreValue<Type = ArrayIrType> + CaptureConstant, O, W: CoreValue>(
+fn can_cache_jit_call_split<V: CoreValue<Type = Type> + CaptureConstant, O, W: CoreValue>(
     callee: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<W>],
 ) -> bool
 where
-    O: CoreOperation<Type = ArrayIrType>,
+    O: CoreOperation<Type = Type>,
 {
     !inputs
         .iter()
@@ -2089,7 +2085,7 @@ where
 /// all-known call that partial evaluation keeps whole under a residual policy uses this, so that the residual planner
 /// sees such an output as the call input that it is, rather than as an output of the call that it would save separately
 /// (e.g., a primal input that the primal call of a linearized callee returns as a residual).
-fn forward_jit_call_inputs<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>, W: CoreValue>(
+fn forward_jit_call_inputs<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>, W: CoreValue>(
     callee: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<W>],
     outputs: Vec<PartialEvaluationValue<W>>,
@@ -2135,7 +2131,7 @@ fn forward_jit_call_inputs<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Ty
 /// residual demand partitions through [`PartialEvaluationContext::partition_residual_demand`], whose bound only the
 /// caller's [`PartiallyEvaluatableOperation::split_on_residual_demand`] states.
 fn split_jit_call<V, C, D>(
-    operation: &JitCallOperation<ArrayIrType>,
+    operation: &JitCallOperation<Type>,
     context: &PartialEvaluationContext<C>,
     driver: &D,
     inputs: &[PartialEvaluationValue<C::Value>],
@@ -2143,10 +2139,8 @@ fn split_jit_call<V, C, D>(
     partition: &dyn Fn(RegionRef<'_, V, Operation<V>>) -> Result<PartitionedProgram<V, Operation<V>>, ProgramError>,
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    V: CoreValue<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
-        + CaptureConstant,
-    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>> + CaptureConstant,
+    C: Context<Type = Type, Constant = V, Operation = Operation<V>>,
     D: PartialEvaluationDriver<C>,
 {
     let callee = driver.region(0)?;
@@ -2295,7 +2289,7 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType,
+        AddOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, ArrayType,
         AssertOperation, AtomId, AttachedRegions, AxisIndexOperation, BatchableOperation, BatchingContext,
         BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, ConvertElementTypeOperation,
@@ -2331,7 +2325,7 @@ mod tests {
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, CustomCallOperationExtension, Options, RuntimeRequirement,
-        StagedFunction, ToPjrt, Value, compile, stage, to_mlir_module_for_program,
+        StagedFunction, ToPjrt, Type, Value, compile, stage, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -2402,7 +2396,7 @@ mod tests {
         values: Vec<Vec<f32>>,
     ) -> Vec<Vec<f32>> {
         for r#type in program.input_types().iter() {
-            assert!(matches!(r#type, ArrayIrType::Array(r#type) if r#type.data_type() == DataType::F32));
+            assert!(matches!(r#type, Type::Array(r#type) if r#type.data_type() == DataType::F32));
         }
         let values = values.iter().map(|values| values_to_bytes(values)).collect();
         execute_array_program(client, program, values)
@@ -2415,7 +2409,7 @@ mod tests {
     /// `residual = print(x * known)`. Its two scalar inputs are the known coefficient and the unknown value.
     fn effectful_mixed_callee(effect_class: EffectClass) -> Arc<FlatProgram> {
         let mut builder = ArrayIrProgramBuilder::new();
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type);
         let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known], None).unwrap()[0];
@@ -2451,8 +2445,8 @@ mod tests {
         program: &Program<Vec<Constant>, Vec<Constant>>,
         values: Vec<Vec<u8>>,
     ) -> Vec<Vec<u8>> {
-        let array_type = |r#type: &ArrayIrType| match r#type {
-            ArrayIrType::Array(r#type) => r#type.clone(),
+        let array_type = |r#type: &Type| match r#type {
+            Type::Array(r#type) => r#type.clone(),
             _ => panic!("expected an array signature"),
         };
         let input_types = program.input_types().iter().map(array_type).collect::<Vec<_>>();
@@ -2478,7 +2472,7 @@ mod tests {
             .into_iter()
             .zip(program.input_types().into_owned())
             .map(|(values, r#type)| {
-                let ArrayIrType::Array(r#type) = r#type else {
+                let Type::Array(r#type) = r#type else {
                     panic!("expected an array input");
                 };
                 let dimensions =
@@ -2511,8 +2505,8 @@ mod tests {
     }
 
     /// Returns the `f32[2, 2]` matrix type of the residual demand workloads.
-    fn residual_demand_matrix_type() -> ArrayIrType {
-        ArrayIrType::from(ArrayType::new_static(DataType::F32, [2, 2]))
+    fn residual_demand_matrix_type() -> Type {
+        Type::from(ArrayType::new_static(DataType::F32, [2, 2]))
     }
 
     /// Stages `sin(a · b) ⊙ cos(a · b) + a` for `a = left` and `b = right` into `builder` and returns its output.
@@ -2584,7 +2578,7 @@ mod tests {
     /// only value that the tangent needs, so every call stays all-known, while differentiating `w` as well makes every
     /// call a differentiated call whose tangent call mixes unknown tangents with known residuals.
     fn residual_demand_program(
-        policy: Option<ResidualPolicyReference<ArrayIrType>>,
+        policy: Option<ResidualPolicyReference<Type>>,
         body: impl Fn(&mut ArrayIrProgramBuilder, AtomId, AtomId) -> AtomId,
     ) -> FlatProgram {
         let mut builder = ArrayIrProgramBuilder::new();
@@ -2873,7 +2867,7 @@ mod tests {
         // Backend replacement also makes a source region dormant, so helper discovery must not emit its callees.
         let named = NamedComposite::new(
             CompositeKey::new("ryft.tests.xla_named_square", 1),
-            |types: &[ArrayIrType]| Ok(types.to_vec()),
+            |types: &[Type]| Ok(types.to_vec()),
             |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
         );
         let rules: CustomRuleRegistration<Constant, Operation> =
@@ -3248,7 +3242,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_operation_with_callee_region() {
-        let input_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let input_type: Type = ArrayType::scalar(DataType::F32).into();
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -3385,9 +3379,8 @@ mod tests {
 
     #[test]
     fn test_jit_call_supports_array_ir_region_boundaries() {
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
-        let array_type = ArrayIrType::Array(vector_type());
+        let dimension_type = Type::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
+        let array_type = Type::Array(vector_type());
         let interface = RegionInterface::new(
             vec![dimension_type.clone()],
             vec![array_type.clone(), dimension_type.clone()],
@@ -3437,7 +3430,7 @@ mod tests {
         // A `jit_call` operation forwards its operands to the callee positionally, so region provenance, capture
         // counts, and output provenance are all index-preserving for the single callee region and absent for any other
         // region.
-        let operation = JitCallOperation::<ArrayIrType>::new(2);
+        let operation = JitCallOperation::<Type>::new(2);
         assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::Input { index: 3 });
         assert_eq!(operation.input_region_provenance(1, 3), InputRegionProvenance::None);
         assert_eq!(operation.region_capture_input_count(0), Some(2));
@@ -3454,7 +3447,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_operation_region_data_flow() {
-        let operation = JitCallOperation::<ArrayIrType>::new(2);
+        let operation = JitCallOperation::<Type>::new(2);
         assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
         let dispatched = Operation::<Constant>::from(operation);
         assert!(matches!(dispatched.region_data_flow(), RegionDataFlow::Provenance));
@@ -3465,7 +3458,7 @@ mod tests {
         // The callee maps its lifted capture `c` and its operands `(x, y)` to `(cos(x), c * y)`. Using only the first
         // output drops the operand `y` and the second output, while the capture prefix is kept although nothing uses
         // it.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let captured = builder.add_input(r#type.clone());
@@ -3595,10 +3588,8 @@ mod tests {
         let branch = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let replacement = builder.add_input(vector_type().into());
-            let reference = builder.add_constant(Constant::Captured(CaptureReference::new(
-                0,
-                ArrayIrType::Reference(reference_type.clone()),
-            )));
+            let reference = builder
+                .add_constant(Constant::Captured(CaptureReference::new(0, Type::Reference(reference_type.clone()))));
             let snapshot = builder
                 .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
                 .unwrap()[0];
@@ -3798,7 +3789,7 @@ mod tests {
         );
         // The call owns a fresh result identity, distinct from the callee-local identity it instantiates.
         let call = &program.entry_region_ref().instructions()[0];
-        assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &ArrayIrType::Dimension(rows));
+        assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &Type::Dimension(rows));
 
         // Execute the discharged program on CPU, with the call staged inside one compiled function.
         let compiled: CompiledFunction<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
@@ -3853,7 +3844,7 @@ mod tests {
         // is classified through the callee to that output's own producer instead of to the opaque `jit_call`. The
         // program squares its known input `x` inside the callee and multiplies the result of the call by its unknown
         // input `y` outside of it, so the residual program needs the result of the call.
-        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let scalar_type = Type::from(ArrayType::scalar(DataType::F64));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
@@ -3876,7 +3867,7 @@ mod tests {
             .unwrap();
         let names = Arc::new(Mutex::new(Vec::new()));
         let recorded = names.clone();
-        let policy = RematerializationPolicyFn::new::<ArrayIrType>(move |candidate| {
+        let policy = RematerializationPolicyFn::new::<Type>(move |candidate| {
             let names = candidate.producers().iter().map(|producer| producer.name().to_string());
             recorded.lock().unwrap().extend(names);
             Ok::<_, ResidualRejection>(ResidualDecision::<NoStorage>::Save)
@@ -3894,8 +3885,8 @@ mod tests {
         // The callee `f(r, x) = { a = read(r); r += x; a * read(r) }` reads the reference before and after mutating it.
         // Splitting it against a known `r` would hoist the first read into the outer program and leave the mutation
         // and the second read behind the residual call, so the call stays whole instead.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
@@ -3971,7 +3962,7 @@ mod tests {
         // beside a runtime-dependent product. The allocation is computable from known inputs alone, but it escapes
         // through a reference output whose later accesses the callee cannot see, so it is live state rather than dead
         // intrinsic state, and the call stays whole instead of hoisting the allocation into the known side.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
@@ -4034,7 +4025,7 @@ mod tests {
     // residual edge flows from the known-side call's outputs into the residual call's inputs.
     #[test]
     fn test_jit_call_partial_evaluation_splits_callee_against_a_live_outer_trace() {
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
 
         // Callee `f(a, x) = (a + a, x * x, (a + a) * x)` over a known `a` and an unknown `x`. Capture constants are
         // deliberately absent, because a capture-bearing callee preserves its boundary instead of splitting, which
@@ -4144,7 +4135,7 @@ mod tests {
         let logical_mesh = mesh.logical_mesh().clone();
         let session = session_with_client(client);
         let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
-        let r#type = ArrayIrType::Array(array_type.clone());
+        let r#type = Type::Array(array_type.clone());
 
         // Callee `f(a, x) = (a + a, (a + a) * x)` over a known `a` and an unknown `x`.
         let callee = {
@@ -4225,7 +4216,7 @@ mod tests {
         // call needs `sin(a)`, which is also a known output, so the known call returns it once and the residual call is
         // fed from that output (JAX's `out_fwd`). The outer partition repeats the known call's output as its own
         // residual edge, because `Program::partition` keeps one edge per residual feeder.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let a = builder.add_input(r#type.clone());
@@ -4285,7 +4276,7 @@ mod tests {
         // Partitioning does not remap the absolute indices of retained capture constants, so a mixed call whose
         // callee still holds one must keep its original boundary instead of splitting into derived callees whose
         // compacted or absent capture prefixes those indices would misname.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
@@ -4349,7 +4340,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_partitions_a_callee_with_a_dead_allocation() {
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known_input = builder.add_input(r#type.clone());
@@ -4433,7 +4424,7 @@ mod tests {
     fn test_jit_call_partial_evaluation_places_callee_residuals_with_the_context_policy() {
         struct SaveDots;
 
-        impl ResidualPolicy<ArrayIrType> for SaveDots {
+        impl ResidualPolicy<Type> for SaveDots {
             type Storage = NoStorage;
 
             fn name(&self) -> &str {
@@ -4442,7 +4433,7 @@ mod tests {
 
             fn classify(
                 &self,
-                candidate: &ResidualCandidate<'_, ArrayIrType>,
+                candidate: &ResidualCandidate<'_, Type>,
             ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
                 Ok(match candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
                     true => ResidualDecision::Save,
@@ -4456,8 +4447,8 @@ mod tests {
         // cosine and the residual call recomputes the cosine.
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let x = builder.add_input(ArrayIrType::Array(vector_type()));
-            let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+            let x = builder.add_input(Type::Array(vector_type()));
+            let t = builder.add_input(Type::Array(ArrayType::scalar(DataType::F64)));
             let dot = ArrayOperation::<ArrayConstant>::from(DotOperation::new(DotDimensionNumbers::new(
                 vec![0],
                 vec![0],
@@ -4474,8 +4465,8 @@ mod tests {
                 .unwrap()
         };
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let x = builder.add_input(ArrayIrType::Array(vector_type()));
-        let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let x = builder.add_input(Type::Array(vector_type()));
+        let t = builder.add_input(Type::Array(ArrayType::scalar(DataType::F64)));
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let output = builder
             .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![x, t], None)
@@ -4555,7 +4546,7 @@ mod tests {
 
         // Ordinary partial evaluation preserves the original compiled-call boundary and expanded residual.
         let ordinary = program.partition(&[false, true]).unwrap();
-        assert_eq!(ordinary.known_program().output_types(), vec![ArrayIrType::from(expanded_type.clone())]);
+        assert_eq!(ordinary.known_program().output_types(), vec![Type::from(expanded_type.clone())]);
         assert_eq!(
             ordinary.to_string(),
             indoc! {"
@@ -4587,7 +4578,7 @@ mod tests {
 
         let policy = ResidualPolicyReference::new(SaveOnlyTheseNames::new(["scale"]));
         let placed = program.partition_with_residual_policy(&[false, true], &policy).unwrap();
-        assert_eq!(placed.known_program().output_types(), vec![ArrayIrType::from(compact_type.clone())]);
+        assert_eq!(placed.known_program().output_types(), vec![Type::from(compact_type.clone())]);
         assert_eq!(compact_type.element_count().unwrap().unwrap() * size_of::<f32>(), 4096);
         assert_eq!(
             placed.to_string(),
@@ -4640,7 +4631,7 @@ mod tests {
         assert_eq!(linearization.residual_count(), 1);
         assert_eq!(
             linearization.primal().output_types(),
-            vec![ArrayIrType::from(expanded_type.clone()), ArrayIrType::from(compact_type.clone())],
+            vec![Type::from(expanded_type.clone()), Type::from(compact_type.clone())],
         );
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
@@ -4696,7 +4687,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_ignores_known_outputs_without_residual_demand() {
-        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let scalar_type = Type::from(ArrayType::scalar(DataType::F32));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -4730,7 +4721,7 @@ mod tests {
             )
             .unwrap();
         let policy =
-            ResidualPolicyReference::new(RematerializationPolicyFn::new::<ArrayIrType>(|candidate| {
+            ResidualPolicyReference::new(RematerializationPolicyFn::new::<Type>(|candidate| {
                 if candidate.producers().iter().any(|producer| {
                     producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "unused")
                 }) {
@@ -4833,7 +4824,7 @@ mod tests {
         );
 
         // An ordered assertion must keep the same owning call and execution order.
-        let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
+        let predicate_type = Type::from(ArrayType::scalar(DataType::Boolean));
         let mut builder = ArrayIrProgramBuilder::new();
         let predicate = builder.add_input(predicate_type.clone());
         builder
@@ -4848,7 +4839,7 @@ mod tests {
 
         // Reference handles and retained capture constants keep their existing boundary semantics too.
         let mut builder = ArrayIrProgramBuilder::new();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         check_boundary(
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -4899,7 +4890,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_keeps_effectful_all_known_calls_whole_on_residual_demand() {
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone());
         builder
@@ -4952,7 +4943,7 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_splits_repeated_all_known_calls_on_residual_demand() {
         let callee = residual_demand_leaf_callee();
-        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+        let repeated = |count: usize, policy: Option<ResidualPolicyReference<Type>>| {
             residual_demand_program(policy, |builder, weights, bias| {
                 (0..count).fold(weights, |hidden, _| add_jit_call(builder, &callee, vec![hidden, bias]))
             })
@@ -5021,7 +5012,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_splits_nested_all_known_calls_on_residual_demand() {
-        let nested = |depth: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+        let nested = |depth: usize, policy: Option<ResidualPolicyReference<Type>>| {
             let callee = residual_demand_diamond_callee(depth);
             residual_demand_program(policy, |builder, weights, bias| {
                 add_jit_call(builder, &callee, vec![weights, bias])
@@ -5107,7 +5098,7 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_replays_all_known_calls_without_saved_interior_values() {
         let callee = residual_demand_leaf_callee();
-        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+        let repeated = |count: usize, policy: Option<ResidualPolicyReference<Type>>| {
             residual_demand_program(policy, |builder, weights, bias| {
                 (0..count).fold(weights, |hidden, _| add_jit_call(builder, &callee, vec![hidden, bias]))
             })
@@ -5180,7 +5171,7 @@ mod tests {
         // value. An ordered assertion and a capture constant keep the boundary of the call, so the residual planner
         // saves the demanded output of the call instead of splitting it.
         let matrix_type = residual_demand_matrix_type();
-        let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
+        let predicate_type = Type::from(ArrayType::scalar(DataType::Boolean));
         let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
         let check_saved_output = |callee: FlatProgram, capture_count: usize| {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -5248,7 +5239,7 @@ mod tests {
         // its producer, before computing `w` from it, and the output and its derivative with respect to `s` (both `w`
         // for `s = 1`) agree. Without that rounding, the output used `t` at `f32` precision (1.21343994 for `x = 1.1`)
         // while the derivative used the saved `bf16` value (1.2109375).
-        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let scalar_type = Type::from(ArrayType::scalar(DataType::F32));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(scalar_type.clone());
@@ -5556,7 +5547,7 @@ mod tests {
         let callee = effectful_mixed_callee(EffectClass::UnorderedIo);
         let program = |callee: &Arc<FlatProgram>, count: usize| {
             let mut builder = ArrayIrProgramBuilder::new();
-            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+            let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
             let known = builder.add_input(scalar_type.clone());
             let unknown = builder.add_input(scalar_type);
             let output = (0..count).fold(unknown, |value, _| add_jit_call(&mut builder, callee, vec![known, value]));
@@ -5596,7 +5587,7 @@ mod tests {
         let mut counts = Vec::new();
         for _ in 0..6 {
             let mut builder = ArrayIrProgramBuilder::new();
-            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+            let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
             let known = builder.add_input(scalar_type.clone());
             let unknown = builder.add_input(scalar_type);
             let first = add_jit_call(&mut builder, &nested, vec![known, unknown]);
@@ -5678,7 +5669,7 @@ mod tests {
         }
 
         let callee = effectful_mixed_callee(EffectClass::UnorderedIo);
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
         let mut builder = ArrayIrProgramBuilder::new();
         let known = builder.add_input(scalar_type.clone());
         let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known], None).unwrap()[0];
@@ -5759,7 +5750,7 @@ mod tests {
         let callee = effectful_mixed_callee(EffectClass::OrderedIo);
         let program = |prefix: bool| {
             let mut builder = ArrayIrProgramBuilder::new();
-            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+            let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
             let known = builder.add_input(scalar_type.clone());
             let unknown = builder.add_input(scalar_type);
             if prefix {
@@ -5832,7 +5823,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_cached_effectful_splits_keep_outputless_residuals() {
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
         let mut builder = ArrayIrProgramBuilder::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type.clone());
@@ -5871,7 +5862,7 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_shares_callees_of_repeated_differentiated_calls() {
         let callee = residual_demand_leaf_callee();
-        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+        let repeated = |count: usize, policy: Option<ResidualPolicyReference<Type>>| {
             residual_demand_program(policy, |builder, weights, bias| {
                 (0..count).fold(weights, |hidden, _| add_jit_call(builder, &callee, vec![hidden, bias]))
             })
@@ -5956,7 +5947,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_shares_callees_of_nested_differentiated_calls() {
-        let nested = |depth: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+        let nested = |depth: usize, policy: Option<ResidualPolicyReference<Type>>| {
             let callee = residual_demand_diamond_callee(depth);
             residual_demand_program(policy, |builder, weights, bias| {
                 add_jit_call(builder, &callee, vec![weights, bias])
@@ -5996,13 +5987,13 @@ mod tests {
         let callees = [Arc::new(callee)];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
-        let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let vector = Type::Array(ArrayType::new_static(DataType::F32, [3]));
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
                 let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-                let outputs = JitCallOperation::<ArrayIrType>::new(0).batch(
+                let outputs = JitCallOperation::<Type>::new(0).batch(
                     &context,
                     &driver,
                     &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?],
@@ -6102,9 +6093,8 @@ mod tests {
 
     #[test]
     fn test_jit_call_differentiation_omits_zero_space_boundary_tangents() {
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
-        let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let dimension_type = Type::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
+        let array_type = Type::Array(ArrayType::scalar(DataType::F64));
 
         let mut callee_builder = ArrayIrProgramBuilder::new();
         let dimension = callee_builder.add_input(dimension_type.clone());
@@ -6135,7 +6125,7 @@ mod tests {
         // The callee's leading input is its lifted capture (`capture_count = 1`). The call's activity mask starts
         // inactive over that prefix, numeric captures included, so the fused callee consumes the primal operands,
         // capture prefix first, followed only by the live operand tangent.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let captured = builder.add_input(r#type.clone());
@@ -6177,8 +6167,8 @@ mod tests {
     fn test_jit_call_differentiation_threads_plumbing_and_active_references() {
         // The callee `f(captured, r, x) = { r += x; read(r) * read(captured) }` behind `jit_call[capture_count=1]`
         // reads a captured plumbing reference and mutates an active reference operand.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let captured = builder.add_input(reference_type.clone());
@@ -6267,8 +6257,8 @@ mod tests {
 
     #[test]
     fn test_jit_call_differentiation_omits_inactive_reference_output_tangents() {
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let mut callee_builder = ArrayIrProgramBuilder::new();
         let reference = callee_builder.add_input(reference_type.clone());
         let value = callee_builder.add_input(scalar_type.clone());
@@ -6312,7 +6302,7 @@ mod tests {
         // When `f(x, y) = (sin(x), cos(y))` is differentiated with respect to `x` only, the structurally zero tangent
         // of `y` gets no fused callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
         // structural zero that the fused call does not return.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
@@ -6356,7 +6346,7 @@ mod tests {
     fn test_jit_call_differentiation_omits_independent_output_tangents() {
         // In `f(x) = (sin(x), 0)`, the tangent of the constant output depends on no tangent input, so it is a
         // structural zero that the fused call does not return.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
@@ -6400,7 +6390,7 @@ mod tests {
     fn test_jit_call_differentiation_preserves_live_outputs_around_inactive_tangent() {
         // `f(x) = (sin(x), 0, x)` has an inactive middle tangent slot. Projecting that slot must leave both live
         // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(r#type.clone());
@@ -6448,7 +6438,7 @@ mod tests {
         // When `f(x, y) = sin(x)` is differentiated with respect to `y` only, no output tangent depends on the tangent
         // of `y` and the tangent callee has no effects, so only the source call is bound and the output tangent is a
         // structural zero.
-        let r#type = ArrayIrType::Array(vector_type());
+        let r#type = Type::Array(vector_type());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let x = builder.add_input(r#type.clone());
@@ -6490,8 +6480,8 @@ mod tests {
         // the primal output's extent only if that extent reaches the tangent call through a residual.
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharding = Sharding::replicated(logical_mesh, 0);
-        let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap());
-        let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
+        let value_type = Type::Array(ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap());
+        let size_type = Type::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
         let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -6690,8 +6680,8 @@ mod tests {
         // `Ignore` destination for the reference no later instruction accumulated into its root and the callee never
         // reads it, so the callee is transposed with an `Ignore` destination as well. The transposed call consumes
         // `[ȳ]` only, returns `x̄` only, and neither it nor its callee stages a cotangent reference.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
@@ -6744,8 +6734,8 @@ mod tests {
     #[test]
     fn test_jit_call_transposition_threads_cotangent_references() {
         // The linear callee `ẏ = { ṫr += ẋ; read(ṫr) }` accumulates into its reference operand and reads it back.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
@@ -6826,8 +6816,8 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
-        let tangent_type = ArrayIrType::Array(tangent_type);
+        let expected = Type::Array(tangent_type.cotangent().unwrap());
+        let tangent_type = Type::Array(tangent_type);
         // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
         // identity-region boundary rather than an empty driver that cannot answer that query.
         let mut source_builder = ArrayIrProgramBuilder::new();
@@ -6870,10 +6860,8 @@ mod tests {
         // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
         let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
         let live = DimensionVariable::new("live", DimensionBounds::new(1, Some(5)).unwrap());
-        let dead_type =
-            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(dead)])));
-        let live_type =
-            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(live)])));
+        let dead_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(dead)])));
+        let live_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(live)])));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let dead = builder.add_input(dead_type.clone());
@@ -6928,7 +6916,7 @@ mod tests {
         // The callee `x ↦ (x, x)` returns its input twice. With only the second output live, the first output's seed
         // is a structural zero, so the transposed call consumes the second seed alone, which is `x̄`. With both outputs
         // live, the transposed callee receives both seeds and adds them.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
@@ -7018,7 +7006,7 @@ mod tests {
         // The callee maps its input through a reverse mode carrier whose backward rule prints its seed and returns a
         // zero. With the call's output dead, its only seed is a structural zero, yet the backward effect must still
         // run. The transposed call has no inputs, and its callee prints a materialized zero seed.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let backward = {
             let mut builder = ArrayIrProgramBuilder::new();
             let seed = builder.add_input(scalar_type.clone());
@@ -7090,8 +7078,8 @@ mod tests {
         // forwards `x`. Only the read is live, so the forwarded output's seed is a structural zero. Under a `Reference`
         // destination the transposed call consumes `[ȳ₀, r̄]` with no input for the dead seed, accumulates into `r̄` in
         // place, and returns `x̄` read back from it.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
+        let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone());
@@ -7173,8 +7161,8 @@ mod tests {
         // The callee runs the scan `(c, x) ↦ (c + x, c)` over three items and returns its final carry and its stacked
         // outputs, of which only the final carry is live. The dead stack's seed reaches the scan inside the callee as a
         // structural zero, so neither the transposed call nor its reversed scan receives a zero stack.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
+        let stack_type = Type::Array(ArrayType::new_static(DataType::F64, [3]));
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -7242,7 +7230,7 @@ mod tests {
         // The callee selects on `c > 0` between the branches `x ↦ (x, x + x)` and `x ↦ (x + x, x)` and only the first
         // output is live. The dead output's seed reaches the condition inside the callee as a structural zero, so each
         // transposed branch consumes the live seed alone, giving `x̄ = ȳ₀` when `c > 0` and `x̄ = 2ȳ₀` otherwise.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let branch = |doubled_output: usize| {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
@@ -7345,7 +7333,7 @@ mod tests {
         // `x` to `(x, x + x)`, and only `x + x` is live. In both nestings the dead output's seed stays a structural
         // zero across both boundaries. The outer transposed region consumes the live seed alone, the inner one receives
         // it alone, and `x̄ = ȳ₁ + ȳ₁`.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let doubling = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone());
@@ -7481,8 +7469,8 @@ mod tests {
         // has no input for it and the transposed call consumes the value output's seed alone.
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]));
-        let value_program_type = ArrayIrType::Array(value_type.clone());
-        let predicate_program_type = ArrayIrType::Array(predicate_type.clone());
+        let value_program_type = Type::Array(value_type.clone());
+        let predicate_program_type = Type::Array(predicate_type.clone());
         let source = {
             let mut builder = ArrayIrProgramBuilder::new();
             let value = builder.add_input(value_program_type.clone());
@@ -7510,7 +7498,7 @@ mod tests {
             &[PartialValue::Unknown(value_program_type.clone())],
             &[
                 MaybeZero::Value(value_cotangent.clone()),
-                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+                MaybeZero::Zero(Type::Array(predicate_type.cotangent().unwrap())),
             ],
             &CotangentDestinations::without_references([true]),
         )
@@ -7594,8 +7582,8 @@ mod tests {
     #[test]
     fn test_call_type_bindings() {
         let bounds = DimensionBounds::new(0, Some(4)).unwrap();
-        let input = ArrayIrType::from(DimensionType::new("input", bounds));
-        let local = ArrayIrType::from(DimensionType::new("local", bounds));
+        let input = Type::from(DimensionType::new("input", bounds));
+        let local = Type::from(DimensionType::new("local", bounds));
         let inputs = vec![input.clone()];
         let outputs = vec![input.clone(), local.clone(), local.clone()];
         assert_eq!(CallTypeBindings::fresh(&inputs, &inputs).unwrap(), None);
@@ -7615,7 +7603,7 @@ mod tests {
         assert_eq!(input.rename_identities(&renaming).unwrap(), input);
 
         // Instantiating a forwarded input in another namespace must not rename the call's local result.
-        let actual = ArrayIrType::from(DimensionType::new("actual", bounds));
+        let actual = Type::from(DimensionType::new("actual", bounds));
         let instantiated = first.instantiated(std::slice::from_ref(&actual)).unwrap();
         assert_eq!(instantiated[0], actual);
         assert_eq!(&instantiated[1..], &first.outputs()[1..]);
@@ -7632,7 +7620,7 @@ mod tests {
             CallTypeBindings::with_outputs(&inputs, &outputs, outputs.clone()),
             Err(TypeError::invalid("call local result declarations must use fresh identities")),
         );
-        let other = ArrayIrType::from(DimensionType::new("other", bounds));
+        let other = Type::from(DimensionType::new("other", bounds));
         assert_eq!(
             CallTypeBindings::with_outputs(&inputs, &inputs, vec![other]),
             Err(TypeError::invalid("call result declarations must preserve forwarded input identities")),

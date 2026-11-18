@@ -1,12 +1,12 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension as CoreDimension,
-    DynamicBroadcastOperation, MeshAxisType, Operation as CoreOperation, ProgramError, Sharding, ShardingDimension,
+    ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension as CoreDimension, DynamicBroadcastOperation,
+    MeshAxisType, Operation as CoreOperation, ProgramError, Sharding, ShardingDimension,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::types::{
@@ -18,7 +18,7 @@ use crate::operations::constants::{
     dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for BroadcastOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -90,8 +90,8 @@ impl LowerableOperation for DynamicBroadcastOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -354,7 +354,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, Broadcast, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds,
+        Array as CoreArray, Broadcast, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds,
         DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation, Layout,
         LogicalMesh, MeshAxis, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions,
         StridedLayout, Tile, TileDimension, TiledLayout, TypedProgram,
@@ -370,7 +370,7 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, ExecutionArguments, FromPjrt, compile,
+        Array, ArrayConstant, CompiledFunction, Constant, ExecutionArguments, FromPjrt, Type, compile,
         to_mlir_module_for_program,
     };
 
@@ -1328,7 +1328,7 @@ mod tests {
             .unwrap();
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), columns.into()])).with_layout(layout);
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         assert!(matches!(
             to_mlir_module_for_program(
                 &program,

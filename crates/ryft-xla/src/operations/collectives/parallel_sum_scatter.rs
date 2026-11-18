@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
+    ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
     ParallelSumScatterOperation, ProgramError, ReductionKind,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -15,7 +15,7 @@ use crate::operations::collectives::{
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
 impl LowerableOperation for ParallelSumScatterOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -54,13 +54,13 @@ impl LowerableOperation for ParallelSumScatterOperation {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for ParallelSumScatterOperation {
+impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();

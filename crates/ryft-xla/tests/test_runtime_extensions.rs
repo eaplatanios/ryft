@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use ryft_core::{
-    ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain, CustomCall, CustomCallOperation, DataType,
-    Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction,
+    ArrayType, CompilationCacheDomain, CompilationDomain, CustomCall, CustomCallOperation, DataType, Device,
+    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction,
 };
 use ryft_pjrt::extensions::ffi::{
     FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
@@ -15,7 +15,7 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
     Array, CustomCallOperationExtension, Error, ExecutionResources, FromPjrt, Options, RuntimeError, RuntimeExtension,
-    RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, Value,
+    RuntimeExtensions, RuntimeProvider, RuntimeRequirement, Session, Type, Value,
 };
 
 /// Native target that consumes both independently installed states.
@@ -201,10 +201,7 @@ fn providers(left: &Arc<Statistics>, right: &Arc<Statistics>, duplicate_binding:
 }
 
 /// Stages a source custom call using only the downstream public compilation API.
-fn staged(
-    mesh: DeviceMesh,
-    requirements: Vec<RuntimeRequirement>,
-) -> CoreStagedFunction<Session, ArrayIrType, ArrayIrType> {
+fn staged(mesh: DeviceMesh, requirements: Vec<RuntimeRequirement>) -> CoreStagedFunction<Session, Type, Type> {
     let r#type = ArrayType::scalar(DataType::I32);
     let operation = CustomCallOperation::new(TARGET, vec![r#type.clone()])
         .with_runtime_requirements(requirements)
@@ -212,7 +209,7 @@ fn staged(
     CoreStagedFunction::stage(
         move |_, _, input| Ok(CustomCall::custom_call(&operation, [&input])?.remove(0)),
         Vec::new(),
-        ArrayIrType::Array(r#type),
+        Type::Array(r#type),
         Options::new(mesh),
     )
     .unwrap()

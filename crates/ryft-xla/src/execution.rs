@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension as CoreDimension,
-    Layout, ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
+    ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension as CoreDimension, Layout,
+    ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
     ReferenceCompletionBackend, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape, Sharding,
-    ShardingDimension, StatefulCompilationDomain, StatefulExecution, Type, TypeRefinements, Typed, TypedProgram,
-    ValueProjection, validate_reference_boundary,
+    ShardingDimension, StatefulCompilationDomain, StatefulExecution, Type as CoreType, TypeRefinements, Typed,
+    TypedProgram, ValueProjection, validate_reference_boundary,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Execution, ExecutionDeviceInputs, ExecutionFence, ExecutionInput,
@@ -36,7 +36,7 @@ use crate::lowering::signature::ExecutableSignature;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, ExecutionResources, FromPjrt,
-    RuntimeRequirement, Session, ToPjrt, Value,
+    RuntimeRequirement, Session, ToPjrt, Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -536,7 +536,7 @@ impl Session {
                     && declared.memory() == actual.memory()
             });
         let (input_refinements, actual_input_types) = if static_inputs_match {
-            (<ArrayType as Type>::Refinements::default(), None)
+            (<ArrayType as CoreType>::Refinements::default(), None)
         } else {
             let actual_input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let refinement_input_types = program
@@ -549,7 +549,7 @@ impl Session {
                     actual.clone().with_sharding(declared.sharding().cloned()).map_err(Error::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let input_refinements = <ArrayType as Type>::Refinements::from_local_declarations(
+            let input_refinements = <ArrayType as CoreType>::Refinements::from_local_declarations(
                 program.input_types().iter(),
                 refinement_input_types.iter(),
             )
@@ -725,9 +725,9 @@ impl Session {
                     _ => {
                         let actual = input.r#type();
                         let declared = if expects_reference {
-                            ArrayIrType::Reference(ReferenceType::new(declared.clone()))
+                            Type::Reference(ReferenceType::new(declared.clone()))
                         } else {
-                            ArrayIrType::Array(declared.clone())
+                            Type::Array(declared.clone())
                         };
                         return Err(ProgramError::InvalidArgument {
                             message: format!("runtime input type `{actual}` does not match declared type `{declared}`"),
@@ -1492,7 +1492,7 @@ struct PreparedExecution {
     donation_flags: Vec<bool>,
 
     /// Runtime refinements established from the unmaterialized logical inputs.
-    input_refinements: <ArrayType as Type>::Refinements,
+    input_refinements: <ArrayType as CoreType>::Refinements,
 
     /// Physical result count expected from every addressable device.
     physical_output_count: usize,
@@ -1500,7 +1500,7 @@ struct PreparedExecution {
 
 impl PreparedExecution {
     /// Consumes the materialized arrays into PJRT arguments grouped by device.
-    fn into_arguments(self) -> Result<(ExecutionArguments, <ArrayType as Type>::Refinements, usize), Error> {
+    fn into_arguments(self) -> Result<(ExecutionArguments, <ArrayType as CoreType>::Refinements, usize), Error> {
         let arguments = ExecutionArguments::from_arrays_with_donation(
             self.inputs,
             self.addressable_device_ids,
@@ -1513,13 +1513,13 @@ impl PreparedExecution {
 /// Validates reconstructed logical outputs against the runtime input refinements.
 fn validate_compiled_output_refinements(
     program: &CompiledProgram,
-    input_refinements: &<ArrayType as Type>::Refinements,
+    input_refinements: &<ArrayType as CoreType>::Refinements,
     declared_output_types: &[ArrayType],
     outputs: &[Array],
 ) -> Result<(), Error> {
     let mut closed_identities = Vec::new();
     for (_, identity) in
-        program.input_types().iter().chain(program.all_output_types().iter()).flat_map(Type::identities)
+        program.input_types().iter().chain(program.all_output_types().iter()).flat_map(CoreType::identities)
     {
         if !closed_identities.contains(identity) {
             closed_identities.push(identity.clone());
@@ -1544,12 +1544,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation,
-        CompilationCacheDomain, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation,
-        Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead,
-        ReferenceReadOperation, ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
+        ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds,
+        DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation, Error as CoreError,
+        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
         StagedFunction as CoreStagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
@@ -1566,7 +1566,7 @@ mod tests {
     use crate::{
         Array, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET, Platform,
         ProgramBuilder, Reference, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, ToMlir,
-        Value, compile_statefully, compile_statefully_with_captures,
+        Type, Value, compile_statefully, compile_statefully_with_captures,
     };
 
     use super::*;
@@ -1707,7 +1707,7 @@ mod tests {
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(
+                CastOperation::<Type>::unchecked(
                     input_type.clone().with_layout(layout.clone()).into(),
                     vec![input_type.into()],
                 )
@@ -1787,7 +1787,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), Some(1));
 
@@ -1858,7 +1858,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+            let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
             assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
 
@@ -2294,18 +2294,17 @@ mod tests {
             crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
-        let donated_staged: CoreStagedFunction<Session, ArrayIrType, ArrayIrType> =
-            crate::stage::<_, ArrayType, ArrayType>(
-                |input| input,
-                input_type.clone(),
-                Options::new(mesh.clone()).with_donate(true),
-            )
-            .unwrap()
-            .into_inner();
+        let donated_staged: CoreStagedFunction<Session, Type, Type> = crate::stage::<_, ArrayType, ArrayType>(
+            |input| input,
+            input_type.clone(),
+            Options::new(mesh.clone()).with_donate(true),
+        )
+        .unwrap()
+        .into_inner();
         let donated_lowered = donated_staged.lower(&session).unwrap();
         assert_eq!(donated_lowered.lowered_program().donation_flags(), &[false]);
         assert_eq!(
@@ -2316,7 +2315,7 @@ mod tests {
         // Boolean values retain physical `i1` arguments and results while the identity over the zero data type has an
         // empty physical signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
-        let boolean_staged: CoreStagedFunction<Session, ArrayIrType, ArrayIrType> =
+        let boolean_staged: CoreStagedFunction<Session, Type, Type> =
             crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
@@ -2357,11 +2356,8 @@ mod tests {
         .into_inner();
         let lowered = staged.lower(&session).unwrap();
         assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
-        let compiled: ryft_core::compilation::CompiledFunction<
-            Session,
-            (ArrayIrType, ArrayIrType),
-            (ArrayIrType, ArrayIrType),
-        > = lowered.compile(&session).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<Session, (Type, Type), (Type, Type)> =
+            lowered.compile(&session).unwrap();
         let value = Array::from_host_buffer(
             &session,
             value_type.clone(),
@@ -2424,7 +2420,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let executable_options =
             compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
@@ -2522,12 +2518,7 @@ mod tests {
             .unwrap()[0];
         let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
-            .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
-                Vec::new(),
-                vec![values, start, count],
-                None,
-            )
+            .add_instruction(DynamicSliceOperation::<Type>::from_rank(1), Vec::new(), vec![values, start, count], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -2587,7 +2578,7 @@ mod tests {
         let mut prefix = || {
             builder
                 .add_instruction(
-                    DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                    DynamicSliceOperation::<Type>::from_rank(1),
                     Vec::new(),
                     vec![values, start, count],
                     None,
@@ -2871,8 +2862,8 @@ mod tests {
         let session = session_with_client(client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::new();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
-        let update = builder.add_input(ArrayIrType::Array(scalar_type));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
+        let update = builder.add_input(Type::Array(scalar_type));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
@@ -2940,9 +2931,9 @@ mod tests {
         let session = session_with_client(client);
         let vector_type = replicated_vector_type(&mesh, 2);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully::<_, Type, Type>(
             |reference| reference.read().map_err(Into::into),
-            ArrayIrType::Reference(ReferenceType::new(scalar_type)),
+            Type::Reference(ReferenceType::new(scalar_type)),
             &session,
             Options::new(mesh.clone()),
         )
@@ -2985,9 +2976,9 @@ mod tests {
         let alternate_type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let sharded = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let sharded = compile_statefully::<_, Type, Type>(
             |reference| reference.read().map_err(Into::into),
-            ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
+            Type::Reference(ReferenceType::new(alternate_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3009,15 +3000,12 @@ mod tests {
             panic!("stateful read output must be an array")
         };
         assert_eq!(read_f32s(client, &output), vec![1.0, 2.0]);
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(reference, update)| {
                 reference.add_update(&update)?;
                 reference.read().map_err(Into::into)
             },
-            (
-                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
-                ArrayIrType::Array(replicated_type.clone()),
-            ),
+            (Type::Reference(ReferenceType::new(replicated_type.clone())), Type::Array(replicated_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3057,12 +3045,12 @@ mod tests {
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(reference, update)| {
                 reference.add_update(&update)?;
                 reference.read().map_err(Into::into)
             },
-            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            (Type::Reference(ReferenceType::new(array_type.clone())), Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3142,11 +3130,11 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
         let reference = ArrayReference::new(
             Array::from_host_buffer(&session, array_type, mesh.clone(), None, 1.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
-        let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+        let compiled = compile_statefully_with_captures::<_, Type, Type>(
             |captures, public_reference| {
                 let update = public_reference.read()?;
                 captures[0].add_update(&update)?;
@@ -3181,14 +3169,14 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), (ArrayIrType, ArrayIrType)>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (Type, Type, Type), (Type, Type)>(
             |(first, second, update)| {
                 first.add_update(&update)?;
                 second.add_update(&update)?;
                 Ok((first.read()?, second.read()?))
             },
-            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type.clone(), reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3232,13 +3220,13 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ()>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (Type, Type, Type), ()>(
             |(first, second, update)| {
                 first.add_update(&update)?;
                 second.add_update(&update).map_err(Into::into)
             },
-            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type.clone(), reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3302,15 +3290,15 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (Type, Type, Type, Type), Type>(
             |(first, second, read_only, update)| {
                 let output = read_only.read()?;
                 first.add_update(&update)?;
                 second.add_update(&update)?;
                 Ok(output)
             },
-            (reference_type.clone(), reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type.clone(), reference_type.clone(), reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3484,14 +3472,14 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (Type, Type, Type), Type>(
             |(first, second, update)| {
                 first.add_update(&update)?;
                 second.add_update(&update)?;
                 first.read().map_err(Into::into)
             },
-            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type.clone(), reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3530,17 +3518,17 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
-        let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
+        let read = compile_statefully::<_, Type, Type>(
             |reference| reference.read().map_err(Into::into),
             reference_type.clone(),
             &session,
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let mutate = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+        let mutate = compile_statefully::<_, (Type, Type), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
-            (reference_type, ArrayIrType::Array(array_type.clone())),
+            (reference_type, Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3596,9 +3584,9 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+        let compiled = compile_statefully::<_, (Type, Type), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
-            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            (Type::Reference(ReferenceType::new(array_type.clone())), Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3625,9 +3613,9 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+        let compiled = compile_statefully::<_, (Type, Type), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
-            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            (Type::Reference(ReferenceType::new(array_type.clone())), Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3673,9 +3661,9 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client);
         let array_type = replicated_scalar_type(&mesh, DataType::F32);
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+        let compiled = compile_statefully::<_, (Type, Type), ()>(
             |(reference, update)| reference.add_update(&update).map_err(Into::into),
-            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            (Type::Reference(ReferenceType::new(array_type.clone())), Type::Array(array_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )

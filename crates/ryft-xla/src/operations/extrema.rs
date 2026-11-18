@@ -2,7 +2,8 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, ClampOperation, DataType, MaxOperation, MinOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, BlockRef, LocationRef, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue, ValueRef,
+    Block, BlockRef, LocationRef, Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue,
+    ValueRef,
 };
 
 use crate::operations::{normalize_binary_elementwise_operands, normalize_elementwise_operand};

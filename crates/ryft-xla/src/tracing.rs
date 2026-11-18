@@ -23,11 +23,11 @@
 use std::cell::RefCell;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, ProgramError, ProgramStatistics,
+    ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, ProgramError, ProgramStatistics,
     ProjectedValue, Sharding, ValueProjection,
 };
 
-use crate::{Constant, Error, Program, Session, Tracer};
+use crate::{Constant, Error, Program, Session, Tracer, Type};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies
@@ -103,7 +103,7 @@ where
             output_structure.replace(Some(outputs.parameter_structure()));
             Ok(outputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
         },
-        global_input_types.parameters().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
+        global_input_types.parameters().cloned().map(Type::Array).collect::<Vec<_>>(),
         Vec::new(),
     )?;
     let output_structure = output_structure.into_inner().ok_or_else(|| {

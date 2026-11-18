@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, CastOperation, CastType,
+    ArrayType, CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, CastOperation, CastType,
     ConvertElementTypeOperation, DataType, Dimension as CoreDimension, MeshAxisType, ProgramError,
     ReducePrecisionOperation, ReductionKind, Shape, Sharding,
 };
@@ -20,7 +20,7 @@ use crate::operations::control_flow::{lower_refined_region_input, lower_refined_
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -253,13 +253,13 @@ impl LowerableOperation for CastOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for CastOperation<ArrayIrType> {
+impl LowerableOperation for CastOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         lower_cast_operation(self, lowerer, input_values, input_types, output_types)
     }
@@ -299,15 +299,15 @@ pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_typ
 /// change is returned unchanged even when it has unbounded axes.
 pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
-    input_type: &ArrayIrType,
-    output_type: &ArrayIrType,
+    input_type: &Type,
+    output_type: &Type,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
     // bound for every dynamic axis of both types, including axes that this conversion leaves unchanged.
-    if let (ArrayIrType::Array(input), ArrayIrType::Array(output)) = (input_type, output_type) {
+    if let (Type::Array(input), Type::Array(output)) = (input_type, output_type) {
         let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions()).collect::<Vec<_>>();
         let changed_axis = dimension_pairs.iter().position(|pair| match pair {
             (CoreDimension::Static(_), CoreDimension::Static(_)) => false,
@@ -344,7 +344,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
         }
     }
     let intermediate_type = match (input_type, output_type) {
-        (ArrayIrType::Array(input), ArrayIrType::Array(output)) if input.rank() == output.rank() => {
+        (Type::Array(input), Type::Array(output)) if input.rank() == output.rank() => {
             let dimensions = input
                 .shape()
                 .dimensions()
@@ -355,7 +355,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
                     _ => input.clone(),
                 })
                 .collect();
-            ArrayIrType::Array(input.clone().with_shape(Shape::new(dimensions)))
+            Type::Array(input.clone().with_shape(Shape::new(dimensions)))
         }
         _ => input_type.clone(),
     };
@@ -376,7 +376,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
 /// preceding assertions, because its dependency barrier consumes the current assertion token, without advancing it,
 /// whether or not the cast emits a check of its own. A checked cast emits no check when the actual input types prove
 /// its relationship. An unchecked cast never consumes the assertion token.
-fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
+fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<Type>, O: LowerableOperationFamily>(
     operation: &CastOperation<T>,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -406,7 +406,7 @@ fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: 
 /// `input_types` (i.e., the value followed by the witnesses). The check requires that the value at the cast's output
 /// type and the witnesses at their declared types satisfy their shared identity relationships. The source and output
 /// declarations observe the same first input, preserving its original nominal bindings. Unchecked casts emit nothing.
-fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
+fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<Type>, O: LowerableOperationFamily>(
     operation: &CastOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[T],
@@ -445,13 +445,13 @@ fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: Lowe
 /// Converts a cast's shape and enforces its requested physical layout and explicit sharding.
 fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     value: ValueRef<'b, 'c, 't>,
-    input_type: &ArrayIrType,
-    output_type: &ArrayIrType,
+    input_type: &Type,
+    output_type: &Type,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let value =
         lower_cast_shape(value, input_type, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
-    let (ArrayIrType::Array(input_type), ArrayIrType::Array(output_type)) = (input_type, output_type) else {
+    let (Type::Array(input_type), Type::Array(output_type)) = (input_type, output_type) else {
         return Ok(value);
     };
     let mut result = value;
@@ -1664,8 +1664,8 @@ mod tests {
         // runtime extent 2, and widening `f64[2]` to `f64[n]` next to a witness of type `f64[n]` requires that the
         // witness has extent 2. An unchecked narrowing assumes the extent instead.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
-        let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
+        let symbolic: Type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: Type = ArrayType::new_static(DataType::F64, [2]).into();
         let client = execution_client();
         let symbolic_input = MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]);
         for checked in [true, false] {
@@ -1721,11 +1721,8 @@ mod tests {
         let value = builder.add_input(n.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(
-                    DimensionType::from(CoreDimension::Static(2)).into(),
-                    vec![n.into()],
-                )
-                .unwrap(),
+                CastOperation::<Type>::checked(DimensionType::from(CoreDimension::Static(2)).into(), vec![n.into()])
+                    .unwrap(),
                 vec![],
                 vec![value],
                 None,
@@ -1749,10 +1746,10 @@ mod tests {
     #[test]
     fn test_cast_operation_lower_unchecked_with_witness() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let symbolic: Type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |(value, witness)| value.cast_unchecked(symbolic.clone(), &[witness]),
-            (ArrayIrType::from(ArrayType::new_static(DataType::F64, [2])), symbolic.clone()),
+            (Type::from(ArrayType::new_static(DataType::F64, [2])), symbolic.clone()),
         )
         .unwrap();
         assert_eq!(
@@ -1903,7 +1900,7 @@ mod tests {
     #[test]
     fn test_cast_operation_lower_checked_region_checks() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let symbolic: Type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let body = |index, checked| {
             let mut builder = ArrayIrProgramBuilder::new();
             if index {
@@ -1913,7 +1910,7 @@ mod tests {
             if checked {
                 builder
                     .add_instruction(
-                        CastOperation::<ArrayIrType>::checked(
+                        CastOperation::<Type>::checked(
                             ArrayType::new_static(DataType::F64, [2]).into(),
                             vec![symbolic.clone()],
                         )
@@ -2066,7 +2063,7 @@ mod tests {
                 )?;
                 Ok(outputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>())
             },
-            vec![ArrayIrType::Array(scalar)],
+            vec![Type::Array(scalar)],
             Vec::new(),
         )
         .unwrap();
@@ -2098,7 +2095,7 @@ mod tests {
         let value = builder.add_input(input.clone().into());
         let result = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output.clone().into(), vec![declared.clone().into()]).unwrap(),
+                CastOperation::<Type>::checked(output.clone().into(), vec![declared.clone().into()]).unwrap(),
                 vec![],
                 vec![value],
                 None,
@@ -2168,8 +2165,8 @@ mod tests {
     fn test_cast_operation_lower_bounded_dynamic_values() {
         // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
-        let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
+        let symbolic: Type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: Type = ArrayType::new_static(DataType::F64, [2]).into();
         let mut builder = ArrayIrProgramBuilder::new();
         let first = builder.add_input(exact);
         let second = builder.add_input(symbolic.clone());
@@ -2859,7 +2856,7 @@ mod tests {
             let value = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CastOperation::<ArrayIrType>::checked(
+                    CastOperation::<Type>::checked(
                         output_type.clone().into(),
                         vec![input_type.clone().into(), b.clone().into()],
                     )
@@ -2916,7 +2913,7 @@ mod tests {
         let input = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(swapped.into(), vec![array.clone().into()]).unwrap(),
+                CastOperation::<Type>::checked(swapped.into(), vec![array.clone().into()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2968,7 +2965,7 @@ mod tests {
         let value = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(array.clone().into(), vec![array.into()]).unwrap(),
+                CastOperation::<Type>::checked(array.clone().into(), vec![array.into()]).unwrap(),
                 Vec::new(),
                 vec![value],
                 None,
@@ -2997,7 +2994,7 @@ mod tests {
         let witness = builder.add_input(witness_type.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into(), witness_type.into()])
+                CastOperation::<Type>::checked(output_type.into(), vec![input_type.into(), witness_type.into()])
                     .unwrap(),
                 Vec::new(),
                 vec![input, witness],
@@ -3054,7 +3051,7 @@ mod tests {
         let witness = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(
+                CastOperation::<Type>::checked(
                     output_type.into(),
                     vec![input_type.clone().into(), witness_type.into()],
                 )
@@ -3190,7 +3187,7 @@ mod tests {
         let witness = builder.add_input(symbolic.clone().into());
         let widened = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(
+                CastOperation::<Type>::checked(
                     laid_out.clone().into(),
                     vec![exact.clone().into(), symbolic.clone().into()],
                 )
@@ -3202,7 +3199,7 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(symbolic.clone().into(), vec![laid_out.into()]).unwrap(),
+                CastOperation::<Type>::unchecked(symbolic.clone().into(), vec![laid_out.into()]).unwrap(),
                 Vec::new(),
                 vec![widened],
                 None,
@@ -3330,7 +3327,7 @@ mod tests {
         let input = builder.add_input(source.clone().into());
         let value = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(laid_out.clone().into(), vec![source.clone().into()]).unwrap(),
+                CastOperation::<Type>::unchecked(laid_out.clone().into(), vec![source.clone().into()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -3338,7 +3335,7 @@ mod tests {
             .unwrap()[0];
         let value = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::unchecked(narrowed.into(), vec![laid_out.into()]).unwrap(),
+                CastOperation::<Type>::unchecked(narrowed.into(), vec![laid_out.into()]).unwrap(),
                 Vec::new(),
                 vec![value],
                 None,
@@ -3546,7 +3543,7 @@ mod tests {
         let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
         let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), None, []).unwrap();
         for source_type in [actual_type, ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]))] {
-            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+            for constructor in [CastOperation::<Type>::checked, CastOperation::<Type>::unchecked] {
                 let mut builder = ArrayIrProgramBuilder::new();
                 let source = builder.add_input(source_type.clone().into());
                 let zero_input = builder.add_input(zero_type.clone().into());
@@ -3600,7 +3597,7 @@ mod tests {
         let input = builder.add_input(source_type.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(
+                CastOperation::<Type>::checked(
                     source_type.clone().with_layout(layout.clone()).into(),
                     vec![source_type.into()],
                 )
@@ -3753,13 +3750,13 @@ mod tests {
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CastOperation::<ArrayIrType>::checked(output_type.clone().into(), vec![input_type.into()]).unwrap(),
+                    CastOperation::<Type>::checked(output_type.clone().into(), vec![input_type.into()]).unwrap(),
                     Vec::new(),
                     vec![input],
                     None,
                 )
                 .unwrap()[0];
-            assert_eq!(builder.atoms()[output.index()].r#type().as_ref(), &ArrayIrType::from(output_type));
+            assert_eq!(builder.atoms()[output.index()].r#type().as_ref(), &Type::from(output_type));
         }
 
         // Independent layout and sharding declarations can describe the same value, without a representation change.
@@ -3774,7 +3771,7 @@ mod tests {
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<ArrayIrType>::checked(output_type.into(), vec![input_type.into()]).unwrap(),
+                CastOperation::<Type>::checked(output_type.into(), vec![input_type.into()]).unwrap(),
                 Vec::new(),
                 vec![input],
                 None,
@@ -4157,11 +4154,8 @@ mod tests {
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
-                    CastOperation::<ArrayIrType>::unchecked(
-                        output_type.clone().into(),
-                        vec![input_type.clone().into()],
-                    )
-                    .unwrap(),
+                    CastOperation::<Type>::unchecked(output_type.clone().into(), vec![input_type.clone().into()])
+                        .unwrap(),
                     Vec::new(),
                     vec![input],
                     None,
@@ -4274,7 +4268,7 @@ mod tests {
         let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
-        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+        for constructor in [CastOperation::<Type>::checked, CastOperation::<Type>::unchecked] {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
@@ -4326,7 +4320,7 @@ mod tests {
         let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
-        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+        for constructor in [CastOperation::<Type>::checked, CastOperation::<Type>::unchecked] {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
@@ -4541,7 +4535,7 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(lower_tensor_type(&exact, &context, location).unwrap(), location)]);
         let input = block.argument(0).unwrap().as_ref();
-        let (exact, symbolic) = (ArrayIrType::from(exact), ArrayIrType::from(symbolic));
+        let (exact, symbolic) = (Type::from(exact), Type::from(symbolic));
         let widened =
             lower_cast_shape(input, &exact, &symbolic, &mut block.as_ref(), &context, location.as_ref()).unwrap();
         let narrowed =

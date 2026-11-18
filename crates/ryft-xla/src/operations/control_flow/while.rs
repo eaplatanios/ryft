@@ -1,6 +1,6 @@
 //! Lowering of [`WhileOperation`] to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 //!
-//! A while loop lowers only from the [`ArrayIrType`] operation family, which stores its condition and body regions. The
+//! A while loop lowers only from the [`Type`] operation family, which stores its condition and body regions. The
 //! homogeneous [`ArrayType`] payload carries no regions and is rejected. The loop state of the lowered
 //! `stablehlo.while` is `[counter?, states..., predicate?, tokens...]`, which holds an `i64` iteration counter when the
 //! loop has an iteration bound, the loop states, the carried predicate when the loop threads its predicate through its
@@ -14,11 +14,11 @@
 //! constrained to that placement. Reference state is discharged before lowering.
 
 use ryft_core::{
-    ArrayIrType, ArrayType, ComparisonDirection, DataType, EffectClasses, Operation as CoreOperation, ProgramError,
-    ReductionKind, RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
+    ArrayType, ComparisonDirection, DataType, EffectClasses, Operation as CoreOperation, ProgramError, ReductionKind,
+    RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
-use ryft_mlir::{Block, Operation as MlirOperation, Region, Type, Value as MlirValue, ValueRef};
+use ryft_mlir::{Block, Operation as MlirOperation, Region, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::EffectTokens;
 use crate::lowering::regions::lower_nested_program_inline;
@@ -34,7 +34,7 @@ use crate::operations::control_flow::{
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for WhileOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -55,13 +55,13 @@ impl LowerableOperation for WhileOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for WhileOperation<ArrayIrType> {
+impl LowerableOperation for WhileOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A while loop lowers to one `stablehlo.while` whose state starts with the loop inputs, which the condition and
         // the body receive as their shared state types. The lowering proceeds in order:
@@ -312,7 +312,7 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                         // contract that `WhileType` documents, so masking it is the identity and the body's candidate
                         // result is threaded on directly. This matches eager interpretation, whose `select` returns
                         // equal dimension carries unchanged.
-                        if matches!(state_type, ArrayIrType::Dimension(_)) {
+                        if matches!(state_type, Type::Dimension(_)) {
                             return Ok(candidate);
                         }
                         let state_type = <&ArrayType>::try_from(state_type).map_err(ProgramError::from)?;
@@ -603,7 +603,7 @@ mod tests {
         // An array IR loop needs exactly one condition region and one body region.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
         assert!(matches!(
-            WhileOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
+            WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::MalformedProgram(message))
@@ -614,7 +614,7 @@ mod tests {
         // It also needs one input per loop state.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(regions);
         assert!(matches!(
-            WhileOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
+            WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -819,10 +819,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        assert_eq!(
-            program.output_types(),
-            vec![ArrayIrType::Array(static_type.clone()), ArrayIrType::Array(static_type.clone())],
-        );
+        assert_eq!(program.output_types(), vec![Type::Array(static_type.clone()), Type::Array(static_type.clone())],);
 
         let module = to_mlir_module_for_program(
             &program,
@@ -989,12 +986,7 @@ mod tests {
             let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
             builder
-                .add_instruction(
-                    AssertOperation::<ArrayIrType>::new("condition must be true"),
-                    Vec::new(),
-                    vec![state],
-                    None,
-                )
+                .add_instruction(AssertOperation::<Type>::new("condition must be true"), Vec::new(), vec![state], None)
                 .unwrap();
             let predicate = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)

@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Array as CoreArray, ArrayIrType, ArrayType, ConstantOperation, DataType, Dimension as CoreDimension,
-    DimensionError, FillLikeOperation, IotaLikeOperation, IotaOperation, Layout, OneLikeOperation, OneOperation,
+    Array as CoreArray, ArrayType, ConstantOperation, DataType, Dimension as CoreDimension, DimensionError,
+    FillLikeOperation, IotaLikeOperation, IotaOperation, Layout, OneLikeOperation, OneOperation,
     Operation as CoreOperation, ProgramError, Shape, TypeError, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -17,7 +17,9 @@ use crate::lowering::types::{
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation};
+use crate::{
+    Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
+};
 
 /// Constrains the layout of a statically shaped physical buffer before attaching its runtime dimensions.
 pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
@@ -73,7 +75,7 @@ pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
 pub(crate) fn dynamic_constructor_types(
     name: &str,
     input_count: usize,
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
 ) -> Result<(ArrayType, ArrayType), Error> {
     let [output_type] = output_types else {
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
@@ -368,13 +370,13 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
+impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -383,7 +385,7 @@ impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
         let block = &mut lowerer.block();
         let result = lower_dynamic_constructor(self.name(), 0, &input_values, output_types, block, context, location)?;
         let output_type = match output_types {
-            [ArrayIrType::Array(output_type)] => Some(output_type),
+            [Type::Array(output_type)] => Some(output_type),
             _ => None,
         };
         lower_constructor_sharding_constraint(
@@ -396,13 +398,13 @@ impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
+impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -411,7 +413,7 @@ impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
         let block = &mut lowerer.block();
         let result = lower_dynamic_constructor(self.name(), 1, &input_values, output_types, block, context, location)?;
         let output_type = match output_types {
-            [ArrayIrType::Array(output_type)] => Some(output_type),
+            [Type::Array(output_type)] => Some(output_type),
             _ => None,
         };
         lower_constructor_sharding_constraint(
@@ -424,13 +426,13 @@ impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for IotaOperation<ArrayType> {
+impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -572,8 +574,8 @@ fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     name: &str,
     declared_type: &ArrayType,
     input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayIrType],
-    output_types: &[ArrayIrType],
+    input_types: &[Type],
+    output_types: &[Type],
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let [output_type] = output_types else {
@@ -625,7 +627,7 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     name: &str,
     integer_value: i64,
     input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1552,9 +1554,9 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let one_like = ArrayIrOperation::<ArrayConstant>::from(OneLikeOperation::<ArrayIrType>::new());
+        let one_like = ArrayIrOperation::<ArrayConstant>::from(OneLikeOperation::<Type>::new());
         let one_like = builder.add_instruction(one_like, Vec::new(), vec![zero], None).unwrap()[0];
-        let zero_like = ArrayIrOperation::<ArrayConstant>::from(ZeroLikeOperation::<ArrayIrType>::new());
+        let zero_like = ArrayIrOperation::<ArrayConstant>::from(ZeroLikeOperation::<Type>::new());
         let zero_like = builder.add_instruction(zero_like, Vec::new(), vec![zero], None).unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(
@@ -1563,7 +1565,7 @@ mod tests {
                 vec![Placeholder; 3],
             )
             .unwrap();
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type); 3]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type); 3]);
         for extent in [3, 0] {
             let length = extent as usize;
             assert_eq!(
@@ -1736,10 +1738,10 @@ mod tests {
         let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), CoreDimension::Static(2)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let exemplar = builder.add_input(exemplar_type.into());
-        let fill = FillLikeOperation::<ArrayIrType>::new(CoreArray::scalar(2.5f64).unwrap()).unwrap();
+        let fill = FillLikeOperation::<Type>::new(CoreArray::scalar(2.5f64).unwrap()).unwrap();
         let fill = ArrayIrOperation::<ArrayConstant>::from(fill);
         let fill = builder.add_instruction(fill, Vec::new(), vec![exemplar], None).unwrap()[0];
-        let iota = IotaLikeOperation::<ArrayIrType>::new(0, DataType::I32).unwrap();
+        let iota = IotaLikeOperation::<Type>::new(0, DataType::I32).unwrap();
         let iota = ArrayIrOperation::<ArrayConstant>::from(iota);
         let iota = builder.add_instruction(iota, Vec::new(), vec![exemplar], None).unwrap()[0];
         let program = builder
@@ -1801,7 +1803,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![zero, one, iota], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone()); 3]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type.clone()); 3]);
         let input_types = vec![ArrayType::scalar(DataType::I64)];
         let module =
             to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type; 3], "main", None, None).unwrap();
@@ -1979,7 +1981,7 @@ mod tests {
             .unwrap()[0];
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         let module =
             to_mlir_module_for_program(&program, &[], &Vec::<ArrayType>::new(), &vec![output_type], "main", None, None)
                 .unwrap();
@@ -2038,7 +2040,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![zero, one, iota], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone()); 3]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type.clone()); 3]);
         let module = to_mlir_module_for_program(
             &program,
             &[],
@@ -2106,7 +2108,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 2, 2]);
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         let module = to_mlir_module_for_program(
             &program,
             &[],

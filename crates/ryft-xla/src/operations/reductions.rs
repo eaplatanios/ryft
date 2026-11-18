@@ -7,7 +7,8 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, DetachedRegion, LocationRef,
-    Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type, Value as MlirValue, ValueRef,
+    Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type as MlirType, Value as MlirValue,
+    ValueRef,
 };
 
 use crate::lowering::types::{

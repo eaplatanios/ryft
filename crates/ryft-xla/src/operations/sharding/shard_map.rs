@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation,
-    ParallelAllGatherOutputVariance, Parameterized, ProgramError, SHARD_MAP_OPERATION_NAME, ShardMapBoundary,
-    ShardMapError, ShardMapOperation, ShardMapValueKind, Sharding, ShardingDimension, Typed, TypedProgram,
+    ArrayType, PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+    Parameterized, ProgramError, SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapError, ShardMapOperation,
+    ShardMapValueKind, Sharding, ShardingDimension, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::dialects::shardy::{
     DimensionShardingAttributeRef, TensorShardingAttributeRef, TensorShardingPerValueAttributeRef,
 };
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Type, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::regions::lower_program_outputs_with_inputs;
@@ -19,15 +19,17 @@ use crate::lowering::types::lower_tensor_type;
 use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::Program;
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir};
+use crate::{
+    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
+};
 
 impl LowerableOperation for ShardMapOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         let [body] = lowerer.regions() else {
@@ -393,9 +395,9 @@ pub(crate) mod tests {
         ProjectedContext, ProjectedValue, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceType, ReferenceWrite, Reshape, ReshapeOperation, Shape, ShardMap, ShardMapOptions, Sin, Sort,
-        SortDirection, StagingContext, TracingScope, Type, Typed, TypedProgram, UnreducedKind, Value as CoreValue,
-        ValueProjection, WhileOperation, batch, composite, differentiable_dot_product_attention, differentiate_at,
-        explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        SortDirection, StagingContext, TracingScope, Type as CoreType, Typed, TypedProgram, UnreducedKind,
+        Value as CoreValue, ValueProjection, WhileOperation, batch, composite, differentiable_dot_product_attention,
+        differentiate_at, explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput,
@@ -454,7 +456,7 @@ pub(crate) mod tests {
                 let y = ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
                 Ok(vec![(y.clone() + y).into_value()])
             },
-            vec![ArrayIrType::Array(local_type)],
+            vec![Type::Array(local_type)],
         )?;
         let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], boundary)?;
         let output = x.value().context().bind(operation, vec![body], &[x.value().clone()])?.remove(0);
@@ -563,7 +565,7 @@ pub(crate) mod tests {
         let body = body
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let inputs = vec![ArrayIrType::Reference(ReferenceType::new(reference_type)), ArrayIrType::Array(value_type)];
+        let inputs = vec![Type::Reference(ReferenceType::new(reference_type)), Type::Array(value_type)];
         let operation = ShardMapOperation::from_program(&body, inputs.clone(), boundary).unwrap();
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let inputs = inputs.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
@@ -584,10 +586,10 @@ pub(crate) mod tests {
             .unwrap()
             .with_check_manual_variation(false);
         let referent_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(reduced).unwrap();
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(referent_type.clone()));
         let mut body = CoreProgramBuilder::<Constant, Operation>::new();
         let local_type = boundary.local_input_type(0, &referent_type).unwrap();
-        let reference = body.add_input(ArrayIrType::Reference(ReferenceType::new(local_type)));
+        let reference = body.add_input(Type::Reference(ReferenceType::new(local_type)));
         let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -637,8 +639,8 @@ pub(crate) mod tests {
     }
 
     /// Builds a program over `input_types` whose outputs are the atoms that `build` adds to it.
-    fn build_differential_program<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>>(
-        input_types: Vec<ArrayIrType>,
+    fn build_differential_program<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>>(
+        input_types: Vec<Type>,
         build: impl FnOnce(&mut CoreProgramBuilder<V, O>, &[AtomId]) -> Vec<AtomId>,
     ) -> CoreProgram<V, O, Vec<V>, Vec<V>> {
         let mut builder = CoreProgramBuilder::<V, O>::new();
@@ -656,8 +658,8 @@ pub(crate) mod tests {
     fn shard_map_differential_program<A, V, O>(case: ShardMapDifferentialCase) -> CoreProgram<V, O, Vec<V>, Vec<V>>
     where
         A: CoreValue<Type = ArrayType>,
-        V: CoreValue<Type = ArrayIrType>,
-        O: CoreOperation<Type = ArrayIrType> + OperationPayloadProjection + From<CoreArrayIrOperation<A>>,
+        V: CoreValue<Type = Type>,
+        O: CoreOperation<Type = Type> + OperationPayloadProjection + From<CoreArrayIrOperation<A>>,
     {
         let array_operation = CoreArrayIrOperation::<A>::from;
         let mesh = match case {
@@ -789,11 +791,10 @@ pub(crate) mod tests {
                 let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let input_types = vec![ReferenceType::new(local_type.clone()).into(), local_type.into()];
                 let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
-                    let add_update =
-                        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let add_update = ReferenceAddUpdateOperation::<ArrayType, Type, ArrayReferenceTransform>::new();
                     let add_update = CoreArrayIrOperation::<A>::from(add_update);
                     builder.add_instruction(add_update, Vec::new(), inputs.to_vec(), None).unwrap();
-                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let read = ReferenceReadOperation::<ArrayType, Type, ArrayReferenceTransform>::new();
                     let read = CoreArrayIrOperation::<A>::from(read);
                     builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
                 });
@@ -815,7 +816,7 @@ pub(crate) mod tests {
                     let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
                     let index = array_operation(ArrayOperation::AxisIndex(index));
                     let index = builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap()[0];
-                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+                    let read = ReferenceReadOperation::<ArrayType, Type, ArrayReferenceTransform>::new()
                         .with_transforms(vec![ArrayReferenceTransform::Index {
                             axis: 0,
                             index: ArrayReferenceTransformIndex::Dynamic,
@@ -833,11 +834,10 @@ pub(crate) mod tests {
                 let local_type = boundary.local_input_type(0, &global_type).unwrap();
                 let input_types = vec![ReferenceType::new(local_type).into()];
                 let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
-                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let read = ReferenceReadOperation::<ArrayType, Type, ArrayReferenceTransform>::new();
                     let read = CoreArrayIrOperation::<A>::from(read);
                     let state = builder.add_instruction(read.clone(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
-                    let add_update =
-                        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let add_update = ReferenceAddUpdateOperation::<ArrayType, Type, ArrayReferenceTransform>::new();
                     let add_update = CoreArrayIrOperation::<A>::from(add_update);
                     builder.add_instruction(add_update, Vec::new(), vec![inputs[0], state], None).unwrap();
                     let state = builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap()[0];
@@ -854,7 +854,7 @@ pub(crate) mod tests {
             .global_input_types()
             .iter()
             .map(|r#type| match r#type {
-                ArrayIrType::Reference(reference) => ArrayIrType::Array(reference.referent().clone()),
+                Type::Reference(reference) => Type::Array(reference.referent().clone()),
                 r#type => r#type.clone(),
             })
             .collect();
@@ -863,7 +863,7 @@ pub(crate) mod tests {
             let mut references = Vec::new();
             for (input, r#type) in map_inputs.iter_mut().zip(operation.global_input_types()) {
                 if r#type.is_reference() {
-                    let new = CoreArrayIrOperation::<A>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+                    let new = CoreArrayIrOperation::<A>::from(ReferenceNewOperation::<ArrayType, Type>::new());
                     *input = builder.add_instruction(new, Vec::new(), vec![*input], None).unwrap()[0];
                     references.push(*input);
                 }
@@ -872,7 +872,7 @@ pub(crate) mod tests {
             let operation = CoreArrayIrOperation::<A>::from(operation);
             let mut outputs = builder.add_instruction(operation, vec![body], map_inputs, None).unwrap().to_vec();
             for reference in references {
-                let freeze = CoreArrayIrOperation::<A>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new());
+                let freeze = CoreArrayIrOperation::<A>::from(ReferenceFreezeOperation::<ArrayType, Type>::new());
                 outputs.push(builder.add_instruction(freeze, Vec::new(), vec![reference], None).unwrap()[0]);
             }
             outputs
@@ -893,7 +893,7 @@ pub(crate) mod tests {
             .into_owned()
             .into_iter()
             .map(|r#type| match r#type {
-                ArrayIrType::Array(r#type) => r#type,
+                Type::Array(r#type) => r#type,
                 r#type => panic!("differential programs have array inputs only but got `{type}`"),
             })
             .collect::<Vec<_>>();
@@ -953,11 +953,11 @@ pub(crate) mod tests {
         let xla_program = shard_map_differential_program::<ArrayMember, Constant, Operation>(case);
         let emulated = emulated_program.entry_region_ref().linearize(&[0]).unwrap();
         let xla = xla_program.entry_region_ref().linearize(&[0]).unwrap();
-        let array_types = |types: Vec<ArrayIrType>| {
+        let array_types = |types: Vec<Type>| {
             types
                 .into_iter()
                 .map(|r#type| match r#type {
-                    ArrayIrType::Array(r#type) => r#type,
+                    Type::Array(r#type) => r#type,
                     r#type => panic!("differential programs have array inputs and outputs only but got `{type}`"),
                 })
                 .collect::<Vec<_>>()
@@ -1232,8 +1232,7 @@ pub(crate) mod tests {
         let body = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let map =
-            ShardMapOperation::from_program(&body, vec![ArrayIrType::Array(global_type.clone())], boundary).unwrap();
+        let map = ShardMapOperation::from_program(&body, vec![Type::Array(global_type.clone())], boundary).unwrap();
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(global_type.into());
         let body = builder.import_program(body);
@@ -1299,8 +1298,8 @@ pub(crate) mod tests {
 
         // First-class dimensions cross the boundary of a lowered function as `i64` scalars.
         let derivative = batched.jvp().unwrap();
-        let boundary_type = |r#type: &ArrayIrType| match r#type {
-            ArrayIrType::Array(r#type) => r#type.clone(),
+        let boundary_type = |r#type: &Type| match r#type {
+            Type::Array(r#type) => r#type.clone(),
             _ => ArrayType::scalar(DataType::I64),
         };
         let input_types = derivative.input_types().iter().map(boundary_type).collect::<Vec<_>>();
@@ -1647,7 +1646,7 @@ pub(crate) mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(global_input_type)],
+            vec![Type::Array(global_input_type)],
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
@@ -1756,7 +1755,7 @@ pub(crate) mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(global_type)],
+            vec![Type::Array(global_type)],
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
@@ -2274,7 +2273,7 @@ pub(crate) mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(global_type.clone())],
+            vec![Type::Array(global_type.clone())],
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
@@ -2527,11 +2526,11 @@ pub(crate) mod tests {
                 )?;
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(global_type)],
+            vec![Type::Array(global_type)],
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
-        let array_types = |types: Vec<ArrayIrType>| {
+        let array_types = |types: Vec<Type>| {
             types
                 .iter()
                 .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
@@ -2892,7 +2891,7 @@ pub(crate) mod tests {
                     .unwrap();
                 Ok(vec![value, gradient])
             },
-            vec![ArrayIrType::Array(input_type.clone())],
+            vec![Type::Array(input_type.clone())],
         )
         .unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
@@ -2960,7 +2959,7 @@ pub(crate) mod tests {
                 .unwrap();
                 Ok(vec![output.into_value()])
             },
-            vec![ArrayIrType::Array(caller_type.clone())],
+            vec![Type::Array(caller_type.clone())],
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
@@ -3044,7 +3043,7 @@ pub(crate) mod tests {
                 )?;
                 Ok(vec![output])
             },
-            vec![ArrayIrType::Array(input_type.clone())],
+            vec![Type::Array(input_type.clone())],
         )
         .unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
@@ -3133,7 +3132,7 @@ pub(crate) mod tests {
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
         let inputs = program.input_types().into_owned();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
-        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
             |inputs| program.interpret_in_context(inputs[0].context(), inputs.clone()).map_err(Into::into),
             inputs,
             &session,
@@ -3193,7 +3192,7 @@ pub(crate) mod tests {
                 &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return],
             )
             .unwrap();
-        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
             |inputs| {
                 let context = inputs[0].context().clone();
                 let mut primals = primal.interpret_in_context(&context, inputs[..2].to_vec())?;
@@ -3247,7 +3246,7 @@ pub(crate) mod tests {
         let session = session_with_client(client);
         let sharding = Sharding::replicated(logical_mesh.clone(), 1);
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
         let mut body = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = body.add_input(reference_type.clone());
         let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -3276,13 +3275,13 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
-        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
             |inputs| {
                 let context = inputs[0].context().clone();
                 let outputs = pullback.interpret_in_context(&context, inputs)?;
                 Ok(vec![context.bind(ReferenceReadOperation::new(), Vec::new(), &outputs)?.remove(0)])
             },
-            vec![ArrayIrType::Array(array_type.clone()), reference_type.clone()],
+            vec![Type::Array(array_type.clone()), reference_type.clone()],
             &session,
             Options::new(mesh.clone()),
         )
@@ -3318,8 +3317,8 @@ pub(crate) mod tests {
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let session = session_with_client(client);
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
-        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let reference_type = Type::Reference(ReferenceType::new(referent_type.clone()));
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
             |inputs| {
                 let context = inputs[0].context().clone();
                 program.interpret_in_context(&context, inputs)?;
@@ -3355,8 +3354,8 @@ pub(crate) mod tests {
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let cotangent_type =
             referent_type.clone().with_sharding(referent_type.sharding().unwrap().cotangent().unwrap()).unwrap();
-        let cotangent_reference_type = ArrayIrType::Reference(ReferenceType::new(cotangent_type.clone()));
-        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let cotangent_reference_type = Type::Reference(ReferenceType::new(cotangent_type.clone()));
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
             |inputs| {
                 let context = inputs[0].context().clone();
                 pullback.interpret_in_context(&context, inputs)?;
@@ -3407,8 +3406,8 @@ pub(crate) mod tests {
         let body = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let local_referent = boundary.local_input_type(0, &global_type).unwrap();
-            let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
-            let update = builder.add_input(ArrayIrType::Array(boundary.local_input_type(1, &global_type).unwrap()));
+            let reference = builder.add_input(Type::Reference(ReferenceType::new(local_referent)));
+            let update = builder.add_input(Type::Array(boundary.local_input_type(1, &global_type).unwrap()));
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
@@ -3420,25 +3419,19 @@ pub(crate) mod tests {
         };
         let operation = ShardMapOperation::from_program(
             &body,
-            vec![
-                ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
-                ArrayIrType::Array(sharded_type.clone()),
-            ],
+            vec![Type::Reference(ReferenceType::new(sharded_type.clone())), Type::Array(sharded_type.clone())],
             boundary,
         )
         .unwrap();
-        assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
+        assert_eq!(operation.global_output_types(), &[Type::Array(sharded_type.clone())]);
         let operation = Operation::ShardMap(Box::new(operation));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(reference, update)| {
                 let context = reference.domain();
                 let mut outputs = context.bind(operation, vec![body], &[reference, update])?;
                 Ok(outputs.pop().unwrap())
             },
-            (
-                ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
-                ArrayIrType::Array(sharded_type.clone()),
-            ),
+            (Type::Reference(ReferenceType::new(sharded_type.clone())), Type::Array(sharded_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -3510,8 +3503,8 @@ pub(crate) mod tests {
         let body = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let local_referent = boundary.local_input_type(0, &referent_type).unwrap();
-            let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
-            let update = builder.add_input(ArrayIrType::Array(boundary.local_input_type(1, &global_type).unwrap()));
+            let reference = builder.add_input(Type::Reference(ReferenceType::new(local_referent)));
+            let update = builder.add_input(Type::Array(boundary.local_input_type(1, &global_type).unwrap()));
             let state =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             let state = builder
@@ -3525,25 +3518,19 @@ pub(crate) mod tests {
         };
         let operation = ShardMapOperation::from_program(
             &body,
-            vec![
-                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
-                ArrayIrType::Array(sharded_type.clone()),
-            ],
+            vec![Type::Reference(ReferenceType::new(replicated_type.clone())), Type::Array(sharded_type.clone())],
             boundary,
         )
         .unwrap();
-        assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
+        assert_eq!(operation.global_output_types(), &[Type::Array(sharded_type.clone())]);
         let operation = Operation::ShardMap(Box::new(operation));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+        let compiled = compile_statefully::<_, (Type, Type), Type>(
             |(reference, update)| {
                 let context = reference.domain();
                 let mut outputs = context.bind(operation, vec![body], &[reference, update])?;
                 Ok(outputs.pop().unwrap())
             },
-            (
-                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
-                ArrayIrType::Array(sharded_type.clone()),
-            ),
+            (Type::Reference(ReferenceType::new(replicated_type.clone())), Type::Array(sharded_type.clone())),
             &session,
             Options::new(mesh.clone()),
         )
@@ -4645,12 +4632,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         let body = body.into_flat_program().into_unprojected::<Constant, Operation>().unwrap();
-        let operation = ShardMapOperation::from_program(
-            &body,
-            input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-            boundary,
-        )
-        .unwrap();
+        let operation =
+            ShardMapOperation::from_program(&body, input_types.iter().cloned().map(Type::Array).collect(), boundary)
+                .unwrap();
         let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
             move |inputs: Vec<ArrayTracer>| {
                 let inputs = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
@@ -4754,7 +4738,7 @@ pub(crate) mod tests {
                                         ArrayType::scalar(DataType::F32).with_sharding(limit_sharding).unwrap();
                                     let condition = {
                                         let mut builder = ProgramBuilder::new();
-                                        let state = builder.add_input(ArrayIrType::Array(local_type.clone()));
+                                        let state = builder.add_input(Type::Array(local_type.clone()));
                                         let state = builder
                                             .add_instruction(
                                                 ReduceOperation::new(vec![0], ReductionKind::Sum),
@@ -4786,7 +4770,7 @@ pub(crate) mod tests {
                                     };
                                     let body = {
                                         let mut builder = ProgramBuilder::new();
-                                        let state = builder.add_input(ArrayIrType::Array(local_type));
+                                        let state = builder.add_input(Type::Array(local_type));
                                         let next_state = builder
                                             .add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None)
                                             .unwrap()[0];
@@ -5628,7 +5612,7 @@ pub(crate) mod tests {
                 builder.build::<Vec<Constant>, Vec<Constant>>(vec![coordinate], vec![], vec![Placeholder]).unwrap();
             let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
             let boundary = ShardMapBoundary::new(mesh.clone(), vec![], vec![output_sharding], vec![]).unwrap();
-            (ShardMapOperation::from_program(&body, Vec::<ArrayIrType>::new(), boundary).unwrap(), body)
+            (ShardMapOperation::from_program(&body, Vec::<Type>::new(), boundary).unwrap(), body)
         };
         let input_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let output_type = ArrayType::new_static(DataType::U64, [2])
@@ -5712,7 +5696,7 @@ pub(crate) mod tests {
         let body = builder.build::<Vec<Constant>, Vec<Constant>>(vec![coordinate], vec![], vec![Placeholder]).unwrap();
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let boundary = ShardMapBoundary::new(mesh.clone(), vec![], vec![output_sharding], vec![]).unwrap();
-        let map = ShardMapOperation::from_program(&body, Vec::<ArrayIrType>::new(), boundary).unwrap();
+        let map = ShardMapOperation::from_program(&body, Vec::<Type>::new(), boundary).unwrap();
         let input_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let unplaced_type = ArrayType::new_static(DataType::U64, [2]);
         let replicated_type = unplaced_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();

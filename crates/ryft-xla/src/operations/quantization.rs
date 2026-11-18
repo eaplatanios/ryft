@@ -9,8 +9,8 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, StringRef, Type,
-    Value as MlirValue, ValueRef,
+    Attribute, Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, StringRef,
+    Type as MlirType, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::CollectiveLoweringState;
@@ -537,7 +537,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, BlockQuantize, BlockQuantizedValue,
+        AddOperation, Array as CoreArray, ArrayOperation, BlockQuantize, BlockQuantizedValue,
         BlockScaledDotConfiguration, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
         DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
         RandomAlgorithm, ScaledDot, ScaledDotOperation, Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn,
@@ -552,7 +552,7 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, Session, compile,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, Session, Type, compile,
         to_mlir_module_for_program,
     };
 
@@ -1151,7 +1151,7 @@ mod tests {
                     // Return ordinary floating-point arrays so that the mixed executable fixture can decode them.
                     Ok(vec![elements.convert_element_type(DataType::F64)?, scales.convert_element_type(DataType::F64)?])
                 },
-                vec![ArrayIrType::Array(input_type)],
+                vec![Type::Array(input_type)],
             )
             .unwrap();
             let program = program.into_flat_program().into_simplified().unwrap();

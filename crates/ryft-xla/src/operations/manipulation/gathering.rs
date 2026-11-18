@@ -265,9 +265,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
-        BatchableOperation, BatchingContext, Complex as ComplexNumber, DataType, Diagonal, Dimension as CoreDimension,
-        DimensionBounds, DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather,
+        Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
+        BatchingContext, Complex as ComplexNumber, DataType, Diagonal, Dimension as CoreDimension, DimensionBounds,
+        DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather,
         GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind,
         ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed,
@@ -280,7 +280,7 @@ mod tests {
     };
     use crate::sessions::tests::{domain_mesh, read_f64s, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, Options, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Options, Type, to_mlir_module_for_program};
 
     #[test]
     fn test_gather_operation_lower() {
@@ -892,9 +892,9 @@ mod tests {
                 vec![input_type.clone(), ArrayType::new_static(DataType::I32, [size, 1]), output_type.clone()];
             let specialized = program
                 .clone()
-                .specialize(&input_types[..2].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                .specialize(&input_types[..2].iter().cloned().map(Type::from).collect::<Vec<_>>())
                 .unwrap();
-            assert_eq!(specialized.output_types(), vec![ArrayIrType::from(output_type.clone())], "n={size}");
+            assert_eq!(specialized.output_types(), vec![Type::from(output_type.clone())], "n={size}");
             let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();

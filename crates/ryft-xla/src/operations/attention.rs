@@ -9,8 +9,8 @@
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey,
-    CompositeKey, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DataType,
+    ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey, CompositeKey,
+    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DataType,
     Dimension as CoreDimension, Parameterized, Placeholder, ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -27,7 +27,7 @@ use crate::lowering::types::{
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LoweringError};
+use crate::{Error, LoweringError, Type};
 
 /// Seed of the dropout masks of the fused attention kernels. Calls with dropout but without a dropout state, which
 /// [`AttentionInputs::dropout_state`] holds, have a mask that the implementation defines, and this fixed seed makes the
@@ -73,8 +73,8 @@ const FMHA_BACKWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_grad_gemm1_dot_dimensi
 /// implementation that reports why they are not otherwise, so that it never silently changes the requested numerics.
 pub(crate) fn select_attention_implementation(
     key: &CompositeKey,
-    input_types: &[ArrayIrType],
-    output_types: &[ArrayIrType],
+    input_types: &[Type],
+    output_types: &[Type],
     target_platform: Option<&str>,
 ) -> Option<NamedCompositeImplementation> {
     let key = AttentionKey::from_composite_key(key).ok()??;
@@ -84,7 +84,7 @@ pub(crate) fn select_attention_implementation(
     if implementation == AttentionImplementation::Portable {
         return None;
     }
-    let array_types = |types: &[ArrayIrType]| {
+    let array_types = |types: &[Type]| {
         types.iter().map(|r#type| <&ArrayType>::try_from(r#type).ok().cloned()).collect::<Option<Vec<_>>>()
     };
     let input_types = array_types(input_types)?;
@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     /// Returns the array types of `types`.
-    fn array_types(types: &[ArrayIrType]) -> Vec<ArrayType> {
+    fn array_types(types: &[Type]) -> Vec<ArrayType> {
         types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect()
     }
 
@@ -1056,7 +1056,7 @@ mod tests {
                 }
                 Ok(outputs)
             },
-            input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+            input_types.iter().cloned().map(Type::from).collect::<Vec<_>>(),
         )
         .unwrap();
         (program.into_flat_program(), input_types, array_types(&output_types))
@@ -1088,7 +1088,7 @@ mod tests {
                     .chain(cotangents.bias.filter(|_| has_bias))
                     .collect::<Vec<_>>())
             },
-            input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>(),
+            input_types.iter().cloned().map(Type::from).collect::<Vec<_>>(),
         )
         .unwrap();
         (program.into_flat_program(), input_types, array_types(&output_types))
@@ -1135,14 +1135,14 @@ mod tests {
 
     #[test]
     fn test_select_attention_implementation() {
-        let operand_type = ArrayIrType::from(attention_array_type(DataType::BF16, &[1, 4, 2, 8]));
-        let f32_operand_type = ArrayIrType::from(attention_array_type(DataType::F32, &[1, 4, 2, 8]));
-        let state_type = ArrayIrType::from(attention_array_type(DataType::U64, &[2]));
+        let operand_type = Type::from(attention_array_type(DataType::BF16, &[1, 4, 2, 8]));
+        let f32_operand_type = Type::from(attention_array_type(DataType::F32, &[1, 4, 2, 8]));
+        let state_type = Type::from(attention_array_type(DataType::U64, &[2]));
         let forward_types = vec![operand_type.clone(); 3];
         let select = |implementation: AttentionImplementation,
                       configuration: AttentionConfiguration,
                       input_structure: AttentionInputs<Placeholder>,
-                      input_types: &[ArrayIrType],
+                      input_types: &[Type],
                       target_platform: Option<&str>| {
             let key = AttentionKey::Forward {
                 configuration: configuration.with_implementation(implementation),
@@ -1182,7 +1182,7 @@ mod tests {
             select_attention_implementation(
                 &residual_key.to_composite_key(),
                 &forward_types,
-                &[operand_type.clone(), ArrayIrType::from(attention_array_type(DataType::BF16, &[1, 4, 2]))],
+                &[operand_type.clone(), Type::from(attention_array_type(DataType::BF16, &[1, 4, 2]))],
                 Some("cuda"),
             ),
             Some(NamedCompositeImplementation::Attention { return_residual: true, .. }),
@@ -1235,7 +1235,7 @@ mod tests {
             .cloned()
             .chain([
                 operand_type.clone(),
-                ArrayIrType::from(attention_array_type(DataType::BF16, &[1, 4, 2])),
+                Type::from(attention_array_type(DataType::BF16, &[1, 4, 2])),
                 operand_type.clone(),
             ])
             .collect::<Vec<_>>();

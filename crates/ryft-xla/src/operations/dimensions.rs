@@ -1,9 +1,9 @@
 use ryft_core::{
-    ArrayIrType, ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension as CoreDimension,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
-    EffectClass, Operation as CoreOperation, ProgramError, SaturatingSubOperation,
+    ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension as CoreDimension, DimensionAddOperation,
+    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
+    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionSizeOperation,
+    DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, EffectClass,
+    Operation as CoreOperation, ProgramError, SaturatingSubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -20,15 +20,15 @@ use crate::operations::assertions::{
     ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND, lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for DimensionSizeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
         let context = lowerer.context();
@@ -67,8 +67,8 @@ impl LowerableOperation for DimensionFromScalarOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         let context = lowerer.context();
@@ -124,8 +124,8 @@ impl LowerableOperation for DimensionToScalarOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (lowerer, input_types, output_types);
         let [input] = input_values else {

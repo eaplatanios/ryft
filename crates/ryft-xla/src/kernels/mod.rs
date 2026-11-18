@@ -41,8 +41,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis,
-    MeshAxisType, Operation as CoreOperation, ProgramError, ShardingDimension, TypeError, Typed,
+    ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis, MeshAxisType,
+    Operation as CoreOperation, ProgramError, ShardingDimension, TypeError, Typed,
 };
 use ryft_kernels::{
     KERNEL_KEY_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension, KernelSchedule,
@@ -52,7 +52,7 @@ use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::RuntimeProvider;
+use crate::{RuntimeProvider, Type};
 
 mod aot;
 mod cuda;
@@ -175,7 +175,7 @@ pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
 /// cannot request external reference state slots or alter the kernel's logical inputs and results. An embedding
 /// implementing native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their
 /// token chain, because a pure call cannot discharge or silently discard an observable assertion.
-pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = ArrayIrType> = NoKernelExtension> {
+pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = Type> = NoKernelExtension> {
     /// Returns deterministic bytes covering target names, physical mappings, payload schemas, and plugin ABI facts.
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError>;
 
@@ -193,7 +193,7 @@ pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = ArrayIrT
 /// payload from masquerading as an unverified kernel. Binding emits the selected custom call only after validating
 /// the exact logical inputs. Its attributes participate in existing StableHLO-based compilation and persistence keys.
 #[derive(Clone, Debug)]
-pub struct CompiledKernel<Extension: CoreOperation<Type = ArrayIrType> = NoKernelExtension> {
+pub struct CompiledKernel<Extension: CoreOperation<Type = Type> = NoKernelExtension> {
     /// Immutable body and boundary that were verified before compilation and embedding.
     definition: KernelDefinition<Extension>,
 
@@ -265,7 +265,7 @@ where
         }
         let logical = kernel.definition().operation();
         let expected = logical.output_types();
-        let actual = custom_call.output_types().iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>();
+        let actual = custom_call.output_types().iter().cloned().map(Type::Array).collect::<Vec<_>>();
         if actual != expected {
             return Err(KernelEmbeddingError::Invalid {
                 message: "compiler output types differ from the logical kernel results".to_owned(),
@@ -346,7 +346,7 @@ where
     /// ordinary array values.
     pub fn bind<C>(&self, context: &C, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
     where
-        C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>,
+        C: Context<Type = Type, Operation: From<CustomCallOperation>>,
     {
         let actual = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let custom_call = placed_custom_call(self.definition.operation(), &self.custom_call, &actual)?;
@@ -372,12 +372,12 @@ where
 pub(crate) fn placed_custom_call(
     operation: &ryft_kernels::KernelCallOperation,
     custom_call: &CustomCallOperation,
-    input_types: &[ArrayIrType],
+    input_types: &[Type],
 ) -> Result<CustomCallOperation, TypeError> {
     let logical = operation.output_types_for(input_types)?;
     let mut output_types = custom_call.output_types().to_vec();
     for alias in custom_call.input_output_aliases() {
-        if let (Some(output), Some(ArrayIrType::Array(r#type))) =
+        if let (Some(output), Some(Type::Array(r#type))) =
             (output_types.get_mut(alias.output_index()), logical.get(alias.output_index()))
         {
             // The physical layout of the declaration belongs to the embedding and is kept.
@@ -401,11 +401,11 @@ pub(crate) fn placed_custom_call(
             None => placed,
         }
     };
-    let array_types = |types: &[ArrayIrType]| {
+    let array_types = |types: &[Type]| {
         types
             .iter()
             .filter_map(|r#type| match r#type {
-                ArrayIrType::Array(r#type) => Some(r#type.clone()),
+                Type::Array(r#type) => Some(r#type.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1014,7 +1014,7 @@ pub(crate) mod tests {
                 .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
-            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))],
+            vec![Type::Array(ArrayType::scalar(DataType::I32))],
         )
         .unwrap();
         assert_eq!(
@@ -1035,7 +1035,7 @@ pub(crate) mod tests {
         );
         let error = TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
-            vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))],
+            vec![Type::Array(ArrayType::scalar(DataType::F32))],
         )
         .unwrap_err();
         assert_eq!(
@@ -1049,7 +1049,7 @@ pub(crate) mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh, 0);
         for sharding in [replicated.clone(), replicated.with_varying_manual_axes(["device"]).unwrap()] {
-            let placed = ArrayIrType::Array(ArrayType::scalar(DataType::I32).with_sharding(sharding).unwrap());
+            let placed = Type::Array(ArrayType::scalar(DataType::I32).with_sharding(sharding).unwrap());
             let (output_types, program) = TracingContext::<Constant, Operation>::trace(
                 |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
                     compiled.bind(inputs[0].context(), &inputs)
@@ -1061,7 +1061,7 @@ pub(crate) mod tests {
             let Operation::CustomCall(custom_call) = program.instructions()[0].operation() else {
                 panic!("expected a custom call");
             };
-            let ArrayIrType::Array(placed) = placed else { unreachable!() };
+            let Type::Array(placed) = placed else { unreachable!() };
             assert_eq!(custom_call.output_types(), std::slice::from_ref(&placed));
             assert_eq!(
                 CoreOperation::infer_output_types(custom_call, std::slice::from_ref(&placed), &[]),

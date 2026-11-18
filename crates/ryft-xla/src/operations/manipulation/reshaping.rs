@@ -1,12 +1,12 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, Dimension as CoreDimension, DynamicReshapeOperation, EffectClass,
-    Operation as CoreOperation, ProgramError, ReshapeOperation,
+    ArrayType, Dimension as CoreDimension, DynamicReshapeOperation, EffectClass, Operation as CoreOperation,
+    ProgramError, ReshapeOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::EffectTokens;
@@ -20,7 +20,7 @@ use crate::operations::assertions::{
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ReshapeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -49,8 +49,8 @@ impl LowerableOperation for DynamicReshapeOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();

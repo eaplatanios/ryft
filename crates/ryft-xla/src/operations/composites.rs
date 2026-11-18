@@ -2,7 +2,7 @@ use std::hash::Hash;
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
+    ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
     DifferentiableType, Operation as CoreOperation, Parameter, Placeholder, ProgramError,
@@ -17,7 +17,7 @@ use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
 use crate::operations::jit_call::{JitCallFunctionMap, lower_shared_function_call};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 /// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
 /// named composite call, which [`LowerableOperation::composite_key`] identifies, that a backend implementation replaces
@@ -25,8 +25,8 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Loweri
 /// which would otherwise copy the body per call.
 pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
     operation: &O,
-    input_types: &[ArrayIrType],
-    output_types: &[ArrayIrType],
+    input_types: &[Type],
+    output_types: &[Type],
     nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
     target_platform: Option<&str>,
 ) -> bool {
@@ -87,8 +87,8 @@ impl NamedCompositeImplementation {
     /// and output types when lowering for `target_platform`, or [`None`] when the calls lower their body.
     pub(crate) fn select(
         key: &CompositeKey,
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
         target_platform: Option<&str>,
     ) -> Option<Self> {
         match (key.name(), key.version(), target_platform) {
@@ -131,10 +131,10 @@ impl NamedCompositeImplementation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let array_types = |types: &[ArrayIrType]| {
+        let array_types = |types: &[Type]| {
             types
                 .iter()
                 .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
@@ -185,7 +185,7 @@ impl NamedCompositeImplementation {
 impl<V: Typed + Parameter, RegionOperation, S: CustomRuleSource<V, RegionOperation>> LowerableOperation
     for CompositeOperation<V, RegionOperation, S>
 where
-    V::Type: Eq + Hash + DifferentiableType + Into<ArrayIrType>,
+    V::Type: Eq + Hash + DifferentiableType + Into<Type>,
     Self: CoreOperation<Type = V::Type>,
 {
     #[inline]
@@ -203,8 +203,8 @@ where
         // A named composite call lowers to the backend implementation that replaces it, if any, and otherwise to a call
         // of the shared function that implements its body, if it has one, before falling back to inlining its body.
         if let Some(key) = self.key() {
-            let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<ArrayIrType>>();
-            let output_types = output_types.iter().cloned().map(Into::into).collect::<Vec<ArrayIrType>>();
+            let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<Type>>();
+            let output_types = output_types.iter().cloned().map(Into::into).collect::<Vec<Type>>();
             let target_platform = lowerer.collective_state().target_platform();
             if let Some(backend) =
                 NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform)
@@ -357,7 +357,7 @@ mod tests {
     /// Returns a named composite definition `x ↦ x + x` with the provided key name and version.
     fn named_rules_with_version(key: &str, version: u32) -> CustomRuleRegistration<Constant, Operation> {
         let key = CompositeKey::new(key.to_string(), version);
-        let output_types = |types: &[ArrayIrType]| Ok(types.to_vec());
+        let output_types = |types: &[Type]| Ok(types.to_vec());
         let named = NamedComposite::new(key, output_types, |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]));
         CustomRuleRegistration::new(CustomRuleDefinition::new("doubled").with_named_composite(named))
     }
@@ -382,7 +382,7 @@ mod tests {
     fn test_lowers_without_regions() {
         // Only a named composite call that a backend implementation replaces, or whose body lowers to a shared
         // function, lowers without reading its regions.
-        let types = vec![ArrayIrType::Array(test_vector_type(4))];
+        let types = vec![Type::Array(test_vector_type(4))];
         let rules = named_rules_with_version("ryft.tests.xla_named_square", 1);
         let named = Operation::Composite(CompositeOperation::new(rules.reference()));
         assert!(lowers_without_regions(&named, &types, &types, None, Some("cuda")));
@@ -1074,8 +1074,8 @@ mod tests {
         };
         let operation = CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
             1,
-            vec![ArrayIrType::Array(vector_type.clone())],
-            vec![ArrayIrType::Array(vector_type.clone())],
+            vec![Type::Array(vector_type.clone())],
+            vec![Type::Array(vector_type.clone())],
         );
         let mut builder = ArrayIrProgramBuilder::new();
         let backward_region = builder.import_region(backward.entry_region_ref());

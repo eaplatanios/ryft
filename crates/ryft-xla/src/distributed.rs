@@ -546,10 +546,10 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_core::ParallelBroadcast;
     use ryft_core::{
-        ArrayIrType, ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange,
-        CompilationArtifactExchangeError, DataType, Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis,
-        MeshAxisType, ParallelReduce, ProjectedValue, ReductionKind, ReferenceType, ShardMapOptions, Sharding,
-        ShardingDimension, UnreducedKind, ValueProjection, batch, shard_map,
+        ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange, CompilationArtifactExchangeError, DataType,
+        Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, ProjectedValue,
+        ReductionKind, ReferenceType, ShardMapOptions, Sharding, ShardingDimension, UnreducedKind, ValueProjection,
+        batch, shard_map,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{
@@ -569,7 +569,7 @@ mod tests {
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
     use crate::sessions::tests::session_with_client;
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Value, compile_statefully};
+    use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Type, Value, compile_statefully};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -794,13 +794,13 @@ mod tests {
         // processes, each process calls with its own reference, binds and commits only its addressable shards, and,
         // because the referent is replicated, can read the whole final state densely.
         let (program, referent_type) = doubling_reduced_reference_program(&manual_mesh);
-        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
             |inputs| {
                 let context = inputs[0].context().clone();
                 program.interpret_in_context(&context, inputs)?;
                 Ok(Vec::new())
             },
-            vec![ArrayIrType::Reference(ReferenceType::new(referent_type.clone()))],
+            vec![Type::Reference(ReferenceType::new(referent_type.clone()))],
             &session,
             Options::new(mesh.clone()),
         )

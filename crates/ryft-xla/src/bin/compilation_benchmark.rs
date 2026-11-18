@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value as JsonValue, json};
 
 use ryft_core::{
-    ArrayIrType, ArrayOperation, ArrayType, AttentionConfiguration, AttentionInputs, CompilationTracer, Compile,
+    ArrayOperation, ArrayType, AttentionConfiguration, AttentionInputs, CompilationTracer, Compile,
     CompiledFunction as CoreCompiledFunction, Cos, DataType, Device, DeviceMesh, Differentiate,
     Dimension as CoreDimension, DiskCache, DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Mul, Reduce,
     ReductionKind, Shape, Sharding, Sin, StagedFunction as CoreStagedFunction, Value as CoreValue, ValueProjection,
@@ -38,8 +38,8 @@ use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 use ryft_xla::{
-    Array, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, FromPjrt, Operation, Options, Session, Value,
-    compile, jit,
+    Array, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, FromPjrt, Operation, Options, Session, Type,
+    Value, compile, jit,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -60,10 +60,10 @@ const ATTENTION_DIMENSIONS: [usize; 4] = [4, 2048, 32, 128];
 const SMOKE_ATTENTION_DIMENSIONS: [usize; 4] = [1, 16, 2, 8];
 
 /// Staged benchmark workload.
-type BenchmarkStagedFunction = CoreStagedFunction<Session, ArrayIrType, ArrayIrType>;
+type BenchmarkStagedFunction = CoreStagedFunction<Session, Type, Type>;
 
 /// Compiled benchmark workload.
-type BenchmarkCompiledFunction = CoreCompiledFunction<Session, ArrayIrType, ArrayIrType>;
+type BenchmarkCompiledFunction = CoreCompiledFunction<Session, Type, Type>;
 
 /// Benchmark scenario that `--scenario` selects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -278,7 +278,7 @@ fn stage_workload(
             let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
             (input.clone() * input.clone() + input).sin().unwrap().into_value()
         },
-        ArrayIrType::Array(r#type),
+        Type::Array(r#type),
         Options::new(mesh.clone()),
     )?)
 }
@@ -617,12 +617,12 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let start = Instant::now();
-    let staged: CoreStagedFunction<Session, Vec<ArrayIrType>, Vec<ArrayIrType>> = session.stage(
+    let staged: CoreStagedFunction<Session, Vec<Type>, Vec<Type>> = session.stage(
         |inputs: Vec<CompilationTracer<Session>>| {
             let inputs = AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone());
             vec![attention.call(inputs).unwrap()]
         },
-        vec![ArrayIrType::from(r#type.clone()); 3],
+        vec![Type::from(r#type.clone()); 3],
         Options::new(mesh.clone()),
     )?;
     let staging_nanoseconds = duration_nanoseconds(start);
@@ -634,7 +634,7 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
         assert!(fused, "attention must lower to cuDNN's fused attention kernel on CUDA");
     }
     let start = Instant::now();
-    let compiled: CoreCompiledFunction<Session, Vec<ArrayIrType>, Vec<ArrayIrType>> = lowered.compile(&session)?;
+    let compiled: CoreCompiledFunction<Session, Vec<Type>, Vec<Type>> = lowered.compile(&session)?;
     let compilation_nanoseconds = duration_nanoseconds(start);
 
     // Every input element is the bf16 encoding of one.

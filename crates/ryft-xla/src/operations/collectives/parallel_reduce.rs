@@ -210,10 +210,10 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, Batch, BatchAxis, BatchAxisSpecification, ConditionOperation, Context, DataType, Device,
-        DeviceMesh, Differentiate, Dimension as CoreDimension, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce,
-        Placeholder, Reduce, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension, StagingContext,
-        Typed, Value as CoreValue, ValueProjection, shard_map,
+        Batch, BatchAxis, BatchAxisSpecification, ConditionOperation, Context, DataType, Device, DeviceMesh,
+        Differentiate, Dimension as CoreDimension, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, Placeholder,
+        Reduce, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension, StagingContext, Typed,
+        Value as CoreValue, ValueProjection, shard_map,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, Program};
@@ -224,7 +224,7 @@ pub(crate) mod tests {
     use crate::operations::{Operation, ProgramBuilder};
     use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, TracedProgram, trace};
+    use crate::{Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, TracedProgram, Type, trace};
 
     use super::*;
 
@@ -727,7 +727,7 @@ pub(crate) mod tests {
                             let local_type = local_x.r#type().into_owned();
                             let parallel_sum_branch = {
                                 let mut builder = ProgramBuilder::new();
-                                let input = builder.add_input(ArrayIrType::Array(local_type.clone()));
+                                let input = builder.add_input(Type::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
                                         ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()),
@@ -740,7 +740,7 @@ pub(crate) mod tests {
                             };
                             let identity_branch = {
                                 let mut builder = ProgramBuilder::new();
-                                let input = builder.add_input(ArrayIrType::Array(local_type));
+                                let input = builder.add_input(Type::Array(local_type));
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let context = local_x.value().context().clone();

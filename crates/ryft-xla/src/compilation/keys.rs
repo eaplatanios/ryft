@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 
 use prost::Message;
 use ryft_core::{
-    ArrayIrType, ArrayType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionValue, DimensionVariable,
+    ArrayType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionValue, DimensionVariable,
     DispatchInputs, ProgramError, RegionKey, Shape, Sharding, Typed,
 };
 use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey, CompilationOptions};
@@ -26,7 +26,7 @@ use crate::compilation::persistence::{
     PersistentReferenceState, PersistentSharding, persistent_mapping,
 };
 use crate::compilation::programs::LoweredProgram;
-use crate::{Constant, Error, Operation, RuntimeRequirement, Value};
+use crate::{Constant, Error, Operation, RuntimeRequirement, Type, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -350,7 +350,7 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_> {
         match &self.inputs[index] {
             Value::Array(array) => EagerDispatchInputRef::Array(array.r#type(), array.sharding()),
             Value::Dimension(dimension) => EagerDispatchInputRef::Dimension(dimension.value()),
-            Value::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
+            Value::Reference(_) => unreachable!("reference inputs are rejected before the dispatch cache lookup"),
         }
     }
 
@@ -366,7 +366,7 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_> {
 pub(super) fn dispatch_signature(
     inputs: DispatchInputs<'_, '_, Value>,
     options: &Options,
-) -> Result<(DispatchKey, Arc<[ArrayIrType]>, Option<Options>), Error> {
+) -> Result<(DispatchKey, Arc<[Type]>, Option<Options>), Error> {
     let (input_types, values) = match inputs {
         DispatchInputs::Types(input_types) => (input_types, None),
         DispatchInputs::Values { values, types } => (types, Some(values)),
@@ -418,7 +418,7 @@ pub(super) fn canonical_boundary_types(input_types: &[ArrayType], output_types: 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DispatchKeyKind {
     /// Exact runtime abstract signature used when bucketing is disabled, shared with the effective staged types.
-    Exact(Arc<[ArrayIrType]>),
+    Exact(Arc<[Type]>),
 
     /// Bounded signature using canonical variable indices when bucketing is enabled.
     Bucketed(BucketedDispatchSignature),
@@ -697,13 +697,13 @@ pub(crate) fn canonical_compilation_options_bytes(options: &CompilationOptions) 
 
 /// Applies input sharding declarations and optional executable bucketing, without inspecting runtime values.
 fn normalize_dispatch_signature(
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
     options: &Options,
     bucketing: Option<InputBoundBucketing>,
-) -> Result<(DispatchKey, Arc<[ArrayIrType]>), Error> {
+) -> Result<(DispatchKey, Arc<[Type]>), Error> {
     let input_types = apply_input_shardings(input_types, options)?;
     let Some(bucketing) = bucketing else {
-        let input_types: Arc<[ArrayIrType]> = input_types.into();
+        let input_types: Arc<[Type]> = input_types.into();
         return Ok((DispatchKey::new(DispatchKeyKind::Exact(input_types.clone())), input_types));
     };
     if options.mesh().devices().len() > 1 {
@@ -716,8 +716,8 @@ fn normalize_dispatch_signature(
     let mut bucketed_array_types = Vec::with_capacity(input_types.len());
     for (input_index, r#type) in input_types.iter().enumerate() {
         let array_type = match r#type {
-            ArrayIrType::Array(array_type) => array_type,
-            ArrayIrType::Dimension(_) => {
+            Type::Array(array_type) => array_type,
+            Type::Dimension(_) => {
                 return Err(Error::Compilation(CompilationError::InvalidOptions {
                     reason: format!(
                         "input-bound bucketing only supports array inputs, but input {input_index} has first-class \
@@ -725,7 +725,7 @@ fn normalize_dispatch_signature(
                     ),
                 }));
             }
-            ArrayIrType::Reference(_) => {
+            Type::Reference(_) => {
                 return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
                     reason: format!("external reference input {input_index} does not support input-bound bucketing"),
                 }));
@@ -760,7 +760,7 @@ fn normalize_dispatch_signature(
         bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
     }
     let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
-    let input_types = bucketed_array_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>();
+    let input_types = bucketed_array_types.into_iter().map(Type::Array).collect::<Vec<_>>();
     Ok((DispatchKey::new(DispatchKeyKind::Bucketed(key)), input_types.into()))
 }
 
@@ -770,7 +770,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer, Compile,
+        AddOperation, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer, Compile,
         CompiledFunctionDispatcher, Context, CustomCallOperation, DataType, Dimension as CoreDimension,
         DimensionBounds, DimensionFromScalar, DimensionType, DimensionValue, DimensionVariable,
         DynamicBroadcastOperation, Placeholder, ReduceOperation, ReductionKind, ReferenceType, Shape, Sharding,
@@ -793,7 +793,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
         Array, Constant, CustomCallOperationExtension, Dimension, Error, Operation, ProgramBuilder, RuntimeRequirement,
-        Session, Value,
+        Session, Type, Value,
     };
 
     use super::*;
@@ -829,7 +829,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let key = session.compilation_key(compiled.lowered().lowered_program()).unwrap();
         let independent_session = session_with_client(client);
@@ -950,7 +950,7 @@ mod tests {
             key,
             normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing()).unwrap().0
         );
-        let [ArrayIrType::Array(array_type)] = executable_types.as_ref() else {
+        let [Type::Array(array_type)] = executable_types.as_ref() else {
             panic!("the executable signature must contain one array");
         };
         let [CoreDimension::Dynamic(extent)] = array_type.shape().dimensions() else {
@@ -1031,7 +1031,7 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let function: CompiledFunctionDispatcher<Session, (), Vec<ArrayIrType>, ArrayIrType, _> = session
+        let function: CompiledFunctionDispatcher<Session, (), Vec<Type>, Type, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
 
         let call = |size: i64| {
@@ -1089,7 +1089,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(session.cached_program_count(), 1);
 
@@ -1128,7 +1128,7 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: CompiledFunctionDispatcher<Session, (), Vec<ArrayIrType>, ArrayIrType, _> = session
+        let function: CompiledFunctionDispatcher<Session, (), Vec<Type>, Type, _> = session
             .jit_with_options(move |(), inputs| trace_data_derived(extent.clone(), inputs), Options::new(mesh.clone()));
         let call = |size: i64| {
             let size = Array::from_host_buffer(
@@ -1227,7 +1227,7 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client).with_device_mesh(mesh.clone());
-        let function: CompiledFunctionDispatcher<Session, (), ArrayIrType, ArrayIrType, _> = session.jit_with_options(
+        let function: CompiledFunctionDispatcher<Session, (), Type, Type, _> = session.jit_with_options(
             |(), input| trace(input),
             Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
         );
@@ -1277,7 +1277,7 @@ mod tests {
         // Exact dispatch admits structural reference types for the stateful call surface that callers opt into,
         // while bucketed dispatch rejects them because holder state is not part of the array-only bucketing model.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let reference_input_types: Arc<[ArrayIrType]> = vec![ArrayIrType::Reference(reference_type.clone())].into();
+        let reference_input_types: Arc<[Type]> = vec![Type::Reference(reference_type.clone())].into();
         assert_eq!(
             normalize_dispatch_signature(
                 reference_input_types.to_vec(),
@@ -1289,7 +1289,7 @@ mod tests {
         );
         assert!(matches!(
             normalize_dispatch_signature(
-                vec![ArrayIrType::Reference(reference_type.clone())],
+                vec![Type::Reference(reference_type.clone())],
                 &bucketed_options,
                 bucketing,
             ),
@@ -1321,7 +1321,7 @@ mod tests {
         // Multi-device bucketing is rejected before inspecting individual input kinds.
         assert!(matches!(
             normalize_dispatch_signature(
-                vec![ArrayIrType::Reference(reference_type.clone())],
+                vec![Type::Reference(reference_type.clone())],
                 &multi_device_options,
                 bucketing,
             ),
@@ -1338,8 +1338,8 @@ mod tests {
         let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
         let bounds = DimensionBounds::new(0, Some(5)).unwrap();
         let vector_type =
-            |dimension: CoreDimension| ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
-        let key = |input_types: Vec<ArrayIrType>| {
+            |dimension: CoreDimension| Type::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
+        let key = |input_types: Vec<Type>| {
             normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing()).unwrap().0
         };
 
@@ -1353,7 +1353,7 @@ mod tests {
         .unwrap();
         assert_eq!(three_key, key(vec![vector_type(CoreDimension::Static(4))]));
         assert_ne!(three_key, key(vec![vector_type(CoreDimension::Static(5))]));
-        let [ArrayIrType::Array(three_type)] = three_types.as_ref() else {
+        let [Type::Array(three_type)] = three_types.as_ref() else {
             panic!("bucketing must stage exactly one array input type");
         };
         let [CoreDimension::Dynamic(variable)] = three_type.shape().dimensions() else {

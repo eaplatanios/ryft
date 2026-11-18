@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension as CoreDimension, DimensionBounds,
-    DimensionType, DynamicSliceBounds, DynamicSliceOperation, DynamicUpdateSliceOperation, ProgramError, Shape,
-    SliceOperation, UpdateSliceOperation,
+    ArrayType, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension as CoreDimension, DimensionBounds, DimensionType,
+    DynamicSliceBounds, DynamicSliceOperation, DynamicUpdateSliceOperation, ProgramError, Shape, SliceOperation,
+    UpdateSliceOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -19,7 +19,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for SliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -189,13 +189,13 @@ impl LowerableOperation for DynamicUpdateSliceOperation {
     }
 }
 
-impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
+impl LowerableOperation for DynamicSliceOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -227,7 +227,7 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
             // runtime.
             let unknown_start = DimensionType::new("start", DimensionBounds::unbounded());
             let start_type = match &start_types[axis] {
-                ArrayIrType::Array(array_start_type) => {
+                Type::Array(array_start_type) => {
                     starts[axis] = lower_array_start(starts[axis], array_start_type, block, context, location)?;
                     &unknown_start
                 }
@@ -272,7 +272,7 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
                     .result(0)
                     .unwrap()
                     .as_ref();
-                if matches!(start_types[axis], ArrayIrType::Array(_)) {
+                if matches!(start_types[axis], Type::Array(_)) {
                     // Unlike dimension starts, array starts can be negative, which clamping raises to zero.
                     starts[axis] = block
                         .append_operation(stable_hlo::maximum(starts[axis], constants[0], location)?)?
@@ -685,13 +685,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, ConstantOperation, Context,
-        CotangentDestinationKind, DataType, Dimension as CoreDimension, DimensionBounds, DimensionConstant,
-        DimensionFromScalar, DimensionFromScalarOperation, DimensionOperation, DimensionType, DimensionValue,
-        DimensionVariable, Div, DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation,
-        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EagerContext, Linearization, Pad,
-        Placeholder, ReverseModeDifferentiate, Shape, Slice, StagingContext, TracingContext, Typed, TypedProgram,
-        UpdateSlice, UpdateSliceOperation, ValueProjection,
+        Add, Array as CoreArray, ArrayOperation, ArrayType, ConstantOperation, Context, CotangentDestinationKind,
+        DataType, Dimension as CoreDimension, DimensionBounds, DimensionConstant, DimensionFromScalar,
+        DimensionFromScalarOperation, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Div,
+        DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+        DynamicUpdateSliceOperation, EagerContext, Linearization, Pad, Placeholder, ReverseModeDifferentiate, Shape,
+        Slice, StagingContext, TracingContext, Typed, TypedProgram, UpdateSlice, UpdateSliceOperation, ValueProjection,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -706,7 +705,7 @@ mod tests {
         session_with_client,
     };
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, Constant, Options, Value, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Constant, Options, Type, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1153,8 +1152,8 @@ mod tests {
         // The runtime index remains an input after transposition. Functionalizing the buffer update must keep
         // only the selected block addition, without constructing a full size zero cotangent first.
         let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F64, [5])));
-        let start = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I32)));
+        let input = builder.add_input(Type::Array(ArrayType::new_static(DataType::F64, [5])));
+        let start = builder.add_input(Type::Array(ArrayType::scalar(DataType::I32)));
         let output = builder
             .add_instruction(
                 ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2])),
@@ -1295,9 +1294,9 @@ mod tests {
                 .primal()
                 .as_ref()
                 .clone()
-                .specialize(&input_types[..4].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                .specialize(&input_types[..4].iter().cloned().map(Type::from).collect::<Vec<_>>())
                 .unwrap_or_else(|error| panic!("n={size} specialization: {error}\n{}", linearization.primal()));
-            assert_eq!(specialized.output_types()[0], ArrayIrType::from(input_types[0].clone()), "n={size}");
+            assert_eq!(specialized.output_types()[0], Type::from(input_types[0].clone()), "n={size}");
             let compiled = crate::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
@@ -1479,7 +1478,7 @@ mod tests {
         }
         let result = builder
             .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                DynamicSliceOperation::<Type>::from_rank(1),
                 Vec::new(),
                 vec![input, bounds[0], bounds[1]],
                 None,
@@ -1592,7 +1591,7 @@ mod tests {
                 .unwrap()[0];
             let result = builder
                 .add_instruction(
-                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(bounds),
+                    DynamicSliceOperation::<Type>::from_rank(1).with_bounds(bounds),
                     Vec::new(),
                     vec![input, start, size],
                     None,
@@ -1687,9 +1686,7 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                Operation::DynamicSlice(
-                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_strides(vec![2]).unwrap(),
-                ),
+                Operation::DynamicSlice(DynamicSliceOperation::<Type>::from_rank(1).with_strides(vec![2]).unwrap()),
                 Vec::new(),
                 vec![input, start, size],
                 None,
@@ -1758,7 +1755,7 @@ mod tests {
         let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(9).unwrap()));
         let output = builder
             .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1)
+                DynamicSliceOperation::<Type>::from_rank(1)
                     .with_strides(vec![2])
                     .unwrap()
                     .with_bounds(ryft_core::DynamicSliceBounds::Clamp),
@@ -1954,7 +1951,7 @@ mod tests {
         let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
             .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                DynamicSliceOperation::<Type>::from_rank(1),
                 Vec::new(),
                 vec![input, start, result_dimension],
                 None,
@@ -2008,9 +2005,9 @@ mod tests {
         ]);
         let inputs = (0..3).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
         let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
-        let output_types = vec![ArrayIrType::Array(ArrayType::new_static(DataType::I64, [2]))];
+        let output_types = vec![Type::Array(ArrayType::new_static(DataType::I64, [2]))];
         assert!(matches!(
-            DynamicSliceOperation::<ArrayIrType>::from_rank(1).lower(&mut lowerer, &inputs, &[], &output_types),
+            DynamicSliceOperation::<Type>::from_rank(1).lower(&mut lowerer, &inputs, &[], &output_types),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),

@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, DataType, Dimension as CoreDimension, EffectClass, Operation as CoreOperation,
-    PadOperation, ProgramError, Shape, Type as RyftType, TypeError,
+    ArrayType, DataType, Dimension as CoreDimension, EffectClass, Operation as CoreOperation, PadOperation,
+    ProgramError, Shape, Type as RyftType, TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -17,7 +17,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for PadOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -40,13 +40,13 @@ impl LowerableOperation for PadOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for PadOperation<ArrayIrType> {
+impl LowerableOperation for PadOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
@@ -96,7 +96,7 @@ impl LowerableOperation for PadOperation<ArrayIrType> {
 }
 
 /// Lowers a [`PadOperation`] to StableHLO for both `PadOperation<ArrayType>`, which passes no `output_extents`, and
-/// `PadOperation<ArrayIrType>`, which passes its explicit first-class output extents in `output_extents`.
+/// `PadOperation<Type>`, which passes its explicit first-class output extents in `output_extents`.
 #[allow(clippy::too_many_arguments)]
 fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     operation: &PadOperation<T>,
@@ -294,7 +294,7 @@ fn validate_pad_interior_padding(value: usize) -> Result<(), Error> {
 /// host arithmetic before native dimension narrowing.
 #[allow(clippy::too_many_arguments)]
 fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
-    operation: &PadOperation<ArrayIrType>,
+    operation: &PadOperation<Type>,
     axis: usize,
     input: ValueRef<'b, 'c, 't>,
     output: ValueRef<'b, 'c, 't>,
@@ -336,7 +336,7 @@ mod tests {
         ConstantOperation, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, Placeholder,
         SliceOperation, TypedProgram,
     };
-    use ryft_mlir::{Operation as MlirOperation, Type, Value as MlirValue};
+    use ryft_mlir::{Operation as MlirOperation, Type as MlirType, Value as MlirValue};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
@@ -685,7 +685,7 @@ mod tests {
                             None,
                         )
                         .unwrap()[0];
-                    let operation = PadOperation::<ArrayIrType>::new(vec![low], vec![high], vec![interior]).unwrap();
+                    let operation = PadOperation::<Type>::new(vec![low], vec![high], vec![interior]).unwrap();
                     let result =
                         builder.add_instruction(operation, Vec::new(), vec![array, scalar, extent], None).unwrap()[0];
                     let program = builder

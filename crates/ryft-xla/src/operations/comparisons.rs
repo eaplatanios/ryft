@@ -1,14 +1,14 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayIrType, ArrayType, CompareOperation, ComparisonDirection, DataType, ProgramError};
+use ryft_core::{ArrayType, CompareOperation, ComparisonDirection, DataType, ProgramError};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, FloatTypeRef, IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, TensorTypeRef,
-    Type, TypeRef, Value as MlirValue, ValueRef,
+    Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_operands;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir, Type};
 
 impl ToMlir for ComparisonDirection {
     type Output<'c, 't: 'c> = stable_hlo::ComparisonDirection;
@@ -78,13 +78,13 @@ impl LowerableOperation for CompareOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for CompareOperation<ArrayIrType> {
+impl LowerableOperation for CompareOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         let location = lowerer.location();

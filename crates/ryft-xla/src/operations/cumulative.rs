@@ -350,7 +350,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, Cumulative, CumulativeOperation, DataType,
+        Array as CoreArray, ArrayOperation, ArrayType, Cumulative, CumulativeOperation, DataType,
         Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Max, Placeholder, Reduce, Shape,
         Sharding, associative_scan,
     };
@@ -361,7 +361,7 @@ mod tests {
     };
     use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type, session_with_client};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Value, compile};
+    use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Type, Value, compile};
 
     use super::*;
 
@@ -1162,7 +1162,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         for rows in [2usize, 4] {
             let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();

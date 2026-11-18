@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AxisIndexOperation, DataType, Dimension as CoreDimension, MemberOperation,
-    Operation as CoreOperation, ParallelRaggedAllToAllOperation, ProgramError, ReductionKind, Shape,
+    ArrayType, AxisIndexOperation, DataType, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
+    ParallelRaggedAllToAllOperation, ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
@@ -19,7 +19,7 @@ use crate::operations::collectives::axis_index::lower_axis_index_to_coordinate;
 use crate::operations::collectives::collective_replica_groups;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
 impl LowerableOperation for ParallelRaggedAllToAllOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -57,13 +57,13 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
+impl MemberLowerableOperation<Type> for ParallelRaggedAllToAllOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();

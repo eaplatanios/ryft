@@ -1438,12 +1438,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, AnalyzableCompilationDomain, ArrayIrType, ArrayReference, ArrayType, AssertOperation,
-        CompilationCacheDomain, CompilationDomain, DataType, Dimension as CoreDimension, DimensionBounds,
-        DimensionVariable, DiskCache, ExternalReferenceBinding, Memory, Placeholder, PrintOperation, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSource, ReferenceType, Shape, Sharding,
-        ShardingDimension, Sin, StagedFunction as CoreStagedFunction, StatefulCompilationDomain, Typed,
-        ValueProjection,
+        AddOperation, AnalyzableCompilationDomain, ArrayReference, ArrayType, AssertOperation, CompilationCacheDomain,
+        CompilationDomain, DataType, Dimension as CoreDimension, DimensionBounds, DimensionVariable, DiskCache,
+        ExternalReferenceBinding, Memory, Placeholder, PrintOperation, ProgramError, ReferenceAddUpdateOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceType, Shape, Sharding, ShardingDimension, Sin,
+        StagedFunction as CoreStagedFunction, StatefulCompilationDomain, Typed, ValueProjection,
     };
     use ryft_pjrt::protos::CompilationOptions;
 
@@ -1456,7 +1455,9 @@ mod tests {
         replicated_scalar_type, replicated_vector_type, session_with_client,
     };
     use crate::tests::{cpu_client, values_to_bytes};
-    use crate::{Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Value, with_captured_prints};
+    use crate::{
+        Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Type, Value, with_captured_prints,
+    };
 
     use super::*;
 
@@ -1591,14 +1592,13 @@ mod tests {
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
-        let staged: CoreStagedFunction<Session, ArrayIrType, ArrayIrType> =
-            CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
-                add_capture,
-                vec![Value::Array(capture.clone())],
-                ArrayIrType::Array(input_type.clone()),
-                Options::new(mesh.clone()).with_donate(true),
-            )
-            .unwrap();
+        let staged: CoreStagedFunction<Session, Type, Type> = CoreStagedFunction::<Session, Type, Type>::stage(
+            add_capture,
+            vec![Value::Array(capture.clone())],
+            Type::Array(input_type.clone()),
+            Options::new(mesh.clone()).with_donate(true),
+        )
+        .unwrap();
         let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
         let compiled_analysis = session.analyze(compiled.executable()).unwrap();
         assert_eq!(session.analyze(compiled.executable()).unwrap(), compiled_analysis);
@@ -1722,8 +1722,8 @@ mod tests {
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = ProgramBuilder::new();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
-        let read_only = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type)));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
+        let read_only = builder.add_input(Type::Reference(ReferenceType::new(scalar_type)));
         let read_only_output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read_only], None).unwrap()[0];
         builder
@@ -2006,8 +2006,8 @@ mod tests {
             .with_sharding(state_sharding.clone())
             .unwrap();
         let mut builder = ProgramBuilder::new();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(state_type.clone())));
-        let update = builder.add_input(ArrayIrType::Array(state_type.clone()));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(state_type.clone())));
+        let update = builder.add_input(Type::Array(state_type.clone()));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
@@ -2057,7 +2057,7 @@ mod tests {
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
         builder
-            .add_instruction(AssertOperation::<ArrayIrType>::new("test predicate"), Vec::new(), vec![predicate], None)
+            .add_instruction(AssertOperation::<Type>::new("test predicate"), Vec::new(), vec![predicate], None)
             .unwrap();
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("test value"), Vec::new(), vec![value], None)
@@ -2160,7 +2160,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let first: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let first: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&first_session).unwrap().compile(&first_session).unwrap();
         assert_eq!(first_session.compilation_cache().statistics().compilations, 1);
         drop(first);
@@ -2170,7 +2170,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let _restored: ryft_core::compilation::CompiledFunction<Session, ArrayIrType, ArrayIrType> =
+        let _restored: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&second_session).unwrap().compile(&second_session).unwrap();
         let statistics = second_session.compilation_cache().statistics();
         assert_eq!(statistics.persistent_hits, 1);

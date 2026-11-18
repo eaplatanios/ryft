@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
-    ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, Context, DataType, Device, DeviceMesh,
+    ArrayType, Compile, CompiledFunction as CoreCompiledFunction, Context, DataType, Device, DeviceMesh,
     Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory,
     MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, SaveAndOffloadOnlyTheseNames, ScanOperation, Shape, Sharding,
@@ -38,7 +38,7 @@ use ryft_core::{
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
-use ryft_xla::{Array, FromPjrt, Operation, Options, Session, Tracer, Value};
+use ryft_xla::{Array, FromPjrt, Operation, Options, Session, Tracer, Type, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -49,10 +49,10 @@ const UP_PROJECTION_NAME: &str = "up_projection";
 const DOWN_PROJECTION_NAME: &str = "down_projection";
 
 /// Input types of a benchmarked gradient, which are the hidden state and the two parameter matrices.
-type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
+type BenchmarkInput = (Type, Type, Type);
 
 /// Output types of a benchmarked gradient, which are the gradients of the two parameter matrices.
-type BenchmarkOutput = (ArrayIrType, ArrayIrType);
+type BenchmarkOutput = (Type, Type);
 
 /// Staged gradient of a benchmarked function.
 type BenchmarkStagedFunction = CoreStagedFunction<Session, BenchmarkInput, BenchmarkOutput>;
@@ -162,7 +162,7 @@ fn layer(tagged: bool, hidden: Tracer, up: Tracer, down: Tracer) -> Result<Trace
 }
 
 /// Applies [`layer`] rematerialized with `policy` and the provided optimization barrier and tagging flags.
-fn rematerialized_layer<P: Clone + ResidualPolicy<ArrayIrType>>(
+fn rematerialized_layer<P: Clone + ResidualPolicy<Type>>(
     policy: P,
     optimization_barrier: bool,
     tagged: bool,
@@ -279,9 +279,9 @@ where
                         let (_, apply) = DomainTracingContext::<Session>::trace(
                             |(hidden, up, down): (Tracer, Tracer, Tracer)| apply(hidden, up, down),
                             (
-                                ArrayIrType::from(hidden_type.clone()),
-                                ArrayIrType::from(array_type(up_shape)),
-                                ArrayIrType::from(array_type(down_shape)),
+                                Type::from(hidden_type.clone()),
+                                Type::from(array_type(up_shape)),
+                                Type::from(array_type(down_shape)),
                             ),
                         )?;
                         let context = up.domain();
@@ -294,9 +294,9 @@ where
                 (up, down)
             },
             (
-                ArrayIrType::from(replicated_array_type(mesh, &[model.batch_size, model.width])),
-                ArrayIrType::from(replicated_array_type(mesh, up_shape)),
-                ArrayIrType::from(replicated_array_type(mesh, down_shape)),
+                Type::from(replicated_array_type(mesh, &[model.batch_size, model.width])),
+                Type::from(replicated_array_type(mesh, up_shape)),
+                Type::from(replicated_array_type(mesh, down_shape)),
             ),
             Options::new(mesh.clone()),
         )
@@ -327,10 +327,10 @@ fn stage_scanned_gradient(
                     checkpointed_layer(checkpointing, false, hidden, up, down)
                 },
                 (
-                    ArrayIrType::from(ArrayType::scalar(DataType::I64)),
-                    ArrayIrType::from(hidden_type.clone()),
-                    ArrayIrType::from(layer_up_type.clone()),
-                    ArrayIrType::from(layer_down_type.clone()),
+                    Type::from(ArrayType::scalar(DataType::I64)),
+                    Type::from(hidden_type.clone()),
+                    Type::from(layer_up_type.clone()),
+                    Type::from(layer_down_type.clone()),
                 ),
             )?;
             let context = hidden.context().clone();

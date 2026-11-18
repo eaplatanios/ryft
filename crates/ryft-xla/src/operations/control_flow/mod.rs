@@ -2,15 +2,15 @@ use std::rc::Rc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType,
-    Dimension as CoreDimension, EffectClass, EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation,
-    Parameterized, ProgramError, RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME,
-    ScanOperation, Shape, Typed, TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
+    ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension as CoreDimension,
+    EffectClass, EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
+    RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed,
+    TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, DetachedRegion, LocationRef, Operation as MlirOperation, Region, Type,
-    TypeRef, Value as MlirValue, ValueRef,
+    Block, BlockRef, Context as MlirContext, DetachedRegion, LocationRef, Operation as MlirOperation, Region,
+    Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::regions::lower_nested_program_inline;
@@ -23,7 +23,7 @@ use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::operations::{FlatProgram, Program};
-use crate::{Constant, Error, LowerableOperationFamily};
+use crate::{Constant, Error, LowerableOperationFamily, Type};
 
 pub(crate) mod condition;
 pub(crate) mod scan;
@@ -46,8 +46,8 @@ pub(crate) mod r#while;
 ///   - `values`: Lowered values entering the region, of the `actual_types`.
 pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
     boundary: &str,
-    declared_types: &[ArrayIrType],
-    actual_types: &[ArrayIrType],
+    declared_types: &[Type],
+    actual_types: &[Type],
     values: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -101,19 +101,19 @@ where
                 .iter()
                 .map(|id| region.atoms()[id.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let first_region_input_types = || -> Result<Vec<ArrayIrType>, Error> {
+            let first_region_input_types = || -> Result<Vec<Type>, Error> {
                 let id = instruction.regions().first().copied().ok_or_else(|| {
                     ProgramError::MalformedProgram("control flow without an attached region".to_string())
                 })?;
                 Ok(program.region(id)?.input_types())
             };
             let operation = instruction.operation();
-            let entry = if operation.projected_payload::<ConditionOperation<ArrayIrType>>().is_some() {
+            let entry = if operation.projected_payload::<ConditionOperation<Type>>().is_some() {
                 Some((CONDITION_OPERATION_NAME, first_region_input_types()?, input_types.get(1..).unwrap_or_default()))
-            } else if operation.projected_payload::<WhileOperation<ArrayIrType>>().is_some() {
+            } else if operation.projected_payload::<WhileOperation<Type>>().is_some() {
                 // Both loop regions share the state types, so the condition's input types are the entry types.
                 Some((WHILE_OPERATION_NAME, first_region_input_types()?, input_types.as_slice()))
-            } else if let Some(scan) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
+            } else if let Some(scan) = operation.projected_payload::<ScanOperation<Type>>() {
                 let entry_types = scan
                     .entry_input_types(&first_region_input_types()?, input_types.as_slice())
                     .map_err(ProgramError::from)?;
@@ -140,7 +140,7 @@ where
                 Some((std::slice::from_ref(one.r#type()), output_types()))
             } else if let Some(iota) = operation.projected_payload::<IotaOperation<ArrayType>>() {
                 Some((std::slice::from_ref(iota.r#type()), output_types()))
-            } else if let Some(generator) = operation.projected_payload::<RngBitGeneratorOperation<ArrayIrType>>() {
+            } else if let Some(generator) = operation.projected_payload::<RngBitGeneratorOperation<Type>>() {
                 // The generator's first output is its state, and only its bits have the declared output type.
                 Some((std::slice::from_ref(generator.output_type()), output_types().into_iter().skip(1).collect()))
             } else {
@@ -171,13 +171,13 @@ where
 /// for an axis that stays dynamic.
 pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
-    input_type: &ArrayIrType,
-    region_input_type: &ArrayIrType,
+    input_type: &Type,
+    region_input_type: &Type,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let (ArrayIrType::Array(input_type), ArrayIrType::Array(declared_type)) = (input_type, region_input_type) else {
+    let (Type::Array(input_type), Type::Array(declared_type)) = (input_type, region_input_type) else {
         return Ok(value);
     };
     let dimension_pairs = declared_type.shape().dimensions().iter().zip(input_type.shape().dimensions());
@@ -266,8 +266,8 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
 /// instruction does not refine are returned unchanged.
 pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     values: Vec<ValueRef<'b, 'c, 't>>,
-    region_output_types: &[ArrayIrType],
-    output_types: &[ArrayIrType],
+    region_output_types: &[Type],
+    output_types: &[Type],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -276,8 +276,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     check_count!("output", region_output_types, output_types.len(), ProgramError);
     let mut converted = Vec::with_capacity(values.len());
     for ((value, region_output_type), output_type) in values.into_iter().zip(region_output_types).zip(output_types) {
-        let (ArrayIrType::Array(declared_type), ArrayIrType::Array(output_type)) = (region_output_type, output_type)
-        else {
+        let (Type::Array(declared_type), Type::Array(output_type)) = (region_output_type, output_type) else {
             converted.push(value);
             continue;
         };
@@ -353,7 +352,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
 pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatProgram<O>,
     input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
@@ -482,7 +481,7 @@ pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
 /// which enclosing manual regions bind, are excluded from the constraints that [`lower_sharding_constraint`] emits.
 pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     outputs: Vec<ValueRef<'b, 'c, 't>>,
-    output_types: &[ArrayIrType],
+    output_types: &[Type],
     bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
@@ -490,10 +489,10 @@ pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     let mut constrained = Vec::with_capacity(outputs.len());
     for (output, output_type) in outputs.into_iter().zip(output_types) {
         let explicit_sharding = match output_type {
-            ArrayIrType::Array(output_type) => output_type
+            Type::Array(output_type) => output_type
                 .sharding()
                 .filter(|sharding| sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit)),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+            Type::Dimension(_) | Type::Reference(_) => None,
         };
         constrained.push(match explicit_sharding {
             Some(sharding) => {
@@ -548,10 +547,10 @@ mod tests {
     /// Lowers `program` with the boundary types of the mixed executable ABI of `execute_mixed_program`, in which
     /// first-class dimensions cross the boundary as `i64` scalars.
     pub(super) fn lowered_mixed_module(program: &FlatProgram) -> String {
-        let boundary_type = |r#type: &ArrayIrType| match r#type {
-            ArrayIrType::Array(r#type) => r#type.clone(),
-            ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
-            ArrayIrType::Reference(_) => panic!("mixed execution fixtures have no reference values"),
+        let boundary_type = |r#type: &Type| match r#type {
+            Type::Array(r#type) => r#type.clone(),
+            Type::Dimension(_) => ArrayType::scalar(DataType::I64),
+            Type::Reference(_) => panic!("mixed execution fixtures have no reference values"),
         };
         let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
@@ -729,8 +728,8 @@ mod tests {
         // declared type lowers to the same tensor type and is returned unchanged.
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
-        let input_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
-        let region_input_type: ArrayIrType =
+        let input_type: Type = ArrayType::new_static(DataType::F64, [3]).into();
+        let region_input_type: Type =
             ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))])).into();
         let block = context.block(&[(lower_array_ir_type(&input_type, &context, location).unwrap(), location)]);
         let input = block.as_ref().argument(0).unwrap().as_ref();
@@ -759,9 +758,9 @@ mod tests {
         // unchanged.
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
-        let region_output_type: ArrayIrType =
+        let region_output_type: Type =
             ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))])).into();
-        let output_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
+        let output_type: Type = ArrayType::new_static(DataType::F64, [3]).into();
         let lowered_type = lower_array_ir_type(&region_output_type, &context, location).unwrap();
         let block = context.block(&[(lowered_type, location), (lowered_type, location)]);
         let refined = block.as_ref().argument(0).unwrap().as_ref();
@@ -1115,7 +1114,7 @@ mod tests {
 
         let linearization = program.linearize().unwrap();
         let primal = linearization.primal();
-        let array_types = |types: &[ArrayIrType]| {
+        let array_types = |types: &[Type]| {
             types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
         };
         let primal_module = to_mlir_module_for_program(

@@ -10,13 +10,13 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
-use ryft_core::{AnalyzableCompilationDomain, ArrayIrType, ExecutableFunction, Parameterized};
+use ryft_core::{AnalyzableCompilationDomain, ExecutableFunction, Parameterized};
 use ryft_pjrt::Value as PjrtValue;
 use serde::Serialize;
 
 use crate::compilation::CompilationError;
 use crate::compilation::programs::CompiledProgram;
-use crate::{Error, Session};
+use crate::{Error, Session, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -360,7 +360,7 @@ impl OptimizedProgram {
 impl AnalyzableCompilationDomain for Session {
     type Analysis = CompilationAnalysis;
 
-    fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
+    fn analyze<Input: Parameterized<Type>, Output: Parameterized<Type>>(
         &self,
         executable: &ExecutableFunction<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error> {
@@ -452,12 +452,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayIrType, ArrayType, DataType, StagedFunction as CoreStagedFunction};
+    use ryft_core::{ArrayType, DataType, StagedFunction as CoreStagedFunction};
 
     use crate::compilation::options::Options;
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::execution_client;
-    use crate::{Error, Session};
+    use crate::{Error, Session, Type};
 
     use super::*;
 
@@ -535,7 +535,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = session_with_client(client).with_device_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Session, ArrayIrType, ArrayIrType>::stage(
+        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
             |_, _, input| Ok(input),
             Vec::new(),
             ArrayType::scalar(DataType::F32).into(),

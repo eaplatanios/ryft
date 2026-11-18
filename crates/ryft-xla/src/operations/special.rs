@@ -25,8 +25,10 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         }
 
         // Encoding 0x00 represents 2^-127, the only E8M0 value that is subnormal in f32. CHLO's expansion can
-        // flush it to zero, which converts back to NaN. Its true erf lies below the first rounding midpoint,
-        // so preserve 0x00 for that input. Select between integer encodings to keep the correction exact.
+        // flush it to zero, which converts back to NaN. Its true erf lies below the first rounding midpoint and
+        // rounds to 0x00. XLA's CPU FloatNormalization pass widens a direct F8E8M0FNU select to f32 and converts
+        // its result back to F8E8M0FNU. Selecting the integer encodings keeps the correction independent of f32
+        // subnormal handling.
         let byte_type = lower_tensor_type(
             &output_type.clone().with_data_type(DataType::U8),
             lowerer.context(),

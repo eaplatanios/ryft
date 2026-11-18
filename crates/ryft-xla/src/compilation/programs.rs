@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ryft_core::{ArrayIrType, ArrayType, DeviceMesh, ExternalReferenceBinding, Sharding, TypedProgram};
+use ryft_core::{ArrayType, DeviceMesh, ExternalReferenceBinding, Sharding, TypedProgram};
 use ryft_pjrt::LoadedExecutable;
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 
@@ -21,7 +21,7 @@ use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::ExecutionPlan;
 use crate::lowering::LoweredModule;
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Error, RuntimeRequirement, SessionConstant, Target};
+use crate::{Error, RuntimeRequirement, SessionConstant, Target, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -359,7 +359,7 @@ impl LoweredProgram {
 }
 
 impl TypedProgram for LoweredProgram {
-    type Type = ArrayIrType;
+    type Type = Type;
 
     // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
     // final state output suffix appended by reference discharge, like the inherent `output_types` function.
@@ -367,7 +367,7 @@ impl TypedProgram for LoweredProgram {
         self.input_types.len()
     }
 
-    fn input_types(&self) -> Cow<'_, [ArrayIrType]> {
+    fn input_types(&self) -> Cow<'_, [Type]> {
         Cow::Owned(self.input_types.iter().cloned().map(Into::into).collect())
     }
 
@@ -375,7 +375,7 @@ impl TypedProgram for LoweredProgram {
         self.output_count
     }
 
-    fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
+    fn output_types(&self) -> Cow<'_, [Type]> {
         Cow::Owned(self.output_types[..self.output_count].iter().cloned().map(Into::into).collect())
     }
 }
@@ -800,7 +800,7 @@ impl CompiledProgram {
 }
 
 impl TypedProgram for CompiledProgram {
-    type Type = ArrayIrType;
+    type Type = Type;
 
     // Core reads the public logical signature in the type universe of the domain, which excludes the hidden
     // final state output suffix appended by reference discharge, like the inherent `output_types` function.
@@ -808,7 +808,7 @@ impl TypedProgram for CompiledProgram {
         self.input_types.len()
     }
 
-    fn input_types(&self) -> Cow<'_, [ArrayIrType]> {
+    fn input_types(&self) -> Cow<'_, [Type]> {
         Cow::Owned(self.input_types.iter().cloned().map(Into::into).collect())
     }
 
@@ -816,7 +816,7 @@ impl TypedProgram for CompiledProgram {
         self.output_count
     }
 
-    fn output_types(&self) -> Cow<'_, [ArrayIrType]> {
+    fn output_types(&self) -> Cow<'_, [Type]> {
         Cow::Owned(self.output_types[..self.output_count].iter().cloned().map(Into::into).collect())
     }
 }
@@ -975,7 +975,7 @@ mod tests {
                 stage::<_, ArrayType, ArrayType>(|input| input.clone() + input, input_type, Options::new(mesh.clone()))
                     .unwrap()
                     .into_inner();
-            let compiled: CoreCompiledFunction<Session, ArrayIrType, ArrayIrType> =
+            let compiled: CoreCompiledFunction<Session, Type, Type> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
             compiled
         };

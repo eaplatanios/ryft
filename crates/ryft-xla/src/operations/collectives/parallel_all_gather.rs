@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
+    ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
     ParallelAllGatherOperation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -11,7 +11,7 @@ use ryft_mlir::{
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{collective_replica_groups, refine_collective_result_dimensions};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
 impl LowerableOperation for ParallelAllGatherOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -50,13 +50,13 @@ impl LowerableOperation for ParallelAllGatherOperation {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for ParallelAllGatherOperation {
+impl MemberLowerableOperation<Type> for ParallelAllGatherOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();

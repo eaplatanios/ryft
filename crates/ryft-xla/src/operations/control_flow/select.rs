@@ -11,8 +11,8 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, SELECT_OPERATION_NAME, SelectOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, Context as MlirContext, Location, Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue,
-    ValueRef,
+    Block, Context as MlirContext, Location, Operation as MlirOperation, TensorTypeRef, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::types::{

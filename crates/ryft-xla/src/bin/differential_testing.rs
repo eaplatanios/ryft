@@ -11,22 +11,21 @@ use std::error::Error;
 use serde::Serialize;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-    ArrayOperation, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchAxis,
-    BatchingContext, BatchingTracer, BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration,
-    CollectiveOptions, Compare, ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device,
-    DeviceMesh, Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation,
-    DimensionValue, DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    EagerContext, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance,
-    ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder,
-    ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, Reduce, ReduceOperation, ReductionKind,
-    ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, TypedProgram,
-    Value as CoreValue, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, dot_product_attention,
-    shard_map,
+    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchAxis, BatchingContext, BatchingTracer,
+    BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration, CollectiveOptions, Compare,
+    ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate,
+    Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
+    DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
+    MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute,
+    ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError,
+    ProjectedContext, Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions,
+    Sharding, ShardingDimension, TypedProgram, Value as CoreValue, ValueProjection, ZeroLike, block_scaled_dot,
+    differentiate_at, dot_product_attention, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
+use ryft_xla::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, Type, trace};
 
 // TODO(eaplatanios): Review this module.
 
@@ -555,7 +554,7 @@ fn data_dependent_prefix_program() -> Result<
     )?[0];
     let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
     let output = builder.add_instruction(
-        DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+        DynamicSliceOperation::<Type>::from_rank(1),
         Vec::new(),
         vec![values, start, count],
         None,

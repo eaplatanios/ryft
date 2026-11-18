@@ -2,14 +2,15 @@ use std::collections::HashSet;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CUSTOM_CALL_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute,
-    CustomCallOperation, DataType, Dimension as CoreDimension, EffectClass, Layout, ProgramError, Shape,
+    ArrayType, CUSTOM_CALL_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation,
+    DataType, Dimension as CoreDimension, EffectClass, Layout, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, LocationRef, NamedAttributeRef,
-    Operation as MlirOperation, Region as MlirRegion, Size as MlirSize, StringRef, Type, Value as MlirValue, ValueRef,
+    Operation as MlirOperation, Region as MlirRegion, Size as MlirSize, StringRef, Type as MlirType,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
@@ -17,7 +18,7 @@ use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
     CustomCallOperationExtension, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
-    MemberLowerableOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE,
+    MemberLowerableOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE, Type,
 };
 
 impl LowerableOperation for CustomCallOperation {
@@ -45,13 +46,13 @@ impl LowerableOperation for CustomCallOperation {
     }
 }
 
-impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
+impl MemberLowerableOperation<Type> for CustomCallOperation {
     fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         for requirement in self.runtime_requirements()? {
             lowerer.require_runtime(requirement)?;
@@ -541,13 +542,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, BatchAxis, Composite, CustomCall, CustomCallArrayAttribute, CustomCallAttribute,
-        CustomCallBatching, CustomCallOperation, CustomCallUnrolling, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, DomainTracer, EffectClass, LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder,
-        PrintOperation, ProjectedContext, Reduce, ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension,
-        StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Typed, TypedProgram, batch, differentiate_at,
-        shard_map,
+        BatchAxis, Composite, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
+        CustomCallOperation, CustomCallUnrolling, DataType, Device, DeviceMesh, Dimension as CoreDimension,
+        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracer,
+        EffectClass, LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ProjectedContext,
+        Reduce, ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StaticShape, StridedLayout, Tile,
+        TileDimension, TiledLayout, Typed, TypedProgram, batch, differentiate_at, shard_map,
     };
     use ryft_mlir::{DialectHandle, Operation as MlirOperation, Value as MlirValue, WalkOrder, WalkResult};
     use ryft_pjrt::extensions::ffi::{
@@ -570,7 +570,7 @@ mod tests {
     };
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError, RuntimeError,
-        RuntimeRequirement, Session, TracedProgram, Value, to_mlir_module_for_program, trace,
+        RuntimeRequirement, Session, TracedProgram, Type, Value, to_mlir_module_for_program, trace,
     };
 
     use super::*;
@@ -1171,7 +1171,7 @@ mod tests {
         let output = builder.add_instruction(operation, Vec::new(), vec![extent], None).unwrap()[0];
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F32, [3]);
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
+        assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         let module =
             to_mlir_module_for_program(&program, &[], &Vec::<ArrayType>::new(), &vec![output_type], "main", None, None)
                 .unwrap();

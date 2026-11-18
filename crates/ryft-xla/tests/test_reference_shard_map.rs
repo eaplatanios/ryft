@@ -3,13 +3,13 @@
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    ArrayIrType, ArrayReference, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis,
-    MeshAxisType, Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceAddUpdateOperation,
-    ReferenceReadOperation, ReferenceType, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
-    TypedProgram, Value as CoreValue, batch,
+    ArrayReference, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
+    Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation,
+    ReferenceType, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value as CoreValue,
+    batch,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::{Array, Constant, FromPjrt, Operation, Options, Reference, Session, Value, compile_statefully};
+use ryft_xla::{Array, Constant, FromPjrt, Operation, Options, Reference, Session, Type, Value, compile_statefully};
 
 /// Returns the `f32` contents of the shard of `array` on each device of its mesh, in mesh order.
 fn device_shards(array: &Array) -> Vec<Vec<f32>> {
@@ -33,7 +33,7 @@ fn test_shard_map_operation_from_program() {
         .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
         .unwrap();
     let global = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
-    let reference_type = ArrayIrType::Reference(ReferenceType::new(global.clone()));
+    let reference_type = Type::Reference(ReferenceType::new(global.clone()));
     let mut body = CoreProgramBuilder::<Constant, Operation>::new();
     let reference = body.add_input(ReferenceType::new(local).into());
     let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -57,14 +57,11 @@ fn test_shard_map_operation_from_program() {
     let program = builder
         .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
         .unwrap();
-    assert_eq!(program.output_types(), vec![ArrayIrType::Array(global.clone()), reference_type.clone()]);
+    assert_eq!(program.output_types(), vec![Type::Array(global.clone()), reference_type.clone()]);
     assert_eq!(program.jvp().unwrap().input_types(), vec![reference_type.clone(), reference_type.clone()]);
     let inactive = program.entry_region_ref().jvp(&[]).unwrap();
     assert_eq!(inactive.input_types(), vec![reference_type.clone()]);
-    assert_eq!(
-        inactive.output_types(),
-        vec![ArrayIrType::Array(global.clone()), reference_type, ArrayIrType::Array(global)]
-    );
+    assert_eq!(inactive.output_types(), vec![Type::Array(global.clone()), reference_type, Type::Array(global)]);
 }
 
 #[test]
@@ -91,8 +88,8 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let body = {
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let local_type = boundary.local_input_type(0, &item_type).unwrap();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_type.clone())));
-        let update = builder.add_input(ArrayIrType::Array(local_type));
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(local_type.clone())));
+        let update = builder.add_input(Type::Array(local_type));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
@@ -104,7 +101,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     };
     let operation = ShardMapOperation::from_program(
         &body,
-        vec![ArrayIrType::Reference(ReferenceType::new(item_type.clone())), ArrayIrType::Array(item_type)],
+        vec![Type::Reference(ReferenceType::new(item_type.clone())), Type::Array(item_type)],
         boundary,
     )
     .unwrap();
@@ -112,7 +109,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
     let batched_sharding =
         Sharding::new(logical_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
     let batched_type = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(batched_sharding.clone()).unwrap();
-    let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+    let compiled = compile_statefully::<_, (Type, Type), Type>(
         |(reference, update)| {
             Ok(batch(
                 |(reference, update)| {
@@ -126,7 +123,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
                 None,
             )?)
         },
-        (ArrayIrType::Reference(ReferenceType::new(batched_type.clone())), ArrayIrType::Array(batched_type.clone())),
+        (Type::Reference(ReferenceType::new(batched_type.clone())), Type::Array(batched_type.clone())),
         &session,
         Options::new(mesh.clone()),
     )

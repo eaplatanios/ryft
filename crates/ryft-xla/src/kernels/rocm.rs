@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, Dimension as CoreDimension,
-    EffectClass, Memory, Operation as CoreOperation, Typed,
+    CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, Dimension as CoreDimension, EffectClass, Memory,
+    Operation as CoreOperation, Typed,
 };
 use ryft_kernels::{GridExecution, KernelParameterAccess, VerifiedKernel};
 use ryft_pjrt::Client;
@@ -23,7 +23,7 @@ use crate::kernels::{
 };
 use crate::{
     CustomCallOperationExtension, Error, ExecutionResources, RuntimeExtension, RuntimeProvider, RuntimeRequirement,
-    ToPjrt,
+    ToPjrt, Type,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -62,7 +62,7 @@ impl RocmKernelEmbedding {
 
     /// Reconstructs an artifact and validates its redundant payload and logical signature before loading native code.
     /// The digest detects corruption, but it does not authenticate executable code from an untrusted producer.
-    pub fn from_custom_call<Extension: CoreOperation<Type = ArrayIrType>>(
+    pub fn from_custom_call<Extension: CoreOperation<Type = Type>>(
         kernel: &VerifiedKernel<'_, Extension>,
         operation: &CustomCallOperation,
     ) -> Result<(Self, RocmKernelArtifact), KernelEmbeddingError> {
@@ -100,7 +100,7 @@ impl RocmKernelEmbedding {
     }
 }
 
-impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<RocmKernelArtifact, Extension>
+impl<Extension: CoreOperation<Type = Type>> KernelOutputEmbedding<RocmKernelArtifact, Extension>
     for RocmKernelEmbedding
 {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {

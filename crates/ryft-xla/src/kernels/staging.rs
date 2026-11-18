@@ -6,8 +6,8 @@ use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
-    AtomId, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeJvpRule, CompositeOperation,
+    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
+    BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeJvpRule, CompositeOperation,
     ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     Domain as CoreDomain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
@@ -18,8 +18,8 @@ use ryft_core::{
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
     ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Tracer as CoreTracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
-    TypedProgram, Value as CoreValue,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type as CoreType, TypeError,
+    TypeIdentityRenaming, Typed, TypedProgram, Value as CoreValue,
 };
 use ryft_kernels::{
     KernelCallOperation, KernelCompiler, KernelCompletionProtocol, KernelDefinition,
@@ -34,7 +34,7 @@ use crate::kernels::{
 };
 use crate::{
     Constant, Error, FlatProgram, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation,
-    Target,
+    Target, Type,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -165,7 +165,7 @@ impl PortableKernelExtension for KernelExtension {
 }
 
 impl CoreOperation for KernelExtension {
-    type Type = ArrayIrType;
+    type Type = Type;
 
     fn name(&self) -> &'static str {
         match *self {
@@ -174,7 +174,7 @@ impl CoreOperation for KernelExtension {
         }
     }
 
-    fn defined_type_identities(&self) -> Cow<'_, [<ArrayIrType as Type>::Identity]> {
+    fn defined_type_identities(&self) -> Cow<'_, [<Type as CoreType>::Identity]> {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => operation.defined_type_identities(),
@@ -188,10 +188,7 @@ impl CoreOperation for KernelExtension {
         }
     }
 
-    fn validate_region_interfaces(
-        &self,
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<(), ProgramError> {
+    fn validate_region_interfaces(&self, region_interfaces: &[RegionInterface<Type>]) -> Result<(), ProgramError> {
         let _ = region_interfaces;
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -201,9 +198,9 @@ impl CoreOperation for KernelExtension {
 
     fn infer_region_input_types(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
+    ) -> Result<Vec<Option<Vec<Type>>>, TypeError> {
         let _ = (input_types, region_interfaces);
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -213,9 +210,9 @@ impl CoreOperation for KernelExtension {
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
+    ) -> Result<Vec<Type>, TypeError> {
         let _ = (input_types, region_interfaces);
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -225,8 +222,8 @@ impl CoreOperation for KernelExtension {
 
     fn fold(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
     ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         let _ = (input_types, region_interfaces);
         match *self {
@@ -331,7 +328,7 @@ impl CoreOperation for KernelExtension {
 
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<Type as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         let _ = renaming;
         match *self {
@@ -364,7 +361,7 @@ impl KernelOperation {
     }
 }
 
-impl<Extension: CoreOperation<Type = ArrayIrType> + Into<KernelExtension>> From<PortableKernelOperation<Extension>>
+impl<Extension: CoreOperation<Type = Type> + Into<KernelExtension>> From<PortableKernelOperation<Extension>>
     for KernelOperation
 {
     fn from(operation: PortableKernelOperation<Extension>) -> Self {
@@ -381,13 +378,13 @@ impl Display for KernelOperation {
 }
 
 impl CoreOperation for KernelOperation {
-    type Type = ArrayIrType;
+    type Type = Type;
 
     fn name(&self) -> &'static str {
         self.0.name()
     }
 
-    fn defined_type_identities(&self) -> Cow<'_, [<ArrayIrType as Type>::Identity]> {
+    fn defined_type_identities(&self) -> Cow<'_, [<Type as CoreType>::Identity]> {
         self.0.defined_type_identities()
     }
 
@@ -395,33 +392,30 @@ impl CoreOperation for KernelOperation {
         self.0.region_slots()
     }
 
-    fn validate_region_interfaces(
-        &self,
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<(), ProgramError> {
+    fn validate_region_interfaces(&self, region_interfaces: &[RegionInterface<Type>]) -> Result<(), ProgramError> {
         self.0.validate_region_interfaces(region_interfaces)
     }
 
     fn infer_region_input_types(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
+    ) -> Result<Vec<Option<Vec<Type>>>, TypeError> {
         self.0.infer_region_input_types(input_types, region_interfaces)
     }
 
     fn infer_output_types(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
+    ) -> Result<Vec<Type>, TypeError> {
         self.0.infer_output_types(input_types, region_interfaces)
     }
 
     fn fold(
         &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
     ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         self.0.fold(input_types, region_interfaces)
     }
@@ -480,13 +474,13 @@ impl CoreOperation for KernelOperation {
 
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<Type as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self(self.0.rename_type_identities(renaming)?))
     }
 }
 
-impl<C: Context<Type = ArrayIrType>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
+impl<C: Context<Type = Type>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
     for KernelOperation
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -503,7 +497,7 @@ impl<C: Context<Type = ArrayIrType>, P: ReferenceDischargePolicy<C>> ReferenceDi
     }
 }
 
-impl<C: CoreDomain<Type = ArrayIrType>> InterpretableOperation<C> for KernelOperation {
+impl<C: CoreDomain<Type = Type>> InterpretableOperation<C> for KernelOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -518,7 +512,7 @@ impl<C: CoreDomain<Type = ArrayIrType>> InterpretableOperation<C> for KernelOper
     }
 }
 
-impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for KernelOperation
+impl<C: Context<Type = Type>> PartiallyEvaluatableOperation<C> for KernelOperation
 where
     Self: Into<C::Operation>,
 {
@@ -551,7 +545,7 @@ where
 
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for KernelOperation
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation> + MeshContext,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation> + MeshContext,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -598,7 +592,7 @@ where
 /// `bound_axes` are the mesh axes that the enclosing manual regions made manual (refer to
 /// [`MeshContext::manual_axes`]). A batch dimension that is placed on such axes is a local shard, whether or not the
 /// region tracks manual variation, and one that is placed on other axes is a global value.
-fn unbound_batch_placement<V: CoreValue<Type = ArrayIrType>>(
+fn unbound_batch_placement<V: CoreValue<Type = Type>>(
     inputs: &[ArrayIrBatch<V>],
     bound_axes: &[(String, ryft_core::NamedAxis)],
 ) -> Result<Option<(LogicalMesh, Vec<String>)>, BatchingError> {
@@ -606,7 +600,7 @@ fn unbound_batch_placement<V: CoreValue<Type = ArrayIrType>>(
     for input in inputs {
         let Some(axis) = input.batch_axis_position() else { continue };
         let r#type = input.value().r#type();
-        let ArrayIrType::Array(r#type) = r#type.as_ref() else { return Ok(None) };
+        let Type::Array(r#type) = r#type.as_ref() else { return Ok(None) };
         let current = match r#type.sharding().map(|sharding| (sharding, &sharding.dimensions()[axis])) {
             Some((sharding, ShardingDimension::Sharded(axes))) => {
                 let is_bound = |axis: &&String| {
@@ -664,7 +658,7 @@ fn batch_in_shard_map<C>(
     bound_axes: &[(String, ryft_core::NamedAxis)],
 ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation>,
 {
     let unsupported = |message: String| BatchingError::UnsupportedOperation { message };
 
@@ -691,7 +685,7 @@ where
     let mut input_shardings = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.iter().enumerate() {
         let r#type = input.value().r#type();
-        let ArrayIrType::Array(r#type) = r#type.as_ref() else {
+        let Type::Array(r#type) = r#type.as_ref() else {
             return Err(unsupported("kernel batching accepts only ordinary array inputs".to_owned()));
         };
 
@@ -765,9 +759,9 @@ where
     let local = definition
         .batched(local_batch_size, &batch_axes, ryft_kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
         .map_err(ProgramError::custom)?;
-    let body = kernel_program(&local, local_input_types.into_iter().map(ArrayIrType::Array).collect())?;
+    let body = kernel_program(&local, local_input_types.into_iter().map(Type::Array).collect())?;
     let operation =
-        ShardMapOperation::from_program(&body, input_types.into_iter().map(ArrayIrType::Array).collect(), boundary)
+        ShardMapOperation::from_program(&body, input_types.into_iter().map(Type::Array).collect(), boundary)
             .map_err(ProgramError::custom)?;
     let values = context.bind(
         Operation::ShardMap(Box::new(operation)),
@@ -781,7 +775,7 @@ where
         .collect::<Result<Vec<_>, _>>()
 }
 
-impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for KernelOperation {
+impl<C: Context<Type = Type>> DifferentiableOperation<C> for KernelOperation {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -797,10 +791,9 @@ impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for KernelOperat
     }
 }
 
-impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> TransposableOperation<V, O>
-    for KernelOperation
+impl<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>> TransposableOperation<V, O> for KernelOperation
 where
-    O: OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>, Operation = O>,
+    O: OperationProvider<Type, GuardOperation<Type>, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -824,8 +817,8 @@ impl LowerableOperation for KernelOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (lowerer, input_values, input_types, output_types);
         Err(LoweringError::UnsupportedOperation {
@@ -849,7 +842,7 @@ pub fn stage_kernel<C, Extension>(
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation>,
     Extension: PortableKernelExtension + Into<KernelExtension>,
 {
     context.bind(
@@ -873,7 +866,7 @@ pub fn stage_kernel_with_jvp<C, Extension>(
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation>,
     Extension: PortableKernelExtension + Into<KernelExtension>,
 {
     context.bind(
@@ -896,7 +889,7 @@ pub fn stage_kernel_with_vjp<C, Extension>(
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation>,
     Extension: PortableKernelExtension + Into<KernelExtension>,
 {
     context.bind(
@@ -919,7 +912,7 @@ pub fn stage_kernel_with_rules<C, Extension, S>(
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation>,
     Extension: PortableKernelExtension + Into<KernelExtension>,
     S: CustomRuleSource<Constant, Operation>,
     Operation: From<CompositeOperation<Constant, Operation, S>>,
@@ -944,7 +937,7 @@ pub fn stage_kernel_with_fallback<C, Extension>(
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
-    C: Context<Type = ArrayIrType, Constant = Constant, Operation = Operation>,
+    C: Context<Type = Type, Constant = Constant, Operation = Operation>,
     Extension: PortableKernelExtension + Into<KernelExtension>,
 {
     let signature =
@@ -991,7 +984,7 @@ where
             .regions()
             .iter()
             .flat_map(|region| region.atoms())
-            .any(|atom| matches!(atom.r#type().as_ref(), ArrayIrType::Reference(_)))
+            .any(|atom| matches!(atom.r#type().as_ref(), Type::Reference(_)))
     {
         return Err(ProgramError::UnsupportedOperation {
             message: "pure kernel fallback cannot contain references or observable effects".to_owned(),
@@ -1431,7 +1424,7 @@ pub(crate) fn select_kernels(
                             .inputs()
                             .iter()
                             .filter_map(|input| match region.atoms()[input.index()].r#type().as_ref() {
-                                ArrayIrType::Array(r#type) => Some(r#type.clone()),
+                                Type::Array(r#type) => Some(r#type.clone()),
                                 _ => None,
                             })
                             .collect::<Vec<_>>();
@@ -1525,7 +1518,7 @@ fn stage_body<Extension: PortableKernelExtension + Into<KernelExtension>>(
                                 vec![AtomId::new(index)],
                                 vec![],
                             ));
-                            Atom::Variable(ArrayIrType::Array(value.r#type().into_owned()))
+                            Atom::Variable(Type::Array(value.r#type().into_owned()))
                         }
                         Atom::Constant(ArrayIrValue::Reference(_)) => {
                             return Err(ProgramError::MalformedProgram(
@@ -1556,7 +1549,7 @@ fn stage_body<Extension: PortableKernelExtension + Into<KernelExtension>>(
 }
 
 /// Returns the types of `inputs`, which are the types that a kernel call on them is staged for.
-fn input_types<V: CoreValue<Type = ArrayIrType>>(inputs: &[V]) -> Vec<ArrayIrType> {
+fn input_types<V: CoreValue<Type = Type>>(inputs: &[V]) -> Vec<Type> {
     inputs.iter().map(|input| input.r#type().into_owned()).collect()
 }
 
@@ -1565,7 +1558,7 @@ fn input_types<V: CoreValue<Type = ArrayIrType>>(inputs: &[V]) -> Vec<ArrayIrTyp
 /// manual region).
 fn kernel_program<Extension: PortableKernelExtension + Into<KernelExtension>>(
     definition: &KernelDefinition<Extension>,
-    input_types: Vec<ArrayIrType>,
+    input_types: Vec<Type>,
 ) -> Result<FlatProgram, ProgramError> {
     let mut builder = ryft_core::ProgramBuilder::new();
     let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
@@ -1845,7 +1838,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let session = session_with_client(client).with_device_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Session, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
+        let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
             program.input_types().into_owned(),
@@ -2206,7 +2199,7 @@ pub(crate) mod tests {
         let callees = [Arc::new(stage_body(&definition).unwrap())];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
-        let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let vector = Type::Array(ArrayType::new_static(DataType::F32, [3]));
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
@@ -2311,7 +2304,7 @@ pub(crate) mod tests {
                     }
                 })
             },
-            vec![ArrayIrType::Array(packed)],
+            vec![Type::Array(packed)],
             bound_axes,
         )
         .unwrap();
@@ -2612,9 +2605,7 @@ pub(crate) mod tests {
                 Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]).unwrap();
             assert_eq!(
                 program.output_types().as_ref(),
-                &[ArrayIrType::Array(
-                    ArrayType::new_static(DataType::F32, [4, 3]).with_sharding(output_sharding).unwrap()
-                )],
+                &[Type::Array(ArrayType::new_static(DataType::F32, [4, 3]).with_sharding(output_sharding).unwrap())],
             );
         }
     }
@@ -2730,7 +2721,7 @@ pub(crate) mod tests {
                 .err();
                 Ok::<_, ProgramError>(Vec::<CoreTracer<TracingContext<Constant, Operation>>>::new())
             },
-            vec![ArrayIrType::Array(packed)],
+            vec![Type::Array(packed)],
         )
         .unwrap();
         assert_eq!(
@@ -3159,7 +3150,7 @@ pub(crate) mod tests {
             .unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let placed = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
-        let placed = ArrayIrType::Array(placed);
+        let placed = Type::Array(placed);
         for stage in [true, false] {
             let (output_types, program) = TracingContext::<Constant, Operation>::trace(
                 |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
@@ -3209,7 +3200,7 @@ pub(crate) mod tests {
             .add_instruction(ConstantOperation::new(CoreArray::scalar(true).unwrap()), vec![], vec![], None)
             .unwrap()[0];
         fallback
-            .add_instruction(AssertOperation::<ArrayIrType>::new("check"), vec![], vec![predicate], None)
+            .add_instruction(AssertOperation::<Type>::new("check"), vec![], vec![predicate], None)
             .unwrap();
         let fallback = fallback
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3297,8 +3288,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .with_input_types(&[
                     input_types[0].clone(),
-                    ArrayIrType::Dimension(start.r#type().into_owned()),
-                    ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                    Type::Dimension(start.r#type().into_owned()),
+                    Type::Array(ArrayType::scalar(DataType::F32)),
                 ])
                 .unwrap();
             let mut body = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
@@ -3309,7 +3300,7 @@ pub(crate) mod tests {
             let definition: KernelDefinition =
                 KernelDefinition::new(call, body.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
             let mut fallback = ProgramBuilder::new();
-            let input = fallback.add_input(ArrayIrType::Array(vector.clone()));
+            let input = fallback.add_input(Type::Array(vector.clone()));
             let fallback = fallback
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap();
@@ -3317,7 +3308,7 @@ pub(crate) mod tests {
                 |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
                     stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
                 },
-                vec![ArrayIrType::Array(vector)],
+                vec![Type::Array(vector)],
             )
             .map(|_| ())
         };
@@ -4083,15 +4074,15 @@ pub(crate) mod tests {
     #[test]
     fn test_select_kernels_preserves_external_reference_order() {
         let body = kernel_primal(&differentiable_definition()).unwrap();
-        let ArrayIrType::Array(scalar) = body.input_types()[0].clone() else {
+        let Type::Array(scalar) = body.input_types()[0].clone() else {
             panic!("expected an array");
         };
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar));
+        let reference_type = Type::Reference(ReferenceType::new(scalar));
         let mut builder = ProgramBuilder::new();
         let reference = builder.add_input(reference_type);
         let value = builder
             .add_instruction(
-                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+                ReferenceReadOperation::<ArrayType, Type, ArrayReferenceTransform>::new(),
                 vec![],
                 vec![reference],
                 None,
@@ -4100,7 +4091,7 @@ pub(crate) mod tests {
         let outputs = builder.splice_program(&body, &[value]).unwrap();
         builder
             .add_instruction(
-                ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+                ReferenceWriteOperation::<ArrayType, Type, ArrayReferenceTransform>::new(),
                 vec![],
                 vec![reference, outputs[0]],
                 None,
@@ -4134,12 +4125,12 @@ pub(crate) mod tests {
     #[test]
     fn test_select_kernels_preserves_memory_transfers() {
         let body = kernel_primal(&differentiable_definition()).unwrap();
-        let ArrayIrType::Array(scalar) = body.input_types()[0].clone() else {
+        let Type::Array(scalar) = body.input_types()[0].clone() else {
             panic!("expected an array");
         };
         let host = scalar.with_memory(Memory::Host { pinned: true });
         let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(ArrayIrType::Array(host));
+        let input = builder.add_input(Type::Array(host));
         let device = builder
             .add_instruction(TransferToMemoryOperation::new(Memory::Device), vec![], vec![input], None)
             .unwrap()[0];
@@ -4327,7 +4318,7 @@ pub(crate) mod tests {
         let literal = builder.add_constant(ArrayIrValue::Array(CoreArray::scalar(42i32).unwrap()));
         builder
             .add_instruction(
-                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, Type, ArrayReferenceTransform>::new(),
                 vec![],
                 vec![reference, literal],
                 None,

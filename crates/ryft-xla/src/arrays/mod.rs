@@ -28,7 +28,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ryft_core::{
-    Add, And, ArrayIrType, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, Device, DeviceId, DeviceMesh,
+    Add, And, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, Device, DeviceId, DeviceMesh,
     DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation,
     DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, LayoutError, Memory, Mul, Neg, Not,
     Operation as CoreOperation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
@@ -45,7 +45,7 @@ use crate::arrays::materialization::{
     BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
     LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
 };
-use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt};
+use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1586,7 +1586,7 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
     fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         // Copies this rank-0 integer array to the host and grants its checked value first-class dimension authority.
         let operation = DimensionFromScalarOperation::new(output.into());
-        let mut output_types = operation.infer_output_types(&[ArrayIrType::Array(self.r#type().into_owned())], &[])?;
+        let mut output_types = operation.infer_output_types(&[Type::Array(self.r#type().into_owned())], &[])?;
         let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
         let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
         let invalid_extent = |value: String| ProgramError::InvalidArgument {

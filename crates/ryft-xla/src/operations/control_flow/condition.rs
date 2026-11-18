@@ -1,6 +1,6 @@
 //! Lowering of [`ConditionOperation`] to [StableHLO `if`](https://openxla.org/stablehlo/spec#if).
 //!
-//! A condition lowers only from the [`ArrayIrType`] operation family, which stores its two branch regions. The
+//! A condition lowers only from the [`Type`] operation family, which stores its two branch regions. The
 //! homogeneous [`ArrayType`] payload carries no regions and is rejected. The predicate selects between two
 //! `stablehlo.if` regions that take no arguments and capture the lowered branch inputs implicitly. Each branch input is
 //! converted from its actual type to the shared declared type of its branch input, and an entry guard checks the input
@@ -9,7 +9,7 @@
 //! result types, and both branches normalize their results to the refined output types of the condition. Results whose
 //! types place them over explicit mesh axes are constrained to that placement.
 
-use ryft_core::{ArrayIrType, ArrayType, ConditionOperation, Operation as CoreOperation, ProgramError, TypedProgram};
+use ryft_core::{ArrayType, ConditionOperation, Operation as CoreOperation, ProgramError, TypedProgram};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -18,7 +18,7 @@ use crate::operations::control_flow::{
     lower_control_flow_region, lower_explicit_sharding_constraints, lower_refined_region_input, lower_region_guard,
     lowered_effect_classes, set_threaded_effect_tokens,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for ConditionOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -39,13 +39,13 @@ impl LowerableOperation for ConditionOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for ConditionOperation<ArrayIrType> {
+impl LowerableOperation for ConditionOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
+        input_types: &[Type],
+        output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A condition lowers to one `stablehlo.if` on its predicate, which is the first of its `1 + n` inputs, followed
         // by the `n` inputs of both branches. The branch regions take no arguments. Each one is inlined over the
@@ -278,7 +278,7 @@ mod tests {
             let mut builder = ArrayIrProgramBuilder::new();
             let dimension = builder.add_input(input_dimension.clone().into());
             let array = builder.add_input(array_type.clone().into());
-            let declared: Vec<ArrayIrType> = vec![
+            let declared: Vec<Type> = vec![
                 declared_dimension.clone().into(),
                 ArrayType::new(DataType::F64, Shape::new(vec![declared_dimension.simplified_dimension()])).into(),
             ];
@@ -701,8 +701,7 @@ mod tests {
                 .unwrap()[0];
             builder
                 .add_instruction(
-                    AssertOperation::<ArrayIrType>::new("scalar must equal itself")
-                        .with_labels(vec!["scalar".to_owned()]),
+                    AssertOperation::<Type>::new("scalar must equal itself").with_labels(vec!["scalar".to_owned()]),
                     Vec::new(),
                     vec![predicate, input],
                     None,
@@ -997,7 +996,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))]);
+        assert_eq!(program.output_types(), vec![Type::Array(ArrayType::new_static(DataType::F64, [3]))]);
         assert_eq!(
             execute_mixed_program(
                 execution_client(),
@@ -1053,7 +1052,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone())]);
+            assert_eq!(program.output_types(), vec![Type::Array(static_type.clone())]);
             let expected = if predicate_value { vec![1.0, 2.0, 3.0] } else { vec![0.0; 3] };
             assert_eq!(
                 execute_mixed_program(
@@ -1109,7 +1108,7 @@ mod tests {
         // An array IR condition needs exactly one region per branch.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
         assert!(matches!(
-            ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
+            ConditionOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::MalformedProgram(message))
@@ -1120,7 +1119,7 @@ mod tests {
         // It also needs the predicate followed by one input per branch input.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
         assert!(matches!(
-            ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
+            ConditionOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -1389,8 +1388,7 @@ mod tests {
             let predicate = positive(&mut builder, selector);
             builder
                 .add_instruction(
-                    AssertOperation::<ArrayIrType>::new("selector must be positive")
-                        .with_labels(vec!["selector".to_owned()]),
+                    AssertOperation::<Type>::new("selector must be positive").with_labels(vec!["selector".to_owned()]),
                     Vec::new(),
                     vec![predicate, selector],
                     None,
