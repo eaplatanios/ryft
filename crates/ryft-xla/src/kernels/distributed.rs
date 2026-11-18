@@ -446,8 +446,11 @@ impl<'o> DistributedKernel<'o> {
             let shard = input.addressable_shards().next().unwrap();
             let buffer =
                 shard.buffer().ok_or_else(|| DistributedKernelError::invalid("input has no addressable buffer"))?;
-            let bytes =
-                buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(types[index].rank())))?.r#await()?;
+            let mut work = session.reserve_work();
+            let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(types[index].rank())))?;
+            let bytes = work.track_host_copy(copy).wait()?;
+            // Publish the local copy before exchanging bytes with the other ranks.
+            drop(work);
             if bytes.len() != self.sizes[index] {
                 return Err(DistributedKernelError::invalid(
                     "downloaded input byte count differs from its canonical type",

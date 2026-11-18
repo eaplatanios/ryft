@@ -1,10 +1,10 @@
-use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use ryft_core::DeviceId;
 use ryft_pjrt::{Buffer, ExecutionFence};
 
+use crate::sessions::synchronization::WorkTracker;
 use crate::{Error, ExecutionError};
 
 /// Tracks executions with effects and keeps ordered I/O in reservation order. Cloning a [`Session`](crate::Session)
@@ -15,10 +15,20 @@ use crate::{Error, ExecutionError};
 /// completion of unordered executions. [`Self::barrier`] waits for work already reserved when the barrier takes its
 /// snapshot and reports failures in reservation order. [`Self::acknowledge`] clears reported failures once the
 /// affected work has completed.
+///
+/// Completion is tracked by a [`WorkTracker`], which is the same mechanism that tracks the work of a whole session
+/// for [`Session::synchronize`](crate::Session::synchronize). The two differ in how long they keep a failure. A session
+/// reports each failure once, while a scope keeps its failures until they are acknowledged, and an ordered failure
+/// blocks further ordered reservations until then. The scope itself adds the ordered chain of token publications.
 #[derive(Default)]
 pub(super) struct EffectScope {
-    /// Reservation, observation, and recovery state, which is never held across PJRT calls or device waits.
+    /// Ordered chain and recovery state, which is never held across PJRT calls or device waits. A thread that holds
+    /// this mutex may lock the tracker, but never the other way around.
     state: Mutex<EffectScopeState>,
+
+    /// Reservations of this scope and their completion. The tag of a reservation records whether it is ordered.
+    /// The fence callbacks of published reservations share the tracker, which holds no client resources.
+    work: Arc<WorkTracker<bool, Arc<str>>>,
 }
 
 impl EffectScope {
@@ -41,15 +51,8 @@ impl EffectScope {
     pub(super) fn reserve(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
         ensure_effect_dispatch_is_allowed()?;
 
-        // Hold extracted submissions until after the scope guard is released, even if reading a completion panics.
-        let mut retired = Vec::new();
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
-        if devices.is_some()
-            && state
-                .submissions
-                .iter()
-                .any(|submission| submission.ordered && matches!(submission.completion.result(), Some(Err(_))))
-        {
+        if devices.is_some() && self.work.lock().failures.values().any(|(ordered, _)| *ordered) {
             return Err(ExecutionError::ScopeNeedsRecovery.into());
         }
 
@@ -67,26 +70,17 @@ impl EffectScope {
             }
         }
 
+        let identity = self.work.register(devices.is_some());
         let submission = Arc::new(EffectSubmission {
-            identity: state.next_identity,
-            ordered: devices.is_some(),
-            completion: Arc::new(EffectCompletion::default()),
             publication: Mutex::new(EffectTokenPublication::Pending),
             publication_ready: Condvar::new(),
         });
-        state.next_identity += 1;
         let predecessor = if devices.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
-        retired.extend(
-            state
-                .submissions
-                .extract_if(.., |submission| matches!(submission.completion.result(), Some(Ok(())))),
-        );
-        state.submissions.push(Arc::clone(&submission));
 
-        Ok(EffectReservation { submission, predecessor, committed: false })
+        Ok(EffectReservation { work: Arc::clone(&self.work), identity, submission, predecessor, committed: false })
     }
 
-    /// Takes a snapshot of the scope's current reservations, then waits for each one to finish or be cancelled.
+    /// Takes a snapshot of the scope's current reservations, then waits for each one to finish or be canceled.
     /// This includes reservations still preparing device work. Later reservations are handled by a subsequent
     /// barrier. Reported failures remain in the scope until [`Self::acknowledge`] clears them.
     ///
@@ -96,24 +90,22 @@ impl EffectScope {
     /// order. Returns [`ExecutionError::ReentrantDispatch`] from within a managed effect callback.
     pub(super) fn barrier(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
+        self.barrier_at(self.work.snapshot())
+    }
 
-        let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
-        let mut failures = Vec::new();
-        let mut successful = HashSet::new();
-        for submission in &submissions {
-            match submission.completion.wait() {
-                Ok(()) => {
-                    successful.insert(submission.identity);
-                }
-                Err(error) => failures.push((submission.identity, error)),
-            }
-        }
+    /// Implements [`Self::barrier`] for the snapshot of the reservations that were made before `end`.
+    fn barrier_at(&self, end: u64) -> Result<(), Error> {
+        let failures = self
+            .work
+            .wait(end)
+            .failures
+            .range(..end)
+            .map(|(&identity, (_, reason))| (identity, Arc::clone(reason)))
+            .collect::<Vec<_>>();
 
+        // The tracker has been released by now. Reservations and acknowledgments lock the scope first.
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
-        state.observed.extend(failures.iter().map(|(identity, _)| *identity));
-        state.submissions.retain(|submission| !successful.contains(&submission.identity));
-
-        // Unlock before dropping the snapshot, which still holds the removed submissions and their token buffers.
+        state.observed_end = state.observed_end.max(end);
         drop(state);
 
         if failures.is_empty() {
@@ -135,71 +127,62 @@ impl EffectScope {
     pub(super) fn acknowledge(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
 
-        // Keep the former tail and extracted submissions alive past the scope guard.
-        let mut retired = Vec::new();
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
+        let mut work = self.work.lock();
 
-        // Callbacks publish independently of the scope mutex. Read each completion at most once so a failure
-        // recorded after its submission was checked remains tracked.
-        let mut completed = HashSet::new();
-        let mut ordered_failure = false;
-        let mut ordered_pending = false;
-        for submission in &state.submissions {
-            let Some(result) = submission.completion.result() else {
-                ordered_pending |= submission.ordered;
-                continue;
-            };
-            if result.is_err() {
-                if !state.observed.contains(&submission.identity) {
-                    return Err(ExecutionError::PrematureAcknowledgment.into());
-                }
-                ordered_failure |= submission.ordered;
-            }
-            completed.insert(submission.identity);
-        }
-
-        if ordered_failure && ordered_pending {
+        // A barrier reports every failure of its snapshot, so only failures of later reservations are unreported.
+        if work.failures.last_key_value().is_some_and(|(&identity, _)| identity >= state.observed_end) {
             return Err(ExecutionError::PrematureAcknowledgment.into());
         }
 
-        retired.extend(state.submissions.extract_if(.., |submission| completed.contains(&submission.identity)));
-        if ordered_failure {
-            retired.extend(state.tail.take());
-            state.devices = None;
+        let ordered_failure = work.failures.values().any(|(ordered, _)| *ordered);
+        if ordered_failure && work.pending.values().any(|pending| pending.tag) {
+            return Err(ExecutionError::PrematureAcknowledgment.into());
         }
 
-        state.observed.clear();
+        let failures = std::mem::take(&mut work.failures);
+        drop(work);
+        let tail = if ordered_failure {
+            state.devices = None;
+            state.tail.take()
+        } else {
+            None
+        };
 
-        // Unlock the scope before freeing the completed ID set and destroying retired token buffers.
+        // Unlock the scope before freeing the acknowledged failures and destroying the token buffers
+        // of the former tail.
         drop(state);
+        drop((failures, tail));
 
         Ok(())
     }
 }
 
-/// Scope metadata protected by the [`EffectScope`]'s mutex. Completion callbacks retain their submission's
-/// [`EffectCompletion`] independently of this state.
+/// Ordered chain and recovery state protected by the [`EffectScope`]'s mutex. The scope's [`WorkTracker`] tracks
+/// the completion of its reservations independently of this state.
 #[derive(Default)]
 struct EffectScopeState {
-    /// Identity of the next reserved invocation.
-    next_identity: u64,
-
-    /// Latest ordered invocation, retained even after its successful completion is retired.
+    /// Latest ordered invocation, retained even after it has completed successfully.
     tail: Option<Arc<EffectSubmission>>,
 
-    /// Outstanding invocations and unacknowledged failures, in reservation order.
-    submissions: Vec<Arc<EffectSubmission>>,
-
-    /// Failures reported by completed barriers.
-    observed: HashSet<u64>,
+    /// End of the snapshot of the latest barrier. A barrier reports every failure of its snapshot, so the failures
+    /// of the reservations that were made before this identity have all been reported.
+    observed_end: u64,
 
     /// Device list in token order for the current ordered chain. Acknowledging an ordered failure clears the list.
     devices: Option<Vec<DeviceId>>,
 }
 
 /// Reservation for an execution with effects. Dropping an uncommitted reservation cancels it and lets its successors
-/// follow its predecessor's token publication. Cancellation can proceed without waiting for the predecessor.
+/// follow its predecessor's token publication. Cancellation can proceed without waiting for the predecessor. A canceled
+/// reservation completes without a failure, so a barrier stops waiting for it.
 pub(crate) struct EffectReservation {
+    /// Tracker of the reserving scope, which records the completion of this reservation.
+    work: Arc<WorkTracker<bool, Arc<str>>>,
+
+    /// Identity of this reservation in [`Self::work`], which is local to its scope.
+    identity: u64,
+
     /// Invocation being prepared or published.
     submission: Arc<EffectSubmission>,
 
@@ -211,7 +194,7 @@ pub(crate) struct EffectReservation {
 }
 
 impl EffectReservation {
-    /// Waits for the predecessor's token publication on the host, following any cancelled reservations. Use the
+    /// Waits for the predecessor's token publication on the host, following any canceled reservations. Use the
     /// returned token buffers as inputs even if they are still pending on their devices. Returns [`None`] when there
     /// are no predecessor tokens and propagates any failure published by the predecessor.
     pub(crate) fn wait_for_predecessor_tokens(&self) -> Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>> {
@@ -220,9 +203,9 @@ impl EffectReservation {
 
     /// Consumes the reservation and publishes its ordered I/O token buffers or execution boundary failure to its
     /// successors. Pass `Ok(None)` for a successful submission without ordered tokens. The fence callback records
-    /// the boundary failure if one was published, or the fence's result otherwise. It owns the completion state
-    /// independently of the reservation and can run inline if the fence is already ready. Cancellation on drop is
-    /// disarmed only after callback registration returns.
+    /// the boundary failure if one was published, or the fence's result otherwise, in the tracker of the scope. It
+    /// shares that tracker independently of the reservation and of the scope, and it can run inline if the fence is
+    /// already ready. Cancellation on drop is disarmed only after callback registration returns.
     pub(crate) fn publish(
         mut self,
         tokens: Result<Option<Vec<Arc<Buffer<'static>>>>, Arc<str>>,
@@ -230,13 +213,10 @@ impl EffectReservation {
     ) {
         let boundary_failure = tokens.as_ref().err().cloned();
         self.submission.publish(tokens);
-        let completion = Arc::clone(&self.submission.completion);
+        let (work, identity) = (Arc::clone(&self.work), self.identity);
         fence.on_ready(move |result| {
-            let result = match boundary_failure {
-                Some(reason) => Err(reason),
-                None => result.map_err(|error| Arc::from(error.to_string())),
-            };
-            completion.complete(result);
+            let failure = boundary_failure.or_else(|| result.err().map(|error| Arc::from(error.to_string())));
+            work.complete(identity, failure);
         });
         self.committed = true;
     }
@@ -256,7 +236,7 @@ impl Drop for EffectReservation {
             drop(publication);
 
             self.submission.publication_ready.notify_all();
-            self.submission.completion.cancel();
+            self.work.complete(self.identity, None);
         }
     }
 }
@@ -301,54 +281,6 @@ pub(crate) fn ensure_effect_dispatch_is_allowed() -> Result<(), Error> {
     if EFFECT_CALLBACK_DEPTH.get() != 0 { Err(ExecutionError::ReentrantDispatch.into()) } else { Ok(()) }
 }
 
-/// Records the outcome of one execution with effects. The result is pending until device work finishes or the
-/// reservation is canceled. A canceled reservation records success so a barrier can stop waiting for it. A PJRT
-/// completion callback can own this state independently of the session because it holds no client resources.
-#[derive(Default)]
-struct EffectCompletion {
-    /// Result recorded once when the execution completes or the reservation is canceled.
-    result: Mutex<Option<Result<(), Arc<str>>>>,
-
-    /// Wakes barrier callers when the terminal outcome becomes available.
-    ready: Condvar,
-}
-
-impl EffectCompletion {
-    /// Stores the result and wakes waiting threads. The callback can record the result while another thread holds
-    /// the effect scope's mutex.
-    fn complete(&self, result: Result<(), Arc<str>>) {
-        *self.result.lock().expect("effect completion mutex poisoned") = Some(result);
-        self.ready.notify_all();
-    }
-
-    /// Records a canceled reservation as complete and repairs any poisoned completion state before waking waiters.
-    fn cancel(&self) {
-        let mut result = self.result.lock().unwrap_or_else(PoisonError::into_inner);
-        *result = Some(Ok(()));
-        self.result.clear_poison();
-
-        // Release the repaired result before waking barrier callers.
-        drop(result);
-
-        self.ready.notify_all();
-    }
-
-    /// Returns the recorded result, or [`None`] if completion is pending.
-    fn result(&self) -> Option<Result<(), Arc<str>>> {
-        self.result.lock().expect("effect completion mutex poisoned").clone()
-    }
-
-    /// Blocks the current thread until the execution finishes or the reservation is canceled, then returns the
-    /// recorded result. The wait can begin before device work is submitted.
-    fn wait(&self) -> Result<(), Arc<str>> {
-        let mut result = self.result.lock().expect("effect completion mutex poisoned");
-        while result.is_none() {
-            result = self.ready.wait(result).expect("effect completion mutex poisoned");
-        }
-        result.as_ref().unwrap().clone()
-    }
-}
-
 /// Host publication state for a submission's per-device ordered I/O token buffers.
 #[derive(Clone, Default)]
 enum EffectTokenPublication {
@@ -363,17 +295,9 @@ enum EffectTokenPublication {
     Forward(Option<Arc<EffectSubmission>>),
 }
 
-/// One reserved execution with effects. Its ordered I/O tokens are stored as PJRT buffers.
+/// Token publication of one reserved execution with effects, which is a node of its scope's ordered chain when the
+/// execution is ordered. Ordered I/O tokens are stored as PJRT buffers.
 struct EffectSubmission {
-    /// Monotonically increasing submission identity, local to its scope.
-    identity: u64,
-
-    /// Whether the invocation participates in the ordered I/O chain.
-    ordered: bool,
-
-    /// State without buffers that the completion observer retains.
-    completion: Arc<EffectCompletion>,
-
     /// Token publication or forwarding link for a canceled reservation.
     publication: Mutex<EffectTokenPublication>,
 
@@ -459,7 +383,7 @@ mod tests {
     use crate::tests::cuda_client;
 
     use super::{
-        EFFECT_CALLBACK_DEPTH, EffectCallbackGuard, EffectScope, EffectSubmission, EffectTokenPublication,
+        EFFECT_CALLBACK_DEPTH, EffectCallbackGuard, EffectScope, EffectTokenPublication,
         ensure_effect_dispatch_is_allowed,
     };
 
@@ -490,22 +414,6 @@ mod tests {
             assert!(!timeout.timed_out(), "cancellation did not wake the waiter");
             state = next;
         }
-    }
-
-    /// Waits for the barrier to retain the submission in its snapshot and release the scope lock.
-    fn wait_for_barrier_snapshot(
-        scope: &EffectScope,
-        submission: &Arc<EffectSubmission>,
-        initial_references: usize,
-    ) -> bool {
-        let deadline = Instant::now() + CALLBACK_TIMEOUT;
-        while Instant::now() < deadline {
-            if Arc::strong_count(submission) > initial_references && scope.state.try_lock().is_ok() {
-                return true;
-            }
-            thread::yield_now();
-        }
-        false
     }
 
     /// Chooses one addressable device so the fixture uses the same mesh on CPU and CUDA.
@@ -606,18 +514,16 @@ mod tests {
 
         // Leave a completed entry at the ordered tail so any unordered reservation that joins the chain is visible.
         let ordered = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
-        let ordered_identity = ordered.submission.identity;
+        let ordered_submission = Arc::clone(&ordered.submission);
         ordered.publish(Ok(None), &ExecutionFence::new(Vec::new()));
         let ((), lines) = with_captured_prints(|| {
             let execution = session.execute_compiled_async(&program, vec![input]).unwrap();
             assert!(execution.output().is_empty());
-            let state = session.effect_scope.state.lock().unwrap();
-            assert_eq!(state.submissions.len(), 1);
-            assert!(!state.submissions[0].ordered);
-            assert_eq!(state.tail.as_ref().unwrap().identity, ordered_identity);
 
-            // Release the scope mutex before the barrier takes its snapshot.
-            drop(state);
+            // The execution made the second reservation of the scope and left the ordered tail in place.
+            let scope = &session.effect_scope;
+            assert_eq!(scope.work.snapshot(), 2);
+            assert!(Arc::ptr_eq(scope.state.lock().unwrap().tail.as_ref().unwrap(), &ordered_submission));
 
             session.effects_barrier().unwrap();
         });
@@ -632,9 +538,9 @@ mod tests {
         let unordered = scope.reserve(None).unwrap();
         let second = scope.reserve(Some(&[0])).unwrap();
 
-        assert_eq!(first.submission.identity, 0);
-        assert_eq!(unordered.submission.identity, 1);
-        assert_eq!(second.submission.identity, 2);
+        assert_eq!(first.identity, 0);
+        assert_eq!(unordered.identity, 1);
+        assert_eq!(second.identity, 2);
         assert!(first.predecessor.is_none());
         assert!(unordered.predecessor.is_none());
         assert!(Arc::ptr_eq(second.predecessor.as_ref().unwrap(), &first.submission));
@@ -657,17 +563,6 @@ mod tests {
         let successor = scope.reserve(Some(&[0, 1])).unwrap();
         assert!(Arc::ptr_eq(successor.predecessor.as_ref().unwrap(), &first_submission));
         assert_eq!(scope.state.lock().unwrap().devices.as_ref().unwrap().as_ptr(), device_storage);
-    }
-
-    #[test]
-    fn test_effect_scope_reserve_retires_successful_submissions() {
-        let scope = EffectScope::default();
-        let completed = scope.reserve(None).unwrap();
-        completed.publish(Ok(None), &ExecutionFence::new(Vec::new()));
-        let pending = scope.reserve(None).unwrap();
-        let state = scope.state.lock().unwrap();
-        assert_eq!(state.submissions.len(), 1);
-        assert!(Arc::ptr_eq(&state.submissions[0], &pending.submission));
     }
 
     #[test]
@@ -695,14 +590,7 @@ mod tests {
              call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` \
              to recover once affected work is complete",
         );
-        let tracked = scope
-            .state
-            .lock()
-            .unwrap()
-            .submissions
-            .iter()
-            .map(|submission| submission.identity)
-            .collect::<Vec<_>>();
+        let tracked = scope.work.lock().failures.keys().copied().collect::<Vec<_>>();
         assert_eq!(tracked, vec![0, 2]);
     }
 
@@ -711,21 +599,23 @@ mod tests {
         let scope = EffectScope::default();
         let first = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
-        let first_submission = Arc::clone(&first.submission);
         first.publish(Ok(None), &fence);
-        let initial_references = Arc::strong_count(&first_submission);
+        let snapshot = scope.work.snapshot();
+        let later = scope.reserve(None).unwrap();
         thread::scope(|threads| {
             let (sender, receiver) = channel();
             let scope = &scope;
-            threads.spawn(move || sender.send(scope.barrier()).unwrap());
+            threads.spawn(move || sender.send(scope.barrier_at(snapshot)).unwrap());
 
-            let snapshot_captured = wait_for_barrier_snapshot(scope, &first_submission, initial_references);
-            let later = snapshot_captured.then(|| scope.reserve(None).unwrap());
+            // Only the first reservation belongs to the snapshot, so its completion releases the barrier.
             promise.set(None).unwrap();
             let result = receiver.recv_timeout(CALLBACK_TIMEOUT);
-            assert!(snapshot_captured, "the barrier did not capture its snapshot and release the scope mutex");
+            let later_pending = scope.work.lock().pending.contains_key(&later.identity);
+
+            // Cancel the later reservation so that the barrier can return even if it missed the deadline.
+            drop(later);
             result.unwrap().unwrap();
-            assert_eq!(later.unwrap().submission.completion.result(), None);
+            assert!(later_pending);
         });
     }
 
@@ -734,7 +624,6 @@ mod tests {
         let scope = EffectScope::default();
         let failed = scope.reserve(Some(&[0])).unwrap();
         let tail = scope.reserve(Some(&[0])).unwrap();
-        let failed_completion = Arc::clone(&failed.submission.completion);
         let tail_submission = Arc::downgrade(&tail.submission);
         let ready = ExecutionFence::new(Vec::new());
         tail.publish(Ok(None), &ready);
@@ -747,19 +636,19 @@ mod tests {
             Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
                 if failures == vec![(0, Arc::from("ordered effect failed"))],
         ));
-        // The scope is now the only owner of the successful tail, which the barrier removed from its tracked list.
+        // The scope is the only owner of the successful tail of the failed chain.
         assert!(tail_submission.upgrade().is_some());
 
         let unordered = scope.reserve(None).unwrap();
         scope.acknowledge().unwrap();
         assert!(tail_submission.upgrade().is_none());
-        assert!(Arc::ptr_eq(&scope.state.lock().unwrap().submissions[0], &unordered.submission));
+        assert_eq!(scope.work.lock().pending.keys().copied().collect::<Vec<_>>(), vec![unordered.identity]);
         // Cancel the unordered reservation before checking the barrier after recovery.
         drop(unordered);
         scope.barrier().unwrap();
         let recovered = scope.reserve(Some(&[1])).unwrap();
         assert!(recovered.predecessor.is_none());
-        assert_eq!(failed_completion.result(), Some(Err(Arc::from("ordered effect failed"))));
+        assert!(scope.work.lock().failures.is_empty());
     }
 
     #[test]
@@ -767,31 +656,31 @@ mod tests {
         let scope = EffectScope::default();
         let failed = scope.reserve(Some(&[0])).unwrap();
         let (fence, promise) = pending_fence();
-        let failed_submission = Arc::clone(&failed.submission);
         failed.publish(Ok(None), &fence);
-        let initial_references = Arc::strong_count(&failed_submission);
+        let snapshot = scope.work.snapshot();
+        let later = scope.reserve(Some(&[0])).unwrap();
 
         thread::scope(|threads| {
             let (sender, receiver) = channel();
             let scope = &scope;
-            threads.spawn(move || sender.send(scope.barrier()).unwrap());
+            threads.spawn(move || sender.send(scope.barrier_at(snapshot)).unwrap());
 
-            // Have the barrier report the failure while a later ordered reservation is still pending.
-            let snapshot_captured = wait_for_barrier_snapshot(scope, &failed_submission, initial_references);
-            let later = snapshot_captured.then(|| scope.reserve(Some(&[0])).unwrap());
+            // Have the barrier report the failure while the later ordered reservation is still pending.
             promise.set(Some(ryft_pjrt::Error::invalid_argument("ordered effect failed"))).unwrap();
             let report = receiver.recv_timeout(CALLBACK_TIMEOUT);
-            assert!(snapshot_captured, "the barrier did not capture its snapshot and release the scope mutex");
+            let acknowledgment = scope.acknowledge();
+
+            // Cancel the later reservation so that the barrier can return even if it missed the deadline.
+            drop(later);
             assert!(matches!(
                 report.unwrap(),
                 Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
                     if failures == vec![(0, Arc::from("ordered effect failed"))],
             ));
-            assert_eq!(later.as_ref().unwrap().submission.completion.result(), None);
-            assert!(matches!(scope.acknowledge(), Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
+            assert!(matches!(acknowledgment, Err(Error::Execution(ExecutionError::PrematureAcknowledgment))));
         });
 
-        // The later reservation was cancelled when the scoped thread closure ended.
+        // The later reservation has been canceled, so no ordered work is pending anymore.
         scope.acknowledge().unwrap();
     }
 
@@ -810,7 +699,8 @@ mod tests {
                 if failures == vec![(0, Arc::from("late completion failure"))],
         ));
         scope.acknowledge().unwrap();
-        assert_eq!(scope.state.lock().unwrap().submissions.len(), 0);
+        let work = scope.work.lock();
+        assert!(work.pending.is_empty() && work.failures.is_empty());
     }
 
     #[test]
@@ -961,17 +851,17 @@ mod tests {
         let reservation = scope.reserve(None).unwrap();
         let (fence, promise) = pending_fence();
         let submission = Arc::downgrade(&reservation.submission);
-        let completion = Arc::clone(&reservation.submission.completion);
+        let work = Arc::clone(&scope.work);
         reservation.publish(Ok(None), &fence);
 
-        // The fence callback keeps only the completion alive, so the submission can be released before it fires.
+        // The fence callback keeps only the tracker alive, so the submission can be released before it fires.
         drop(scope);
         let submission_released = submission.upgrade().is_none();
-        let pending = completion.result();
+        let pending = work.lock().pending.contains_key(&0);
         promise.set(None).unwrap();
         assert!(submission_released);
-        assert_eq!(pending, None);
-        assert_eq!(completion.wait(), Ok(()));
+        assert!(pending);
+        assert!(work.wait(1).failures.is_empty());
     }
 
     #[test]
@@ -988,13 +878,13 @@ mod tests {
             &*submission.publication.lock().unwrap(),
             EffectTokenPublication::Published(Err(reason)) if reason.as_ref() == "boundary failed",
         );
-        let pending = submission.completion.result();
+        let pending = scope.work.lock().pending.contains_key(&0);
         promise.set(Some(ryft_pjrt::Error::invalid_argument("execution fence failed"))).unwrap();
 
         assert!(published);
-        assert_eq!(pending, None);
+        assert!(pending);
         assert!(matches!(successor.wait_for_predecessor_tokens(), Err(reason) if reason.as_ref() == "boundary failed"));
-        assert_eq!(submission.completion.wait(), Err(Arc::from("boundary failed")));
+        assert_eq!(scope.work.wait(1).failures.get(&0), Some(&(true, Arc::from("boundary failed"))));
     }
 
     #[test]
@@ -1013,7 +903,8 @@ mod tests {
         let scope = EffectScope::default();
         let first = scope.reserve(Some(&[0])).unwrap();
         let second = scope.reserve(Some(&[0])).unwrap();
-        let cancelled = Arc::clone(&second.submission);
+        let canceled = Arc::clone(&second.submission);
+        let canceled_identity = second.identity;
         thread::scope(|threads| {
             let (sender, receiver) = channel();
             threads.spawn(move || {
@@ -1023,7 +914,7 @@ mod tests {
             });
 
             let cancellation = receiver.recv_timeout(CALLBACK_TIMEOUT);
-            let predecessor_pending = first.submission.completion.result().is_none();
+            let predecessor_pending = scope.work.lock().pending.contains_key(&first.identity);
 
             // Release any waiter on the predecessor even if cancellation timed out.
             drop(first);
@@ -1031,8 +922,11 @@ mod tests {
             assert_eq!(cancellation, Ok(()));
             assert!(predecessor_pending);
         });
-        assert_eq!(cancelled.completion.result(), Some(Ok(())));
-        assert!(cancelled.wait_for_tokens().unwrap().is_none());
+        // A canceled reservation completes without a failure, so a barrier stops waiting for it.
+        let work = scope.work.wait(canceled_identity + 1);
+        assert!(!work.failures.contains_key(&canceled_identity));
+        drop(work);
+        assert!(canceled.wait_for_tokens().unwrap().is_none());
     }
 
     #[test]
@@ -1041,20 +935,19 @@ mod tests {
         let first = scope.reserve(Some(&[0])).unwrap();
         let reservation = scope.reserve(Some(&[0])).unwrap();
         let submission = Arc::clone(&reservation.submission);
+        let identity = reservation.identity;
         first.publish(Err(Arc::from("predecessor publication failed")), &ExecutionFence::new(Vec::new()));
 
         let poisoned = catch_unwind(|| {
             let _publication = submission.publication.lock().unwrap();
-            let _completion = submission.completion.result.lock().unwrap();
+            let _work = scope.work.lock();
             panic!("poison cancellation state");
         });
         assert!(poisoned.is_err());
         assert!(submission.publication.is_poisoned());
-        assert!(submission.completion.result.is_poisoned());
 
         thread::scope(|threads| {
             let (sender, receiver) = channel();
-            let publication_started = sender.clone();
             let publication = &submission.publication;
             let publication_ready = &submission.publication_ready;
             threads.spawn(move || {
@@ -1062,22 +955,20 @@ mod tests {
                     publication,
                     publication_ready,
                     |publication| matches!(publication, EffectTokenPublication::Pending),
-                    publication_started,
+                    sender,
                 );
             });
-            let completion = &submission.completion;
-            threads
-                .spawn(move || wait_for_cancellation(&completion.result, &completion.ready, Option::is_none, sender));
-            let first_started = receiver.recv_timeout(CALLBACK_TIMEOUT);
-            let second_started = receiver.recv_timeout(CALLBACK_TIMEOUT);
+            let started = receiver.recv_timeout(CALLBACK_TIMEOUT);
 
-            // Cancel after both waiters have reached their pending state.
+            // Cancel after the waiter has reached its pending state.
             drop(reservation);
-            assert_eq!(first_started, Ok(()));
-            assert_eq!(second_started, Ok(()));
+            assert_eq!(started, Ok(()));
         });
 
-        assert_eq!(submission.completion.wait(), Ok(()));
+        // Cancellation completed the reservation in the tracker, whose mutex the panic had poisoned as well.
+        let work = scope.work.wait(identity + 1);
+        assert!(!work.failures.contains_key(&identity));
+        drop(work);
         assert!(matches!(
             submission.wait_for_tokens(),
             Err(reason) if reason.as_ref() == "predecessor publication failed",
@@ -1139,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn test_effect_submission_drop_releases_long_cancelled_chain() {
+    fn test_effect_submission_drop_releases_long_canceled_chain() {
         let scope = EffectScope::default();
         let first = scope.reserve(Some(&[0])).unwrap();
         let head = Arc::downgrade(&first.submission);

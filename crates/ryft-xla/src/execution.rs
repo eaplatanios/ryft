@@ -97,6 +97,17 @@ pub enum ExecutionError {
     #[error("asynchronous XLA execution failed: {reason}")]
     AsynchronousFailure { reason: Arc<str> },
 
+    /// Session synchronization observed failed executions or transfers in registration order.
+    #[error(
+        "session work failed: {}",
+        .failures
+            .iter()
+            .map(|(identity, error)| format!("submission {identity}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )]
+    SynchronizationFailures { failures: Vec<(u64, Error)> },
+
     /// An effect barrier observed failed submissions, retaining their reservation order and diagnostics.
     #[error(
         "{}; call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` to recover \
@@ -1105,6 +1116,7 @@ impl Session {
             }
         }
         let devices = ordered.then_some(arguments.addressable_device_ids());
+        let mut work = self.reserve_work();
         let reservation = if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
         if let Some(reservation) = &reservation
             && ordered
@@ -1160,6 +1172,7 @@ impl Session {
             .executable()
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, None, None, None, &[])?
             .into_parts();
+        work.track_fence(fence.clone());
         // The fence releases the context before it reports readiness, and the session releases these leases only after
         // that, so pointees of the context's user data outlive native context destruction.
         self.runtimes().retain(&fence, retained_resources);
@@ -1167,13 +1180,18 @@ impl Session {
         after_submission(&fence);
         let output_count = program.signature().physical_output_count();
         debug_assert_eq!(array_output_count, program.signature().array_output_count());
-        let invalid_count = device_outputs
+        let invalid_outputs = device_outputs
             .iter()
             .find(|outputs| outputs.outputs.len() != output_count)
-            .map(|outputs| outputs.outputs.len());
+            .map(|outputs| format!("expected {output_count} output(s) per device, but got {}", outputs.outputs.len()));
+        let boundary_error = invalid_outputs.as_ref().map(|message| {
+            let error = Error::Pjrt(ryft_pjrt::Error::invalid_argument(message.clone()));
+            work.track_error(error.clone());
+            error
+        });
         if let Some(reservation) = reservation {
-            let tokens = if let Some(actual) = invalid_count {
-                Err(Arc::from(format!("expected {output_count} output(s) per device, but got {actual}")))
+            let tokens = if let Some(message) = invalid_outputs {
+                Err(Arc::from(message))
             } else if ordered {
                 Ok(Some(
                     device_outputs
@@ -1188,10 +1206,8 @@ impl Session {
             };
             reservation.publish(tokens, &fence);
         }
-        if let Some(actual) = invalid_count {
-            return Err(Error::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
-                "expected {output_count} output(s) per device, but got {actual}",
-            ))));
+        if let Some(error) = boundary_error {
+            return Err(error);
         }
 
         #[cfg(test)]

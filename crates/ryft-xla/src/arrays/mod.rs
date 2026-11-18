@@ -534,6 +534,7 @@ impl Array {
             .filter(|(_, axis)| summed_axes.contains(axis.name()))
             .map(|(axis_index, _)| axis_index)
             .collect::<Vec<_>>();
+        let mut work = session.reserve_work();
         let mut addressable_buffers = Vec::new();
         for shard in layout.descriptors() {
             let shard_device = shard.device();
@@ -564,25 +565,18 @@ impl Array {
             let zero_summand = mesh
                 .device_coordinates(shard.index())
                 .is_some_and(|coordinates| unreduced_axis_indices.iter().any(|&axis| coordinates[axis] != 0));
-            if zero_summand {
+            let uploaded = if zero_summand {
                 let byte_count = ArrayType::new(data_type, shard_shape.clone().into()).size_in_bytes()?;
-                addressable_buffers.push(client.buffer(
+                client.buffer(
                     Arc::<[u8]>::from(vec![0u8; byte_count]),
                     buffer_type,
                     shard_dimensions.as_slice(),
                     None,
                     memory,
                     device_layout.clone(),
-                )?);
+                )?
             } else if shard_slice.is_empty() {
-                addressable_buffers.push(client.buffer(
-                    buffer,
-                    buffer_type,
-                    shard_dimensions.as_slice(),
-                    None,
-                    memory,
-                    device_layout.clone(),
-                )?);
+                client.buffer(buffer, buffer_type, shard_dimensions.as_slice(), None, memory, device_layout.clone())?
             } else {
                 // Compute row-major strides in units of elements so that each shard slice can be translated
                 // into flat element offsets in the full dense host buffer.
@@ -650,15 +644,17 @@ impl Array {
 
                 // Transfer the shard from the original host buffer. For strided shards, the slice starts at the shard's
                 // first element and spans the full byte window that the stride metadata can address.
-                addressable_buffers.push(client.buffer(
+                client.buffer(
                     &buffer[start_byte_offset..end_byte_offset],
                     buffer_type,
                     shard_dimensions.as_slice(),
                     byte_strides.as_deref(),
                     memory,
                     device_layout.clone(),
-                )?);
-            }
+                )?
+            };
+            work.track_buffer(&uploaded);
+            addressable_buffers.push(uploaded);
         }
 
         // Reuse the buffer constructor for final buffer validation and global sharding metadata assembly.
@@ -750,10 +746,13 @@ impl Array {
 
         let buffer_type = Self::physical_buffer_type(data_type);
         let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
+        let mut work = session.reserve_work();
         let mut buffers = Vec::with_capacity(uploads.len());
         for (bytes, shape, memory) in uploads {
             let dimensions = shape.as_slice().iter().map(|&extent| extent as u64).collect::<Vec<_>>();
-            buffers.push(client.buffer(bytes, buffer_type, dimensions, None, memory, device_layout.clone())?);
+            let buffer = client.buffer(bytes, buffer_type, dimensions, None, memory, device_layout.clone())?;
+            work.track_buffer(&buffer);
+            buffers.push(buffer);
         }
         Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)
     }
@@ -797,6 +796,7 @@ impl Array {
         }
 
         // Every device holds at most one shard, and the shards on devices of other processes get no buffer.
+        let mut work = session.reserve_work();
         let mut buffers = Vec::new();
         for descriptor in descriptors {
             let Some(device) = devices.remove(&descriptor.device().id()) else {
@@ -806,14 +806,16 @@ impl Array {
             let element_count = Shape::from(&shard_shape).element_count()?.unwrap();
             let bytes = element.repeat(element_count);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            buffers.push(client.buffer(
+            let buffer = client.buffer(
                 bytes.as_slice(),
                 Self::physical_buffer_type(data_type),
                 dimensions.as_slice(),
                 None,
                 device,
                 None,
-            )?);
+            )?;
+            work.track_buffer(&buffer);
+            buffers.push(buffer);
         }
         Self::from_canonical_addressable_buffers(session, r#type, None, mesh, buffers)
     }
@@ -1564,7 +1566,7 @@ impl WhilePredicate for Array {
             addressable_count += 1;
             if !any {
                 let bytes = shard
-                    .copy_to_host()
+                    .copy_to_host_internal(Some(self.session()))
                     .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
                 any = bytes.iter().any(|byte| *byte != 0);
             }
@@ -1920,6 +1922,11 @@ impl ArrayShard {
     /// Returns [`ArrayError::MissingShardBuffer`] when this shard lives in another process. PJRT transfer failures
     /// are returned unchanged.
     pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
+        self.copy_to_host_internal(None)
+    }
+
+    /// Copies this shard, tracking the transfer when the caller has its owning session.
+    fn copy_to_host_internal(&self, session: Option<&Session>) -> Result<Vec<u8>, Error> {
         let buffer = match &self.storage {
             ArrayShardStorage::Buffer(buffer) => buffer,
             ArrayShardStorage::Zero => return Ok(Vec::new()),
@@ -1939,7 +1946,13 @@ impl ArrayShard {
         }
 
         // Request row-major bytes explicitly, because the device buffer may have another physical layout.
-        Ok(buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?.r#await()?)
+        let mut work = session.map(Session::reserve_work);
+        let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
+        let bytes = match &mut work {
+            Some(work) => work.track_host_copy(copy).wait(),
+            None => copy.r#await(),
+        }?;
+        Ok(bytes)
     }
 
     /// Compares this shard's storage identity with `other`.
@@ -2486,36 +2499,33 @@ mod tests {
     fn test_array_from_addressable_buffers() {
         let client = cpu_client(2);
         let session = session_with_client(client);
-        let mesh = domain_mesh(client, "x", 2);
+        let devices = client.addressable_devices().unwrap();
+        let mesh = domain_mesh(client, "x", devices.len());
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let devices = client.addressable_devices().unwrap();
         let bytes = values_to_bytes(&[1.0f32, 2.0]);
         let upload = |device| client.buffer(bytes.as_slice(), BufferType::F32, [2u64], None, device, None).unwrap();
 
-        let buffer = upload(devices[0].clone());
-        let array =
-            Array::from_addressable_buffers(&session, array_type.clone(), mesh.clone(), None, vec![buffer]).unwrap();
-        assert_eq!(array.shape(), StaticShape::new(vec![2]));
-        assert_eq!(array.data_type(), DataType::F32);
-        assert_eq!(array.sharding(), &sharding);
-        assert_eq!(array.shards().len(), 2);
-        assert_eq!(array.addressable_shards().count(), 1);
-        assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2])));
-
-        let buffers = devices.iter().cloned().map(&upload).collect();
-        let array = Array::from_addressable_buffers(&session, array_type.clone(), mesh.clone(), None, buffers).unwrap();
-        assert_eq!(array.sharding(), &sharding);
-        assert_eq!(
-            array.addressable_shards().map(|shard| shard.copy_to_host().unwrap()).collect::<Vec<_>>(),
-            vec![bytes.clone(), bytes.clone()],
-        );
+        // The full replicated layout is present even when some or all buffers are absent.
+        for buffer_count in 0..=devices.len() {
+            let buffers = devices.iter().take(buffer_count).cloned().map(&upload).collect();
+            let array =
+                Array::from_addressable_buffers(&session, array_type.clone(), mesh.clone(), None, buffers).unwrap();
+            assert_eq!(array.shape(), StaticShape::new(vec![2]));
+            assert_eq!(array.data_type(), DataType::F32);
+            assert_eq!(array.sharding(), &sharding);
+            assert_eq!(array.shards().len(), devices.len());
+            assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2])));
+            assert_eq!(
+                array.addressable_shards().map(|shard| shard.copy_to_host().unwrap()).collect::<Vec<_>>(),
+                vec![bytes.clone(); buffer_count],
+            );
+        }
 
         // Replication requires each buffer to hold the full logical value.
         let global_type = ArrayType::new_static(DataType::F32, [4]);
         let buffers = devices.into_iter().map(upload).collect();
-        let error =
-            Array::from_addressable_buffers(&session, global_type.clone(), mesh, None, buffers).unwrap_err();
+        let error = Array::from_addressable_buffers(&session, global_type.clone(), mesh, None, buffers).unwrap_err();
         assert!(matches!(
             &error,
             Error::Array(error) if matches!(
@@ -2524,24 +2534,6 @@ mod tests {
             ),
         ));
         assert_eq!(error.to_string(), format!("buffer has type `{array_type}`, but expected `{global_type}`"));
-    }
-
-    #[test]
-    fn test_array_from_addressable_buffers_without_local_buffers() {
-        let client = cpu_client(1);
-        let session = session_with_client(client);
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![Device::new(0, 1)],
-        )
-        .unwrap();
-        let array_type = ArrayType::new_static(DataType::F32, [8]);
-
-        let array = Array::from_addressable_buffers(&session, array_type, mesh.clone(), None, Vec::new()).unwrap();
-        assert_eq!(array.sharding(), &Sharding::replicated(mesh.logical_mesh().clone(), 1));
-        assert_eq!(array.shards().len(), 1);
-        assert_eq!(array.shards()[0].shape(), StaticShape::new(vec![8]));
-        assert_eq!(array.addressable_shards().count(), 0);
     }
 
     #[test]

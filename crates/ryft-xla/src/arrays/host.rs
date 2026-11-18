@@ -11,9 +11,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{ArrayType, DataType, Layout, ProgramError, StaticShape, Typed, UnreducedKind};
-use ryft_pjrt::{DeviceId, Event, ExecutionFence, HostDestination, HostDestinationSlice};
+use ryft_pjrt::{DeviceId, ExecutionFence, HostDestination, HostDestinationSlice};
 
 use crate::arrays::{Array, ArrayError, ArrayShard, ArrayTypeExtension, ShardIndex};
+use crate::sessions::synchronization::HostCopy;
 use crate::{Error, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
@@ -69,7 +70,7 @@ impl DenseArrayHostCopy {
             DenseShardHostCopies::Direct { destination, copies } => {
                 // Every slice is dropped once its copy completes, which makes the destination's bytes accessible.
                 for copy in copies {
-                    drop(copy.r#await()?);
+                    drop(copy.wait()?);
                 }
                 let bytes = destination.into_bytes().ok().unwrap();
                 return Ok((bytes, false));
@@ -79,14 +80,14 @@ impl DenseArrayHostCopy {
             .into_iter()
             .map(|shard| {
                 let PendingDenseShardHostCopy {
-                    event,
+                    copy,
                     shard_index,
                     device_id,
                     expected_byte_count,
                     slices,
                     unreduced_coordinates,
                 } = shard;
-                let bytes = event.r#await()?;
+                let bytes = copy.wait()?;
                 if bytes.len() != expected_byte_count {
                     return Err(Error::from(ArrayError::ShardByteCountMismatch {
                         shard_index,
@@ -203,6 +204,7 @@ impl Array {
             }
         };
         let unreduced_kind = self.sharding().unreduced_kind();
+        let mut work = self.session().reserve_work();
 
         // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile
         // suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only the
@@ -232,7 +234,8 @@ impl Array {
                     .zip(slices)
                     .map(|((shard, _), slice)| {
                         let layout = ryft_pjrt::Layout::dense_major_to_minor(shard.shape().rank());
-                        Ok(shard.buffer().unwrap().copy_to_host_buffer(Some(layout), slice)?)
+                        let event = shard.buffer().unwrap().copy_to_host_buffer(Some(layout), slice)?;
+                        Ok(work.track_host_copy(event))
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let shards = DenseShardHostCopies::Direct { destination, copies };
@@ -254,9 +257,10 @@ impl Array {
                 let shard_index = shard.index();
                 let buffer = shard.buffer().map(|buffer| buffer.as_ref()).unwrap();
                 let shard_shape = shard.shape();
+                // The merge consumes row-major bytes even when the device buffer has another physical layout.
+                let event = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?;
                 Ok(PendingDenseShardHostCopy {
-                    // The merge consumes row-major bytes even when the device buffer has another physical layout.
-                    event: buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?,
+                    copy: work.track_host_copy(event),
                     shard_index,
                     device_id: device.id(),
                     expected_byte_count: ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?,
@@ -282,6 +286,7 @@ impl Array {
         let device_layout = layout.to_pjrt()?;
         let buffer_type = Array::physical_buffer_type(self.data_type());
         let client = session.client();
+        let mut work = session.reserve_work();
         let mut buffers = Vec::new();
         for shard in self.addressable_shards() {
             let shard_index = shard.index();
@@ -289,16 +294,19 @@ impl Array {
                 Error::from(ArrayError::MissingShardBuffer { shard_index, device_id: shard.device().id() })
             })?;
             let shape = shard.shape();
-            let bytes = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?.r#await()?;
+            let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
+            let bytes = work.track_host_copy(copy).wait()?;
             let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            buffers.push(client.buffer(
+            let uploaded = client.buffer(
                 Arc::<[u8]>::from(bytes),
                 buffer_type,
                 dimensions.as_slice(),
                 None,
                 buffer.memory()?,
                 Some(device_layout.clone()),
-            )?);
+            )?;
+            work.track_buffer(&uploaded);
+            buffers.push(uploaded);
         }
         Array::from_addressable_buffers(session, r#type, self.mesh().clone(), Some(self.sharding().clone()), buffers)
     }
@@ -325,8 +333,8 @@ impl Array {
 
 /// One in-flight device-to-host shard copy and the metadata needed to merge it.
 struct PendingDenseShardHostCopy {
-    /// Completion event carrying the copied shard bytes.
-    event: Event<Vec<u8>>,
+    /// Tracked copy carrying the shard bytes.
+    copy: HostCopy<Vec<u8>>,
 
     /// Stable global shard index used in diagnostics.
     shard_index: ShardIndex,
@@ -356,7 +364,7 @@ enum DenseShardHostCopies {
     /// Copies of one shard per distinct tile of the array directly into the range of `destination` that the tile
     /// occupies in the dense representation of the array, which needs neither per-shard buffers nor a merge (refer to
     /// [`contiguous_tile_byte_range`] for when this applies).
-    Direct { destination: HostDestination, copies: Vec<Event<HostDestinationSlice>> },
+    Direct { destination: HostDestination, copies: Vec<HostCopy<HostDestinationSlice>> },
 }
 
 /// Returns row-major element strides for `global_shape`. `strides[i]` is the number of logical elements skipped when

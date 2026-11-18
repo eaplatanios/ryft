@@ -67,10 +67,11 @@
 //! uses the invoking session's scope. Mutable references also retain their own coordination across calls, based on
 //! their identities.
 //!
-//! Array readiness observes completion of the work that produced that array. [`Session::effects_barrier`] observes
-//! previously submitted effects, including work whose outputs were discarded. Call it before the process exits when
-//! those effects must be observed. The client of a session lives for the rest of the process, as in JAX, so sessions
-//! and their values carry no lifetime and can be stored and moved across threads freely.
+//! Array readiness observes completion of the work that produced that array. [`Session::synchronize`] waits for
+//! computations and transfers across the session's handles, including work whose outputs were discarded.
+//! [`Session::effects_barrier`] observes and reports effects in the calling handle's scope for recovery with
+//! [`Session::acknowledge_effect_errors`]. The client of a session lives for the rest of the process, as in JAX,
+//! so sessions and their values carry no lifetime and can be stored and moved across threads freely.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -102,6 +103,7 @@ use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
+use crate::sessions::synchronization::{WorkReservation, WorkTracker};
 use crate::{
     Array, ArrayError, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LowerableOperation,
     Operation, Options, ProgramBuilder, Value,
@@ -110,6 +112,7 @@ use crate::{
 pub mod effects;
 pub mod platforms;
 pub mod runtimes;
+pub(crate) mod synchronization;
 pub mod targets;
 
 pub use platforms::Platform;
@@ -388,6 +391,34 @@ impl Session {
     /// handoff with [`EffectReservation::publish`]. Dropping the reservation before handoff cancels it.
     pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
         self.effect_scope.reserve(devices)
+    }
+
+    /// Registers work with the session before enqueuing it. The reservation publishes any attached work on drop.
+    pub(crate) fn reserve_work(&self) -> WorkReservation {
+        self.state.work.reserve()
+    }
+
+    /// Blocks until the work registered with this session when the call takes its snapshot has finished. This
+    /// includes compiled executions and array transfers that Ryft issues on the calling process, across all
+    /// handles of the session, including handles with independent effect scopes. Later registrations are handled
+    /// by a subsequent synchronization. Cross-host transfers may still need another process to issue a matching
+    /// operation. Independently built sessions have their own tracker even when they use the same PJRT client.
+    /// Direct PJRT submissions, imported buffer readiness, and standalone shard readbacks use their own completion
+    /// APIs.
+    ///
+    /// Use this function to wait for a batch of submissions or before shutting down the session. Recover from an
+    /// ordered I/O failure with [`Self::effects_barrier`] and [`Self::acknowledge_effect_errors`] on the affected scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SynchronizationFailures`](crate::ExecutionError::SynchronizationFailures) in registration order
+    /// after waiting for the snapshot. A failed launch or batch of copies contributes one error, including a failure
+    /// to obtain a transfer's ready event. Synchronization reports each recorded failure once across the session's
+    /// handles. Effect barriers and execution outputs retain their own results. Returns
+    /// [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
+    pub fn synchronize(&self) -> Result<(), Error> {
+        ensure_effect_dispatch_is_allowed()?;
+        self.state.work.synchronize()
     }
 
     /// Waits for the executions already reserved in this handle's effect scope to finish or be canceled. This
@@ -1308,6 +1339,7 @@ impl SessionBuilder {
                 compilation_cache,
                 eager_dispatch_cache: SpecializationCache::new(self.eager_dispatch_cache_capacity),
                 runtimes: RuntimeRegistry::new(client, self.runtime_extensions),
+                work: Arc::new(WorkTracker::default()),
             }),
             mesh: None,
             effect_scope: Arc::new(EffectScope::default()),
@@ -1457,6 +1489,9 @@ struct SessionState {
 
     /// Runtime extensions associated with the client, and ownership of launches borrowing their resources.
     runtimes: RuntimeRegistry,
+
+    /// Pending work and synchronization failures shared by all handles of the session.
+    work: Arc<WorkTracker<(), Error>>,
 }
 
 /// Compiled program that the eager dispatch cache retains for one [`EagerDispatchKey`].
@@ -1994,6 +2029,51 @@ pub(crate) mod tests {
             Err(Error::Core(error))
                 if *error == CoreError::Sharding(ShardingError::DeviceCountMismatch { expected: 8, actual: 4 }),
         ));
+    }
+
+    #[test]
+    fn test_session_synchronize() {
+        let client = execution_client();
+        let session = session_with_client(client);
+        let other = session_with_client(client);
+        let scope = session.with_new_effect_scope();
+        let ready = ExecutionFence::new(Vec::new());
+        let mut work = scope.reserve_work();
+        let reservation = scope.reserve_effects(Some(&[0])).unwrap();
+        work.track_fence(ready.clone());
+        work.track_error(ryft_pjrt::Error::invalid_argument("effect outputs invalid").into());
+        reservation.publish(Err(Arc::from("effect outputs invalid")), &ready);
+        drop(work);
+
+        // Synchronization spans all handles of one session, even when another session uses the same PJRT client.
+        other.synchronize().unwrap();
+        assert!(matches!(
+            session.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(0, Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))]
+                    if message == "effect outputs invalid"),
+        ));
+        scope.synchronize().unwrap();
+
+        // The session report leaves it to this scope's barrier to observe the failure before acknowledgment.
+        session.effects_barrier().unwrap();
+        assert!(matches!(
+            scope.acknowledge_effect_errors(),
+            Err(Error::Execution(ExecutionError::PrematureAcknowledgment)),
+        ));
+        assert!(
+            matches!(scope.reserve_effects(Some(&[0])), Err(Error::Execution(ExecutionError::ScopeNeedsRecovery)),)
+        );
+        assert!(matches!(
+            scope.effects_barrier(),
+            Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                if failures == vec![(0, Arc::from("effect outputs invalid"))],
+        ));
+        scope.acknowledge_effect_errors().unwrap();
+        assert!(scope.reserve_effects(Some(&[1])).unwrap().wait_for_predecessor_tokens().unwrap().is_none());
+
+        let _callback = EffectCallbackGuard::enter();
+        assert!(matches!(session.synchronize(), Err(Error::Execution(ExecutionError::ReentrantDispatch))));
     }
 
     #[test]
