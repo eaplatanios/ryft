@@ -11,7 +11,6 @@ use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiUserData};
 use ryft_pjrt::{Client, ExecutionContext, ExecutionFence};
 
 use crate::Error;
-use crate::sessions::targets::Target;
 
 /// Represents errors produced while declaring [`RuntimeRequirement`]s, configuring [`RuntimeExtensions`], initializing
 /// a [`RuntimeExtension`], or attaching native user data to [`ExecutionResources`]. Runtime APIs return these errors
@@ -234,15 +233,11 @@ impl CustomCallOperationExtension for CustomCallOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Factory for one named runtime contract, configured before a session is constructed.
-///
-/// Initialization receives the invoking client's target. Providers must validate their settings, the requested ABI,
-/// and the target's native capabilities before returning an instance. Instances must not retain an owning session
-/// handle.
-/// Reentry into an unfinished initializer is rejected. A nested initialization also cannot wait for another thread's
-/// initializer in the same session, which prevents dependency cycles between concurrent providers.
+/// Factory for one named runtime contract, configured before a session is constructed. Providers use the invoking
+/// client to validate their settings, the requested ABI, and the client's native capabilities before returning an
+/// instance. Instances must not retain an owning session handle. Reentry into an unfinished initializer is rejected.
+/// A nested initialization also cannot wait for another thread's initializer in the same session, which prevents
+/// dependency cycles between concurrent providers.
 ///
 /// Providers register native types with explicit IDs from [`FfiTypeId::from_name`] and handlers through PJRT during
 /// initialization. Type registration is idempotent, and XLA accepts re-registration of an identical handler. Each
@@ -250,25 +245,26 @@ impl CustomCallOperationExtension for CustomCallOperation {
 /// handlers look up their user data with the same constant ID.
 ///
 /// Providers and extensions own their state, and they may hold the client, which lives for the rest of the process.
-/// For example, a downstream
-/// crate can add a contract that only registers native handlers alongside the built-in providers and annotate its
-/// custom calls with the same requirement.
+/// For example, a downstream crate can add a contract that only registers native handlers alongside the built-in
+/// providers and annotate its custom calls with the same requirement.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use std::sync::Arc;
+/// # use std::sync::Arc;
+/// #
+/// # use ryft_core::CustomCallOperation;
+/// # use ryft_pjrt::Client;
+/// # use ryft_xla::sessions::{
+/// #     CustomCallOperationExtension, RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement,
+/// # };
+/// # use ryft_xla::{Error, RuntimeError, Session};
 ///
-/// use ryft_core::CustomCallOperation;
-/// use ryft_pjrt::Client;
-/// use ryft_xla::sessions::{
-///     CustomCallOperationExtension, RuntimeExtension, RuntimeExtensions, RuntimeProvider, RuntimeRequirement,
-/// };
-/// use ryft_xla::{Error, RuntimeError, Session, Target};
+/// struct Runtime { client: &'static Client<'static> }
+///
+/// impl RuntimeExtension for Runtime {}
 ///
 /// struct Provider;
-/// struct Runtime { client: &'static Client<'static> }
-/// impl RuntimeExtension for Runtime {}
 ///
 /// impl RuntimeProvider for Provider {
 ///     fn identifier(&self) -> &str { "example.runtime" }
@@ -276,7 +272,6 @@ impl CustomCallOperationExtension for CustomCallOperation {
 ///     fn initialize(
 ///         &self,
 ///         client: &'static Client<'static>,
-///         target: &Target,
 ///         requirement: &RuntimeRequirement,
 ///     ) -> Result<Arc<dyn RuntimeExtension>, Error> {
 ///         if requirement.abi_version() != 1 {
@@ -284,7 +279,8 @@ impl CustomCallOperationExtension for CustomCallOperation {
 ///                 identifier: self.identifier().into(), version: requirement.abi_version(),
 ///             }.into());
 ///         }
-///         // Validate configuration and target capabilities, then register this contract's native handlers here.
+///
+///         // Validate provider settings and client capabilities, then register this contract's native handlers here.
 ///         Ok(Arc::new(Runtime { client }))
 ///     }
 /// }
@@ -293,12 +289,13 @@ impl CustomCallOperationExtension for CustomCallOperation {
 ///     let providers = RuntimeExtensions::new().with_provider(Arc::new(Provider))?;
 ///     let requirement = RuntimeRequirement::new("example.runtime", 1)?;
 ///     let operation = CustomCallOperation::new("example.call", vec![]).with_runtime_requirements([requirement])?;
+///
 ///     // Apply `operation` in the staged program. XLA consumes its reserved runtime annotation during lowering.
 ///     Session::builder().client(client).runtime_extensions(providers).build()
 /// }
 /// ```
 pub trait RuntimeProvider: Send + Sync {
-    /// Returns the contract identifier this provider implements.
+    /// Returns the contract identifier that this provider implements.
     fn identifier(&self) -> &str;
 
     /// Validates and initializes one contract instance associated with `client`. A failed initialization may be
@@ -307,26 +304,25 @@ pub trait RuntimeProvider: Send + Sync {
     fn initialize(
         &self,
         client: &'static Client<'static>,
-        target: &Target,
         requirement: &RuntimeRequirement,
     ) -> Result<Arc<dyn RuntimeExtension>, Error>;
 }
 
-/// Live extension instance shared by calls through one [`Session`](crate::Session).
-///
-/// The session initializes one instance for each [`RuntimeRequirement`] before it first compiles, loads, or executes
-/// a program that needs the requirement. Later calls reuse the instance. The session keeps its stable allocation
-/// alive until all executions borrowing extension data have completed.
-/// Implementations must synchronize native handler access across devices and threads. Extensions that only register
-/// native handlers may use the default preparation behavior, which does not create an execution context. A runtime
-/// cannot borrow a client that does not live for the rest of the process.
+/// Live extension instance shared by calls through one [`Session`](crate::Session). The session initializes one
+/// instance for each [`RuntimeRequirement`] before it first compiles, loads, or executes a program that needs the
+/// requirement. Later calls reuse the instance. The session keeps its stable allocation alive until all executions
+/// borrowing extension data have completed. Implementations must synchronize native handler access across devices and
+/// threads. Extensions that only register native handlers may use the default preparation behavior, which does not
+/// create an execution context. A runtime cannot borrow a client that does not live for the rest of the process:
 ///
 /// ```compile_fail
-/// use std::sync::Arc;
-/// use ryft_pjrt::Client;
-/// use ryft_xla::sessions::RuntimeExtension;
+/// # use std::sync::Arc;
+/// #
+/// # use ryft_pjrt::Client;
+/// # use ryft_xla::sessions::RuntimeExtension;
 ///
 /// struct BorrowedRuntime<'c>(&'c Client<'c>);
+///
 /// impl<'c> RuntimeExtension for BorrowedRuntime<'c> {}
 ///
 /// fn escaped<'c>(client: Client<'c>) -> Arc<dyn RuntimeExtension + 'c> {
@@ -334,19 +330,97 @@ pub trait RuntimeProvider: Send + Sync {
 /// }
 /// ```
 pub trait RuntimeExtension: Send + Sync {
-    /// Checks the device and participant restrictions of an invocation before native submission.
-    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+    /// Checks device and participant restrictions for the invocation's mesh before native submission.
+    #[inline]
+    fn validate(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
         let _ = (client, mesh);
         Ok(())
     }
 
     /// Attaches invocation data before native submission and retains any additional owners needed through completion.
-    ///
     /// The session calls this method on each required extension with the same [`ExecutionResources`] for the
     /// invocation.
+    #[inline]
     fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
         let _ = resources;
         Ok(())
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Invocation data and owners prepared before one native submission.
+///
+/// Retain stable allocations such as `Arc<T>` before attaching pointers into them. On preparation failure, the context
+/// is destroyed before retained owners. After submission, the session retains owners through the joined fence,
+/// including when outputs are discarded. Extensions contribute to one lazily created execution context. Ordinary
+/// execution and extensions that only register native handlers create no context and introduce no additional
+/// destruction barrier.
+pub struct ExecutionResources {
+    /// Client receiving this invocation's context.
+    client: &'static Client<'static>,
+
+    /// Native context, allocated only when invocation data is first attached. Fields drop in declaration order, so
+    /// this context is destroyed before the retained owners, including when preparation fails.
+    context: Option<ExecutionContext>,
+
+    /// Type identifiers already installed in this invocation.
+    user_data: HashSet<FfiTypeId>,
+
+    /// Additional owners with the same lifetime as the invoking session's client.
+    retained: Vec<Box<dyn RetainedResource>>,
+}
+
+impl ExecutionResources {
+    /// Returns the client receiving the invocation.
+    pub fn client(&self) -> &'static Client<'static> {
+        self.client
+    }
+
+    /// Retains an owner until the whole execution completes. Use a stable allocation such as `Arc` or `Box` when native
+    /// user data points into the retained value, because moving a stack value into this function does not preserve its
+    /// address.
+    pub fn retain<T: 'static + Send + Sync>(&mut self, owner: T) {
+        self.retained.push(Box::new(owner));
+    }
+
+    /// Adds one borrowed native user data binding to this invocation, creating the context lazily.
+    ///
+    /// `data` pairs a native [`FfiTypeId`] with a raw pointer, which the native handlers of this invocation look up by
+    /// that type ID and dereference during execution.
+    ///
+    /// # Safety
+    ///
+    /// Neither the pointer nor its pointee is checked. The pointer must point to a value of the type registered under
+    /// its native type ID and remain stable until completion. Its owner must be this session's runtime instance or be
+    /// retained through [`Self::retain`]. Native handlers may access it concurrently on several devices, so the pointee
+    /// must support those accesses. The function is public so that third-party FFI integrations can attach their own
+    /// data, and its `unsafe` boundary keeps native pointer insertion explicit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::DuplicateUserData`] if this invocation already holds user data for the same type ID, and
+    /// an [`Error`] if the execution context cannot be created or the native insertion fails.
+    pub unsafe fn add_ffi_user_data(&mut self, data: FfiUserData) -> Result<(), Error> {
+        let type_id = data.type_id;
+        if self.user_data.contains(&type_id) {
+            return Err(RuntimeError::DuplicateUserData { type_id: type_id.into() }.into());
+        }
+        if self.context.is_none() {
+            self.context = Some(self.client.execution_context()?);
+        }
+        unsafe { self.context.as_ref().unwrap().add_ffi_user_data(data) }?;
+
+        // The type ID is recorded only after the native insertion succeeds, so that a failed call can be retried.
+        self.user_data.insert(type_id);
+        Ok(())
+    }
+
+    /// Separates native context ownership from the resource lease that the session owns.
+    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources) {
+        let Self { context, retained, .. } = self;
+        let needed = context.is_some() || !retained.is_empty();
+        (context, RetainedExecutionResources { needed, _owners: retained })
     }
 }
 
@@ -425,81 +499,6 @@ impl Debug for RuntimeExtensions {
     }
 }
 
-/// Invocation data and owners prepared before one native submission.
-///
-/// Retain stable allocations such as `Arc<T>` before attaching pointers into them. On preparation failure, the context
-/// is destroyed before retained owners. After submission, the session retains owners through the joined fence,
-/// including when outputs are discarded. Extensions contribute to one lazily created execution context. Ordinary
-/// execution and extensions that only register native handlers create no context and introduce no additional
-/// destruction barrier.
-pub struct ExecutionResources {
-    /// Client receiving this invocation's context.
-    client: &'static Client<'static>,
-
-    /// Native context, allocated only when invocation data is first attached. Fields drop in declaration order, so
-    /// this context is destroyed before the retained owners, including when preparation fails.
-    context: Option<ExecutionContext>,
-
-    /// Type identifiers already installed in this invocation.
-    user_data: HashSet<FfiTypeId>,
-
-    /// Additional owners with the same lifetime as the invoking session's client.
-    retained: Vec<Box<dyn RetainedResource>>,
-}
-
-impl ExecutionResources {
-    /// Returns the client receiving the invocation.
-    pub fn client(&self) -> &'static Client<'static> {
-        self.client
-    }
-
-    /// Retains an owner until the whole execution completes. Use a stable allocation such as `Arc` or `Box` when native
-    /// user data points into the retained value, because moving a stack value into this function does not preserve its
-    /// address.
-    pub fn retain<T: 'static + Send + Sync>(&mut self, owner: T) {
-        self.retained.push(Box::new(owner));
-    }
-
-    /// Adds one borrowed native user data binding to this invocation, creating the context lazily.
-    ///
-    /// `data` pairs a native [`FfiTypeId`] with a raw pointer, which the native handlers of this invocation look up by
-    /// that type ID and dereference during execution.
-    ///
-    /// # Safety
-    ///
-    /// Neither the pointer nor its pointee is checked. The pointer must point to a value of the type registered under
-    /// its native type ID and remain stable until completion. Its owner must be this session's runtime instance or be
-    /// retained through [`Self::retain`]. Native handlers may access it concurrently on several devices, so the pointee
-    /// must support those accesses. The function is public so that third-party FFI integrations can attach their own
-    /// data, and its `unsafe` boundary keeps native pointer insertion explicit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError::DuplicateUserData`] if this invocation already holds user data for the same type ID, and
-    /// an [`Error`] if the execution context cannot be created or the native insertion fails.
-    pub unsafe fn add_ffi_user_data(&mut self, data: FfiUserData) -> Result<(), Error> {
-        let type_id = data.type_id;
-        if self.user_data.contains(&type_id) {
-            return Err(RuntimeError::DuplicateUserData { type_id: type_id.into() }.into());
-        }
-        if self.context.is_none() {
-            self.context = Some(self.client.execution_context()?);
-        }
-        unsafe { self.context.as_ref().unwrap().add_ffi_user_data(data) }?;
-
-        // The type ID is recorded only after the native insertion succeeds, so that a failed call can be retried.
-        self.user_data.insert(type_id);
-        Ok(())
-    }
-
-    /// Separates native context ownership from the resource lease that the session owns.
-    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources) {
-        let Self { context, retained, .. } = self;
-        let needed = context.is_some() || !retained.is_empty();
-        (context, RetainedExecutionResources { needed, _owners: retained })
-    }
-}
-
 /// Invocation ownership retained by the session only when extensions borrow runtime data.
 pub(crate) struct RetainedExecutionResources {
     /// Whether the invocation borrowed data, even if its owner is the session's runtime instance itself.
@@ -553,9 +552,9 @@ impl RuntimeRegistry {
     }
 
     /// Initializes all required providers before native compilation or loading.
-    pub(crate) fn ensure(&self, requirements: &[RuntimeRequirement], target: &Target) -> Result<(), Error> {
+    pub(crate) fn ensure(&self, requirements: &[RuntimeRequirement]) -> Result<(), Error> {
         for requirement in normalize_runtime_requirements(requirements.iter().cloned())? {
-            self.instance(&requirement, target)?;
+            self.instance(&requirement)?;
         }
         Ok(())
     }
@@ -564,14 +563,13 @@ impl RuntimeRegistry {
     pub(crate) fn prepare(
         &self,
         requirements: &[RuntimeRequirement],
-        target: &Target,
         mesh: &DeviceMesh,
     ) -> Result<ExecutionResources, Error> {
         let mut resources =
             ExecutionResources { client: self.client, context: None, user_data: HashSet::new(), retained: Vec::new() };
         for requirement in normalize_runtime_requirements(requirements.iter().cloned())? {
-            let runtime = self.instance(&requirement, target)?;
-            runtime.validate_execution(self.client, mesh)?;
+            let runtime = self.instance(&requirement)?;
+            runtime.validate(self.client, mesh)?;
             runtime.prepare(&mut resources)?;
         }
         Ok(resources)
@@ -605,7 +603,7 @@ impl RuntimeRegistry {
     }
 
     /// Initializes outside registry locks and publishes one stable successful instance.
-    fn instance(&self, requirement: &RuntimeRequirement, target: &Target) -> Result<Arc<dyn RuntimeExtension>, Error> {
+    fn instance(&self, requirement: &RuntimeRequirement) -> Result<Arc<dyn RuntimeExtension>, Error> {
         let provider = self
             .configuration
             .providers
@@ -664,7 +662,7 @@ impl RuntimeRegistry {
         }
         drop(state);
         let mut rollback = InitializationGuard { slot: &slot, active: true };
-        let runtime = provider.initialize(self.client, target, requirement)?;
+        let runtime = provider.initialize(self.client, requirement)?;
         *slot.state.lock().expect("runtime initialization mutex poisoned") =
             Initialization::Ready(Arc::clone(&runtime));
         rollback.active = false;
@@ -789,12 +787,11 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{CustomCallAttribute, CustomCallOperation};
+    use ryft_core::{CustomCallAttribute, CustomCallOperation, DeviceMesh};
     use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiTypeInformation, FfiUserData};
     use ryft_pjrt::{Client, ExecutionFence};
 
     use crate::Error;
-    use crate::sessions::targets::Target;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::execution_client;
 
@@ -832,10 +829,9 @@ mod tests {
         fn initialize(
             &self,
             client: &'static Client<'static>,
-            target: &Target,
             requirement: &RuntimeRequirement,
         ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-            let _ = (client, target, requirement);
+            let _ = (client, requirement);
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.swap(false, Ordering::SeqCst) {
                 return Err(Error::custom(std::io::Error::other("fixture initialization failed")));
@@ -861,8 +857,7 @@ mod tests {
     /// Prepares one single-device invocation without runtime requirements.
     fn prepare_without_requirements(registry: &RuntimeRegistry) -> ExecutionResources {
         let client = registry.client;
-        let target = Target::from_client(client).unwrap();
-        registry.prepare(&[], &target, &domain_mesh(client, "x", 1)).unwrap()
+        registry.prepare(&[], &domain_mesh(client, "x", 1)).unwrap()
     }
 
     #[test]
@@ -1121,34 +1116,32 @@ mod tests {
     #[test]
     fn test_runtime_registry_ensure() {
         let client = execution_client();
-        let target = Target::from_client(client).unwrap();
         let provider = Arc::new(CountingProvider::new("test.provider"));
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let first = RuntimeRegistry::new(client, configuration.clone());
         let second = RuntimeRegistry::new(client, configuration);
         let requirements = [builtin_requirement("test.provider")];
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        first.ensure(&requirements, &target).unwrap();
+        first.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        first.ensure(&requirements, &target).unwrap();
+        first.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        second.ensure(&requirements, &target).unwrap();
+        second.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn test_runtime_registry_ensure_retries_failed_initialization() {
         let client = execution_client();
-        let target = Target::from_client(client).unwrap();
         let provider = Arc::new(CountingProvider::new("test.provider"));
         provider.fail.store(true, Ordering::SeqCst);
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = RuntimeRegistry::new(client, configuration);
         let requirements = [builtin_requirement("test.provider")];
-        let error = registry.ensure(&requirements, &target).unwrap_err();
+        let error = registry.ensure(&requirements).unwrap_err();
         assert_eq!(error.downcast_custom::<std::io::Error>().unwrap().to_string(), "fixture initialization failed",);
-        registry.ensure(&requirements, &target).unwrap();
-        registry.ensure(&requirements, &target).unwrap();
+        registry.ensure(&requirements).unwrap();
+        registry.ensure(&requirements).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1174,10 +1167,9 @@ mod tests {
             fn initialize(
                 &self,
                 client: &'static Client<'static>,
-                target: &Target,
                 requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension>, Error> {
-                let _ = (client, target, requirement);
+                let _ = (client, requirement);
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     self.started.send(()).unwrap();
                     self.publish.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1187,7 +1179,6 @@ mod tests {
         }
 
         let client = execution_client();
-        let target = Arc::new(Target::from_client(client).unwrap());
         let (started, initializing) = mpsc::channel();
         let (publish, permission) = mpsc::channel();
         let provider =
@@ -1197,11 +1188,10 @@ mod tests {
         let start = Arc::new(Barrier::new(2));
         let (finished, completed) = mpsc::channel();
         let spawn = || {
-            let (registry, target, start, finished) =
-                (registry.clone(), target.clone(), start.clone(), finished.clone());
+            let (registry, start, finished) = (registry.clone(), start.clone(), finished.clone());
             thread::spawn(move || {
                 start.wait();
-                finished.send(registry.ensure(&[builtin_requirement("test.concurrent")], &target)).unwrap();
+                finished.send(registry.ensure(&[builtin_requirement("test.concurrent")])).unwrap();
             })
         };
         let first = spawn();
@@ -1236,18 +1226,11 @@ mod tests {
             fn initialize(
                 &self,
                 client: &'static Client<'static>,
-                target: &Target,
                 requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension>, Error> {
                 let _ = client;
                 match self.calls.fetch_add(1, Ordering::SeqCst) {
-                    0 => self
-                        .registry
-                        .get()
-                        .unwrap()
-                        .upgrade()
-                        .unwrap()
-                        .ensure(std::slice::from_ref(requirement), target)?,
+                    0 => self.registry.get().unwrap().upgrade().unwrap().ensure(std::slice::from_ref(requirement))?,
                     1 => panic!("fixture initializer unwound"),
                     _ => {}
                 }
@@ -1256,13 +1239,12 @@ mod tests {
         }
 
         let client = execution_client();
-        let target = Target::from_client(client).unwrap();
         let provider = Arc::new(ReentrantProvider { registry: OnceLock::new(), calls: AtomicUsize::new(0) });
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = Arc::new(RuntimeRegistry::new(client, configuration));
         provider.registry.set(Arc::downgrade(&registry)).unwrap();
         let requirements = [builtin_requirement("test.recursive")];
-        let ensure = || registry.ensure(&requirements, &target);
+        let ensure = || registry.ensure(&requirements);
         // Both a returned error and a panic must release the initialization slot for another attempt.
         assert!(matches!(
             ensure(),
@@ -1303,21 +1285,19 @@ mod tests {
             fn initialize(
                 &self,
                 client: &'static Client<'static>,
-                target: &Target,
                 requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension>, Error> {
                 let _ = (client, requirement);
                 if self.reenter.swap(false, Ordering::SeqCst) {
                     self.started.wait();
                     let registry = self.registry.get().unwrap().upgrade().unwrap();
-                    registry.ensure(&[builtin_requirement(self.dependency)], target)?;
+                    registry.ensure(&[builtin_requirement(self.dependency)])?;
                 }
                 Ok(Arc::new(RegistrationOnlyRuntime))
             }
         }
 
         let client = execution_client();
-        let target = Arc::new(Target::from_client(client).unwrap());
         let started = Arc::new(Barrier::new(2));
         let left = Arc::new(DependentProvider {
             identifier: "test.left",
@@ -1343,9 +1323,9 @@ mod tests {
         right.registry.set(Arc::downgrade(&registry)).unwrap();
         let (finished, completed) = mpsc::channel();
         let spawn = |identifier, dependency| {
-            let (registry, target, finished) = (registry.clone(), target.clone(), finished.clone());
+            let (registry, finished) = (registry.clone(), finished.clone());
             thread::spawn(move || {
-                let result = registry.ensure(&[builtin_requirement(identifier)], &target);
+                let result = registry.ensure(&[builtin_requirement(identifier)]);
                 finished.send((dependency, result)).unwrap();
             })
         };
@@ -1366,9 +1346,7 @@ mod tests {
         left.join().unwrap();
         right.join().unwrap();
         assert!(rejected > 0);
-        registry
-            .ensure(&[builtin_requirement("test.left"), builtin_requirement("test.right")], &target)
-            .unwrap();
+        registry.ensure(&[builtin_requirement("test.left"), builtin_requirement("test.right")]).unwrap();
     }
 
     #[test]
@@ -1376,7 +1354,7 @@ mod tests {
         let client = execution_client();
         let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         assert!(matches!(
-            registry.ensure(&[builtin_requirement("test.missing")], &Target::from_client(client).unwrap()),
+            registry.ensure(&[builtin_requirement("test.missing")]),
             Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing",
         ));
     }
@@ -1384,18 +1362,60 @@ mod tests {
     #[test]
     fn test_runtime_registry_prepare() {
         let client = execution_client();
-        let target = Target::from_client(client).unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let provider = Arc::new(CountingProvider::new("test.provider"));
         let configuration = RuntimeExtensions::empty().with_provider(provider.clone()).unwrap();
         let registry = RuntimeRegistry::new(client, configuration);
         let requirements = [builtin_requirement("test.provider")];
-        let (context, retained) = registry.prepare(&requirements, &target, &mesh).unwrap().into_parts();
+        let (context, retained) = registry.prepare(&requirements, &mesh).unwrap().into_parts();
 
         // A registration-only extension still initializes, but its invocation needs no context or owners.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(context.is_none());
         assert!(!retained.needed);
+    }
+
+    #[test]
+    fn test_runtime_registry_prepare_validates_invocation_mesh() {
+        /// Provider and extension that reject the invocation mesh before preparing launch resources.
+        struct MeshCheckingRuntime;
+
+        impl RuntimeProvider for MeshCheckingRuntime {
+            fn identifier(&self) -> &str {
+                "test.mesh"
+            }
+
+            fn initialize(
+                &self,
+                client: &'static Client<'static>,
+                requirement: &RuntimeRequirement,
+            ) -> Result<Arc<dyn RuntimeExtension>, Error> {
+                let _ = (client, requirement);
+                Ok(Arc::new(Self))
+            }
+        }
+
+        impl RuntimeExtension for MeshCheckingRuntime {
+            fn validate(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+                assert_eq!(mesh, &domain_mesh(client, "invocation", 1));
+                Err(Error::custom(std::io::Error::other("fixture rejected the invocation mesh")))
+            }
+
+            fn prepare(&self, resources: &mut ExecutionResources) -> Result<(), Error> {
+                let _ = resources;
+                panic!("invocation preparation ran after mesh validation failed");
+            }
+        }
+
+        let client = execution_client();
+        let configuration = RuntimeExtensions::empty().with_provider(Arc::new(MeshCheckingRuntime)).unwrap();
+        let registry = RuntimeRegistry::new(client, configuration);
+        let mesh = domain_mesh(client, "invocation", 1);
+        assert!(matches!(
+            registry.prepare(&[builtin_requirement("test.mesh")], &mesh),
+            Err(error) if error.downcast_custom::<std::io::Error>()
+                .is_some_and(|error| error.to_string() == "fixture rejected the invocation mesh"),
+        ));
     }
 
     #[test]
