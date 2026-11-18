@@ -1042,7 +1042,6 @@ mod tests {
         }
         let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
         assert!(tail.wait_for_tokens().unwrap().is_none());
-        scope.barrier().unwrap();
 
         // Release the scope's reference so the retained tail owns the entire chain.
         drop(scope);

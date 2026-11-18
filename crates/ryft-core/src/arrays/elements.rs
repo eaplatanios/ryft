@@ -768,19 +768,8 @@ impl LowPrecisionFloatingPointFormat {
     /// Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate one step
     /// past its largest finite magnitude. Ties choose the even encoding except for exponent-only values, whose
     /// one-bit significand rounds a tie up to the next power of two. Results beyond the finite range follow this
-    /// format's [`LowPrecisionFloatingPointFormatClass`]. Exponent-only values use their special minimum-boundary rule.
+    /// format's [`LowPrecisionFloatingPointFormatClass`].
     fn nearest_bits(self, magnitude: f64, negative: bool) -> u8 {
-        if matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
-            // The minimum exponent is the boundary inherited from an `F32` subnormal. Positive inputs through the
-            // minimum map to it and every input above it but below the next power of two maps to that next power.
-            if magnitude <= self.decode_magnitude(0) {
-                return 0;
-            }
-            if magnitude < self.decode_magnitude(1) {
-                return 1;
-            }
-        }
-
         // An input above the virtual overflow candidate is unambiguously an overflow. Resolving it before the scan
         // also keeps the distance comparisons below meaningful, because the distances from every candidate round to
         // the same value once the input is astronomically larger than this format's whole range.
@@ -830,7 +819,7 @@ impl LowPrecisionFloatingPointFormat {
     /// Encodes the value nearest to `value` in this [`LowPrecisionFloatingPointFormat`], rounding to nearest with
     /// exact ties broken toward the even encoding, or upward for exponent-only values. Special inputs and values whose
     /// rounded result falls beyond the finite range follow the policies of this format's
-    /// [`LowPrecisionFloatingPointFormatClass`], including its special minimum-boundary rule for exponent-only values.
+    /// [`LowPrecisionFloatingPointFormatClass`].
     fn encode(self, value: f64) -> Result<u8, TypeError> {
         let negative = value.is_sign_negative();
         let exponent_only = matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly);
@@ -1001,13 +990,10 @@ pub struct f8e5m2fnuz(u8);
 /// factors of the microscaling formats. The whole storage byte is an eight-bit exponent field with bias 127 and there
 /// are no sign or mantissa bits, so every encoding `e` in `0x00..=0xfe` denotes exactly `2^(e - 127)`, spanning
 /// `2^-127` through `2^127`, and `0xff` is the single NaN. The format has no zero, no negative value, and no infinity,
-/// so [`f8e8m0fnu::MIN`] is the smallest positive value `2^-127` rather than a negative one, zero inputs are rejected
-/// with a [`TypeError`], and negative, infinite, and overflowing inputs convert to NaN. Conversions round to nearest
-/// with exact ties rounded upward: `1.5` rounds to `2`, `3` to `4`, and `6` to `8`. The implicit one-bit significand
-/// carries into the next exponent at a tie; the parity of the encoded exponent does not select the rounding direction.
-/// At the minimum boundary, every positive input at most `2^-127` becomes `2^-127`, and every input strictly between
-/// `2^-127` and `2^-126` becomes `2^-126`. This boundary follows the underlying exponent extraction, rather than the
-/// arithmetic midpoint between these two smallest values.
+/// so [`f8e8m0fnu::MIN`] is the smallest positive value `2^-127`, zero inputs are rejected with a [`TypeError`], and
+/// negative, infinite, and overflowing inputs convert to NaN. Conversions round to nearest. At an exact tie the
+/// implicit one-bit significand carries into the next exponent, so `1.5` rounds to `2`, `3` to `4`, and `6` to `8`.
+/// Positive inputs below the first midpoint `1.5 * 2^-127` round to `2^-127`. The midpoint itself rounds to `2^-126`.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e8m0fnu(u8);
@@ -1039,9 +1025,8 @@ macro_rules! impl_low_precision_floating_point_type {
             }
 
             /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding except
-            /// for [`f8e8m0fnu`], which rounds ties upward and uses the minimum-boundary rule described on its type.
-            /// Returns an error only when this format has no encoding for the input at all, namely a NaN input
-            /// to a microscaling format or a zero input to [`f8e8m0fnu`].
+            /// for [`f8e8m0fnu`], which rounds ties upward. Returns an error only when this format has no encoding for
+            /// the input at all, namely a NaN input to a microscaling format or a zero input to [`f8e8m0fnu`].
             #[inline]
             pub fn from_f32(value: f32) -> Result<Self, TypeError> {
                 // Widening to `f64` is exact, so the `f64` conversion performs the only rounding step.
@@ -1049,9 +1034,8 @@ macro_rules! impl_low_precision_floating_point_type {
             }
 
             /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding except
-            /// for [`f8e8m0fnu`], which rounds ties upward and uses the minimum-boundary rule described on its type.
-            /// Returns an error only when this format has no encoding for the input at all, namely a NaN input to a
-            /// microscaling format or a zero input to [`f8e8m0fnu`].
+            /// for [`f8e8m0fnu`], which rounds ties upward. Returns an error only when this format has no encoding for
+            /// the input at all, namely a NaN input to a microscaling format or a zero input to [`f8e8m0fnu`].
             #[inline]
             pub fn from_f64(value: f64) -> Result<Self, TypeError> {
                 Self::FORMAT.encode(value).map(Self)
@@ -4351,15 +4335,23 @@ mod tests {
         assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_bits), Ok(0x82));
         assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_f64), Ok(8.0));
 
-        // The minimum exponent follows a distinct boundary instead of using the arithmetic midpoint.
+        // The same midpoint rule applies between the two smallest encodings.
         let minimum = 2f64.powi(-127);
+        let midpoint = 1.5 * minimum;
         assert_eq!(f8e8m0fnu::from_f64(minimum / 2.0).map(f8e8m0fnu::to_bits), Ok(0x00));
         assert_eq!(f8e8m0fnu::from_f64(minimum.next_down()).map(f8e8m0fnu::to_bits), Ok(0x00));
         assert_eq!(f8e8m0fnu::from_f64(minimum).map(f8e8m0fnu::to_bits), Ok(0x00));
-        assert_eq!(f8e8m0fnu::from_f64(minimum.next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64(minimum.next_up()).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(midpoint.next_down()).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(midpoint).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64(midpoint.next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
         assert_eq!(f8e8m0fnu::from_f64((minimum * 2.0).next_down()).map(f8e8m0fnu::to_bits), Ok(0x01));
         assert_eq!(f8e8m0fnu::from_f64(minimum * 2.0).map(f8e8m0fnu::to_bits), Ok(0x01));
-        assert_eq!(f8e8m0fnu::from_f32((minimum as f32).next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        let midpoint = midpoint as f32;
+        assert_eq!(f8e8m0fnu::from_f32((minimum as f32).next_up()).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f32(midpoint.next_down()).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f32(midpoint).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f32(midpoint.next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
         assert_eq!(f8e8m0fnu::from_f64(1.5 * 2f64.powi(127)).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f32(1.5).map(f8e8m0fnu::to_bits), Ok(0x80));
 
