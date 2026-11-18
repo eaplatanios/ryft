@@ -381,33 +381,16 @@ impl Session {
         Ok(DeviceMesh::new(logical_mesh, devices)?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Reserves a place in this handle's effect scope before submitting a program with effects to PJRT. The
-    /// reservation is visible to [`Self::effects_barrier`] during submission setup.
-    ///
-    /// See [`EffectScope::reserve`] for device ordering and errors. Before submitting ordered I/O, check for input
-    /// tokens with [`EffectReservation::wait_for_predecessor_tokens`]. Once PJRT accepts the submission, finish the
-    /// handoff with [`EffectReservation::publish`]. Dropping the reservation before handoff cancels it.
-    pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
-        self.effect_scope.reserve(devices)
-    }
-
-    /// Registers work with the session before enqueuing it. The reservation publishes any attached work on drop.
-    pub(crate) fn reserve_work(&self) -> WorkReservation {
-        self.state.work.reserve()
-    }
-
-    /// Blocks until the work registered with this session when the call takes its snapshot has finished. This
-    /// includes compiled executions and array transfers that Ryft issues on the calling process, across all
-    /// handles of the session, including handles with independent effect scopes. Later registrations are handled
-    /// by a subsequent synchronization. Cross-host transfers may still need another process to issue a matching
-    /// operation. Independently built sessions have their own tracker even when they use the same PJRT client.
-    /// Direct PJRT submissions, imported buffer readiness, and standalone shard readbacks use their own completion
-    /// APIs.
+    /// Blocks until the work registered with this session when the call takes its snapshot has finished. This includes
+    /// compiled executions and array transfers that Ryft issues on the calling process, across all handles of the
+    /// session, including handles with independent effect scopes. Later registrations are handled by a subsequent
+    /// synchronization. Cross-host transfers may still need another process to issue a matching operation.
+    /// Independently built sessions have their own tracker even when they use the same PJRT client. Direct PJRT
+    /// submissions, imported buffer readiness, and standalone shard readbacks use their own completion APIs.
     ///
     /// Use this function to wait for a batch of submissions or before shutting down the session. Recover from an
-    /// ordered I/O failure with [`Self::effects_barrier`] and [`Self::acknowledge_effect_errors`] on the affected scope.
+    /// ordered I/O failure with [`Self::effects_barrier`] and [`Self::acknowledge_effect_errors`] on the affected
+    /// scope.
     ///
     /// # Errors
     ///
@@ -416,28 +399,32 @@ impl Session {
     /// to obtain a transfer's ready event. Synchronization reports each recorded failure once across the session's
     /// handles. Effect barriers and execution outputs retain their own results. Returns
     /// [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
+    #[inline]
     pub fn synchronize(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
         self.state.work.synchronize()
     }
 
-    /// Waits for the executions already reserved in this handle's effect scope to finish or be canceled. This
-    /// includes ordered and unordered I/O, local assertions, and submissions still being prepared. Call this
-    /// function before exiting the process or whenever the host needs those effects to finish, even if there are no
-    /// output arrays to wait on. A subsequent barrier covers later reservations. Handles created with
-    /// [`Self::with_new_effect_scope`] have independent barriers.
+    /// Waits for the executions already reserved in this handle's effect scope to finish or be canceled. This includes
+    /// ordered and unordered I/O, local assertions, and submissions still being prepared. Call this function before
+    /// exiting the process or whenever the host needs those effects to finish, even if there are no output arrays to
+    /// wait on. A subsequent barrier covers later reservations. Handles created with [`Self::with_new_effect_scope`]
+    /// have independent barriers.
     ///
     /// If ordered I/O fails, inspect the failures reported by this function, then call
     /// [`Self::acknowledge_effect_errors`] on the same scope before resuming ordered submissions.
     ///
     /// # Errors
     ///
-    /// Returns [`EffectSubmissionFailures`](crate::ExecutionError::EffectSubmissionFailures) with failures in
-    /// reservation order. These failures remain in the scope until acknowledged. Returns
+    /// Returns [`EffectSubmissionFailures`](crate::ExecutionError::EffectSubmissionFailures)
+    /// with failures in reservation order. These failures remain in the scope until acknowledged. Returns
     /// [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
+    #[inline]
     pub fn effects_barrier(&self) -> Result<(), Error> {
         self.effect_scope.barrier()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Clears completed failures from this handle's effect scope after [`Self::effects_barrier`] has reported them.
     /// To recover from an ordered I/O failure, first call the barrier on the same scope and inspect the failures it
@@ -457,8 +444,24 @@ impl Session {
     /// again on the same scope and retry acknowledgment.
     ///
     /// Returns [`ReentrantDispatch`](crate::ExecutionError::ReentrantDispatch) from within a managed effect callback.
+    #[inline]
     pub fn acknowledge_effect_errors(&self) -> Result<(), Error> {
         self.effect_scope.acknowledge()
+    }
+
+    /// Reserves a place in this handle's effect scope before submitting a program with effects to PJRT. The
+    /// reservation is visible to [`Self::effects_barrier`] during submission setup.
+    ///
+    /// See [`EffectScope::reserve`] for device ordering and errors. Before submitting ordered I/O, check for input
+    /// tokens with [`EffectReservation::wait_for_predecessor_tokens`]. Once PJRT accepts the submission, finish the
+    /// handoff with [`EffectReservation::publish`]. Dropping the reservation before handoff cancels it.
+    pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
+        self.effect_scope.reserve(devices)
+    }
+
+    /// Registers work with the session before enqueuing it. The reservation publishes any attached work on drop.
+    pub(crate) fn reserve_work(&self) -> WorkReservation {
+        self.state.work.reserve()
     }
 
     /// Returns a new [`Array`] that belongs to this handle and shares the storage that `constant` retains.
