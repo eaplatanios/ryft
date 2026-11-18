@@ -86,8 +86,6 @@ impl EffectScope {
         Ok(EffectReservation { submission, predecessor, committed: false })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Takes a snapshot of the scope's current reservations, then waits for each one to finish or be cancelled.
     /// This includes reservations still preparing device work. Later reservations are handled by a subsequent
     /// barrier. Reported failures remain in the scope until [`Self::acknowledge`] clears them.
@@ -98,6 +96,7 @@ impl EffectScope {
     /// order. Returns [`ExecutionError::ReentrantDispatch`] from within a managed effect callback.
     pub(super) fn barrier(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
+
         let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
         let mut failures = Vec::new();
         let mut successful = HashSet::new();
@@ -110,13 +109,12 @@ impl EffectScope {
             }
         }
 
-        {
-            let mut state = self.state.lock().expect("effect scope mutex poisoned");
-            state.observed.extend(failures.iter().map(|(identity, _)| *identity));
+        let mut state = self.state.lock().expect("effect scope mutex poisoned");
+        state.observed.extend(failures.iter().map(|(identity, _)| *identity));
+        state.submissions.retain(|submission| !successful.contains(&submission.identity));
 
-            // The snapshot retains each removed submission until after the scope mutex is released.
-            state.submissions.retain(|submission| !successful.contains(&submission.identity));
-        }
+        // Unlock before dropping the snapshot, which still holds the removed submissions and their token buffers.
+        drop(state);
 
         if failures.is_empty() {
             return Ok(());
@@ -136,39 +134,50 @@ impl EffectScope {
     /// [`ExecutionError::ReentrantDispatch`] from within a managed effect callback.
     pub(super) fn acknowledge(&self) -> Result<(), Error> {
         ensure_effect_dispatch_is_allowed()?;
+
         // Keep the former tail and extracted submissions alive past the scope guard.
         let _retired_tail;
         let mut retired = Vec::new();
         let mut state = self.state.lock().expect("effect scope mutex poisoned");
+
         // Callbacks publish independently of the scope mutex. Read each completion exactly once so a failure
         // arriving after validation cannot be discarded by the retirement step below.
-        let completions = state
-            .submissions
-            .iter()
-            .map(|submission| (submission.identity, submission.ordered, submission.completion.result()))
-            .collect::<Vec<_>>();
-        let ordered_failure = completions.iter().any(|(_, ordered, result)| *ordered && matches!(result, Some(Err(_))));
-        if completions.iter().any(|(identity, ordered, result)| {
-            (ordered_failure && *ordered && result.is_none())
-                || (matches!(result, Some(Err(_))) && !state.observed.contains(identity))
-        }) {
+        let mut completed = HashSet::new();
+        let mut ordered_failure = false;
+        let mut ordered_pending = false;
+        let mut unreported_failure = false;
+        for submission in &state.submissions {
+            let Some(result) = submission.completion.result() else {
+                ordered_pending |= submission.ordered;
+                continue;
+            };
+            if result.is_err() {
+                ordered_failure |= submission.ordered;
+                unreported_failure |= !state.observed.contains(&submission.identity);
+            }
+            completed.insert(submission.identity);
+        }
+
+        if unreported_failure || (ordered_failure && ordered_pending) {
             return Err(ExecutionError::PrematureAcknowledgment.into());
         }
-        let completed = completions
-            .iter()
-            .filter_map(|(identity, _, result)| result.as_ref().map(|_| *identity))
-            .collect::<HashSet<_>>();
+
         _retired_tail = if ordered_failure { state.tail.take() } else { None };
         if ordered_failure {
             state.devices = None;
         }
+
         retired.extend(state.submissions.extract_if(.., |submission| completed.contains(&submission.identity)));
         state.observed.clear();
-        // Unlock the scope before freeing the completion snapshot and destroying retired token buffers.
+
+        // Unlock the scope before freeing the completed ID set and destroying retired token buffers/
         drop(state);
+
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Scope metadata protected by the [`EffectScope`]'s mutex. Completion callbacks retain their submission's
 /// [`EffectCompletion`] independently of this state.
