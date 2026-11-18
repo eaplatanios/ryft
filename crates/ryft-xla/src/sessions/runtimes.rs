@@ -437,19 +437,18 @@ pub(crate) struct RetainedExecutionResources {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Immutable provider configuration, independent of initialized session runtime instances.
-///
-/// Supply this configuration to [`SessionBuilder::runtime_extensions`](super::SessionBuilder::runtime_extensions)
-/// before constructing a [`Session`](crate::Session). The session uses these [`RuntimeProvider`]s to initialize its
+/// Immutable provider configuration, independent of initialized session runtime instances. Supply this
+/// configuration to [`SessionBuilder::runtime_extensions`](super::SessionBuilder::runtime_extensions) before
+/// constructing a [`Session`](crate::Session). The session uses these [`RuntimeProvider`]s to initialize its
 /// own [`RuntimeExtension`] instances lazily.
 #[derive(Clone)]
 pub struct RuntimeExtensions {
-    /// Providers keyed by their public contract identifiers.
+    /// [`RuntimeProvider`]s keyed by their public contract identifiers.
     providers: BTreeMap<String, Arc<dyn RuntimeProvider>>,
 }
 
 impl RuntimeExtensions {
-    /// Creates the built-in configuration. Providers are lazy, so this does not load accelerator drivers.
+    /// Creates the built-in [`RuntimeExtensions`]. Providers are lazy, so this does not load accelerator drivers.
     pub fn new() -> Self {
         let mut configuration = Self::empty();
         let mut providers = crate::kernels::runtime_providers();
