@@ -468,16 +468,15 @@ impl Session {
         self.state.work.reserve()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Validates that every input lives on this session's PJRT client and that all inputs share one device placement,
     /// mirroring JAX's incompatible devices diagnostic for compiled computations on the eager path. Every [`Array`]
     /// belongs to a session whose client owns its addressable shard buffers, which is validated at construction, so
-    /// client identity is exact and also rejects arrays with the same device IDs that a *different* client owns.
+    /// client identity is exact and also rejects arrays with the same device IDs that a _different_ client owns.
     fn validate_input_placement(&self, inputs: &[Array]) -> Result<(), ProgramError> {
         if inputs.is_empty() {
             return Ok(());
         }
+
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
         for (index, input) in inputs.iter().enumerate() {
             if !std::ptr::eq(input.client(), self.client()) {
@@ -487,6 +486,7 @@ impl Session {
                 )));
             }
         }
+
         // Arrays produced by the same program, or cloned from one array, share their mesh allocation, so pointer
         // equality settles the common case without comparing devices.
         let first_mesh = inputs[0].mesh();
@@ -497,15 +497,19 @@ impl Session {
                 && !mesh.devices().iter().map(Device::id).eq(first_mesh.devices().iter().map(Device::id))
             {
                 return Err(invalid_argument(format!(
-                    "received incompatible devices for eager XLA execution: input #{index} is placed on devices {:?} \
+                    "received incompatible devices for eager XLA execution: input #{} is placed on devices {:?} \
                      but input #0 is placed on devices {:?}",
+                    index,
                     device_ids(mesh),
                     device_ids(first_mesh),
                 )));
             }
         }
+
         Ok(())
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Resolves the concrete [`DeviceMesh`] for eager execution. The first input's mesh takes precedence over the
     /// mesh configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in
