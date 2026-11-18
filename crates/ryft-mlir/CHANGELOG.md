@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded to the LLVM, StableHLO (v1.25.0), Shardy, and Triton revisions pinned by OpenXLA commit
+- Upgraded to the LLVM, StableHLO (v1.25.3), Shardy, and Triton revisions pinned by OpenXLA commit
   `aaed3e0327d520ee375451ca42dd239ee40a50e6` and JAX commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`.
 - Changed all `OperationBuilder::add_*` functions to return `Result<Self, Error>` and report context mismatches
   immediately. Callers must now handle each addition's result (for example, using `?` in builder chains). A failed
@@ -65,8 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Updated GPU target-attachment passes for LLVM's split native registration families while preserving bulk registration.
 - Made LLVM masked load, store, gather, and scatter alignments optional `i64` attributes. Omitting alignment selects
   the element type's ABI alignment.
-- Updated canonical printer expectations for module visibility, function calls, LLVM operations, and Mosaic GPU
-  properties.
+- Updated canonical printer expectations for module visibility, function calls, LLVM operations, Mosaic GPU
+  properties, and Vector operations.
 - Updated Index, NVVM, NVGPU, and `sparse_tensor` enum attributes to the LLVM enum attribute syntax.
 
 ### Removed

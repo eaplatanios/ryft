@@ -1,0 +1,7 @@
+diff --git a/third_party/triton/workspace.bzl b/third_party/triton/workspace.bzl
+--- a/third_party/triton/workspace.bzl
++++ b/third_party/triton/workspace.bzl
+@@ -77,2 +77,3 @@
+         name = "triton",
++        patch_file = ["@//patches:triton-nvidia-llvm-bit-cast.patch"],
+         sha256 = TRITON_SHA256,

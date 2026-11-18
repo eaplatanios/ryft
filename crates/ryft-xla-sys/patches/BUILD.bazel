@@ -2,9 +2,11 @@ exports_files([
     "jax-mosaic-c-api-visibility.patch",
     "jax-mosaic-gpu-mbarrier-serde.patch",
     "jax-mosaic-gpu-runtime-symbols.patch",
+    "triton-nvidia-llvm-bit-cast.patch",
     "xla-cpu-exp-nan.patch",
     "xla-embedded-constants-target.patch",
     "xla-fp6-nan-predicate.patch",
     "xla-llvm-sharded-op-defs.patch",
+    "xla-triton-nvidia-llvm-bit-cast.patch",
     "xla-xnnpack-integer-min-max.patch",
 ])

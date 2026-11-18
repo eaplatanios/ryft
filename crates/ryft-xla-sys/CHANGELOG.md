@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to commit `9564ca1d3df0d312cad4346458b8d41ce5204ff7`, together with their LLVM, StableHLO, Shardy, and Triton pins.
   Native builds use Bazel 8.8.2, CCCL 3.4.0, and XLA's pinned ROCm 10.1 development distribution. The pinned Triton
   sources require C++20, so Linux builds use the glibc 2.31 sysroot with GCC 10's standard library.
+- Used LLVM's `bit_cast` in the Triton NVIDIA lowering to support the pinned Linux standard library.
 - Limited CUDA Triton output to PTX 9.0 for the qualified CUDA 13.0 assembler.
 - Updated the JAX Mosaic GPU serde pass to compile with the NVVM barrier's new builder signature.
 - Updated the ROCm plugin feature, artifact names, environment variables and path accessor to ROCm 10.

@@ -77,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   FFI state access now rejects both execution and recording stages before calling native code, and invocation
   extensions validate their generic header before exposing borrowed backend data. `FfiHandlerBundle::new` now requires
   a `record` argument, and `GpuCustomCallTypedHandler::new` now requires a `traits` argument.
+- Updated the StableHLO version expectations to 1.25.3 for the new OpenXLA pin.
 - Updated ROCm support to version 10 with the `rocm-10` feature and `load_rocm_10_plugin` loader.
 - Renamed `GpuClientOptions::use_tfrt_gpu_client` to `use_async_dispatch` to reflect upstream's asynchronous host
   dispatch behavior in the Stream Executor client. The serialized native option key remains `use_tfrt_gpu_client`.

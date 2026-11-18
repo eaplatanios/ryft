@@ -760,7 +760,7 @@ pub unsafe fn raw_interleave<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// rendering:
 ///
 /// ```mlir
-/// %res1, %res2 = vector.deinterleave %arg0 : vector<4xf32> -> vector<2xf32>
+/// %resultEven, %resultOdd = vector.deinterleave %arg0 : vector<4xf32> -> vector<2xf32>
 /// ```
 ///
 /// Refer to the [official MLIR documentation][docs] for more information.
@@ -4031,7 +4031,7 @@ pub unsafe fn raw_vector_scale<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 /// The following is an example of a [`ScanOperation`] represented using its [`Display`](std::fmt::Display) rendering:
 ///
 /// ```mlir
-/// %dest, %accumulated_value = vector.scan <add>, %arg0, %arg1 reduction_dim = 0, inclusive = true :
+/// %result, %accumulated_value = vector.scan <add>, %arg0, %arg1 reduction_dim = 0, inclusive = true :
 ///   vector<2x4xf32>, vector<4xf32>
 /// ```
 ///
@@ -4856,7 +4856,7 @@ mod tests {
             indoc! {"
             module {
               func.func @test_deinterleave(%arg0: vector<4xf32>) {
-                %res1, %res2 = vector.deinterleave %arg0 : vector<4xf32> -> vector<2xf32>
+                %resultEven, %resultOdd = vector.deinterleave %arg0 : vector<4xf32> -> vector<2xf32>
                 return
               }
             }
@@ -7319,7 +7319,7 @@ mod tests {
             indoc! {"
             module {
               func.func @test_scan(%arg0: vector<2x4xf32>, %arg1: vector<4xf32>) {
-                %dest, %accumulated_value = vector.scan <add>, %arg0, %arg1 reduction_dim = 0, inclusive = true \
+                %result, %accumulated_value = vector.scan <add>, %arg0, %arg1 reduction_dim = 0, inclusive = true \
                 : vector<2x4xf32>, vector<4xf32>
                 return
               }
