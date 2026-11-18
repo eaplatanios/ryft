@@ -417,13 +417,22 @@ impl ExecutionResources {
         Ok(())
     }
 
-    /// Returns the optional [`ExecutionContext`] for PJRT submission and the resources the session keeps alive
-    /// until the execution fence is ready.
-    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources) {
+    /// Returns the optional [`ExecutionContext`] for PJRT submission and the resources the session keeps alive until
+    /// the execution fence is ready. The second value is `Some` when the invocation has a context or additional
+    /// resources. A context can borrow from the session's runtime instance, so even a context with no additional
+    /// resources requires retaining the fence.
+    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, Option<RetainedExecutionResources>) {
         let Self { context, retained, .. } = self;
-        let needed = context.is_some() || !retained.is_empty();
-        (context, RetainedExecutionResources { needed, _resources: retained })
+        let resources =
+            (context.is_some() || !retained.is_empty()).then_some(RetainedExecutionResources { _resources: retained });
+        (context, resources)
     }
+}
+
+/// Invocation resources retained by the session through execution.
+pub(crate) struct RetainedExecutionResources {
+    /// Additional resources destroyed after the whole execution completes.
+    _resources: Vec<Box<dyn RetainedResource>>,
 }
 
 // TODO(eaplatanios): Review from here onwards.
@@ -489,27 +498,20 @@ impl RuntimeExtensions {
 }
 
 impl Default for RuntimeExtensions {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Debug for RuntimeExtensions {
+    #[inline]
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RuntimeExtensions")
             .field("identifiers", &self.identifiers().collect::<Vec<_>>())
             .finish()
     }
-}
-
-/// Invocation resources retained by the session through execution.
-pub(crate) struct RetainedExecutionResources {
-    /// Whether the invocation has an execution context or additional resources to retain.
-    needed: bool,
-
-    /// Additional resources destroyed after the whole execution completes.
-    _resources: Vec<Box<dyn RetainedResource>>,
 }
 
 /// Runtime extension instances of one [`Session`](crate::Session) and the ownership of the resources of its pending
@@ -579,11 +581,11 @@ impl RuntimeRegistry {
         Ok(resources)
     }
 
-    /// Retains successful submission resources before any fallible result reconstruction.
-    pub(crate) fn retain(&self, fence: &ExecutionFence, resources: RetainedExecutionResources) {
-        if !resources.needed {
+    /// Tracks successful submissions that need retention before any fallible result reconstruction.
+    pub(crate) fn retain(&self, fence: &ExecutionFence, resources: Option<RetainedExecutionResources>) {
+        let Some(resources) = resources else {
             return;
-        }
+        };
         let mut completed = Vec::new();
         {
             let mut pending = self.pending.lock().expect("runtime completion mutex poisoned");
@@ -1088,7 +1090,7 @@ mod tests {
         resources.retain(DropCounter(Arc::clone(&drops)));
         let (context, retained) = resources.into_parts();
         assert!(context.is_none());
-        assert!(retained.needed);
+        assert!(retained.is_some());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(retained);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -1376,7 +1378,7 @@ mod tests {
         // A registration-only extension still initializes, but its invocation needs no context or retained resources.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(context.is_none());
-        assert!(!retained.needed);
+        assert!(retained.is_none());
     }
 
     #[test]
@@ -1453,6 +1455,24 @@ mod tests {
         registry.retain(&ExecutionFence::new(vec![]), retained);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert!(registry.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_runtime_registry_retain_tracks_context_without_additional_resources() {
+        let client = execution_client();
+        let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
+        let mut resources = prepare_without_requirements(&registry);
+        resources.context = Some(client.execution_context().unwrap());
+        let (context, retained) = resources.into_parts();
+        assert!(context.is_some());
+
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        registry.retain(&fence, retained);
+        let pending_before_completion = registry.pending.lock().unwrap().len();
+        promise.set(None).unwrap();
+        fence.block_until_ready().unwrap();
+        assert_eq!(pending_before_completion, 1);
     }
 
     #[test]
