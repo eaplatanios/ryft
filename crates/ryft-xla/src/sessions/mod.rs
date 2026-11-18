@@ -568,11 +568,10 @@ impl Session {
 
         Ok(())
     }
-
-    // TODO(eaplatanios): Review from here onwards.
 }
 
 impl Clone for Session {
+    #[inline]
     fn clone(&self) -> Self {
         Self { state: Arc::clone(&self.state), mesh: self.mesh.clone(), effect_scope: Arc::clone(&self.effect_scope) }
     }
@@ -584,6 +583,8 @@ impl Domain for Session {
     type Constant = Constant;
     type Operation = Operation;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl NamedAxes for Session {
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
