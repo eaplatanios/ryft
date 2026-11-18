@@ -483,7 +483,7 @@ impl Array {
         let logical_mesh = sharding.as_ref().or(r#type.sharding()).map(Sharding::mesh);
         let mesh = match mesh.into() {
             Some(mesh) => mesh,
-            None => session.eager_mesh(&[], logical_mesh)?,
+            None => session.device_mesh_for(&[], logical_mesh)?,
         };
         let buffer = buffer.as_ref();
         // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
@@ -755,69 +755,6 @@ impl Array {
             buffers.push(buffer);
         }
         Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)
-    }
-
-    /// Creates an [`Array`] of `r#type` over `mesh` whose elements all have the value that `kind` selects, without
-    /// allocating the whole array in host memory. Every shard that the client of `session` can address is uploaded
-    /// from a host buffer that has the shape of that shard. `r#type` must have a static shape and a sharding, and an
-    /// array of [`DataType::Zero`] has no buffers.
-    pub(crate) fn from_constant(
-        session: &Session,
-        r#type: ArrayType,
-        mesh: DeviceMesh,
-        kind: ConstantKind,
-    ) -> Result<Self, Error> {
-        if r#type.data_type().is_zero() {
-            return Self::from_zero_space(session, r#type, None, mesh);
-        }
-        let client = session.client();
-        let data_type = r#type.data_type();
-        let element_size = data_type.to_pjrt().element_size_in_bytes()?;
-        let element = kind.element_bytes(data_type, element_size).ok_or_else(|| {
-            Error::from(ProgramError::InvalidArgument {
-                message: format!("the data type `{data_type}` has no host encoding for a constant of kind {kind:?}"),
-            })
-        })?;
-        let sharding = r#type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
-        let shape = r#type
-            .static_shape()
-            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-
-        // The uploads below go to the default memory of each device. A type that requests host memory needs the memory
-        // selection of the host upload, which takes the bytes of the whole array.
-        if r#type.memory() != Memory::Device {
-            let element_count = Shape::from(&shape).element_count()?.unwrap();
-            return Self::from_host_buffer(session, r#type, mesh, None, element.repeat(element_count));
-        }
-        let (descriptors, _) = ShardLayout::new(&shape, &mesh, sharding)?.into_parts();
-        let mut devices = HashMap::new();
-        for device in client.addressable_devices()? {
-            devices.insert(device.id()?, device);
-        }
-
-        // Every device holds at most one shard, and the shards on devices of other processes get no buffer.
-        let mut work = session.reserve_work();
-        let mut buffers = Vec::new();
-        for descriptor in descriptors {
-            let Some(device) = devices.remove(&descriptor.device().id()) else {
-                continue;
-            };
-            let shard_shape = descriptor.shape();
-            let element_count = Shape::from(&shard_shape).element_count()?.unwrap();
-            let bytes = element.repeat(element_count);
-            let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let buffer = client.buffer(
-                bytes.as_slice(),
-                Self::physical_buffer_type(data_type),
-                dimensions.as_slice(),
-                None,
-                device,
-                None,
-            )?;
-            work.track_buffer(&buffer);
-            buffers.push(buffer);
-        }
-        Self::from_canonical_addressable_buffers(session, r#type, None, mesh, buffers)
     }
 
     /// Creates an [`Array`] that belongs to `session` from the per-device `buffers` that one execution of a compiled
@@ -2270,93 +2207,6 @@ impl ArrayTypeExtension for ArrayType {
     }
 }
 
-/// Kind of constant value that [`Array::from_constant`] materializes.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConstantKind {
-    /// Additive identity.
-    Zero,
-
-    /// Multiplicative identity.
-    One,
-}
-
-impl ConstantKind {
-    /// Returns whether [`Self::element_bytes`] has a host encoding of this value for `data_type`.
-    pub(crate) fn has_host_encoding(self, data_type: DataType) -> bool {
-        self == Self::Zero || Self::one_pattern_bytes(data_type).is_some()
-    }
-
-    /// Returns the host encoding of one element of `data_type` with this value, which is `element_size` bytes long,
-    /// or [`None`] if this crate has no host encoding of that value for `data_type`.
-    ///
-    /// Booleans are encoded as one byte per element (i.e., `0` or `1`). Integers and floating-point numbers are
-    /// encoded in the native-endian byte order that [`Client::buffer`] expects. Complex numbers are encoded as a
-    /// `(real, imaginary)` pair of native-endian floats.
-    pub(crate) fn element_bytes(self, data_type: DataType, element_size: usize) -> Option<Vec<u8>> {
-        match self {
-            Self::Zero => Some(vec![0u8; element_size]),
-            Self::One => {
-                let pattern = Self::one_pattern_bytes(data_type)?;
-                debug_assert_eq!(pattern.len(), element_size);
-                Some(pattern)
-            }
-        }
-    }
-
-    /// Returns the native-endian byte pattern for a single element of `data_type` whose value is `1`, or [`None`] for
-    /// the data types without such a pattern here.
-    fn one_pattern_bytes(data_type: DataType) -> Option<Vec<u8>> {
-        Some(match data_type {
-            DataType::Boolean => vec![1u8],
-            DataType::I8 => 1i8.to_ne_bytes().to_vec(),
-            DataType::U8 => 1u8.to_ne_bytes().to_vec(),
-            DataType::I16 => 1i16.to_ne_bytes().to_vec(),
-            DataType::U16 => 1u16.to_ne_bytes().to_vec(),
-            DataType::I32 => 1i32.to_ne_bytes().to_vec(),
-            DataType::U32 => 1u32.to_ne_bytes().to_vec(),
-            DataType::I64 => 1i64.to_ne_bytes().to_vec(),
-            DataType::U64 => 1u64.to_ne_bytes().to_vec(),
-            DataType::BF16 => half::bf16::ONE.to_bits().to_ne_bytes().to_vec(),
-            DataType::F16 => half::f16::ONE.to_bits().to_ne_bytes().to_vec(),
-            DataType::F32 => 1.0f32.to_ne_bytes().to_vec(),
-            DataType::F64 => 1.0f64.to_ne_bytes().to_vec(),
-            DataType::C64 => {
-                let mut bytes = Vec::with_capacity(8);
-                bytes.extend_from_slice(&1.0f32.to_ne_bytes());
-                bytes.extend_from_slice(&0.0f32.to_ne_bytes());
-                bytes
-            }
-            DataType::C128 => {
-                let mut bytes = Vec::with_capacity(16);
-                bytes.extend_from_slice(&1.0f64.to_ne_bytes());
-                bytes.extend_from_slice(&0.0f64.to_ne_bytes());
-                bytes
-            }
-            // Low-precision floating-point types (i.e., 4-, 6-, and 8-bit types) do not have a canonical Rust
-            // representation, and encoding `1.0` as a raw byte pattern would depend on the exact variant.
-            DataType::F8E3M4
-            | DataType::F8E4M3
-            | DataType::F8E4M3FN
-            | DataType::F8E4M3FNUZ
-            | DataType::F8E4M3B11FNUZ
-            | DataType::F8E5M2
-            | DataType::F8E5M2FNUZ
-            | DataType::F8E8M0FNU
-            | DataType::Token
-            | DataType::Zero
-            | DataType::I1
-            | DataType::I2
-            | DataType::I4
-            | DataType::U1
-            | DataType::U2
-            | DataType::U4
-            | DataType::F4E2M1FN
-            | DataType::F6E2M3FN
-            | DataType::F6E3M2FN => return None,
-        })
-    }
-}
-
 /// Immutable storage of an [`Array`] that its clones share.
 struct ArrayParts {
     /// [`ArrayType`] of the [`Array`], shared with the other arrays produced for the same compiled program output. Its
@@ -2445,8 +2295,8 @@ mod tests {
     use crate::{Error, FromPjrt, Session, ToPjrt};
 
     use super::{
-        Array, ArrayError, ArrayOutputLayout, ArrayShard, ArrayTypeExtension, ConstantKind, ShardDescriptor,
-        ShardLayout, block_until_ready, ready,
+        Array, ArrayError, ArrayOutputLayout, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout,
+        block_until_ready, ready,
     };
 
     // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
@@ -3267,48 +3117,6 @@ mod tests {
         assert_eq!(array.sharding(), &sharding);
         assert_eq!(array.r#type().sharding(), Some(&sharding.without_auto_axes()));
         assert_eq!(array.copy_to_host().unwrap(), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_array_from_constant() {
-        let client = cpu_client(2);
-        let session = session_with_client(client);
-        let devices = client.addressable_devices().unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(
-            logical_mesh.clone(),
-            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
-        )
-        .unwrap();
-        let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        // Every shard holds the constant in the memory that the type requests.
-        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
-            let r#type = ArrayType::new_static(DataType::F32, [4])
-                .with_sharding(sharding.clone())
-                .unwrap()
-                .with_memory(memory);
-            for (kind, value) in [(ConstantKind::Zero, 0f32), (ConstantKind::One, 1f32)] {
-                let array = Array::from_constant(&session, r#type.clone(), mesh.clone(), kind).unwrap();
-                assert_eq!(array.r#type().as_ref(), &r#type);
-                assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![value; 4]);
-                for (shard, device) in array.shards().iter().zip(&devices) {
-                    let actual = shard.buffer().unwrap().memory().unwrap();
-                    match memory {
-                        Memory::Device => assert_eq!(actual, device.default_memory().unwrap()),
-                        Memory::Host { pinned: true } => assert_eq!(actual.kind().unwrap(), "pinned_host"),
-                        Memory::Host { pinned: false } => assert_eq!(actual.kind().unwrap(), "unpinned_host"),
-                    }
-                }
-            }
-        }
-
-        // A data type without a host encoding of one is an error.
-        let r#type = ArrayType::new_static(DataType::F8E5M2, [4]).with_sharding(sharding).unwrap();
-        assert_eq!(
-            Array::from_constant(&session, r#type, mesh, ConstantKind::One).unwrap_err().to_string(),
-            "the data type `f8e5m2` has no host encoding for a constant of kind One",
-        );
     }
 
     #[test]
@@ -4364,27 +4172,5 @@ mod tests {
         );
         assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
         assert_eq!(error.to_string(), message);
-    }
-
-    #[test]
-    fn test_constant_kind_has_host_encoding() {
-        assert!(ConstantKind::Zero.has_host_encoding(DataType::F8E5M2));
-        assert!(ConstantKind::One.has_host_encoding(DataType::BF16));
-        assert!(ConstantKind::One.has_host_encoding(DataType::C64));
-        assert!(!ConstantKind::One.has_host_encoding(DataType::F8E5M2));
-        assert!(!ConstantKind::One.has_host_encoding(DataType::I4));
-    }
-
-    #[test]
-    fn test_constant_kind_element_bytes() {
-        assert_eq!(ConstantKind::Zero.element_bytes(DataType::F64, 8), Some(vec![0u8; 8]));
-        assert_eq!(ConstantKind::One.element_bytes(DataType::Boolean, 1), Some(vec![1u8]));
-        assert_eq!(ConstantKind::One.element_bytes(DataType::I32, 4), Some(1i32.to_ne_bytes().to_vec()));
-        assert_eq!(
-            ConstantKind::One.element_bytes(DataType::BF16, 2),
-            Some(half::bf16::ONE.to_bits().to_ne_bytes().to_vec()),
-        );
-        assert_eq!(ConstantKind::One.element_bytes(DataType::C64, 8), Some(values_to_bytes(&[1f32, 0f32])));
-        assert_eq!(ConstantKind::One.element_bytes(DataType::F8E5M2, 1), None);
     }
 }
