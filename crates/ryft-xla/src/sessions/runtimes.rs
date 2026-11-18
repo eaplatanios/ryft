@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::ThreadId;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -571,7 +571,7 @@ pub(crate) struct RuntimeRegistry {
 
     /// One slot per [`RuntimeRequirement`], including its ABI version. Each slot coordinates initialization and holds
     /// the instance once it is ready.
-    instances: Mutex<HashMap<RuntimeRequirement, Arc<RuntimeInitialization>>>,
+    instances: Mutex<HashMap<RuntimeRequirement, Arc<RuntimeInitializationSlot>>>,
 
     /// Fences and retained resources for submissions with an execution context or additional invocation resources.
     pending: Mutex<Vec<PendingExecution>>,
@@ -635,13 +635,15 @@ impl RuntimeRegistry {
         };
 
         let mut completed = Vec::new();
-        let mut pending = self.pending.lock().expect("runtime completion mutex poisoned");
+        let mut pending = self.pending.lock().unwrap_or_else(|poisoned| {
+            // An interrupted pass leaves unfinished submissions in the list with their resources.
+            self.pending.clear_poison();
+            poisoned.into_inner()
+        });
+
+        // Record the submission before polling fences so the registry still owns its resources if a poll panics.
+        pending.push(PendingExecution { fence: fence.clone(), _resources: resources });
         completed.extend(pending.extract_if(.., |execution| !matches!(execution.fence.is_ready(), Ok(false))));
-        if matches!(fence.is_ready(), Ok(false)) {
-            pending.push(PendingExecution { fence: fence.clone(), _resources: resources });
-        } else {
-            completed.push(PendingExecution { fence: fence.clone(), _resources: resources });
-        }
 
         // Release the lock before running destructors for completed executions' retained resources.
         drop(pending);
@@ -666,7 +668,10 @@ impl RuntimeRegistry {
         let slot = {
             let mut instances = self.instances.lock().expect("runtime registry mutex poisoned");
             Arc::clone(instances.entry(requirement.clone()).or_insert_with(|| {
-                Arc::new(RuntimeInitialization { state: Mutex::new(Initialization::Empty), ready: Condvar::new() })
+                Arc::new(RuntimeInitializationSlot {
+                    state: Mutex::new(RuntimeInitializationState::Empty),
+                    state_changed: Condvar::new(),
+                })
             }))
         };
 
@@ -674,13 +679,13 @@ impl RuntimeRegistry {
         let mut state = slot.state.lock().expect("runtime initialization mutex poisoned");
         loop {
             match &*state {
-                Initialization::Ready(runtime) => return Ok(Arc::clone(runtime)),
-                Initialization::Running(owner) if *owner == current => {
+                RuntimeInitializationState::Ready(runtime) => return Ok(Arc::clone(runtime)),
+                RuntimeInitializationState::Running(owner) if *owner == current => {
                     return Err(
                         RuntimeError::RecursiveInitialization { identifier: requirement.identifier.clone() }.into()
                     );
                 }
-                Initialization::Running(_) => {
+                RuntimeInitializationState::Running(_) => {
                     // Do not wait while this thread initializes another descriptor in the same registry. Two
                     // providers could otherwise each wait for the other's thread indefinitely. Release this slot
                     // before inspecting other slots so concurrent dependency checks never invert their lock order.
@@ -695,22 +700,25 @@ impl RuntimeRegistry {
                     let initializing = slots.iter().any(|slot| {
                         matches!(
                             *slot.state.lock().expect("runtime initialization mutex poisoned"),
-                            Initialization::Running(owner) if owner == current
+                            RuntimeInitializationState::Running(owner) if owner == current
                         )
                     });
                     state = slot.state.lock().expect("runtime initialization mutex poisoned");
-                    if matches!(*state, Initialization::Running(_)) {
+                    if matches!(*state, RuntimeInitializationState::Running(_)) {
                         if initializing {
                             return Err(RuntimeError::RecursiveInitialization {
                                 identifier: requirement.identifier.clone(),
                             }
                             .into());
                         }
-                        state = slot.ready.wait(state).expect("runtime initialization mutex poisoned while waiting");
+                        state = slot
+                            .state_changed
+                            .wait(state)
+                            .expect("runtime initialization mutex poisoned while waiting");
                     }
                 }
-                Initialization::Empty => {
-                    *state = Initialization::Running(current);
+                RuntimeInitializationState::Empty => {
+                    *state = RuntimeInitializationState::Running(current);
                     break;
                 }
             }
@@ -720,12 +728,9 @@ impl RuntimeRegistry {
         // publication, and rollback can acquire it.
         drop(state);
 
-        let mut rollback = InitializationGuard { slot: &slot, active: true };
+        let guard = RuntimeInitializationGuard { slot: &slot, active: true };
         let runtime = provider.initialize(self.client, requirement)?;
-        *slot.state.lock().expect("runtime initialization mutex poisoned") =
-            Initialization::Ready(Arc::clone(&runtime));
-        rollback.active = false;
-        slot.ready.notify_all();
+        guard.publish(&runtime);
         Ok(runtime)
     }
 }
@@ -733,7 +738,8 @@ impl RuntimeRegistry {
 impl Drop for RuntimeRegistry {
     fn drop(&mut self) {
         // Wait for tracked submissions to finish before dropping their resources and the initialized extensions.
-        let pending = std::mem::take(self.pending.get_mut().expect("runtime completion mutex poisoned"));
+        // Teardown has exclusive access to the pending list, even if its mutex was poisoned.
+        let pending = std::mem::take(self.pending.get_mut().unwrap_or_else(PoisonError::into_inner));
         for execution in pending {
             // Failure is terminal too, and its diagnostics remain in the caller's fence and in effect and reference
             // state.
@@ -744,43 +750,68 @@ impl Drop for RuntimeRegistry {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Initialization state for one session and complete runtime descriptor.
-enum Initialization {
-    /// No successful instance has been published.
+/// State of a [`RuntimeInitializationSlot`] for one [`RuntimeRequirement`].
+enum RuntimeInitializationState {
+    /// The slot is available for an attempt. It starts here and returns here if initialization fails or unwinds.
     Empty,
 
-    /// One thread initializes outside the registry lock.
+    /// One thread is initializing the extension. Its ID lets the registry detect recursive initialization.
     Running(ThreadId),
 
-    /// Immutable stable instance shared by later calls.
+    /// The initialized extension, reused by subsequent callers.
     Ready(Arc<dyn RuntimeExtension>),
 }
 
-/// Independent synchronization for one runtime, so unrelated initialization does not serialize.
-struct RuntimeInitialization {
-    /// Mutable initialization state.
-    state: Mutex<Initialization>,
+/// Allows one thread at a time to initialize the extension for a given [`RuntimeRequirement`] in a session. A caller
+/// claims an empty slot under its mutex and releases the mutex before invoking the provider. Other callers can wait
+/// on the slot's condition variable and recheck its state when they wake. The [`RuntimeInitializationGuard`] wakes
+/// waiters after publishing the extension or resetting the slot if the provider returns an error or unwinds. A caller
+/// can reuse the published extension or retry initialization if the slot is empty. Each requirement has its own slot,
+/// so different requirements can initialize concurrently.
+struct RuntimeInitializationSlot {
+    /// Protects state transitions and access to the initialized extension.
+    state: Mutex<RuntimeInitializationState>,
 
-    /// Notification after successful initialization or retryable failure.
-    ready: Condvar,
+    /// Signaled when the slot becomes [`RuntimeInitializationState::Ready`] or rolls back to
+    /// [`RuntimeInitializationState::Empty`]. Woken callers recheck the state.
+    state_changed: Condvar,
 }
 
-/// Resets an unfinished initializer on error or unwind, without poisoning the instance slot.
-struct InitializationGuard<'o> {
-    /// Slot whose running state must be cleared unless publication succeeds.
-    slot: &'o RuntimeInitialization,
+/// Rolls back a claimed [`RuntimeInitializationSlot`] if the provider returns an error or unwinds. Dropping an active
+/// guard resets the slot to [`RuntimeInitializationState::Empty`], clears any poison on the slot mutex, and wakes
+/// waiters so they can retry.
+struct RuntimeInitializationGuard<'o> {
+    /// Slot claimed by the current initializer.
+    slot: &'o RuntimeInitializationSlot,
 
-    /// Whether initialization still needs rollback.
+    /// Whether dropping the guard should roll back the attempt. [`Self::publish`] takes ownership of the guard, which
+    /// still drops when `publish` returns. Clearing this flag after storing the extension lets the destructor skip
+    /// reacquiring the slot mutex.
     active: bool,
 }
 
-impl Drop for InitializationGuard<'_> {
+impl RuntimeInitializationGuard<'_> {
+    /// Stores the initialized extension and clears `active` so dropping the guard leaves the slot in
+    /// [`RuntimeInitializationState::Ready`]. Wakes callers waiting for the slot.
+    fn publish(mut self, runtime: &Arc<dyn RuntimeExtension>) {
+        *self.slot.state.lock().expect("runtime initialization mutex poisoned") =
+            RuntimeInitializationState::Ready(Arc::clone(runtime));
+        self.active = false;
+        self.slot.state_changed.notify_all();
+    }
+}
+
+impl Drop for RuntimeInitializationGuard<'_> {
     fn drop(&mut self) {
         if self.active {
-            *self.slot.state.lock().expect("runtime initialization mutex poisoned") = Initialization::Empty;
-            self.slot.ready.notify_all();
+            let mut state = self.slot.state.lock().unwrap_or_else(PoisonError::into_inner);
+            *state = RuntimeInitializationState::Empty;
+            self.slot.state.clear_poison();
+
+            // Release the repaired slot before waking waiters so they can retry initialization.
+            drop(state);
+
+            self.slot.state_changed.notify_all();
         }
     }
 }
@@ -810,13 +841,15 @@ fn validate_identifier(identifier: &str) -> Result<(), Error> {
     Ok(())
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, PoisonError, Weak};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -830,8 +863,9 @@ mod tests {
 
     use super::{
         CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES,
-        RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
-        RuntimeRegistry, RuntimeRequirement, normalize_runtime_requirements,
+        RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeInitializationGuard,
+        RuntimeInitializationSlot, RuntimeInitializationState, RuntimeProvider, RuntimeRegistry, RuntimeRequirement,
+        normalize_runtime_requirements,
     };
 
     /// Provider that counts initialization attempts and can fail the next attempt.
@@ -890,6 +924,16 @@ mod tests {
     fn prepare_without_requirements(registry: &RuntimeRegistry) -> ExecutionResources {
         let client = registry.client;
         registry.prepare(&[], &domain_mesh(client, "x", 1)).unwrap()
+    }
+
+    /// Poisons `mutex` by unwinding while holding its lock.
+    fn poison_mutex<T>(mutex: &Mutex<T>) {
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("fixture poisoned the mutex");
+        });
+        assert_eq!(panic.unwrap_err().downcast_ref::<&str>(), Some(&"fixture poisoned the mutex"));
+        assert!(mutex.is_poisoned());
     }
 
     #[test]
@@ -1493,6 +1537,9 @@ mod tests {
         let (_, retained) = resources.into_parts();
         let (event, promise) = client.event(()).unwrap();
         let fence = ExecutionFence::new(vec![event]);
+
+        // A submission can still be running when its resources reach a poisoned pending list.
+        poison_mutex(&registry.pending);
         registry.retain(&fence, retained);
         let pending_before_completion = registry.pending.lock().unwrap().len();
         let drops_before_completion = drops.load(Ordering::SeqCst);
@@ -1543,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_registry_drop_waits_for_all_events_after_fence_is_dropped() {
+    fn test_runtime_registry_drop_waits_for_all_events_with_poisoned_pending_mutex() {
         let client = execution_client();
         let registry = RuntimeRegistry::new(client, RuntimeExtensions::empty());
         let drops = Arc::new(AtomicUsize::new(0));
@@ -1556,6 +1603,8 @@ mod tests {
         registry.retain(&fence, retained);
         drop(fence);
         first_promise.set(Some(ryft_pjrt::Error::aborted("test execution failed"))).unwrap();
+
+        poison_mutex(&registry.pending);
 
         let (started, waiting) = mpsc::channel();
         let (released, completed) = mpsc::channel();
@@ -1576,5 +1625,39 @@ mod tests {
         completed.recv_timeout(Duration::from_secs(5)).unwrap();
         teardown.join().unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_runtime_initialization_guard_drop_repairs_poisoned_slot() {
+        let slot = RuntimeInitializationSlot {
+            state: Mutex::new(RuntimeInitializationState::Running(thread::current().id())),
+            state_changed: Condvar::new(),
+        };
+        let guard = RuntimeInitializationGuard { slot: &slot, active: true };
+        let (started, waiting) = mpsc::channel();
+
+        thread::scope(|threads| {
+            let waiter = threads.spawn(|| {
+                let mut state = slot.state.lock().unwrap();
+                started.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while matches!(*state, RuntimeInitializationState::Running(_)) {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let (next, timeout) =
+                        slot.state_changed.wait_timeout(state, remaining).unwrap_or_else(PoisonError::into_inner);
+                    assert!(!timeout.timed_out(), "rollback did not wake the waiter");
+                    state = next;
+                }
+                assert!(matches!(*state, RuntimeInitializationState::Empty));
+            });
+
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            poison_mutex(&slot.state);
+
+            drop(guard);
+            waiter.join().unwrap();
+        });
+
+        assert!(matches!(*slot.state.lock().unwrap(), RuntimeInitializationState::Empty));
     }
 }
