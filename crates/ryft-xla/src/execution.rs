@@ -20,19 +20,20 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension as CoreDimension, Layout,
-    ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
+    Memory, ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
     ReferenceCompletionBackend, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape, Sharding,
     ShardingDimension, StatefulCompilationDomain, StatefulExecution, Type as CoreType, TypeRefinements, Typed,
     TypedProgram, ValueProjection, validate_reference_boundary,
 };
 use ryft_pjrt::{
-    Buffer, BufferSpecification, BufferType, Execution, ExecutionDeviceInputs, ExecutionFence, ExecutionInput,
-    LoadedExecutable,
+    Buffer, BufferSpecification, BufferType, Error as PjrtError, Execution, ExecutionDeviceInputs, ExecutionFence,
+    ExecutionInput, LoadedExecutable,
 };
 
 use crate::arrays::ArrayOutputLayout;
 use crate::arrays::materialization::materialize_bounded_dynamic_inputs;
 use crate::lowering::signature::ExecutableSignature;
+use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, ExecutionResources, FromPjrt,
@@ -152,8 +153,9 @@ pub(super) struct ExecutionPlan {
     zero_space_inputs: bool,
 
     /// Placement of every logical output, present when every output has a static type, every output without a
-    /// physical result has the zero data type, and the program runs on a single device or declares a sharding without
-    /// `Unconstrained` dimensions for every output, which XLA must then honor. The outputs of such programs are built
+    /// physical result has the zero data type, the program runs on a single device or declares a sharding without
+    /// `Unconstrained` dimensions for every output, which XLA must then honor, and the executable reports the memory
+    /// of every output, which [`Self::new`] compares with the declared one. The outputs of such programs are built
     /// directly from the returned buffers.
     output_layouts: Option<Vec<ArrayOutputLayout>>,
 }
@@ -207,6 +209,59 @@ impl ExecutionPlan {
                 }
             }
         }
+        // The same compile options can override the MLIR memory attributes, so the memories of the compiled ABI are
+        // validated like its layouts. A plugin that does not report them leaves the inputs to the execution itself and
+        // the outputs to the validation of their returned buffers, which the planned output layouts below skip. Device
+        // placement means the default memory of the plugin, whose kind is platform-dependent.
+        let devices = executable.addressable_devices()?;
+        let default_memory_kind = match devices.first() {
+            Some(device) => device.default_memory()?.kind()?.into_owned(),
+            None => memory_placement_kind(Memory::Device).to_string(),
+        };
+        let input_memory_kinds = if physical_input_types.is_empty() {
+            Some(Vec::new())
+        } else {
+            match compiled_executable.input_memory_kinds() {
+                Ok(memory_kinds) => Some(memory_kinds),
+                Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => None,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let output_memory_kinds = if physical_output_types.is_empty() {
+            Some(Vec::new())
+        } else {
+            match compiled_executable.output_memory_kinds() {
+                Ok(memory_kinds) => Some(memory_kinds),
+                Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => None,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        for (kind, types, memory_kinds) in [
+            ("input", physical_input_types.as_slice(), &input_memory_kinds),
+            ("output", physical_output_types.as_slice(), &output_memory_kinds),
+        ] {
+            let Some(memory_kinds) = memory_kinds else {
+                continue;
+            };
+            for (index, array_type) in types.iter().enumerate() {
+                let expected = match array_type.memory() {
+                    Memory::Device => default_memory_kind.as_str(),
+                    memory => memory_placement_kind(memory),
+                };
+                let actual = memory_kinds.get(index).ok_or_else(|| {
+                    Error::Compilation(CompilationError::IncompatibleExecutable {
+                        reason: format!("executable {kind} {index} has no memory kind"),
+                    })
+                })?;
+                if actual.as_ref() != expected {
+                    return Err(Error::Compilation(CompilationError::IncompatibleExecutable {
+                        reason: format!(
+                            "executable {kind} {index} uses memory kind `{actual}` but its type declares `{expected}`",
+                        ),
+                    }));
+                }
+            }
+        }
         // These types describe the physical executable signature, including layouts chosen for unconstrained
         // logical inputs. Keep the logical declarations unchanged so they still admit other representations.
         for (index, array_type) in physical_input_types.iter_mut().enumerate() {
@@ -227,11 +282,8 @@ impl ExecutionPlan {
                 *donation = false;
             }
         }
-        let addressable_device_ids = executable
-            .addressable_devices()?
-            .iter()
-            .map(|device| device.id().map_err(Error::from))
-            .collect::<Result<Arc<[_]>, _>>()?;
+        let addressable_device_ids =
+            devices.iter().map(|device| device.id().map_err(Error::from)).collect::<Result<Arc<[_]>, _>>()?;
         let static_inputs = input_types.iter().all(|input_type| input_type.static_shape().is_some());
         let zero_space_inputs = physical_input_types.iter().any(|input_type| input_type.data_type().is_zero());
         let static_outputs = signature.output_dimensions().is_empty()
@@ -247,7 +299,7 @@ impl ExecutionPlan {
                 && output_shardings.iter().all(|sharding| {
                     !sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Unconstrained))
                 });
-        let output_layouts = if static_outputs && declared_placement {
+        let output_layouts = if static_outputs && declared_placement && output_memory_kinds.is_some() {
             let mesh = Arc::new(mesh.clone());
             Some(
                 output_types
@@ -299,7 +351,7 @@ impl ExecutionArguments {
 
     /// Creates execution arguments from `arrays`, honoring `donation_flags` only for arrays whose shard buffers are
     /// uniquely owned. A requested donation is silently downgraded to a non-donating input when any shard buffer is
-    /// shared (e.g., by another clone of the array or by a retained materialization cache). Callers that need to
+    /// shared (e.g., by another clone of the array). Callers that need to
     /// observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
     pub fn from_arrays_with_donation(
         arrays: Vec<Array>,
@@ -585,7 +637,6 @@ impl Session {
                 actual_input_types.as_slice(),
                 inputs,
             )?
-            .into_inputs()
         };
         let inputs = if plan.zero_space_inputs {
             self.materialize_zero_space_carriers(plan.physical_input_types.as_slice(), inputs)?
@@ -1547,13 +1598,13 @@ mod tests {
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
         ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds,
         DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation, Error as CoreError,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation, ReductionKind,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation, ReductionKind,
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
         ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
         StagedFunction as CoreStagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
-    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision, Shape as ShapeProto};
     use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program};
 
     use crate::execution::ExecutionArguments;
@@ -1767,6 +1818,71 @@ mod tests {
         )
         .unwrap();
         let outputs = session.execute_program(&compiled, vec![input]).unwrap();
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), values);
+    }
+
+    #[test]
+    fn test_execution_plan_new_rejects_compilation_options_with_conflicting_memories() {
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let device_type = ArrayType::new_static(DataType::F64, [2]);
+        let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
+        let lower = |r#type: &ArrayType| {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(r#type.clone().into());
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap()
+        };
+        // XLA marks host memory in a layout with the memory space `Layout::kHostMemorySpace`, which is five.
+        let device_shape = BufferSpecification::new(BufferType::F64, [2]).proto().unwrap();
+        let mut host_shape = device_shape.clone();
+        host_shape.layout.as_mut().unwrap().memory_space = Some(5);
+        // Explicit argument and result layouts bypass the MLIR memory attributes in PJRT. A conflicting override must
+        // fail before its buffers can be wrapped in types that claim another memory, in either direction.
+        let compile = |r#type: &ArrayType, argument_shape: &ShapeProto, result_shape: &ShapeProto| {
+            let lowered = lower(r#type);
+            let mut compilation_options = lowered.compilation_options().clone();
+            compilation_options.argument_layouts = vec![argument_shape.clone()];
+            compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(result_shape.clone());
+            session.compile_program(&lowered.with_compilation_options(compilation_options))
+        };
+        let message = |result: Result<_, Error>| match result {
+            Err(error @ Error::Compilation(CompilationError::IncompatibleExecutable { .. })) => error.to_string(),
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("conflicting executable memory unexpectedly accepted"),
+        };
+        assert_eq!(
+            message(compile(&host_type, &device_shape, &host_shape)),
+            "incompatible XLA executable: executable input 0 uses memory kind `device` but its type declares \
+             `pinned_host`",
+        );
+        assert_eq!(
+            message(compile(&device_type, &host_shape, &device_shape)),
+            "incompatible XLA executable: executable input 0 uses memory kind `pinned_host` but its type declares \
+             `device`",
+        );
+        assert_eq!(
+            message(compile(&host_type, &host_shape, &device_shape)),
+            "incompatible XLA executable: executable output 0 uses memory kind `device` but its type declares \
+             `pinned_host`",
+        );
+        assert_eq!(
+            message(compile(&device_type, &device_shape, &host_shape)),
+            "incompatible XLA executable: executable output 0 uses memory kind `pinned_host` but its type declares \
+             `device`",
+        );
+
+        // Overrides that agree with the declared memories are accepted, and the result occupies the declared memory.
+        let compiled = compile(&host_type, &host_shape, &host_shape).unwrap();
+        let values = [1f64, 2.];
+        let input = Array::from_host_buffer(&session, host_type.clone(), mesh, None, values_to_bytes(&values)).unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
+        assert_eq!(outputs[0].r#type().memory(), Memory::Host { pinned: true });
+        let buffer = outputs[0].addressable_shards().next().unwrap().buffer().unwrap();
+        assert_eq!(buffer.memory().unwrap().kind().unwrap(), "pinned_host");
         assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), values);
     }
 
@@ -2456,7 +2572,10 @@ mod tests {
                 values.iter().map(|value| value * 2.0).collect::<Vec<_>>()
             );
         }
-        assert_eq!(session.cached_program_count(), 1);
+
+        // Besides the compiled function, the session caches the padding program of the one input shape that is below
+        // its bound.
+        assert_eq!(session.cached_program_count(), 2);
 
         // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
         // requested placement to replication. Types record no placement over auto mesh axes, so that placement is an
@@ -2837,10 +2956,9 @@ mod tests {
             .unwrap();
         let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, None, []).unwrap();
 
-        // The input of the zero data type below its bounds must bypass the retained cache and byte padding tiers,
-        // because its dense host copy is empty, and rely on the carrier materialization to synthesize the predicate
-        // argument at its bounds.
-        let materialized = materialize_bounded_dynamic_inputs(
+        // The input of the zero data type below its bounds must bypass the padding, because it has no payload, and
+        // rely on the carrier materialization to synthesize the predicate argument at its bounds.
+        let inputs = materialize_bounded_dynamic_inputs(
             &session,
             &signature,
             std::slice::from_ref(&declared_type),
@@ -2848,7 +2966,6 @@ mod tests {
             vec![zero],
         )
         .unwrap();
-        let inputs = materialized.into_inputs();
         assert_eq!(inputs.len(), 2);
 
         let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));

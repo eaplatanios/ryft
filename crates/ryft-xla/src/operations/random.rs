@@ -11,6 +11,7 @@ use ryft_mlir::{
 
 use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::assertions::lower_output_extent_validation;
+use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
@@ -127,7 +128,8 @@ impl LowerableOperation for DropoutOperation {
             }
         };
         let mask_type = self.mask_type(input_type)?;
-        let generated = lower_rng_bit_generator_to_mlir(algorithm, &mask_type, &[state], block, context, location)?;
+        let generated =
+            lower_unplaced_rng_bit_generator_to_mlir(algorithm, &mask_type, &[state], block, context, location)?;
         let mask_tensor_type = lower_tensor_type(&mask_type, context, location)?;
         let threshold = lower_f64_constant_splat(
             f64::from(self.drop_threshold()),
@@ -203,11 +205,29 @@ impl LowerableOperation for DropoutOperation {
     }
 }
 
+/// Lowers one random bit generation like [`lower_unplaced_rng_bit_generator_to_mlir`] and applies the declared memory
+/// placement of `bits_type` to the generated bits when that placement is not the device memory. The advanced state
+/// keeps the placement of the input state.
+fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
+    algorithm: RandomAlgorithm,
+    bits_type: &ArrayType,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let mut generated =
+        lower_unplaced_rng_bit_generator_to_mlir(algorithm, bits_type, input_values, block, context, location)?;
+    generated[1] = annotate_output_memory(generated[1], bits_type, block, context, location)?;
+    Ok(generated)
+}
+
 /// Lowers one random bit generation with `algorithm` to a `stablehlo.rng_bit_generator` that produces bits of type
 /// `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are the
 /// advanced generator state and the bits. The bits type is the instruction's output type, which may be refined, rather
-/// than the operation's declared one, whose dynamic axes exact extent operands may have refined to static axes.
-fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
+/// than the operation's declared one, whose dynamic axes exact extent operands may have refined to static axes. The
+/// bits stay in the memory where they are generated, which suits callers that consume them inside their own lowering.
+fn lower_unplaced_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
     algorithm: RandomAlgorithm,
     bits_type: &ArrayType,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -233,7 +253,7 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType, ConvertElementTypeOperation,
         DataType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Dropout, DropoutOperation, Placeholder, ProgramError, Random, RandomAlgorithm,
+        DimensionVariable, Dropout, DropoutOperation, Memory, Placeholder, ProgramError, Random, RandomAlgorithm,
         RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram, ZeroOperation,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
@@ -292,6 +312,47 @@ mod tests {
                   func.func @main(%arg0: tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>) {
                     %output_state, %output = stablehlo.rng_bit_generator %arg0, algorithm = THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
                     return %output_state, %output : tensor<2xui64>, tensor<4xui32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_rng_bit_generator_operation_lower_memory_placement() {
+        // The generator produces its bits in device memory. Bits that are declared in host memory are therefore
+        // transferred there, while the advanced state keeps the placement of the input state.
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_memory(Memory::Host { pinned: true });
+        let mut builder = ProgramBuilder::new();
+        let state = builder.add_input(state_type.clone());
+        let outputs = builder
+            .add_instruction(
+                RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type.clone()),
+                Vec::new(),
+                vec![state],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let input_types = vec![state_type.clone()];
+        let output_types = vec![state_type, bits_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32> {mhlo.memory_kind = "pinned_host"}) {
+                    %output_state, %output = stablehlo.rng_bit_generator %arg0, algorithm = THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
+                    %0 = stablehlo.custom_call @annotate_device_placement(%output) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<4xui32>) -> tensor<4xui32>
+                    return %output_state, %0 : tensor<2xui64>, tensor<4xui32>
                   }
                 }
             "#},

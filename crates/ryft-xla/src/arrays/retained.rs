@@ -32,15 +32,12 @@ use crate::arrays::{Array, ArrayParts};
 ///   - **No Session:** An [`Array`] carries the [`Session`] that it belongs to, which is what lets operations on it
 ///     find their execution context. A retained array carries none, so it must first be turned back into an array
 ///     by lifting its constant in a session, which is also the session that the new array belongs to.
-///   - **No Caches:** An [`Array`] owns caches of values derived from it (e.g., padded materializations), which are
-///     arrays themselves. A retained array holds only the type, the placement, the shards, and the completion fences
-///     of its array.
 ///   - **Usable as a Key:** A retained array implements [`Eq`] and [`Hash`] by the identity of the storage that it
 ///     was created from and by its type, so retaining one array twice yields equal values and programs that refer to
 ///     the same array share their compiled forms.
 ///
-/// The first two differences are what make it safe to store in a program. Programs live in the caches of a session,
-/// so a program that held an [`Array`] would keep alive the session whose caches keep the program alive, and neither
+/// The first difference is what makes it safe to store in a program. Programs live in the caches of a session, so
+/// a program that held an [`Array`] would keep alive the session whose caches keep the program alive, and neither
 /// would ever be released, including the device buffers.
 ///
 /// # Ownership
@@ -61,7 +58,7 @@ pub struct RetainedArray {
     actual_type: Arc<ArrayType>,
 
     /// Identity of the storage of the [`Array`] that was retained, which is the same for every retention of that
-    /// array. It keeps the address of that storage reserved without keeping the storage or its caches alive.
+    /// array. It keeps the address of that storage reserved without keeping the storage alive.
     identity: Weak<ArrayParts>,
 
     /// Runtime placement of the retained array over all mesh axes.
@@ -88,10 +85,9 @@ pub struct RetainedArray {
 }
 
 impl RetainedArray {
-    /// Retains `array` without its session and its caches. Its device buffers stay alive for as long as the returned
-    /// value or any of its clones exists. Retaining one array more than once returns equal values, so that repeatedly
-    /// importing the same captured array (e.g., the weights that a compiled function captures) stages the same constant
-    /// every time.
+    /// Retains `array` without its session. Its device buffers stay alive for as long as the returned value or any of
+    /// its clones exists. Retaining one array more than once returns equal values, so that repeatedly importing the
+    /// same captured array (e.g., the weights that a compiled function captures) stages the same constant every time.
     #[inline]
     pub fn new(array: &Array) -> Self {
         Self {
@@ -123,8 +119,8 @@ impl RetainedArray {
             .into());
         }
 
-        // The new array has storage of its own, with empty value-local caches, and its shards refer to the same device
-        // buffers. The parts need no validation because they come from an array that was already validated.
+        // The new array has storage of its own, and its shards refer to the same device buffers.
+        // The parts need no validation because they come from an array that was already validated.
         Ok(Array {
             parts: Arc::new(ArrayParts::new(
                 session,

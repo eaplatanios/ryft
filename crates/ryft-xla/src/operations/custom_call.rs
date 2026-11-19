@@ -16,6 +16,7 @@ use ryft_mlir::{
 use crate::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
+use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{
     CustomCallOperationExtension, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
     MemberLowerableOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE, Type,
@@ -33,7 +34,7 @@ impl LowerableOperation for CustomCallOperation {
             lowerer.require_runtime(requirement)?;
         }
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        lower_custom_call_to_mlir(
+        let results = lower_custom_call_to_mlir(
             self,
             input_values,
             input_types,
@@ -42,7 +43,8 @@ impl LowerableOperation for CustomCallOperation {
             &mut block,
             context,
             location,
-        )
+        )?;
+        lower_custom_call_output_memories(results, output_types, &mut block, context, location)
     }
 }
 
@@ -130,7 +132,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
             .zip(&array_input_types)
             .map(|(input, input_type)| lower_physical_storage(*input, input_type, block, context, location))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut results = if let Some(predicate) = validation {
+        let results = if let Some(predicate) = validation {
             // A separate assertion token cannot gate a pure or nullary foreign ABI. The conditional keeps every
             // foreign effect in the valid branch. Its false results are unreachable because validation reports an
             // execution failure, so placeholders only satisfy StableHLO's requirement for matching branch signatures.
@@ -205,6 +207,8 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
                 location,
             )?
         };
+        // The declared memories apply to the allocations at the bounds, after the conditional that may guard the call.
+        let mut results = lower_custom_call_output_memories(results, &physical_output_types, block, context, location)?;
         let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
         let mut output_extents = output_extents.iter();
         for (output_index, output_type) in self.output_types().iter().enumerate() {
@@ -236,6 +240,23 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
         }
         Ok(results)
     }
+}
+
+/// Applies the memory placements that `output_types` declare to the array `results` of one custom call. A custom call
+/// has no attribute for the memory of its results, which the foreign function always produces in device memory, so
+/// every result that is declared elsewhere is transferred there after the call.
+fn lower_custom_call_output_memories<'b, 'c: 'b, 't: 'c>(
+    results: Vec<ValueRef<'b, 'c, 't>>,
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    results
+        .into_iter()
+        .zip(output_types)
+        .map(|(result, output_type)| annotate_output_memory(result, output_type, block, context, location))
+        .collect()
 }
 
 /// Lowers one custom call to a `stablehlo.custom_call` using the typed FFI calling convention (i.e.,
@@ -810,6 +831,47 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_call_operation_lower_memory_placement() {
+        // A foreign function returns its results in device memory, so a result that is declared in host memory is
+        // transferred there after the call.
+        let output_type = ArrayType::new_static(DataType::F64, [2]).with_memory(Memory::Host { pinned: true });
+        let mut builder = ProgramBuilder::new();
+        let output = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.placed", vec![output_type.clone()]),
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &Vec::<ArrayType>::new(),
+                &vec![output_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main() -> (tensor<2xf64> {mhlo.memory_kind = "pinned_host"}) {
+                    %0 = stablehlo.custom_call @ryft.test.placed() {api_version = 4 : i32, backend_config = {}, operand_layouts = [], result_layouts = [dense<0> : tensor<1xindex>]} : () -> tensor<2xf64>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<2xf64>) -> tensor<2xf64>
+                    return %1 : tensor<2xf64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_custom_call_operation_lower_preserves_kernel_layout_error() {
         let input_type = test_matrix_type(2, 3);
         let output_type = input_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
@@ -1345,7 +1407,7 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_mixed_extents_false_branch_omits_memory_placement() {
         // The unreachable placeholder matches the unannotated result of the guarded call, even when the declared
-        // output has a non-default memory placement.
+        // output has a non-default memory placement. That placement is applied once, to the result of the conditional.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]))
             .with_memory(Memory::Host { pinned: true });
@@ -1377,14 +1439,15 @@ mod tests {
                     %1 = stablehlo.after_all  : !stablehlo.token
                     %2 = stablehlo.custom_call @ryft.assert(%0, %arg0, %1) {api_version = 4 : i32, backend_config = {actor = "custom_call", kind = "generic", label_0 = "size", label_count = "1", message = "input dimension `size` expected 3"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
                     %3 = "stablehlo.if"(%0) ({
-                      %4 = stablehlo.custom_call @ryft.test.guarded() {api_version = 4 : i32, backend_config = {}, operand_layouts = [], result_layouts = [dense<[1, 0]> : tensor<2xindex>]} : () -> tensor<3x3xf64>
-                      stablehlo.return %4 : tensor<3x3xf64>
+                      %5 = stablehlo.custom_call @ryft.test.guarded() {api_version = 4 : i32, backend_config = {}, operand_layouts = [], result_layouts = [dense<[1, 0]> : tensor<2xindex>]} : () -> tensor<3x3xf64>
+                      stablehlo.return %5 : tensor<3x3xf64>
                     }, {
                       %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                      %4 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<3x3xf64>
-                      stablehlo.return %4 : tensor<3x3xf64>
+                      %5 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<3x3xf64>
+                      stablehlo.return %5 : tensor<3x3xf64>
                     }) : (tensor<i1>) -> tensor<3x3xf64>
-                    return %3 : tensor<3x3xf64>
+                    %4 = stablehlo.custom_call @annotate_device_placement(%3) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<3x3xf64>) -> tensor<3x3xf64>
+                    return %4 : tensor<3x3xf64>
                   }
                 }
             "#},

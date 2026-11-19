@@ -461,7 +461,7 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, Typed};
+    use ryft_core::{DeviceMesh, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, Typed};
     use ryft_pjrt::BufferType;
 
     use crate::sessions::tests::domain_mesh;
@@ -708,6 +708,21 @@ mod tests {
         assert_eq!(copied.r#type(), source.r#type());
         assert_eq!(copied.mesh(), source.mesh());
         assert_eq!(shares_source_buffer(&copied), vec![false]);
+        assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
+
+        // A forbidden alias copies every shard within its own memory, so an array in host memory stays there.
+        let host = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]).with_memory(Memory::Host { pinned: true }),
+            source.mesh().clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let copied = session.place(host.clone(), options(None, false, Some(false))).unwrap();
+        assert_eq!(copied.r#type(), host.r#type());
+        assert!(!Arc::ptr_eq(copied.shards()[0].buffer().unwrap(), host.shards()[0].buffer().unwrap()));
+        assert_eq!(copied.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
         assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
 
         // A shard that stays on its device shares its buffer unless aliasing is forbidden.

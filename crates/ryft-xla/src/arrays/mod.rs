@@ -4,8 +4,8 @@
 //! device, which records the slice of the global array that the device holds. Every [`Array`] keeps one [`ArrayShard`]
 //! per device, including the shards that live in other processes, so that every process can reason about the complete
 //! global placement while only transferring, executing with, or reading the buffers that it can address. Clones of an
-//! array share its type, shards, and value-local caches, so cloning never copies device data. The
-//! [`shards`](mod@shards) module defines the shard types.
+//! array share its type and shards, so cloning never copies device data. The [`shards`](mod@shards) module defines the
+//! shard types.
 //!
 //! Every array belongs to a [`Session`], which determines the PJRT [`Client`], session, effect scope, and compilation
 //! options that operations on the array use. Arrays implement `ryft-core` value capabilities by binding each operation
@@ -20,18 +20,17 @@
 //! unreduced mesh axes. [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host
 //! values to other devices or shardings. The [`placement`](mod@placement) module defines what a placement is and how to
 //! request one, and the [`resharding`](mod@resharding) module implements the moves. Finally, the
-//! [`materialization`](mod@materialization) module pads arrays to the static bounds of executables compiled for bounded
-//! dynamic shapes and caches the padded copies per array. Array failures are reported through [`Error::Array`] with an
-//! [`ArrayError`].
+//! [`materialization`](mod@materialization) module pads arrays on their devices to the static bounds of executables
+//! compiled for bounded dynamic shapes. Array failures are reported through [`Error::Array`] with an [`ArrayError`].
 //!
 //! Every session counts the arrays that are created through it, which [`ArrayStatistics`] reports, and can describe
 //! the ones that are still alive as [`LiveArray`]s. The unit that it counts is the storage that an array shares with
 //! its clones, so cloning and dropping array handles involves no bookkeeping.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use ryft_core::{
     Add, And, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, Device, DeviceId, DeviceMesh,
@@ -44,10 +43,6 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
 
-use crate::arrays::materialization::{
-    BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
-    LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
-};
 use crate::arrays::statistics::ArrayRegistration;
 use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
 
@@ -74,29 +69,23 @@ pub use statistics::{ArrayStatistics, LiveArray};
 /// alongside the original core error.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ArrayError {
-    /// An array type is missing required sharding metadata.
     #[error("missing required sharding metadata")]
     MissingSharding,
 
-    /// The sharding of an array type disagrees with the placement that an array was constructed with.
     #[error(
         "array type sharding `{type_sharding}` does not match the placement `{sharding}` over the non-auto mesh axes"
     )]
     PlacementTypeMismatch { type_sharding: Sharding, sharding: Sharding },
 
-    /// An operation requires a session with a device mesh.
     #[error("session has no device mesh")]
     MissingMesh,
 
-    /// An operation requires a static array shape.
     #[error("expected static shape but got `{shape}`")]
     DynamicShape { shape: Shape },
 
-    /// Default placement could not select a local device.
     #[error("`Session::place` needs a default local device, but the PJRT client has no addressable devices")]
     MissingDefaultDevice,
 
-    /// An explicit source placement differs from the array's current placement.
     #[error(
         "`Session::place` source mesh `{expected_mesh:?}` with sharding `{expected_sharding:?}` does not match the \
          array's current mesh `{actual_mesh:?}` with sharding `{actual_sharding:?}`"
@@ -108,67 +97,51 @@ pub enum ArrayError {
         actual_sharding: Sharding,
     },
 
-    /// The current PJRT client cannot address a required device.
     #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
     NonAddressableDevice { device_id: DeviceId, process_index: usize },
 
-    /// A buffer's owning device is absent from the array mesh.
     #[error("device {device_id} is not present in the device mesh")]
     DeviceNotInMesh { device_id: DeviceId },
 
-    /// A buffer's owning process differs from the corresponding mesh device.
     #[error("device {device_id} reports process index {actual_process_index}, but expected {expected_process_index}")]
     DeviceProcessIndexMismatch { device_id: DeviceId, expected_process_index: usize, actual_process_index: usize },
 
-    /// A device has no memory matching the requested placement.
     #[error("device {device_id} has no addressable memory for `{memory}`")]
     UnsupportedMemory { device_id: DeviceId, memory: Memory },
 
-    /// Compiled resharding cannot handle an axis already owned by a manual computation.
     #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
     ManualReshardingAxis { axis_name: String },
 
-    /// Multiple buffers were supplied for one device.
     #[error("got multiple buffers for device {device_id}")]
     MultipleBuffersOnDevice { device_id: DeviceId },
 
-    /// A physical buffer has a different array type than its declared shard.
     #[error("buffer has type `{actual}`, but expected `{expected}`")]
     BufferTypeMismatch { expected: ArrayType, actual: ArrayType },
 
-    /// A physical buffer occupies a different memory tier than its declared shard.
     #[error("buffer on device {device_id} uses memory kind `{actual}`, but expected `{expected}`")]
     BufferMemoryMismatch { device_id: DeviceId, expected: Memory, actual: String },
 
-    /// A zero-space buffer contains an observable nonzero physical carrier value.
     #[error("zero-space buffer on device {device_id} contains a nonzero physical carrier value")]
     NonCanonicalZeroBuffer { device_id: DeviceId },
 
-    /// Supplied host bytes do not match the declared array type.
     #[error("expected {expected} byte(s) but got {actual}")]
     ByteCountMismatch { expected: usize, actual: usize },
 
-    /// Multiple host shards were supplied for one device.
     #[error("got multiple host shards for device {device_id}")]
     MultipleHostShardsOnDevice { device_id: DeviceId },
 
-    /// No host shard was supplied for a required local device.
     #[error("missing host shard for device {device_id}")]
     MissingHostShard { device_id: DeviceId },
 
-    /// The bytes supplied for a host shard do not match the size implied by its shape and element type.
     #[error("host shard on device {device_id} needs {expected} byte(s) but got {actual}")]
     HostShardByteCountMismatch { device_id: DeviceId, expected: usize, actual: usize },
 
-    /// A shard slice has a different rank than its array shape.
     #[error("shape rank {shape_rank} does not match shard slice rank {slice_rank}")]
     ShardSliceRankMismatch { shape_rank: usize, slice_rank: usize },
 
-    /// Array placement or host materialization requires a shard that has no local buffer.
     #[error("array shard #{shard_index} on device {device_id} has no addressable buffer")]
     MissingShardBuffer { shard_index: ShardIndex, device_id: DeviceId },
 
-    /// A shard dimension cannot be encoded by the transfer ABI, retaining its canonical core cause.
     #[error("cross-host transfer for shard #{shard_index}, dimension #{dimension}: {source}")]
     InvalidShardDimension {
         shard_index: ShardIndex,
@@ -177,7 +150,6 @@ pub enum ArrayError {
         source: DimensionError,
     },
 
-    /// Downloaded shard bytes do not match the expected logical shard size.
     #[error(
         "copied shard #{shard_index} from device {device_id} to host and got {actual_byte_count} byte(s), but expected \
          {expected_byte_count}"
@@ -189,12 +161,9 @@ pub enum ArrayError {
         actual_byte_count: usize,
     },
 
-    /// Overlapping physical shard slices contain different values.
     #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
     InconsistentOverlappingShardData { shard_index: ShardIndex },
 }
-
-// TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
 
 /// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information. An
 /// [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
@@ -217,7 +186,7 @@ pub enum ArrayError {
 /// convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer types.
 #[derive(Clone, Parameter)]
 pub struct Array {
-    /// Type, shards, and value-local caches of this [`Array`]. They are immutable once constructed and shared by
+    /// Type and shards of this [`Array`]. They are immutable once constructed and shared by
     /// every clone, so cloning an array costs a few reference-count increments rather than a deep copy.
     parts: Arc<ArrayParts>,
 
@@ -451,7 +420,9 @@ impl Array {
     /// Unlike [`Self::from_addressable_buffers`], this constructor does not query the buffers' devices, memories,
     /// element types, or dimensions, because XLA guarantees those properties for the buffers that it returns from a
     /// program whose signature Ryft lowered, and skipping the queries keeps each execution free of per-output PJRT
-    /// calls. In builds with debug assertions, every buffer is still validated with the same checks.
+    /// calls. Low-level compile options can override the layouts and the memories of that signature, so the execution
+    /// plan that provides `layout` exists only for an executable whose reported layouts and memory kinds match the
+    /// declared output types. In builds with debug assertions, every buffer is still validated with the same checks.
     pub(crate) fn from_execution_output(
         session: &Session,
         layout: &ArrayOutputLayout,
@@ -636,50 +607,6 @@ impl Array {
         self.parts.r#type.size_in_bytes()
     }
 
-    /// Returns whether every global shard has process-local storage and can therefore retain a bounded materialization.
-    pub(crate) fn supports_bounded_materialization_cache(&self) -> bool {
-        self.parts.shards.iter().all(ArrayShard::is_addressable)
-    }
-
-    /// Probes the bounded materialization cache that the clones of this array share for one structural `key`.
-    pub(crate) fn probe_bounded_materialization(&self, key: BoundedMaterializationKey) -> BoundedMaterializationProbe {
-        self.parts.bounded_materializations.get_or_init(Arc::default).probe(key)
-    }
-
-    /// Returns the replicated device-resident `i32` scalar for `extent` and whether this call uploaded it.
-    pub(crate) fn logical_extent_scalar(&self, session: &Session, extent: i32) -> Result<(Array, bool), Error> {
-        let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
-        if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
-            let entry = scalars.remove(index).unwrap();
-            let scalar = entry.1.clone();
-            scalars.push_back(entry);
-            return Ok((scalar, false));
-        }
-
-        // Release the cache lock before the upload, because `Array::from_host_buffer` issues a PJRT host transfer and
-        // other users of this array should not wait behind it. Another thread may therefore insert the same extent
-        // while the lock is released, so the cache is checked again after relocking. A cached scalar wins over the
-        // fresh upload, which is dropped, so that every caller observes one shared scalar per extent. The second
-        // element of the result still reports `true` because this call performed an upload.
-        drop(scalars);
-
-        let scalar_type =
-            ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))?;
-        let scalar = Array::from_host_buffer(session, scalar_type, self.mesh().clone(), None, extent.to_ne_bytes())?;
-        let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
-        if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
-            let entry = scalars.remove(index).unwrap();
-            let cached = entry.1.clone();
-            scalars.push_back(entry);
-            return Ok((cached, true));
-        }
-        scalars.push_back((extent, scalar.clone()));
-        while scalars.len() > LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY {
-            scalars.pop_front();
-        }
-        Ok((scalar, true))
-    }
-
     /// Returns whether this array has no clones and every addressable shard buffer is uniquely owned by it. An array
     /// without any shard buffers (e.g., a bufferless zero-space array) is never reported as uniquely owned, so it is
     /// never donated.
@@ -687,8 +614,7 @@ impl Array {
     /// Donation is all or nothing across shards, so any shared buffer disables donation for the complete logical
     /// input. The check is sound, rather than a heuristic, when the caller owns `self` by value, because a strong count
     /// of one means that this array holds the only reference to the buffer, so no concurrent clone can appear between
-    /// this check and the buffer's consumption. Note that caches shared by clones (e.g., retained bounded
-    /// materializations) keep their own references, so cached arrays are never donated.
+    /// this check and the buffer's consumption.
     pub(crate) fn has_unique_shard_buffers(&self) -> bool {
         let mut buffer_count = 0usize;
         // Clones share their parts, and with them the shard buffers, so the array itself must also be unique.
@@ -1385,12 +1311,6 @@ struct ArrayParts {
     /// Concrete [`DeviceMesh`] implied by the global shard placement, shared for the same reason.
     mesh: Arc<DeviceMesh>,
 
-    /// Value-local cache of lazily padded device materializations with bound shapes, allocated on first use.
-    bounded_materializations: OnceLock<Arc<BoundedMaterializationCache>>,
-
-    /// Value-local Least Recently Used (LRU) cache of device-resident scalar arguments for bounded logical extents.
-    logical_extent_scalars: Mutex<VecDeque<(i32, Array)>>,
-
     /// Registration of this storage as one logical array of the session that created it, which keeps the array counted
     /// as live in [`Session::array_statistics`] until the storage is dropped. It is the last field so that the shards
     /// and caches are released before the array stops counting as live.
@@ -1398,7 +1318,7 @@ struct ArrayParts {
 }
 
 impl ArrayParts {
-    /// Creates new [`ArrayParts`] with empty value-local caches and registers them as one logical array of `session`.
+    /// Creates new [`ArrayParts`] and registers them as one logical array of `session`.
     /// Storage can only be created through this function, so every logical array is counted exactly once.
     fn new(
         session: &Session,
@@ -1409,16 +1329,7 @@ impl ArrayParts {
         mesh: Arc<DeviceMesh>,
     ) -> Self {
         let registration = session.array_tracker().register(&r#type, &sharding, &mesh, &shards);
-        Self {
-            r#type,
-            sharding,
-            shards,
-            shard_index_by_device,
-            mesh,
-            bounded_materializations: OnceLock::new(),
-            logical_extent_scalars: Mutex::new(VecDeque::new()),
-            _registration: registration,
-        }
+        Self { r#type, sharding, shards, shard_index_by_device, mesh, _registration: registration }
     }
 }
 

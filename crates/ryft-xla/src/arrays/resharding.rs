@@ -43,6 +43,12 @@ impl Array {
     /// When the host fallback also cannot satisfy the request, typically because some source shards live on a remote
     /// process, the original error of the device work is propagated as the most informative diagnostic.
     ///
+    /// Every strategy keeps the [`Memory`] of this array, because a placement decides which device owns each shard
+    /// and not which memory of that device holds it. The shards of an array in host memory are therefore copied to
+    /// the host memory of the same kind of their destination devices, and a device without that memory produces
+    /// [`ArrayError::UnsupportedMemory`]. PJRT cross-host transfers always deliver to the default memory of the
+    /// receiving device, so a shard that arrives through one is copied on that device to the memory of this array.
+    ///
     /// Use [`Self::into_placement`] when the source array is no longer needed after the move. It consumes `self` and
     /// lets PJRT donate the source buffers to the destination, which avoids the extra allocation.
     ///
@@ -103,14 +109,15 @@ impl Array {
     }
 
     /// Returns an array with the type and the placement of this array whose addressable shards are copies of the
-    /// shards of this array on the same devices, so that the result shares no buffer with any other array.
+    /// shards of this array on the same devices and in the same memories, so that the result shares no buffer with
+    /// any other array.
     pub(crate) fn with_copied_shard_buffers(&self, session: &Session) -> Result<Self, Error> {
         let mut work = session.reserve_work();
         let buffers = self
             .addressable_shards()
             .filter_map(ArrayShard::buffer)
             .map(|buffer| {
-                let copied = buffer.copy_to_device(buffer.device()?)?;
+                let copied = buffer.copy_to_memory(buffer.memory()?)?;
                 work.track_buffer(&copied);
                 Ok(Arc::new(copied))
             })
@@ -148,9 +155,9 @@ impl Array {
                 Err((error, None)) => return Err(error),
             };
 
-        // Host fallback copies the source array to the host and uploads it again with `from_host_buffer`. Both the
-        // source array and the destination mesh must be fully addressable from this process, as in JAX. If the
-        // fallback fails, surface the original device error.
+        // Host fallback copies the source array to the host and uploads it again with `from_host_buffer`, to the
+        // memory of the source array. Both the source array and the destination mesh must be fully addressable from
+        // this process, as in JAX. If the fallback fails, surface the original device error.
         let local_process = session.client().process_index()?;
         let destination_fully_addressable =
             target_mesh.devices().iter().all(|device| device.process_index() == local_process);
@@ -161,7 +168,7 @@ impl Array {
             Ok(bytes) => bytes,
             Err(_) => return Err(compiled_error),
         };
-        let host_type = ArrayType::new(source.data_type(), source.shape().into());
+        let host_type = ArrayType::new(source.data_type(), source.shape().into()).with_memory(source.r#type().memory());
         match Self::from_host_buffer(
             session,
             host_type,
@@ -212,8 +219,9 @@ impl Array {
     /// slices of one source shard and both shardings hold one value per slice (refer to
     /// [`Self::plan_exact_shard_put`]). A destination shard on the device of its source shard shares the buffer of
     /// that shard. Other local source shards are copied between devices, and remote source shards arrive through
-    /// the PJRT cross-host transfers extension. The result is `None` when the destination needs other shards or
-    /// when a remote move needs the cross-host transfers extension and the plugin does not provide it.
+    /// the PJRT cross-host transfers extension. Both kinds of copies end up in the memory of this array on their
+    /// destination devices. The result is `None` when the destination needs other shards or when a remote move needs
+    /// the cross-host transfers extension and the plugin does not provide it.
     ///
     /// The buffers come with the completion fence of the cross-host sends that this process issues for the
     /// destination shards of other processes, or `None` when it issues none. This function never waits for those
@@ -250,6 +258,7 @@ impl Array {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
+        let memory = self.r#type().memory();
         let mut work = session.reserve_work();
         let mut addressable_buffers = Vec::new();
         for local_copy_plan in plan.local_copies() {
@@ -276,7 +285,8 @@ impl Array {
                         process_index: client_process_index,
                     })
                 })?;
-            let copied = source_buffer.copy_to_device(destination_device.clone())?;
+            // Copying to the destination device itself would always allocate in its default memory.
+            let copied = source_buffer.copy_to_memory(Self::device_memory(destination_device, memory)?)?;
             work.track_buffer(&copied);
             addressable_buffers.push(Arc::new(copied));
         }
@@ -317,7 +327,7 @@ impl Array {
                 dimensions: receive_plan.cross_host_shape()?,
             });
         }
-        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers)?;
+        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, memory)?;
         addressable_buffers.extend(received_buffers.into_iter().map(|received| Arc::new(received.buffer)));
 
         Ok(Some((addressable_buffers, send_fence)))
@@ -515,7 +525,7 @@ impl Array {
                 }
             }
         }
-        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers)?;
+        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, Memory::Device)?;
         destination_buffers
             .extend(received_buffers.into_iter().map(|received| (received.transfer_key, Arc::new(received.buffer))));
 
@@ -833,8 +843,9 @@ impl Array {
     }
 
     /// Compiles the identity program that reshards this array, which must already be on `destination_mesh`, to
-    /// `destination_sharding`. If `donate` is `true`, the input of the program is marked as donated so that PJRT can
-    /// reuse the memory of its buffers for the output buffers.
+    /// `destination_sharding`. The input and the output of the program are declared in the memory of this array, so
+    /// the program accepts this array and returns its result in the same memory. If `donate` is `true`, the input of
+    /// the program is marked as donated so that PJRT can reuse the memory of its buffers for the output buffers.
     ///
     /// The compilation cache is keyed by the complete lowered computation, including its input and output sharding
     /// annotations and PJRT options.
@@ -851,8 +862,9 @@ impl Array {
         let destination_sharding = destination_sharding.clone();
 
         // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached as
-        // `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
-        let bare_input_type = ArrayType::new(element_type, shape.clone().into());
+        // `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`. The
+        // type keeps the memory of this array, which the identity carries over to the output.
+        let bare_input_type = ArrayType::new(element_type, shape.clone().into()).with_memory(self.r#type().memory());
 
         let options = Options::new(destination_mesh.clone())
             .with_input_shardings(vec![source_sharding.clone()])
@@ -866,7 +878,8 @@ impl Array {
 
     /// Copies this fully replicated array onto every device of `destination_mesh`, using copies between the devices of
     /// this process and PJRT cross-host transfers between processes, and then reshards the copy on
-    /// `destination_mesh` to `destination_sharding` with [`Self::reshard_on_same_mesh`]. The result retains the
+    /// `destination_mesh` to `destination_sharding` with [`Self::reshard_on_same_mesh`]. The copy and the result are
+    /// in the memory of this array. The result retains the
     /// completion fence of the cross-host sends that this process issued, so that [`Self::ready`] and
     /// [`Self::block_until_ready`] surface their errors without this function waiting for them.
     fn reshard_replicated_across_meshes(
@@ -902,10 +915,11 @@ impl Array {
         let source_process_indices =
             self.mesh().devices().iter().map(|device| device.process_index()).collect::<HashSet<_>>();
 
-        // Decide the transfer plan of each destination device. Local destinations are served by `copy_to_device` when
+        // Decide the transfer plan of each destination device. Local destinations are served by `copy_to_memory` when
         // this process owns a device of the source mesh, or by a cross-host receive otherwise. Remote destinations of
         // processes that own no device of the source mesh are served by cross-host sends from the process of the
         // canonical sender, and every other remote destination is ignored.
+        let memory = self.r#type().memory();
         let mut work = session.reserve_work();
         let mut local_buffers: HashMap<DeviceId, Buffer<'static>> = HashMap::new();
         let mut transfers = Vec::new();
@@ -930,7 +944,7 @@ impl Array {
                             device_id: canonical_source_device.id(),
                         })
                     })?;
-                    let buffer = local_source.copy_to_device(pjrt_device.clone())?;
+                    let buffer = local_source.copy_to_memory(Self::device_memory(pjrt_device, memory)?)?;
                     work.track_buffer(&buffer);
                     local_buffers.insert(destination_device_id, buffer);
                 } else {
@@ -970,7 +984,7 @@ impl Array {
 
         // Waiting for the sends here could deadlock, because a send completes only once its receiver issues the
         // matching receive, so the returned array retains their completion fence instead.
-        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers)?;
+        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, memory)?;
         local_buffers.extend(received_buffers.into_iter().map(|received| (received.destination, received.buffer)));
 
         // Assemble the buffers of the devices in the device order of `destination_mesh`. Only locally addressable
@@ -986,7 +1000,9 @@ impl Array {
         let shape = self.shape();
         let element_type = self.data_type();
         let replicated_on_destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), shape.rank());
-        let intermediate_type = ArrayType::new(element_type, shape.into()).with_sharding(replicated_on_destination)?;
+        let intermediate_type = ArrayType::new(element_type, shape.into())
+            .with_memory(memory)
+            .with_sharding(replicated_on_destination)?;
         let intermediate =
             Array::from_addressable_buffers(session, intermediate_type, destination_mesh.clone(), None, buffers)?;
 
@@ -1376,6 +1392,10 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
 /// Issues `transfers`, which are the cross-host transfers that the current process takes part in for one placement,
 /// and returns a fence for the sends and the received buffers with their transfer keys and device IDs.
 ///
+/// PJRT delivers a received buffer to the default memory of its destination device. When `memory` is another memory,
+/// each received buffer is therefore copied on its device to `memory`, and the copy is returned in its place. That
+/// copy is local to the device and does not wait for the transfer, so it does not affect the order described below.
+///
 /// The transfers are issued one at a time in the order of their source and then destination device IDs, keeping the
 /// given order of the transfers between the same two devices. The CUDA plugin carries the transfers between two
 /// devices over a communicator of that pair and pairs them by the order in which both sides issue them, ignoring their
@@ -1386,6 +1406,7 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
 fn issue_cross_host_transfers(
     session: &Session,
     mut transfers: Vec<CrossHostTransfer<'_>>,
+    memory: Memory,
 ) -> Result<(Option<ExecutionFence>, Vec<ReceivedShardBuffer>), Error> {
     if transfers.is_empty() {
         return Ok((None, Vec::new()));
@@ -1413,6 +1434,13 @@ fn issue_cross_host_transfers(
                 )?;
                 for buffer in buffers {
                     receives.track_buffer(&buffer);
+                    let buffer = if memory == Memory::Device {
+                        buffer
+                    } else {
+                        let placed = buffer.copy_to_memory(Array::device_memory(device, memory)?)?;
+                        receives.track_buffer(&placed);
+                        placed
+                    };
                     received_buffers.push(ReceivedShardBuffer { transfer_key, destination, buffer });
                 }
             }
@@ -1470,6 +1498,14 @@ mod tests {
             .shards()
             .iter()
             .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
+            .collect()
+    }
+
+    // Returns the PJRT memory kinds of the buffers that the addressable shards of `array` hold.
+    fn shard_memory_kinds(array: &Array) -> Vec<String> {
+        array
+            .addressable_shards()
+            .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned())
             .collect()
     }
 
@@ -1657,6 +1693,88 @@ mod tests {
     }
 
     #[test]
+    fn test_array_to_placement_preserves_host_memory() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = four_device_mesh_x(client);
+        let single_device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![mesh.devices()[0]],
+        )
+        .unwrap();
+        let sub_mesh = two_device_sub_mesh_x(client);
+        let manual_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            mesh.devices().to_vec(),
+        )
+        .unwrap();
+        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = |mesh: &DeviceMesh| {
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
+        };
+        let values = [1f32, 2., 3., 4.];
+        let tiles = vec![vec![1f32], vec![2.], vec![3.], vec![4.]];
+        for (memory, kind) in
+            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
+        {
+            let upload = |mesh: &DeviceMesh, sharding: Sharding| {
+                let r#type = ArrayType::new_static(DataType::F32, [4]).with_memory(memory);
+                Array::from_host_buffer(&session, r#type, mesh.clone(), Some(sharding), values_to_bytes(&values))
+                    .unwrap()
+            };
+            let place = |source: &Array, mesh: &DeviceMesh, sharding: Sharding| {
+                source.to_placement(&session, ArrayPlacement::Mesh { mesh: mesh.clone(), sharding }).unwrap()
+            };
+
+            // Whole shards that move to other devices are copied to the same memory of those devices, while the
+            // shard that stays on its device shares its buffer. No program is compiled for them.
+            let programs = session.cached_program_count();
+            let source = upload(&single_device_mesh, replicated(&single_device_mesh));
+            let placed = place(&source, &mesh, replicated(&mesh));
+            assert_eq!(session.cached_program_count(), programs);
+            assert_eq!(placed.r#type().memory(), memory);
+            assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
+            assert_eq!(shard_values(&placed), vec![values.to_vec(); 4]);
+
+            // The compiled reshard on one mesh declares its input and its output in the memory of the source, with
+            // and without donating the source.
+            let source = upload(&mesh, replicated(&mesh));
+            let placed = place(&source, &mesh, sharded(&mesh));
+            assert_eq!(placed.r#type().memory(), memory);
+            assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
+            assert_eq!(shard_values(&placed), tiles);
+            let placed = source
+                .into_placement(&session, ArrayPlacement::Mesh { mesh: mesh.clone(), sharding: sharded(&mesh) })
+                .unwrap();
+            assert_eq!(placed.r#type().memory(), memory);
+            assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
+            assert_eq!(shard_values(&placed), tiles);
+
+            // A replicated source on another mesh is copied to the memory of the source on the destination devices
+            // before it is resharded there.
+            let source = upload(&single_device_mesh, replicated(&single_device_mesh));
+            let placed = place(&source, &mesh, sharded(&mesh));
+            assert_eq!(placed.r#type().memory(), memory);
+            assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
+            assert_eq!(shard_values(&placed), tiles);
+
+            // A sharded source on another mesh is first gathered on its own mesh, which also keeps its memory.
+            let source = upload(&sub_mesh, sharded(&sub_mesh));
+            let placed = place(&source, &mesh, sharded(&mesh));
+            assert_eq!(placed.r#type().memory(), memory);
+            assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
+            assert_eq!(shard_values(&placed), tiles);
+
+            // The host fallback, which manual mesh axes require, uploads to the memory of the source.
+            let source = upload(&manual_mesh, replicated(&manual_mesh));
+            let placed = place(&source, &manual_mesh, sharded(&manual_mesh));
+            assert_eq!(placed.r#type().memory(), memory);
+            assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
+            assert_eq!(shard_values(&placed), tiles);
+        }
+    }
+
+    #[test]
     fn test_array_to_placement_zero_space_is_bufferless_and_preserves_type_metadata() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -1769,7 +1887,7 @@ mod tests {
 
         // The target is replicated on the full 4-device mesh. The exact shard path matches every destination shard to
         // the single source shard, which covers the full array. The destination shard on the source device shares the
-        // source buffer, `copy_to_device` produces independent buffers on the other devices, and `copy_to_host`
+        // source buffer, `copy_to_memory` produces independent buffers on the other devices, and `copy_to_host`
         // works on every one of them.
         let target_mesh = four_device_mesh_x(client);
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);

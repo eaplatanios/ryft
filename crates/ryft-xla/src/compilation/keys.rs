@@ -1254,7 +1254,10 @@ mod tests {
         assert_eq!(statistics.lowerings, 2);
         assert_eq!(statistics.compilation_requests, 2);
         assert_eq!(function.executable_specialization_count(), 2);
-        assert_eq!(session.cached_program_count(), 2);
+
+        // Besides the two specializations, the session caches one padding program for each input shape that is below
+        // its bound, which here are the shapes `[3]` and `[5]`.
+        assert_eq!(session.cached_program_count(), 4);
     }
 
     #[test]

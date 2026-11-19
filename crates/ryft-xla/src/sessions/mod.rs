@@ -454,8 +454,7 @@ impl Session {
     /// An array counts towards the session whose handle created its storage, and it keeps doing so after
     /// [`Array::associate`] moves it to another session. Every array that [`RetainedArray::to_array`] creates is a new
     /// logical array of the session that it is created in, even though it shares its device buffers with the array
-    /// that was retained. Arrays that the session holds internally (e.g., device scalars that it caches for bounded
-    /// dynamic shapes) are counted like any other array.
+    /// that was retained.
     ///
     /// The counts are maintained without locks and cost nothing when arrays are cloned or dropped, so they are always
     /// available. A count of live arrays that keeps growing across the steps of a loop indicates retained arrays, and

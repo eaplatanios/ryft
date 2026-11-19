@@ -443,6 +443,8 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
         let tensor_type = lower_tensor_type(&physical_type, context, location)?;
         let iota = block.append_operation(stable_hlo::iota(tensor_type, self.dimension(), location)?)?;
         let result = iota.result(0).unwrap().as_ref();
+        // The declared memory applies to the allocation at the bounds, like for the other dynamic constructors.
+        let result = annotate_output_memory(result, &physical_type, block, context, location)?;
         let result = refine_dynamic_constructor_result(
             result,
             &input_values,
@@ -1873,6 +1875,75 @@ mod tests {
                 MixedValue::Dimension(3),
                 MixedValue::Dimension(3),
             ],
+        );
+    }
+
+    #[test]
+    fn test_lower_dynamic_constructor_memory_placement() {
+        // Every dynamic constructor applies its declared memory to the allocation at the bounds, before the logical
+        // extent is attached to it.
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(3)).unwrap());
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]))
+            .with_memory(Memory::Host { pinned: true });
+        let mut builder = ArrayIrProgramBuilder::new();
+        let dimension = builder.add_input(DimensionType::from(size).into());
+        let zero = builder
+            .add_instruction(
+                ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
+                Vec::new(),
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let iota = builder
+            .add_instruction(
+                ArrayIrOperation::<ArrayConstant>::Iota(IotaOperation::new(output_type.clone(), 0).unwrap()),
+                Vec::new(),
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![zero, iota], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let input_types = vec![ArrayType::scalar(DataType::I64)];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type; 2], "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<i64>) -> (tensor<?xf64, #stablehlo.bounds<2>> {mhlo.memory_kind = \
+                      \"pinned_host\"}, tensor<?xf64, #stablehlo.bounds<2>> {mhlo.memory_kind = \"pinned_host\"}, \
+                      tensor<i64>, tensor<i64>) {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<2xf64>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = \"\", \
+                        has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = \
+                        \"pinned_host\"}} : (tensor<2xf64>) -> tensor<2xf64>
+                    %2 = stablehlo.convert %arg0 : (tensor<i64>) -> tensor<i32>
+                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<2xf64>, tensor<i32>) -> tensor<?xf64, \
+                        #stablehlo.bounds<2>>
+                    %4 = stablehlo.iota dim = 0 : tensor<2xf64>
+                    %5 = stablehlo.custom_call @annotate_device_placement(%4) {backend_config = \"\", \
+                        has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = \
+                        \"pinned_host\"}} : (tensor<2xf64>) -> tensor<2xf64>
+                    %6 = stablehlo.convert %arg0 : (tensor<i64>) -> tensor<i32>
+                    %7 = stablehlo.set_dimension_size %5, %6, dim = 0 : (tensor<2xf64>, tensor<i32>) -> tensor<?xf64, \
+                        #stablehlo.bounds<2>>
+                    %8:2 = stablehlo.optimization_barrier %3, %7 : tensor<?xf64, #stablehlo.bounds<2>>, tensor<?xf64, \
+                        #stablehlo.bounds<2>>
+                    %9 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?xf64, #stablehlo.bounds<2>>) -> \
+                        tensor<i32>
+                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
+                    %11 = stablehlo.get_dimension_size %7, dim = 0 : (tensor<?xf64, #stablehlo.bounds<2>>) -> \
+                        tensor<i32>
+                    %12 = stablehlo.convert %11 : (tensor<i32>) -> tensor<i64>
+                    return %8#0, %8#1, %10, %12 : tensor<?xf64, #stablehlo.bounds<2>>, tensor<?xf64, \
+                        #stablehlo.bounds<2>>, tensor<i64>, tensor<i64>
+                  }
+                }
+            "},
         );
     }
 

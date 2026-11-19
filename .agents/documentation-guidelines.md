@@ -7,6 +7,10 @@ code comments. Preserve the documented contract, technical rationale, and links 
   documentation unless their name is self-explanatory. If an enum variant requires a documentation string, then you must
   add documentation for all variants in that enum. Test functions are an exception. Give them descriptive names and use
   ordinary code comments for non-obvious intent rather than adding documentation strings.
+- Do not add documentation strings to the variants of error enums. The `#[error(...)]` message of each variant already
+  describes it, so document the enum itself, and the fields of a variant when their roles are not obvious (e.g., which
+  bound is inclusive). Keep an empty line between adjacent variants. Refer to `ShardingError` and `BroadcastingError` in
+  `ryft-core` for the expected form.
 - When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
   unit variants or small enums.
 - Keep an empty line between adjacent documented struct fields, including fields of private implementation structs.

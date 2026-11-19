@@ -3,8 +3,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayType, DataType, DeviceMesh, Layout, Memory, ProgramError, Sharding, StaticShape, Typed,
-    UnreducedKind,
+    Array as CoreArray, ArrayType, DataType, DeviceMesh, Layout, Memory, Sharding, StaticShape, Typed, UnreducedKind,
 };
 use ryft_pjrt::{
     Device as PjrtDevice, DeviceId, ExecutionFence, HostBuffer, HostDestination, HostDestinationSlice,
@@ -46,15 +45,6 @@ pub(crate) struct DenseArrayHostCopy {
 }
 
 impl DenseArrayHostCopy {
-    /// Returns the number of device-to-host shard copies that this materialization has already issued.
-    #[inline]
-    pub(crate) fn shard_copy_count(&self) -> usize {
-        match &self.shards {
-            DenseShardHostCopies::Merged(shards) => shards.len(),
-            DenseShardHostCopies::Direct { copies, .. } => copies.len(),
-        }
-    }
-
     /// Waits for every previously issued copy and produces one dense row-major byte buffer.
     pub(crate) fn finish(self) -> Result<Vec<u8>, Error> {
         self.finish_with_measurements().map(|(bytes, _)| bytes)
@@ -251,7 +241,7 @@ impl Array {
 
             // Resolve the requested space explicitly, because passing the device itself would always upload to its
             // default memory and could silently mislabel a host-resident array as pinned or unpinned memory.
-            let memory = Self::host_upload_memory(device, r#type.memory())?;
+            let memory = Self::device_memory(device, r#type.memory())?;
 
             // Upload the local shard bytes to the PJRT device using the static shape of the shard. For non-scalar
             // shards, the host pointer is moved to the shard's first element in the dense source buffer, and PJRT's
@@ -435,7 +425,7 @@ impl Array {
                 return Err(ArrayError::HostShardByteCountMismatch { device_id, expected, actual }.into());
             }
             if !data_type.is_zero() {
-                let memory = Self::host_upload_memory(device, r#type.memory())?;
+                let memory = Self::device_memory(device, r#type.memory())?;
                 uploads.push((bytes, shape, memory));
             }
         }
@@ -674,27 +664,14 @@ impl Array {
         Array::from_addressable_buffers(session, r#type, self.mesh().clone(), Some(self.sharding().clone()), buffers)
     }
 
-    /// Rejects a dense host round trip of this array for `purpose` (i.e., materializing its logical value on the host
-    /// and uploading a value derived from it) when the sharding of this array has unreduced axes. The devices of such
-    /// an array hold separate summands of its value, which the round trip would replace with a canonical decomposition
-    /// of their sum, and an unchecked `shard_map` body observes those summands. `purpose` names the round trip in the
-    /// error message (e.g., `"pad"`).
-    pub(crate) fn validate_host_round_trip(&self, purpose: &str) -> Result<(), Error> {
-        if self.sharding().unreduced_axes().is_empty() {
-            return Ok(());
-        }
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "cannot {purpose} an array of type `{}` through the host, because its devices hold separate summands \
-                 along its unreduced axes, which a dense host copy would not preserve",
-                self.r#type(),
-            ),
-        }
-        .into())
-    }
-
-    /// Resolves the destination memory of a host upload on `device`.
-    fn host_upload_memory<'d>(device: &'d PjrtDevice<'_>, memory: Memory) -> Result<PjrtMemory<'d>, Error> {
+    /// Resolves `memory` to the PJRT memory of `device` that holds the shards of an array placed in it, which is where
+    /// host uploads and copies between devices allocate their buffers. [`Memory::Device`] resolves to the default
+    /// memory of the device, and a host placement resolves to its `pinned_host` or `unpinned_host` memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrayError::UnsupportedMemory`] if `device` has no memory of the requested host kind.
+    pub(super) fn device_memory<'d>(device: &'d PjrtDevice<'_>, memory: Memory) -> Result<PjrtMemory<'d>, Error> {
         match memory {
             Memory::Device => Ok(device.default_memory()?),
             Memory::Host { pinned } => {
@@ -995,8 +972,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Device, DeviceMesh, Dimension as CoreDimension, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, TiledLayout,
+        Device, DeviceMesh, Dimension as CoreDimension, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
+        ProgramError, Shape, Sharding, ShardingDimension, TiledLayout,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
@@ -1005,6 +982,14 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, logical_mesh_2x2, values_from_bytes, values_to_bytes};
 
     use super::*;
+
+    // Returns the number of device-to-host shard copies that `copy` has issued.
+    fn shard_copy_count(copy: &DenseArrayHostCopy) -> usize {
+        match &copy.shards {
+            DenseShardHostCopies::Merged(shards) => shards.len(),
+            DenseShardHostCopies::Direct { copies, .. } => copies.len(),
+        }
+    }
 
     #[test]
     fn test_array_from_host_buffer() {
@@ -1217,18 +1202,11 @@ mod tests {
             assert_eq!(materialize(&candidates), expected.to_vec());
         }
 
-        // A host relayout keeps every device's summand, while a dense host round trip, which would replace them, is
-        // rejected.
+        // A host relayout keeps every device's summand.
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
         let relaid = summands.relayout_through_host(&session, &layout).unwrap();
         assert_eq!(relaid.layout(), Some(&layout));
         assert_eq!(device_values(&relaid), vec![vec![1., 2.], vec![3., 4.], vec![10., 20.], vec![30., 40.]]);
-        assert_eq!(
-            summands.validate_host_round_trip("pad").unwrap_err().to_string(),
-            "cannot pad an array of type `f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:explicit]>, [{'y'}], \
-             unreduced={'x'}}]` through the host, because its devices hold separate summands along its unreduced \
-             axes, which a dense host copy would not preserve",
-        );
     }
 
     #[test]
@@ -1554,7 +1532,7 @@ mod tests {
                     .unwrap()
                     .with_execution_fence(ExecutionFence::new(vec![event]));
             let copy = array.begin_copy_to_host().unwrap();
-            assert_eq!(copy.shard_copy_count(), 0);
+            assert_eq!(shard_copy_count(&copy), 0);
             assert_eq!(copy.finish().unwrap_err().to_string(), "empty producer failed");
         }
     }
@@ -1585,7 +1563,7 @@ mod tests {
             let array =
                 Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&values)).unwrap();
             let copy = array.begin_copy_to_host().unwrap();
-            let shard_copy_count = copy.shard_copy_count();
+            let shard_copy_count = shard_copy_count(&copy);
             let (bytes, merged) = copy.finish_with_measurements().unwrap();
             (values_from_bytes::<f32>(bytes.as_slice()), shard_copy_count, merged)
         };
