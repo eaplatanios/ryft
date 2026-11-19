@@ -112,7 +112,7 @@ use crate::{
 pub mod effects;
 pub mod platforms;
 pub mod runtimes;
-pub(crate) mod synchronization;
+pub mod synchronization;
 pub mod targets;
 
 pub use platforms::Platform;
@@ -122,6 +122,16 @@ pub use runtimes::{
     normalize_runtime_requirements,
 };
 pub use targets::{Target, TargetDevice};
+
+/// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SessionError {
+    #[error("platform `{platform}` is unavailable because `ryft-xla` was built without its `{feature}` feature")]
+    UnavailablePlatform { platform: Platform, feature: &'static str },
+
+    #[error("invalid client options: {reason}")]
+    InvalidClientOptions { reason: String },
+}
 
 /// Default maximum number of compiled operation applications retained in a session's eager dispatch cache, which
 /// [`SessionBuilder::eager_dispatch_cache_capacity`] overrides.
@@ -1126,41 +1136,23 @@ impl CoreConstant<Value, Constant> for Session {
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
 pub type Tracer = DomainTracer<Session>;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`].
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SessionError {
-    /// The Cargo feature of `ryft-xla` that provides the plugin of the requested platform is not enabled.
-    #[error("platform `{platform}` is unavailable because `ryft-xla` was built without its `{feature}` feature")]
-    UnavailablePlatform { platform: Platform, feature: &'static str },
-
-    /// Client options were supplied for a client that they cannot configure.
-    #[error("invalid client options: {reason}")]
-    InvalidClientOptions { reason: String },
-}
-
 /// Builder of [`Session`]s, which [`Session::builder`] returns and which is the one interface for configuring their
-/// construction. [`Session::new`] is a shorthand for building a session without any configuration.
-///
-/// A builder first selects the PJRT client of the session. By default, the session creates its own client for
-/// [`Platform::Auto`]. [`Self::platform`] requests a specific platform, [`Self::plugin`] uses a PJRT plugin that
-/// `ryft-xla` does not know about, and [`Self::client_options`] configures the client that either of them creates.
-/// These clients live for the rest of the process, and sessions that request the same plugin with equal client
-/// options share one client, as the [`platforms`] module documents. [`Self::client`]
-/// instead supplies a client that the caller created. Each of [`Self::platform`], [`Self::plugin`], and
-/// [`Self::client`] replaces the selection of the others.
-///
-/// The remaining functions configure the resources that all handles of the session share. The order in which a
-/// builder is configured does not matter otherwise.
+/// construction. [`Session::new`] is a shorthand for building a session without any configuration. A builder first
+/// selects the PJRT [`Client`] of the session. By default, the session creates its own client for [`Platform::Auto`].
+/// [`Self::platform`] requests a specific platform, [`Self::plugin`] uses a PJRT plugin that the Ryft XLA backend does
+/// not know about, and [`Self::client_options`] configures the client that either of them creates. These clients live
+/// for the rest of the process, and sessions that request the same plugin with equal client options share one client,
+/// as the [`platforms`] module documents. [`Self::client`] instead supplies a client that the caller created. Each of
+/// [`Self::platform`], [`Self::plugin`], and [`Self::client`] replaces the selection of the others. The remaining
+/// functions configure the resources that all handles of the session share. The order in which a builder is configured
+/// does not matter otherwise.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use ryft_core::DiskCache;
-/// use ryft_pjrt::{ClientOptions, CpuClientOptions};
-/// use ryft_xla::{Platform, Session};
-///
+/// # use ryft_core::DiskCache;
+/// # use ryft_pjrt::{ClientOptions, CpuClientOptions};
+/// # use ryft_xla::{Platform, Session};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // A session on the best available platform, whose compiled programs persist across processes.
 /// let session = Session::builder().disk_cache(DiskCache::open("/tmp/ryft-cache")?).build()?;
@@ -1172,10 +1164,10 @@ pub enum SessionError {
 /// # }
 /// ```
 pub struct SessionBuilder {
-    /// Source of the client of the session.
+    /// Source of the [`Client`] of the session.
     client_source: ClientSource,
 
-    /// Options of the client that `ryft-xla` creates for the session, if the caller supplied any.
+    /// Options of the [`Client`] that the Ryft XLA backend creates for the session, if the caller supplied any.
     client_options: Option<ClientOptions>,
 
     /// Template of the options that the session forwards to [`Client::compile`].
@@ -1190,38 +1182,43 @@ pub struct SessionBuilder {
     /// Maximum number of compiled operation applications that the eager dispatch cache of the session retains.
     eager_dispatch_cache_capacity: usize,
 
-    /// Runtime provider configuration of the session.
+    /// [`RuntimeExtensions`] of the session.
     runtime_extensions: RuntimeExtensions,
 }
 
 impl SessionBuilder {
-    /// Requests a client that `ryft-xla` creates for `platform`. An explicit platform never falls back to another
-    /// one, so building the session fails if `platform` is unavailable.
+    /// Requests a client that the Ryft XLA backend creates for `platform`. An explicit platform never falls back to
+    /// another one, so building the session fails if `platform` is unavailable.
+    #[inline]
     pub fn platform(mut self, platform: Platform) -> Self {
         self.client_source = ClientSource::Platform(platform);
         self
     }
 
-    /// Requests a client that `ryft-xla` creates through `plugin`, for PJRT plugins that [`Platform`] does not name
-    /// (e.g., one loaded with [`load_plugin`](ryft_pjrt::load_plugin)). The client is created with the options of
-    /// [`Self::client_options`], or with the default [`ClientOptions`] if none are supplied.
+    /// Requests a client that the Ryft XLA backend creates through `plugin`, for PJRT plugins that [`Platform`] does
+    /// not name (e.g., one loaded with [`load_plugin`](ryft_pjrt::load_plugin)). The client is created with the options
+    /// of [`Self::client_options`], or with the default [`ClientOptions`] if none are supplied.
+    #[inline]
     pub fn plugin(mut self, plugin: Plugin) -> Self {
         self.client_source = ClientSource::Plugin(plugin);
         self
     }
 
-    /// Supplies the options of the client that `ryft-xla` creates for the session (e.g., the number of CPU devices,
-    /// or the visible devices and the memory allocator of a GPU client) in place of the defaults of its platform. The
-    /// options must fit the platform or plugin of the session, so they require an explicit one.
+    /// Supplies the options of the [`Client`] that the Ryft XLA backend creates for the session (e.g., the number of
+    /// CPU devices, or the visible devices and the memory allocator of a GPU client) in place of the defaults of its
+    /// platform. The options must fit the platform or plugin of the session, so they require an explicit one.
+    #[inline]
     pub fn client_options(mut self, client_options: ClientOptions) -> Self {
         self.client_options = Some(client_options);
         self
     }
 
-    /// Supplies a client that the caller created, which must live for the rest of the process (e.g., a leaked client
-    /// or one that is stored in a static) and which several sessions may share. This is the extension point for
-    /// clients that `ryft-xla` cannot create (e.g., a client of a [`DistributedRuntime`](crate::DistributedRuntime),
-    /// whose runtime must then live for the rest of the process as well).
+    /// Supplies a [`Client`] that the caller created, which must live for the rest of the process (e.g., a leaked
+    /// client or one that is stored in a static) and which several sessions may share. This is the extension point
+    /// for clients that the Ryft XLA backend cannot create (e.g., a client of a
+    /// [`DistributedRuntime`](crate::DistributedRuntime), whose runtime must
+    /// then live for the rest of the process as well).
+    #[inline]
     pub fn client(mut self, client: &'static Client<'static>) -> Self {
         self.client_source = ClientSource::Client(client);
         self
@@ -1229,6 +1226,7 @@ impl SessionBuilder {
 
     /// Supplies the template of the options that the session forwards to [`Client::compile`].
     /// Refer to [`Session::compilation_options`] for more information.
+    #[inline]
     pub fn compilation_options(mut self, compilation_options: CompilationOptions) -> Self {
         self.compilation_options = compilation_options;
         self
@@ -1237,6 +1235,7 @@ impl SessionBuilder {
     /// Supplies the compilation cache of the session in place of the default one, which keeps up to its default
     /// number of compiled programs in memory. Refer to [`CompilationCache`] for information on its tiers, its
     /// artifact exchange, and its event reporting.
+    #[inline]
     pub fn compilation_cache(mut self, compilation_cache: CompilationCache<'static, Session>) -> Self {
         self.compilation_cache = compilation_cache;
         self
@@ -1245,14 +1244,18 @@ impl SessionBuilder {
     /// Makes the compilation cache of the session also write through to `disk_cache`, with its size cap and write
     /// thresholds, so that later processes restart warm. This replaces the disk cache of a context that was supplied
     /// through [`Self::compilation_cache`].
+    #[inline]
     pub fn disk_cache(mut self, disk_cache: DiskCache) -> Self {
         self.disk_cache = Some(DiskCacheSource::Explicit(disk_cache));
         self
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Makes the compilation cache of the session also write through to the [`DiskCache`] that the
-    /// [`DiskCache::ENV_VAR`] environment variable configures, if it is set. An absent variable leaves the cache as
-    /// it is otherwise configured. The variable is read when the session is built.
+    /// [`DiskCache::ENV_VAR`] environment variable configures, if it is set. An absent variable leaves
+    /// the cache as it is otherwise configured. The variable is read when the session is built.
+    #[inline]
     pub fn disk_cache_from_env(mut self) -> Self {
         self.disk_cache = Some(DiskCacheSource::Environment);
         self
@@ -1264,6 +1267,7 @@ impl SessionBuilder {
     /// [`CompilationCache`] (i.e., [`CompilationCache::with_capacity`], with a default of 8192). The two caches
     /// are bounded independently, like the corresponding caches of JAX, and a program stays alive for as long as
     /// either cache retains it.
+    #[inline]
     pub fn eager_dispatch_cache_capacity(mut self, capacity: usize) -> Self {
         self.eager_dispatch_cache_capacity = capacity;
         self
@@ -1274,6 +1278,7 @@ impl SessionBuilder {
     /// Initialized instances belong to the session, even when `runtime_extensions` was cloned from another
     /// configuration. Providers initialize lazily when an executable requires them, so building the session does not
     /// load GPU drivers on their behalf.
+    #[inline]
     pub fn runtime_extensions(mut self, runtime_extensions: RuntimeExtensions) -> Self {
         self.runtime_extensions = runtime_extensions;
         self
@@ -1799,6 +1804,18 @@ pub(crate) mod tests {
             .into_iter()
             .map(|value| value != 0)
             .collect()
+    }
+
+    #[test]
+    fn test_session_error_display() {
+        assert_eq!(
+            SessionError::UnavailablePlatform { platform: Platform::Tpu, feature: "tpu" }.to_string(),
+            "platform `tpu` is unavailable because `ryft-xla` was built without its `tpu` feature",
+        );
+        assert_eq!(
+            SessionError::InvalidClientOptions { reason: "reason".to_string() }.to_string(),
+            "invalid client options: reason",
+        );
     }
 
     #[test]
@@ -4208,18 +4225,6 @@ pub(crate) mod tests {
         // dispatch.
         let output: Array = batch(|x| Ok(x.clone() * x), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(read_f32s(client, &output), vec![1.0, 4.0, 9.0]);
-    }
-
-    #[test]
-    fn test_session_error_display() {
-        assert_eq!(
-            SessionError::UnavailablePlatform { platform: Platform::Tpu, feature: "tpu" }.to_string(),
-            "platform `tpu` is unavailable because `ryft-xla` was built without its `tpu` feature",
-        );
-        assert_eq!(
-            SessionError::InvalidClientOptions { reason: "reason".to_string() }.to_string(),
-            "invalid client options: reason",
-        );
     }
 
     #[test]

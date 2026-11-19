@@ -727,8 +727,13 @@ impl AssertionValue for ArrayConstant {
 ///     a nested region, most importantly a `shard_map` manual computation, which owns no capture table of its own.
 ///     That is what lets shape arithmetic, such as the explicit result extents of the collectives, be staged against
 ///     a manual region's shard-local values.
-///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
-///     composition, and assertion folding without requiring a captured device buffer.
+///   - **Immediate Boolean predicates:** a predicate that is already known on the host while tracing (i.e., the
+///     result of comparing two first-class dimensions with known extents) is stored in the program itself, so that it
+///     stays concrete through array projection, logical composition, and assertion folding without requiring a
+///     captured device buffer. Like an immediate dimension, it also stays usable inside nested regions, which own no
+///     capture table. Booleans are the only array elements with an immediate form because predicates are the only
+///     array values that host-side reasoning produces. Nothing in tracing computes, for example, a known `F32` scalar
+///     on the host, so every other array constant is a capture or a session array.
 ///   - **Session arrays:** a [`SessionConstant`] is a handle to an array that is retained for a
 ///     trace whose capture table cannot hold runtime arrays (e.g., the body of a rematerialized function or of a
 ///     composite). Lowering turns it into a hidden executable argument, as it does for a capture.
