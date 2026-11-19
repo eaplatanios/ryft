@@ -150,29 +150,29 @@ pub enum ArrayError {
     InconsistentOverlappingShardData { shard_index: ShardIndex },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information. An
-/// [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
-/// devices in a [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by its
-/// type and sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
-/// [`Array::shards`] is a global list, which contains one [`ArrayShard`] for each device that participates in the
-/// array placement, and not only for the devices that are visible to the current process. In a single-process setup,
-/// every shard is normally _addressable_ because the local [`Client`] can directly access its storage. In a
-/// multi-device or multi-node setup, the same logical array can span devices owned by other processes. Shards on the
-/// current process's devices are addressable and ordinarily carry local [`Buffer`]s. Bufferless [`DataType::Zero`]
-/// shards are also addressable because their unique value requires no storage. Shards on remote devices are
-/// non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and [`ArrayType`].
-/// Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason about the
-/// complete global placement while only transferring, executing with, or materializing buffers that this process can
-/// access directly. This distinction is what allows array movement, execution argument assembly, and cross-host
-/// transfers to preserve the full global sharding contract without requiring every process to own every shard buffer.
+/// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information.
+/// An [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
+/// devices in a [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by
+/// its type and sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
+/// [`Array::shards`] is a global list, which contains one [`ArrayShard`] for each device that participates in the array
+/// placement, and not only for the devices that are visible to the current process. In a single-process setup, every
+/// shard is normally _addressable_ because the local [`Client`] can directly access its storage. In a multi-device or
+/// multi-node setup, the same logical array can span devices owned by other processes. Shards on the current process's
+/// devices are addressable and ordinarily carry local [`Buffer`]s. Bufferless [`DataType::Zero`] shards are also
+/// addressable because their unique value requires no storage. Shards on remote devices are non-addressable and carry
+/// only metadata such as their global [`ShardIndex`], [`DeviceId`], and [`ArrayType`]. Keeping both addressable and
+/// non-addressable shards in the same [`Array`] lets local code reason about the complete global placement while only
+/// transferring, executing with, or materializing buffers that this process can access directly. This distinction is
+/// what allows array movement, execution argument assembly, and cross-host transfers to preserve the full global
+/// sharding contract without requiring every process to own every shard buffer.
 ///
-/// The current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays retain
-/// their logical `I1` or `U1` type while using one byte per element in this physical representation. This executable
-/// convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer types.
+/// Note that the current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays
+/// retain their logical `I1` or `U1` type while using one byte per element in this physical representation. This
+/// executable convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer
+/// types.
 #[derive(Clone, Parameter)]
 pub struct Array {
+    // TODO(eaplatanios): Review from here onwards.
     /// Type and shards of this [`Array`]. They are immutable once constructed and shared by
     /// every clone, so cloning an array costs a few reference-count increments rather than a deep copy.
     parts: Arc<ArrayParts>,
