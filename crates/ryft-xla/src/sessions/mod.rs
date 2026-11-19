@@ -1473,7 +1473,7 @@ pub(crate) mod tests {
     use std::convert::Infallible;
 
     use half::{bf16, f16};
-    use indoc::indoc;
+    use indoc::formatdoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
@@ -4350,9 +4350,9 @@ pub(crate) mod tests {
         assert_eq!(output_types, vec![array_type.clone(), dimension.r#type().into_owned()]);
         assert_eq!(
             program.to_string(),
-            indoc! {"
+            formatdoc! {"
                 lambda %0:f32[] .
-                let %1:f32[2][sharding={mesh<['x'=1:auto]>, [{}]}] = const session:f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]
+                let %1:{array_type} = const session:{array_type}
                     %2:dimension<3> = const 3
                 in (%1, %2)
             "}
