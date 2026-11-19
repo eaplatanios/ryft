@@ -593,10 +593,9 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     #[cfg(feature = "cuda-13")]
-    #[cfg(feature = "cuda-13")]
     use crate::tests::{values_from_bytes, values_to_bytes};
     #[cfg(feature = "cuda-13")]
-    use crate::{Array, ExecutionArguments, FromPjrt, Platform};
+    use crate::{Array, ExecutionArguments, FromPjrt, Platform, Session};
     use crate::{ArrayTracer, TracedProgram, trace};
 
     use super::*;

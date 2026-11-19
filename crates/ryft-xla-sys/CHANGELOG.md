@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added CUDA 12, CUDA 13, and ROCm 10 static archives to the native release workflow. Triton builds select the
+  corresponding GPU archive when a GPU feature is enabled.
 - Added native bindings for converting XProf `XSpace` traces into XLA feedback-directed optimization profiles and
   aggregating multiple instruction profiles at a configurable percentile.
 - Added support for Linux AArch64.

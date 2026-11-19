@@ -44,6 +44,10 @@ pre-release-replacements = [
 [features]
 default = []
 
+# Selects a GPU-enabled native archive when a supported GPU feature is enabled on Linux,
+# which supports Triton compilation.
+triton = []
+
 # Includes support for the [PJRT](https://openxla.org/xla/pjrt) [CUDA 12](https://docs.nvidia.com/cuda/) plugin that
 # enables using CUDA-supported accelerators. Note that if an appropriate `pjrt-plugin` archive is not found at the
 # location specified by the `PJRT_PLUGIN_CUDA_12_LIB` environment variable, then an attempt will be made to build it

@@ -254,13 +254,14 @@ bool Compile(RYFT_XLA_Triton_Compile_Args* args, llvm::raw_ostream& diagnostics)
   std::string artifact;
   if (cuda) {
 #if defined(RYFT_TRITON_CUDA)
-    // The qualified ptxas 13.0 assembler accepts PTX 9.0. LLVM can emit a newer version by default.
+    // The qualified CUDA 12.9 and 13.0 assemblers accept PTX 8.8 and 9.0, respectively.
+    // LLVM can emit a newer version by default.
     auto compiled = xla::gpu::nvptx::CompileToPtx(
         llvm_module.get(), capability, xla::DefaultDebugOptionsIgnoringFlags(), [&](llvm::TargetMachine* target) {
           llvm_module->setDataLayout(target->createDataLayout());
           llvm_module->setTargetTriple(target->getTargetTriple());
         },
-        /*max_ptx_isa_version=*/90);
+        /*max_ptx_isa_version=*/CUDA_VERSION < 13000 ? 88 : 90);
     if (!compiled.ok()) {
       diagnostics << compiled.status().ToString() << "\n";
       return false;

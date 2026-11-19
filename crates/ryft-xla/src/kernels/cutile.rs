@@ -114,13 +114,14 @@ mod tests {
     #[cfg(feature = "cutile-compiler")]
     use crate::FromPjrt;
     #[cfg(feature = "cutile-compiler")]
+    use crate::Session;
+    #[cfg(feature = "cutile-compiler")]
     use crate::kernels::aot::tests::{executable_bundle, refresh_checksum};
     #[cfg(feature = "cutile-compiler")]
     use crate::kernels::aot::{KernelAotBundle, KernelAotError};
     #[cfg(feature = "cutile-compiler")]
     use crate::kernels::staging::KernelCompilerBinding;
     use crate::kernels::staging::KernelDeviceFacts;
-    #[cfg(feature = "cutile-compiler")]
     #[cfg(feature = "cutile-compiler")]
     use crate::tests::execution_client;
 

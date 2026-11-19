@@ -248,46 +248,61 @@ jobs:
           echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
           echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Build `ryft-xla-sys` Library
-        if: ${{ matrix.config.device == 'cpu' }}
+      - name: Build `ryft-xla-sys` Archive and PJRT Plugin
         working-directory: ./ryft/crates/ryft-xla-sys
-        id: build_ryft_xla_sys_library
+        id: build_native
         shell: bash
+        env:
+          NATIVE_DEVICE: ${{ matrix.config.device }}
+          NATIVE_PLATFORM: ${{ matrix.config.platform }}
         run: |
-          OUTPUT=ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-          bazel build --config=${{ matrix.config.platform }} //:ryft-xla-sys-archive
-          cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
-          echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+          configs=("--config=$NATIVE_PLATFORM")
+          targets=(//:ryft-xla-sys-archive)
+          if [[ "$NATIVE_DEVICE" != cpu ]]; then
+            configs+=("--config=$NATIVE_DEVICE")
+            targets+=(//:pjrt-gpu-plugin)
+          fi
+          bazel build "${configs[@]}" "${targets[@]}"
+
+          archive="ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-$NATIVE_DEVICE.tar.gz"
+          cp bazel-bin/ryft-xla-sys-archive.tar.gz "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          if [[ "$NATIVE_DEVICE" != cpu ]]; then
+            plugin="libpjrt-plugin-$NATIVE_DEVICE.so"
+            cp bazel-bin/libpjrt-gpu-plugin.so "$plugin"
+            echo "plugin=$plugin" >> "$GITHUB_OUTPUT"
+          fi
 
       # Retain the exact built headers for binding regeneration even when a subsequent compatibility check fails.
       # Publication still depends on every build and test job succeeding.
       - name: Upload `ryft-xla-sys` Library
-        if: ${{ matrix.config.device == 'cpu' }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+          name: ${{ steps.build_native.outputs.archive }}
+          path: ryft/crates/ryft-xla-sys/${{ steps.build_native.outputs.archive }}
 
       - name: Test `ryft-xla-sys` Library / Check Archive Contents and Reproducibility
-        if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
         shell: bash
         env:
           RYFT_XLA_SYS_ARCHIVE: >-
-            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_native.outputs.archive }}
+          NATIVE_DEVICE: ${{ matrix.config.device }}
         run: |
           # Check the exact upload artifact without asking Bazel to rebuild its native dependencies.
           python tests/archive_contract_test.py "$RYFT_XLA_SYS_ARCHIVE"
-          bazel test --config=${{ matrix.config.platform }} --test_output=errors \
-            //:ryft-xla-sys-archive-reproducibility-test
+          if [[ "$NATIVE_DEVICE" == cpu ]]; then
+            bazel test --config=${{ matrix.config.platform }} --test_output=errors \
+              //:ryft-xla-sys-archive-reproducibility-test
+          fi
 
       - name: Test `ryft-xla-sys` Library / Run Rust Binding and MLIR Tests
-        if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
         shell: bash
         env:
           RYFT_XLA_SYS_ARCHIVE: >-
-            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_native.outputs.archive }}
+          RYFT_TEST_TRITON_ARCHIVE_DEVICE: ${{ matrix.config.device }}
         run: |
           # GNU ld can overflow AArch64 branch relocations when linking the whole native archive.
           if [[ "${{ matrix.config.os }}" == "linux" && "${{ matrix.config.architecture }}" == "arm64" ]]; then
@@ -295,7 +310,9 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
           fi
           cargo test --manifest-path ../../Cargo.toml -p ryft-xla-sys --lib
-          cargo test --manifest-path ../../Cargo.toml -p ryft-mlir --lib
+          if [[ "$RYFT_TEST_TRITON_ARCHIVE_DEVICE" == cpu ]]; then
+            cargo test --manifest-path ../../Cargo.toml -p ryft-mlir --lib
+          fi
 
       - name: Test `ryft-xla-sys` Library / Check Upstream API Coverage and Archive Symbols
         if: ${{ matrix.config.device == 'cpu' }}
@@ -303,7 +320,7 @@ jobs:
         shell: bash
         env:
           RYFT_XLA_SYS_ARCHIVE: >-
-            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_native.outputs.archive }}
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           python tests/symbol_contract_test.py \
@@ -315,19 +332,6 @@ jobs:
             --ryft-mlir-root ../ryft-mlir
           python -m unittest tests/symbol_contract_test.py
 
-      - name: Build PJRT Plugin
-        if: ${{ matrix.config.device != 'cpu' }}
-        working-directory: ./ryft/crates/ryft-xla-sys
-        id: build_pjrt_plugin
-        shell: bash
-        run: |
-          LIB_PREFIX="${{ matrix.config.os != 'windows' && 'lib' || '' }}"
-          LIB_SUFFIX="${{ matrix.config.os == 'linux' && '.so' || '' }}${{ matrix.config.os == 'macos' && '.dylib' || '' }}${{ matrix.config.os == 'windows' && '.dll' || '' }}"
-          OUTPUT="${LIB_PREFIX}pjrt-plugin-${{ matrix.config.device }}${LIB_SUFFIX}"
-          bazel build --config=${{ matrix.config.platform }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-10' && '--config=rocm-10' || '' }} //:pjrt-gpu-plugin
-          cp bazel-bin/libpjrt-gpu-plugin.so $OUTPUT
-          echo "library=$OUTPUT" >> $GITHUB_OUTPUT
-
       # The CUDA plugins link JAX's Mosaic GPU runtime with static registration of the `mosaic_gpu_v2` XLA FFI target.
       # The version script hides every symbol except `GetPjrtApi`, so retention is proven through the registration
       # string that `XLA_FFI_REGISTER_HANDLER` embeds; the exported-symbol table must still contain only the PJRT entry.
@@ -336,7 +340,7 @@ jobs:
         working-directory: ./ryft/crates/ryft-xla-sys
         shell: bash
         run: |
-          python3 - "${{ steps.build_pjrt_plugin.outputs.library }}" << 'PY'
+          python3 - "${{ steps.build_native.outputs.plugin }}" << 'PY'
           import pathlib
           import sys
           library = pathlib.Path(sys.argv[1]).read_bytes()
@@ -344,7 +348,7 @@ jobs:
               raise SystemExit(f"{sys.argv[1]} does not retain the `mosaic_gpu_v2` XLA FFI registration")
           print(f"{sys.argv[1]} retains the `mosaic_gpu_v2` registration")
           PY
-          LIBRARY="${{ steps.build_pjrt_plugin.outputs.library }}"
+          LIBRARY="${{ steps.build_native.outputs.plugin }}"
           EXPORTED=$(nm -D --defined-only "$LIBRARY" | awk '{sub(/@.*/, "", $NF); print $NF}' | sort -u)
           test "$EXPORTED" = "GetPjrtApi" || { echo "unexpected exported symbols: $EXPORTED"; exit 1; }
 
@@ -354,7 +358,7 @@ jobs:
         with:
           command: c
           cwd: ./ryft/crates/ryft-xla-sys/
-          files: ${{ steps.build_pjrt_plugin.outputs.library }}
+          files: ${{ steps.build_native.outputs.plugin }}
           outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
 
       - name: Upload PJRT Plugin
@@ -383,7 +387,7 @@ jobs:
           files: "*.tar.gz/*.tar.gz"
 
   verify-release:
-    name: Verify Published Consumer [${{ matrix.config.os }}-${{ matrix.config.architecture }}]
+    name: Verify Published Consumer [${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}]
     if: ${{ !cancelled() && (inputs.verify_published_only || (needs.build.result == 'success' && needs.release.result == 'success')) }}
     needs: ["build", "release"]
     permissions:
@@ -395,16 +399,40 @@ jobs:
         config:
           - os: linux
             architecture: amd64
+            device: cpu
             runner: ubuntu-latest
           - os: linux
             architecture: arm64
+            device: cpu
             runner: ubuntu-24.04-arm
           - os: macos
             architecture: arm64
+            device: cpu
             runner: macos-26
           - os: windows
             architecture: amd64
+            device: cpu
             runner: windows-latest
+          - os: linux
+            architecture: amd64
+            device: cuda-12
+            runner: ubuntu-latest
+          - os: linux
+            architecture: arm64
+            device: cuda-12
+            runner: ubuntu-24.04-arm
+          - os: linux
+            architecture: amd64
+            device: cuda-13
+            runner: ubuntu-latest
+          - os: linux
+            architecture: arm64
+            device: cuda-13
+            runner: ubuntu-24.04-arm
+          - os: linux
+            architecture: amd64
+            device: rocm-10
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
@@ -420,7 +448,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ARCHIVE_NAME: ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-cpu.tar.gz
+          ARCHIVE_NAME: ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
         run: |
           XLA_COMMIT_ID=$(sed -n 's/^XLA_COMMIT = "\([0-9a-f]\{40\}\)"$/\1/p' crates/ryft-xla-sys/WORKSPACE)
           [[ "$XLA_COMMIT_ID" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid XLA commit identifier"; exit 1; }
@@ -428,11 +456,17 @@ jobs:
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ARCHIVE_NAME" --dir native-release
           echo "RYFT_XLA_SYS_ARCHIVE=$GITHUB_WORKSPACE/native-release/$ARCHIVE_NAME" >> "$GITHUB_ENV"
 
-      - name: Link and Test PJRT Against Published Archive
+      - name: Link and Test Against Published Archive
         shell: bash
+        env:
+          RYFT_TEST_TRITON_ARCHIVE_DEVICE: ${{ matrix.config.device }}
         run: |
           if [[ "${{ matrix.config.os }}" == "linux" && "${{ matrix.config.architecture }}" == "arm64" ]]; then
             export PATH="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
           fi
-          cargo test -p ryft-pjrt --lib
+          if [[ "$RYFT_TEST_TRITON_ARCHIVE_DEVICE" == cpu ]]; then
+            cargo test -p ryft-pjrt --lib
+          else
+            cargo test -p ryft-xla-sys --lib triton::tests
+          fi

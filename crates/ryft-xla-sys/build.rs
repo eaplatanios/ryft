@@ -340,14 +340,17 @@ struct BuildConfiguration {
 }
 
 impl BuildConfiguration {
-    /// Parses the target [`BuildConfiguration`] of this build from the `CARGO_CFG_TARGET_OS`
-    /// and `CARGO_CFG_TARGET_ARCH` environment variables.
+    /// Selects the linked archive from Cargo's target and features. The CUDA archives support both Triton targets,
+    /// so prefer CUDA over ROCm when multiple GPU features are enabled and prefer CUDA 13 over CUDA 12.
     fn from_environment() -> Result<Self> {
-        Ok(Self {
-            operating_system: OperatingSystem::from_environment()?,
-            architecture: Architecture::from_environment()?,
-            device: Device::Cpu,
-        })
+        let operating_system = OperatingSystem::from_environment()?;
+        let device = match (operating_system, cfg!(feature = "triton")) {
+            (OperatingSystem::Linux, true) if cfg!(feature = "cuda-13") => Device::Cuda13,
+            (OperatingSystem::Linux, true) if cfg!(feature = "cuda-12") => Device::Cuda12,
+            (OperatingSystem::Linux, true) if cfg!(feature = "rocm-10") => Device::Rocm10,
+            _ => Device::Cpu,
+        };
+        Ok(Self { operating_system, architecture: Architecture::from_environment()?, device })
     }
 
     /// Downloads or builds the `ryft-xla-sys` native library and emits linking directives for it.

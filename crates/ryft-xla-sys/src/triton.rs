@@ -235,6 +235,12 @@ mod tests {
             assert_eq!(arguments.actual_warp_count, 4);
             assert_eq!(arguments.threads_per_warp, if versions.cuda_available { 32 } else { 64 });
             assert_eq!(arguments.shared_memory_bytes, 0);
+            if versions.cuda_available {
+                let bytes = unsafe { std::slice::from_raw_parts(arguments.artifact, arguments.artifact_size) };
+                let ptx = std::str::from_utf8(bytes).unwrap();
+                let version = if versions.cuda_toolkit_version < 13000 { ".version 8.8" } else { ".version 9.0" };
+                assert!(ptx.lines().any(|line| line.trim() == version));
+            }
             assert_eq!(
                 unsafe { std::slice::from_raw_parts(arguments.entry_name, arguments.entry_name_size) },
                 b"ryft_kernel",
@@ -335,6 +341,19 @@ mod tests {
         assert!(versions.assembler_version_size > 0);
         assert_eq!(versions.cuda_toolkit_version > 0, versions.cuda_available);
         assert!(!versions.cuda_available || versions.rocm_available);
+        if let Ok(device) = std::env::var("RYFT_TEST_TRITON_ARCHIVE_DEVICE") {
+            let (cuda, rocm, toolkit) = match device.as_str() {
+                "cpu" => (false, false, 0),
+                "cuda-12" => (true, true, 12090),
+                "cuda-13" => (true, true, 13020),
+                "rocm-10" => (false, true, 0),
+                _ => panic!("unsupported Triton archive test device `{device}`"),
+            };
+            assert_eq!(
+                (versions.cuda_available, versions.rocm_available, versions.cuda_toolkit_version),
+                (cuda, rocm, toolkit)
+            );
+        }
         unsafe { RYFT_XLA_Triton_Versions_Destroy(&mut versions) };
     }
 

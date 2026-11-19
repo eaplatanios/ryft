@@ -24,6 +24,11 @@ provided as a precompiled archive using the `RYFT_XLA_SYS_ARCHIVE` environment v
 crate will attempt to download a precompiled archive from GitHub releases of `ryft`, if one can be found for the target
 platform and `RYFT_XLA_SYS_ARCHIVE` is not set.
 
+Cargo selects the CPU archive by default. On Linux, the `triton` feature selects the GPU archive for the enabled
+backend feature. When several GPU features are enabled, Cargo selects CUDA 13, CUDA 12, then ROCm 10 in that order
+because CUDA archives can compile both PTX and HSACO. CUDA archives are built for Linux x86-64 and AArch64. The
+ROCm 10 archive is built for Linux x86-64. `RYFT_XLA_SYS_ARCHIVE` overrides the selection.
+
 Furthermore, this crate has optional features for loading PJRT plugins for various kinds of accelerators, each having
 potentially different build time and runtime requirements:
 
@@ -210,7 +215,7 @@ linkage does not impose a closed list of SM architectures; runtime and compiler 
 
 The native archive exposes XLA's pinned Triton pipeline through [C bindings](src/c++/triton_compiler.h) and the Rust
 `triton` module. CUDA-configured archives support PTX and HSACO compilation; ROCm-configured archives support HSACO.
-CPU-only archives expose the same interface but report compilation unavailable. Compilation runs in process without
+CPU-only archives report compilation unavailable through the same interface. Compilation runs in process without
 creating a GPU context and retains ordinary XLA failure semantics. AMD compilation uses embedded device bitcode and
 does not require an AMD device or ROCm installation.
 
@@ -239,6 +244,8 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
       introduces duplicate definitions. Cargo links the merged archive with `+whole-archive` to retain upstream
       registration-only objects, including the PJRT CPU compiler.
 2. Rebuild and publish precompiled `ryft-xla-sys` artifacts using `.github/workflows/build_ryft_xla_sys.yaml`.
+    - GPU jobs build the static archive and the PJRT plugin with the same Bazel configuration. Expect both
+      `ryft-xla-sys-<os>-<arch>-<device>.tar.gz` and `pjrt-plugin-<os>-<arch>-<device>.tar.gz` for each GPU row.
     - Make sure your OpenXLA upgrade changes are committed and pushed to a branch before triggering the workflow.
     - Create and push `ryft-xla-sys-<XLA_COMMIT>` at that exact build commit. The workflow checks this tag before
       starting native builds and records the build commit and run in the release. Pre-creating the tag also avoids
@@ -267,7 +274,7 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
       ```
       Compare final bytes with any workflow artifacts used for earlier checks. Intermediate hashes must not replace
       finalized release checksums.
-    - For Rust-only consumer fixes after publication, reuse the four-platform consumer matrix against the existing
+    - For Rust-only consumer fixes after publication, reuse the consumer matrix against the existing
       release without rebuilding or replacing native artifacts. Its release tag comes from the checked-out XLA pin:
       ```bash
       gh workflow run build_ryft_xla_sys.yaml \
