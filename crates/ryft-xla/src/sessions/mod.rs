@@ -993,18 +993,18 @@ impl Context for Session {
                             .map(|atom| -> Result<_, ProgramError> {
                                 Ok(match builder.atoms()[atom.index()].r#type().as_ref() {
                                     Type::Dimension(r#type) if let Some(extent) = r#type.extent() => {
-                                        EagerOutput::Dimension(
+                                        EagerDispatchOutput::Dimension(
                                             DimensionValue::constant(extent).map_err(TypeError::from)?,
                                         )
                                     }
-                                    _ => EagerOutput::Array,
+                                    _ => EagerDispatchOutput::Array,
                                 })
                             })
                             .collect::<Result<Arc<[_]>, _>>()?;
                         let array_output_atoms = output_atoms
                             .into_iter()
                             .zip(outputs.iter())
-                            .filter_map(|(atom, output)| matches!(output, EagerOutput::Array).then_some(atom))
+                            .filter_map(|(atom, output)| matches!(output, EagerDispatchOutput::Array).then_some(atom))
                             .collect::<Vec<_>>();
                         let output_count = array_output_atoms.len();
                         let program: FlatProgram = builder.build(
@@ -1043,7 +1043,7 @@ impl Context for Session {
                             .compilation_cache()
                             .compile(self, &lowered)
                             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                        producer.insert(EagerDispatchProgram {
+                        producer.insert(EagerDispatchEntry {
                             program,
                             constants: Arc::clone(lowered.session_constants()),
                             outputs,
@@ -1066,10 +1066,12 @@ impl Context for Session {
             .outputs
             .iter()
             .map(|output| match output {
-                EagerOutput::Array => arrays.next().map(Value::Array).ok_or_else(|| {
+                EagerDispatchOutput::Array => arrays.next().map(Value::Array).ok_or_else(|| {
                     ProgramError::MalformedProgram("eager program returned fewer arrays than its outputs".to_string())
                 }),
-                EagerOutput::Dimension(value) => Ok(Value::Dimension(Dimension::new(value.clone(), self.clone()))),
+                EagerDispatchOutput::Dimension(value) => {
+                    Ok(Value::Dimension(Dimension::new(value.clone(), self.clone())))
+                }
             })
             .collect()
     }
@@ -1151,7 +1153,7 @@ struct SessionState {
 
     /// Compiled programs of eager operation applications, keyed ahead of program construction and lowering.
     /// Refer to the documentation of [`EagerDispatchKey`] for information on what the key captures.
-    eager_dispatch_cache: SpecializationCache<EagerDispatchKey, EagerDispatchProgram>,
+    eager_dispatch_cache: SpecializationCache<EagerDispatchKey, EagerDispatchEntry>,
 
     /// Runtime extensions associated with the client, and ownership of launches borrowing their resources.
     runtimes: RuntimeRegistry,
@@ -1406,11 +1408,11 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Output of an eager application.
+/// How one output of an eager operation application is obtained after its compiled program has run. Most outputs
+/// are arrays that the program returns. An output whose value is already known when the application is compiled is
+/// recorded here instead, and it is handed back on every execution without being computed on a device.
 #[derive(Clone)]
-enum EagerOutput {
+enum EagerDispatchOutput {
     /// Array that the compiled program returns.
     Array,
 
@@ -1420,9 +1422,11 @@ enum EagerOutput {
     Dimension(DimensionValue),
 }
 
-/// Compiled program that the eager dispatch cache retains for one [`EagerDispatchKey`].
+/// Entry of a session's eager dispatch cache for one [`EagerDispatchKey`]. It holds everything that is needed to
+/// execute an eager operation application again without rebuilding or lowering its program (i.e., the compiled
+/// program, the retained arrays that it takes as hidden arguments, and how its outputs are assembled).
 #[derive(Clone)]
-struct EagerDispatchProgram {
+struct EagerDispatchEntry {
     /// Compiled program of the eager application.
     program: Arc<CompiledProgram>,
 
@@ -1430,11 +1434,14 @@ struct EagerDispatchProgram {
     /// of the application. Their handles are part of the key, through its regions.
     constants: Arc<[RetainedArray]>,
 
-    /// Outputs of the application, in order. The compiled program returns the [`EagerOutput::Array`] outputs, in order.
-    outputs: Arc<[EagerOutput]>,
+    /// Outputs of the application, in order. The compiled program returns the [`EagerDispatchOutput::Array`]
+    /// outputs, in order.
+    outputs: Arc<[EagerDispatchOutput]>,
 }
 
-/// Source of the PJRT client of a session that is being built.
+/// Where a [`SessionBuilder`] gets the PJRT client of its session from, as selected by the last call of
+/// [`SessionBuilder::platform`], [`SessionBuilder::plugin`], or [`SessionBuilder::client`]. The builder only
+/// records the choice, and [`SessionBuilder::build`] creates or looks up the client.
 enum ClientSource {
     /// Process-wide client that `ryft-xla` creates for a platform.
     Platform(Platform),
@@ -1446,7 +1453,9 @@ enum ClientSource {
     Client(&'static Client<'static>),
 }
 
-/// Persistent tier that a session under construction adds to its compilation cache.
+/// Where a [`SessionBuilder`] gets the disk cache of its session from, as selected by the last call of
+/// [`SessionBuilder::disk_cache`] or [`SessionBuilder::disk_cache_from_env`]. The choice is recorded rather than
+/// resolved at once because the environment is only read by [`SessionBuilder::build`].
 enum DiskCacheSource {
     /// Disk cache that the caller supplied.
     Explicit(DiskCache),
