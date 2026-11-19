@@ -122,12 +122,11 @@ impl RetainedArray {
             .into());
         }
 
-        crate::telemetry::array_constructed();
-
         // The new array has storage of its own, with empty value-local caches, and its shards refer to the same device
         // buffers. The parts need no validation because they come from an array that was already validated.
         Ok(Array {
             parts: Arc::new(ArrayParts::new(
+                session,
                 Arc::clone(&self.actual_type),
                 Arc::clone(&self.sharding),
                 self.shards.to_vec(),

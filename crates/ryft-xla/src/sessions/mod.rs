@@ -60,6 +60,15 @@
 //! Outputs belong to the session that produced them, so chained eager operations and transforms over them keep the same
 //! session, effect scope, and compilation options.
 //!
+//! # Diagnostics
+//!
+//! A session counts the logical arrays that are created through it, which [`Session::array_statistics`] reports, and
+//! a session built with [`SessionBuilder::live_array_tracking`] also describes each of its live arrays through
+//! [`Session::live_arrays`] and totals their device bytes through [`Session::live_array_bytes_by_device`].
+//! [`Session::device_memory_statistics`] reports the allocator statistics of the devices of the session's client for
+//! PJRT plugins that provide them. Refer to the documentation of [`ArrayStatistics`] and [`LiveArray`] for what these
+//! represent.
+//!
 //! # Effects and Completion
 //!
 //! Cloned sessions share effect ordering. [`Session::with_new_effect_scope`] starts an independent sequence while
@@ -93,8 +102,9 @@ use ryft_core::{
     Zero, ZeroOperation,
 };
 use ryft_pjrt::protos::CompilationOptions;
-use ryft_pjrt::{Client, ClientOptions, Plugin};
+use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
 
+use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
@@ -102,8 +112,8 @@ use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{WorkReservation, WorkTracker};
 use crate::{
-    Array, ArrayError, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LowerableOperation,
-    Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
+    Array, ArrayError, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
+    LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
 pub mod effects;
@@ -244,6 +254,7 @@ impl Session {
             compilation_cache: CompilationCache::new(),
             disk_cache: None,
             eager_dispatch_cache_capacity: DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY,
+            live_array_tracking: false,
             runtime_extensions: RuntimeExtensions::new(),
         }
     }
@@ -316,6 +327,13 @@ impl Session {
     #[inline]
     pub(crate) fn runtimes(&self) -> &RuntimeRegistry {
         &self.state.runtimes
+    }
+
+    /// Returns the [`ArrayTracker`] that counts the logical arrays created through this [`Session`]. Array storage
+    /// registers with it when it is created.
+    #[inline]
+    pub(crate) fn array_tracker(&self) -> &Arc<ArrayTracker> {
+        &self.state.array_tracker
     }
 
     /// Returns the [`Target`] of this [`Session`]'s [`Client`].
@@ -426,6 +444,108 @@ impl Session {
     pub fn clear_cache(&self) {
         self.compilation_cache().clear_cache();
         self.state.eager_dispatch_cache.clear();
+    }
+
+    /// Returns a snapshot of the number of logical arrays that were created through this [`Session`] and of how many of
+    /// them are still alive. A logical array is the storage that an [`Array`] and all of its clones share, so cloning
+    /// and dropping array handles changes nothing until the last handle of an array is dropped. All handles of the
+    /// session share the counts, and independently built sessions count separately, even on the same PJRT client.
+    ///
+    /// An array counts towards the session whose handle created its storage, and it keeps doing so after
+    /// [`Array::associate`] moves it to another session. Every array that [`RetainedArray::to_array`] creates is a new
+    /// logical array of the session that it is created in, even though it shares its device buffers with the array
+    /// that was retained. Arrays that the session holds internally (e.g., device scalars that it caches for bounded
+    /// dynamic shapes) are counted like any other array.
+    ///
+    /// The counts are maintained without locks and cost nothing when arrays are cloned or dropped, so they are always
+    /// available. A count of live arrays that keeps growing across the steps of a loop indicates retained arrays, and
+    /// the growth of the count of created arrays over one step is the number of arrays that the step allocated.
+    #[inline]
+    pub fn array_statistics(&self) -> ArrayStatistics {
+        self.state.array_tracker.statistics()
+    }
+
+    /// Returns descriptions of the logical arrays that were created through this [`Session`] and are still alive,
+    /// in the order in which they were created, or [`None`] if the session was built without
+    /// [`SessionBuilder::live_array_tracking`]. Each [`LiveArray`] records the type and placement of an array and the
+    /// sizes of its local device buffers. This corresponds to `jax.live_arrays()` and is the way to see which arrays
+    /// hold device memory on PJRT plugins that provide no [`Self::device_memory_statistics`].
+    ///
+    /// The descriptions are metadata that is copied out of the session, so the result does not keep any array or
+    /// device buffer alive. Which arrays count towards the session is described in [`Self::array_statistics`].
+    #[inline]
+    pub fn live_arrays(&self) -> Option<Vec<LiveArray>> {
+        self.state.array_tracker.live_arrays()
+    }
+
+    /// Returns the number of logical payload bytes that the live arrays of this [`Session`] hold on each
+    /// device of the current process, keyed by [`DeviceId`], or [`None`] if the session was built without
+    /// [`SessionBuilder::live_array_tracking`]. The live arrays are the ones that [`Self::live_arrays`] describes.
+    /// A device buffer that several of them share (e.g., an array and the array that [`RetainedArray::to_array`]
+    /// creates from it) is counted once, like in the device memory profile of JAX, so the result is not the sum of
+    /// [`LiveArray::addressable_size_in_bytes`] over the live arrays. Devices on which no live array holds a buffer
+    /// are absent from the result.
+    ///
+    /// These are the bytes of the array payloads, which is a lower bound on what the arrays cost. The allocator of
+    /// a device may round buffers up and holds memory for other purposes, which [`Self::device_memory_statistics`]
+    /// reports where it is supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if the element type of a live array has no dense storage size and
+    /// [`Error::SizeLimitExceeded`] if a total does not fit in a [`usize`].
+    #[inline]
+    pub fn live_array_bytes_by_device(&self) -> Result<Option<HashMap<DeviceId, usize>>, Error> {
+        self.state.array_tracker.live_array_bytes_by_device()
+    }
+
+    /// Returns the allocator statistics of every device that the client of this [`Session`] can address, in the order
+    /// in which the client reports the devices and paired with their [`DeviceId`]s. The statistics of a device are
+    /// [`None`] if its PJRT plugin or its memory allocator does not provide any, which is the case for the built-in
+    /// CPU plugin.
+    ///
+    /// The statistics describe everything that the allocator of a device has handed out, including temporaries of
+    /// running programs and buffers of other sessions on the same client, so they answer whether device memory is
+    /// growing rather than which arrays hold it. Reading them queries the allocators and adds no cost to any other
+    /// operation of the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if the devices of the client cannot be queried or if a device fails to report its
+    /// statistics for a reason other than not supporting them.
+    pub fn device_memory_statistics(&self) -> Result<Vec<(DeviceId, Option<MemoryStatistics>)>, Error> {
+        self.client()
+            .addressable_devices()?
+            .iter()
+            .map(|device| {
+                let statistics = match device.memory_statistics() {
+                    Ok(statistics) => Some(statistics),
+                    Err(PjrtError::MissingFunction { .. } | PjrtError::Unimplemented { .. }) => None,
+                    Err(error) => return Err(error.into()),
+                };
+                Ok((device.id()?, statistics))
+            })
+            .collect()
+    }
+
+    /// Resets the allocator statistics of every device that the client of this [`Session`] can
+    /// address, so that the peaks that [`Self::device_memory_statistics`] reports afterward (e.g.,
+    /// [`MemoryStatistics::peak_bytes_in_use`]) cover only what happens after this call. This makes it possible to
+    /// measure the peak memory of one step of a program. Devices that provide no statistics are skipped. The reset
+    /// applies to the devices themselves, so it also affects other sessions on the same client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if the devices of the client cannot be queried or if a device fails to reset its
+    /// statistics for a reason other than not supporting them.
+    pub fn clear_device_memory_statistics(&self) -> Result<(), Error> {
+        for device in self.client().addressable_devices()? {
+            match device.clear_memory_statistics() {
+                Ok(()) | Err(PjrtError::MissingFunction { .. } | PjrtError::Unimplemented { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Creates a [`DeviceMesh`] with the provided `axes` over the devices of this session's client. The mesh takes as
@@ -1160,6 +1280,10 @@ struct SessionState {
 
     /// Pending work and synchronization failures shared by all handles of the session.
     work: Arc<WorkTracker<(), Error>>,
+
+    /// Counts of the logical arrays created through the session, and descriptions of the live ones if the session
+    /// tracks them. Array storage holds its own handle, which lets it update the counts when it is dropped.
+    array_tracker: Arc<ArrayTracker>,
 }
 
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
@@ -1210,6 +1334,10 @@ pub struct SessionBuilder {
 
     /// Maximum number of compiled operation applications that the eager dispatch cache of the session retains.
     eager_dispatch_cache_capacity: usize,
+
+    /// Whether the session keeps descriptions of its live arrays for [`Session::live_arrays`] and
+    /// [`Session::live_array_bytes_by_device`].
+    live_array_tracking: bool,
 
     /// [`RuntimeExtensions`] of the session.
     runtime_extensions: RuntimeExtensions,
@@ -1315,6 +1443,19 @@ impl SessionBuilder {
         self
     }
 
+    /// Sets whether the session keeps a description of each of its live arrays, which [`Session::live_arrays`]
+    /// then returns and [`Session::live_array_bytes_by_device`] totals. Tracking is disabled by default, in which
+    /// case both functions return [`None`] and creating an array costs only the lock-free counting behind
+    /// [`Session::array_statistics`]. An enabled session additionally takes a lock and allocates a small description
+    /// whenever an array is created, and takes the lock again when the last clone of an array is dropped. Cloning and
+    /// dropping other array handles stays free of bookkeeping either way. Enable tracking to find out which arrays
+    /// hold device memory.
+    #[inline]
+    pub fn live_array_tracking(mut self, enabled: bool) -> Self {
+        self.live_array_tracking = enabled;
+        self
+    }
+
     /// Sets the runtime extensions that programs of the session can use. A runtime extension is native support that
     /// a compiled program needs beyond what the PJRT plugin provides (e.g., the host callback behind `print` or the
     /// launcher of precompiled CUDA kernels), and `runtime_extensions` holds one [`RuntimeProvider`] for each
@@ -1376,6 +1517,7 @@ impl SessionBuilder {
                 eager_dispatch_cache: SpecializationCache::new(self.eager_dispatch_cache_capacity),
                 runtimes: RuntimeRegistry::new(client, self.runtime_extensions),
                 work: Arc::new(WorkTracker::default()),
+                array_tracker: Arc::new(ArrayTracker::new(self.live_array_tracking)),
             }),
             mesh: None,
             effect_scope: Arc::new(EffectScope::default()),
@@ -1866,6 +2008,121 @@ pub(crate) mod tests {
         Neg::neg(&vector).unwrap();
         assert_eq!(session.eager_dispatch_statistics().misses, 2);
         assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (1, 1));
+    }
+
+    #[test]
+    fn test_session_array_statistics() {
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 0 });
+
+        // Creating an array counts one logical array, which its clones share.
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 1 });
+        let clone = vector.clone();
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 1 });
+
+        // The output of an eager operation is another logical array.
+        let negated = Neg::neg(&vector).unwrap();
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 2, created_arrays: 2 });
+
+        // An array stays alive until its last clone is dropped, and dropped arrays stay counted as created.
+        drop(vector);
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 2, created_arrays: 2 });
+        drop(clone);
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 2 });
+        drop(negated);
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 2 });
+
+        // All handles of a session share its counts, while another session on the same client counts separately. An
+        // array keeps counting towards the session that created it after it is associated with another one.
+        let other_session = Session::builder().client(client).build().unwrap();
+        let array = f32_vector(&session.with_new_effect_scope(), &mesh, &[1.0]);
+        let retained = RetainedArray::new(&array);
+        let array = array.associate(&other_session).unwrap();
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 3 });
+        assert_eq!(other_session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 0 });
+
+        // An array that is created from a retained array is a new logical array of the session that it is created in.
+        // The retained array itself is not a logical array, even though it keeps the device buffers alive.
+        let restored = retained.to_array(&other_session).unwrap();
+        assert_eq!(other_session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 1 });
+        drop((array, restored));
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 3 });
+        assert_eq!(other_session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 1 });
+        drop(retained);
+    }
+
+    #[test]
+    fn test_session_live_arrays() {
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+
+        // A session describes its live arrays only if it was built to track them.
+        let session = Session::builder().client(client).build().unwrap();
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        assert!(session.live_arrays().is_none());
+        assert_eq!(session.array_statistics().live_arrays, 1);
+        drop(vector);
+
+        // All handles of a tracking session describe the same arrays.
+        let session = Session::builder().client(client).live_array_tracking(true).build().unwrap();
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        let live_arrays = session.with_new_effect_scope().live_arrays().unwrap();
+        assert_eq!(live_arrays.len(), 1);
+        assert_eq!(live_arrays[0].r#type(), vector.r#type());
+        assert_eq!(live_arrays[0].addressable_size_in_bytes().unwrap(), 8);
+
+        // The descriptions hold neither the array nor its buffers, so the array can still donate its buffers while a
+        // snapshot exists, and dropping the array releases it.
+        assert!(vector.has_unique_shard_buffers());
+        drop(vector);
+        assert!(session.live_arrays().unwrap().is_empty());
+        assert_eq!(live_arrays.len(), 1);
+    }
+
+    #[test]
+    fn test_session_live_array_bytes_by_device() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let device_ids = mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+
+        // A session totals the bytes of its live arrays only if it was built to track them.
+        let session = Session::builder().client(client).build().unwrap();
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        assert_eq!(session.live_array_bytes_by_device().unwrap(), None);
+        drop(vector);
+
+        // A replicated array holds its payload on every device, and buffers that two live arrays share count once.
+        let session = Session::builder().client(client).live_array_tracking(true).build().unwrap();
+        assert_eq!(session.live_array_bytes_by_device().unwrap(), Some(HashMap::new()));
+        let vector = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        let restored = RetainedArray::new(&vector).to_array(&session).unwrap();
+        assert_eq!(session.live_arrays().unwrap().len(), 2);
+        assert_eq!(
+            session.with_new_effect_scope().live_array_bytes_by_device().unwrap(),
+            Some(HashMap::from([(device_ids[0], 8), (device_ids[1], 8)])),
+        );
+        drop((vector, restored));
+        assert_eq!(session.live_array_bytes_by_device().unwrap(), Some(HashMap::new()));
+    }
+
+    #[test]
+    fn test_session_device_memory_statistics() {
+        // The built-in CPU plugin provides no allocator statistics, so every addressable device reports none.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let device_ids =
+            client.addressable_devices().unwrap().iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        assert_eq!(session.device_memory_statistics().unwrap(), vec![(device_ids[0], None), (device_ids[1], None)]);
+    }
+
+    #[test]
+    fn test_session_clear_device_memory_statistics() {
+        // Devices that provide no allocator statistics are skipped, so the reset succeeds on the built-in CPU plugin.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        assert!(session.clear_device_memory_statistics().is_ok());
     }
 
     #[test]
@@ -4293,6 +4550,17 @@ pub(crate) mod tests {
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0])).unwrap();
         Neg::neg(&f32_vector(&session, &mesh, &[1.0, 2.0, 3.0])).unwrap();
         assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (1, 2));
+    }
+
+    #[test]
+    fn test_session_builder_live_array_tracking() {
+        // Sessions describe their live arrays only when they are asked to, which is not the default.
+        let client = execution_client();
+        assert!(Session::builder().client(client).build().unwrap().live_arrays().is_none());
+        let session = Session::builder().client(client).live_array_tracking(false).build().unwrap();
+        assert!(session.live_arrays().is_none());
+        let session = Session::builder().client(client).live_array_tracking(true).build().unwrap();
+        assert!(session.live_arrays().unwrap().is_empty());
     }
 
     #[test]

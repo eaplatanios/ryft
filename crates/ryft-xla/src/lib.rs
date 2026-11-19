@@ -30,14 +30,13 @@ pub mod operations;
 pub mod pjrt;
 pub mod sessions;
 pub mod sharding;
-pub mod telemetry;
 pub mod tracing;
 pub mod types;
 pub mod values;
 
 pub use arrays::{
-    Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutTarget, RetainedArray, ShardDescriptor,
-    ShardIndex, ShardLayout, block_until_ready, ready,
+    Array, ArrayError, ArrayShard, ArrayStatistics, DevicePutLeaf, DevicePutOptions, DevicePutTarget, LiveArray,
+    RetainedArray, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready,
 };
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
@@ -87,7 +86,6 @@ pub use sessions::{
     normalize_runtime_requirements,
 };
 pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
-pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
 pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
 pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};
 

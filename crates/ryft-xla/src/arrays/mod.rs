@@ -20,6 +20,10 @@
 //! devices or shardings, which the [`mod@placement`] and [`mod@device_put`] modules implement. Finally, the
 //! `materialization` module pads arrays to the static bounds of executables compiled for bounded dynamic shapes and
 //! caches the padded copies per array. Array failures are reported through [`Error::Array`] with an [`ArrayError`].
+//!
+//! Every session counts the arrays that are created through it, which [`ArrayStatistics`] reports, and can describe
+//! the ones that are still alive as [`LiveArray`]s. The unit that it counts is the storage that an array shares with
+//! its clones, so cloning and dropping array handles involves no bookkeeping.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -45,6 +49,7 @@ use crate::arrays::materialization::{
     BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
     LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY,
 };
+use crate::arrays::statistics::ArrayRegistration;
 use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -54,10 +59,12 @@ pub(crate) mod host;
 pub(crate) mod materialization;
 pub mod placement;
 pub mod retained;
+pub mod statistics;
 
 pub use device_put::{DevicePutLeaf, DevicePutOptions};
 pub use placement::DevicePutTarget;
 pub use retained::RetainedArray;
+pub use statistics::{ArrayStatistics, LiveArray};
 
 /// Represents errors produced while validating distributed [`Array`] metadata and buffers, placing arrays on devices,
 /// or materializing arrays on the host.
@@ -208,7 +215,7 @@ pub enum ArrayError {
 /// The current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays retain
 /// their logical `I1` or `U1` type while using one byte per element in this physical representation. This executable
 /// convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer types.
-#[derive(Parameter)]
+#[derive(Clone, Parameter)]
 pub struct Array {
     /// Type, shards, and value-local caches of this [`Array`]. They are immutable once constructed and shared by
     /// every clone, so cloning an array costs a few reference-count increments rather than a deep copy.
@@ -364,10 +371,9 @@ impl Array {
             })
             .collect::<Vec<_>>();
 
-        // TODO(eaplatanios): Review this.
-        crate::telemetry::array_constructed();
         Ok(Self {
             parts: Arc::new(ArrayParts::new(
+                session,
                 Arc::new(r#type),
                 Arc::new(sharding),
                 shards,
@@ -422,9 +428,9 @@ impl Array {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        crate::telemetry::array_constructed();
         Ok(Self {
             parts: Arc::new(ArrayParts::new(
+                session,
                 Arc::new(r#type),
                 Arc::new(sharding),
                 shards,
@@ -809,9 +815,9 @@ impl Array {
                 None => ArrayShard::new(descriptor.clone(), None),
             })
             .collect::<Vec<_>>();
-        crate::telemetry::array_constructed();
         Self {
             parts: Arc::new(ArrayParts::new(
+                session,
                 Arc::clone(&layout.r#type),
                 Arc::clone(&layout.sharding),
                 shards,
@@ -1264,26 +1270,6 @@ pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Resul
         array.block_until_ready()?;
     }
     Ok(())
-}
-
-// TODO(eaplatanios): Review this.
-impl Clone for Array {
-    fn clone(&self) -> Self {
-        crate::telemetry::array_constructed();
-        Self {
-            parts: Arc::clone(&self.parts),
-            execution_fence: self.execution_fence.clone(),
-            send_fence: self.send_fence.clone(),
-            session: self.session.clone(),
-        }
-    }
-}
-
-// TODO(eaplatanios): Review this.
-impl Drop for Array {
-    fn drop(&mut self) {
-        crate::telemetry::array_dropped();
-    }
 }
 
 impl Debug for Array {
@@ -2158,17 +2144,25 @@ struct ArrayParts {
 
     /// Value-local LRU of device-resident scalar arguments for bounded logical extents.
     logical_extent_scalars: Mutex<VecDeque<(i32, Array)>>,
+
+    /// Registration of this storage as one logical array of the session that created it, which keeps the array counted
+    /// as live in [`Session::array_statistics`] until the storage is dropped. It is the last field so that the shards
+    /// and caches are released before the array stops counting as live.
+    _registration: ArrayRegistration,
 }
 
 impl ArrayParts {
-    /// Creates new [`ArrayParts`] with empty value-local caches.
+    /// Creates new [`ArrayParts`] with empty value-local caches and registers them as one logical array of `session`.
+    /// Storage can only be created through this function, so every logical array is counted exactly once.
     fn new(
+        session: &Session,
         r#type: Arc<ArrayType>,
         sharding: Arc<Sharding>,
         shards: Vec<ArrayShard>,
         shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
         mesh: Arc<DeviceMesh>,
     ) -> Self {
+        let registration = session.array_tracker().register(&r#type, &sharding, &mesh, &shards);
         Self {
             r#type,
             sharding,
@@ -2177,6 +2171,7 @@ impl ArrayParts {
             mesh,
             bounded_materializations: OnceLock::new(),
             logical_extent_scalars: Mutex::new(VecDeque::new()),
+            _registration: registration,
         }
     }
 }
@@ -2222,8 +2217,8 @@ mod tests {
     use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
 
     use super::{
-        Array, ArrayError, ArrayOutputLayout, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout,
-        block_until_ready, ready,
+        Array, ArrayError, ArrayOutputLayout, ArrayShard, ArrayStatistics, ArrayTypeExtension, ShardDescriptor,
+        ShardLayout, block_until_ready, ready,
     };
 
     // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
@@ -3437,6 +3432,9 @@ mod tests {
         assert!(!array.has_unique_shard_buffers());
         drop(clone);
         assert!(array.has_unique_shard_buffers());
+
+        // Clones are handles of one logical array, so creating and dropping them leaves the session's counts unchanged.
+        assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 1 });
     }
 
     #[test]
