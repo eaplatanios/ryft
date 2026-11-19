@@ -1,28 +1,28 @@
-//! Distributed device arrays backed by PJRT buffers, which are the concrete eager values of the XLA backend.
-//!
+//! Distributed device arrays backed by PJRT [`Buffer`]s, which are the concrete eager values of the XLA backend.
 //! An [`Array`] is one logical value of an [`ArrayType`] with a static [`Shape`], placed on the devices of a
 //! [`DeviceMesh`] according to a [`Sharding`]. [`ShardLayout`] expands that placement into one [`ShardDescriptor`] per
-//! device, which records the slice of the global array that the device holds. Every [`Array`] keeps one
-//! [`ArrayShard`] per device, including the shards that live in other processes, so that every process can reason
-//! about the complete global placement while only transferring, executing with, or reading the buffers that it can
-//! address. Clones of an array share its type, shards, and value-local caches, so cloning never copies device data.
-//! The [`mod@shards`] module defines the shard types.
+//! device, which records the slice of the global array that the device holds. Every [`Array`] keeps one [`ArrayShard`]
+//! per device, including the shards that live in other processes, so that every process can reason about the complete
+//! global placement while only transferring, executing with, or reading the buffers that it can address. Clones of an
+//! array share its type, shards, and value-local caches, so cloning never copies device data. The
+//! [`shards`](mod@shards) module defines the shard types.
 //!
-//! Every array belongs to a [`Session`], which determines the PJRT client, session, effect scope, and compilation
-//! options that operations on the array use. Arrays implement the `ryft-core` value capabilities by binding each
-//! operation through that session, which executes it eagerly, op by op, as a cached single-operation program.
+//! Every array belongs to a [`Session`], which determines the PJRT [`Client`], session, effect scope, and compilation
+//! options that operations on the array use. Arrays implement `ryft-core` value capabilities by binding each operation
+//! through that session, which executes it eagerly, operation-by-operation, as a sequence of cached single-operation
+//! programs.
 //!
-//! [`Array::from_host_buffer`] uploads a dense host value, [`Array::from_host_shards`] uploads the host shards
-//! owned by this process, and [`Array::from_addressable_buffers`] wraps existing PJRT [`Buffer`]s. These
-//! constructors support placement over auto mesh axes when the caller supplies runtime sharding.
-//! [`Array::copy_to_host`] and [`ArrayShard::copy_to_host_bytes`] read values back to the host. The `host` module implements
-//! the uploads and the readback of whole arrays, including the combination of the separate values that devices hold
-//! along unreduced mesh axes.
-//! [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host values to other
-//! devices or shardings. The [`mod@placement`] module defines what a placement is and how to request one, and the
-//! `resharding` module implements the moves. Finally, the
-//! `materialization` module pads arrays to the static bounds of executables compiled for bounded dynamic shapes and
-//! caches the padded copies per array. Array failures are reported through [`Error::Array`] with an [`ArrayError`].
+//! [`Array::from_host_buffer`] uploads a dense host value, [`Array::from_host_shards`] uploads the host shards owned by
+//! this process, and [`Array::from_addressable_buffers`] wraps existing PJRT [`Buffer`]s. These constructors support
+//! placement over auto mesh axes when the caller supplies runtime sharding. [`Array::copy_to_host`] and
+//! [`ArrayShard::copy_to_host_bytes`] read values back to the host. The [`host`](mod@host) module implements the
+//! uploads and the readback of whole arrays, including the combination of the separate values that devices hold along
+//! unreduced mesh axes. [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host
+//! values to other devices or shardings. The [`placement`](mod@placement) module defines what a placement is and how to
+//! request one, and the [`resharding`](mod@resharding) module implements the moves. Finally, the
+//! [`materialization`](mod@materialization) module pads arrays to the static bounds of executables compiled for bounded
+//! dynamic shapes and caches the padded copies per array. Array failures are reported through [`Error::Array`] with an
+//! [`ArrayError`].
 //!
 //! Every session counts the arrays that are created through it, which [`ArrayStatistics`] reports, and can describe
 //! the ones that are still alive as [`LiveArray`]s. The unit that it counts is the storage that an array shares with
@@ -51,12 +51,10 @@ use crate::arrays::materialization::{
 use crate::arrays::statistics::ArrayRegistration;
 use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
 
-// TODO(eaplatanios): Review this module.
-
-pub(crate) mod host;
-pub(crate) mod materialization;
+pub mod host;
+pub mod materialization;
 pub mod placement;
-pub(crate) mod resharding;
+pub mod resharding;
 pub mod retained;
 pub mod shards;
 pub mod statistics;
@@ -65,6 +63,8 @@ pub use placement::{ArrayPlacement, Placeable, PlacementOptions};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents errors produced while validating distributed [`Array`] metadata and buffers, placing arrays on devices,
 /// or materializing arrays on the host.
