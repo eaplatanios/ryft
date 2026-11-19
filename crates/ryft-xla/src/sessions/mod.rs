@@ -112,7 +112,7 @@ use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{WorkReservation, WorkTracker};
 use crate::{
-    Array, ArrayError, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
+    Array, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
     LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
@@ -130,7 +130,8 @@ pub use runtimes::{
 };
 pub use targets::{Target, TargetDevice};
 
-/// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`].
+/// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`],
+/// or while using a session that lacks something that an operation needs.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionError {
     #[error("platform `{platform}` is unavailable because `ryft-xla` was built without its `{feature}` feature")]
@@ -138,6 +139,9 @@ pub enum SessionError {
 
     #[error("invalid client options: {reason}")]
     InvalidClientOptions { reason: String },
+
+    #[error("session has no device mesh")]
+    MissingMesh,
 }
 
 /// Default maximum number of compiled operation applications retained in a session's eager dispatch cache, which
@@ -351,12 +355,12 @@ impl Session {
             .map_err(Clone::clone)
     }
 
-    /// Returns the default [`DeviceMesh`] of this [`Session`], or [`ArrayError::MissingMesh`] if this session has no
+    /// Returns the default [`DeviceMesh`] of this [`Session`], or [`SessionError::MissingMesh`] if this session has no
     /// default mesh. Eager binds execute on the mesh of their array inputs and only use this mesh when they have none.
     /// Refer to [`Self::with_device_mesh`] for more information.
     #[inline]
     pub fn device_mesh(&self) -> Result<&DeviceMesh, Error> {
-        self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))
+        self.mesh.as_ref().ok_or_else(|| Error::from(SessionError::MissingMesh))
     }
 
     /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
@@ -1813,7 +1817,7 @@ pub(crate) mod tests {
         assert_eq!(session.compilation_options(), &CompilationOptions::default());
         assert!(session.compilation_cache().disk_cache().is_none());
         assert_eq!(session.cached_program_count(), 0);
-        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
     }
 
     #[test]
@@ -1839,7 +1843,7 @@ pub(crate) mod tests {
         assert!(shares_effect_scope(&meshed, &session));
 
         // The handle that the mesh was added to is unaffected.
-        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
     }
 
     #[test]
@@ -1930,7 +1934,7 @@ pub(crate) mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
-        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
         assert_eq!(session.with_device_mesh(mesh.clone()).device_mesh().unwrap(), &mesh);
     }
 
@@ -2140,7 +2144,7 @@ pub(crate) mod tests {
         assert_eq!(mesh.devices(), &devices[..2]);
 
         // Creating a mesh does not make it the mesh of the session.
-        assert!(matches!(session.device_mesh(), Err(Error::Array(error)) if matches!(*error, ArrayError::MissingMesh)));
+        assert!(matches!(session.device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
 
         // Invalid axes and meshes that need more devices than the client has are rejected.
         assert!(matches!(

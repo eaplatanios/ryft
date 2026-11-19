@@ -188,7 +188,7 @@ impl Array {
             }));
         }
         if r#type.data_type().is_zero() {
-            return Self::from_zero_space(session, r#type, Some(sharding), mesh);
+            return Self::zero(session, r#type, Some(sharding), mesh);
         }
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.
@@ -430,7 +430,7 @@ impl Array {
             }
         }
         if data_type.is_zero() {
-            return Self::from_zero_space(session, r#type, Some(sharding), mesh);
+            return Self::zero(session, r#type, Some(sharding), mesh);
         }
 
         let buffer_type = Self::physical_buffer_type(data_type);

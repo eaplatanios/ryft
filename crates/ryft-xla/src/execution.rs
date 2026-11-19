@@ -1568,7 +1568,7 @@ impl Session {
                         )?
                         .with_execution_fence(fence.clone()))
                     }
-                    None => Ok(Array::from_zero_space(
+                    None => Ok(Array::zero(
                         self,
                         output_type.clone(),
                         Some(program.output_shardings()[logical_index].clone()),

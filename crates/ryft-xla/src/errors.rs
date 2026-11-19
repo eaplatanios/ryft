@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(payload.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(payload.to_string(), "extension is unreadable");
         assert!(error.downcast_custom::<PjrtError>().is_none());
-        assert!(Error::from(ArrayError::MissingMesh).downcast_custom::<io::Error>().is_none());
+        assert!(Error::from(ArrayError::MissingDefaultDevice).downcast_custom::<io::Error>().is_none());
         assert!(Error::from(io::Error::other("ordinary I/O failure")).downcast_custom::<io::Error>().is_none());
     }
 

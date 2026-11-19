@@ -980,7 +980,7 @@ mod tests {
     use crate::tests::{
         cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type,
     };
-    use crate::{Array, ArrayError, FromPjrt, Operation, ProgramBuilder, Session};
+    use crate::{Array, FromPjrt, Operation, ProgramBuilder, Session, SessionError};
 
     use super::*;
 
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(array.domain().device_mesh().unwrap(), &mesh);
         assert!(matches!(
             dimension(&session, 3).domain().device_mesh(),
-            Err(crate::Error::Array(error)) if matches!(*error, ArrayError::MissingMesh),
+            Err(crate::Error::Session(SessionError::MissingMesh)),
         ));
         let other_mesh = mesh_on(client, 1);
         assert_ne!(other_mesh, mesh);

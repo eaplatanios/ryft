@@ -339,11 +339,9 @@ impl Array {
         })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
     /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
-    pub(crate) fn from_zero_space(
+    pub(crate) fn zero(
         session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
@@ -356,6 +354,7 @@ impl Array {
             ))
             .into());
         }
+
         let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
         let shape = r#type
             .static_shape()
@@ -366,6 +365,7 @@ impl Array {
         let process_index = client.process_index()?;
         let addressable_device_ids =
             client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
+
         let shards = descriptors
             .into_iter()
             .map(|descriptor| -> Result<_, Error> {
@@ -397,6 +397,8 @@ impl Array {
             session: session.clone(),
         })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Creates an [`Array`] that belongs to `session` from the per-device `buffers` that one execution of a compiled
     /// program returned for one of its outputs, placed according to that output's precomputed `layout`. The buffers

@@ -124,7 +124,7 @@ impl Array {
             .collect::<Result<Vec<_>, Error>>()?;
         let r#type = self.r#type().into_owned().with_sharding(None)?;
         let output = if self.data_type().is_zero() {
-            Self::from_zero_space(session, r#type, Some(self.sharding().clone()), self.mesh().clone())?
+            Self::zero(session, r#type, Some(self.sharding().clone()), self.mesh().clone())?
         } else {
             let (sharding, mesh) = (self.sharding().clone(), self.mesh().clone());
             Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, buffers, false)?
@@ -195,7 +195,7 @@ impl Array {
     ) -> Result<Option<Self>, Error> {
         let output = if self.data_type().is_zero() {
             let r#type = self.r#type().into_owned().with_sharding(None)?;
-            Self::from_zero_space(session, r#type, Some(sharding.clone()), mesh.clone())?
+            Self::zero(session, r#type, Some(sharding.clone()), mesh.clone())?
         } else {
             let shape = self.shape();
             let Some((buffers, send_fence)) = self.exact_shard_buffers(session, &shape, mesh, sharding)? else {

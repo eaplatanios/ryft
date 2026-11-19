@@ -317,7 +317,7 @@ mod tests {
 
         // A zero-space array has no device buffers.
         let zero_type = replicated.r#type().into_owned().with_data_type(DataType::Zero);
-        let _zero = Array::from_zero_space(&session, zero_type, None, mesh.clone()).unwrap();
+        let _zero = Array::zero(&session, zero_type, None, mesh.clone()).unwrap();
         let live_arrays = session.live_arrays().unwrap();
         assert_eq!(live_arrays[1].addressable_size_in_bytes().unwrap(), 0);
     }
