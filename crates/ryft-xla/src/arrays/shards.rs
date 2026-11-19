@@ -167,17 +167,14 @@ pub enum ArrayShardStorage {
     Buffer(Arc<Buffer<'static>>),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Row-major ordinal index of an [`ArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
 /// row-major ordering as [`DeviceMesh::devices`]. This gives all processes a stable way to refer to the same global
 /// shard without depending on whether that shard is locally addressable or not.
 pub type ShardIndex = usize;
 
-/// Device ownership and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent of
-/// any local [`Buffer`]. It describes which [`Device`] owns the [`ArrayShard`] and which slice of the underlying
-/// [`Array`](crate::Array) that shard represents. [`ArrayShard`]s pair this metadata with optional addressable
-/// buffers.
+/// Device ownership and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent
+/// of any local [`Buffer`]. It describes which [`Device`] owns the [`ArrayShard`] and which slice of the underlying
+/// [`Array`](crate::Array) that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// Refer to the documentation of [`Self::index`] for information on this field.
@@ -186,8 +183,8 @@ pub struct ShardDescriptor {
     /// Refer to the documentation of [`Self::device`] for information on this field.
     device: Device,
 
-    /// Refer to the documentation of [`Self::slice`] for information on this field. It is shared, so cloning a
-    /// descriptor (e.g., into every output [`Array`](crate::Array) of a compiled program) does not allocate.
+    /// Refer to the documentation of [`Self::slice`] for information on this field. It is shared, so cloning
+    /// a descriptor (e.g., into every output [`Array`](crate::Array) of a compiled program) does not allocate.
     slice: Arc<[Range<usize>]>,
 }
 
@@ -229,9 +226,15 @@ impl ShardDescriptor {
         StaticShape::new(self.slice.iter().map(|slice| slice.len()).collect())
     }
 
-    /// Returns the outermost dimension `d` such that, in a row-major buffer representing the storage of an array with
-    /// the provided [`StaticShape`], the elements covered by this [`ShardDescriptor`]'s [`Self::slice`] over dimensions
-    /// `d..rank` form a single contiguous span, together with the element count of that contiguous block.
+    /// Describes how the elements that this [`ShardDescriptor`]'s [`Self::slice`] covers are laid out in a row-major
+    /// buffer that stores an array of the provided [`StaticShape`], as a sequence of equally sized contiguous blocks.
+    /// Returns the pair `(dimension, element_count)`, where:
+    ///
+    ///   - `dimension` is the outermost dimension `d` for which the slice over the dimensions `d..rank` is one
+    ///     contiguous span of the buffer once the indices of the dimensions `0..d` are fixed. Each choice of those
+    ///     outer indices within the slice therefore selects one block.
+    ///   - `element_count` is the number of elements in each such block, which is the product of the slice lengths
+    ///     over the dimensions `d..rank`.
     ///
     /// Trailing dimensions whose slice fully covers the corresponding `shape` extent are absorbed into the contiguous
     /// block. The innermost dimension is always part of the block since its element span at fixed outer indices is
@@ -258,8 +261,8 @@ impl ShardDescriptor {
     /// ```
     ///
     /// The left slice fully covers the inner dimension (i.e., `0..6` over a host extent of `6`), and so the outer
-    /// dimension is absorbed into the block, and the whole shard is one contiguous span. The right slice does not cover
-    /// the inner dimension, and so each row of the slice becomes its own contiguous block of `3` elements.
+    /// dimension is absorbed into the block, and the whole shard is one contiguous span. The right slice does not
+    /// cover the inner dimension, and so each row of the slice becomes its own contiguous block of `3` elements.
     ///
     /// # Parameters
     ///
@@ -288,9 +291,10 @@ impl ShardDescriptor {
             element_count =
                 element_count.checked_mul(self.slice[dimension].len()).ok_or_else(|| Error::SizeLimitExceeded {
                     message: format!(
-                        "contiguous shard block element count for shard slice `{:?}` and shape `{shape}` exceeds the \
+                        "contiguous shard block element count for shard slice `{:?}` and shape `{}` exceeds the \
                          maximum allowed size of {}",
                         self.slice,
+                        shape,
                         usize::MAX,
                     ),
                 })?;
@@ -298,6 +302,8 @@ impl ShardDescriptor {
         Ok((dimension, element_count))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`ShardLayout`] that is obtained by applying a [`Sharding`] to a [`StaticShape`] over a [`DeviceMesh`].
 /// [`ShardLayout`] is the bridge between type-level device placement metadata and runtime array metadata. It expands
