@@ -83,15 +83,15 @@ use std::sync::{Arc, OnceLock};
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CapturingContext, CastType,
-    Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device,
-    DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, ImportingContext,
-    InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
+    Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME,
+    CapturingContext, CastType, Compare, CompilationCache, Concretizable, Constant as CoreConstant, ConstantOperation,
+    Context, DataType, Device, DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize,
+    DimensionType, DimensionValue, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
+    ImportingContext, InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
     NestedTracingContext, Operation as CoreOperation, OperationProvider, Parameter, Placeholder, ProgramError,
     Provenance, ProvenanceScope, RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry,
     SpecializationCacheStatistics, TracingContext, Type as CoreType, TypeError, TypeIdentityRenaming, Typed,
-    TypedProgram, Zero, ZeroOperation,
+    TypedProgram, ValueProjection, Zero, ZeroOperation,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::protos::CompilationOptions;
@@ -735,92 +735,122 @@ impl Context for Session {
             });
         }
 
-        // TODO(eaplatanios): Review from here onwards.
+        let array_inputs = inputs
+            .iter()
+            .filter_map(|input| match input {
+                Value::Array(array) => Some(array.clone()),
+                Value::Dimension(_) | Value::Reference(_) => None,
+            })
+            .collect::<Vec<_>>();
 
-        // `Context::bind` has already rejected attached regions for the operations that declare no region slots,
-        // which includes every operation that is executed on the host below.
-        if let Operation::Dimension(operation) = &operation {
-            let inputs = inputs
-                .iter()
-                .map(|input| {
-                    <Value as ryft_core::ValueProjection<DimensionType>>::projected(input)
-                        .map(|dimension| dimension.value().clone())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
-                operation.clone(),
-                Vec::new(),
-                inputs.as_slice(),
-            )?;
-            return Ok(outputs
-                .into_iter()
-                .map(|output| Value::Dimension(Dimension::new(output, self.clone())))
-                .collect());
-        }
+        // These operations are decided on the host and return without compiling a program. `Context::bind` has already
+        // rejected attached regions for the operations that declare no region slots, which includes all of them. Every
+        // other operation falls through to the compiled path below.
+        match &operation {
+            Operation::Dimension(operation) => {
+                let inputs = inputs
+                    .iter()
+                    .map(|input| {
+                        <Value as ValueProjection<DimensionType>>::projected(input)
+                            .map(|dimension| dimension.value().clone())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
+                    operation.clone(),
+                    Vec::new(),
+                    inputs.as_slice(),
+                )?;
+                return Ok(outputs
+                    .into_iter()
+                    .map(|output| Value::Dimension(Dimension::new(output, self.clone())))
+                    .collect());
+            }
+            Operation::DimensionSize(operation) => {
+                check_count!("input", inputs, 1, ProgramError);
+                operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+                let array = <Value as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+                let extent = array.dimension_size(operation.axis())?;
+                let value = DimensionValue::new(operation.output_type().clone(), extent)?;
+                return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
+            }
+            Operation::DimensionFromScalar(operation) => {
+                check_count!("input", inputs, 1, ProgramError);
+                operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
+                let array = <Value as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+                let value = array.to_dimension(operation.output_type().to_variable())?;
+                return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
+            }
+            Operation::DimensionToScalar(_) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let dimension = <Value as ValueProjection<DimensionType>>::projected(&inputs[0])?;
+                let extent = i64::try_from(dimension.value().extent()).unwrap();
+                let output =
+                    Array::from_host_buffer(self, ArrayType::scalar(DataType::I64), None, None, extent.to_ne_bytes())
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                return Ok(vec![Value::Array(output)]);
+            }
+            Operation::Compare(operation) if let [Value::Dimension(left), Value::Dimension(right)] = inputs => {
+                // Both extents are concrete, so the predicate is decided on the host by the comparison of first-class
+                // dimensions, which proves it from their types and extents, instead of compiling a program for each
+                // pair of extents. Only the Boolean result is materialized in this session.
+                let output =
+                    Compare::<ArrayIrValue<CoreArray>>::compare(left.value(), right.value(), operation.direction())?;
+                let output = Concretizable::<bool>::concretize(&output)?;
+                let output =
+                    Array::from_host_buffer(self, ArrayType::scalar(DataType::Boolean), None, None, [u8::from(output)])
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                return Ok(vec![Value::Array(output)]);
+            }
+            Operation::Array(ArrayOperation::Constant(operation))
+                if cfg!(target_endian = "little") && operation.value().r#type().data_type() != DataType::Token =>
+            {
+                // Core arrays store little-endian element encodings and PJRT reads native ones, so the two only
+                // coincide on little-endian targets. The other targets take the compiled path, whose lowering converts
+                // between them, and so do token literals, which that lowering rejects. Also, a literal is host data
+                // already, so it is uploaded like any other host buffer. Embedding it in a compiled program instead
+                // would compile and retain one program for every distinct literal (e.g., for every value that `Fill`
+                // is given).
+                check_count!("input", inputs, 0, ProgramError);
+                operation.infer_output_types(&[], &[])?;
+                let literal = operation.value();
+                let r#type = literal.r#type().into_owned();
 
-        if let Operation::DimensionSize(operation) = &operation {
-            check_count!("input", inputs, 1, ProgramError);
-            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            let extent = array.dimension_size(operation.axis())?;
-            // Arrays derived from this dimension are placed on the mesh of the array that it was read from.
-            let value = DimensionValue::new(operation.output_type().clone(), extent)?;
-            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
-        }
-        if let Operation::DimensionFromScalar(operation) = &operation {
-            check_count!("input", inputs, 1, ProgramError);
-            operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <Value as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
-            let value = array.to_dimension(operation.output_type().to_variable())?;
-            return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
-        }
+                // The upload takes dense row-major bytes, which is how a literal without a layout is stored.
+                let bytes = match r#type.layout() {
+                    Some(_) => Cow::Owned(literal.logical_bytes()),
+                    None => Cow::Borrowed(literal.storage_bytes()),
+                };
 
-        if matches!(&operation, Operation::DimensionToScalar(_)) {
-            check_count!("input", inputs, 1, ProgramError);
-            let dimension = <Value as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
-            let extent = i64::try_from(dimension.value().extent()).unwrap();
-            let output =
-                Array::from_host_buffer(self, ArrayType::scalar(DataType::I64), None, None, extent.to_ne_bytes())
+                let output = Array::from_host_buffer(self, r#type, None, None, bytes)
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            return Ok(vec![Value::Array(output)]);
-        }
-        if let Operation::Compare(operation) = &operation
-            && let [Value::Dimension(left), Value::Dimension(right)] = inputs
-        {
-            // Both extents are concrete, so the predicate is decided on the host by the comparison of first-class
-            // dimensions, which proves it from their types and extents, instead of compiling a program for each pair
-            // of extents. Only the Boolean result is materialized in this session.
-            let output =
-                Compare::<ArrayIrValue<ryft_core::Array>>::compare(left.value(), right.value(), operation.direction())?;
-            let output = Concretizable::<bool>::concretize(&output)?;
-            let output =
-                Array::from_host_buffer(self, ArrayType::scalar(DataType::Boolean), None, None, [u8::from(output)])
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            return Ok(vec![Value::Array(output)]);
-        }
-        // Core arrays store little-endian element encodings and PJRT reads native ones, so the two only coincide on
-        // little-endian targets. The other targets take the compiled path, whose lowering converts between them, and
-        // so do token literals, which that lowering rejects.
-        if let Operation::Array(ArrayOperation::Constant(operation)) = &operation
-            && cfg!(target_endian = "little")
-            && operation.value().r#type().data_type() != DataType::Token
-        {
-            // A literal is host data already, so it is uploaded like any other host buffer. Embedding it in a compiled
-            // program instead would compile and retain one program for every distinct literal (e.g., for every value
-            // that `Fill` is given).
-            check_count!("input", inputs, 0, ProgramError);
-            operation.infer_output_types(&[], &[])?;
-            let literal = operation.value();
-            let r#type = literal.r#type().into_owned();
-            // The upload takes dense row-major bytes, which is how a literal without a layout is stored.
-            let bytes = match r#type.layout() {
-                Some(_) => Cow::Owned(literal.logical_bytes()),
-                None => Cow::Borrowed(literal.storage_bytes()),
-            };
-            let output = Array::from_host_buffer(self, r#type, None, None, bytes)
-                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            return Ok(vec![Value::Array(output)]);
+                return Ok(vec![Value::Array(output)]);
+            }
+            Operation::Cast(operation) if matches!(operation.output_type(), Type::Dimension(_)) => {
+                // `Context::bind` rejects attached regions. Validate the original declaration before observing
+                // every array witness producer, because the host dimension has no buffer that could retain those
+                // dependencies. Eager values have exact types, so interpreted inference proves the relationship
+                // or rejects it and never leaves a check to a backend.
+                let values = inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
+                let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+                let (_, interpreted) = Type::infer_cast_output_type(operation, &input_types)?;
+                if interpreted.is_none() {
+                    return Err(ProgramError::Concretization {
+                        message: format!(
+                            "`{}` cannot check symbolic type relationships during interpretation; \
+                             bind the operation through its context",
+                            operation.name(),
+                        ),
+                    });
+                }
+                self.validate_input_placement(&array_inputs)?;
+                for input in &array_inputs {
+                    input
+                        .block_until_ready()
+                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                }
+                return Ok(vec![Value::from_array_ir_value(values[0].clone(), self)?]);
+            }
+            _ => {}
         }
 
         // A composite call whose concrete inputs refine the types that its primal region was traced over (e.g., a named
@@ -840,6 +870,7 @@ impl Context for Session {
         {
             if let Some(key) = operation.composite_key() {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+
                 // A session whose target cannot be queried cannot compile the call either, so the failure is reported
                 // here instead of silently selecting the portable body.
                 let target =
@@ -851,52 +882,18 @@ impl Context for Session {
                     primal.interface().output_types(),
                     target_platform,
                 );
+
                 if let Some(error) = implementation.and_then(|implementation| implementation.body_substitution_error())
                 {
                     return Err(ProgramError::UnsupportedOperation { message: error.to_string() });
                 }
             }
+
             return primal.interpret_in_context(self, inputs.to_vec());
         }
 
-        let array_inputs = inputs
-            .iter()
-            .filter_map(|input| match input {
-                Value::Array(array) => Some(array.clone()),
-                Value::Dimension(_) | Value::Reference(_) => None,
-            })
-            .collect::<Vec<_>>();
-
-        if let Operation::Cast(operation) = &operation
-            && matches!(operation.output_type(), Type::Dimension(_))
-        {
-            // `Context::bind` rejects attached regions. Validate the original declaration before observing every
-            // array witness producer, because the host dimension has no buffer that could retain those dependencies.
-            // Eager values have exact types, so interpreted inference proves the relationship or rejects it and never
-            // leaves a check to a backend.
-            let values = inputs.iter().cloned().map(Value::into_array_ir_value).collect::<Vec<_>>();
-            let input_types = values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-            let (_, interpreted) = Type::infer_cast_output_type(operation, &input_types)?;
-            if interpreted.is_none() {
-                return Err(ProgramError::Concretization {
-                    message: format!(
-                        "`{}` cannot check symbolic type relationships during interpretation; \
-                         bind the operation through its context",
-                        operation.name(),
-                    ),
-                });
-            }
-            self.validate_input_placement(&array_inputs)?;
-            for input in &array_inputs {
-                input
-                    .block_until_ready()
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            }
-            return Ok(vec![Value::from_array_ir_value(values[0].clone(), self)?]);
-        }
-
-        // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
-        // and its inputs directly to a compiled program, so a repeated application skips program construction,
+        // Applications go through the session's eager dispatch cache, which maps the operation, its attached
+        // regions, and its inputs directly to a compiled program, so a repeated application skips program construction,
         // lowering, and compilation key construction and only revalidates its input placement. Hits are looked up
         // through a borrowed query, and the owned key is only built on a miss.
         let region_keys = regions.regions().map(RegionRef::key).collect::<Vec<_>>();
@@ -905,11 +902,12 @@ impl Context for Session {
             region_keys.as_slice(),
             inputs,
             // This is the mesh that `Self::device_mesh_for` resolves for these inputs when it does not have to fall
-            // back to the devices of the client, and it must stay in agreement with that function. The fallbacks
-            // depend only on the operation and the client, which the key already covers, and leaving them out keeps
-            // cache hits free of device queries.
+            // back to the devices of the client, and it must stay in agreement with that function. The fallbacks depend
+            // only on the operation and the client, which the key already covers, and leaving them out keeps cache hits
+            // free of device queries.
             array_inputs.first().map(Array::mesh).or(self.mesh.as_ref()),
         );
+
         let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
                 self.validate_input_placement(array_inputs.as_slice())?;
@@ -1068,6 +1066,8 @@ impl Context for Session {
             })
             .collect()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     // Every `Session` is backed by a PJRT client, so it executes every bound operation for real and its concrete arrays
     // support host readback through `Concretizable<bool>` and `WhilePredicate`. Strategies that fold data-dependent
@@ -1558,14 +1558,14 @@ pub(crate) mod tests {
         Atan2Operation, AttachedRegions, BatchAxis, CaptureReference, Cast, CastOperation, CompareOperation,
         ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, ConditionOperation,
         ConstantOperation, DataType, DenseDifferentiableType, Device, Dimension as CoreDimension,
-        DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionSizeOperation,
-        DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation, DomainTracer,
-        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Fill, Layout, MeshAxisType, Mul,
-        MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Placeholder, ProjectedContext,
-        ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType,
-        ScanOperation, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
-        Sharding, ShardingDimension, ShardingError, StaticShape, SubOperation, TiledLayout, Typed, Value as CoreValue,
-        WhileOperation, ZeroOperation, batch, differentiate_at, i4, shard_map, shard_map_along,
+        DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionError, DimensionFromScalarOperation,
+        DimensionSizeOperation, DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation,
+        DomainTracer, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Fill, Layout,
+        MeshAxisType, Mul, MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Placeholder,
+        ProjectedContext, ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceType, ScanOperation, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation,
+        ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, SubOperation, TiledLayout, Typed,
+        Value as CoreValue, WhileOperation, ZeroOperation, batch, differentiate_at, i4, shard_map, shard_map_along,
         shard_map_with_inferred_input_shardings,
     };
     #[cfg(feature = "cuda-13")]
@@ -2400,11 +2400,7 @@ pub(crate) mod tests {
         assert_eq!(session.cached_program_count(), 0);
 
         let from_scalar = session
-            .bind(
-                ryft_core::DimensionFromScalarOperation::new(output.r#type().into_owned()),
-                Vec::new(),
-                &[Value::Array(scalar)],
-            )
+            .bind(DimensionFromScalarOperation::new(output.r#type().into_owned()), Vec::new(), &[Value::Array(scalar)])
             .unwrap()
             .remove(0);
         let Value::Dimension(from_scalar) = from_scalar else {
@@ -2582,7 +2578,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 session.bind(operation.clone(), Vec::new(), &[value.clone(), invalid.clone()]),
-                Err(ProgramError::Type(TypeError::custom(ryft_core::DimensionError::InputDimensionMismatch {
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
                     dimension: "extent".to_owned(),
                     expected: 2,
                     actual: 3,
