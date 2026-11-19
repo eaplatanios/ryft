@@ -375,19 +375,16 @@ impl Array {
         })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Creates an [`Array`] that belongs to `session` from the per-device `buffers` that one execution of a compiled
     /// program returned for one of its outputs, placed according to that output's precomputed `plan`. The buffers
     /// must be ordered like the addressable devices that `plan` was created for, and `fence` is the whole-execution
-    /// completion fence of the launch.
-    ///
-    /// Unlike [`Self::from_addressable_buffers`], this constructor does not query the buffers' devices, memories,
-    /// element types, or dimensions, because XLA guarantees those properties for the buffers that it returns from a
-    /// program whose signature Ryft lowered, and skipping the queries keeps each execution free of per-output PJRT
-    /// calls. Low-level compile options can override the layouts and the memories of that signature, so an execution
-    /// plan provides `plan` only for an executable whose reported layouts and memory kinds match the declared output
-    /// types. In builds with debug assertions, every buffer is still validated with the same checks.
+    /// completion fence of the launch. Unlike [`Self::from_addressable_buffers`], this constructor does not query the
+    /// buffers' devices, memories, element types, or dimensions, because XLA guarantees those properties for the
+    /// buffers that it returns from a program whose signature Ryft lowered, and skipping the queries keeps each
+    /// execution free of per-output PJRT calls. Low-level compile options can override the layouts and the memories of
+    /// that signature, so an execution plan provides `plan` only for an executable whose reported layouts and memory
+    /// kinds match the declared output types. In builds with debug assertions, every buffer is still validated with
+    /// the same checks.
     pub(crate) fn from_execution_output(
         session: &Session,
         plan: &ArrayOutputPlan,
@@ -413,16 +410,17 @@ impl Array {
                 "execution output buffer {position} does not match its planned placement: {device_id:?}",
             );
         }
-        let zero_space = plan.metadata.r#type().data_type().is_zero();
+
+        let is_zero = plan.metadata.r#type().data_type().is_zero();
         let mut buffers = buffers.into_iter().map(Some).collect::<Vec<_>>();
         let shards = plan
             .descriptors
             .iter()
             .zip(plan.buffer_positions.iter())
             .map(|(descriptor, position)| match position {
-                // Zero-space outputs need no storage. A returned carrier holds only false bits and is discarded like in
-                // the validating constructors, and a program may also return no carrier at all.
-                Some(_) if zero_space => ArrayShard::zero(descriptor.clone()),
+                // Zero-space outputs need no storage. A returned carrier holds only false bits and is discarded like
+                // in the validating constructors, and a program may also return no carrier at all.
+                Some(_) if is_zero => ArrayShard::zero(descriptor.clone()),
                 Some(position) => {
                     let buffer = buffers.get_mut(*position).and_then(Option::take).map(Arc::new);
                     ArrayShard::new(descriptor.clone(), buffer)
@@ -430,6 +428,7 @@ impl Array {
                 None => ArrayShard::new(descriptor.clone(), None),
             })
             .collect::<Vec<_>>();
+
         Self {
             parts: Arc::new(ArrayParts::new(session, Arc::clone(&plan.metadata), shards)),
             execution_fence: Some(fence),
@@ -454,6 +453,8 @@ impl Array {
         self.send_fence = Some(fence);
         self
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Associates this [`Array`] with `session` for future receiver-based dispatch, keeping its storage. This selects
     /// a different effect scope or mesh of the same session, or a different session on the same PJRT client. It does
