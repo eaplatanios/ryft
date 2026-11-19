@@ -83,8 +83,8 @@ impl DenseArrayHostCopy {
                     return Err(Error::from(ArrayError::ShardByteCountMismatch {
                         shard_index,
                         device_id,
-                        expected_byte_count,
-                        actual_byte_count: bytes.len(),
+                        expected: expected_byte_count,
+                        actual: bytes.len(),
                     }));
                 }
                 Ok((shard_index, slices, unreduced_coordinates, bytes))
@@ -182,7 +182,7 @@ impl Array {
         // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
         let expected_byte_count = r#type.size_in_bytes()?;
         if buffer.len() != expected_byte_count {
-            return Err(Error::from(ArrayError::ByteCountMismatch {
+            return Err(Error::from(ArrayError::HostBufferByteCountMismatch {
                 expected: expected_byte_count,
                 actual: buffer.len(),
             }));

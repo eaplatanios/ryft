@@ -57,32 +57,25 @@ pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents errors produced while validating distributed [`Array`] metadata and buffers, placing arrays on devices,
-/// or materializing arrays on the host.
-///
-/// Array APIs return these errors through [`Error::Array`]. Core and PJRT failures generally retain their original
-/// error types. [`Self::InvalidShardDimension`] also records the shard and dimension that failed transport encoding
-/// alongside the original core error.
+/// or materializing arrays on the host. Array APIs return these errors through [`Error::Array`]. Core and PJRT failures
+/// generally retain their original error types. [`Self::InvalidShardDimension`] also records the shard and dimension
+/// that failed transport encoding alongside the original core error.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ArrayError {
-    #[error("missing required sharding metadata")]
-    MissingSharding,
+    #[error("expected static shape but got `{shape}`")]
+    DynamicShape { shape: Shape },
+
+    #[error("session has no device mesh")]
+    MissingMesh,
+
+    #[error("`Session::place` needs a default local device, but the PJRT client has no addressable devices")]
+    MissingDefaultDevice,
 
     #[error(
         "array type sharding `{type_sharding}` does not match the placement `{sharding}` over the non-auto mesh axes"
     )]
     PlacementTypeMismatch { type_sharding: Sharding, sharding: Sharding },
-
-    #[error("session has no device mesh")]
-    MissingMesh,
-
-    #[error("expected static shape but got `{shape}`")]
-    DynamicShape { shape: Shape },
-
-    #[error("`Session::place` needs a default local device, but the PJRT client has no addressable devices")]
-    MissingDefaultDevice,
 
     #[error(
         "`Session::place` source mesh `{expected_mesh:?}` with sharding `{expected_sharding:?}` does not match the \
@@ -95,20 +88,20 @@ pub enum ArrayError {
         actual_sharding: Sharding,
     },
 
-    #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
-    NonAddressableDevice { device_id: DeviceId, process_index: usize },
+    #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
+    ManualReshardingAxis { axis_name: String },
 
     #[error("device {device_id} is not present in the device mesh")]
     DeviceNotInMesh { device_id: DeviceId },
 
-    #[error("device {device_id} reports process index {actual_process_index}, but expected {expected_process_index}")]
-    DeviceProcessIndexMismatch { device_id: DeviceId, expected_process_index: usize, actual_process_index: usize },
+    #[error("device {device_id} reports process index {actual}, but expected {expected}")]
+    DeviceProcessIndexMismatch { device_id: DeviceId, expected: usize, actual: usize },
+
+    #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
+    NonAddressableDevice { device_id: DeviceId, process_index: usize },
 
     #[error("device {device_id} has no addressable memory for `{memory}`")]
     UnsupportedMemory { device_id: DeviceId, memory: Memory },
-
-    #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
-    ManualReshardingAxis { axis_name: String },
 
     #[error("got multiple buffers for device {device_id}")]
     MultipleBuffersOnDevice { device_id: DeviceId },
@@ -122,14 +115,14 @@ pub enum ArrayError {
     #[error("zero-space buffer on device {device_id} contains a nonzero physical carrier value")]
     NonCanonicalZeroBuffer { device_id: DeviceId },
 
-    #[error("expected {expected} byte(s) but got {actual}")]
-    ByteCountMismatch { expected: usize, actual: usize },
-
-    #[error("got multiple host shards for device {device_id}")]
-    MultipleHostShardsOnDevice { device_id: DeviceId },
+    #[error("host buffer needs {expected} byte(s) but got {actual}")]
+    HostBufferByteCountMismatch { expected: usize, actual: usize },
 
     #[error("missing host shard for device {device_id}")]
     MissingHostShard { device_id: DeviceId },
+
+    #[error("got multiple host shards for device {device_id}")]
+    MultipleHostShardsOnDevice { device_id: DeviceId },
 
     #[error("host shard on device {device_id} needs {expected} byte(s) but got {actual}")]
     HostShardByteCountMismatch { device_id: DeviceId, expected: usize, actual: usize },
@@ -140,6 +133,11 @@ pub enum ArrayError {
     #[error("array shard #{shard_index} on device {device_id} has no addressable buffer")]
     MissingShardBuffer { shard_index: ShardIndex, device_id: DeviceId },
 
+    #[error(
+        "copied shard #{shard_index} from device {device_id} to host and got {actual} byte(s), but expected {expected}"
+    )]
+    ShardByteCountMismatch { shard_index: ShardIndex, device_id: DeviceId, expected: usize, actual: usize },
+
     #[error("cross-host transfer for shard #{shard_index}, dimension #{dimension}: {source}")]
     InvalidShardDimension {
         shard_index: ShardIndex,
@@ -148,20 +146,11 @@ pub enum ArrayError {
         source: DimensionError,
     },
 
-    #[error(
-        "copied shard #{shard_index} from device {device_id} to host and got {actual_byte_count} byte(s), but expected \
-         {expected_byte_count}"
-    )]
-    ShardByteCountMismatch {
-        shard_index: ShardIndex,
-        device_id: DeviceId,
-        expected_byte_count: usize,
-        actual_byte_count: usize,
-    },
-
     #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
     InconsistentOverlappingShardData { shard_index: ShardIndex },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information. An
 /// [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
@@ -742,8 +731,8 @@ impl Array {
         if process_index != descriptor.device().process_index() {
             return Err(Error::from(ArrayError::DeviceProcessIndexMismatch {
                 device_id,
-                expected_process_index: descriptor.device().process_index(),
-                actual_process_index: process_index,
+                expected: descriptor.device().process_index(),
+                actual: process_index,
             }));
         }
 
