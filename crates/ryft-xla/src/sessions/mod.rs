@@ -1250,22 +1250,35 @@ impl SessionBuilder {
         self
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Makes the compilation cache of the session also write through to the [`DiskCache`] that the
-    /// [`DiskCache::ENV_VAR`] environment variable configures, if it is set. An absent variable leaves
-    /// the cache as it is otherwise configured. The variable is read when the session is built.
+    /// Opts the session into the persistent [`DiskCache`] that the environment configures. Sessions never read the
+    /// environment unless this function is called, so that a variable in the shell of a user cannot change how a
+    /// program that did not ask for it compiles.
+    ///
+    /// When the session is built, it reads [`DiskCache::ENV_VAR`] (i.e., `RYFT_COMPILATION_CACHE_DIR`):
+    ///
+    ///   - If the variable is set, the compilation cache of the session also writes through to a disk cache in that
+    ///     directory, exactly as if it had been passed to [`Self::disk_cache`]. The cache is capped when
+    ///     [`DiskCache::MAX_BYTES_ENV_VAR`] is set as well.
+    ///   - If the variable is not set, this function has no effect, and the cache stays as it is otherwise
+    ///     configured (i.e., in memory only, unless [`Self::compilation_cache`] supplied a disk cache of its own).
+    ///
+    /// This function and [`Self::disk_cache`] replace each other, so the one that is called last applies.
+    ///
+    /// # Errors
+    ///
+    /// This function itself cannot fail, but it makes [`Self::build`] return [`Error::Io`] if the variable is set
+    /// and its directory cannot be opened or the size cap is not a valid number of bytes.
     #[inline]
     pub fn disk_cache_from_env(mut self) -> Self {
         self.disk_cache = Some(DiskCacheSource::Environment);
         self
     }
 
-    /// Sets the maximum number of compiled operation applications that the eager dispatch cache of the session
-    /// retains, in place of its default of 4096. This cache maps eager operation applications directly to their
-    /// compiled programs, in front of the compilation cache, whose own capacity is that of the session's
-    /// [`CompilationCache`] (i.e., [`CompilationCache::with_capacity`], with a default of 8192). The two caches
-    /// are bounded independently, like the corresponding caches of JAX, and a program stays alive for as long as
+    /// Sets the maximum number of compiled operation applications that the eager dispatch cache of the session retains,
+    /// in place of its default of `4,096`. This cache maps eager operation applications directly to their compiled
+    /// programs, in front of the compilation cache, whose own capacity is that of the session's [`CompilationCache`]
+    /// (i.e., [`CompilationCache::with_capacity`], with a default of `8,192`). The two caches are bounded
+    /// independently, like the corresponding caches of JAX, and a program stays alive for as long as
     /// either cache retains it.
     #[inline]
     pub fn eager_dispatch_cache_capacity(mut self, capacity: usize) -> Self {
@@ -1273,18 +1286,27 @@ impl SessionBuilder {
         self
     }
 
-    /// Supplies the immutable runtime provider configuration of the session in place of the built-in providers.
+    /// Sets the runtime extensions that programs of the session can use. A runtime extension is native support that
+    /// a compiled program needs beyond what the PJRT plugin provides (e.g., the host callback behind `print` or the
+    /// launcher of precompiled CUDA kernels), and `runtime_extensions` holds one [`RuntimeProvider`] for each
+    /// extension that the session knows how to set up. Refer to [`RuntimeExtensions`] for more information.
     ///
-    /// Initialized instances belong to the session, even when `runtime_extensions` was cloned from another
-    /// configuration. Providers initialize lazily when an executable requires them, so building the session does not
-    /// load GPU drivers on their behalf.
+    /// The default is [`RuntimeExtensions::new`], which contains the built-in providers. Call this function to
+    /// add providers of your own to them, or to start from [`RuntimeExtensions::empty`] and choose every provider
+    /// yourself. A program that needs an extension whose provider is missing fails to compile, load, or execute
+    /// in the session with [`RuntimeError::MissingProvider`].
+    ///
+    /// Building the session sets up none of the extensions. The session sets each one up the first time that a
+    /// program needs it and then keeps it for later programs, so a provider for an accelerator that is never used,
+    /// never loads its drivers. Sessions that are built with the same `runtime_extensions` share the providers but
+    /// each set up extensions of their own.
     #[inline]
     pub fn runtime_extensions(mut self, runtime_extensions: RuntimeExtensions) -> Self {
         self.runtime_extensions = runtime_extensions;
         self
     }
 
-    /// Builds an independent session with a fresh effect scope.
+    /// Builds a [`Session`] with a fresh [`EffectScope`].
     ///
     /// # Errors
     ///
@@ -1309,11 +1331,13 @@ impl SessionBuilder {
                 .into());
             }
         };
+
         let compilation_cache = match self.disk_cache {
             None => self.compilation_cache,
             Some(DiskCacheSource::Explicit(disk_cache)) => self.compilation_cache.with_disk_cache(disk_cache),
             Some(DiskCacheSource::Environment) => self.compilation_cache.with_disk_cache_from_env()?,
         };
+
         Ok(Session {
             state: Arc::new(SessionState {
                 client,
@@ -1329,6 +1353,8 @@ impl SessionBuilder {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Handle to an array that a [`Session`] retains on behalf of a trace whose capture table cannot hold runtime arrays.
 /// Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of a
