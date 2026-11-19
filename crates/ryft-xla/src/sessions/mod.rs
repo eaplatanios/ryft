@@ -1067,21 +1067,19 @@ impl Context for Session {
             .collect()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    // Every `Session` is backed by a PJRT client, so it executes every bound operation for real and its concrete arrays
-    // support host readback through `Concretizable<bool>` and `WhilePredicate`. Strategies that fold data-dependent
-    // work through values visible on the host (i.e., the eager data-dependent `while` rules and the unrolling of
-    // concretizable `while` loops) therefore always apply.
     fn is_eager(&self) -> bool {
+        // Every `Session` is backed by a PJRT client, so it executes every bound operation for real and its concrete
+        // arrays support host readback through `Concretizable<bool>` and `WhilePredicate`. Strategies that fold
+        // data-dependent work through values visible on the host (i.e., the eager data-dependent `while` rules
+        // and the unrolling of concretizable `while` loops) therefore always apply.
         true
     }
 
-    // `Session` is a terminal execution domain. It dispatches each operation to its own compiled program instead of
-    // recording instructions, so there is nothing to attach provenance to and scopes are a deliberate no-op. Programs
-    // traced *over* this session attach provenance through their own tracing contexts.
     #[inline]
     fn provenance(&self) -> Provenance {
+        // `Session` is a terminal execution domain. It dispatches each operation to its own compiled program instead
+        // of recording instructions, so there is nothing to attach provenance to and scopes are a deliberate no-op.
+        // Programs traced _over_ this session attach provenance through their own tracing contexts.
         Provenance::unknown()
     }
 
@@ -1098,33 +1096,37 @@ impl Context for Session {
     }
 }
 
-// Context capability that materializes additive identity arrays. Transform machinery over this session (e.g., the
-// batching rules of nullary constant operations and the accumulator seeding of recursive higher-order rules)
-// synthesizes constants through the `Zero`, `One`, `Fill`, and `Iota` leaves of the active context, which are driven
-// by types alone. The bind below goes through the eager dispatch cache like any other operation, so a program is
-// compiled for the first zero of each type and reused afterwards. Dynamic array zeros are intentionally not available
-// through this capability, because it receives only a type and they require explicit first-class extent operands.
 impl Zero<Value> for Session {
     fn zero(&self, r#type: &Type) -> Result<Value, ProgramError> {
+        // Transform machinery over this session (e.g., the batching rules of nullary constant operations and the
+        // accumulator seeding of recursive higher-order rules) synthesizes constants through the `Zero`, `One`, `Fill`,
+        // and `Iota` leaves of the active context, which are driven by types alone. The bind below goes through the
+        // eager dispatch cache like any other operation, so a program is compiled for the first zero of each type and
+        // reused afterwards. Dynamic array zeros are intentionally not available through this capability, because it
+        // receives only a type and they require explicit first-class extent operands.
         let mut outputs = self.bind(Operation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-// Materialization delegates to `Context::lift` and therefore shares its semantics. An immediate dimension extent
-// materializes directly and a Boolean literal uploads a replicated scalar, while a `Constant::Captured` payload carries
-// only a type and no data and is always rejected outside a surrounding capture table. The implementation exists
-// because operation families that support interpretation and batching require a `ryft_core::Constant` leaf on their
-// contexts. Programs whose constants were compiled into capture tables never take the captured path.
 impl CoreConstant<Value, Constant> for Session {
+    #[inline]
     fn constant(&self, value: Constant) -> Result<Value, ProgramError> {
+        // Materialization delegates to `Context::lift` and therefore shares its semantics. An immediate dimension
+        // extent materializes directly and a Boolean literal uploads a replicated scalar, while a `Constant::Captured`
+        // payload carries only a type and no data and is always rejected outside a surrounding capture table. The
+        // implementation exists because operation families that support interpretation and batching require a
+        // `ryft_core::Constant` leaf on their contexts. Programs whose constants were compiled into capture tables
+        // never take the captured path.
         self.lift(value)
     }
 }
 
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
 pub type Tracer = DomainTracer<Session>;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
