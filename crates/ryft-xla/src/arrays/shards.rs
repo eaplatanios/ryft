@@ -447,46 +447,109 @@ mod tests {
     use crate::arrays::Array;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{
-        cpu_client, device_mesh_2x2, logical_mesh_2x2, replicated_array, values_from_bytes, values_to_bytes,
+        cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, replicated_array, values_from_bytes,
+        values_to_bytes,
     };
 
     use super::*;
 
+    // Returns a device buffer that holds the `f32` values `[1, 2]`, for shards that need process-local storage.
+    fn vector_buffer() -> Arc<Buffer<'static>> {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
+        Arc::clone(array.shards()[0].buffer().unwrap())
+    }
+
     #[test]
     fn test_array_shard_new() {
-        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
+        // Without a buffer, the shard is a remote shard that only carries its descriptor.
+        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![0..2]);
         let shard = ArrayShard::new(descriptor.clone(), None);
-
         assert_eq!(shard.descriptor(), &descriptor);
-        assert!(shard.buffer().is_none());
-        assert_eq!(shard.index(), 3);
-        assert_eq!(shard.device(), Device::new(7, 2));
-        assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
-        assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
-        assert!(!shard.is_addressable());
+        assert!(matches!(shard.storage(), ArrayShardStorage::Remote));
+
+        // With a buffer, the shard holds that buffer as its process-local storage.
+        let buffer = vector_buffer();
+        let shard = ArrayShard::new(descriptor.clone(), Some(Arc::clone(&buffer)));
+        assert_eq!(shard.descriptor(), &descriptor);
+        assert!(matches!(shard.storage(), ArrayShardStorage::Buffer(storage) if Arc::ptr_eq(storage, &buffer)));
+    }
+
+    #[test]
+    fn test_array_shard_zero() {
+        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![0..2]);
+        let shard = ArrayShard::zero(descriptor.clone());
+        assert_eq!(shard.descriptor(), &descriptor);
+        assert!(matches!(shard.storage(), ArrayShardStorage::Zero));
+    }
+
+    #[test]
+    fn test_array_shard_descriptor() {
+        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
+        assert_eq!(ArrayShard::new(descriptor.clone(), None).descriptor(), &descriptor);
+        assert_eq!(ArrayShard::zero(descriptor.clone()).descriptor(), &descriptor);
     }
 
     #[test]
     fn test_array_shard_storage() {
-        // A shard without a buffer lives in another process, and a zero shard is local without holding a buffer.
         let descriptor = ShardDescriptor::new(0, Device::new(0, 0), vec![0..2]);
+        let buffer = vector_buffer();
         assert!(matches!(ArrayShard::new(descriptor.clone(), None).storage(), ArrayShardStorage::Remote));
-        assert!(matches!(ArrayShard::zero(descriptor).storage(), ArrayShardStorage::Zero));
-
-        // A shard of an uploaded array holds the buffer that `ArrayShard::buffer` returns.
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 1);
-        let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
-        let shard = &array.shards()[0];
+        assert!(matches!(ArrayShard::zero(descriptor.clone()).storage(), ArrayShardStorage::Zero));
         assert!(matches!(
-            shard.storage(),
-            ArrayShardStorage::Buffer(buffer) if Arc::ptr_eq(buffer, shard.buffer().unwrap()),
+            ArrayShard::new(descriptor, Some(Arc::clone(&buffer))).storage(),
+            ArrayShardStorage::Buffer(storage) if Arc::ptr_eq(storage, &buffer),
         ));
     }
 
     #[test]
-    fn test_array_shard_copy_to_host() {
+    fn test_array_shard_buffer() {
+        // Only a shard with process-local storage in a buffer has one, so remote and zero shards have none.
+        let descriptor = ShardDescriptor::new(0, Device::new(0, 0), vec![0..2]);
+        let buffer = vector_buffer();
+        assert!(ArrayShard::new(descriptor.clone(), None).buffer().is_none());
+        assert!(ArrayShard::zero(descriptor.clone()).buffer().is_none());
+        let shard = ArrayShard::new(descriptor, Some(Arc::clone(&buffer)));
+        assert!(Arc::ptr_eq(shard.buffer().unwrap(), &buffer));
+    }
+
+    #[test]
+    fn test_array_shard_index() {
+        let shard = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);
+        assert_eq!(shard.index(), 3);
+    }
+
+    #[test]
+    fn test_array_shard_device() {
+        let shard = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);
+        assert_eq!(shard.device(), Device::new(7, 2));
+    }
+
+    #[test]
+    fn test_array_shard_slice() {
+        let shard = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);
+        assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
+    }
+
+    #[test]
+    fn test_array_shard_shape() {
+        let shard = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);
+        assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
+    }
+
+    #[test]
+    fn test_array_shard_is_addressable() {
+        // A shard is addressable when the current process holds it, whether or not it needs a buffer.
+        let descriptor = ShardDescriptor::new(0, Device::new(0, 0), vec![0..2]);
+        assert!(!ArrayShard::new(descriptor.clone(), None).is_addressable());
+        assert!(ArrayShard::zero(descriptor.clone()).is_addressable());
+        assert!(ArrayShard::new(descriptor, Some(vector_buffer())).is_addressable());
+    }
+
+    #[test]
+    fn test_array_shard_copy_to_host_bytes() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
@@ -539,13 +602,36 @@ mod tests {
 
     #[test]
     fn test_shard_descriptor_new() {
-        let device = Device::new(7, 2);
-        let descriptor = ShardDescriptor::new(3, device, vec![2..5, 0..4]);
+        assert_eq!(
+            ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]),
+            ShardDescriptor { index: 3, device: Device::new(7, 2), slice: Arc::from([2..5, 0..4]) },
+        );
+    }
 
-        assert_eq!(descriptor.index(), 3);
-        assert_eq!(descriptor.device(), device);
-        assert_eq!(descriptor.slice(), [2..5, 0..4].as_slice());
-        assert_eq!(descriptor.shape(), StaticShape::new(vec![3, 4]));
+    #[test]
+    fn test_shard_descriptor_index() {
+        assert_eq!(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]).index(), 3);
+    }
+
+    #[test]
+    fn test_shard_descriptor_device() {
+        assert_eq!(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]).device(), Device::new(7, 2));
+    }
+
+    #[test]
+    fn test_shard_descriptor_slice() {
+        assert_eq!(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]).slice(), [2..5, 0..4].as_slice());
+
+        // A rank-0 shard has no dimensions to slice.
+        assert_eq!(ShardDescriptor::new(0, Device::new(7, 2), vec![]).slice(), [].as_slice());
+    }
+
+    #[test]
+    fn test_shard_descriptor_shape() {
+        // The extent of each dimension is the length of its range, so an empty range yields an extent of zero.
+        let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4, 6..6]);
+        assert_eq!(descriptor.shape(), StaticShape::new(vec![3, 4, 0]));
+        assert_eq!(ShardDescriptor::new(0, Device::new(7, 2), vec![]).shape(), StaticShape::new(vec![]));
     }
 
     #[test]
@@ -583,10 +669,20 @@ mod tests {
         // A scalar (i.e., rank-0) descriptor trivially reports a single block with one element.
         let descriptor = ShardDescriptor::new(0, device, vec![]);
         assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![])).unwrap(), (0, 1));
+
+        // A block whose element count does not fit in a `usize` is rejected instead of wrapping around.
+        let descriptor = ShardDescriptor::new(0, device, vec![0..usize::MAX, 0..2]);
+        let error = descriptor.contiguous_inner_block(&StaticShape::new(vec![usize::MAX, 2])).unwrap_err();
+        let message = format!(
+            "contiguous shard block element count for shard slice `[0..{max}, 0..2]` and shape `[{max}, 2]` exceeds \
+             the maximum allowed size of {max}",
+            max = usize::MAX,
+        );
+        assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
     }
 
     #[test]
-    fn test_shard_layout_new_evenly_partitions_two_dimensions() {
+    fn test_shard_layout_new() {
         let mesh = device_mesh_2x2();
         let shape = StaticShape::new(vec![8, 6]);
         let sharding = Sharding::new(
