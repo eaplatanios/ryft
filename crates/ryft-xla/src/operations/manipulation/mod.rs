@@ -38,16 +38,16 @@ mod tests {
     };
 
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, read_f64s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{Array, Constant, Options, Type};
+    use crate::{Array, Constant, Options, Session, Type};
 
     #[test]
     fn test_compiled_indexing() {
         // Compiled basic and broadcast advanced reads and repeated indexed updates.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_types = vec![
             ArrayType::new_static(DataType::F64, [3, 4]),
             ArrayType::new_static(DataType::I64, [2, 1]),
@@ -82,14 +82,17 @@ mod tests {
             .collect::<Vec<_>>();
         let outputs = compiled.executable().execute(&session, inputs).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[3, 2]);
-        assert_eq!(read_f64s(client, &outputs[0]), vec![9., 11., 5., 7., 1., 3.]);
+        assert_eq!(read_first_shard::<f64>(client, &outputs[0]), vec![9., 11., 5., 7., 1., 3.]);
         assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
-        assert_eq!(read_f64s(client, &outputs[1]), vec![9., 9., 11., 1., 1., 3.]);
+        assert_eq!(read_first_shard::<f64>(client, &outputs[1]), vec![9., 9., 11., 1., 1., 3.]);
         // A huge negative stride selects only the last row and must not wrap when lowered to signed attributes.
         assert_eq!(outputs[3].shape().as_slice(), &[1, 4]);
-        assert_eq!(read_f64s(client, &outputs[3]), vec![8., 9., 10., 11.]);
+        assert_eq!(read_first_shard::<f64>(client, &outputs[3]), vec![8., 9., 10., 11.]);
         // Duplicate advanced coordinates contribute twice, and the original input remains a value, not a mutable view.
-        assert_eq!(read_f64s(client, &outputs[2]), vec![0., 3., 2., 4., 4., 5., 6., 7., 8., 11., 10., 12.]);
+        assert_eq!(
+            read_first_shard::<f64>(client, &outputs[2]),
+            vec![0., 3., 2., 4., 4., 5., 6., 7., 8., 11., 10., 12.]
+        );
     }
 
     #[test]
@@ -97,7 +100,7 @@ mod tests {
         // One symbolic indexing graph replays at distinct concrete extents.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
@@ -166,7 +169,7 @@ mod tests {
                 .execute(&session, inputs)
                 .unwrap()
                 .iter()
-                .map(|output| read_f64s(client, output))
+                .map(|output| read_first_shard::<f64>(client, output))
                 .collect::<Vec<_>>()
         };
         assert_eq!(execute(&[1., 2., 3., 4.]), vec![vec![2., 2., 4.], vec![1., 32., 3., 34.], vec![2., 2., 4.]]);
@@ -180,7 +183,7 @@ mod tests {
     fn test_compiled_symbolic_manipulation_primal_and_pullback() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in the
         // pinned JAX oracle, plus empty rows for the conveniences that admit them. Keep dimension residuals internal to
         // a fused primal and pullback. This verifies retained graph specialization, without asserting reuse of one
@@ -561,7 +564,7 @@ mod tests {
                     assert_eq!(output.mesh(), &mesh);
                 }
                 assert_eq!(outputs[0].shape().as_slice(), output_type.static_shape().unwrap().as_slice());
-                assert_eq!(read_f64s(client, &outputs[0]), expected, "{name}, n={size}");
+                assert_eq!(read_first_shard::<f64>(client, &outputs[0]), expected, "{name}, n={size}");
                 let mut gradient =
                     vec![if name == "broadcast" || name == "concatenate" { 2f64 } else { 1f64 }; size * 4];
                 if name == "gather" || name == "gather_axis" {
@@ -604,7 +607,7 @@ mod tests {
                     }
                 }
                 assert_eq!(outputs[1].shape().as_slice(), &[size, 4]);
-                assert_eq!(read_f64s(client, &outputs[1]), gradient, "{name} pullback, n={size}");
+                assert_eq!(read_first_shard::<f64>(client, &outputs[1]), gradient, "{name} pullback, n={size}");
             }
         }
     }

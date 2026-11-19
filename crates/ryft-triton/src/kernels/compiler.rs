@@ -130,8 +130,13 @@ impl Compiler {
         self
     }
 
-    /// Computes linked compiler and effective toolchain identity, or checks the recorded AOT configuration.
+    /// Serializes the linked or recorded compiler configuration used for artifact identity.
     fn key(&self, target: &Target, options: &Options, schedule: &KernelSchedule) -> Result<Vec<u8>, Error> {
+        Ok(serde_json::to_vec(&self.configuration(target, options, schedule)?)?)
+    }
+
+    /// Computes linked compiler and effective toolchain identity, or checks the recorded AOT configuration.
+    fn configuration(&self, target: &Target, options: &Options, schedule: &KernelSchedule) -> Result<Value, Error> {
         target.validate()?;
         let stages = schedule.pipeline_stages().map_or(2, |stages| stages.get());
         if stages > 8 || schedule.buffering_depth().is_some() {
@@ -149,7 +154,7 @@ impl Compiler {
                     message: "requested options differ from recorded compiler configuration".into(),
                 });
             }
-            return Ok(serde_json::to_vec(configuration)?);
+            return Ok(configuration.clone());
         }
         let native = NativeVersions(unsafe { RYFT_XLA_Triton_Get_Versions() });
         let available = match target {
@@ -175,11 +180,11 @@ impl Compiler {
             }).map_err(|_| Error::Invalid { message: "native assembler version is not UTF-8".into() })?,
         });
         Self::validate_versions(&versions, target)?;
-        Ok(serde_json::to_vec(&json!({
+        Ok(json!({
             "schema": COMPILER_SCHEMA_VERSION, "versions": versions, "lowering_sha256": lowering_sha256(),
             "target": target, "warp_count": options.warp_count(), "pipeline_stages": stages,
             "maximum_scratch_bytes": schedule.maximum_scratch_bytes(),
-        }))?)
+        }))
     }
 
     /// Checks the same linked-source and target toolchain contract for live and recorded configurations.
@@ -189,11 +194,7 @@ impl Compiler {
             "rocm_device_libs": "53996464fa8d94b182ac4aaa7dc3a109ab524f45",
         });
         let valid_toolchain = match target {
-            Target::Cuda { .. } => {
-                versions["cuda_available"] == json!(true)
-                    && versions["cuda_toolkit_version"] == json!(13020)
-                    && versions["assembler_version"] == json!("13.0.88")
-            }
+            Target::Cuda { .. } => versions["cuda_available"] == json!(true) && cuda_ptx_version(versions).is_some(),
             Target::Rocm { .. } => {
                 versions["rocm_available"] == json!(true)
                     && versions["cuda_toolkit_version"]
@@ -308,7 +309,8 @@ impl KernelCompiler for Compiler {
             }
             let context = Context::new();
             let lowered = lowering::lower(&context, kernel, options, schedule)?;
-            let configuration_key = self.key(target, options, schedule)?;
+            let configuration = self.configuration(target, options, schedule)?;
+            let configuration_key = serde_json::to_vec(&configuration)?;
             let (platform, architecture, threads_per_warp) = match target {
                 Target::Cuda { major, minor } => ("cuda", format!("{major}.{minor}"), 32),
                 Target::Rocm { architecture } => ("rocm", architecture.clone(), 64),
@@ -365,7 +367,9 @@ impl KernelCompiler for Compiler {
                 Target::Cuda { .. } => {
                     let ptx = std::str::from_utf8(&bytes)
                         .map_err(|_| Error::Artifact { message: "PTX is not UTF-8".into() })?;
-                    let architecture = validate_ptx(ptx, target, &metadata)?;
+                    let version = cuda_ptx_version(&configuration["versions"])
+                        .expect("validated CUDA compiler configuration must specify a PTX version");
+                    let architecture = validate_ptx(ptx, version, target, &metadata)?;
                     Artifact::Cuda(CudaKernelArtifact::new(
                         CudaArtifactFormat::Ptx,
                         bytes,
@@ -489,8 +493,17 @@ fn tokens(source: &str) -> Result<Vec<&str>, Error> {
     Ok(tokens)
 }
 
-/// Requires the actual PTX declaration and resources to agree with the post-LLVM native signature.
-fn validate_ptx(source: &str, target: &Target, metadata: &Metadata) -> Result<String, Error> {
+/// Returns the PTX ISA version for a qualified CUDA header and assembler pair.
+fn cuda_ptx_version(versions: &Value) -> Option<&'static str> {
+    match (versions["cuda_toolkit_version"].as_u64()?, versions["assembler_version"].as_str()?) {
+        (12090, "12.9.86") => Some("8.8"),
+        (13020, "13.0.88") => Some("9.0"),
+        _ => None,
+    }
+}
+
+/// Requires the actual PTX declaration and resources to agree with the toolchain and post-LLVM native signature.
+fn validate_ptx(source: &str, version: &str, target: &Target, metadata: &Metadata) -> Result<String, Error> {
     let tokens = tokens(source)?;
     let invalid = || Error::Artifact { message: "PTX declarations differ from the native artifact contract".into() };
     let unique = |name: &str| -> Result<usize, Error> {
@@ -501,7 +514,8 @@ fn validate_ptx(source: &str, target: &Target, metadata: &Metadata) -> Result<St
         }
         Ok(position)
     };
-    if tokens.get(unique(".version")? + 1) != Some(&"9.0") || tokens.get(unique(".address_size")? + 1) != Some(&"64") {
+    if tokens.get(unique(".version")? + 1) != Some(&version) || tokens.get(unique(".address_size")? + 1) != Some(&"64")
+    {
         return Err(invalid());
     }
     let Target::Cuda { major, minor } = target else {
@@ -659,6 +673,11 @@ mod tests {
             assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&changed).unwrap()),
                 Err(Error::Invalid { message }) if message == "invalid recorded compiler options"));
         }
+        let mut cuda_12 = configuration.clone();
+        cuda_12["versions"]["cuda_toolkit_version"] = json!(12090);
+        assert!(Compiler::from_configuration(&serde_json::to_vec(&cuda_12).unwrap()).is_err());
+        cuda_12["versions"]["assembler_version"] = json!("12.9.86");
+        assert!(Compiler::from_configuration(&serde_json::to_vec(&cuda_12).unwrap()).is_ok());
         let mut rocm = configuration.clone();
         rocm["target"] = json!(Target::Rocm { architecture: "gfx942".into() });
         rocm["versions"]["cuda_toolkit_version"] = json!(0);
@@ -1004,7 +1023,9 @@ mod tests {
     #[test]
     fn test_validate_ptx() {
         let target = Target::Cuda { major: 12, minor: 1 };
-        assert_eq!(validate_ptx(PTX, &target, &metadata()).unwrap(), "sm_121");
+        assert_eq!(validate_ptx(PTX, "9.0", &target, &metadata()).unwrap(), "sm_121");
+        assert_eq!(validate_ptx(&PTX.replace("9.0", "8.8"), "8.8", &target, &metadata()).unwrap(), "sm_121");
+        assert!(validate_ptx(PTX, "8.8", &target, &metadata()).is_err());
         for source in [
             PTX.replace("sm_121", "sm_80"),
             PTX.replace(".u64", ".u32"),
@@ -1013,11 +1034,11 @@ mod tests {
             PTX.replace("9.0", "8.0"),
             format!("{PTX}\n{PTX}"),
         ] {
-            assert!(matches!(validate_ptx(&source, &target, &metadata()), Err(Error::Artifact { message })
+            assert!(matches!(validate_ptx(&source, "9.0", &target, &metadata()), Err(Error::Artifact { message })
                 if message == "PTX declarations differ from the native artifact contract"));
         }
         let mut changed = metadata();
         changed.argument_count = 2;
-        assert!(matches!(validate_ptx(PTX, &target, &changed), Err(Error::Artifact { .. })));
+        assert!(matches!(validate_ptx(PTX, "9.0", &target, &changed), Err(Error::Artifact { .. })));
     }
 }

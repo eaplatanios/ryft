@@ -2214,7 +2214,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
-    use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client, shares_effect_scope};
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type, shares_effect_scope};
     use crate::tests::{
         assert_send_sync, cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, other_cpu_client,
         replicated_array, values_from_bytes, values_to_bytes,
@@ -2275,7 +2275,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
         let mesh = domain_mesh(client, "x", devices.len());
         let values = CoreArray::vector(vec![1.0f32, 2.0]).unwrap();
@@ -2321,7 +2321,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers_rejects_dynamic_shape() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![Device::new(0, 1)],
@@ -2344,7 +2344,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers_memory() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::scalar(DataType::I32);
@@ -2375,7 +2375,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers_rejects_noncanonical_zero_carrier() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let device_id = device.id().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -2399,7 +2399,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers_discards_canonical_zero_carrier() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
@@ -2415,7 +2415,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers_rejects_native_one_bit_carrier() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap().remove(0);
         let mesh = domain_mesh(client, "x", 1);
         for data_type in [DataType::I1, DataType::U1] {
@@ -2437,7 +2437,7 @@ mod tests {
     #[test]
     fn test_array_from_addressable_buffers_with_runtime_sharding() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
@@ -2568,7 +2568,7 @@ mod tests {
     #[test]
     fn test_array_from_host_buffer() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [2]);
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0]);
 
@@ -2619,7 +2619,7 @@ mod tests {
     #[allow(deprecated)] // PJRT currently exposes actual buffer layout only through this query.
     fn test_array_from_host_buffer_layout() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap().remove(0);
         let mesh = domain_mesh(client, "x", 1);
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
@@ -2667,7 +2667,7 @@ mod tests {
     #[test]
     fn test_array_from_host_buffer_memory() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let mesh = domain_mesh(client, "x", 1);
         let values = values_to_bytes::<i64>(&[i64::MIN, i64::MAX]);
@@ -2699,7 +2699,7 @@ mod tests {
         // dimension. A host upload places the whole value on the devices at coordinate zero along `x` and zeros on the
         // others, and host materialization sums the summands of each tile.
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -2793,7 +2793,7 @@ mod tests {
     #[test]
     fn test_array_from_host_buffer_zero_space() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
 
@@ -2814,7 +2814,7 @@ mod tests {
     #[test]
     fn test_array_from_host_buffer_zero_space_remote_shards() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -2833,7 +2833,7 @@ mod tests {
     #[test]
     fn test_array_from_host_buffer_uneven_1d_partitioning() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [0.0f32, 1.0, 2.0, 3.0, 4.0];
@@ -2875,7 +2875,7 @@ mod tests {
     #[test]
     fn test_array_from_host_buffer_2d_partitioning() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2938,7 +2938,7 @@ mod tests {
     #[test]
     fn test_array_from_host_shards() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mut devices = client
             .addressable_devices()
             .unwrap()
@@ -3026,7 +3026,7 @@ mod tests {
     #[test]
     fn test_array_from_host_shards_with_auto_axis() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new_static(DataType::U8, [3]);
@@ -3049,7 +3049,7 @@ mod tests {
     #[test]
     fn test_array_from_execution_output() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_ids = devices.iter().map(Device::id).collect::<Vec<_>>();
@@ -3123,7 +3123,7 @@ mod tests {
     #[should_panic(expected = "does not match its planned placement")]
     fn test_array_from_execution_output_rejects_misplaced_buffers_in_debug_builds() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let device_ids = client_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let mesh = domain_mesh(client, "x", 2);
@@ -3147,7 +3147,7 @@ mod tests {
     #[test]
     fn test_array_with_send_fence() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::new_static(DataType::F32, [2]);
         let mut context = Context::from_waker(Waker::noop());
@@ -3207,7 +3207,7 @@ mod tests {
     fn test_array_associate() {
         let client = cpu_client(1);
         let other_client = other_cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
         let original = array.clone();
@@ -3223,7 +3223,7 @@ mod tests {
 
         // Associating with a handle of another session on the same client switches the session, and therefore its
         // compilation cache and effect scope, while keeping the array's storage.
-        let other_session = session_with_client(client);
+        let other_session = Session::builder().client(client).build().unwrap();
         let reassociated = array.associate(&other_session.with_new_effect_scope()).unwrap();
         assert!(reassociated.session().is_same_session(&other_session));
         assert!(std::ptr::eq(reassociated.client(), client));
@@ -3241,7 +3241,7 @@ mod tests {
 
         // Association rejects a session of a different client, even when no numerical buffer could establish
         // ownership (e.g., for bufferless zero-space arrays).
-        let other_client_session = session_with_client(other_client);
+        let other_client_session = Session::builder().client(other_client).build().unwrap();
         let zero = Array::from_host_buffer(&session, ArrayType::scalar(DataType::Zero), None, None, []).unwrap();
         for array in [original, zero] {
             assert!(matches!(
@@ -3268,7 +3268,7 @@ mod tests {
 
         // Arrays constructed from host buffers belong to the provided session and live on its client, which transferred
         // their shard buffers. Cloning an array preserves that association.
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let bytes = values_to_bytes::<f32>(values.as_slice());
         let array = Array::from_host_buffer(
@@ -3311,7 +3311,7 @@ mod tests {
         // A session whose client does not own the addressable shard buffers is rejected, even when that client was
         // created from the same plugin with identical options.
         let other_client = other_cpu_client(4);
-        let other_session = session_with_client(other_client);
+        let other_session = Session::builder().client(other_client).build().unwrap();
         let error = Array::from_addressable_buffers(
             &other_session,
             array_type.clone(),
@@ -3341,7 +3341,7 @@ mod tests {
     #[test]
     fn test_array_copy_to_host() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -3395,7 +3395,7 @@ mod tests {
     #[test]
     fn test_array_to_shardy_tensor_sharding_attribute() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array = Array::from_host_buffer(
@@ -3422,7 +3422,7 @@ mod tests {
     #[test]
     fn test_array_clone() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
         let array =
@@ -3442,7 +3442,7 @@ mod tests {
     #[test]
     fn test_array_debug() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
@@ -3471,7 +3471,7 @@ mod tests {
     #[test]
     fn test_array_display() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
         assert_eq!(array.to_string(), "array(type=f32[2][sharding={mesh<['x'=1:auto]>, [{}]}])");
@@ -3482,7 +3482,7 @@ mod tests {
         // Arrays whose shards all live on another process have no local storage to compare, so two of them are equal
         // only when they share their parts.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let remote = Device::new(local.id() + 1, local.process_index() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -3500,7 +3500,7 @@ mod tests {
     #[test]
     fn test_array_domain() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
 
@@ -3513,7 +3513,7 @@ mod tests {
     #[test]
     fn test_array_concretize_bool() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let truth = replicated_array(&session, &mesh, DataType::Boolean, &[], &[1]);
         let falsity = replicated_array(&session, &mesh, DataType::Boolean, &[], &[0]);
@@ -3537,7 +3537,7 @@ mod tests {
         // The two devices hold the candidates `false` and `true` of a Boolean scalar whose unreduced kind is `max`, so
         // its value is `true` even though the first addressable shard holds `false`.
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = unreduced_scalar(&session, DataType::Boolean, UnreducedKind::Max, [&[0], &[1]]);
         assert_eq!(Concretizable::<bool>::concretize(&array), Ok(true));
     }
@@ -3545,7 +3545,7 @@ mod tests {
     #[test]
     fn test_array_concretize_i128() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let signed = replicated_array(&session, &mesh, DataType::I64, &[], &i64::MIN.to_ne_bytes());
         let unsigned = replicated_array(&session, &mesh, DataType::U64, &[], &u64::MAX.to_ne_bytes());
@@ -3571,7 +3571,7 @@ mod tests {
         // The two devices hold the summands `3` and `4` of a scalar that is unreduced along `x`, so it reads as their
         // sum rather than as the summand of the first addressable shard.
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array =
             unreduced_scalar(&session, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
         assert_eq!(Concretizable::<i128>::concretize(&array), Ok(7));
@@ -3580,7 +3580,7 @@ mod tests {
     #[test]
     fn test_array_any_true() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let mixed = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let none = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 0]);
@@ -3589,7 +3589,7 @@ mod tests {
 
         // The devices of an unreduced predicate hold candidates, which its unreduced kind combines.
         let client = cpu_client(2);
-        let unreduced_session = session_with_client(client);
+        let unreduced_session = Session::builder().client(client).build().unwrap();
         for (kind, expected) in [(UnreducedKind::Min, false), (UnreducedKind::Max, true), (UnreducedKind::Sum, true)] {
             let candidates = unreduced_scalar(&unreduced_session, DataType::Boolean, kind, [&[1], &[0]]);
             assert_eq!(candidates.any_true(), Ok(expected));
@@ -3610,7 +3610,7 @@ mod tests {
     #[test]
     fn test_array_select() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let mixed = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let on_true = replicated_array(&session, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[1f32, 2., 3., 4.]));
@@ -3637,7 +3637,7 @@ mod tests {
     #[test]
     fn test_array_assertion_observation() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let scalar = replicated_array(&session, &mesh, DataType::F32, &[], &2.5f32.to_ne_bytes());
         assert_eq!(scalar.assertion_observation(), Ok("2.5".to_string()));
@@ -3657,7 +3657,7 @@ mod tests {
     fn test_array_assertion_observation_unreduced() {
         // The observation of a scalar that is unreduced along `x` is the sum of the summands `3` and `4`.
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array =
             unreduced_scalar(&session, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
         assert_eq!(array.assertion_observation(), Ok("7".to_string()));
@@ -3666,7 +3666,7 @@ mod tests {
     #[test]
     fn test_array_assertion_array() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let bytes = values_to_bytes(&[1f32, 2.]);
         let array = replicated_array(&session, &mesh, DataType::F32, &[2], &bytes);
@@ -3681,7 +3681,7 @@ mod tests {
     #[test]
     fn test_array_dimension_size() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
         let matrix = replicated_array(&session, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&[0f32; 6]));
         assert_eq!(matrix.dimension_size(0), Ok(2));
@@ -3708,7 +3708,7 @@ mod tests {
     #[test]
     fn test_array_to_dimension() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let scalar = replicated_array(&session, &mesh, DataType::I32, &[], &5i32.to_ne_bytes());
@@ -3728,7 +3728,7 @@ mod tests {
         // The devices of a scalar that is unreduced along `x` hold the summands `3` and `4`, which are not the same on
         // every device, so the scalar must be combined before it can become a dimension.
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array =
             unreduced_scalar(&session, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -3744,7 +3744,7 @@ mod tests {
     #[test]
     fn test_array_operators() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let read = |array: Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
         let a = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
@@ -3780,7 +3780,7 @@ mod tests {
     #[test]
     fn test_array_shard_copy_to_host() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
 
         // A buffer-backed shard holds only its own tile of the array.

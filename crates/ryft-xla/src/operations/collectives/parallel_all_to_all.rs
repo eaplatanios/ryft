@@ -185,16 +185,15 @@ mod tests {
     use crate::lowering::tests::{static_sharded_array_type, test_manual_mesh, test_spmd_compilation_options};
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::Operation;
-    use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, TracedProgram, trace};
+    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
     use super::*;
 
     #[test]
     fn test_parallel_all_to_all_operation_lower() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -314,7 +313,7 @@ mod tests {
     #[test]
     fn test_parallel_all_to_all_operation_lower_untiled_exchanges_rank() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(

@@ -1133,7 +1133,7 @@ mod tests {
     use crate::operations::debugging::with_captured_prints;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, f32_vector, read_f32s, read_f64s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, f32_vector, read_first_shard};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
@@ -1204,7 +1204,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let input =
             replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
@@ -1215,7 +1215,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_integer_rounding() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Integer precision above a BF16 rounding midpoint must survive the conversion.
@@ -1243,7 +1243,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_f64_rounding() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         // Converting `f64` to a narrower float rounds once, so values just below, at, and just above a rounding
         // midpoint land on the correct neighbor for both signs, at normal and subnormal midpoints alike.
@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_finite_formats() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Formats without infinities or NaNs saturate infinities and finite overflow, and NaNs select the positive
@@ -1308,7 +1308,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_f8e8m0fnu_rounding() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // The lowest midpoint lies in the F32 subnormal range. F64 inputs one step to either side of it must
@@ -1349,7 +1349,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_fp6_to_f32() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let encodings = (0u8..64).collect::<Vec<_>>();
         // Every FP6 encoding is finite. Exact F32 bytes distinguish both zeros and cover the boundary between
@@ -1380,7 +1380,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_complex_to_boolean() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         // Purely imaginary values and NaNs in either component are nonzero, whereas signed zeros are false.
         let components = [0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
@@ -1392,7 +1392,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_operation_lower_sub_byte_integers() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // The same physical bit represents -1 for I1 and +1 for U1 and Boolean.
@@ -1464,7 +1464,7 @@ mod tests {
     fn test_convert_element_type_operation_lower_bitcast_preserves_dynamic_prefix_extents() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
@@ -1523,10 +1523,10 @@ mod tests {
                 session.execute_program(&compiled, vec![f32_vector(&session, &mesh, &vec![1.0; count])]).unwrap();
             assert_eq!(outputs[0].shape(), StaticShape::new(vec![count, 2]));
             assert_eq!(outputs[1].shape(), StaticShape::new(vec![count]));
-            assert_eq!(read_f32s(client, &outputs[1]), vec![1.0; count]);
+            assert_eq!(read_first_shard::<f32>(client, &outputs[1]), vec![1.0; count]);
             assert_eq!(outputs[2].shape(), StaticShape::new(vec![count, 32]));
             assert_eq!(outputs[3].shape(), StaticShape::new(vec![count]));
-            assert_eq!(read_f32s(client, &outputs[3]), vec![1.0; count]);
+            assert_eq!(read_first_shard::<f32>(client, &outputs[3]), vec![1.0; count]);
             let bytes = outputs[0]
                 .addressable_shards()
                 .next()
@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn test_reduce_precision_operation_lower_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Each case lists element encodings covering ties, rounding carries into the exponent, overflow, underflow,
@@ -3477,7 +3477,7 @@ mod tests {
     fn test_cast_operation_lower_preserves_layouts() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let values = vec![1f64, 2., 3., 4., 5., 6.];
@@ -3499,7 +3499,7 @@ mod tests {
             );
             // The next executable must consume the actual column-major buffer and return dense logical values.
             let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
-            assert_eq!(read_f64s(client, &consumed), values);
+            assert_eq!(read_first_shard::<f64>(client, &consumed), values);
             assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
             let destination_mesh = domain_mesh(client, "destination", 1);
             let moved = output
@@ -3532,9 +3532,9 @@ mod tests {
             )
             .unwrap();
             let doubled = consumer.executable().execute(&session, opaque).unwrap();
-            assert_eq!(read_f64s(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            assert_eq!(read_first_shard::<f64>(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
             let doubled = consumer.executable().execute(&session, output).unwrap();
-            assert_eq!(read_f64s(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            assert_eq!(read_first_shard::<f64>(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
         }
 
         // A tuple mixes an erased zero, a constrained result and an unconstrained result. The dynamic case also
@@ -3578,7 +3578,7 @@ mod tests {
                     Ok(layout.to_pjrt().unwrap())
                 );
                 assert_eq!(values_from_bytes::<f64>(&outputs[1].copy_to_host().unwrap()), values);
-                assert_eq!(read_f64s(client, &outputs[2]), values);
+                assert_eq!(read_first_shard::<f64>(client, &outputs[2]), values);
                 assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
             }
         }
@@ -3589,7 +3589,7 @@ mod tests {
     fn test_cast_operation_lower_preserves_dynamic_row_major_layout_with_ordered_io() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
@@ -3662,7 +3662,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F64, [4, 3])
             .with_sharding(
                 Sharding::new(
@@ -4547,7 +4547,7 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, -0.0]));
         let integers = input.bitcast_element_type(DataType::I32).unwrap();
@@ -4566,7 +4566,7 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir_one_bit() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         // One-bit targets split a byte into eight elements ordered from the least significant bit.
         let input = replicated_array(&session, &mesh, DataType::U8, &[], &[0xab]);
@@ -4587,7 +4587,7 @@ mod tests {
     #[test]
     fn test_lower_bitcast_to_mlir_fp6() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let encodings = (0u8..64).collect::<Vec<_>>();
         for (data_type, other_data_type) in

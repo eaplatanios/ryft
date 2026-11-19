@@ -1527,7 +1527,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionFence};
 
     use crate::FromPjrt;
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{
         cpu_client, device_mesh_2x2, four_device_mesh_x, logical_mesh_2x2, values_from_bytes, values_to_bytes,
     };
@@ -1599,7 +1599,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_reshards_fully_addressable_array() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1650,7 +1650,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_copies_matching_local_shards_without_full_source_addressability() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -1689,7 +1689,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_rejects_non_addressable_source_shards() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![Device::new(0, 0), Device::new(1, 1)],
@@ -1731,7 +1731,7 @@ mod tests {
         // dimension. Every destination shard has the slices of a source shard, but a copy of that shard would hold
         // one summand instead of the logical value.
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -1776,7 +1776,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_zero_space_is_bufferless_and_preserves_type_metadata() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
         let source_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
@@ -1806,7 +1806,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_zero_space_preserves_producer_completion() {
         let client = crate::tests::execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap().remove(0);
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1864,7 +1864,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_exact_shards_replicated_cross_mesh_to_replicated_destination() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
 
         // The source is replicated on a 1-device submesh.
@@ -1906,7 +1906,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_replicated_to_sharded_on_same_mesh() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [10.0f32, 11.0, 12.0, 13.0];
@@ -1936,7 +1936,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_sharded_to_replicated_on_same_mesh() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [20.0f32, 21.0, 22.0, 23.0];
@@ -1963,7 +1963,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2018,7 +2018,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_with_explicit_mesh_axes() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2059,7 +2059,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_cross_mesh_replicated_source_to_sharded_destination() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
 
         // The source lives on a 1-device submesh.
@@ -2097,7 +2097,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_cross_mesh_sharded_source_to_replicated_destination() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
 
         // The source is sharded along "x" on a 2-device submesh, so devices 0 and 1 each hold half the data.
         let source_mesh = two_device_sub_mesh_x(client);
@@ -2130,7 +2130,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_cross_mesh_sharded_source_to_sharded_destination() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
 
         // The source is sharded along "x" on a 2-device submesh.
         let source_mesh = two_device_sub_mesh_x(client);
@@ -2163,7 +2163,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_moves_only_required_cross_mesh_regions() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let source_mesh = two_device_sub_mesh_x(client);
         let source_sharding = Sharding::new(
             source_mesh.logical_mesh().clone(),
@@ -2217,7 +2217,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_caches_executable_across_calls() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [30.0f32, 31.0, 32.0, 33.0];
@@ -2261,7 +2261,7 @@ mod tests {
     #[ignore = "timing-sensitive; runs locally to validate the structural cache hit"]
     fn test_array_to_placement_compiled_reshard_cache_hit_avoids_tracing_and_lowering() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
         let values = (0..4096).map(|index| index as f32).collect::<Vec<_>>();
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
@@ -2302,7 +2302,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_preserves_missing_cross_host_extension() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -2361,7 +2361,7 @@ mod tests {
     fn test_array_to_placement_preserves_missing_cross_host_extension_for_receiver() {
         let client = cpu_client(1);
         assert!(matches!(client.cross_host_transfers_extension(), Err(PjrtError::Unimplemented { .. })));
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let source_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -2393,7 +2393,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_with_manual_mesh_axes_uses_host_fallback() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2444,7 +2444,7 @@ mod tests {
     #[test]
     fn test_array_into_placement_preserves_same_partially_addressable_placement() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;
@@ -2483,7 +2483,7 @@ mod tests {
     #[test]
     fn test_array_into_placement_donates_source_and_returns_independently_readable_output() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [300.0f32, 301.0, 302.0, 303.0];
@@ -2516,7 +2516,7 @@ mod tests {
     #[test]
     fn test_array_reshard_on_devices() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2605,7 +2605,7 @@ mod tests {
     #[test]
     fn test_array_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_moves() {
         let client = cpu_client(1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
         let remote_device_id = local_device_id + 1;

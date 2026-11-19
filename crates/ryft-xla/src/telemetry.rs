@@ -69,9 +69,8 @@ mod tests {
         Shape, Sharding,
     };
 
-    use crate::Array;
-    use crate::sessions::tests::session_with_client;
     use crate::tests::execution_client;
+    use crate::{Array, Session};
 
     use super::*;
 
@@ -81,7 +80,7 @@ mod tests {
     #[test]
     fn test_constructed_array_count_and_dropped_array_count() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();

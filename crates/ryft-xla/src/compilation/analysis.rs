@@ -455,7 +455,7 @@ mod tests {
     use ryft_core::{ArrayType, DataType, StagedFunction as CoreStagedFunction};
 
     use crate::compilation::options::Options;
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::execution_client;
     use crate::{Error, Session, Type};
 
@@ -534,7 +534,7 @@ mod tests {
     fn test_session_analyze_preserves_cached_errors() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let staged = CoreStagedFunction::<Session, Type, Type>::stage(
             |_, _, input| Ok(input),
             Vec::new(),

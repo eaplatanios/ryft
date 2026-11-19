@@ -421,9 +421,9 @@ mod tests {
         ProgramBuilder, ragged_dot_cpu_compilation_options, to_mlir_module_for_plain_program, unproject_plain_program,
     };
     use crate::operations::{FlatProgram, Operation};
-    use crate::sessions::tests::{domain_mesh, read_f64s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, Constant, Options, ToPjrt, Type, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Constant, Options, Session, ToPjrt, Type, to_mlir_module_for_program};
 
     use super::*;
 
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn test_scatter_operation_lower_complex_max() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         // Complex extrema compare `(real, imaginary)` lexicographically, so the update `1 + 9i` replaces `1 + 5i`.
         let input = replicated_array(
@@ -1013,7 +1013,7 @@ mod tests {
         type DynamicPolicy = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let staged_types = vec![
             ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)])),
@@ -1121,7 +1121,7 @@ mod tests {
             assert_eq!(outputs[0].shape().as_slice(), &[size, 4], "n={size}");
             assert_eq!(outputs[1].shape().as_slice(), &[size, 4], "n={size}");
             assert_eq!(outputs[2].shape().as_slice(), &[size, 1], "n={size}");
-            outputs.iter().map(|output| read_f64s(client, output)).collect::<Vec<_>>()
+            outputs.iter().map(|output| read_first_shard::<f64>(client, output)).collect::<Vec<_>>()
         };
         let all_indices = [1i32, 3, 0, 2, 3];
 
@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn test_scatter_operation_lower_differentiation_duplicate_overwrite() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[2f32, 5.0]));
         let indices = replicated_array(&session, &mesh, DataType::I32, &[2, 1], &values_to_bytes(&[0i32, 0]));

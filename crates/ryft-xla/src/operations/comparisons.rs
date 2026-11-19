@@ -136,9 +136,9 @@ mod tests {
     use ryft_core::{Compare, DataTypeError, Error as CoreError, Typed};
     use ryft_mlir::Context as MlirContext;
 
-    use crate::Options;
-    use crate::sessions::tests::{domain_mesh, f32_vector, session_with_client};
+    use crate::sessions::tests::{domain_mesh, f32_vector};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Options, Session};
 
     use super::*;
 
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn test_compare_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let left = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 5.0, 3.0, 8.0]));
         let right = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[4f32, 2.0, 3.0, 9.0]));
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_compare_operation_lower_one_bit_integers() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Every pair of bits is compared in every direction. I1 interprets the set bit as -1, while U1 and Boolean
@@ -232,7 +232,7 @@ mod tests {
     fn test_compare_operation_lower_executes_per_element() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let values = f32_vector(&session, &mesh, &[1., -2., 3., -4.]);
         let limits = f32_vector(&session, &mesh, &[0., 0., 0., 0.]);
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(

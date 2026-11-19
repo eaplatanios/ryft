@@ -1683,7 +1683,6 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::sessions::tests::session_with_client;
     use crate::{ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, ProgramBuilder, Session};
 
     use super::*;
@@ -1837,7 +1836,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],

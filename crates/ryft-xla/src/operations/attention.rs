@@ -999,7 +999,7 @@ mod tests {
     use crate::Platform;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Session, Tracer, to_mlir_module_for_program};
 
@@ -1493,7 +1493,7 @@ mod tests {
                 ..Default::default()
             })))
             .unwrap();
-        let session = session_with_client(&client);
+        let session = Session::builder().client(&client).build().unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let halves = |dimensions: &[usize], values: &[f32]| {
             let values = values.iter().copied().map(half::f16::from_f32).collect::<Vec<_>>();
@@ -1538,7 +1538,7 @@ mod tests {
                 ..Default::default()
             })))
             .unwrap();
-        let session = session_with_client(&client);
+        let session = Session::builder().client(&client).build().unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         for (query_dimensions, key_value_dimensions, expected_residual) in [
@@ -1620,7 +1620,7 @@ mod tests {
                 ..Default::default()
             })))
             .unwrap();
-        let session = session_with_client(&client);
+        let session = Session::builder().client(&client).build().unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let reference = |dimensions: &[usize], elements: &[f32]| {
             let elements = elements.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
@@ -1749,7 +1749,7 @@ mod tests {
     #[test]
     fn test_portable_attention_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
@@ -1803,7 +1803,7 @@ mod tests {
     fn test_portable_attention_backward_matches_reference_backend() {
         // Distinct query, key, and value inputs make a mix-up between their cotangents visible.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let query_values = [0.25f32, -0.5, 0.75, 1.0];
         let key_values = [-0.75f32, 0.5, 1.25, -0.25];
@@ -1852,7 +1852,7 @@ mod tests {
         // the reference backend over inputs without a sharding. A key that is sharded along its sequence shards the
         // scores along the dimension over which the softmax reduces its maximum.
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(client, "x", 2).devices().to_vec()).unwrap();
         let values = |start: f32, count: usize| (0..count).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
@@ -2056,7 +2056,7 @@ mod tests {
         // A broadcast rank-0 bias, an arbitrary mask, independent length vectors, the default scale, an asymmetric
         // window, and the residual all agree with the reference backend.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();

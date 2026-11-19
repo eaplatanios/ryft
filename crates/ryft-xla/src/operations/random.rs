@@ -242,7 +242,7 @@ mod tests {
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, Session, Type,
@@ -497,7 +497,7 @@ mod tests {
         // first even-sized axis of the output, or else its first largest axis, and advances the counter by the size
         // of the resulting half shape, which the last group covers at several shapes and every narrow width.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         for (algorithm, state_values, outputs) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, 7], vec![(DataType::U32, vec![5]), (DataType::U64, vec![3])]),
@@ -542,7 +542,7 @@ mod tests {
         // Empty outputs preserve the state, and counter advancement wraps at the counter width of the algorithm while
         // the bits stay byte-identical with the reference backend for every output width.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         for (algorithm, state_values) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, u64::MAX - 1]),
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_split_rng_key_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let (device_advanced_state, device_keys) = state.split_rng_key(2).unwrap();
@@ -606,7 +606,7 @@ mod tests {
         // Every step of the composition is exact arithmetic over byte-identical ThreeFry bits, so the samples keep
         // their exact encodings on both backends, including the narrow floating-point types.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for data_type in [DataType::F32, DataType::BF16, DataType::F16] {
@@ -628,7 +628,7 @@ mod tests {
         // The Box-Muller transform goes through transcendental functions, whose last bits may differ between the
         // backends. Complex samples consist of two independently drawn components.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for (data_type, component_count, tolerance) in
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn test_random_categorical_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let logit_values = [0f32, 10.0, -3.0, 2.0];
@@ -690,7 +690,7 @@ mod tests {
         // High-precision sampling never selects a category masked with `-inf` and advances the same state on both
         // backends.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         for (algorithm, state_values) in
             [(RandomAlgorithm::ThreeFry, vec![11u64, 3]), (RandomAlgorithm::Philox, vec![11u64, 3, 0])]

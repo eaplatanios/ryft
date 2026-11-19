@@ -681,10 +681,10 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, program_array, read_f32s, read_f64s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, Constant, Error, FromPjrt, Options, Value, compile, compile_statefully,
+        Array, CompiledFunction, Constant, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
         to_mlir_module_for_program,
     };
 
@@ -1947,7 +1947,7 @@ mod tests {
         );
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         // Staging succeeds, so the error comes from the discharge that precedes lowering.
         let mut staged = false;
         let error = compile_statefully::<_, (Type, Type, Type), Type>(
@@ -4103,7 +4103,7 @@ mod tests {
         // lowering.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let scalar_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4148,8 +4148,8 @@ mod tests {
         let inputs =
             Array::from_host_buffer(&session, inputs_type, mesh, None, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
         let (sum, prefixes) = compiled.executable().execute(&session, (carry, inputs)).unwrap();
-        assert_eq!(read_f64s(client, &sum), vec![6.0]);
-        assert_eq!(read_f64s(client, &prefixes), vec![1.0, 3.0, 6.0]);
+        assert_eq!(read_first_shard::<f64>(client, &sum), vec![6.0]);
+        assert_eq!(read_first_shard::<f64>(client, &prefixes), vec![1.0, 3.0, 6.0]);
     }
 
     #[test]
@@ -4158,13 +4158,13 @@ mod tests {
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let value = |dimensions: &[usize], values: &[f32]| {
             Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
         let read = |value: Value| {
             let array = program_array(&value);
-            (array.shape().dimensions().to_vec(), read_f32s(client, array))
+            (array.shape().dimensions().to_vec(), read_first_shard::<f32>(client, array))
         };
         let (carry, prefixes) = batch(
             |(carry, items)| {

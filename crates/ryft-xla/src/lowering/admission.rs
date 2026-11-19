@@ -404,9 +404,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::sessions::tests::{
-        domain_mesh, read_booleans, read_f32s, read_u64s, replicated_scalar_type, session_with_client,
-    };
+    use crate::sessions::tests::{domain_mesh, read_booleans, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
     use crate::{
         Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Type, Value,
@@ -707,7 +705,7 @@ mod tests {
     fn test_validate_data_dependent_compilation() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
 
         let mut builder = ProgramBuilder::new();
@@ -1017,7 +1015,7 @@ mod tests {
     fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -1069,17 +1067,17 @@ mod tests {
 
         let small = execute(2);
         assert_eq!(small[0].shape(), StaticShape::new(vec![2]));
-        assert_eq!(read_f32s(client, &small[0]), vec![-1.0, 0.0]);
-        assert_eq!(read_f32s(client, &small[1]), vec![1.0, 0.0]);
-        assert_eq!(read_u64s(client, &small[2]), vec![1, 0]);
-        assert_eq!(read_u64s(client, &small[3]), vec![1, 0]);
-        assert_eq!(read_f32s(client, &small[4]), vec![1.0]);
-        assert_eq!(read_f32s(client, &small[5]), vec![1.0]);
-        assert_eq!(read_f32s(client, &small[6]), vec![-1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[0]), vec![-1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[1]), vec![1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(client, &small[2]), vec![1, 0]);
+        assert_eq!(read_first_shard::<u64>(client, &small[3]), vec![1, 0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[4]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[5]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[6]), vec![-1.0]);
         assert_eq!(read_booleans(client, &small[7]), vec![true]);
         assert_eq!(read_booleans(client, &small[8]), vec![true]);
-        assert_eq!(read_f32s(client, &small[9]), vec![1.0]);
-        assert_eq!(read_f32s(client, &small[12]), vec![2.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[9]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[12]), vec![2.0]);
         assert_eq!(read_i32s(client, &small[13]), vec![1]);
         assert_eq!(read_i32s(client, &small[14]), vec![1]);
         assert_eq!(read_i32s(client, &small[15]), vec![3, 3]);
@@ -1090,14 +1088,14 @@ mod tests {
         // `exp` and `log`, not because the discipline is approximate, and the byte comparison against the reference
         // kernel inside `execute` is exact.
         assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
-        let log_sum_exp = read_f32s(client, &small[10]);
+        let log_sum_exp = read_first_shard::<f32>(client, &small[10]);
         assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
         assert!((log_sum_exp[1] - 4.440_19).abs() < 1e-4, "{log_sum_exp:?}");
 
         // The prefix scan runs along the static axis, so row `i` accumulates `[i, 2i + 1, 3i + 3, 4i + 6]` while the
         // data-derived extent rides through on the rows it never mixes.
         assert_eq!(small[11].shape(), StaticShape::new(vec![2, 4]));
-        assert_eq!(read_f32s(client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
 
         // With a single live position, every physical suffix position of the data-derived axis is padding, which index
         // reductions must still never select.
@@ -1109,17 +1107,17 @@ mod tests {
 
         let at_bound = execute(4);
         assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
-        assert_eq!(read_f32s(client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
-        assert_eq!(read_f32s(client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
-        assert_eq!(read_u64s(client, &at_bound[2]), vec![3, 2, 1, 0]);
-        assert_eq!(read_u64s(client, &at_bound[3]), vec![3, 2, 1, 0]);
-        assert_eq!(read_f32s(client, &at_bound[4]), vec![6.0]);
-        assert_eq!(read_f32s(client, &at_bound[5]), vec![3.0]);
-        assert_eq!(read_f32s(client, &at_bound[6]), vec![-3.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(client, &at_bound[2]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<u64>(client, &at_bound[3]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[4]), vec![6.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[5]), vec![3.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[6]), vec![-3.0]);
         assert_eq!(read_booleans(client, &at_bound[7]), vec![true]);
         assert_eq!(read_booleans(client, &at_bound[8]), vec![true]);
-        assert_eq!(read_f32s(client, &at_bound[9]), vec![14.0]);
-        assert_eq!(read_f32s(client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[12]), vec![24.0]);
         assert_eq!(read_i32s(client, &at_bound[13]), vec![3]);
         assert_eq!(read_i32s(client, &at_bound[14]), vec![3]);
         assert_eq!(read_i32s(client, &at_bound[15]), vec![3, 3, 3, 3]);
@@ -1128,14 +1126,14 @@ mod tests {
         // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
         // padded row silently participating at the smaller size.
         assert_eq!(at_bound[10].shape(), StaticShape::new(vec![4]));
-        let log_sum_exp = read_f32s(client, &at_bound[10]);
+        let log_sum_exp = read_first_shard::<f32>(client, &at_bound[10]);
         assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
         assert!((log_sum_exp[1] - 4.440_19).abs() < 1e-4, "{log_sum_exp:?}");
         assert!((log_sum_exp[2] - 5.440_19).abs() < 1e-4, "{log_sum_exp:?}");
         assert!((log_sum_exp[3] - 6.440_19).abs() < 1e-4, "{log_sum_exp:?}");
         assert_eq!(at_bound[11].shape(), StaticShape::new(vec![4, 4]));
         assert_eq!(
-            read_f32s(client, &at_bound[11]),
+            read_first_shard::<f32>(client, &at_bound[11]),
             vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0, 2.0, 5.0, 9.0, 14.0, 3.0, 7.0, 12.0, 18.0],
         );
     }
@@ -1144,7 +1142,7 @@ mod tests {
     fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_scaled_dot_attention_fixture(
@@ -1204,7 +1202,7 @@ mod tests {
 
         let small = execute(2);
         assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
-        assert_eq!(read_f32s(client, &small[0]), vec![16.0; 2]);
+        assert_eq!(read_first_shard::<f32>(client, &small[0]), vec![16.0; 2]);
         assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
         assert_eq!(read_bf16s(client, &small[1]), vec![0.0; 32]);
         assert_eq!(read_bf16s(client, &small[2]), vec![0.0; 32]);
@@ -1216,7 +1214,7 @@ mod tests {
 
         let at_bound = execute(4);
         assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
-        assert_eq!(read_f32s(client, &at_bound[0]), vec![16.0; 4]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[0]), vec![16.0; 4]);
         assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
         assert_eq!(
             read_bf16s(client, &at_bound[1]),
@@ -1278,7 +1276,7 @@ mod tests {
             })))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(&client).build().unwrap().with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -1292,34 +1290,34 @@ mod tests {
         };
 
         let small = execute(2);
-        assert_eq!(read_f32s(&client, &small[0]), vec![-1.0, 0.0]);
-        assert_eq!(read_f32s(&client, &small[1]), vec![1.0, 0.0]);
-        assert_eq!(read_u64s(&client, &small[2]), vec![1, 0]);
-        assert_eq!(read_u64s(&client, &small[3]), vec![1, 0]);
-        assert_eq!(read_f32s(&client, &small[4]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[5]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[6]), vec![-1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[0]), vec![-1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[1]), vec![1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(&client, &small[2]), vec![1, 0]);
+        assert_eq!(read_first_shard::<u64>(&client, &small[3]), vec![1, 0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[4]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[5]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[6]), vec![-1.0]);
         assert_eq!(read_booleans(&client, &small[7]), vec![true]);
         assert_eq!(read_booleans(&client, &small[8]), vec![true]);
-        assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
-        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[9]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[12]), vec![2.0]);
         assert_eq!(read_i32s(&client, &small[13]), vec![1]);
         assert_eq!(read_i32s(&client, &small[14]), vec![1]);
         assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
         assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
 
         let at_bound = execute(4);
-        assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
-        assert_eq!(read_f32s(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
-        assert_eq!(read_u64s(&client, &at_bound[2]), vec![3, 2, 1, 0]);
-        assert_eq!(read_u64s(&client, &at_bound[3]), vec![3, 2, 1, 0]);
-        assert_eq!(read_f32s(&client, &at_bound[4]), vec![6.0]);
-        assert_eq!(read_f32s(&client, &at_bound[5]), vec![3.0]);
-        assert_eq!(read_f32s(&client, &at_bound[6]), vec![-3.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(&client, &at_bound[2]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<u64>(&client, &at_bound[3]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[4]), vec![6.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[5]), vec![3.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[6]), vec![-3.0]);
         assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
         assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
-        assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
-        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[12]), vec![24.0]);
         assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
         assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
         assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
@@ -1337,7 +1335,7 @@ mod tests {
             })))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(&client).build().unwrap().with_device_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [
             (DataType::F4E2M1FN, DataType::F8E4M3FN),
             (DataType::F8E4M3FN, DataType::F8E8M0FNU),
@@ -1379,7 +1377,7 @@ mod tests {
 
             let small = execute(2);
             assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
-            assert_eq!(read_f32s(&client, &small[0]), vec![scaled_dot_value; 2]);
+            assert_eq!(read_first_shard::<f32>(&client, &small[0]), vec![scaled_dot_value; 2]);
             assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
             assert_eq!(read_bf16s(&client, &small[1]), vec![0.0; 32]);
             assert_eq!(read_bf16s(&client, &small[2]), vec![0.0; 32]);
@@ -1391,7 +1389,7 @@ mod tests {
 
             let at_bound = execute(4);
             assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
-            assert_eq!(read_f32s(&client, &at_bound[0]), vec![scaled_dot_value; 4]);
+            assert_eq!(read_first_shard::<f32>(&client, &at_bound[0]), vec![scaled_dot_value; 4]);
             assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
             assert_eq!(
                 read_bf16s(&client, &at_bound[1]),

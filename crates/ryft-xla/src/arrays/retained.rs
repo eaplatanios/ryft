@@ -201,147 +201,159 @@ impl Typed for RetainedArray {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayType, DataType, TypeError, TypeIdentityRenaming, Typed};
 
-    use crate::arrays::Array;
-    use crate::sessions::tests::{domain_mesh, replicated_scalar_type, session_with_client, shares_effect_scope};
+    use ryft_core::{DataType, DimensionBounds, DimensionVariable};
+
+    use crate::sessions::tests::{domain_mesh, replicated_scalar_type, shares_effect_scope};
     use crate::tests::{execution_client, hash_of, other_cpu_client, values_from_bytes};
 
-    use super::RetainedArray;
+    use super::*;
 
     #[test]
     fn test_retained_array_new() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
 
-        // Retaining one array twice yields equal handles, and the handles keep the array alive after the array itself
-        // is dropped.
-        let handle = RetainedArray::new(&array);
-        let duplicate = RetainedArray::new(&array);
-        assert_eq!(duplicate, handle);
-        drop((array, duplicate));
-        let resolved = handle.to_array(&session).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
+        // Retaining one array twice yields equal retained arrays, which share the type of the array and keep its
+        // device buffers alive after the array itself is dropped.
+        let retained = RetainedArray::new(&array);
+        assert_eq!(RetainedArray::new(&array), retained);
+        assert!(Arc::ptr_eq(&retained.declared_type, &array.parts.r#type));
+        assert!(Arc::ptr_eq(&retained.actual_type, &array.parts.r#type));
+        drop(array);
+        let restored = retained.to_array(&session).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&restored.copy_to_host().unwrap()), vec![1f32]);
 
-        // An array that was resolved from a handle has storage of its own, so retaining it yields another handle.
-        assert_ne!(RetainedArray::new(&resolved), handle);
+        // An array that was created from a retained array has storage of its own, so retaining it yields a different
+        // retained array.
+        assert_ne!(RetainedArray::new(&restored), retained);
     }
 
     #[test]
     fn test_retained_array_to_array() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        let handle = RetainedArray::new(&array);
+        let retained = RetainedArray::new(&array);
 
-        // The resolved array shares the retained storage and belongs to the resolving handle.
+        // The new array refers to the retained device buffers and belongs to the session handle that created it.
         let fork = session.with_new_effect_scope();
-        let resolved = handle.to_array(&fork).unwrap();
-        assert_eq!(resolved, array);
-        assert!(shares_effect_scope(resolved.session(), &fork));
+        let restored = retained.to_array(&fork).unwrap();
+        assert_eq!(restored, array);
+        assert!(shares_effect_scope(restored.session(), &fork));
 
-        // Every session of the client that owns the array resolves the handle, and the array outlives its session.
-        let other_session = session_with_client(client);
-        drop((array, resolved, fork, session));
-        let resolved = handle.to_array(&other_session).unwrap();
-        assert!(resolved.session().is_same_session(&other_session));
-        assert_eq!(values_from_bytes::<f32>(&resolved.copy_to_host().unwrap()), vec![1f32]);
+        // Every session of the client that owns the buffers can create the array, and the buffers outlive the session
+        // of the array that was retained.
+        let other_session = Session::builder().client(client).build().unwrap();
+        drop((array, restored, fork, session));
+        let restored = retained.to_array(&other_session).unwrap();
+        assert!(restored.session().is_same_session(&other_session));
+        assert_eq!(values_from_bytes::<f32>(&restored.copy_to_host().unwrap()), vec![1f32]);
 
-        // Sessions of another client cannot use the buffers of the array.
-        let foreign_session = session_with_client(other_cpu_client(1));
+        // Sessions of another client cannot use the buffers.
+        let foreign_session = Session::builder().client(other_cpu_client(1)).build().unwrap();
         assert_eq!(
-            handle.to_array(&foreign_session),
-            Err(TypeError::invalid(format!(
-                "session constant `{handle}` retains an array of a different PJRT client than the client of this \
-                 session",
-            ))
+            retained.to_array(&foreign_session),
+            Err(TypeError::invalid(
+                "session constant `session:f32[][sharding={mesh<['x'=1:auto]>, []}]` retains an array of a different \
+                 PJRT client than the client of this session",
+            )
             .into()),
         );
     }
 
     #[test]
     fn test_retained_array_rename_type_identities() {
-        // Renaming keeps the storage of a handle and only renames its type.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        let handle = RetainedArray::new(&array);
-        let renamed = handle.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
-        assert_eq!(renamed, handle);
-        assert!(Arc::ptr_eq(&renamed.shards, &handle.shards));
+        let retained = RetainedArray::new(&array);
+
+        // Runtime arrays have static shapes, so their types have no identities and a renaming leaves the declared type
+        // as it is. The renamed value refers to the same array.
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming
+            .insert(DimensionVariable::new("source", bounds), DimensionVariable::new("target", bounds))
+            .unwrap();
+        let renamed = retained.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed, retained);
+        assert_eq!(renamed.declared_type, retained.declared_type);
+        assert!(Arc::ptr_eq(&renamed.actual_type, &retained.actual_type));
+        assert!(Arc::ptr_eq(&renamed.shards, &retained.shards));
     }
 
     #[test]
-    fn test_retained_array_eq() {
+    fn test_retained_array_debug() {
         let client = execution_client();
-        let session = session_with_client(client);
-        let other_session = session_with_client(client);
-        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+        let session = Session::builder().client(client).build().unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        let second =
-            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
-                .unwrap();
-        let other =
-            Array::from_host_buffer(&other_session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
-                .unwrap();
-        let handle = RetainedArray::new(&first);
-
-        // Handles are equal when they refer to the same retained array of the same session with the same type.
-        assert_eq!(handle, handle.clone());
-        assert_eq!(handle, RetainedArray::new(&first));
-        assert_ne!(handle, RetainedArray::new(&second));
-        assert_ne!(handle, RetainedArray::new(&other));
-    }
-
-    #[test]
-    fn test_retained_array_hash() {
-        let client = execution_client();
-        let session = session_with_client(client);
-        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
-            .unwrap();
-        let second =
-            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
-                .unwrap();
-        let handle = RetainedArray::new(&first);
-        let other = RetainedArray::new(&second);
-        assert_eq!(hash_of(&handle), hash_of(&RetainedArray::new(&first)));
-        assert_ne!(hash_of(&handle), hash_of(&other));
-        let constants = HashMap::from([(handle.clone(), "first"), (other.clone(), "second")]);
-        assert_eq!(constants.get(&RetainedArray::new(&first)), Some(&"first"));
-        assert_eq!(constants.get(&other), Some(&"second"));
+        assert_eq!(
+            format!("{:?}", RetainedArray::new(&array)),
+            format!("RetainedArray {{ type: {:?}, storage: {:?} }}", array.parts.r#type, Arc::as_ptr(&array.parts)),
+        );
     }
 
     #[test]
     fn test_retained_array_display() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        let handle = RetainedArray::new(&array);
-        assert_eq!(handle.to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
+        assert_eq!(RetainedArray::new(&array).to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
+    }
+
+    #[test]
+    fn test_retained_array_eq() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        let second =
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+                .unwrap();
+        let retained = RetainedArray::new(&first);
+
+        // Retained arrays are equal when they were created from the same array, and never because two arrays have
+        // the same type and the same contents.
+        assert_eq!(retained, retained.clone());
+        assert_eq!(retained, RetainedArray::new(&first));
+        assert_ne!(retained, RetainedArray::new(&second));
+    }
+
+    #[test]
+    fn test_retained_array_hash() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        let second =
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+                .unwrap();
+        let retained = RetainedArray::new(&first);
+        let other = RetainedArray::new(&second);
+        assert_eq!(hash_of(&retained), hash_of(&RetainedArray::new(&first)));
+        assert_ne!(hash_of(&retained), hash_of(&other));
+
+        // Retained arrays can therefore be looked up by retaining their array again.
+        let constants = HashMap::from([(retained, "first"), (other.clone(), "second")]);
+        assert_eq!(constants.get(&RetainedArray::new(&first)), Some(&"first"));
+        assert_eq!(constants.get(&other), Some(&"second"));
     }
 
     #[test]
     fn test_retained_array_type() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
-        let array = Array::from_host_buffer(
-            &session,
-            replicated_scalar_type(&mesh, DataType::F32),
-            None,
-            None,
-            1f32.to_ne_bytes(),
-        )
-        .unwrap();
-        assert_eq!(RetainedArray::new(&array).r#type().into_owned(), replicated_scalar_type(&mesh, DataType::F32));
+        let session = Session::builder().client(client).build().unwrap();
+        let r#type = replicated_scalar_type(&mesh, DataType::F32);
+        let array = Array::from_host_buffer(&session, r#type.clone(), None, None, 1f32.to_ne_bytes()).unwrap();
+        assert_eq!(RetainedArray::new(&array).r#type().into_owned(), r#type);
     }
 }

@@ -618,7 +618,7 @@ mod tests {
     use ryft_pjrt::{Error as PjrtError, ExecutionFence};
 
     use crate::FromPjrt;
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn test_array_begin_copy_to_host_preserves_producer_errors_for_empty_arrays() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         for data_type in [DataType::F32, DataType::Zero] {
             let (event, promise) = client.event(()).unwrap();
@@ -648,7 +648,7 @@ mod tests {
         // Sharding its columns makes the tiles non-contiguous, so every shard is copied into its own buffer and merged,
         // and a replicated array needs a single copy.
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),

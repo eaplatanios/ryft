@@ -170,9 +170,9 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, program_array, read_f32s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Constant, Value, to_mlir_module_for_program};
+    use crate::{Constant, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1880,13 +1880,13 @@ mod tests {
         // extent that array IR batching threads through the batched branches.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let value = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
             Value::Array(replicated_array(&session, &mesh, data_type, dimensions, bytes))
         };
         let read = |value: Value| {
             let array = program_array(&value);
-            (array.shape().dimensions().to_vec(), read_f32s(client, array))
+            (array.shape().dimensions().to_vec(), read_first_shard::<f32>(client, array))
         };
         let inputs = value(DataType::F32, &[3], values_to_bytes(&[1f32, 2.0, 3.0]).as_slice());
 

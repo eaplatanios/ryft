@@ -784,12 +784,10 @@ mod tests {
     use crate::Platform;
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
+    use crate::compilation::tests::external_reference_read_program;
     #[cfg(feature = "cuda-13")]
     use crate::sessions::tests::replicated_vector_type;
-    use crate::sessions::tests::{
-        domain_mesh, external_reference_read_program, f32_vector, program_array, read_f32s, replicated_scalar_type,
-        session_with_client,
-    };
+    use crate::sessions::tests::{domain_mesh, f32_vector, program_array, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
         Array, Constant, CustomCallOperationExtension, Dimension, Error, Operation, ProgramBuilder, RuntimeRequirement,
@@ -822,7 +820,7 @@ mod tests {
     fn test_lowered_program_compilation_key() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -832,7 +830,7 @@ mod tests {
         let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let key = session.compilation_key(compiled.lowered().lowered_program()).unwrap();
-        let independent_session = session_with_client(client);
+        let independent_session = Session::builder().client(client).build().unwrap();
         let repeated = independent_session.compilation_key(compiled.lowered().lowered_program()).unwrap();
 
         assert_eq!(key, repeated);
@@ -852,7 +850,7 @@ mod tests {
     fn test_lowered_program_compilation_key_includes_runtime_requirements() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let array_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -885,7 +883,7 @@ mod tests {
     fn test_eager_dispatch_query_compares_and_hashes_like_its_key() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let operation = Operation::Array(AddOperation::new().into());
         let inputs = [
             Value::Array(f32_vector(&session, &mesh, &[1.0, 2.0])),
@@ -921,7 +919,7 @@ mod tests {
     fn test_session_dispatch_signature() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let input = Value::Array(
             Array::from_host_buffer(
                 &session,
@@ -965,7 +963,7 @@ mod tests {
     fn test_session_dispatch_signature_runtime_placement() {
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let tiled = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated_input = Value::Array(
@@ -1027,7 +1025,7 @@ mod tests {
     fn test_session_dispatch_signature_reuses_one_specialization_for_data_derived_extents() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -1054,8 +1052,8 @@ mod tests {
             function.execute((), vec![Value::Array(size), Value::Array(value)]).unwrap()
         };
 
-        assert_eq!(read_f32s(client, program_array(&call(2))), vec![4.0]);
-        assert_eq!(read_f32s(client, program_array(&call(4))), vec![8.0]);
+        assert_eq!(read_first_shard::<f32>(client, program_array(&call(2))), vec![4.0]);
+        assert_eq!(read_first_shard::<f32>(client, program_array(&call(4))), vec![8.0]);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_misses, 1);
         assert_eq!(statistics.dispatch_hits, 1);
@@ -1077,7 +1075,7 @@ mod tests {
             })))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = session_with_client(&client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(&client).build().unwrap().with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -1113,7 +1111,10 @@ mod tests {
                 };
                 output.block_until_ready().unwrap();
                 assert_eq!(output.shape().as_slice(), &[size]);
-                assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
+                assert_eq!(
+                    read_first_shard::<f32>(&client, &output),
+                    values.iter().map(|value| value * 2.0).collect::<Vec<_>>()
+                );
                 assert_eq!(
                     session.cached_program_count(),
                     1,
@@ -1149,8 +1150,8 @@ mod tests {
             .unwrap();
             function.execute((), vec![Value::Array(size), Value::Array(value)])
         };
-        assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);
-        assert_eq!(read_f32s(&client, program_array(&call(7).unwrap())), vec![14.0]);
+        assert_eq!(read_first_shard::<f32>(&client, program_array(&call(4).unwrap())), vec![8.0]);
+        assert_eq!(read_first_shard::<f32>(&client, program_array(&call(7).unwrap())), vec![14.0]);
         let invalid = call(8).unwrap();
         let error = program_array(&invalid).block_until_ready().unwrap_err();
         assert!(
@@ -1226,7 +1227,7 @@ mod tests {
 
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let function: CompiledFunctionDispatcher<Session, (), Type, Type, _> = session.jit_with_options(
             |(), input| trace(input),
             Options::new(mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo),
@@ -1238,13 +1239,13 @@ mod tests {
 
         let three = call(&[1.0, 2.0, 3.0]);
         assert_eq!(program_array(&three).shape(), StaticShape::new(vec![3]));
-        assert_eq!(read_f32s(client, program_array(&three)), vec![2.0, 4.0, 6.0]);
+        assert_eq!(read_first_shard::<f32>(client, program_array(&three)), vec![2.0, 4.0, 6.0]);
         let four = call(&[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(program_array(&four).shape(), StaticShape::new(vec![4]));
-        assert_eq!(read_f32s(client, program_array(&four)), vec![2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(read_first_shard::<f32>(client, program_array(&four)), vec![2.0, 4.0, 6.0, 8.0]);
         let five = call(&[1.0, 2.0, 3.0, 4.0, 5.0]);
         assert_eq!(program_array(&five).shape(), StaticShape::new(vec![5]));
-        assert_eq!(read_f32s(client, program_array(&five)), vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+        assert_eq!(read_first_shard::<f32>(client, program_array(&five)), vec![2.0, 4.0, 6.0, 8.0, 10.0]);
 
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_hits, 1);
@@ -1260,8 +1261,11 @@ mod tests {
     fn test_normalize_dispatch_signature_rejects_unsupported_signatures() {
         let single_device_client = cpu_client(1);
         let single_device_mesh = domain_mesh(single_device_client, "x", 1);
-        let single_device_session =
-            session_with_client(single_device_client).with_device_mesh(single_device_mesh.clone());
+        let single_device_session = Session::builder()
+            .client(single_device_client)
+            .build()
+            .unwrap()
+            .with_device_mesh(single_device_mesh.clone());
         let bucketing = Some(InputBoundBucketing::PowerOfTwo);
         let bucketed_options =
             Options::new(single_device_mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);

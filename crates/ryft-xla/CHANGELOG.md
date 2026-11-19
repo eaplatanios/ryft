@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Initial release.
+- Admit the pinned CUDA 12.9 PJRT platform for direct Triton kernels.
 
 ### Removed
 

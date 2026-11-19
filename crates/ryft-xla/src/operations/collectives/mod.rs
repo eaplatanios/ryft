@@ -211,10 +211,9 @@ mod tests {
     };
     use crate::operations::Operation;
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
-    use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableOperation, Lowerer, TracedProgram, trace,
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableOperation, Lowerer, Session, TracedProgram, trace,
         trace_with_context,
     };
 
@@ -408,7 +407,7 @@ mod tests {
     #[test]
     fn test_collective_replica_groups_execute_grouped_shape_changing_collectives_on_cpu() {
         let client = cpu_client(4);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(

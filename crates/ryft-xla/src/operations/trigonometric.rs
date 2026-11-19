@@ -381,10 +381,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayOperation, Atan2, Cos, Placeholder, Sin, Tanh, differentiate_at};
 
-    use crate::ArrayConstant;
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program};
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{ArrayConstant, Session};
 
     use super::*;
 
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_atan2_operation_lower_complex_differentiation() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let y = Complex::new(0.7f32, -0.2);
         let x = Complex::new(-0.3f32, 0.4);
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn test_tanh_operation_lower_complex_large_real() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         // Real parts large enough to overflow the intermediate exponentials saturate to `±1 + 0i` without NaN.
         let input = replicated_array(
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn test_lower_complex_sine_or_cosine_large_imaginary() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Hyperbolic factors need not overflow with their exponential intermediates, and a small real factor can keep

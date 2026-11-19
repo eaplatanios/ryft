@@ -547,7 +547,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, Dimension as CoreDimension,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Print, PrintOperation, Shape, Sharding, Typed, batch,
+        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Print, PrintOperation, ProjectedContext, Shape, Sharding,
+        Typed, batch,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
@@ -559,10 +560,11 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
-    use crate::sessions::tests::{array_domain, domain_mesh, f64_vector, read_f64s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, f64_vector, read_first_shard};
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, compile, to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile,
+        to_mlir_module_for_program,
     };
 
     use super::*;
@@ -571,7 +573,7 @@ mod tests {
     /// the payload passes through unchanged.
     fn assert_eager_bind_executes_print_effect(client: &'static Client<'static>) {
         let mesh = domain_mesh(client, "x", 1);
-        let domain = array_domain(client);
+        let domain = ProjectedContext::<Session, ArrayType>::new(Session::builder().client(client).build().unwrap());
         ensure_print_handler_registered(client).unwrap();
 
         // The effectful `print` rides the compiled program of the operation as a `@ryft.print` custom call that threads
@@ -844,7 +846,7 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let engine = session_with_client(client);
+        let engine = Session::builder().client(client).build().unwrap();
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -913,7 +915,7 @@ mod tests {
         let client = cpu_client(1);
         ensure_print_handler_registered(client).unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input = f64_vector(&session, &mesh, &[1.5, 2.5]);
 
         // Eager batching binds one print of the whole batch through the `@ryft.print` host callback.
@@ -921,7 +923,7 @@ mod tests {
             batch(|item| item.print("x"), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap()
         });
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
-        assert_eq!(read_f64s(client, &output), vec![1.5, 2.5]);
+        assert_eq!(read_first_shard::<f64>(client, &output), vec![1.5, 2.5]);
 
         // Batching under a staging parent keeps the print in the staged program, which prints the whole batch once
         // per execution.
@@ -942,7 +944,7 @@ mod tests {
         let (outputs, lines) = with_captured_prints(|| session.execute_program(&compiled, vec![input]).unwrap());
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
         assert_eq!(outputs.len(), 1);
-        assert_eq!(read_f64s(client, &outputs[0]), vec![1.5, 2.5]);
+        assert_eq!(read_first_shard::<f64>(client, &outputs[0]), vec![1.5, 2.5]);
     }
 
     #[test]

@@ -62,3 +62,21 @@ pub enum CompilationError {
     #[error("invalid XLA compilation analysis: {reason}")]
     InvalidAnalysis { reason: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use ryft_core::{ArrayType, Placeholder, ReferenceReadOperation, ReferenceType};
+
+    use crate::{Constant, FlatProgram, ProgramBuilder, Type};
+
+    /// Builds a flat program that reads and returns one externally supplied reference.
+    pub(super) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram {
+        let mut builder = ProgramBuilder::new();
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(referent_type)));
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+}

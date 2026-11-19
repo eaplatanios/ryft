@@ -237,9 +237,9 @@ mod tests {
 
     use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
 
-    use crate::sessions::tests::{domain_mesh, replicated_vector_type, session_with_client};
+    use crate::sessions::tests::{domain_mesh, replicated_vector_type};
     use crate::tests::cpu_client;
-    use crate::{FlatProgram, Operation, Options, ProgramBuilder, Type};
+    use crate::{FlatProgram, Operation, Options, ProgramBuilder, Session, Type};
 
     use super::*;
 
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_target_from_client() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let target = session.target().unwrap();
         assert!(std::ptr::eq(target, session.clone().target().unwrap()));
         assert_eq!(target.platform_name(), client.platform_name().unwrap());

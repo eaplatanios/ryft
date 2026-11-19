@@ -372,11 +372,11 @@ mod tests {
     };
     use ryft_pjrt::{Buffer, BufferSpecification, BufferType, Client, EventPromise, ExecutionFence};
 
-    use crate::sessions::tests::{f64_vector, session_with_client, two_device_mesh};
+    use crate::sessions::tests::{f64_vector, two_device_mesh};
     use crate::tests::{cpu_client, values_to_bytes};
     use crate::{
         Array, Constant, Error, ExecutionError, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
-        ensure_print_handler_registered, with_captured_prints,
+        Session, ensure_print_handler_registered, with_captured_prints,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -437,7 +437,7 @@ mod tests {
     /// every input event is recorded, so that case checks print order after session synchronization.
     fn assert_session_array_ordered_effects(client: &'static Client<'static>, hold_predecessor: bool) {
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let first = f64_vector(&session, &mesh, &[1.0]);
         let second = f64_vector(&session, &mesh, &[2.0]);
 
@@ -493,7 +493,7 @@ mod tests {
     /// Checks that an outputless unordered execution registers with the effect scope and preserves the ordered tail.
     fn assert_outputless_unordered_execution(client: &'static Client<'static>) {
         let mesh = single_device_mesh(client);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
         let mut builder = ProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
@@ -740,7 +740,7 @@ mod tests {
     fn test_effect_reservation_wait_for_predecessor_tokens_preserves_per_device_dependencies() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         ensure_print_handler_registered(client).unwrap();
         let r#type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(

@@ -142,7 +142,7 @@ mod tests {
     use crate::lowering::tests::test_vector_type;
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::{FlatProgram, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type, session_with_client};
+    use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{Array, CompiledFunction, Constant, Session, Tracer, compile, to_mlir_module_for_program};
 
@@ -170,7 +170,7 @@ mod tests {
     fn test_stop_gradient_operation_lower_executes_as_the_identity() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let engine = session_with_client(client);
+        let engine = Session::builder().client(client).build().unwrap();
 
         let input_type = replicated_vector_type(&mesh, 4);
         let compiled: CompiledFunction<ArrayType, ArrayType> =
@@ -187,7 +187,7 @@ mod tests {
         .unwrap();
         let output = compiled.executable().execute(&engine, source).unwrap();
 
-        let observed = read_f32s(client, &output);
+        let observed = read_first_shard::<f32>(client, &output);
         for (got, &input) in observed.iter().zip(values.iter()) {
             let expected = input * input;
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
@@ -220,8 +220,8 @@ mod tests {
             Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
         let (first, second) = variadic.executable().execute(&engine, (first, second)).unwrap();
-        assert_eq!(read_f32s(client, &first), values);
-        assert_eq!(read_f32s(client, &second), other_values);
+        assert_eq!(read_first_shard::<f32>(client, &first), values);
+        assert_eq!(read_first_shard::<f32>(client, &second), other_values);
     }
 
     #[test]

@@ -15,7 +15,7 @@ ryft-kernels.workspace = true
 ryft-cuda.workspace = true
 ryft-mlir.workspace = true
 ryft-rocm.workspace = true
-ryft-xla-sys.workspace = true
+ryft-xla-sys = { workspace = true, features = ["triton"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

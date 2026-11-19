@@ -66,14 +66,15 @@ impl KernelTarget for Target {
             Target::Cuda { major, minor } => {
                 if !matches!((*major, *minor), (8, 0) | (12, 1))
                     || !facts.platform_name().eq_ignore_ascii_case("cuda")
-                    || facts.platform_version() != "cuda 13020"
+                    || !matches!(facts.platform_version(), "cuda 12090" | "cuda 13020")
                     || facts.pjrt_version() != ryft_pjrt::VERSION
                     || !facts.has_ffi_extension()
                     || facts.devices().is_empty()
                 {
                     return Err(KernelEmbeddingError::Invalid {
-                        message: "triton requires a qualified CUDA target and the pinned CUDA 13.2 PJRT FFI platform"
-                            .into(),
+                        message:
+                            "triton requires a qualified CUDA target and a pinned CUDA 12.9 or 13.2 PJRT FFI platform"
+                                .into(),
                     });
                 }
                 format!("{major}.{minor}")
@@ -125,15 +126,14 @@ mod tests {
     use ryft_triton::kernels::{Compiler, Error, Options, TRITON_VERSION, XLA_VERSION, lowering_sha256};
     use serde_json::json;
 
-    use crate::FromPjrt;
     use crate::kernels::aot::tests::executable_bundle;
     use crate::kernels::aot::{KernelAotBundle, KernelAotError};
     use crate::kernels::staging::{KernelCompilerBinding, KernelDeviceFacts};
     use crate::kernels::tuning::{
         KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest, KernelTuningRunner,
     };
-    use crate::sessions::tests::session_with_client;
     use crate::tests::execution_client;
+    use crate::{FromPjrt, Session};
 
     use super::*;
 
@@ -383,7 +383,7 @@ mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let target = Target::Cuda { major: 12, minor: 1 };
         assert!(matches!(Compiler::from_configuration(&historical_configuration()),
             Err(Error::Invalid { message }) if message == "invalid recorded compiler configuration"));
@@ -493,10 +493,10 @@ mod tests {
 
     #[test]
     fn test_target_admit_execution() {
-        let facts = |has_ffi_extension: bool| {
+        let facts = |platform_version: &str, has_ffi_extension: bool| {
             KernelExecutionFacts::new(
                 "CUDA",
-                "cuda 13020",
+                platform_version,
                 ryft_pjrt::VERSION,
                 has_ffi_extension,
                 BTreeMap::new(),
@@ -507,12 +507,18 @@ mod tests {
             )
         };
         let target = Target::Cuda { major: 12, minor: 1 };
-        target.admit_execution(&facts(true)).unwrap();
-        let result = Target::Cuda { major: 8, minor: 0 }.admit_execution(&facts(true));
+        for version in ["cuda 12090", "cuda 13020"] {
+            target.admit_execution(&facts(version, true)).unwrap();
+        }
+        let result = Target::Cuda { major: 8, minor: 0 }.admit_execution(&facts("cuda 13020", true));
         assert!(matches!(result, Err(KernelEmbeddingError::Invalid { message })
             if message == "triton requires exact device compute capability `8.0`"));
-        assert!(matches!(target.admit_execution(&facts(false)), Err(KernelEmbeddingError::Invalid { message })
-            if message == "triton requires a qualified CUDA target and the pinned CUDA 13.2 PJRT FFI platform"));
+        for (version, ffi) in [("cuda 13020", false), ("cuda 12080", true)] {
+            assert!(
+                matches!(target.admit_execution(&facts(version, ffi)), Err(KernelEmbeddingError::Invalid { message })
+                if message == "triton requires a qualified CUDA target and a pinned CUDA 12.9 or 13.2 PJRT FFI platform")
+            );
+        }
     }
 
     #[test]

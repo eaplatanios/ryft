@@ -359,7 +359,7 @@ mod tests {
     use crate::lowering::tests::{
         ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
     };
-    use crate::sessions::tests::{domain_mesh, read_f32s, replicated_vector_type, session_with_client};
+    use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Type, Value, compile};
 
@@ -472,7 +472,7 @@ mod tests {
     fn test_cumulative_operation_lower_sum_executes_with_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let engine = session_with_client(client);
+        let engine = Session::builder().client(client).build().unwrap();
 
         let input_type = replicated_vector_type(&mesh, 4);
         let values = [1.0f32, 2.0, 3.0, 4.0];
@@ -492,12 +492,12 @@ mod tests {
         let forward: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = forward.executable().execute(&engine, source()).unwrap();
-        assert_eq!(read_f32s(client, &output), vec![1.0, 3.0, 6.0, 10.0]);
+        assert_eq!(read_first_shard::<f32>(client, &output), vec![1.0, 3.0, 6.0, 10.0]);
 
         let reverse: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = reverse.executable().execute(&engine, source()).unwrap();
-        assert_eq!(read_f32s(client, &output), vec![10.0, 9.0, 7.0, 4.0]);
+        assert_eq!(read_first_shard::<f32>(client, &output), vec![10.0, 9.0, 7.0, 4.0]);
 
         // Reverse mode differentiation through the compiled scan exercises the transposed direction end to end.
         // Summing every prefix weights element `i` by the number of prefixes that contain it, so the gradient is the
@@ -511,7 +511,7 @@ mod tests {
         .unwrap();
         let gradient: CompiledFunction<ArrayType, ArrayType> = total.gradient(&engine).unwrap();
         let output = gradient.executable().execute(&engine, source()).unwrap();
-        assert_eq!(read_f32s(client, &output), vec![4.0, 3.0, 2.0, 1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &output), vec![4.0, 3.0, 2.0, 1.0]);
     }
 
     #[test]
@@ -648,7 +648,7 @@ mod tests {
     fn test_cumulative_operation_lower_log_sum_exp_executes() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let engine = session_with_client(client);
+        let engine = Session::builder().client(client).build().unwrap();
 
         let input_type = replicated_vector_type(&mesh, 4);
         let source = |values: [f32; 4]| {
@@ -679,9 +679,9 @@ mod tests {
         let reduced: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = reduced.executable().execute(&engine, source([0.0; 4])).unwrap();
-        assert_close(&read_f32s(client, &output), &[4.0f32.ln()]);
+        assert_close(&read_first_shard::<f32>(client, &output), &[4.0f32.ln()]);
         let output = reduced.executable().execute(&engine, source([1000.0; 4])).unwrap();
-        assert_close(&read_f32s(client, &output), &[1000.0 + 4.0f32.ln()]);
+        assert_close(&read_first_shard::<f32>(client, &output), &[1000.0 + 4.0f32.ln()]);
 
         // The reverse prefix scan folds the pairwise stable `log_add_exp` over each suffix, so position `i` of an
         // operand of zeros holds `log(4 - i)` and the final position holds `log(1) = 0`.
@@ -689,7 +689,7 @@ mod tests {
             compile(|x| x.reverse_cumulative_log_sum_exp(0).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
         let output = scanned.executable().execute(&engine, source([0.0; 4])).unwrap();
-        assert_close(&read_f32s(client, &output), &[4.0f32.ln(), 3.0f32.ln(), 2.0f32.ln(), 0.0]);
+        assert_close(&read_first_shard::<f32>(client, &output), &[4.0f32.ln(), 3.0f32.ln(), 2.0f32.ln(), 0.0]);
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_executes() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let increasing = replicated_array(
             &session,
@@ -861,7 +861,7 @@ mod tests {
         // `f32` prefix sum exact, so every form must agree with a sequential scan bit for bit, including along a
         // scanned axis longer than one thousand elements, which spans several levels of the parallel scan.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let (rows, columns) = (3, 1025);
         let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_one_bit_integers_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let bits = [1, 1, 0, 1];
         for data_type in [DataType::I1, DataType::U1] {
@@ -1057,7 +1057,7 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         for (data_type, lowest) in [
             (DataType::F4E2M1FN, vec![0x0f]),
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn test_lower_cumulative_log_sum_exp_complex() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Every window is padded with `-∞ + 0i` initial values, and an operand whose real component is negative
@@ -1148,7 +1148,7 @@ mod tests {
         // count, exactly like the reference backend's cumulative maximum.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =
@@ -1182,7 +1182,7 @@ mod tests {
             assert_eq!(output.shape().as_slice(), &[rows, 5]);
             let expected =
                 CoreArray::matrix(rows, 5, values).unwrap().cumulative_max(1).unwrap().elements::<f32>().unwrap();
-            assert_eq!(read_f32s(client, &output), expected);
+            assert_eq!(read_first_shard::<f32>(client, &output), expected);
         }
     }
 }

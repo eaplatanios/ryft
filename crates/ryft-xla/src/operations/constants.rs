@@ -648,8 +648,9 @@ mod tests {
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, Complex as ComplexNumber, Context, DimensionBounds, DimensionType,
         DimensionValue, DimensionVariable, Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation,
-        OneOperation, Placeholder, ProgramBuilder as CoreProgramBuilder, Sharding, ShardingDimension, StaticShape,
-        TiledLayout, TracingContext, Typed, TypedProgram, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        OneOperation, Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Sharding, ShardingDimension,
+        StaticShape, TiledLayout, TracingContext, Typed, TypedProgram, ZeroLikeOperation, ZeroOperation, i1, i2, i4,
+        u1, u2, u4,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -659,9 +660,9 @@ mod tests {
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::sessions::tests::{array_domain, read_f32s, read_u64s};
+    use crate::sessions::tests::read_first_shard;
     use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, to_mlir_module_for_program};
+    use crate::{ArrayConstant, Constant, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1113,7 +1114,7 @@ mod tests {
     #[test]
     fn test_fill_materializes_scalar_literal_then_broadcasts_over_a_default_mesh() {
         let client = execution_client();
-        let domain = array_domain(client);
+        let domain = ProjectedContext::<Session, ArrayType>::new(Session::builder().client(client).build().unwrap());
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
             let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).with_memory(memory);
@@ -1135,13 +1136,13 @@ mod tests {
 
             assert_eq!(output.r#type().memory(), memory);
             assert_eq!(output.shape(), StaticShape::new(vec![3]));
-            assert_eq!(read_f32s(client, &output), vec![2.5, 2.5, 2.5]);
+            assert_eq!(read_first_shard::<f32>(client, &output), vec![2.5, 2.5, 2.5]);
         }
 
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
         let value = Complex::new(1.5f64, -2.0f64);
         let output = domain.fill(&r#type, value).unwrap();
-        assert_eq!(read_f32s(client, &output), vec![1.5, 1.5]);
+        assert_eq!(read_first_shard::<f32>(client, &output), vec![1.5, 1.5]);
 
         // A complex fill value lowers as two real part splats composed through `stablehlo.complex`, and a `c64`
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
@@ -1150,14 +1151,14 @@ mod tests {
         let output = domain.fill(&r#type, value).unwrap();
 
         assert_eq!(output.shape(), StaticShape::new(vec![2]));
-        assert_eq!(read_f32s(client, &output), vec![1.5, -2.0, 1.5, -2.0]);
+        assert_eq!(read_first_shard::<f32>(client, &output), vec![1.5, -2.0, 1.5, -2.0]);
 
         // Integer literals remain exact through conversion and scalar constant lowering, including values that
         // cannot be represented exactly by the floating-point intermediary used for floating-point constants.
         let r#type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
         let value = u64::MAX - 1;
         let output = domain.fill(&r#type, value).unwrap();
-        assert_eq!(read_u64s(client, &output), vec![value, value]);
+        assert_eq!(read_first_shard::<u64>(client, &output), vec![value, value]);
     }
 
     #[test]

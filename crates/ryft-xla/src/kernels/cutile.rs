@@ -121,7 +121,6 @@ mod tests {
     use crate::kernels::staging::KernelCompilerBinding;
     use crate::kernels::staging::KernelDeviceFacts;
     #[cfg(feature = "cutile-compiler")]
-    use crate::sessions::tests::session_with_client;
     #[cfg(feature = "cutile-compiler")]
     use crate::tests::execution_client;
 
@@ -224,7 +223,7 @@ mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let target = Target::new(12, 1).unwrap();
         let python = PathBuf::from("/explicit/python");
         let compiler = Compiler::new(python.clone());

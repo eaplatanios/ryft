@@ -977,7 +977,6 @@ mod tests {
     };
     use ryft_pjrt::Client;
 
-    use crate::sessions::tests::session_with_client;
     use crate::tests::{
         cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type,
     };
@@ -1024,7 +1023,7 @@ mod tests {
     #[test]
     fn test_dimension_new() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let value = DimensionValue::constant(3).unwrap();
         let dimension = Dimension::new(value.clone(), session.clone());
         assert_eq!(dimension.value(), &value);
@@ -1036,7 +1035,7 @@ mod tests {
     fn test_dimension_display_and_debug() {
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = Dimension::new(value.clone(), session_with_client(client));
+        let dimension = Dimension::new(value.clone(), Session::builder().client(client).build().unwrap());
         assert_eq!(dimension.to_string(), "3");
         assert_eq!(format!("{dimension:?}"), format!("Dimension({value:?})"));
     }
@@ -1046,17 +1045,20 @@ mod tests {
         // Equality ignores the session, which only selects where derived arrays are materialized.
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let first = Dimension::new(value.clone(), session_with_client(client));
-        let second = Dimension::new(value, session_with_client(client));
+        let first = Dimension::new(value.clone(), Session::builder().client(client).build().unwrap());
+        let second = Dimension::new(value, Session::builder().client(client).build().unwrap());
         assert_eq!(first, second);
-        assert_ne!(first, Dimension::new(DimensionValue::constant(4).unwrap(), session_with_client(client)));
+        assert_ne!(
+            first,
+            Dimension::new(DimensionValue::constant(4).unwrap(), Session::builder().client(client).build().unwrap())
+        );
     }
 
     #[test]
     fn test_dimension_borrow() {
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = Dimension::new(value.clone(), session_with_client(client));
+        let dimension = Dimension::new(value.clone(), Session::builder().client(client).build().unwrap());
         assert_eq!(Borrow::<DimensionValue>::borrow(&dimension), &value);
     }
 
@@ -1064,7 +1066,7 @@ mod tests {
     fn test_dimension_type() {
         let client = execution_client();
         let value = DimensionValue::constant(3).unwrap();
-        let dimension = Dimension::new(value.clone(), session_with_client(client));
+        let dimension = Dimension::new(value.clone(), Session::builder().client(client).build().unwrap());
         assert_eq!(dimension.r#type(), value.r#type());
     }
 
@@ -1072,7 +1074,7 @@ mod tests {
     fn test_dimension_compare() {
         // The predicate is decided on the host, so only the Boolean result is uploaded and no program is compiled.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
         let three = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
         let program_count = session.cached_program_count();
@@ -1088,7 +1090,7 @@ mod tests {
     fn test_dimension_session() {
         // Dimension arithmetic dispatches through the dimension's session, which evaluates it on the host.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
         let three = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
         assert!(same_session(two.domain().parent(), &session));
@@ -1106,7 +1108,7 @@ mod tests {
         let source = DimensionVariable::new("source", bounds);
         let target = DimensionVariable::new("target", bounds);
         let value = DimensionValue::new(source.clone().into(), 4).unwrap();
-        let dimension = Dimension::new(value, session_with_client(client));
+        let dimension = Dimension::new(value, Session::builder().client(client).build().unwrap());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(source, target.clone()).unwrap();
         let renamed = dimension.rename_type_identities(&renaming).unwrap();
@@ -1117,7 +1119,7 @@ mod tests {
     #[test]
     fn test_reference_new() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let handle = ArrayReference::new(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         let reference = Reference::new(handle.clone(), session.clone());
@@ -1129,7 +1131,7 @@ mod tests {
     #[test]
     fn test_reference_display_and_debug() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let handle = ArrayReference::new(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         let reference = Reference::new(handle.clone(), session);
@@ -1141,11 +1143,11 @@ mod tests {
     fn test_reference_equality() {
         // References compare by handle identity, regardless of their sessions.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let handle = ArrayReference::new(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         let reference = Reference::new(handle.clone(), session.clone());
-        assert_eq!(reference, Reference::new(handle, session_with_client(client)));
+        assert_eq!(reference, Reference::new(handle, Session::builder().client(client).build().unwrap()));
         let other = ArrayReference::new(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         assert_ne!(reference, Reference::new(other, session));
     }
@@ -1153,7 +1155,7 @@ mod tests {
     #[test]
     fn test_reference_type() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let handle = ArrayReference::new(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         let reference = Reference::new(handle.clone(), session);
@@ -1163,7 +1165,7 @@ mod tests {
     #[test]
     fn test_value_session() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let reference = Reference::new(ArrayReference::new(array.clone()), session.clone());
@@ -1176,7 +1178,7 @@ mod tests {
     fn test_value_into_array_ir_value() {
         // The conversion is lossless up to the sessions, which the inverse conversion binds to the provided session.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let handle = ArrayReference::new(array.clone());
@@ -1191,7 +1193,7 @@ mod tests {
             converted,
             [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle),],
         );
-        let other_session = session_with_client(client);
+        let other_session = Session::builder().client(client).build().unwrap();
         let restored = converted.map(|value| Value::from_array_ir_value(value, &other_session).unwrap());
         assert_eq!(restored, values);
         assert!(same_session(restored[0].session(), &session));
@@ -1202,7 +1204,7 @@ mod tests {
     #[test]
     fn test_value_constant() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
 
@@ -1229,7 +1231,7 @@ mod tests {
     fn test_value_display_and_debug() {
         // Values render exactly like the corresponding `ArrayIrValue` members.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let reference = Reference::new(ArrayReference::new(array.clone()), session.clone());
@@ -1243,7 +1245,7 @@ mod tests {
     #[test]
     fn test_value_type() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let reference = Reference::new(ArrayReference::new(array.clone()), session.clone());
@@ -1255,7 +1257,7 @@ mod tests {
     #[test]
     fn test_value_domain() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         assert!(same_session(&array.domain(), &session));
@@ -1278,7 +1280,7 @@ mod tests {
     #[test]
     fn test_value_domain_places_dimension_derived_arrays_on_the_source_mesh() {
         let client = cpu_client(2);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 1);
         let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
         let size = input.dimension_size(0).unwrap();
@@ -1293,7 +1295,7 @@ mod tests {
     #[test]
     fn test_value_rename_type_identities() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
@@ -1322,7 +1324,7 @@ mod tests {
     #[test]
     fn test_value_validate_as_constant() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), session.clone()));
@@ -1340,7 +1342,7 @@ mod tests {
     #[test]
     fn test_value_is_zero() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[0.0f32], &[]);
         let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), session.clone()));
@@ -1360,7 +1362,7 @@ mod tests {
     #[test]
     fn test_value_reference_id() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let handle = ArrayReference::new(array.clone());
@@ -1373,7 +1375,7 @@ mod tests {
     #[test]
     fn test_value_array_projection() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let value = <Value as ValueProjection<ArrayType>>::from_projected(array.clone());
@@ -1388,7 +1390,7 @@ mod tests {
     #[test]
     fn test_value_dimension_projection() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let dimension = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
         let value = <Value as ValueProjection<DimensionType>>::from_projected(dimension.clone());
@@ -1404,7 +1406,7 @@ mod tests {
     #[test]
     fn test_value_reference_projection() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let reference = Reference::new(ArrayReference::new(array.clone()), session.clone());
@@ -1420,7 +1422,7 @@ mod tests {
     #[test]
     fn test_value_from() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
         let dimension = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
@@ -1433,7 +1435,7 @@ mod tests {
     #[test]
     fn test_value_concretize() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let predicate = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
         assert_eq!(predicate.concretize(), Ok(true));
@@ -1447,7 +1449,7 @@ mod tests {
     #[test]
     fn test_value_any_true() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         assert_eq!(Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 1], &[2])).any_true(), Ok(true));
         assert_eq!(Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 0], &[2])).any_true(), Ok(false));
@@ -1461,7 +1463,7 @@ mod tests {
     #[test]
     fn test_value_select() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
 
         // A scalar predicate selects whole values.
@@ -1492,7 +1494,7 @@ mod tests {
     #[test]
     fn test_value_assertion_value() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let scalar = Value::Array(array(&session, &mesh, DataType::I32, &[42i32], &[]));
         assert_eq!(scalar.assertion_observation(), Ok("42".to_string()));
@@ -1504,7 +1506,7 @@ mod tests {
     #[test]
     fn test_value_assert() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let truth = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
         let falsity = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8], &[]));
@@ -1518,7 +1520,7 @@ mod tests {
     #[test]
     fn test_value_operators() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
         let four = Value::Array(array(&session, &mesh, DataType::F32, &[4.0f32], &[]));
@@ -1534,7 +1536,7 @@ mod tests {
         // Comparing first-class dimensions executes eagerly outside any context, without compiling a program, and
         // materializes the Boolean result in the session of the inputs.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let (two, three) = (dimension(&session, 2), dimension(&session, 3));
         let program_count = session.cached_program_count();
@@ -1559,7 +1561,7 @@ mod tests {
         // Arithmetic on two first-class dimensions uses their dimension members and executes eagerly outside any
         // context, without compiling a program.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let (two, three) = (dimension(&session, 2), dimension(&session, 3));
         let program_count = session.cached_program_count();
@@ -1585,7 +1587,7 @@ mod tests {
     #[test]
     fn test_value_dimension_to_scalar() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let program_count = session.cached_program_count();
         let scalar = dimension(&session, 2).to_scalar().unwrap();
         assert!(matches!(
@@ -1601,7 +1603,7 @@ mod tests {
         // Top-level reference operations execute eagerly on their host-side handles, with the validation and locking of
         // the generic array IR reference implementations.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let vector = |values: &[f32]| Value::Array(array(&session, &mesh, DataType::F32, values, &[values.len()]));
         let scalar = |value: f32| Value::Array(array(&session, &mesh, DataType::F32, &[value], &[]));
@@ -1649,7 +1651,7 @@ mod tests {
         // Capabilities without a receiver-shaped signature project onto the array member through the generalized
         // array IR implementations in `ryft-core`.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let input = Value::Array(array(&session, &mesh, DataType::F32, &[3.0f32, 1.0, 2.0], &[3]));
         let sorted = Value::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending).unwrap();
@@ -1666,7 +1668,7 @@ mod tests {
     fn test_value_program_replay_lifts_dimension_constants() {
         // Replaying a program over the session lifts its dimension constants through the session-aware `lift`.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let input = array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]);
 
@@ -1694,7 +1696,7 @@ mod tests {
     fn test_value_free_transforms() {
         // Free transform entry points recover the session from the values, so no explicit context is needed.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
 
@@ -1717,7 +1719,7 @@ mod tests {
     fn test_value_free_transforms_replay_dimension_derived_values() {
         // Each item is scaled by its own folded extent, which the transforms replay as a dimension constant.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
         let scaled: Value = batch(
@@ -1750,7 +1752,7 @@ mod tests {
         // At concrete primals, the forward mode `while` rule decides the loop condition on the host through the
         // predicate contracts of `Value` and unrolls the executed iterations.
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let condition = {

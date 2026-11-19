@@ -73,8 +73,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{Array as CoreArray, ArrayOperation, Erf};
 
+    use crate::Session;
     use crate::lowering::tests::lowered_unary_module;
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -98,7 +99,7 @@ mod tests {
     #[test]
     fn test_erf_operation_lower_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // The grid covers every approximation regime of the reference implementation on both signs (i.e., the series
@@ -134,7 +135,7 @@ mod tests {
     #[test]
     fn test_erf_operation_lower_f8e8m0fnu_matches_reference_backend() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
         // Cover every encoding, including the smallest input whose erf rounds back to itself and NaN.

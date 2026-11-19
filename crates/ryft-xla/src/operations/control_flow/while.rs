@@ -529,9 +529,9 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::sessions::tests::{domain_mesh, program_array, read_f32s, session_with_client};
+    use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Constant, Value, to_mlir_module_for_program};
+    use crate::{Constant, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1618,13 +1618,13 @@ mod tests {
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let value = |dimensions: &[usize], values: &[f32]| {
             Value::Array(replicated_array(&session, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
         let read = |value: Value| {
             let array = program_array(&value);
-            (array.shape().dimensions().to_vec(), read_f32s(client, array))
+            (array.shape().dimensions().to_vec(), read_first_shard::<f32>(client, array))
         };
         let (state, limit) = batch(
             |(state, limit)| {

@@ -53,7 +53,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{Ceil, DataType, Floor, Round};
 
-    use crate::sessions::tests::{domain_mesh, session_with_client};
+    use crate::Session;
+    use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     // Signed zeros, quarters, and ties around zero and one, compared by encoding so that the sign of a zero result and
@@ -66,7 +67,7 @@ mod tests {
     #[test]
     fn test_floor_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
         assert_eq!(
@@ -83,7 +84,7 @@ mod tests {
     #[test]
     fn test_ceil_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
         assert_eq!(
@@ -99,7 +100,7 @@ mod tests {
     #[test]
     fn test_round_operation_lower() {
         let client = execution_client();
-        let session = session_with_client(client);
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
         assert_eq!(

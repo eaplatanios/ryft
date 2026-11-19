@@ -400,9 +400,9 @@ mod tests {
 
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
-    use crate::sessions::tests::{domain_mesh, read_i64s, replicated_scalar_type, session_with_client};
+    use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, Options, to_mlir_module_for_program};
+    use crate::{Array, Constant, Options, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -489,7 +489,7 @@ mod tests {
     fn test_dimension_from_scalar_operation_lower_reports_bounds_failures() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
 
@@ -518,7 +518,7 @@ mod tests {
             Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, 4i64.to_ne_bytes().as_slice())
                 .unwrap();
         let valid = session.execute_program(&compiled, vec![valid]).unwrap();
-        assert_eq!(read_i64s(client, &valid[0]), vec![4]);
+        assert_eq!(read_first_shard::<i64>(client, &valid[0]), vec![4]);
 
         let invalid = Array::from_host_buffer(&session, input_type, mesh, None, 9i64.to_ne_bytes().as_slice()).unwrap();
         let error = session.execute_program(&compiled, vec![invalid]).unwrap_err();
@@ -847,7 +847,7 @@ mod tests {
     fn test_lower_dimension_arithmetic_preserves_checked_diagnostics() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -898,7 +898,7 @@ mod tests {
 
             let output =
                 session.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
-            assert_eq!(read_i64s(client, &output[0]), vec![expected_output]);
+            assert_eq!(read_first_shard::<i64>(client, &output[0]), vec![expected_output]);
             let error = session
                 .execute_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
                 .unwrap_err();

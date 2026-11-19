@@ -774,9 +774,8 @@ mod tests {
     use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::Platform;
-    use crate::sessions::tests::session_with_client;
     use crate::tests::{cpu_client, execution_client};
+    use crate::{Platform, Session};
 
     use super::*;
 
@@ -955,7 +954,7 @@ mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let session = session_with_client(client).with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let compiler_options = if mode == "configuration" { 1 + process as u32 } else { 1 };
         let kernel = loaded(&session, &mesh, compiler_options);
         let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();

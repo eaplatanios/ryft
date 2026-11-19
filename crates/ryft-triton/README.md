@@ -17,9 +17,10 @@ CUDA `12.1`; AMD products are compiled and inspected without device execution.
 
 Source revisions are the XLA and JAX revisions pinned by `ryft-xla-sys` (`ryft_xla_sys::XLA_COMMIT` and
 `ryft_xla_sys::JAX_COMMIT`) and the Triton revision that this XLA revision selects (`ryft_xla_sys::TRITON_COMMIT`),
-with the pinned XLA patches. CUDA compilation requires the recorded CUDA 13.2 toolkit contract and assembler 13.0.88,
-producing PTX 9.0. The runtime integration requires the pinned PJRT FFI contract. ROCm uses HIP 7.13 and the native
-compiler's embedded ROCm device-bitcode revision `53996464fa8d94b182ac4aaa7dc3a109ab524f45`; see `ryft-rocm` for its
+with the pinned XLA patches. The CUDA 12 archive uses CUDA 12.9 headers and assembler 12.9.86 for PTX 8.8. The CUDA 13
+archive uses CUDA 13.2 headers and assembler 13.0.88 for PTX 9.0. The runtime integration requires the pinned PJRT FFI
+contract. ROCm uses HIP 7.13 and the native compiler's embedded ROCm device-bitcode revision
+`53996464fa8d94b182ac4aaa7dc3a109ab524f45`; see `ryft-rocm` for its
 exact ABI contract. A full native build with CUDA configuration disabled has not been qualified.
 
 The initial portable subset uses static, unsharded, dense row-major F32 device parameters, one global pointer per
@@ -40,9 +41,10 @@ admission; selecting Triton does not add a new transform policy or silently sele
 
 ## Native compiler and selection
 
-Use a GPU-enabled `ryft-xla-sys` archive built following that crate's README. The compiler uses the same native archive,
-C header, C++ implementation and Rust FFI conventions as the other bridges. CPU-only archives expose the same API but
-report compilation unavailable; GPU-enabled archives retain ordinary CPU PJRT support. `Compiler::new()` requires no
+On Linux, combine `triton` with `cuda-12`, `cuda-13`, or `rocm-10` in `ryft-xla` to select the matching precompiled
+`ryft-xla-sys` archive. An explicit `RYFT_XLA_SYS_ARCHIVE` can supply another compatible build. See the
+[`ryft-xla-sys` README](../ryft-xla-sys/README.md#native-triton-compiler) for selection and platform support. CPU-only
+archives report compilation unavailable. GPU archives retain CPU PJRT support. `Compiler::new()` requires no
 executable path and does not initialize a GPU runtime.
 
 Compilation borrows the typed MLIR module under its context's exclusive guard and lowers a native clone, preserving
