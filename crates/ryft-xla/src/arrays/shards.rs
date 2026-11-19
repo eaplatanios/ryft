@@ -48,6 +48,12 @@ impl ArrayShard {
         &self.descriptor
     }
 
+    /// Returns the [`ArrayShardStorage`] of this [`ArrayShard`], which is what the current process holds for it.
+    #[inline]
+    pub fn storage(&self) -> &ArrayShardStorage {
+        &self.storage
+    }
+
     /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
     /// addressable bufferless [`DataType::Zero`](ryft_core::DataType::Zero)-valued shard.
     #[inline]
@@ -130,22 +136,10 @@ impl ArrayShard {
         let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
         Ok(copy.r#await()?)
     }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Compares this shard's storage identity with `other`.
-    pub(super) fn storage_eq(&self, other: &Self) -> bool {
-        match (&self.storage, &other.storage) {
-            (ArrayShardStorage::Zero, ArrayShardStorage::Zero) => true,
-            (ArrayShardStorage::Buffer(left), ArrayShardStorage::Buffer(right)) => Arc::ptr_eq(left, right),
-            // Two shards on other processes have no local storage to compare, so they are only known to be the same
-            // storage when their arrays share their parts, which `PartialEq for Array` checks first.
-            _ => false,
-        }
-    }
 }
 
 impl Debug for ArrayShard {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let device = self.device();
         formatter
@@ -158,6 +152,22 @@ impl Debug for ArrayShard {
             .finish()
     }
 }
+
+/// Physical storage state of an [`ArrayShard`], which [`ArrayShard::storage`] returns.
+#[derive(Clone)]
+pub enum ArrayShardStorage {
+    /// The shard belongs to another process and has no process-local storage.
+    Remote,
+
+    /// The shard is process-local but represents the unique value of
+    /// [`DataType::Zero`](ryft_core::DataType::Zero) without an underlying buffer.
+    Zero,
+
+    /// The shard is process-local and backed by a PJRT [`Buffer`].
+    Buffer(Arc<Buffer<'static>>),
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Row-major ordinal index of an [`ArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
 /// row-major ordering as [`DeviceMesh::devices`]. This gives all processes a stable way to refer to the same global
@@ -424,20 +434,6 @@ impl ShardLayout {
     }
 }
 
-/// Physical storage state of an [`ArrayShard`].
-#[derive(Clone)]
-enum ArrayShardStorage {
-    /// The shard belongs to another process and has no process-local storage.
-    Remote,
-
-    /// The shard is process-local but represents the unique value of
-    /// [`DataType::Zero`](ryft_core::DataType::Zero) without an underlying buffer.
-    Zero,
-
-    /// The shard is process-local and backed by a PJRT [`Buffer`].
-    Buffer(Arc<Buffer<'static>>),
-}
-
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[allow(clippy::single_range_in_vec_init)]
 #[cfg(test)]
@@ -466,6 +462,25 @@ mod tests {
         assert_eq!(shard.slice(), [2..5, 0..4].as_slice());
         assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
         assert!(!shard.is_addressable());
+    }
+
+    #[test]
+    fn test_array_shard_storage() {
+        // A shard without a buffer lives in another process, and a zero shard is local without holding a buffer.
+        let descriptor = ShardDescriptor::new(0, Device::new(0, 0), vec![0..2]);
+        assert!(matches!(ArrayShard::new(descriptor.clone(), None).storage(), ArrayShardStorage::Remote));
+        assert!(matches!(ArrayShard::zero(descriptor).storage(), ArrayShardStorage::Zero));
+
+        // A shard of an uploaded array holds the buffer that `ArrayShard::buffer` returns.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
+        let shard = &array.shards()[0];
+        assert!(matches!(
+            shard.storage(),
+            ArrayShardStorage::Buffer(buffer) if Arc::ptr_eq(buffer, shard.buffer().unwrap()),
+        ));
     }
 
     #[test]

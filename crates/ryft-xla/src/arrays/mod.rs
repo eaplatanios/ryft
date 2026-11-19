@@ -63,7 +63,7 @@ pub mod statistics;
 
 pub use placement::{ArrayPlacement, Placeable, PlacementOptions};
 pub use retained::RetainedArray;
-pub use shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
 
 /// Represents errors produced while validating distributed [`Array`] metadata and buffers, placing arrays on devices,
@@ -945,7 +945,15 @@ impl PartialEq for Array {
             || (left.r#type == right.r#type
                 && left.sharding == right.sharding
                 && left.shards.len() == right.shards.len()
-                && left.shards.iter().zip(right.shards.iter()).all(|(left, right)| left.storage_eq(right)))
+                && left.shards.iter().zip(right.shards.iter()).all(|(left, right)| {
+                    match (left.storage(), right.storage()) {
+                        (ArrayShardStorage::Zero, ArrayShardStorage::Zero) => true,
+                        (ArrayShardStorage::Buffer(left), ArrayShardStorage::Buffer(right)) => Arc::ptr_eq(left, right),
+                        // Two shards on other processes have no local storage to compare, so they are only known to
+                        // be the same storage when their arrays share their parts, which is checked first.
+                        _ => false,
+                    }
+                }))
     }
 }
 
