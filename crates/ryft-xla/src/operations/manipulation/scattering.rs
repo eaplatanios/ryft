@@ -998,7 +998,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap()),
+            values_from_bytes::<Complex<f32>>(&output.copy_to_host_bytes().unwrap()),
             vec![Complex::new(1.0, 9.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)],
         );
     }
@@ -1263,11 +1263,11 @@ mod tests {
                     .unwrap()
             })
             .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&input_gradient.copy_to_host().unwrap()), vec![0.0, 1.0]);
-        let gradient = values_from_bytes::<f32>(&updates_gradient.copy_to_host().unwrap());
+        assert_eq!(input_gradient.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.0, 1.0]);
+        let gradient = updates_gradient.copy_to_host().unwrap().elements::<f32>().unwrap();
         assert!(gradient == vec![1.0, 0.0] || gradient == vec![0.0, 1.0], "{gradient:?}");
         assert_eq!(
-            values_from_bytes::<f32>(&value.copy_to_host().unwrap()),
+            value.copy_to_host().unwrap().elements::<f32>().unwrap(),
             vec![5.0 + 7.0 * gradient[0] + 8.0 * gradient[1]],
         );
     }

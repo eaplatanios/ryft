@@ -167,7 +167,7 @@ mod tests {
         let right = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[4f32, 2.0, 3.0, 9.0]));
         assert_eq!(
             values_from_bytes::<bool>(
-                &left.compare(&right, ComparisonDirection::LessThan).unwrap().copy_to_host().unwrap(),
+                &left.compare(&right, ComparisonDirection::LessThan).unwrap().copy_to_host_bytes().unwrap(),
             ),
             [true, false, false, true],
         );
@@ -194,7 +194,7 @@ mod tests {
                 (ComparisonDirection::GreaterThanOrEqual, [true, signed, !signed, true]),
             ] {
                 assert_eq!(
-                    values_from_bytes::<bool>(&left.compare(&right, direction).unwrap().copy_to_host().unwrap()),
+                    left.compare(&right, direction).unwrap().copy_to_host().unwrap().elements::<bool>().unwrap(),
                     expected,
                     "{data_type} {direction:?}",
                 );
@@ -220,7 +220,7 @@ mod tests {
                 (ComparisonDirection::GreaterThanOrEqual, [false, true]),
             ] {
                 assert_eq!(
-                    values_from_bytes::<bool>(&signed.compare(&zero, direction).unwrap().copy_to_host().unwrap()),
+                    signed.compare(&zero, direction).unwrap().copy_to_host().unwrap().elements::<bool>().unwrap(),
                     expected,
                     "{data_type} {direction:?}",
                 );

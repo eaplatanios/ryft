@@ -825,7 +825,7 @@ mod tests {
             &[4],
             values_to_bytes(&[4f32, 0.25, -1.5, 2.5]).as_slice(),
         );
-        let read = |array: Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: Array| array.copy_to_host().unwrap().elements::<f32>().unwrap();
 
         // Dyadic inputs keep every sum and product exact, whatever tree the scan combines them in.
         assert_eq!(read(increasing.cumulative_sum(0).unwrap()), vec![0.5, 1.75, 3.75, 7.5]);
@@ -875,9 +875,9 @@ mod tests {
         for row in reverse.chunks_mut(columns) {
             (0..columns - 1).rev().for_each(|column| row[column] += row[column + 1]);
         }
-        assert_eq!(values_from_bytes::<f32>(&input.cumulative_sum(1).unwrap().copy_to_host().unwrap()), forward);
+        assert_eq!(input.cumulative_sum(1).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap(), forward);
         assert_eq!(
-            values_from_bytes::<f32>(&input.reverse_cumulative_sum(1).unwrap().copy_to_host().unwrap()),
+            input.reverse_cumulative_sum(1).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap(),
             reverse,
         );
 
@@ -890,7 +890,7 @@ mod tests {
             &values_to_bytes(&[1i32, -2, 3, 4, -5, 6, 7, -8]),
         );
         assert_eq!(
-            values_from_bytes::<i32>(&integers.cumulative_sum(0).unwrap().copy_to_host().unwrap()),
+            integers.cumulative_sum(0).unwrap().copy_to_host().unwrap().elements::<i32>().unwrap(),
             vec![1, -2, 4, 2, -1, 8, 6, 0],
         );
     }
@@ -958,7 +958,7 @@ mod tests {
                     let output = input.cumulative(0, kind, reverse).unwrap();
                     assert_eq!(output.data_type(), data_type);
                     assert_eq!(
-                        output.copy_to_host().unwrap(),
+                        output.copy_to_host_bytes().unwrap(),
                         reference.cumulative(0, kind, reverse).unwrap().logical_bytes(),
                         "{data_type} {kind} reverse={reverse}",
                     );
@@ -1068,7 +1068,7 @@ mod tests {
         ] {
             let bytes = lowest.repeat(3001);
             let input = replicated_array(&session, &mesh, data_type, &[3001], &bytes);
-            assert_eq!(input.cumulative_log_sum_exp(0).unwrap().copy_to_host().unwrap(), bytes, "{data_type}");
+            assert_eq!(input.cumulative_log_sum_exp(0).unwrap().copy_to_host_bytes().unwrap(), bytes, "{data_type}");
         }
     }
 
@@ -1093,14 +1093,14 @@ mod tests {
             values_to_bytes(&[first, first, negative_infinity, rotated_negative_infinity]).as_slice(),
         );
         let forward = input.cumulative_log_sum_exp(0).unwrap();
-        let forward = values_from_bytes::<Complex<f32>>(&forward.copy_to_host().unwrap());
+        let forward = values_from_bytes::<Complex<f32>>(&forward.copy_to_host_bytes().unwrap());
         assert_eq!(forward.len(), 4);
         assert_eq!(forward[0], first);
         for prefix in &forward[1..] {
             assert!((prefix - doubled).norm() < 1e-5, "{prefix}");
         }
         let reverse = input.reverse_cumulative_log_sum_exp(0).unwrap();
-        let reverse = values_from_bytes::<Complex<f32>>(&reverse.copy_to_host().unwrap());
+        let reverse = values_from_bytes::<Complex<f32>>(&reverse.copy_to_host_bytes().unwrap());
         assert_eq!(reverse.len(), 4);
         assert!((reverse[0] - doubled).norm() < 1e-5, "{}", reverse[0]);
         assert_eq!(reverse[1], first);
@@ -1121,7 +1121,7 @@ mod tests {
         // XLA's sine, cosine, and arctangent may differ from the host's in the last bit of the reduced phase.
         let wrapped = 4f64.sin().atan2(4f64.cos());
         let prefixes = input.cumulative_log_sum_exp(0).unwrap();
-        let prefixes = values_from_bytes::<Complex<f64>>(&prefixes.copy_to_host().unwrap());
+        let prefixes = values_from_bytes::<Complex<f64>>(&prefixes.copy_to_host_bytes().unwrap());
         assert_eq!(prefixes.iter().map(|prefix| prefix.re).collect::<Vec<_>>(), vec![1f64, 1.0]);
         for prefix in &prefixes {
             assert!((prefix.im - wrapped).abs() <= 1e-13 * wrapped.abs(), "{} vs {wrapped}", prefix.im);
@@ -1135,7 +1135,7 @@ mod tests {
         );
         let wrapped = 1e16f64.sin().atan2(1e16f64.cos());
         let prefixes = input.cumulative_log_sum_exp(0).unwrap();
-        let prefixes = values_from_bytes::<Complex<f64>>(&prefixes.copy_to_host().unwrap());
+        let prefixes = values_from_bytes::<Complex<f64>>(&prefixes.copy_to_host_bytes().unwrap());
         assert_eq!(prefixes.len(), 1);
         assert_eq!(prefixes[0].re, 1f64);
         assert!((prefixes[0].im - wrapped).abs() <= 1e-13 * wrapped.abs(), "{} vs {wrapped}", prefixes[0].im);

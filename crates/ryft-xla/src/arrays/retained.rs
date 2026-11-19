@@ -206,7 +206,7 @@ mod tests {
     use ryft_core::{DataType, DimensionBounds, DimensionVariable};
 
     use crate::sessions::tests::{domain_mesh, replicated_scalar_type, shares_effect_scope};
-    use crate::tests::{execution_client, hash_of, other_cpu_client, values_from_bytes};
+    use crate::tests::{execution_client, hash_of, other_cpu_client};
 
     use super::*;
 
@@ -225,7 +225,7 @@ mod tests {
         assert!(Arc::ptr_eq(&retained.actual_type, &array.parts.r#type));
         drop(array);
         let restored = retained.to_array(&session).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&restored.copy_to_host().unwrap()), vec![1f32]);
+        assert_eq!(restored.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32]);
 
         // An array that was created from a retained array has storage of its own, so retaining it yields a different
         // retained array.
@@ -252,7 +252,7 @@ mod tests {
         drop((array, restored, fork, session));
         let restored = retained.to_array(&other_session).unwrap();
         assert!(restored.session().is_same_session(&other_session));
-        assert_eq!(values_from_bytes::<f32>(&restored.copy_to_host().unwrap()), vec![1f32]);
+        assert_eq!(restored.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32]);
 
         // Sessions of another client cannot use the buffers.
         let foreign_session = Session::builder().client(other_cpu_client(1)).build().unwrap();

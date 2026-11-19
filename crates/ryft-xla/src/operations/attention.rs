@@ -1000,7 +1000,7 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes};
     use crate::{Array, Session, Tracer, to_mlir_module_for_program};
 
     use super::*;
@@ -1018,7 +1018,7 @@ mod tests {
     /// the exponentials and divisions in the attention bodies.
     fn assert_matches_reference(actual: &Array, expected: &CoreArray) {
         assert_eq!(actual.r#type().shape(), expected.r#type().shape());
-        let actual = values_from_bytes::<f32>(&actual.copy_to_host().unwrap());
+        let actual = actual.copy_to_host().unwrap().elements::<f32>().unwrap();
         let expected = expected.elements::<f32>().unwrap();
         assert_eq!(actual.len(), expected.len());
         for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
@@ -1518,7 +1518,7 @@ mod tests {
                     halves(&[1, 2, 1, 8], values.as_slice()),
                 )
             };
-            let output = function.call(inputs).unwrap().copy_to_host().unwrap();
+            let output = function.call(inputs).unwrap().copy_to_host_bytes().unwrap();
             let output = values_from_bytes::<half::f16>(&output).into_iter().map(half::f16::to_f32).collect::<Vec<_>>();
             assert_eq!(output, vec![1.0; 8], "{implementation}");
         }
@@ -1557,7 +1557,7 @@ mod tests {
                 ))
                 .unwrap();
             assert_eq!(output.r#type().static_shape().unwrap().dimensions(), query_dimensions.as_slice());
-            assert_eq!(values_from_bytes::<f32>(&residual.copy_to_host().unwrap()), expected_residual);
+            assert_eq!(residual.copy_to_host().unwrap().elements::<f32>().unwrap(), expected_residual);
         }
     }
 
@@ -1673,7 +1673,11 @@ mod tests {
             (&gradients.value, &reference_gradients.value, 0.05),
         ] {
             assert_eq!(actual.r#type().shape(), expected.r#type().shape());
-            let actual = values_from_bytes::<u16>(&actual.copy_to_host().unwrap())
+            let actual = actual
+                .copy_to_host()
+                .unwrap()
+                .elements::<u16>()
+                .unwrap()
                 .into_iter()
                 .map(|bits| f64::from(bf16::from_bits(bits).to_f32()))
                 .collect::<Vec<_>>();

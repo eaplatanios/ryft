@@ -422,14 +422,14 @@ mod tests {
         // Boolean maxima are disjunctions.
         let booleans = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let truth = replicated_array(&session, &mesh, DataType::Boolean, &[], &[1]);
-        assert_eq!(booleans.max(&truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[true, true]));
+        assert_eq!(booleans.max(&truth).unwrap().copy_to_host_bytes().unwrap(), values_to_bytes(&[true, true]));
 
         // Floating-point maxima order negative zero below positive zero in both operand orders, keep the sign of
         // equal zeros, and propagate a NaN of either operand with its payload, preferring the left one. Exact byte
         // comparisons check the signs of the zeros and the payloads.
         let (left, right) = real_operands(&session, &mesh);
         assert_eq!(
-            left.max(&right).unwrap().copy_to_host().unwrap(),
+            left.max(&right).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[
                 2f32,
                 3.0,
@@ -455,11 +455,11 @@ mod tests {
         // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
         let (left, right, left_array, right_array) = complex_operands(&session, &mesh);
         assert_eq!(
-            left_array.max(&right_array).unwrap().copy_to_host().unwrap(),
+            left_array.max(&right_array).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[right[0], right[1], right[2], right[3], right[4]]),
         );
         assert_eq!(
-            right_array.max(&left_array).unwrap().copy_to_host().unwrap(),
+            right_array.max(&left_array).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[right[0], right[1], left[2], left[3], left[4]]),
         );
 
@@ -475,7 +475,10 @@ mod tests {
         let output = complex.max(&real).unwrap();
         assert_eq!(output.data_type(), DataType::C128);
         assert_eq!(output.shape().dimensions(), &[2]);
-        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[Complex::new(2f64, 0.0), Complex::new(3.0, 4.0)]));
+        assert_eq!(
+            output.copy_to_host_bytes().unwrap(),
+            values_to_bytes(&[Complex::new(2f64, 0.0), Complex::new(3.0, 4.0)])
+        );
     }
 
     #[test]
@@ -487,13 +490,13 @@ mod tests {
         // Boolean minima are conjunctions.
         let booleans = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let truth = replicated_array(&session, &mesh, DataType::Boolean, &[], &[1]);
-        assert_eq!(booleans.min(&truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[false, true]));
+        assert_eq!(booleans.min(&truth).unwrap().copy_to_host_bytes().unwrap(), values_to_bytes(&[false, true]));
 
         // Floating-point minima order negative zero below positive zero in both operand orders, keep the sign of
         // equal zeros, and propagate a NaN of either operand with its payload, preferring the left one.
         let (left, right) = real_operands(&session, &mesh);
         assert_eq!(
-            left.min(&right).unwrap().copy_to_host().unwrap(),
+            left.min(&right).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[
                 1f32,
                 1.0,
@@ -519,11 +522,11 @@ mod tests {
         // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
         let (left, right, left_array, right_array) = complex_operands(&session, &mesh);
         assert_eq!(
-            left_array.min(&right_array).unwrap().copy_to_host().unwrap(),
+            left_array.min(&right_array).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[left[0], left[1], right[2], right[3], right[4]]),
         );
         assert_eq!(
-            right_array.min(&left_array).unwrap().copy_to_host().unwrap(),
+            right_array.min(&left_array).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[left[0], left[1], left[2], left[3], left[4]]),
         );
 
@@ -539,7 +542,10 @@ mod tests {
         let output = complex.min(&real).unwrap();
         assert_eq!(output.data_type(), DataType::C128);
         assert_eq!(output.shape().dimensions(), &[2]);
-        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[Complex::new(1f64, 2.0), Complex::new(2.0, 0.0)]));
+        assert_eq!(
+            output.copy_to_host_bytes().unwrap(),
+            values_to_bytes(&[Complex::new(1f64, 2.0), Complex::new(2.0, 0.0)])
+        );
     }
 
     #[test]
@@ -602,11 +608,11 @@ mod tests {
         let lower = replicated_array(&session, &mesh, DataType::F32, &[], values_to_bytes(&[-1f32]).as_slice());
         let upper = replicated_array(&session, &mesh, DataType::F32, &[], values_to_bytes(&[1f32]).as_slice());
         assert_eq!(
-            input.clamp(&lower, &upper).unwrap().copy_to_host().unwrap(),
+            input.clamp(&lower, &upper).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[-1f32, 0.5, 1.0, f32::NAN]),
         );
         assert_eq!(
-            input.clamp(&upper, &lower).unwrap().copy_to_host().unwrap(),
+            input.clamp(&upper, &lower).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[-1f32, -1.0, -1.0, f32::NAN]),
         );
 
@@ -614,15 +620,21 @@ mod tests {
         let zeros = replicated_array(&session, &mesh, DataType::F32, &[2], values_to_bytes(&[0.5f32, -0.0]).as_slice());
         let nan = replicated_array(&session, &mesh, DataType::F32, &[], values_to_bytes(&[f32::NAN]).as_slice());
         let zero = replicated_array(&session, &mesh, DataType::F32, &[], values_to_bytes(&[0f32]).as_slice());
-        assert_eq!(zeros.clamp(&nan, &upper).unwrap().copy_to_host().unwrap(), values_to_bytes(&[f32::NAN, f32::NAN]));
-        assert_eq!(zeros.clamp(&lower, &nan).unwrap().copy_to_host().unwrap(), values_to_bytes(&[f32::NAN, f32::NAN]));
-        assert_eq!(zeros.clamp(&zero, &upper).unwrap().copy_to_host().unwrap(), values_to_bytes(&[0.5f32, 0.0]));
+        assert_eq!(
+            zeros.clamp(&nan, &upper).unwrap().copy_to_host_bytes().unwrap(),
+            values_to_bytes(&[f32::NAN, f32::NAN])
+        );
+        assert_eq!(
+            zeros.clamp(&lower, &nan).unwrap().copy_to_host_bytes().unwrap(),
+            values_to_bytes(&[f32::NAN, f32::NAN])
+        );
+        assert_eq!(zeros.clamp(&zero, &upper).unwrap().copy_to_host_bytes().unwrap(), values_to_bytes(&[0.5f32, 0.0]));
 
         // Array bounds broadcast to the result.
         let bounds =
             replicated_array(&session, &mesh, DataType::F32, &[4], values_to_bytes(&[0f32, 1.0, 2.0, 3.0]).as_slice());
         assert_eq!(
-            input.clamp(&lower, &bounds).unwrap().copy_to_host().unwrap(),
+            input.clamp(&lower, &bounds).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[-1f32, 0.5, 2.0, f32::NAN]),
         );
 
@@ -632,14 +644,17 @@ mod tests {
         let integer_lower = replicated_array(&session, &mesh, DataType::I32, &[], values_to_bytes(&[0i32]).as_slice());
         let integer_upper = replicated_array(&session, &mesh, DataType::I32, &[], values_to_bytes(&[5i32]).as_slice());
         assert_eq!(
-            integers.clamp(&integer_lower, &integer_upper).unwrap().copy_to_host().unwrap(),
+            integers.clamp(&integer_lower, &integer_upper).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[0i32, 2, 5]),
         );
 
         // Boolean inputs clamp with conjunction and disjunction.
         let booleans = replicated_array(&session, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let truth = replicated_array(&session, &mesh, DataType::Boolean, &[], &[1]);
-        assert_eq!(booleans.clamp(&truth, &truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[true, true]));
+        assert_eq!(
+            booleans.clamp(&truth, &truth).unwrap().copy_to_host_bytes().unwrap(),
+            values_to_bytes(&[true, true])
+        );
 
         // All three inputs take part in promotion before selection, preserving integers that would round in `f32`.
         let input = replicated_array(&session, &mesh, DataType::I64, &[], values_to_bytes(&[16777217i64]).as_slice());
@@ -647,7 +662,7 @@ mod tests {
         let upper = replicated_array(&session, &mesh, DataType::F64, &[], values_to_bytes(&[2e7f64]).as_slice());
         let output = input.clamp(&lower, &upper).unwrap();
         assert_eq!(output.data_type(), DataType::F64);
-        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[16777217f64]));
+        assert_eq!(output.copy_to_host_bytes().unwrap(), values_to_bytes(&[16777217f64]));
 
         // Complex inputs compose the lexicographic extrema, so the imaginary part decides between equal real parts.
         let complex = replicated_array(
@@ -672,7 +687,7 @@ mod tests {
             values_to_bytes(&[Complex::new(1f32, 2.0)]).as_slice(),
         );
         assert_eq!(
-            complex.clamp(&complex_lower, &complex_upper).unwrap().copy_to_host().unwrap(),
+            complex.clamp(&complex_lower, &complex_upper).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[Complex::new(1f32, 0.0), Complex::new(1.0, 1.0), Complex::new(1.0, 2.0)]),
         );
     }

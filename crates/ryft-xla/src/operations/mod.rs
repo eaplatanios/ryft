@@ -866,7 +866,7 @@ mod tests {
     };
     use crate::operations::jit_call::JitCallOperation;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
     use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, Tracer, Type, to_mlir_module_for_program};
 
     use super::*;
@@ -1833,7 +1833,7 @@ mod tests {
             ("rem", left.rem(&right).unwrap(), reference_left.rem(&reference_right).unwrap()),
         ];
         for (name, output, reference) in cases {
-            let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
+            let values = output.copy_to_host().unwrap().elements::<f32>().unwrap();
             let expected = reference.elements::<f32>().unwrap();
             assert_eq!(values.len(), expected.len(), "`{name}`");
             for (&value, &expected) in values.iter().zip(&expected) {
@@ -1911,12 +1911,12 @@ mod tests {
         // selects, so results are compared with the reference within that bound.
         let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
         for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
-            let sine = values_from_bytes::<f32>(&input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
+            let sine = input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
             assert_eq!(sine.len(), expected_sine.len());
             for (sine, expected) in sine.iter().zip(&expected_sine) {
                 assert!((sine - expected).abs() <= 1e-6, "{accuracy:?}: {sine} vs {expected}");
             }
-            let tanh = values_from_bytes::<f32>(&input.tanh_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
+            let tanh = input.tanh_with_accuracy(accuracy).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
             assert_eq!(tanh.len(), expected_tanh.len());
             for (tanh, expected) in tanh.iter().zip(&expected_tanh) {
                 assert!((tanh - expected).abs() <= 1e-6, "{accuracy:?}: {tanh} vs {expected}");

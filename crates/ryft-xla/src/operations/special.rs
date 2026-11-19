@@ -76,7 +76,7 @@ mod tests {
     use crate::Session;
     use crate::lowering::tests::lowered_unary_module;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
 
     use super::*;
 
@@ -110,7 +110,7 @@ mod tests {
             1.0, 1.2, 1.25, 2.0, 2.9, 3.0, 4.0, 6.5,
         ];
         let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
-        let device_values = values_from_bytes::<f32>(&input.erf().unwrap().copy_to_host().unwrap());
+        let device_values = input.erf().unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
         let reference_values = CoreArray::vector(values.to_vec()).unwrap().erf().unwrap().to_f64s();
         assert_eq!(device_values.len(), reference_values.len());
         for ((input, device_value), reference_value) in
@@ -141,7 +141,7 @@ mod tests {
         // Cover every encoding, including the smallest input whose erf rounds back to itself and NaN.
         let bytes = (0..=255u8).collect::<Vec<_>>();
         let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[256], &bytes);
-        let output = input.erf().unwrap().copy_to_host().unwrap();
+        let output = input.erf().unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(&output[..3], &[0, 1, 2]);
         let reference =
             CoreArray::new(ArrayType::new_static(DataType::F8E8M0FNU, [256]), bytes).unwrap().erf().unwrap();

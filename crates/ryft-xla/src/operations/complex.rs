@@ -238,7 +238,7 @@ mod tests {
         // together with `real` and `complex`.
         let gradient =
             differentiate_at(input).gradient(|z| (z.clone() * z.conjugate().unwrap()).real().unwrap()).unwrap();
-        assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host().unwrap()), [(z + z).conj()]);
+        assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host_bytes().unwrap()), [(z + z).conj()]);
     }
 
     #[test]

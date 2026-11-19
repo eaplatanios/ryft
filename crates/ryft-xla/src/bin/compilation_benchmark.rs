@@ -390,7 +390,7 @@ fn jit_eager_gradient(
         let start = Instant::now();
         let output = function.execute((), input)?;
         samples.push(duration_nanoseconds(start));
-        let gradient = f32::from_ne_bytes(output.copy_to_host()?.as_slice().try_into()?);
+        let gradient = f32::from_ne_bytes(output.copy_to_host_bytes()?.as_slice().try_into()?);
         if smoke {
             assert_eq!(gradient, 2.0 * index as f32, "the gradient of `x * x` must be `2 * x`");
         }

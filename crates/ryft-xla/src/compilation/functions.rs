@@ -4093,7 +4093,7 @@ mod tests {
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
-        let read = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: &Array| array.copy_to_host().unwrap().elements::<f32>().unwrap();
         let assert_close = |actual: Vec<f32>, expected: Vec<f32>| {
             assert_eq!(actual.len(), expected.len());
             assert!(actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-5));
@@ -6685,7 +6685,7 @@ mod tests {
         let output = function.executable().execute(&engine, input).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&replicated));
         assert_eq!(output.sharding(), &sharded);
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![0.0, 1.0, 2.0, 3.0],);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0],);
     }
 
     #[test]

@@ -524,12 +524,12 @@ mod tests {
                 let (reference_advanced_state, reference_bits) =
                     reference_state.rng_bit_generator(algorithm, &output_type).unwrap();
                 assert_eq!(
-                    device_advanced_state.copy_to_host().unwrap(),
+                    device_advanced_state.copy_to_host_bytes().unwrap(),
                     reference_advanced_state.logical_bytes(),
                     "{algorithm} state for {output_type}",
                 );
                 assert_eq!(
-                    device_bits.copy_to_host().unwrap(),
+                    device_bits.copy_to_host_bytes().unwrap(),
                     reference_bits.logical_bytes(),
                     "{algorithm} bits for {output_type}",
                 );
@@ -572,12 +572,12 @@ mod tests {
                         state.rng_bit_generator(algorithm, &output_type).unwrap();
                     let (_, reference_bits) = reference_state.rng_bit_generator(algorithm, &output_type).unwrap();
                     assert_eq!(
-                        values_from_bytes::<u64>(&device_advanced_state.copy_to_host().unwrap()),
+                        device_advanced_state.copy_to_host().unwrap().elements::<u64>().unwrap(),
                         expected_state,
                         "{algorithm} state for {output_type}",
                     );
                     assert_eq!(
-                        device_bits.copy_to_host().unwrap(),
+                        device_bits.copy_to_host_bytes().unwrap(),
                         reference_bits.logical_bytes(),
                         "{algorithm} bits for {output_type}",
                     );
@@ -594,9 +594,9 @@ mod tests {
         let (state, reference_state) = generator_states(&session, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let (device_advanced_state, device_keys) = state.split_rng_key(2).unwrap();
         let (reference_advanced_state, reference_keys) = reference_state.split_rng_key(2).unwrap();
-        assert_eq!(device_advanced_state.copy_to_host().unwrap(), reference_advanced_state.logical_bytes());
+        assert_eq!(device_advanced_state.copy_to_host_bytes().unwrap(), reference_advanced_state.logical_bytes());
         assert_eq!(
-            device_keys.iter().map(|key| key.copy_to_host().unwrap()).collect::<Vec<_>>(),
+            device_keys.iter().map(|key| key.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
             reference_keys.iter().map(CoreArray::logical_bytes).collect::<Vec<_>>(),
         );
     }
@@ -614,9 +614,9 @@ mod tests {
             let (device_advanced_state, device_samples) = state.random_uniform(&sample_type).unwrap();
             let (reference_advanced_state, reference_samples) = reference_state.random_uniform(&sample_type).unwrap();
             assert_eq!(device_samples.data_type(), data_type);
-            assert_eq!(device_samples.copy_to_host().unwrap(), reference_samples.logical_bytes(), "{data_type}");
+            assert_eq!(device_samples.copy_to_host_bytes().unwrap(), reference_samples.logical_bytes(), "{data_type}");
             assert_eq!(
-                device_advanced_state.copy_to_host().unwrap(),
+                device_advanced_state.copy_to_host_bytes().unwrap(),
                 reference_advanced_state.logical_bytes(),
                 "{data_type}",
             );
@@ -639,11 +639,11 @@ mod tests {
             let (reference_advanced_state, reference_samples) = reference_state.random_normal(&sample_type).unwrap();
             assert_eq!(device_samples.data_type(), data_type);
             assert_eq!(
-                device_advanced_state.copy_to_host().unwrap(),
+                device_advanced_state.copy_to_host_bytes().unwrap(),
                 reference_advanced_state.logical_bytes(),
                 "{data_type}",
             );
-            let device_bytes = device_samples.copy_to_host().unwrap();
+            let device_bytes = device_samples.copy_to_host_bytes().unwrap();
             let reference_bytes = reference_samples.logical_bytes();
             let (device_components, reference_components) = if data_type == DataType::C128 {
                 (values_from_bytes::<f64>(&device_bytes), values_from_bytes::<f64>(&reference_bytes))
@@ -680,9 +680,9 @@ mod tests {
         let (device_advanced_state, device_samples) = state.random_categorical(&logits, 0).unwrap();
         let (reference_advanced_state, reference_samples) =
             reference_state.random_categorical(&reference_logits, 0).unwrap();
-        assert_eq!(values_from_bytes::<i32>(&device_samples.copy_to_host().unwrap()), vec![1]);
-        assert_eq!(device_samples.copy_to_host().unwrap(), reference_samples.logical_bytes());
-        assert_eq!(device_advanced_state.copy_to_host().unwrap(), reference_advanced_state.logical_bytes());
+        assert_eq!(device_samples.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![1]);
+        assert_eq!(device_samples.copy_to_host_bytes().unwrap(), reference_samples.logical_bytes());
+        assert_eq!(device_advanced_state.copy_to_host_bytes().unwrap(), reference_advanced_state.logical_bytes());
     }
 
     #[test]
@@ -710,12 +710,12 @@ mod tests {
                     .random_categorical_with_mode(&reference_logits, -1, CategoricalSamplingMode::HighPrecision)
                     .unwrap();
                 assert_eq!(
-                    values_from_bytes::<i32>(&device_samples.copy_to_host().unwrap()),
+                    device_samples.copy_to_host().unwrap().elements::<i32>().unwrap(),
                     vec![1, 2],
                     "{algorithm} {data_type}",
                 );
                 assert_eq!(
-                    device_advanced_state.copy_to_host().unwrap(),
+                    device_advanced_state.copy_to_host_bytes().unwrap(),
                     reference_advanced_state.logical_bytes(),
                     "{algorithm} {data_type}",
                 );
@@ -729,7 +729,7 @@ mod tests {
             [(CategoricalSamplingMode::LowPrecision, 1i32), (CategoricalSamplingMode::HighPrecision, 0)]
         {
             let (_, samples) = state.random_categorical_with_mode(&logits, 0, mode).unwrap();
-            assert_eq!(values_from_bytes::<i32>(&samples.copy_to_host().unwrap()), vec![expected], "{mode:?}");
+            assert_eq!(samples.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![expected], "{mode:?}");
         }
     }
 

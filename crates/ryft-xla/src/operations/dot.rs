@@ -874,8 +874,8 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
                 .unwrap(),
         );
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[1f32, 1.25, 2.5, 2.75]));
-        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+        assert_eq!(product.copy_to_host_bytes().unwrap(), values_to_bytes(&[1f32, 1.25, 2.5, 2.75]));
+        assert_eq!(product.copy_to_host_bytes().unwrap(), reference_product.logical_bytes());
     }
 
     #[test]
@@ -895,8 +895,8 @@ mod tests {
         let product = left.dot_with_accumulation_type(&right, &dimensions, DataType::F16).unwrap();
         let reference_product =
             reference_left.dot_with_accumulation_type(&reference_right, &dimensions, DataType::F16).unwrap();
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[f16::from_f32(1.000_976_6)]));
-        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+        assert_eq!(product.copy_to_host_bytes().unwrap(), values_to_bytes(&[f16::from_f32(1.000_976_6)]));
+        assert_eq!(product.copy_to_host_bytes().unwrap(), reference_product.logical_bytes());
     }
 
     #[test]
@@ -923,8 +923,8 @@ mod tests {
         let product = left.dot_with_accumulation_type(&right, &dimensions, DataType::BF16).unwrap();
         let reference_product =
             reference_left.dot_with_accumulation_type(&reference_right, &dimensions, DataType::BF16).unwrap();
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[bf16::from_f32(5.0)]));
-        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+        assert_eq!(product.copy_to_host_bytes().unwrap(), values_to_bytes(&[bf16::from_f32(5.0)]));
+        assert_eq!(product.copy_to_host_bytes().unwrap(), reference_product.logical_bytes());
     }
 
     #[test]
@@ -1087,8 +1087,8 @@ mod tests {
         let reference_product = reference_left
             .dot_with_precision(&reference_right, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into())
             .unwrap();
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[3.0f64]));
-        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+        assert_eq!(product.copy_to_host_bytes().unwrap(), values_to_bytes(&[3.0f64]));
+        assert_eq!(product.copy_to_host_bytes().unwrap(), reference_product.logical_bytes());
 
         // The same preset also rounds inputs that are stored as `f32`, where the tie `33685504` rounds to `2²⁵` at
         // `bf16`. XLA does that on GPUs for every contraction. Its CPU backend ignores the algorithm of contractions
@@ -1101,12 +1101,12 @@ mod tests {
         let reference_product = reference_stored
             .dot_with_precision(&reference_unit, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into())
             .unwrap();
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[33554432.0f32]));
-        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+        assert_eq!(product.copy_to_host_bytes().unwrap(), values_to_bytes(&[33554432.0f32]));
+        assert_eq!(product.copy_to_host_bytes().unwrap(), reference_product.logical_bytes());
 
         // Per-input precisions are hints that the CPU backend ignores.
         let product = left.dot_with_precision(&right, &dimensions, DotInputPrecision::Highest.into()).unwrap();
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[3.0009765625f64]));
+        assert_eq!(product.copy_to_host_bytes().unwrap(), values_to_bytes(&[3.0009765625f64]));
     }
 
     #[test]
@@ -2068,7 +2068,7 @@ mod tests {
             let reference_output = CoreArray::einsum(subscripts, reference_inputs.iter()).unwrap();
             assert_eq!(output.r#type().shape(), reference_output.r#type().shape(), "{subscripts}");
             assert_eq!(
-                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                output.copy_to_host().unwrap().elements::<f32>().unwrap(),
                 reference_output.elements::<f32>().unwrap(),
                 "{subscripts}",
             );
@@ -2081,7 +2081,7 @@ mod tests {
         let options = EinsumOptions::new().with_output_sharding(output_sharding.clone());
         let output = Einsum::einsum_with_options(&"ij->ji".parse().unwrap(), [&input], &options).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&output_sharding));
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
 
         // The options select the path, the precision, and the accumulation type of the staged contractions.
         let values = [3.0f32, 0.5, 2.0, 4.0].map(bf16::from_f32);
@@ -2096,7 +2096,7 @@ mod tests {
         let reference_output =
             CoreArray::einsum_with_options(&specification, [&reference, &reference, &reference], &options).unwrap();
         assert_eq!(reference_output.r#type().data_type(), DataType::F32);
-        assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes());
+        assert_eq!(output.copy_to_host_bytes().unwrap(), reference_output.logical_bytes());
 
         // Boolean and complex inputs, accumulation types of another kind than the inputs, algorithms over integers,
         // reductions in a path, and the dynamic programming search agree with the reference backend as well. Every
@@ -2153,7 +2153,7 @@ mod tests {
         let output = Einsum::einsum("ij,jk->ik", [&lhs, &rhs]).unwrap();
         let reference_output = CoreArray::einsum("ij,jk->ik", [&integers, &fractions]).unwrap();
         assert_eq!(reference_output.r#type().data_type(), DataType::F32);
-        assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes());
+        assert_eq!(output.copy_to_host_bytes().unwrap(), reference_output.logical_bytes());
 
         // An algorithm contracts its inputs as they are and converts its result to an accumulation type of any kind.
         // The `i16` inputs below are exact at `f32`, while `2049` rounds to `2048` at `f16`, so converting them to
@@ -2176,7 +2176,7 @@ mod tests {
                 .with_accumulation_type(accumulation_type);
             let output = Einsum::einsum_with_options(&specification, [&lhs, &rhs], &options).unwrap();
             assert_eq!(output.r#type().data_type(), accumulation_type);
-            assert_eq!(output.copy_to_host().unwrap(), expected.logical_bytes(), "{accumulation_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), expected.logical_bytes(), "{accumulation_type}");
             assert_eq!(CoreArray::einsum_with_options(&specification, [&wide, &ones], &options), Ok(expected));
         }
 
@@ -2192,9 +2192,9 @@ mod tests {
             .with_accumulation_type(DataType::F32);
         let expected = CoreArray::scalar(33816576.0f32).unwrap();
         let output = Einsum::einsum_with_options(&specification, [&lhs, &rhs], &options).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), expected.logical_bytes());
+        assert_eq!(output.copy_to_host_bytes().unwrap(), expected.logical_bytes());
         let output = Einsum::einsum_with_options(&specification, [&rhs, &lhs], &options).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), expected.logical_bytes());
+        assert_eq!(output.copy_to_host_bytes().unwrap(), expected.logical_bytes());
         assert_eq!(CoreArray::einsum_with_options(&specification, [&wide, &unit], &options), Ok(expected));
 
         for (subscripts, reference, options) in cases {
@@ -2206,7 +2206,11 @@ mod tests {
             let reference_output =
                 CoreArray::einsum_with_options(&specification, vec![reference; count], &options).unwrap();
             assert_eq!(output.r#type().data_type(), reference_output.r#type().data_type(), "{subscripts}");
-            assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes(), "{subscripts} {options:?}");
+            assert_eq!(
+                output.copy_to_host_bytes().unwrap(),
+                reference_output.logical_bytes(),
+                "{subscripts} {options:?}"
+            );
         }
     }
 
@@ -2243,7 +2247,7 @@ mod tests {
         let reference_output = CoreArray::einsum("ij,jk,kl->il", reference_inputs.iter()).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&shardings[2]));
         assert_eq!(
-            values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+            output.copy_to_host().unwrap().elements::<f32>().unwrap(),
             reference_output.elements::<f32>().unwrap(),
         );
     }
@@ -2279,14 +2283,14 @@ mod tests {
         for output in [first, second] {
             assert_eq!(output.r#type().shape(), reference_output.r#type().shape());
             assert_eq!(
-                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                output.copy_to_host().unwrap().elements::<f32>().unwrap(),
                 reference_output.elements::<f32>().unwrap(),
             );
         }
         let inline = Einsum::einsum("ij,jk,kl->il", inputs.iter()).unwrap();
         assert_eq!(dispatches(), (3, 1));
         assert_eq!(
-            values_from_bytes::<f32>(&inline.copy_to_host().unwrap()),
+            inline.copy_to_host().unwrap().elements::<f32>().unwrap(),
             reference_output.elements::<f32>().unwrap(),
         );
 
@@ -2300,7 +2304,7 @@ mod tests {
             .gradient(|left, (middle, right)| Einsum::einsum("ij,jk,kl->", [&left, &middle, &right]))
             .unwrap();
         assert_eq!(
-            values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()),
+            gradient.copy_to_host().unwrap().elements::<f32>().unwrap(),
             reference_gradient.elements::<f32>().unwrap(),
         );
     }

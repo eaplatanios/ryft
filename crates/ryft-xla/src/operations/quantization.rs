@@ -738,7 +738,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
                 .unwrap(),
         );
-        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+        assert_eq!(product.copy_to_host_bytes().unwrap(), reference_product.logical_bytes());
     }
 
     #[test]

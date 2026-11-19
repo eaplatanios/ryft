@@ -324,7 +324,7 @@ mod tests {
     use crate::lowering::tests::test_vector_type;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Array, Constant, Session, to_mlir_module_for_program};
 
     use super::*;
@@ -568,12 +568,12 @@ mod tests {
         );
 
         let (value, derivative) = differentiate_at(input.clone()).jvp(tangent.clone(), |x| function.call(x)).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![0.25f32, 1.0, 2.25]);
-        assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![1f32, 2.0, 3.0]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.25f32, 1.0, 2.25]);
+        assert_eq!(derivative.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 2.0, 3.0]);
 
         let batched: Array =
             batch(|x| function.call(x), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&batched.copy_to_host().unwrap()), vec![0.5f32, 2.0, 4.5]);
+        assert_eq!(batched.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.5f32, 2.0, 4.5]);
 
         let (value, derivative): (Array, Array) = batch(
             |(x, tangent)| Ok(differentiate_at(x).jvp(tangent, |x| function.call(x))?),
@@ -583,8 +583,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![0.5f32, 2.0, 4.5]);
-        assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![2f32, 4.0, 6.0]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.5f32, 2.0, 4.5]);
+        assert_eq!(derivative.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2f32, 4.0, 6.0]);
     }
 
     #[test]
@@ -622,8 +622,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![12f32, 24.0, 36.0]);
-        assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![18f32, 24.0, 39.0]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![12f32, 24.0, 36.0]);
+        assert_eq!(derivative.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![18f32, 24.0, 39.0]);
     }
 
     #[test]
@@ -984,7 +984,7 @@ mod tests {
         let primitive = logits.softmax(-1).unwrap();
         assert_eq!(dispatches(), (14, 9));
         let assert_same = |actual: &Array, expected: &[f32]| {
-            let actual = values_from_bytes::<f32>(&actual.copy_to_host().unwrap());
+            let actual = actual.copy_to_host().unwrap().elements::<f32>().unwrap();
             assert_eq!(actual.len(), expected.len());
             for (actual, expected) in actual.iter().zip(expected) {
                 assert!(
@@ -993,7 +993,7 @@ mod tests {
                 );
             }
         };
-        let probabilities = values_from_bytes::<f32>(&primitive.copy_to_host().unwrap());
+        let probabilities = primitive.copy_to_host().unwrap().elements::<f32>().unwrap();
         assert_same(&first, &probabilities);
         assert_same(&second, &probabilities);
         assert!(probabilities[..9].iter().all(|probability| probability.is_nan()));
@@ -1012,7 +1012,7 @@ mod tests {
             .with_captures(weights)
             .gradient(|logits, weights| logits.softmax(-1)?.mul(&weights)?.reduce_sum(&[0, 1], None))
             .unwrap();
-        assert_same(&gradient, &values_from_bytes::<f32>(&expected.copy_to_host().unwrap()));
+        assert_same(&gradient, &expected.copy_to_host().unwrap().elements::<f32>().unwrap());
     }
 
     #[test]
@@ -1037,7 +1037,7 @@ mod tests {
                 (ComparisonDirection::GreaterThanOrEqual, [true, signed, !signed, true]),
             ] {
                 assert_eq!(
-                    values_from_bytes::<bool>(&left.compare(&right, direction).unwrap().copy_to_host().unwrap()),
+                    left.compare(&right, direction).unwrap().copy_to_host().unwrap().elements::<bool>().unwrap(),
                     expected,
                     "{data_type} {direction:?}",
                 );
@@ -1049,7 +1049,7 @@ mod tests {
         let values = [nan, 0.0, 1.0, infinity, 0.0, 1.0, -infinity, -infinity, -infinity, 0.0, 0.0, 0.0];
         let logits = replicated_array(&session, &mesh, DataType::F32, &[4, 3], &values_to_bytes(&values));
         let function = softmax::<ProjectedContext<Session, ArrayType>>(-1);
-        let probabilities = values_from_bytes::<f32>(&function.call(logits).unwrap().copy_to_host().unwrap());
+        let probabilities = function.call(logits).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
         assert!(probabilities[..9].iter().all(|probability| probability.is_nan()), "{probabilities:?}");
         assert!(
             probabilities[9..].iter().all(|probability| (probability - 1.0 / 3.0).abs() < 1e-7),

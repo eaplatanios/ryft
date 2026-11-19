@@ -624,7 +624,7 @@ impl Session {
                     // The devices of an unreduced array hold separate summands, which a dense round trip would replace.
                     *input = input.relayout_through_host(self, expected)?;
                 } else if needs_conversion {
-                    let bytes = input.copy_to_host()?;
+                    let bytes = input.copy_to_host_bytes()?;
                     *input = Array::from_host_buffer(
                         self,
                         input.r#type().into_owned().with_layout(expected.clone()),
@@ -1338,7 +1338,7 @@ impl Session {
                 physical_output,
             )?
             .with_execution_fence(fence.clone());
-            let bytes = scalar.copy_to_host()?;
+            let bytes = scalar.copy_to_host_bytes()?;
             let extent = bytes
                 .get(..size_of::<i64>())
                 .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
@@ -1756,7 +1756,7 @@ mod tests {
         )
         .unwrap();
         let outputs = session.execute_program(&compiled, vec![input]).unwrap();
-        assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), values);
         let input = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F64, [2, 3])
@@ -1767,7 +1767,7 @@ mod tests {
         )
         .unwrap();
         let outputs = session.execute_program(&compiled, vec![input]).unwrap();
-        assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), values);
     }
 
     #[test]
@@ -1870,7 +1870,7 @@ mod tests {
             };
             assert_eq!(output.mesh(), &mesh);
             assert_eq!(
-                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                output.copy_to_host().unwrap().elements::<f32>().unwrap(),
                 values.iter().map(|value| value * 2.0).collect::<Vec<_>>(),
             );
         }

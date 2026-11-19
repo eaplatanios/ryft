@@ -2603,7 +2603,7 @@ pub(crate) mod tests {
         let nibbles = CoreArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap();
         let nibbles = session.bind(ConstantOperation::new(nibbles), Vec::new(), &[]).unwrap();
         assert_eq!(program_array(&nibbles[0]).data_type(), DataType::I4);
-        assert_eq!(program_array(&nibbles[0]).copy_to_host().unwrap(), vec![0x08, 0x07]);
+        assert_eq!(program_array(&nibbles[0]).copy_to_host_bytes().unwrap(), vec![0x08, 0x07]);
 
         // A literal with a layout is stored in the order of that layout and is uploaded in logical row-major order.
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
@@ -2613,7 +2613,7 @@ pub(crate) mod tests {
         let outputs = session.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap();
         assert_eq!(program_array(&outputs[0]).layout(), Some(&layout));
         assert_eq!(
-            values_from_bytes::<f64>(&program_array(&outputs[0]).copy_to_host().unwrap()),
+            program_array(&outputs[0]).copy_to_host().unwrap().elements::<f64>().unwrap(),
             vec![1., 2., 3., 4., 5., 6.],
         );
 
@@ -3135,7 +3135,7 @@ pub(crate) mod tests {
         let shard_values = output
             .addressable_shards()
             .map(|shard| {
-                let bytes = shard.copy_to_host().unwrap();
+                let bytes = shard.copy_to_host_bytes().unwrap();
                 values_from_bytes::<f32>(bytes.as_slice())
             })
             .collect::<Vec<_>>();
@@ -3165,7 +3165,7 @@ pub(crate) mod tests {
 
         // XLA computes complex magnitudes with a scaled square root that may differ from the exact value in the last
         // bit (e.g., `|5 + 12i|` evaluates to `12.999999`).
-        let magnitudes = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
+        let magnitudes = output.copy_to_host().unwrap().elements::<f32>().unwrap();
         assert_eq!(magnitudes.len(), 4);
         for (actual, expected) in magnitudes.into_iter().zip([5f32, 13.0, 17.0, 25.0]) {
             assert!((actual - expected).abs() <= 1e-5 * expected, "expected {expected} but got {actual}");
@@ -3725,7 +3725,7 @@ pub(crate) mod tests {
         let shard_values = output
             .addressable_shards()
             .map(|shard| {
-                let bytes = shard.copy_to_host().unwrap();
+                let bytes = shard.copy_to_host_bytes().unwrap();
                 values_from_bytes::<f32>(bytes.as_slice())
             })
             .collect::<Vec<_>>();
@@ -4047,8 +4047,8 @@ pub(crate) mod tests {
             .with_captures(capture.clone())
             .value_and_gradient(|input, capture| input.mul(&capture).unwrap().reduce(&[0], ReductionKind::Sum).unwrap())
             .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![60.0]);
-        assert_eq!(values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()), vec![4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![60.0]);
+        assert_eq!(gradient.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![4.0, 5.0, 6.0, 7.0]);
         assert_eq!(gradient.sharding(), &sharding);
         assert!(gradient.session().is_same_session(&session));
 
@@ -4061,7 +4061,7 @@ pub(crate) mod tests {
         let capture_residual = pushforward
             .residuals()
             .iter()
-            .find(|residual| values_from_bytes::<f32>(&residual.copy_to_host().unwrap()) == vec![4.0, 5.0, 6.0, 7.0])
+            .find(|residual| residual.copy_to_host().unwrap().elements::<f32>().unwrap() == vec![4.0, 5.0, 6.0, 7.0])
             .unwrap();
         assert_eq!(capture_residual.sharding(), &sharding);
         assert!(capture_residual.session().is_same_session(&session));
@@ -4085,7 +4085,7 @@ pub(crate) mod tests {
         assert_eq!(basis.data_type(), DataType::F16);
         assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
         assert_eq!(
-            values_from_bytes::<f16>(&basis.copy_to_host().unwrap()),
+            basis.copy_to_host().unwrap().elements::<f16>().unwrap(),
             vec![one, zero, zero, zero, one, zero, zero, zero, one],
         );
 
@@ -4100,7 +4100,7 @@ pub(crate) mod tests {
         assert_eq!(basis.data_type(), DataType::BF16);
         assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
         assert_eq!(
-            values_from_bytes::<bf16>(&basis.copy_to_host().unwrap()),
+            basis.copy_to_host().unwrap().elements::<bf16>().unwrap(),
             vec![one, zero, zero, zero, one, zero, zero, zero, one],
         );
 
@@ -4118,7 +4118,7 @@ pub(crate) mod tests {
             expected[(coordinate + 1) * 6 + coordinate] = 1.0;
         }
         assert_eq!(basis.shape(), StaticShape::new(vec![8, 2, 3]));
-        assert_eq!(values_from_bytes::<f32>(&basis.copy_to_host().unwrap()), expected);
+        assert_eq!(basis.copy_to_host().unwrap().elements::<f32>().unwrap(), expected);
 
         // Complex leaves select typed complex ones and zeros.
         let values = [Complex::new(2f32, 1.0), Complex::new(-1.0, 3.0)];
@@ -4130,7 +4130,7 @@ pub(crate) mod tests {
                 .into_value();
         let (one, zero) = (Complex::new(1f32, 0.0), Complex::new(0f32, 0.0));
         assert_eq!(basis.data_type(), DataType::C64);
-        assert_eq!(values_from_bytes::<Complex<f32>>(&basis.copy_to_host().unwrap()), vec![one, zero, zero, one]);
+        assert_eq!(values_from_bytes::<Complex<f32>>(&basis.copy_to_host_bytes().unwrap()), vec![one, zero, zero, one]);
     }
 
     #[test]
@@ -4154,7 +4154,7 @@ pub(crate) mod tests {
         assert!(block.value().session().is_same_session(&session));
         assert_eq!(block.value().shape(), StaticShape::new(vec![4, 4]));
         assert_eq!(
-            values_from_bytes::<f32>(&block.value().copy_to_host().unwrap()),
+            block.value().copy_to_host().unwrap().elements::<f32>().unwrap(),
             vec![2.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0],
         );
 
@@ -4166,7 +4166,7 @@ pub(crate) mod tests {
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().data_type(), DataType::F16);
         assert_eq!(
-            values_from_bytes::<f16>(&block.value().copy_to_host().unwrap()),
+            block.value().copy_to_host().unwrap().elements::<f16>().unwrap(),
             [2f32, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0]
                 .map(f16::from_f32)
                 .to_vec(),
@@ -4190,7 +4190,7 @@ pub(crate) mod tests {
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(
-            values_from_bytes::<f32>(&block.value().copy_to_host().unwrap()),
+            block.value().copy_to_host().unwrap().elements::<f32>().unwrap(),
             vec![2.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0],
         );
     }
@@ -4207,7 +4207,7 @@ pub(crate) mod tests {
         assert_eq!(block.first_input_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(block.second_input_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(
-            values_from_bytes::<f32>(&block.value().copy_to_host().unwrap()),
+            block.value().copy_to_host().unwrap().elements::<f32>().unwrap(),
             vec![2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0],
         );
     }
@@ -4225,8 +4225,8 @@ pub(crate) mod tests {
             .holomorphic()
             .value_and_gradient(|input| input.mul(&input).unwrap())
             .unwrap();
-        assert_eq!(values_from_bytes::<Complex<f32>>(&value.copy_to_host().unwrap()), vec![z * z]);
-        assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host().unwrap()), vec![z + z]);
+        assert_eq!(values_from_bytes::<Complex<f32>>(&value.copy_to_host_bytes().unwrap()), vec![z * z]);
+        assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host_bytes().unwrap()), vec![z + z]);
 
         let forward =
             differentiate_at(input.clone()).holomorphic().jacobian_forward(|input| input.mul(&input)).unwrap();
@@ -4234,15 +4234,21 @@ pub(crate) mod tests {
             differentiate_at(input.clone()).holomorphic().jacobian_reverse(|input| input.mul(&input)).unwrap();
         let hessian = differentiate_at(input).holomorphic().hessian(|input| input.mul(&input)).unwrap();
         assert_eq!(
-            values_from_bytes::<Complex<f32>>(&forward.iter_blocks().next().unwrap().value().copy_to_host().unwrap()),
+            values_from_bytes::<Complex<f32>>(
+                &forward.iter_blocks().next().unwrap().value().copy_to_host_bytes().unwrap()
+            ),
             vec![z + z],
         );
         assert_eq!(
-            values_from_bytes::<Complex<f32>>(&reverse.iter_blocks().next().unwrap().value().copy_to_host().unwrap()),
+            values_from_bytes::<Complex<f32>>(
+                &reverse.iter_blocks().next().unwrap().value().copy_to_host_bytes().unwrap()
+            ),
             vec![z + z],
         );
         assert_eq!(
-            values_from_bytes::<Complex<f32>>(&hessian.iter_blocks().next().unwrap().value().copy_to_host().unwrap()),
+            values_from_bytes::<Complex<f32>>(
+                &hessian.iter_blocks().next().unwrap().value().copy_to_host_bytes().unwrap()
+            ),
             vec![Complex::new(2.0, 0.0)],
         );
     }
@@ -4811,7 +4817,7 @@ pub(crate) mod tests {
 
         let restored_outputs = restored_session.execute_program(&restored, vec![outputs[0].clone()]).unwrap();
         for (array, expected) in [(&input, 42), (&outputs[0], 43), (&restored_outputs[0], 44)] {
-            assert_eq!(values_from_bytes::<i32>(&array.copy_to_host().unwrap()), vec![expected]);
+            assert_eq!(array.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![expected]);
         }
         drop(outputs);
         drop(restored_outputs);

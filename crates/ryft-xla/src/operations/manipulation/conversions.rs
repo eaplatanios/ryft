@@ -1209,7 +1209,7 @@ mod tests {
         let input =
             replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
         let output = input.convert_element_type(DataType::F8E4M3FN).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), vec![0x30, 0x3a, 0x40, 0x47]);
+        assert_eq!(output.copy_to_host_bytes().unwrap(), vec![0x30, 0x3a, 0x40, 0x47]);
     }
 
     #[test]
@@ -1223,21 +1223,21 @@ mod tests {
         let values = [midpoint - 1, midpoint, midpoint + 1, u64::MAX];
         let input = replicated_array(&session, &mesh, DataType::U64, &[values.len()], &values_to_bytes(&values));
         let output = input.convert_element_type(DataType::BF16).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[0x5d80u16, 0x5d80, 0x5d81, 0x5f80]));
+        assert_eq!(output.copy_to_host_bytes().unwrap(), values_to_bytes(&[0x5d80u16, 0x5d80, 0x5d81, 0x5f80]));
 
         // Rounding direction is measured by magnitude for negative integers, including the signed extrema.
         let midpoint = midpoint as i64;
         let values = [-midpoint - 1, -midpoint, -midpoint + 1, i64::MIN, i64::MAX];
         let input = replicated_array(&session, &mesh, DataType::I64, &[values.len()], &values_to_bytes(&values));
         let output = input.convert_element_type(DataType::BF16).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[0xdd81u16, 0xdd80, 0xdd80, 0xdf00, 0x5f00]));
+        assert_eq!(output.copy_to_host_bytes().unwrap(), values_to_bytes(&[0xdd81u16, 0xdd80, 0xdd80, 0xdf00, 0x5f00]));
 
         // Exponent-only targets round wide integers once as well.
         let midpoint = 3u64 << 60;
         let values = [midpoint - 1, midpoint, midpoint + 1];
         let input = replicated_array(&session, &mesh, DataType::U64, &[values.len()], &values_to_bytes(&values));
         let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), vec![0xbc, 0xbd, 0xbd]);
+        assert_eq!(output.copy_to_host_bytes().unwrap(), vec![0xbc, 0xbd, 0xbd]);
     }
 
     #[test]
@@ -1279,7 +1279,7 @@ mod tests {
             ];
             let input = replicated_array(&session, &mesh, DataType::F64, &[values.len()], &values_to_bytes(&values));
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&expected), "{data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), values_to_bytes(&expected), "{data_type}");
         }
     }
 
@@ -1301,7 +1301,7 @@ mod tests {
             (DataType::F8E8M0FNU, vec![0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x86, 0xff]),
         ] {
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), expected, "{data_type}");
         }
     }
 
@@ -1342,7 +1342,7 @@ mod tests {
             let host_bytes = host_input.convert_element_type(DataType::F8E8M0FNU).unwrap().logical_bytes();
             let device_output = device_input.convert_element_type(DataType::F8E8M0FNU).unwrap();
             assert_eq!(host_bytes, expected, "host conversion from {data_type}");
-            assert_eq!(device_output.copy_to_host().unwrap(), host_bytes, "XLA conversion from {data_type}");
+            assert_eq!(device_output.copy_to_host_bytes().unwrap(), host_bytes, "XLA conversion from {data_type}");
         }
     }
 
@@ -1373,7 +1373,7 @@ mod tests {
             let input = replicated_array(&session, &mesh, data_type, &[64], &encodings);
             let output = input.convert_element_type(DataType::F32).unwrap();
             let expected = magnitudes.into_iter().chain(magnitudes.map(|value| -value)).collect::<Vec<_>>();
-            assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&expected), "{data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), values_to_bytes(&expected), "{data_type}");
         }
     }
 
@@ -1386,7 +1386,7 @@ mod tests {
         let components = [0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
         let input = replicated_array(&session, &mesh, DataType::C64, &[6], &values_to_bytes(&components));
         let output = input.convert_element_type(DataType::Boolean).unwrap();
-        assert_eq!(output.copy_to_host().unwrap(), vec![0, 1, 1, 1, 1, 0]);
+        assert_eq!(output.copy_to_host_bytes().unwrap(), vec![0, 1, 1, 1, 1, 0]);
     }
 
     #[test]
@@ -1401,7 +1401,7 @@ mod tests {
         {
             let input = replicated_array(&session, &mesh, data_type, &[2], &[0, 1]);
             let output = input.convert_element_type(DataType::F32).unwrap();
-            assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), expected, "{data_type}");
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), expected, "{data_type}");
         }
 
         // Real inputs truncate and saturate to the logical one-bit range, unlike Boolean truthiness.
@@ -1413,7 +1413,7 @@ mod tests {
             (DataType::Boolean, vec![0, 1, 1, 1, 1, 1, 1, 1]),
         ] {
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), expected, "{data_type}");
         }
 
         // Integer inputs keep only their lowest bit.
@@ -1421,7 +1421,7 @@ mod tests {
         let input = replicated_array(&session, &mesh, DataType::I32, &[integers.len()], &values_to_bytes(&integers));
         for data_type in [DataType::I1, DataType::U1] {
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(output.copy_to_host().unwrap(), vec![1, 0, 1, 0, 1, 0, 0, 1], "{data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), vec![1, 0, 1, 0, 1, 0, 0, 1], "{data_type}");
         }
 
         // Wider carriers also saturate at their logical limits, including infinities, and NaNs convert to zero.
@@ -1456,7 +1456,7 @@ mod tests {
             (DataType::U4, vec![0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 7, 8, 15, 15, 15, 15, 15, 15, 0, 15, 0]),
         ] {
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), expected, "{data_type}");
         }
     }
 
@@ -1644,7 +1644,7 @@ mod tests {
                 let device_output = device_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
                 let device_output = CoreArray::from_logical_bytes(
                     ArrayType::new_static(data_type, [count]),
-                    &device_output.copy_to_host().unwrap(),
+                    &device_output.copy_to_host_bytes().unwrap(),
                 )
                 .unwrap();
                 let reference_output = reference_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
@@ -3500,7 +3500,7 @@ mod tests {
             // The next executable must consume the actual column-major buffer and return dense logical values.
             let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
             assert_eq!(read_first_shard::<f64>(client, &consumed), values);
-            assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
+            assert_eq!(output.copy_to_host().unwrap().elements::<f64>().unwrap(), values);
             let destination_mesh = domain_mesh(client, "destination", 1);
             let moved = output
                 .to_placement(
@@ -3512,7 +3512,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(moved.layout(), Some(&layout));
-            assert_eq!(values_from_bytes::<f64>(&moved.copy_to_host().unwrap()), values);
+            assert_eq!(moved.copy_to_host().unwrap().elements::<f64>().unwrap(), values);
             // A raw buffer may have a known physical layout even when its logical type leaves that field open.
             let opaque = Array::from_addressable_buffers(
                 &session,
@@ -3577,7 +3577,7 @@ mod tests {
                     outputs[1].addressable_shards().next().unwrap().buffer().unwrap().layout(),
                     Ok(layout.to_pjrt().unwrap())
                 );
-                assert_eq!(values_from_bytes::<f64>(&outputs[1].copy_to_host().unwrap()), values);
+                assert_eq!(outputs[1].copy_to_host().unwrap().elements::<f64>().unwrap(), values);
                 assert_eq!(read_first_shard::<f64>(client, &outputs[2]), values);
                 assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
             }
@@ -3642,7 +3642,7 @@ mod tests {
                 outputs[0].addressable_shards().next().unwrap().buffer().unwrap().layout(),
                 Ok(layout.to_pjrt().unwrap()),
             );
-            assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
+            assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), values);
             assert_eq!(prints.len(), 1);
         }
     }
@@ -3682,7 +3682,7 @@ mod tests {
             assert_eq!(shard.shape().as_slice(), &[2, 3]);
             assert_eq!(shard.buffer().unwrap().layout(), Ok(layout.to_pjrt().unwrap()));
         }
-        assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f64>().unwrap(), values);
     }
 
     #[test]
@@ -4551,16 +4551,16 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, -0.0]));
         let integers = input.bitcast_element_type(DataType::I32).unwrap();
-        assert_eq!(values_from_bytes::<i32>(&integers.copy_to_host().unwrap()), vec![0x3f800000, i32::MIN]);
+        assert_eq!(integers.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![0x3f800000, i32::MIN]);
 
         // A narrower element type appends a trailing axis that splits each element's bits, starting from the least
         // significant ones, and widening removes that axis and restores the original bits.
         let halves = input.bitcast_element_type(DataType::U16).unwrap();
         assert_eq!(halves.shape().dimensions(), &[2, 2]);
-        assert_eq!(values_from_bytes::<u16>(&halves.copy_to_host().unwrap()), vec![0x0000, 0x3f80, 0x0000, 0x8000]);
+        assert_eq!(halves.copy_to_host().unwrap().elements::<u16>().unwrap(), vec![0x0000, 0x3f80, 0x0000, 0x8000]);
         let restored = halves.bitcast_element_type(DataType::F32).unwrap();
         assert_eq!(restored.shape().dimensions(), &[2]);
-        assert_eq!(restored.copy_to_host().unwrap(), values_to_bytes(&[1f32, -0.0]));
+        assert_eq!(restored.copy_to_host_bytes().unwrap(), values_to_bytes(&[1f32, -0.0]));
     }
 
     #[test]
@@ -4573,15 +4573,15 @@ mod tests {
         for data_type in [DataType::I1, DataType::U1] {
             let bits = input.bitcast_element_type(data_type).unwrap();
             assert_eq!(bits.shape().dimensions(), &[8]);
-            assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1, 0, 1, 0, 1, 0, 1], "{data_type}");
+            assert_eq!(bits.copy_to_host_bytes().unwrap(), vec![1, 1, 0, 1, 0, 1, 0, 1], "{data_type}");
             let restored = bits.bitcast_element_type(DataType::U8).unwrap();
-            assert_eq!(restored.copy_to_host().unwrap(), vec![0xab], "{data_type}");
+            assert_eq!(restored.copy_to_host_bytes().unwrap(), vec![0xab], "{data_type}");
         }
         let pair = replicated_array(&session, &mesh, DataType::U2, &[], &[3]);
         let bits = pair.bitcast_element_type(DataType::U1).unwrap();
-        assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1]);
+        assert_eq!(bits.copy_to_host_bytes().unwrap(), vec![1, 1]);
         let restored = bits.bitcast_element_type(DataType::U2).unwrap();
-        assert_eq!(restored.copy_to_host().unwrap(), vec![3]);
+        assert_eq!(restored.copy_to_host_bytes().unwrap(), vec![3]);
     }
 
     #[test]
@@ -4598,7 +4598,7 @@ mod tests {
             // Same-width reinterpretation preserves the complete encoding, including both signed zeros.
             let output = input.bitcast_element_type(other_data_type).unwrap();
             assert_eq!(output.shape().dimensions(), &[64]);
-            assert_eq!(output.copy_to_host().unwrap(), encodings, "{data_type} to {other_data_type}");
+            assert_eq!(output.copy_to_host_bytes().unwrap(), encodings, "{data_type} to {other_data_type}");
 
             // Packing uses six logical bits, not the eight-bit host carrier. Splitting appends exactly six one-bit
             // or three two-bit elements, ordered from the least significant bits, and widening removes that axis.
@@ -4612,10 +4612,10 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(pieces.shape().dimensions(), &[64, piece_count]);
-                assert_eq!(pieces.copy_to_host().unwrap(), expected, "{data_type} to {pieces_type}");
+                assert_eq!(pieces.copy_to_host_bytes().unwrap(), expected, "{data_type} to {pieces_type}");
                 let restored = pieces.bitcast_element_type(data_type).unwrap();
                 assert_eq!(restored.r#type().as_ref(), input.r#type().as_ref());
-                assert_eq!(restored.copy_to_host().unwrap(), encodings, "{data_type} from {pieces_type}");
+                assert_eq!(restored.copy_to_host_bytes().unwrap(), encodings, "{data_type} from {pieces_type}");
             }
         }
     }

@@ -289,7 +289,7 @@ mod tests {
         // or executed eagerly. Its type is replicated, because types record no placement over auto mesh axes, while
         // the compiler chooses its runtime placement over them.
         let expected = vec![1.540_302_3_f32, -1.406_139_4, -0.369_981_4, 1.714_072_5];
-        let read = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: &Array| array.copy_to_host().unwrap().elements::<f32>().unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
             {
                 let input_sharding = input_sharding.clone();
@@ -409,7 +409,7 @@ mod tests {
         let gradient = compiled.executable().execute(&session, input.clone()).unwrap();
         assert_eq!(gradient.r#type(), input.r#type());
         assert_eq!(gradient.sharding(), &input_placement);
-        let gradient = gradient.copy_to_host().unwrap();
+        let gradient = gradient.copy_to_host_bytes().unwrap();
         let expected = [1.0f32, -0.30116868, -2.2347417, -1.4133525, 2.3735664, 5.078284, 2.6366632, -3.8450038];
         for (actual, expected) in values_from_bytes::<f32>(gradient.as_slice()).iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-5, "expected {expected} but got {actual}");

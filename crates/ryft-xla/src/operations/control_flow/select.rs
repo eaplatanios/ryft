@@ -170,7 +170,7 @@ mod tests {
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{ArrayConstant, Session, to_mlir_module_for_program};
 
     use super::*;
@@ -338,11 +338,11 @@ mod tests {
         // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Both branch positions
         // are exercised so that recovering the sign cannot depend on the selected side.
         assert_eq!(
-            values_from_bytes::<i32>(&condition.select(&signed, &wide).unwrap().copy_to_host().unwrap()),
+            condition.select(&signed, &wide).unwrap().copy_to_host().unwrap().elements::<i32>().unwrap(),
             [-1, 3, 0, 5],
         );
         assert_eq!(
-            values_from_bytes::<i32>(&condition.select(&wide, &signed).unwrap().copy_to_host().unwrap()),
+            condition.select(&wide, &signed).unwrap().copy_to_host().unwrap().elements::<i32>().unwrap(),
             [2, -1, 4, 0],
         );
     }

@@ -474,7 +474,7 @@ mod tests {
         array
             .shards()
             .iter()
-            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host().unwrap()))
+            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
             .collect()
     }
 
@@ -553,9 +553,9 @@ mod tests {
         let flag = session.place(true, PlacementOptions::defaults()).unwrap();
         assert_eq!(scalar.r#type().into_owned().with_sharding(None).unwrap(), ArrayType::scalar(DataType::F32));
         assert_eq!(scalar.mesh().devices(), [Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()]);
-        assert_eq!(values_from_bytes::<f32>(&scalar.copy_to_host().unwrap()), vec![2.5]);
+        assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
         assert_eq!(flag.data_type(), DataType::Boolean);
-        assert_eq!(flag.copy_to_host().unwrap(), vec![1u8]);
+        assert_eq!(flag.copy_to_host_bytes().unwrap(), vec![1u8]);
 
         // A destination device places the leaf on that device.
         let placed = session
@@ -570,7 +570,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(placed.mesh().devices(), [device]);
-        assert_eq!(placed.copy_to_host().unwrap(), bf16::from_f32(1.5).to_bits().to_ne_bytes().to_vec());
+        assert_eq!(placed.copy_to_host_bytes().unwrap(), bf16::from_f32(1.5).to_bits().to_ne_bytes().to_vec());
     }
 
     #[test]
@@ -583,7 +583,7 @@ mod tests {
             array.r#type().into_owned().with_sharding(None).unwrap(),
             ArrayType::new_static(DataType::F32, [2, 3]),
         );
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1., 2., 3., 4., 5., 6.]);
+        assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4., 5., 6.]);
     }
 
     #[test]
@@ -760,7 +760,7 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
-        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host().unwrap();
+        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(copied_shard_bytes.as_slice()), vec![0.0, 1.0]);
         assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
     }

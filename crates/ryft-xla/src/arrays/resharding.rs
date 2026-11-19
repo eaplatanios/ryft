@@ -157,7 +157,7 @@ impl Array {
         if !destination_fully_addressable {
             return Err(compiled_error);
         }
-        let host_bytes = match source.copy_to_host() {
+        let host_bytes = match source.copy_to_host_bytes() {
             Ok(bytes) => bytes,
             Err(_) => return Err(compiled_error),
         };
@@ -1469,7 +1469,7 @@ mod tests {
         array
             .shards()
             .iter()
-            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host().unwrap()))
+            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
             .collect()
     }
 
@@ -1566,7 +1566,7 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
-        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host().unwrap();
+        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(copied_shard_bytes.as_slice()), vec![0.0, 1.0]);
         assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
     }
@@ -1653,7 +1653,7 @@ mod tests {
             .unwrap();
         let summands = value.to_placement(&session, ArrayPlacement::mesh(mesh, unreduced.clone()).unwrap()).unwrap();
         assert_eq!(summands.sharding(), &unreduced);
-        assert_eq!(values_from_bytes::<f32>(&summands.copy_to_host().unwrap()), vec![1., 2., 3., 4.]);
+        assert_eq!(summands.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4.]);
     }
 
     #[test]
@@ -2091,7 +2091,7 @@ mod tests {
             shard_values(&output),
             vec![vec![0., 4., 8., 12.], vec![1., 5., 9., 13.], vec![2., 6., 10., 14.], vec![3., 7., 11., 15.]],
         );
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), values);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
     }
 
     #[test]
@@ -2350,7 +2350,7 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
-        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host().unwrap();
+        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(copied_shard_bytes.as_slice()), vec![0.0, 1.0]);
         assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
     }

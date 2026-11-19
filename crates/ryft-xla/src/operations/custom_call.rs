@@ -1533,13 +1533,13 @@ mod tests {
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2, 2])]);
         let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![2.5f32, 3.5, 4.5, 5.5]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5f32, 3.5, 4.5, 5.5]);
 
         // A typed `f64` attribute reaches the handler through the `backend_config` dictionary.
         let operation = operation.with_attribute("increment", 2.5f64);
         let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![4f32, 5.0, 6.0, 7.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![4f32, 5.0, 6.0, 7.0]);
 
         // An aliased ordered I/O call keeps the handler ABI with only arrays while its lowering threads a hidden token.
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
@@ -1549,7 +1549,7 @@ mod tests {
             .with_effect_class(EffectClass::OrderedIo);
         let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![2.5f32, 3.5]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5f32, 3.5]);
     }
 
     #[test]
@@ -1735,19 +1735,19 @@ mod tests {
             .with_input_layouts([Some(column_major)]);
         let outputs = CustomCall::custom_call(&operation, [&row_major_input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]);
         let outputs = CustomCall::custom_call(&operation, [&column_major_input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // Both an omitted declaration and a `None` entry request row-major storage, even for a column-major input.
         let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[6])]);
         let outputs = CustomCall::custom_call(&operation, [&column_major_input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let outputs = CustomCall::custom_call(&operation.with_input_layouts([None]), [&column_major_input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // Aliasing applies to the converted row-major buffer. The handler also permits input and output overlap.
         let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[2, 3])])
@@ -1755,7 +1755,7 @@ mod tests {
             .unwrap();
         let outputs = CustomCall::custom_call(&operation, [&column_major_input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]
@@ -1812,7 +1812,7 @@ mod tests {
         let [Value::Array(output)] = outputs.as_slice() else {
             panic!("expected one array output but got {} outputs", outputs.len());
         };
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![0f32, 1.0, 2.0, 3.0]);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0f32, 1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1845,7 +1845,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![2.5f32, 3.5, 4.5, 5.5, 6.5, 7.5]);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5f32, 3.5, 4.5, 5.5, 6.5, 7.5]);
 
         // `CustomCallBatching::Sequential` stages a `scan` that applies the kernel once per batch item. The eager
         // batching parent is a `ProjectedContext`, which lifts that `scan` and its body region into the array IR
@@ -1865,7 +1865,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                output.copy_to_host().unwrap().elements::<f32>().unwrap(),
                 vec![2.5f32, 3.5, 4.5, 5.5, 6.5, 7.5],
             );
         }
@@ -2013,8 +2013,8 @@ mod tests {
         let (value, gradient) = differentiate_at(input)
             .value_and_gradient(|x| function.call(vec![x]).unwrap().remove(0).reduce(&[0], ReductionKind::Sum).unwrap())
             .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![6f32]);
-        assert_eq!(values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()), vec![1f32, 1.0]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![6f32]);
+        assert_eq!(gradient.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32, 1.0]);
     }
 
     #[test]

@@ -931,7 +931,7 @@ pub(crate) mod tests {
         let outputs = outputs
             .iter()
             .map(|output| {
-                let bytes = output.copy_to_host().unwrap();
+                let bytes = output.copy_to_host_bytes().unwrap();
                 ArrayIrValue::Array(CoreArray::from_logical_bytes(output.r#type().into_owned(), &bytes).unwrap())
             })
             .collect::<Vec<_>>();
@@ -1019,7 +1019,7 @@ pub(crate) mod tests {
         let cotangents = execute(&xla.pullback().unwrap().into_program(), pullback_inputs)
             .iter()
             .map(|cotangent| {
-                let bytes = cotangent.copy_to_host().unwrap();
+                let bytes = cotangent.copy_to_host_bytes().unwrap();
                 ArrayIrValue::Array(CoreArray::from_logical_bytes(cotangent.r#type().into_owned(), &bytes).unwrap())
             })
             .collect::<Vec<_>>();
@@ -3378,7 +3378,7 @@ pub(crate) mod tests {
             .unwrap();
         let destination = destination.read().unwrap();
         assert_eq!(read_sharded_f32_array(&destination), vec![10.0, 14.0, 0.0, 0.0]);
-        assert_eq!(values_from_bytes::<f32>(&destination.copy_to_host().unwrap()), vec![10.0, 14.0],);
+        assert_eq!(destination.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![10.0, 14.0],);
     }
 
     #[test]
@@ -5433,7 +5433,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(squares.r#type().sharding(), Some(&unreduced));
         assert_eq!(read_device_f32s(&squares), vec![vec![1.0], vec![4.0]]);
-        let materialized = squares.copy_to_host().unwrap();
+        let materialized = squares.copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![5.0]);
     }
 
@@ -5645,8 +5645,8 @@ pub(crate) mod tests {
         let input = Array::from_host_buffer(&session, input_type.clone(), device_mesh(&mesh), None, 0f32.to_ne_bytes())
             .unwrap();
         let (first, second) = compiled.executable().execute(&session, input).unwrap();
-        assert_eq!(values_from_bytes::<u64>(&first.copy_to_host().unwrap()), vec![0, 1]);
-        assert_eq!(values_from_bytes::<u64>(&second.copy_to_host().unwrap()), vec![0, 1]);
+        assert_eq!(first.copy_to_host().unwrap().elements::<u64>().unwrap(), vec![0, 1]);
+        assert_eq!(second.copy_to_host().unwrap().elements::<u64>().unwrap(), vec![0, 1]);
 
         // A map over the reordered mesh is rejected instead of computing coordinates that do not match the device ids.
         assert!(matches!(
@@ -5718,7 +5718,7 @@ pub(crate) mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&session, input_type, device_mesh(), None, 0f32.to_ne_bytes()).unwrap();
         let (unplaced, replicated) = compiled.executable().execute(&session, input).unwrap();
-        assert_eq!(values_from_bytes::<u64>(&unplaced.copy_to_host().unwrap()), vec![0, 1]);
-        assert_eq!(values_from_bytes::<u64>(&replicated.copy_to_host().unwrap()), vec![0, 1]);
+        assert_eq!(unplaced.copy_to_host().unwrap().elements::<u64>().unwrap(), vec![0, 1]);
+        assert_eq!(replicated.copy_to_host().unwrap().elements::<u64>().unwrap(), vec![0, 1]);
     }
 }

@@ -3,7 +3,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, DataType, DeviceMesh, Layout, Memory, ProgramError, Sharding, StaticShape, Typed, UnreducedKind,
+    Array as CoreArray, ArrayType, DataType, DeviceMesh, Layout, Memory, ProgramError, Sharding, StaticShape, Typed,
+    UnreducedKind,
 };
 use ryft_pjrt::{
     Device as PjrtDevice, DeviceId, ExecutionFence, HostBuffer, HostDestination, HostDestinationSlice,
@@ -455,6 +456,25 @@ impl Array {
         Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)
     }
 
+    /// Copies the value of this [`Array`] to the host and returns it as a host array of the reference backend (i.e.,
+    /// a [`ryft_core::Array`]) with the data type and shape of this array. The type of the result has no sharding and
+    /// no physical layout, because the host value is one dense row-major array. Read its elements with
+    /// [`ryft_core::Array::elements`], which checks the requested element type against the data type of the array.
+    /// This corresponds to converting a `jax.Array` to a NumPy array.
+    ///
+    /// This function reads the value as [`Self::copy_to_host_bytes`] does, with the same synchronization, shard
+    /// selection, and combination of unreduced values, and it then validates the bytes as the storage of the host
+    /// array, which visits every element once. Use [`Self::copy_to_host_bytes`] to skip that validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::copy_to_host_bytes`], and an [`Error::Core`] if the bytes that the devices
+    /// returned are not a valid encoding of the data type of this array.
+    pub fn copy_to_host(&self) -> Result<CoreArray, Error> {
+        let bytes = self.copy_to_host_bytes()?;
+        Ok(CoreArray::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?)
+    }
+
     /// Copies the value of this [`Array`] to the host and returns its dense row-major bytes, irrespective of the
     /// physical [`Layout`] of its shard buffers. This is an explicit synchronization boundary. It blocks the current
     /// thread until the copies and the whole execution that produced this array complete, so it also surfaces the
@@ -464,7 +484,7 @@ impl Array {
     /// When the [`Sharding`] of this array has unreduced axes, along which the devices hold separate values of each
     /// tile (e.g., summands), every shard is copied and those values are combined with the [`UnreducedKind`] of the
     /// sharding. Arrays with no elements and [`DataType::Zero`] arrays produce no bytes and issue no copies. Use
-    /// [`ArrayShard::copy_to_host`] to read the bytes that a single device holds instead.
+    /// [`ArrayShard::copy_to_host_bytes`] to read the bytes that a single device holds instead.
     ///
     /// # Errors
     ///
@@ -472,7 +492,7 @@ impl Array {
     /// the case when a shard lives in another process and either the addressable shards do not cover the array or its
     /// sharding has unreduced axes. PJRT transfer failures and the errors of the producing execution are returned
     /// unchanged.
-    pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
+    pub fn copy_to_host_bytes(&self) -> Result<Vec<u8>, Error> {
         self.begin_copy_to_host()?.finish()
     }
 
@@ -999,7 +1019,7 @@ mod tests {
         assert_eq!(array.r#type().into_owned(), replicated_vector_type(&default_mesh, 2));
         assert_eq!(array.mesh(), &default_mesh);
         assert!(array.session().is_same_session(&session));
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+        assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0]);
 
         // Without a configured mesh, the type's sharding supplies the logical mesh.
         let inferred_mesh = domain_mesh(client, "y", 1);
@@ -1007,7 +1027,7 @@ mod tests {
         let array = Array::from_host_buffer(&session, sharded_type.clone(), None, None, bytes.as_slice()).unwrap();
         assert_eq!(array.r#type().into_owned(), sharded_type);
         assert_eq!(array.mesh(), &inferred_mesh);
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+        assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0]);
 
         // An explicit mesh takes precedence over the session's configured mesh.
         let configured_mesh = domain_mesh(client, "z", 1);
@@ -1015,7 +1035,7 @@ mod tests {
         let array = Array::from_host_buffer(&configured_session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
         assert_eq!(array.r#type().into_owned(), replicated_vector_type(&configured_mesh, 2));
         assert_eq!(array.mesh(), &configured_mesh);
-        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1.0, 2.0]);
+        assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0]);
         let array =
             Array::from_host_buffer(&configured_session, r#type.clone(), default_mesh.clone(), None, bytes.as_slice())
                 .unwrap();
@@ -1057,7 +1077,7 @@ mod tests {
             array.addressable_shards().next().unwrap().buffer().unwrap().layout(),
             Ok(layout.to_pjrt().unwrap())
         );
-        assert_eq!(values_from_bytes::<f64>(&array.copy_to_host().unwrap()), vec![1., 2., 3., 4., 5., 6.]);
+        assert_eq!(array.copy_to_host().unwrap().elements::<f64>().unwrap(), vec![1., 2., 3., 4., 5., 6.]);
         let wrong_buffer = client
             .buffer(
                 values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]).as_slice(),
@@ -1147,7 +1167,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let materialize = |array: &Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let materialize = |array: &Array| array.copy_to_host().unwrap().elements::<f32>().unwrap();
 
         let uploaded =
             Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
@@ -1224,7 +1244,7 @@ mod tests {
         let shard = array.addressable_shards().next().unwrap();
         assert!(shard.buffer().is_none());
         assert_eq!(array, array.clone());
-        assert_eq!(array.copy_to_host().unwrap(), Vec::<u8>::new());
+        assert_eq!(array.copy_to_host_bytes().unwrap(), Vec::<u8>::new());
 
         let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(0)]));
         let zero_sized = Array::from_host_buffer(&session, zero_sized_type, array.mesh().clone(), None, []).unwrap();
@@ -1277,7 +1297,7 @@ mod tests {
             array
                 .shards()
                 .iter()
-                .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host().unwrap()))
+                .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
                 .collect::<Vec<_>>(),
             vec![vec![0.0, 1.0, 2.0], vec![3.0, 4.0]],
         );
@@ -1345,7 +1365,7 @@ mod tests {
             array
                 .shards()
                 .iter()
-                .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host().unwrap()))
+                .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
                 .collect::<Vec<_>>(),
             vec![
                 vec![0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 12.0, 13.0, 14.0, 18.0, 19.0, 20.0],
@@ -1388,8 +1408,8 @@ mod tests {
         array.block_until_ready().unwrap();
         assert_eq!(array.shape(), StaticShape::new(vec![5]));
         assert_eq!(array.addressable_shards().count(), 2);
-        assert_eq!(array.shards()[0].copy_to_host().unwrap(), first_bytes);
-        assert_eq!(array.shards()[1].copy_to_host().unwrap(), second_bytes);
+        assert_eq!(array.shards()[0].copy_to_host_bytes().unwrap(), first_bytes);
+        assert_eq!(array.shards()[1].copy_to_host_bytes().unwrap(), second_bytes);
         assert!(!array.shards()[2].is_addressable());
 
         let missing =
@@ -1464,7 +1484,7 @@ mod tests {
         array.block_until_ready().unwrap();
         assert_eq!(array.sharding(), &sharding);
         assert_eq!(array.r#type().sharding(), Some(&sharding.without_auto_axes()));
-        assert_eq!(array.copy_to_host().unwrap(), vec![1, 2, 3]);
+        assert_eq!(array.copy_to_host_bytes().unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -1484,13 +1504,13 @@ mod tests {
         for sharding in [sharded.clone(), replicated.clone()] {
             let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
             let array = Array::from_host_buffer(&session, r#type, mesh.clone(), None, values.as_slice()).unwrap();
-            assert_eq!(array.copy_to_host().unwrap(), values);
+            assert_eq!(array.copy_to_host_bytes().unwrap(), values);
         }
 
         // An array with no elements produces no bytes.
         let r#type = ArrayType::new_static(DataType::F32, [0]).with_sharding(sharded.clone()).unwrap();
         let empty = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
-        assert_eq!(empty.copy_to_host().unwrap(), Vec::<u8>::new());
+        assert_eq!(empty.copy_to_host_bytes().unwrap(), Vec::<u8>::new());
 
         // When the second mesh device lives in another process, the current process holds a replicated value in full,
         // but only half of a sharded value and only one of the summands of an unreduced value.
@@ -1505,9 +1525,9 @@ mod tests {
                 client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, client_devices[0].clone(), None);
             Array::from_addressable_buffers(&session, r#type, remote_mesh.clone(), None, vec![buffer.unwrap()]).unwrap()
         };
-        assert_eq!(with_remote_shard(replicated, &[1., 2., 3., 4.]).copy_to_host().unwrap(), values);
+        assert_eq!(with_remote_shard(replicated, &[1., 2., 3., 4.]).copy_to_host_bytes().unwrap(), values);
         for (sharding, local_values) in [(sharded, [1f32, 2.].as_slice()), (unreduced, [1f32, 2., 3., 4.].as_slice())] {
-            let error = with_remote_shard(sharding, local_values).copy_to_host().unwrap_err();
+            let error = with_remote_shard(sharding, local_values).copy_to_host_bytes().unwrap_err();
             assert!(matches!(
                 &error,
                 Error::Array(error) if matches!(error.as_ref(),

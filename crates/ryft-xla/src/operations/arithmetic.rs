@@ -713,8 +713,8 @@ mod tests {
         let primal = replicated_array(&session, &mesh, DataType::F32, &[], &values_to_bytes(&[0f32]));
         let tangent = replicated_array(&session, &mesh, DataType::F32, &[], &values_to_bytes(&[3f32]));
         let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
-        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [3f32]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), [0f32]);
+        assert_eq!(tangent.copy_to_host().unwrap().elements::<f32>().unwrap(), [3f32]);
 
         // The complex rule yields a zero tangent at the origin.
         let primal =
@@ -722,8 +722,8 @@ mod tests {
         let tangent =
             replicated_array(&session, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(1f32, 2.0)]));
         let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
-        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [0f32]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), [0f32]);
+        assert_eq!(tangent.copy_to_host().unwrap().elements::<f32>().unwrap(), [0f32]);
     }
 
     #[test]
@@ -759,11 +759,11 @@ mod tests {
         let two = replicated_array(&session, &mesh, DataType::I8, &[], &[2]);
 
         // Implicit promotion interprets a signed set bit as -1 before doing wider arithmetic.
-        assert_eq!(values_from_bytes::<i8>(&signed.add(&two).unwrap().copy_to_host().unwrap()), [1, 2]);
-        assert_eq!(values_from_bytes::<i8>(&signed.sub(&two).unwrap().copy_to_host().unwrap()), [-3, -2]);
-        assert_eq!(values_from_bytes::<i8>(&signed.mul(&two).unwrap().copy_to_host().unwrap()), [-2, 0]);
-        assert_eq!(values_from_bytes::<i8>(&signed.div(&two).unwrap().copy_to_host().unwrap()), [0, 0]);
-        assert_eq!(values_from_bytes::<i8>(&signed.rem(&two).unwrap().copy_to_host().unwrap()), [-1, 0]);
+        assert_eq!(signed.add(&two).unwrap().copy_to_host().unwrap().elements::<i8>().unwrap(), [1, 2]);
+        assert_eq!(signed.sub(&two).unwrap().copy_to_host().unwrap().elements::<i8>().unwrap(), [-3, -2]);
+        assert_eq!(signed.mul(&two).unwrap().copy_to_host().unwrap().elements::<i8>().unwrap(), [-2, 0]);
+        assert_eq!(signed.div(&two).unwrap().copy_to_host().unwrap().elements::<i8>().unwrap(), [0, 0]);
+        assert_eq!(signed.rem(&two).unwrap().copy_to_host().unwrap().elements::<i8>().unwrap(), [-1, 0]);
     }
 
     #[test]
@@ -808,19 +808,19 @@ mod tests {
             let right = replicated_array(&session, &mesh, data_type, &[4], &[0, 1, 0, 1]);
             let one = replicated_array(&session, &mesh, data_type, &[], &[1]);
             let zero = replicated_array(&session, &mesh, data_type, &[], &[0]);
-            assert_eq!(left.add(&right).unwrap().copy_to_host().unwrap(), [0, 1, 1, 0], "{data_type}");
-            assert_eq!(left.sub(&right).unwrap().copy_to_host().unwrap(), [0, 1, 1, 0], "{data_type}");
-            assert_eq!(left.mul(&right).unwrap().copy_to_host().unwrap(), [0, 0, 0, 1], "{data_type}");
-            assert_eq!(left.neg().unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
+            assert_eq!(left.add(&right).unwrap().copy_to_host_bytes().unwrap(), [0, 1, 1, 0], "{data_type}");
+            assert_eq!(left.sub(&right).unwrap().copy_to_host_bytes().unwrap(), [0, 1, 1, 0], "{data_type}");
+            assert_eq!(left.mul(&right).unwrap().copy_to_host_bytes().unwrap(), [0, 0, 0, 1], "{data_type}");
+            assert_eq!(left.neg().unwrap().copy_to_host_bytes().unwrap(), [0, 0, 1, 1], "{data_type}");
             if data_type == DataType::I1 {
-                assert_eq!(left.sign().unwrap().copy_to_host().unwrap(), [0, 0, 1, 1]);
+                assert_eq!(left.sign().unwrap().copy_to_host_bytes().unwrap(), [0, 0, 1, 1]);
             }
-            assert_eq!(left.div(&one).unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
-            assert_eq!(left.rem(&one).unwrap().copy_to_host().unwrap(), [0, 0, 0, 0], "{data_type}");
+            assert_eq!(left.div(&one).unwrap().copy_to_host_bytes().unwrap(), [0, 0, 1, 1], "{data_type}");
+            assert_eq!(left.rem(&one).unwrap().copy_to_host_bytes().unwrap(), [0, 0, 0, 0], "{data_type}");
             // Division by zero produces a backend-defined value. The CPU sentinel narrows to the single set bit.
             if cpu {
-                assert_eq!(left.div(&zero).unwrap().copy_to_host().unwrap(), [1, 1, 1, 1], "{data_type}");
-                assert_eq!(left.rem(&zero).unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
+                assert_eq!(left.div(&zero).unwrap().copy_to_host_bytes().unwrap(), [1, 1, 1, 1], "{data_type}");
+                assert_eq!(left.rem(&zero).unwrap().copy_to_host_bytes().unwrap(), [0, 0, 1, 1], "{data_type}");
             }
         }
     }

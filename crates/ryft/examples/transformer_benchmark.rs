@@ -795,7 +795,7 @@ mod benchmark {
 
     /// Copies the `f32` scalar `sum` to the host.
     fn read_scalar<R: Recorder<Array>>(sum: &Array, recorder: &R) -> BenchmarkResult<f32> {
-        let bytes = recorder.record_host(Category::HostReadback, || sum.copy_to_host())?;
+        let bytes = recorder.record_host(Category::HostReadback, || sum.copy_to_host_bytes())?;
         let bytes: [u8; 4] = bytes.as_slice().try_into().map_err(|_| "the logit sum is not a single `f32`")?;
         Ok(f32::from_ne_bytes(bytes))
     }

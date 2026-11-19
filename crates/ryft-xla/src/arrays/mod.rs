@@ -15,7 +15,7 @@
 //! [`Array::from_host_buffer`] uploads a dense host value, [`Array::from_host_shards`] uploads the host shards
 //! owned by this process, and [`Array::from_addressable_buffers`] wraps existing PJRT [`Buffer`]s. These
 //! constructors support placement over auto mesh axes when the caller supplies runtime sharding.
-//! [`Array::copy_to_host`] and [`ArrayShard::copy_to_host`] read values back to the host. The `host` module implements
+//! [`Array::copy_to_host`] and [`ArrayShard::copy_to_host_bytes`] read values back to the host. The `host` module implements
 //! the uploads and the readback of whole arrays, including the combination of the separate values that devices hold
 //! along unreduced mesh axes.
 //! [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host values to other
@@ -996,8 +996,9 @@ impl Concretizable<bool> for Array {
         // a single Boolean, and arrays whose value the current process does not hold error because it cannot read
         // their payload.
         if self.r#type().rank() == 0 && self.data_type().is_boolean() {
-            let bytes =
-                self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+            let bytes = self
+                .copy_to_host_bytes()
+                .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
             return Ok(bytes.iter().any(|byte| *byte != 0));
         }
         Err(ProgramError::Concretization {
@@ -1011,8 +1012,11 @@ impl Concretizable<bool> for Array {
 
 impl Concretizable<i128> for Array {
     fn concretize(&self) -> Result<i128, ProgramError> {
-        // Decode through the CPU capability to preserve every signed and unsigned integer value.
-        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        // Decode through the CPU capability to preserve every signed and unsigned integer value. The host array keeps
+        // the full type of this array, including its sharding, so that errors name the type that the caller sees.
+        let bytes = self
+            .copy_to_host_bytes()
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
         ryft_core::Array::new(self.r#type().into_owned(), bytes)?.concretize()
     }
 }
@@ -1042,8 +1046,9 @@ impl WhilePredicate for Array {
         // decides. For the kind `min`, all of its candidates have to be true, so the logical value comes from the host
         // copy, which combines them.
         if !self.sharding().unreduced_axes().is_empty() && self.sharding().unreduced_kind() == UnreducedKind::Min {
-            let bytes =
-                self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+            let bytes = self
+                .copy_to_host_bytes()
+                .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
             return Ok(bytes.iter().any(|byte| *byte != 0));
         }
 
@@ -1057,7 +1062,7 @@ impl WhilePredicate for Array {
             addressable_count += 1;
             if !any {
                 let bytes = shard
-                    .copy_to_host_internal(Some(self.session()))
+                    .copy_to_host_bytes()
                     .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
                 any = bytes.iter().any(|byte| *byte != 0);
             }
@@ -1104,13 +1109,16 @@ impl WhilePredicate for Array {
 
 impl AssertionValue for Array {
     fn assertion_observation(&self) -> Result<String, ProgramError> {
-        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        // The host array keeps the full type of this array, including its sharding, so that errors name the type that
+        // the caller sees.
+        let bytes = self
+            .copy_to_host_bytes()
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
         ryft_core::Array::new(self.r#type().into_owned(), bytes)?.assertion_observation()
     }
 
     fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
-        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
-        Ok(Some(ryft_core::Array::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?))
+        Ok(Some(self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?))
     }
 }
 
@@ -1142,7 +1150,9 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
         let operation = DimensionFromScalarOperation::new(output.into());
         let mut output_types = operation.infer_output_types(&[Type::Array(self.r#type().into_owned())], &[])?;
         let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
-        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        let bytes = self
+            .copy_to_host_bytes()
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
         let invalid_extent = |value: String| ProgramError::InvalidArgument {
             message: format!(
                 "`{}` scalar input must be a nonnegative host-representable extent but is {value}",
@@ -1504,7 +1514,7 @@ mod tests {
             assert_eq!(array.shards().len(), devices.len());
             assert!(array.shards().iter().all(|shard| shard.shape() == shape));
             assert_eq!(
-                array.addressable_shards().map(|shard| shard.copy_to_host().unwrap()).collect::<Vec<_>>(),
+                array.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
                 vec![bytes; buffer_count],
             );
         }
@@ -1828,7 +1838,7 @@ mod tests {
         assert!(Arc::ptr_eq(&output.parts.r#type, &other_output.parts.r#type));
         assert!(Arc::ptr_eq(&output.parts.mesh, &other_output.parts.mesh));
         output.block_until_ready().unwrap();
-        let shard_bytes = output.device_shard(device_ids[3]).unwrap().copy_to_host().unwrap();
+        let shard_bytes = output.device_shard(device_ids[3]).unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), vec![30.0, 31.0, 32.0, 33.0]);
 
         // Zero-space outputs need no returned carriers.
@@ -1955,7 +1965,7 @@ mod tests {
 
         // Receiver-based operations on the reassociated array compile and execute in the other session.
         let negated = Neg::neg(&reassociated).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&negated.copy_to_host().unwrap()), vec![-1f32]);
+        assert_eq!(negated.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![-1f32]);
         assert_eq!(other_session.cached_program_count(), 1);
         assert_eq!(session.cached_program_count(), 0);
 
@@ -2292,7 +2302,7 @@ mod tests {
         // The predicate, whose shape is a prefix of the operand shape, broadcasts along its leading axes. Item 0 keeps
         // the first row of `on_false` and item 1 takes the second row of `on_true`.
         let selected = WhilePredicate::select(&mixed, &on_true, &on_false).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&selected.copy_to_host().unwrap()), vec![5f32, 6., 3., 4.]);
+        assert_eq!(selected.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![5f32, 6., 3., 4.]);
 
         // Non-Boolean predicates are rejected.
         assert_eq!(
@@ -2419,7 +2429,7 @@ mod tests {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let read = |array: Array| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let read = |array: Array| array.copy_to_host().unwrap().elements::<f32>().unwrap();
         let a = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
         let b = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[3f32, 5.]));
         assert_eq!(read(a.clone() + b.clone()), vec![4f32, 7.]);
@@ -2430,10 +2440,10 @@ mod tests {
 
         let truths = replicated_array(&session, &mesh, DataType::Boolean, &[4], &[1, 1, 0, 0]);
         let mixed = replicated_array(&session, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
-        assert_eq!((truths.clone() & mixed.clone()).copy_to_host().unwrap(), vec![1u8, 0, 0, 0]);
-        assert_eq!((truths.clone() | mixed.clone()).copy_to_host().unwrap(), vec![1u8, 1, 1, 0]);
-        assert_eq!((truths ^ mixed.clone()).copy_to_host().unwrap(), vec![0u8, 1, 1, 0]);
-        assert_eq!((!mixed).copy_to_host().unwrap(), vec![0u8, 1, 0, 1]);
+        assert_eq!((truths.clone() & mixed.clone()).copy_to_host_bytes().unwrap(), vec![1u8, 0, 0, 0]);
+        assert_eq!((truths.clone() | mixed.clone()).copy_to_host_bytes().unwrap(), vec![1u8, 1, 1, 0]);
+        assert_eq!((truths ^ mixed.clone()).copy_to_host_bytes().unwrap(), vec![0u8, 1, 1, 0]);
+        assert_eq!((!mixed).copy_to_host_bytes().unwrap(), vec![0u8, 1, 0, 1]);
     }
 
     #[test]

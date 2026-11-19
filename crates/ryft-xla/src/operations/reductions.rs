@@ -977,7 +977,7 @@ mod tests {
         let vector = |values: &[Complex<f64>]| {
             replicated_array(&session, &mesh, DataType::C128, &[values.len()], values_to_bytes(values).as_slice())
         };
-        let read = |array: Array| values_from_bytes::<Complex<f64>>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<Complex<f64>>(&array.copy_to_host_bytes().unwrap());
 
         let infinite_values = [Complex::new(f64::INFINITY, 1.0), Complex::new(1.0, 1.0)];
         assert_eq!(
@@ -1002,11 +1002,11 @@ mod tests {
         // Comparing bytes distinguishes the signs of the zero components.
         let negative_zero = [Complex::new(-0f64, -0.0)];
         assert_eq!(
-            vector(&negative_zero).reduce_product(&[0]).unwrap().copy_to_host().unwrap(),
+            vector(&negative_zero).reduce_product(&[0]).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&negative_zero),
         );
         assert_eq!(
-            vector(&negative_zero).cumulative_product(0).unwrap().copy_to_host().unwrap(),
+            vector(&negative_zero).cumulative_product(0).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&negative_zero),
         );
     }
@@ -1057,7 +1057,7 @@ mod tests {
         let input =
             replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
         let read =
-            |kind: ReductionKind| values_from_bytes::<f32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap());
+            |kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
         assert_eq!(read(ReductionKind::Sum), vec![7.5]);
         assert_eq!(read(ReductionKind::Mean), vec![1.875]);
         assert_eq!(read(ReductionKind::Max), vec![3.75]);
@@ -1066,7 +1066,7 @@ mod tests {
         // Integer `Mean` divides with truncation.
         let input = replicated_array(&session, &mesh, DataType::I32, &[4], &values_to_bytes(&[5i32, -2, 7, 0]));
         let read =
-            |kind: ReductionKind| values_from_bytes::<i32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap());
+            |kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap().elements::<i32>().unwrap();
         assert_eq!(read(ReductionKind::Sum), vec![10]);
         assert_eq!(read(ReductionKind::Mean), vec![2]);
         assert_eq!(read(ReductionKind::Max), vec![7]);
@@ -1344,46 +1344,55 @@ mod tests {
 
         // Boolean extrema use the `false` and `true` identities, including when the reduced axis is empty.
         let empty_booleans = replicated_array(&session, &mesh, DataType::Boolean, &[0], &[]);
-        assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0]);
-        assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), vec![1]);
+        assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), vec![0]);
+        assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(), vec![1]);
 
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
         let nan = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, f32::NAN]));
-        let maximum = values_from_bytes::<f32>(&nan.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap());
+        let maximum = nan.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
         assert_eq!(maximum.len(), 1);
         assert!(maximum[0].is_nan(), "{maximum:?}");
         let zeros = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[-0f32, 0.0]));
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), 0f32.to_ne_bytes());
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), (-0f32).to_ne_bytes());
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), 0f32.to_ne_bytes());
+        assert_eq!(
+            zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
+            (-0f32).to_ne_bytes()
+        );
 
         // The order of the zeros does not matter, and extrema of equal zeros keep their sign.
         for (zeros, maximum, minimum) in
             [([0f32, -0.0], 0f32, -0f32), ([-0.0, -0.0], -0.0, -0.0), ([0.0, 0.0], 0.0, 0.0)]
         {
             let zeros = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&zeros));
-            assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), maximum.to_ne_bytes());
-            assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), minimum.to_ne_bytes());
+            assert_eq!(
+                zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(),
+                maximum.to_ne_bytes()
+            );
+            assert_eq!(
+                zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
+                minimum.to_ne_bytes()
+            );
         }
 
         // Narrower floating-point types order their signed zeros in the same way.
         let zeros =
             replicated_array(&session, &mesh, DataType::BF16, &[2], &values_to_bytes(&[bf16::NEG_ZERO, bf16::ZERO]));
         assert_eq!(
-            zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
+            zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(),
             bf16::ZERO.to_bits().to_ne_bytes(),
         );
         assert_eq!(
-            zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(),
+            zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
             bf16::NEG_ZERO.to_bits().to_ne_bytes(),
         );
         let zeros =
             replicated_array(&session, &mesh, DataType::F16, &[2], &values_to_bytes(&[f16::NEG_ZERO, f16::ZERO]));
         assert_eq!(
-            zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
+            zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(),
             f16::ZERO.to_bits().to_ne_bytes(),
         );
         assert_eq!(
-            zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(),
+            zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
             f16::NEG_ZERO.to_bits().to_ne_bytes(),
         );
 
@@ -1396,7 +1405,8 @@ mod tests {
             let r#type = ArrayType::new_static(data_type, [4]).with_sharding(sharding).unwrap();
             Array::from_host_buffer(&session, r#type, device_mesh.clone(), None, bytes).unwrap()
         };
-        let reduce = |input: &Array, kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host().unwrap();
+        let reduce =
+            |input: &Array, kind: ReductionKind| input.reduce(&[0], kind).unwrap().copy_to_host_bytes().unwrap();
         let floats = sharded(DataType::F32, values_to_bytes(&[-0f32, -1.0, 0.0, -2.0]));
         assert_eq!(reduce(&floats, ReductionKind::Max), 0f32.to_ne_bytes());
         assert_eq!(reduce(&floats, ReductionKind::Min), (-2f32).to_ne_bytes());
@@ -1417,8 +1427,8 @@ mod tests {
 
         // The sign of an `f8e4m3fn` zero is its most significant bit.
         let zeros = replicated_array(&session, &mesh, DataType::F8E4M3FN, &[2], &[0x80, 0x00]);
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0x00]);
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), vec![0x80]);
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), vec![0x00]);
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(), vec![0x80]);
 
         // Complex extrema compare `(real, imaginary)` lexicographically, and their identity has negative infinite
         // components.
@@ -1429,7 +1439,7 @@ mod tests {
             &[3],
             &values_to_bytes(&[Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)]),
         );
-        let read = |array: Array| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<Complex<f32>>(&array.copy_to_host_bytes().unwrap());
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Max).unwrap()), vec![Complex::new(2.0, 4.0)]);
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Min).unwrap()), vec![Complex::new(1.0, 5.0)]);
         let empty_complex = replicated_array(&session, &mesh, DataType::C64, &[0], &[]);
@@ -1879,7 +1889,7 @@ mod tests {
         )
         .unwrap();
         for input in [input, sharded_input] {
-            let output = values_from_bytes::<f32>(&softmax.call(input).unwrap().copy_to_host().unwrap());
+            let output = softmax.call(input).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
             assert_eq!(output.len(), 6);
             for (index, (actual, expected)) in
                 output.iter().zip([0.125f32, 0.25, 0.625, 0.625, 0.125, 0.25]).enumerate()
@@ -1909,7 +1919,7 @@ mod tests {
         };
         let reduce = |values: [f32; 4], kind: ReductionKind| {
             let input = sharded(DataType::F32, &[4], 0, values_to_bytes(&values));
-            values_from_bytes::<f32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap())[0].to_bits()
+            input.reduce(&[0], kind).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap()[0].to_bits()
         };
         let nan = f32::NAN;
         let infinity = f32::INFINITY;
@@ -1940,7 +1950,13 @@ mod tests {
         let matrix = [1f32, -0.0, nan, 4.0, 0.5, 0.0, 2.0, -8.0];
         let matrix = sharded(DataType::F32, &[2, 4], 1, values_to_bytes(&matrix));
         let read = |axes: &[usize], kind: ReductionKind| {
-            values_from_bytes::<f32>(&matrix.reduce(axes, kind).unwrap().copy_to_host().unwrap())
+            matrix
+                .reduce(axes, kind)
+                .unwrap()
+                .copy_to_host()
+                .unwrap()
+                .elements::<f32>()
+                .unwrap()
                 .into_iter()
                 .map(f32::to_bits)
                 .collect::<Vec<_>>()
@@ -1953,24 +1969,30 @@ mod tests {
 
         // The other floating-point types that have keys order their signed zeros and propagate NaNs in the same way.
         let doubles = sharded(DataType::F64, &[4], 0, values_to_bytes(&[-0f64, -1.0, 0.0, -2.0]));
-        assert_eq!(doubles.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), 0f64.to_ne_bytes());
-        assert_eq!(doubles.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), (-2f64).to_ne_bytes());
+        assert_eq!(doubles.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), 0f64.to_ne_bytes());
+        assert_eq!(
+            doubles.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
+            (-2f64).to_ne_bytes()
+        );
         let doubles = sharded(DataType::F64, &[4], 0, values_to_bytes(&[1f64, 2.0, f64::NAN, -2.0]));
-        assert_eq!(doubles.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), f64::NAN.to_ne_bytes());
+        assert_eq!(
+            doubles.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
+            f64::NAN.to_ne_bytes()
+        );
         let halves = [f16::NEG_ZERO, f16::from_f32(-1.0), f16::ZERO, f16::from_f32(-2.0)];
         let halves = sharded(DataType::F16, &[4], 0, values_to_bytes(&halves));
         assert_eq!(
-            halves.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
+            halves.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(),
             f16::ZERO.to_bits().to_ne_bytes(),
         );
         assert_eq!(
-            halves.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(),
+            halves.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(),
             f16::from_f32(-2.0).to_bits().to_ne_bytes(),
         );
         let brains = [bf16::ZERO, bf16::from_f32(1.0), bf16::NEG_ZERO, bf16::NAN];
         let brains = sharded(DataType::BF16, &[4], 0, values_to_bytes(&brains));
         assert_eq!(
-            brains.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
+            brains.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(),
             bf16::NAN.to_bits().to_ne_bytes(),
         );
 
@@ -1981,7 +2003,7 @@ mod tests {
         let complex =
             [Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0), Complex::new(0.0, 0.0)];
         let complex = sharded(DataType::C64, &[4], 0, values_to_bytes(&complex));
-        let read = |array: Array| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
+        let read = |array: Array| values_from_bytes::<Complex<f32>>(&array.copy_to_host_bytes().unwrap());
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Max).unwrap()), vec![Complex::new(2.0, 4.0)]);
         assert_eq!(read(complex.reduce(&[0], ReductionKind::Min).unwrap()), vec![Complex::new(0.0, 0.0)]);
         let factors = [Complex::new(1f32, 1.0), Complex::new(2.0, 0.0), Complex::new(0.0, 1.0), Complex::new(1.0, 0.0)];
@@ -1992,8 +2014,8 @@ mod tests {
         let factors = sharded(DataType::C64, &[4], 0, values_to_bytes(&factors));
         assert_eq!(read(factors.reduce(&[0], ReductionKind::Product).unwrap()), vec![Complex::new(infinity, 0.0)]);
         let bytes = sharded(DataType::F8E5M2, &[4], 0, vec![0x80, 0x3C, 0x00, 0x40]);
-        assert_eq!(bytes.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0x40]);
-        assert_eq!(bytes.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), vec![0x80]);
+        assert_eq!(bytes.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), vec![0x40]);
+        assert_eq!(bytes.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host_bytes().unwrap(), vec![0x80]);
 
         // The compiler places values over auto mesh axes without their types describing it, so the same reductions
         // also keep their results for an input that only such a placement shards.
@@ -2017,19 +2039,19 @@ mod tests {
         let factors = placed(DataType::C64, values_to_bytes(&factors));
         assert_eq!(read(factors.reduce(&[0], ReductionKind::Product).unwrap()), vec![Complex::new(-2.0, 2.0)]);
         let bytes = placed(DataType::F8E5M2, vec![0x80, 0x3C, 0x00, 0x40]);
-        assert_eq!(bytes.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0x40]);
+        assert_eq!(bytes.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), vec![0x40]);
         let floats = placed(DataType::F32, values_to_bytes(&[-0f32, nan, 0.0, 1.0]));
         assert_eq!(
-            floats.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(),
+            floats.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(),
             nan.to_bits().to_ne_bytes(),
         );
         let floats = placed(DataType::F32, values_to_bytes(&[-0f32, -1.0, 0.0, -2.0]));
-        assert_eq!(floats.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), 0f32.to_ne_bytes());
+        assert_eq!(floats.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host_bytes().unwrap(), 0f32.to_ne_bytes());
 
         // The maximum of a `LogSumExp` reduces across the shards as well.
         let logits = sharded(DataType::F32, &[4], 0, values_to_bytes(&[1f32.ln(), 2f32.ln(), 5f32.ln(), 8f32.ln()]));
         let total = logits.reduce(&[0], ReductionKind::LogSumExp).unwrap();
-        let total = values_from_bytes::<f32>(&total.copy_to_host().unwrap());
+        let total = total.copy_to_host().unwrap().elements::<f32>().unwrap();
         assert!((total[0] - 16f32.ln()).abs() < 1e-6, "{total:?}");
     }
 
@@ -2568,7 +2590,7 @@ mod tests {
             values_to_bytes(&[first, second, Complex::new(f32::NEG_INFINITY, 0.0)]).as_slice(),
         );
         let output = input.reduce_log_sum_exp(&[0]).unwrap();
-        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
+        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host_bytes().unwrap());
         let expected = ((first - shift).exp() + (second - shift).exp()).ln() + shift;
         assert_eq!(output.len(), 1);
         assert!((output[0] - expected).norm() < 1e-5, "{} vs {expected}", output[0]);
@@ -2582,7 +2604,7 @@ mod tests {
             values_to_bytes(&[Complex::new(1f32, 4.0), Complex::new(2f32, -4.0)]).as_slice(),
         );
         let output = input.reduce_log_sum_exp(&[]).unwrap();
-        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
+        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host_bytes().unwrap());
         let expected = [
             Complex::new(1f32, 4.0 - 2.0 * std::f32::consts::PI),
             Complex::new(2f32, -4.0 + 2.0 * std::f32::consts::PI),
@@ -2653,12 +2675,12 @@ mod tests {
         for (data_type, bytes, axis, index_data_type, expected_argmax, expected_argmin) in cases {
             let input = replicated_array(&session, &mesh, data_type, &[2, 3], &bytes);
             assert_eq!(
-                input.argmax_with_index_data_type(axis, index_data_type).unwrap().copy_to_host().unwrap(),
+                input.argmax_with_index_data_type(axis, index_data_type).unwrap().copy_to_host_bytes().unwrap(),
                 expected_argmax,
                 "{data_type}",
             );
             assert_eq!(
-                input.argmin_with_index_data_type(axis, index_data_type).unwrap().copy_to_host().unwrap(),
+                input.argmin_with_index_data_type(axis, index_data_type).unwrap().copy_to_host_bytes().unwrap(),
                 expected_argmin,
                 "{data_type}",
             );
@@ -2681,12 +2703,12 @@ mod tests {
         ] {
             let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
             assert_eq!(
-                values_from_bytes::<i32>(&input.argmax(0).unwrap().copy_to_host().unwrap()),
+                input.argmax(0).unwrap().copy_to_host().unwrap().elements::<i32>().unwrap(),
                 vec![expected_argmax],
                 "{values:?}",
             );
             assert_eq!(
-                values_from_bytes::<i32>(&input.argmin(0).unwrap().copy_to_host().unwrap()),
+                input.argmin(0).unwrap().copy_to_host().unwrap().elements::<i32>().unwrap(),
                 vec![expected_argmin],
                 "{values:?}",
             );

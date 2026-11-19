@@ -234,7 +234,7 @@ mod tests {
 
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{ArrayConstant, Session, to_mlir_module_for_program};
 
     use super::*;
@@ -439,7 +439,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    sorted.iter().map(|output| output.copy_to_host().unwrap()).collect::<Vec<_>>(),
+                    sorted.iter().map(|output| output.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
                     reference_sorted.iter().map(CoreArray::logical_bytes).collect::<Vec<_>>(),
                     "{ordering} {direction}",
                 );
@@ -479,8 +479,8 @@ mod tests {
         let input =
             replicated_array(&session, &mesh, DataType::F32, &[6], &values_to_bytes(&[3f32, 1.0, 3.0, -0.0, 0.0, 2.0]));
         let (values, indices) = input.top_k(3, 0).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&values.copy_to_host().unwrap()), vec![3.0, 3.0, 2.0]);
-        assert_eq!(values_from_bytes::<i32>(&indices.copy_to_host().unwrap()), vec![0, 2, 5]);
+        assert_eq!(values.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.0, 3.0, 2.0]);
+        assert_eq!(indices.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![0, 2, 5]);
     }
 
     #[test]
@@ -527,9 +527,9 @@ mod tests {
                 Sort::sort_with_key_count(&[primary.clone(), secondary.clone(), passenger.clone()], 0, 2, direction)
                     .unwrap();
             assert_eq!(sorted.len(), 3);
-            assert_eq!(values_from_bytes::<i32>(&sorted[0].copy_to_host().unwrap()), expected_primary);
-            assert_eq!(values_from_bytes::<f32>(&sorted[1].copy_to_host().unwrap()), expected_secondary);
-            assert_eq!(values_from_bytes::<f32>(&sorted[2].copy_to_host().unwrap()), expected_passenger);
+            assert_eq!(sorted[0].copy_to_host().unwrap().elements::<i32>().unwrap(), expected_primary);
+            assert_eq!(sorted[1].copy_to_host().unwrap().elements::<f32>().unwrap(), expected_secondary);
+            assert_eq!(sorted[2].copy_to_host().unwrap().elements::<f32>().unwrap(), expected_passenger);
         }
     }
 
@@ -558,6 +558,6 @@ mod tests {
             replicated_array(&session, &mesh, DataType::F32, &[6], &values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0]));
         let sorted = Sort::sort(&[keys, positions], 0, SortDirection::Ascending).unwrap();
         assert_eq!(sorted.len(), 2);
-        assert_eq!(values_from_bytes::<f32>(&sorted[1].copy_to_host().unwrap()), vec![4.0, 5.0, 3.0, 2.0, 0.0, 1.0]);
+        assert_eq!(sorted[1].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![4.0, 5.0, 3.0, 2.0, 0.0, 1.0]);
     }
 }

@@ -727,8 +727,8 @@ mod tests {
                     .unwrap()
             })
             .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![54.0]);
-        assert_eq!(values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()), vec![0.0, 2.0, 0.0]);
+        assert_eq!(value.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![54.0]);
+        assert_eq!(gradient.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.0, 2.0, 0.0]);
     }
 
     #[test]
@@ -751,13 +751,13 @@ mod tests {
                 "diagonal({offset}, {axis1}, {axis2})",
             );
             assert_eq!(
-                diagonal.copy_to_host().unwrap(),
+                diagonal.copy_to_host_bytes().unwrap(),
                 reference_diagonal.logical_bytes(),
                 "diagonal({offset}, {axis1}, {axis2})",
             );
         }
         assert_eq!(
-            values_from_bytes::<f32>(&input.diagonal(1, 0, 2).unwrap().copy_to_host().unwrap()),
+            input.diagonal(1, 0, 2).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap(),
             vec![1.0, 4.0, 8.0, 11.0],
         );
     }

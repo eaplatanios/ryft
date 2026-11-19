@@ -594,7 +594,7 @@ mod tests {
 
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
         assert_eq!(outputs.len(), 1);
-        assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), vec![1.5, 2.5]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), vec![1.5, 2.5]);
     }
 
     #[test]

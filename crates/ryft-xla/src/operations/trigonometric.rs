@@ -659,13 +659,13 @@ mod tests {
         let denominator = x * x + y * y;
         let imaginary_unit = Complex::new(0f32, 1.0);
         let expected_value = -imaginary_unit * ((x + imaginary_unit * y) / denominator.sqrt()).ln();
-        let value = values_from_bytes::<Complex<f32>>(&value.copy_to_host().unwrap());
+        let value = values_from_bytes::<Complex<f32>>(&value.copy_to_host_bytes().unwrap());
         assert_eq!(value.len(), 1);
         assert!((value[0] - expected_value).norm() < 1e-5, "{} vs {expected_value}", value[0]);
-        let y_gradient = values_from_bytes::<Complex<f32>>(&y_gradient.copy_to_host().unwrap());
+        let y_gradient = values_from_bytes::<Complex<f32>>(&y_gradient.copy_to_host_bytes().unwrap());
         assert_eq!(y_gradient.len(), 1);
         assert!((y_gradient[0] - x / denominator).norm() < 1e-5, "{}", y_gradient[0]);
-        let x_gradient = values_from_bytes::<Complex<f32>>(&x_gradient.copy_to_host().unwrap());
+        let x_gradient = values_from_bytes::<Complex<f32>>(&x_gradient.copy_to_host_bytes().unwrap());
         assert_eq!(x_gradient.len(), 1);
         assert!((x_gradient[0] + y / denominator).norm() < 1e-5, "{}", x_gradient[0]);
     }
@@ -703,7 +703,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            values_from_bytes::<Complex<f64>>(&input.tanh().unwrap().copy_to_host().unwrap()),
+            values_from_bytes::<Complex<f64>>(&input.tanh().unwrap().copy_to_host_bytes().unwrap()),
             [Complex::new(1f64, 0.0), Complex::new(1f64, 0.0), Complex::new(-1f64, 0.0)],
         );
     }
@@ -724,7 +724,7 @@ mod tests {
             &[3],
             &values_to_bytes(&[Complex::new(0f64, 710.0), Complex::new(0f64, -710.0), Complex::new(1e-300f64, 1400.0)]),
         );
-        let sine = values_from_bytes::<Complex<f64>>(&input.sin().unwrap().copy_to_host().unwrap());
+        let sine = values_from_bytes::<Complex<f64>>(&input.sin().unwrap().copy_to_host_bytes().unwrap());
         assert_eq!(sine.len(), 3);
         assert_eq!(sine[0].re, 0.0);
         assert!((sine[0].im / 1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", sine[0]);
@@ -732,7 +732,7 @@ mod tests {
         assert!((sine[1].im / -1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", sine[1]);
         assert!((sine[2].re / 5.143333304259947e307 - 1.0).abs() < 2e-15, "{}", sine[2]);
         assert_eq!(sine[2].im, f64::INFINITY);
-        let cosine = values_from_bytes::<Complex<f64>>(&input.cos().unwrap().copy_to_host().unwrap());
+        let cosine = values_from_bytes::<Complex<f64>>(&input.cos().unwrap().copy_to_host_bytes().unwrap());
         assert_eq!(cosine.len(), 3);
         assert!((cosine[0].re / 1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", cosine[0]);
         assert_eq!(cosine[0].im, 0.0);
@@ -750,12 +750,12 @@ mod tests {
             &[2],
             &values_to_bytes(&[Complex::new(0f32, 89.0), Complex::new(0f32, 1000.0)]),
         );
-        let sine = values_from_bytes::<Complex<f32>>(&input.sin().unwrap().copy_to_host().unwrap());
+        let sine = values_from_bytes::<Complex<f32>>(&input.sin().unwrap().copy_to_host_bytes().unwrap());
         assert_eq!(sine.len(), 2);
         assert_eq!(sine[0].re, 0.0);
         assert!((sine[0].im / 2.2448064e38 - 1.0).abs() < 2e-7, "{}", sine[0]);
         assert_eq!(sine[1], Complex::new(0f32, f32::INFINITY));
-        let cosine = values_from_bytes::<Complex<f32>>(&input.cos().unwrap().copy_to_host().unwrap());
+        let cosine = values_from_bytes::<Complex<f32>>(&input.cos().unwrap().copy_to_host_bytes().unwrap());
         assert_eq!(cosine.len(), 2);
         assert!((cosine[0].re / 2.2448064e38 - 1.0).abs() < 2e-7, "{}", cosine[0]);
         assert_eq!(cosine[0].im, 0.0);

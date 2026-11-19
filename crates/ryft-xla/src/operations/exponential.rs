@@ -881,7 +881,7 @@ mod tests {
 
         // The logarithm of one in a format with only exponent bits is an unrepresentable zero and converts to NaN.
         let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
-        assert_eq!(input.log().unwrap().copy_to_host().unwrap(), vec![255]);
+        assert_eq!(input.log().unwrap().copy_to_host_bytes().unwrap(), vec![255]);
     }
 
     #[test]
@@ -1014,8 +1014,8 @@ mod tests {
             replicated_array(&session, &mesh, DataType::F64, &[2], values_to_bytes(&[-700f64, 700.0]).as_slice());
         let tangent = replicated_array(&session, &mesh, DataType::F64, &[2], values_to_bytes(&[1f64, 1.0]).as_slice());
         let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
-        let output = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
-        let derivative = values_from_bytes::<f64>(&derivative.copy_to_host().unwrap());
+        let output = output.copy_to_host().unwrap().elements::<f64>().unwrap();
+        let derivative = derivative.copy_to_host().unwrap().elements::<f64>().unwrap();
         assert!((output[0] / expected - 1.0).abs() < 1e-12);
         assert_eq!(output[1], 1.0);
         assert!((derivative[0] / expected - 1.0).abs() < 1e-12);
@@ -1037,8 +1037,8 @@ mod tests {
             values_to_bytes(&[Complex::new(1f64, 0.0), Complex::new(1.0, 0.0)]).as_slice(),
         );
         let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
-        let output = values_from_bytes::<Complex<f64>>(&output.copy_to_host().unwrap());
-        let derivative = values_from_bytes::<Complex<f64>>(&derivative.copy_to_host().unwrap());
+        let output = values_from_bytes::<Complex<f64>>(&output.copy_to_host_bytes().unwrap());
+        let derivative = values_from_bytes::<Complex<f64>>(&derivative.copy_to_host_bytes().unwrap());
         assert!((output[0].re / expected - 1.0).abs() < 1e-12);
         assert_eq!([output[0].im, output[1].re, output[1].im], [0.0, 1.0, 0.0]);
         assert!((derivative[0].re / expected - 1.0).abs() < 1e-12);
@@ -1056,7 +1056,7 @@ mod tests {
         // format with only exponent bits and for a half precision format.
         let left = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
         let right = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[1], &[126]);
-        assert_eq!(left.log_add_exp(&right).unwrap().copy_to_host().unwrap(), vec![127]);
+        assert_eq!(left.log_add_exp(&right).unwrap().copy_to_host_bytes().unwrap(), vec![127]);
         let left = replicated_array(
             &session,
             &mesh,
@@ -1072,7 +1072,7 @@ mod tests {
             values_to_bytes(&[f16::ONE, f16::from_f32(-5.0)]).as_slice(),
         );
         assert_eq!(
-            values_from_bytes::<f16>(&left.log_add_exp(&right).unwrap().copy_to_host().unwrap()),
+            left.log_add_exp(&right).unwrap().copy_to_host().unwrap().elements::<f16>().unwrap(),
             vec![f16::from_f32(1.473_632_8), f16::from_f32(-4.308_593_8)],
         );
 
@@ -1092,7 +1092,7 @@ mod tests {
             &[4],
             values_to_bytes(&[f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, 1.25]).as_slice(),
         );
-        let output = values_from_bytes::<f32>(&left.log_add_exp(&right).unwrap().copy_to_host().unwrap());
+        let output = left.log_add_exp(&right).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
         assert_eq!(output.len(), 4);
         assert_eq!(output[..3], [f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY]);
         assert!(output[3].is_nan());
@@ -1110,7 +1110,8 @@ mod tests {
         // Complex outputs wrap the phase onto the principal logarithm branch. The phase rotation rounds in the last
         // bits, hence the tolerances.
         let input = c128_vector(Complex::new(0.0, 4.0));
-        let output = values_from_bytes::<Complex<f64>>(&input.log_add_exp(&input).unwrap().copy_to_host().unwrap());
+        let output =
+            values_from_bytes::<Complex<f64>>(&input.log_add_exp(&input).unwrap().copy_to_host_bytes().unwrap());
         assert!((output[0].re - LN_2).abs() < 1e-15);
         assert!((output[0].im - (4.0 - 2.0 * PI)).abs() < 1e-15);
 
@@ -1122,7 +1123,8 @@ mod tests {
             &[1],
             values_to_bytes(&[Complex::new(0f32, 1e-20)]).as_slice(),
         );
-        let output = values_from_bytes::<Complex<f32>>(&input.log_add_exp(&input).unwrap().copy_to_host().unwrap());
+        let output =
+            values_from_bytes::<Complex<f32>>(&input.log_add_exp(&input).unwrap().copy_to_host_bytes().unwrap());
         assert!((output[0].re - std::f32::consts::LN_2).abs() <= f32::EPSILON);
         assert_eq!(output[0].im, 1e-20);
 
@@ -1132,7 +1134,7 @@ mod tests {
             &c128_vector(Complex::new(0.0, 0.0))
                 .log_add_exp(&c128_vector(Complex::new(-40.0, 0.0)))
                 .unwrap()
-                .copy_to_host()
+                .copy_to_host_bytes()
                 .unwrap(),
         );
         assert!((output[0].re / (-40f64).exp() - 1.0).abs() < 1e-13);
@@ -1142,7 +1144,7 @@ mod tests {
         // by the phase of the larger one instead of subtracting the imaginary components.
         let (left, right) = (Complex::new(0.0, 1e16), Complex::new(-1.0, 1.0));
         let output = values_from_bytes::<Complex<f64>>(
-            &c128_vector(left).log_add_exp(&c128_vector(right)).unwrap().copy_to_host().unwrap(),
+            &c128_vector(left).log_add_exp(&c128_vector(right)).unwrap().copy_to_host_bytes().unwrap(),
         );
         let expected = (left.exp() + right.exp()).ln();
         assert!((output[0].re - expected.re).abs() <= 1e-13 * expected.re.abs());
@@ -1165,7 +1167,7 @@ mod tests {
             values_to_bytes(&[Complex::new(1e-20f64, 1e-20), Complex::new(0.0, 1e-10), Complex::new(-40.0, 1.0)])
                 .as_slice(),
         );
-        let output = values_from_bytes::<Complex<f64>>(&input.exp_m1().unwrap().copy_to_host().unwrap());
+        let output = values_from_bytes::<Complex<f64>>(&input.exp_m1().unwrap().copy_to_host_bytes().unwrap());
         assert_eq!(output.len(), 3);
         assert_eq!(output[..2], [Complex::new(1e-20, 1e-20), Complex::new(-2.0 * (5e-11 * 5e-11), 1e-10)]);
         assert!((output[2].re + 1.0).abs() <= f64::EPSILON);
@@ -1193,7 +1195,7 @@ mod tests {
             ])
             .as_slice(),
         );
-        let output = values_from_bytes::<Complex<f64>>(&input.ln_1p().unwrap().copy_to_host().unwrap());
+        let output = values_from_bytes::<Complex<f64>>(&input.ln_1p().unwrap().copy_to_host_bytes().unwrap());
         assert_eq!(output.len(), 5);
         assert_eq!(output[..3], [Complex::new(1e-20, 1e-20), Complex::new(0.0, PI), Complex::new(0.0, -PI)]);
 

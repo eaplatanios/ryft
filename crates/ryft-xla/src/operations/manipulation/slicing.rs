@@ -723,7 +723,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let input = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
         let output = input.slice(&[1], &[3], &[1]).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![2.0, 3.0]);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.0, 3.0]);
     }
 
     #[test]
@@ -1042,7 +1042,7 @@ mod tests {
         let input = replicated_array(&session, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
         let update = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
         let output = input.update_slice(&update, &[1]).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![1.0, 5.0, 6.0, 4.0]);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 5.0, 6.0, 4.0]);
     }
 
     #[test]

@@ -1317,7 +1317,7 @@ mod tests {
         )
         .unwrap();
         let outputs = session.execute_program(&compiled, vec![input]).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1.0, 3.0, 6.0, 10.0]);
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 3.0, 6.0, 10.0]);
     }
 
     #[test]
