@@ -565,28 +565,27 @@ impl Array {
         self.session.client()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns whether this array has no clones and every addressable shard buffer is uniquely owned by it. An array
     /// without any shard buffers (e.g., a bufferless zero-space array) is never reported as uniquely owned, so it is
-    /// never donated.
-    ///
-    /// Donation is all or nothing across shards, so any shared buffer disables donation for the complete logical
-    /// input. The check is sound, rather than a heuristic, when the caller owns `self` by value, because a strong count
-    /// of one means that this array holds the only reference to the buffer, so no concurrent clone can appear between
-    /// this check and the buffer's consumption.
+    /// never donated. Donation is all or nothing across shards, so any shared buffer disables donation for the complete
+    /// logical input. The check is sound, rather than a heuristic, when the caller owns `self` by value, because a
+    /// strong count of one means that this array holds the only reference to the buffer, so no concurrent clone can
+    /// appear between this check and the buffer's consumption.
     pub(crate) fn has_unique_shard_buffers(&self) -> bool {
         let mut buffer_count = 0usize;
+
         // Clones share their parts, and with them the shard buffers, so the array itself must also be unique.
         if Arc::strong_count(&self.parts) != 1 {
             return false;
         }
+
         for buffer in self.parts.shards.iter().filter_map(ArrayShard::buffer) {
             if Arc::strong_count(buffer) != 1 {
                 return false;
             }
             buffer_count += 1;
         }
+
         buffer_count > 0
     }
 
@@ -602,14 +601,17 @@ impl Array {
                 buffer.ready()?.await?;
             }
         }
+
         if let Some(fence) = &self.execution_fence {
             // Once all output buffers are ready, the launch completion event is normally complete as well,
             // so this preserves whole-execution errors without introducing a wait into device pipelines.
             fence.ready().await?;
         }
+
         if let Some(fence) = &self.send_fence {
             fence.ready().await?;
         }
+
         Ok(())
     }
 
@@ -620,16 +622,21 @@ impl Array {
         if let Some(fence) = &self.execution_fence {
             fence.block_until_ready()?;
         }
+
         for shard in self.addressable_shards() {
             if let Some(buffer) = shard.buffer() {
                 buffer.ready()?.r#await()?;
             }
         }
+
         if let Some(fence) = &self.send_fence {
             fence.block_until_ready()?;
         }
+
         Ok(())
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Renders the Shardy tensor sharding attribute (i.e., `#sdy.sharding<...>`) implied by this array, using the
     /// canonical `@mesh` symbol name.
