@@ -815,8 +815,8 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "`Session::place` source mesh `{:?}` with sharding `{:?}` does not match the array's current mesh \
-                 `{:?}` with sharding `{:?}`",
+                "expected source mesh `{:?}` with sharding `{:?}` does not match the array's current mesh `{:?}` \
+                 with sharding `{:?}`",
                 expected_source.0, expected_source.1, actual_source.0, actual_source.1,
             ),
         );

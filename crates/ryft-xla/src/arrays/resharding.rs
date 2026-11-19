@@ -127,7 +127,7 @@ impl Array {
             Self::from_zero_space(session, r#type, Some(self.sharding().clone()), self.mesh().clone())?
         } else {
             let (sharding, mesh) = (self.sharding().clone(), self.mesh().clone());
-            Self::from_shared_addressable_buffers(session, r#type, sharding, mesh, buffers)?
+            Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, buffers, false)?
         };
         Ok(match self.execution_fence() {
             Some(fence) => output.with_execution_fence(fence.clone()),
@@ -202,8 +202,14 @@ impl Array {
                 return Ok(None);
             };
             let r#type = self.r#type().into_owned().with_shape(shape).with_sharding(None)?;
-            let output =
-                Self::from_shared_addressable_buffers(session, r#type, sharding.clone(), mesh.clone(), buffers)?;
+            let output = Self::from_addressable_buffers_internal(
+                session,
+                r#type,
+                Some(sharding.clone()),
+                mesh.clone(),
+                buffers,
+                false,
+            )?;
             match send_fence {
                 Some(fence) => output.with_send_fence(fence),
                 None => output,
@@ -550,8 +556,14 @@ impl Array {
             buffers.push(Self::assemble_shard_regions(session, data_type, destination, pieces, &mut execution_fences)?);
         }
         let r#type = self.r#type().into_owned().with_sharding(None)?;
-        let mut output =
-            Self::from_shared_addressable_buffers(session, r#type, sharding.clone(), mesh.clone(), buffers)?;
+        let mut output = Self::from_addressable_buffers_internal(
+            session,
+            r#type,
+            Some(sharding.clone()),
+            mesh.clone(),
+            buffers,
+            false,
+        )?;
         if !execution_fences.is_empty() {
             output = output.with_execution_fence(ExecutionFence::join(execution_fences));
         }
@@ -736,7 +748,7 @@ impl Array {
         let (mesh, sharding) = ArrayPlacement::Device(device).resolve(shape.rank())?;
         let layout = Layout::from_pjrt(buffer.specification()?.layout)?;
         let r#type = ArrayType::new(data_type, shape.into()).with_layout(layout);
-        Self::from_shared_addressable_buffers(session, r#type, sharding, mesh, vec![buffer])
+        Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, vec![buffer], false)
     }
 
     /// Places this array on `mesh` according to `sharding` with device work only, and on failure also returns this

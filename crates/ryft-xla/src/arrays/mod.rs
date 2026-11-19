@@ -66,10 +66,7 @@ pub enum ArrayError {
     #[error("expected static shape but got `{shape}`")]
     DynamicShape { shape: Shape },
 
-    #[error("session has no device mesh")]
-    MissingMesh,
-
-    #[error("`Session::place` needs a default local device, but the PJRT client has no addressable devices")]
+    #[error("no default local device is available, because the PJRT client has no addressable devices")]
     MissingDefaultDevice,
 
     #[error(
@@ -78,8 +75,8 @@ pub enum ArrayError {
     PlacementTypeMismatch { type_sharding: Sharding, sharding: Sharding },
 
     #[error(
-        "`Session::place` source mesh `{expected_mesh:?}` with sharding `{expected_sharding:?}` does not match the \
-         array's current mesh `{actual_mesh:?}` with sharding `{actual_sharding:?}`"
+        "expected source mesh `{expected_mesh:?}` with sharding `{expected_sharding:?}` does not match the array's \
+         current mesh `{actual_mesh:?}` with sharding `{actual_sharding:?}`"
     )]
     SourcePlacementMismatch {
         expected_mesh: DeviceMesh,
@@ -199,17 +196,14 @@ pub struct Array {
     session: Session,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Array {
     /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
-    /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the
-    /// addressable buffers. The provided [`ArrayType`] describes the global logical array and must have a static
-    /// [`Shape`].
+    /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the addressable
+    /// buffers. The provided [`ArrayType`] describes the global logical array and must have a static [`Shape`].
     ///
-    /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and defaults to
-    /// replication over `mesh` otherwise. Each buffer in a replicated placement must have the full logical shape,
-    /// and callers are responsible for supplying the same value in each replica.
+    /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and defaults to replication
+    /// over `mesh` otherwise. Each buffer in a replicated placement must have the full logical shape, and callers are
+    /// responsible for supplying the same value in each replica.
     ///
     /// A supplied sharding can place the array over auto mesh axes. After removing its auto axes with
     /// [`Sharding::without_auto_axes`], it must match any sharding in the type, or the function returns
@@ -238,6 +232,7 @@ impl Array {
     ///   - `sharding`: Optional runtime [`Sharding`] over `mesh`.
     ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process. An empty
     ///     list creates an array with only shard metadata.
+    #[inline]
     pub fn from_addressable_buffers(
         session: &Session,
         r#type: ArrayType,
@@ -245,8 +240,14 @@ impl Array {
         sharding: Option<Sharding>,
         buffers: Vec<Buffer<'static>>,
     ) -> Result<Self, Error> {
-        let buffers = buffers.into_iter().map(Arc::new).collect();
-        Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, buffers, true)
+        Self::from_addressable_buffers_internal(
+            session,
+            r#type,
+            sharding,
+            mesh,
+            buffers.into_iter().map(Arc::new).collect(),
+            true,
+        )
     }
 
     /// Creates an [`Array`] from buffers produced by the backend whose zero-space carriers are known to be canonical.
@@ -260,24 +261,19 @@ impl Array {
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'static>>,
     ) -> Result<Self, Error> {
-        let buffers = buffers.into_iter().map(Arc::new).collect();
-        Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, buffers, false)
-    }
-
-    /// Creates an [`Array`] like [`Self::from_canonical_addressable_buffers`] from buffers that other arrays may also
-    /// hold. Sharing is safe because arrays never mutate their buffers and because donation skips arrays whose
-    /// buffers are shared (refer to [`Self::has_unique_shard_buffers`]).
-    pub(crate) fn from_shared_addressable_buffers(
-        session: &Session,
-        r#type: ArrayType,
-        sharding: Sharding,
-        mesh: DeviceMesh,
-        buffers: Vec<Arc<Buffer<'static>>>,
-    ) -> Result<Self, Error> {
-        Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, buffers, false)
+        Self::from_addressable_buffers_internal(
+            session,
+            r#type,
+            sharding,
+            mesh,
+            buffers.into_iter().map(Arc::new).collect(),
+            false,
+        )
     }
 
     /// Implements addressable buffer construction with optional validation of private zero-space carrier payloads.
+    /// The buffers may be ones that other arrays also hold. Sharing is safe because arrays never mutate their buffers
+    /// and because donation skips arrays whose buffers are shared (refer to [`Self::has_unique_shard_buffers`]).
     fn from_addressable_buffers_internal(
         session: &Session,
         r#type: ArrayType,
@@ -342,6 +338,8 @@ impl Array {
             session: session.clone(),
         })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
     /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
@@ -811,22 +809,6 @@ impl Array {
     }
 }
 
-/// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
-pub async fn ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
-    for array in values.parameters() {
-        array.ready().await?;
-    }
-    Ok(())
-}
-
-/// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
-pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
-    for array in values.parameters() {
-        array.block_until_ready()?;
-    }
-    Ok(())
-}
-
 impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1191,6 +1173,24 @@ impl std::ops::BitXor for Array {
     fn bitxor(self, right: Self) -> Self {
         Xor::xor(&self, &right).expect("`xor` operation failed")
     }
+}
+
+/// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
+#[inline]
+pub async fn ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
+    for array in values.parameters() {
+        array.ready().await?;
+    }
+    Ok(())
+}
+
+/// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
+#[inline]
+pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
+    for array in values.parameters() {
+        array.block_until_ready()?;
+    }
+    Ok(())
 }
 
 /// Placement of one output of a compiled program, computed once per program so that every execution can build that
