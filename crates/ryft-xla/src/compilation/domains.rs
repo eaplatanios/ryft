@@ -50,7 +50,7 @@ impl CompilationDomain for Session {
     }
 
     // The cached executable depends only on the types of the session constants of `program`, so their arrays are
-    // resolved through this session's session for every request, including cache hits, as `SessionConstant` explains.
+    // resolved through this session's session for every request, including cache hits, as `RetainedArray` explains.
     fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram>, Vec<Value>), Self::Error> {
         let session_arrays = program
             .session_constants()

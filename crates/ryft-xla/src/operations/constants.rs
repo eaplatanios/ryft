@@ -1117,6 +1117,20 @@ mod tests {
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
             let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).with_memory(memory);
+
+            // The fill literal is uploaded to the requested memory, but XLA's CUDA compiler cannot take it from
+            // unpinned host memory as the argument of the program that broadcasts it.
+            if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
+                && memory == (Memory::Host { pinned: false })
+            {
+                assert!(matches!(
+                    domain.fill(&r#type, 2.5f64),
+                    Err(ProgramError::InvalidArgument { message })
+                        if message == "programs compiled for platform `cuda` cannot take or return values in \
+                                       `Host[Unpinned]` memory",
+                ));
+                continue;
+            }
             let output = domain.fill(&r#type, 2.5f64).unwrap();
 
             assert_eq!(output.r#type().memory(), memory);

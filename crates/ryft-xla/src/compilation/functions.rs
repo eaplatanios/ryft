@@ -27,7 +27,7 @@
 //! [`StagedFunction::call`], [`CompiledFunction::call`], and [`CompiledFunctionDispatcher::call`] bind a `jit_call`
 //! operation, which carries the retained source program of the called function, in the context that their inputs belong
 //! to. These inputs and outputs are the `ArrayType` leaves of a [`ProjectedContext`] over an array IR context, which
-//! the call recovers from the first input. They are [`Array`]s under the eager [`Session`] and [`ProjectedValue`]s of
+//! the call recovers from the first input. They are [`Array`]s under a [`Session`] and [`ProjectedValue`]s of
 //! tracers under a trace or a transform (e.g., the [`CompileTracer`]s of an enclosing compilation). The
 //! `call_in_context` variants take the array IR context explicitly, which also serves nullary functions. Every parent
 //! context is supported:
@@ -60,7 +60,7 @@
 //! of [`rematerialize`](ryft_core::rematerialize) and [`composite`](ryft_core::composite), the custom rules of
 //! composites, and the regions nested in them. Their capture tables cannot hold runtime arrays, so calls in them
 //! import captures through [`ThroughSession`](crate::ThroughSession) instead. The body stages a
-//! [`SessionConstant`](crate::SessionConstant) handle to each such array, which retains the array for as long as the
+//! [`RetainedArray`](crate::RetainedArray) handle to each such array, which retains the array for as long as the
 //! handle exists and keeps the callee closed. An eager parent resolves the handle when it lifts it, and lowering passes
 //! every distinct handle of a program as a hidden argument of the entry function after its captures, so the executable
 //! depends only on the types of these arrays.
@@ -310,7 +310,7 @@ where
     /// a `jit_call` operation in the array IR context recovered from `inputs`. Unlike [`Self::execute`], it works under
     /// any context, including eager, staging, and transform contexts, so this dispatcher's closure composes with
     /// enclosing transforms and compilations. Inputs and outputs are `ArrayType` values of a [`ProjectedContext`] over
-    /// that context (e.g., [`Array`]s under the eager [`Session`] and [`ProjectedValue`]s under traces and transforms),
+    /// that context (e.g., [`Array`]s under a [`Session`] and [`ProjectedValue`]s under traces and transforms),
     /// as for [`StagedFunction::call`]. The closure is traced with the named axes and default mesh of that context, so
     /// it can read named batch and mesh axes of its caller. Refer to
     /// [`CoreCompiledFunctionDispatcher::call_in_context`] for how staged specializations are traced and retained.
@@ -846,7 +846,7 @@ where
     ///
     /// The call binds a boundary that carries this function's retained source program, so enclosing transforms
     /// rewrite it through the ordinary rules of the `jit_call` operation. Inputs and outputs are `ArrayType` values of
-    /// a [`ProjectedContext`] over `C`, which the call recovers from the first input. Under the eager [`Session`], they
+    /// a [`ProjectedContext`] over `C`, which the call recovers from the first input. Under a [`Session`], they
     /// are [`Array`]s and the call executes immediately through eager dispatch. Under a trace or a transform (e.g.,
     /// forward mode differentiation), they are [`ProjectedValue`]s of its tracers and the call is recorded or
     /// rewritten there. The captured runtime arrays of this function enter `C` through [`ImportingContext`], which
@@ -1194,7 +1194,7 @@ where
     }
 
     /// Calls this compiled function as a `jit_call` operation in the array IR context recovered from `inputs`, exactly
-    /// as [`StagedFunction::call`] calls its retained staged function. Under the eager [`Session`], the call executes
+    /// as [`StagedFunction::call`] calls its retained staged function. Under a [`Session`], the call executes
     /// through eager dispatch rather than through the retained executable, so use [`ExecutableFunction::execute`] to
     /// run that executable directly on concrete arrays.
     ///
@@ -6447,7 +6447,7 @@ mod tests {
             Ok(x.dot(&w, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?.into_value())
         });
 
-        // Eager calls and eager differentiation resolve the session constant on the eager session.
+        // Eager calls and eager differentiation resolve the session constant on the session.
         assert_close(read(function.call(Value::Array(array(&vector_type, &x))).unwrap()), vec![dot.sin()]);
         let (value, eager_gradient) = engine
             .differentiate_at(Value::Array(array(&vector_type, &x)))

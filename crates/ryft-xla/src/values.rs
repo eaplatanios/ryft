@@ -36,7 +36,7 @@ use ryft_core::{
 };
 use ryft_macros::Parameter;
 
-use crate::{Array, Session, SessionConstant};
+use crate::{Array, RetainedArray, Session};
 
 /// Type of an XLA [`Value`], which is the [`ArrayIrType`] of `ryft-core` used as it is. XLA defines its own values,
 /// constants, and operations, but it adds no types of its own, so this alias only gives the type universe of
@@ -289,7 +289,7 @@ impl Value {
     /// outlives the current transform.
     pub(crate) fn constant(self) -> Result<Constant, ProgramError> {
         match self {
-            Self::Array(value) => Ok(Constant::Session(SessionConstant::new(&value))),
+            Self::Array(value) => Ok(Constant::Session(RetainedArray::new(&value))),
             Self::Dimension(value) => Ok(Constant::Dimension(value.into_value())),
             Self::Reference(_) => Err(TypeError::invalid(
                 "cannot import an XLA reference into a trace whose capture table holds constants",
@@ -576,8 +576,8 @@ pub enum ArrayConstant {
     /// A reference to array data in the enclosing capture table.
     Captured(CaptureReference<ArrayType>),
 
-    /// A handle that retains array data, which [`SessionConstant`] describes.
-    Session(SessionConstant),
+    /// A handle that retains array data, which [`RetainedArray`] describes.
+    Session(RetainedArray),
 
     /// An immediate scalar Boolean predicate.
     Boolean(bool),
@@ -734,7 +734,7 @@ impl AssertionValue for ArrayConstant {
 ///     capture table. Booleans are the only array elements with an immediate form because predicates are the only
 ///     array values that host-side reasoning produces. Nothing in tracing computes, for example, a known `F32` scalar
 ///     on the host, so every other array constant is a capture or a session array.
-///   - **Session arrays:** a [`SessionConstant`] is a handle to an array that is retained for a
+///   - **Session arrays:** a [`RetainedArray`] is a handle to an array that is retained for a
 ///     trace whose capture table cannot hold runtime arrays (e.g., the body of a rematerialized function or of a
 ///     composite). Lowering turns it into a hidden executable argument, as it does for a capture.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
@@ -743,7 +743,7 @@ pub enum Constant {
     Captured(CaptureReference<Type>),
 
     /// Handle that retains an array.
-    Session(SessionConstant),
+    Session(RetainedArray),
 
     /// Immediate checked host-side first-class dimension extent.
     Dimension(DimensionValue),

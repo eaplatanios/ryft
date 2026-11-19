@@ -59,11 +59,11 @@ use crate::operations::collectives::collective_replica_groups;
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
-use crate::operations::manipulation::memory::memory_placement_kind;
+use crate::operations::manipulation::memory::{memory_placement_kind, validate_boundary_memory};
 use crate::sharding::ShardyTensorSharding;
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, FlatProgram, Operation, Program, RaggedDotLoweringStrategy,
-    RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, SessionConstant, ToMlir, Type, normalize_runtime_requirements,
+    RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type, normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -116,6 +116,11 @@ pub enum LoweringError {
     /// A valid element type cannot be represented in the selected lowering context.
     #[error("cannot lower element type `{data_type}` for {context}")]
     UnsupportedElementType { data_type: DataType, context: String },
+
+    /// An argument or a result of the entry function is placed in a memory that programs compiled for the target
+    /// platform can neither read their arguments from nor return their results in.
+    #[error("programs compiled for platform `{platform}` cannot take or return values in `{memory}` memory")]
+    UnsupportedBoundaryMemory { memory: Memory, platform: String },
 
     /// The constructed MLIR module failed verification without returning a native error value.
     #[error("constructed MLIR module failed verification during XLA lowering")]
@@ -911,11 +916,11 @@ pub(crate) struct CollectiveLoweringState {
     /// Runtime contracts declared by emitted operations across every nested lowering scope.
     runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
 
-    /// Distinct [`SessionConstant`]s of the module, in the order of the hidden entry arguments that carry them (refer
+    /// Distinct [`RetainedArray`]s of the module, in the order of the hidden entry arguments that carry them (refer
     /// to [`collect_session_constants`]). Their values form the suffix of every `captured_values` table that can reach
     /// the entry function's arguments. Scopes that cannot reach them (i.e., `sdy.manual_computation` bodies) carry no
     /// session constants.
-    session_constants: Rc<[SessionConstant]>,
+    session_constants: Rc<[RetainedArray]>,
 }
 
 impl CollectiveLoweringState {
@@ -936,7 +941,7 @@ impl CollectiveLoweringState {
     }
 
     /// Returns a copy of this state whose scope reaches the hidden entry arguments carrying `session_constants`.
-    pub(crate) fn with_session_constants(mut self, session_constants: Rc<[SessionConstant]>) -> Self {
+    pub(crate) fn with_session_constants(mut self, session_constants: Rc<[RetainedArray]>) -> Self {
         self.session_constants = session_constants;
         self
     }
@@ -1049,7 +1054,7 @@ impl CollectiveLoweringState {
     /// Returns the value of `constant` in a scope whose captured values are `captured_values`.
     pub(crate) fn lower_session_constant<'b, 'c: 'b, 't: 'c>(
         &self,
-        constant: &SessionConstant,
+        constant: &RetainedArray,
         captured_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let values = self.session_values(captured_values);
@@ -1408,17 +1413,17 @@ where
     )
 }
 
-/// Returns the distinct [`SessionConstant`]s that `program` references in any of its regions, in the order of their
+/// Returns the distinct [`RetainedArray`]s that `program` references in any of its regions, in the order of their
 /// first occurrence in the region arena. Lowering passes their arrays as hidden entry arguments that follow the lifted
 /// captures, in this order, and so the caller that assembles the executable arguments must use the same order.
 pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = Type>>(
     program: &Program<ProgramInput, ProgramOutput, O>,
-) -> Vec<SessionConstant>
+) -> Vec<RetainedArray>
 where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    let mut session_constants = Vec::<SessionConstant>::new();
+    let mut session_constants = Vec::<RetainedArray>::new();
     for region in program.regions().iter() {
         for atom in region.atoms() {
             if let Some(Constant::Session(constant)) = atom.as_constant()
@@ -1845,7 +1850,7 @@ where
     let function_name = normalize_function_name(function_name.as_ref())?;
     // Session constants are carried by hidden arguments that form the suffix of the capture arguments. The caller
     // declares them through the trailing `capture_types`, in the order of `collect_session_constants`.
-    let session_constants: Rc<[SessionConstant]> = collect_session_constants(program).into();
+    let session_constants: Rc<[RetainedArray]> = collect_session_constants(program).into();
     let session_count = session_constants.len();
     if session_count > 0
         && (capture_types.len() < session_count
@@ -2106,6 +2111,7 @@ where
             }
             if let Some(r#type) = physical_argument_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
             {
+                validate_boundary_memory(r#type.memory(), target_platform)?;
                 attributes.insert(
                     "mhlo.memory_kind".into(),
                     context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
@@ -2135,6 +2141,7 @@ where
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(r#type) = physical_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device) {
+                validate_boundary_memory(r#type.memory(), target_platform)?;
                 attributes.insert(
                     "mhlo.memory_kind".into(),
                     context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),

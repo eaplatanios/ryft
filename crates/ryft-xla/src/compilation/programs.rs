@@ -21,7 +21,7 @@ use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::ExecutionPlan;
 use crate::lowering::LoweredModule;
 use crate::lowering::signature::ExecutableSignature;
-use crate::{Error, RuntimeRequirement, SessionConstant, Target, Type};
+use crate::{Error, RetainedArray, RuntimeRequirement, Target, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -74,7 +74,7 @@ pub struct LoweredProgram {
 
     /// Session constants of the lowered program, whose arrays the trailing [`Self::session_constants`]`.len()` of the
     /// [`Self::capture_count`] capture arguments carry, in order.
-    session_constants: Arc<[SessionConstant]>,
+    session_constants: Arc<[RetainedArray]>,
 
     /// Effective sharding expected for every physical executable argument, including materialized captures first.
     expected_argument_shardings: Arc<[Sharding]>,
@@ -144,7 +144,7 @@ impl LoweredProgram {
         reference_states: Arc<[ExternalReferenceBinding]>,
         donation_flags: Arc<[bool]>,
         capture_count: usize,
-        session_constants: Arc<[SessionConstant]>,
+        session_constants: Arc<[RetainedArray]>,
         expected_argument_shardings: Arc<[Sharding]>,
         output_shardings: Arc<[Sharding]>,
         open_outputs: Arc<[bool]>,
@@ -245,7 +245,7 @@ impl LoweredProgram {
     /// Returns the handles of the session constants that the executable receives as hidden arguments after its
     /// captures. The handles are shared so that callers can retain them without copying.
     #[inline]
-    pub(crate) fn session_constants(&self) -> &Arc<[SessionConstant]> {
+    pub(crate) fn session_constants(&self) -> &Arc<[RetainedArray]> {
         &self.session_constants
     }
 

@@ -82,9 +82,9 @@ pub use operations::{
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use sessions::{
     CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, Platform,
-    RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
-    RuntimeRequirement, Session, SessionBuilder, SessionConstant, SessionError, Target, TargetDevice, ThroughSession,
-    Tracer, normalize_runtime_requirements,
+    RUNTIME_REQUIREMENTS_ATTRIBUTE, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
+    RuntimeRequirement, Session, SessionBuilder, SessionError, Target, TargetDevice, ThroughSession, Tracer,
+    normalize_runtime_requirements,
 };
 pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};

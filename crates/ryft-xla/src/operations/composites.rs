@@ -329,7 +329,7 @@ mod tests {
 
     use super::*;
 
-    // Value that composite rules see when a composite executes through the projection of the eager session onto arrays.
+    // Value that composite rules see when a composite executes through the projection of the session onto arrays.
     type ArrayTracer = DomainTracer<ProjectedContext<Session, ArrayType>>;
 
     /// Returns a program that applies `calls` named composite calls of `rules` to the same input, each attaching the
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_composite_operation_lower_executes_batching_rule() {
-        // A composite with a custom batching rule executes through the projection of the eager session onto arrays,
+        // A composite with a custom batching rule executes through the projection of the session onto arrays,
         // which lifts the regions of the calls that it binds. Its unbatched derivative differentiates the primal `x²`,
         // while batching it, before or after differentiating it, applies the rule, which computes `2x²` so that its use
         // is observable.

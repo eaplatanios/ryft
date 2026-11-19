@@ -6,7 +6,7 @@ use ryft_mlir::{
     Attribute, Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Returns the XLA memory kind string for `memory`, used by `mhlo.memory_kind` signature attributes and the
 /// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the
@@ -19,6 +19,26 @@ pub(crate) fn memory_placement_kind(memory: Memory) -> &'static str {
         Memory::Host { pinned: true } => "pinned_host",
         Memory::Host { pinned: false } => "unpinned_host",
     }
+}
+
+/// Validates that a program compiled for `target_platform` can take its arguments from `memory` and return its
+/// results in it.
+///
+/// XLA's CUDA compiler does not place values in unpinned host memory, although its plugin can hold buffers there. It
+/// reads an argument that is declared in that memory from device memory, and it returns a result that is declared in
+/// that memory in device memory or, after a transfer, in pinned host memory. A program with such a boundary would
+/// therefore reject its actual arguments and mislabel its results, so it is rejected here instead. Values inside a
+/// program are not affected, because the compiler treats pinned and unpinned host memory alike there.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedBoundaryMemory`] if `memory` is unpinned host memory and `target_platform` is
+/// CUDA.
+pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&str>) -> Result<(), Error> {
+    if memory == (Memory::Host { pinned: false }) && target_platform == Some("cuda") {
+        return Err(LoweringError::UnsupportedBoundaryMemory { memory, platform: "cuda".to_string() }.into());
+    }
+    Ok(())
 }
 
 /// Applies the non-default memory placement declared by `output_type` to `value`.
@@ -110,13 +130,12 @@ mod tests {
         Trace, TransferToMemory, Typed, ZeroOperation,
     };
 
+    use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_mlir_module_for_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, session_with_client};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{
-        Array, ArrayConstant, ArrayError, CompiledFunction, Constant, Error, compile, to_mlir_module_for_program,
-    };
+    use crate::{Array, ArrayConstant, CompiledFunction, Constant, Error, compile, to_mlir_module_for_program};
 
     use super::*;
 
@@ -125,6 +144,27 @@ mod tests {
         assert_eq!(memory_placement_kind(Memory::Device), "device");
         assert_eq!(memory_placement_kind(Memory::Host { pinned: true }), "pinned_host");
         assert_eq!(memory_placement_kind(Memory::Host { pinned: false }), "unpinned_host");
+    }
+
+    #[test]
+    fn test_validate_boundary_memory() {
+        // Only unpinned host memory at the boundary of a program compiled for CUDA is rejected.
+        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
+            assert!(validate_boundary_memory(memory, None).is_ok());
+            assert!(validate_boundary_memory(memory, Some("cpu")).is_ok());
+        }
+        assert!(validate_boundary_memory(Memory::Device, Some("cuda")).is_ok());
+        assert!(validate_boundary_memory(Memory::Host { pinned: true }, Some("cuda")).is_ok());
+        let error = validate_boundary_memory(Memory::Host { pinned: false }, Some("cuda")).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory, platform })
+                if *memory == (Memory::Host { pinned: false }) && platform == "cuda",
+        ));
+        assert_eq!(
+            error.to_string(),
+            "programs compiled for platform `cuda` cannot take or return values in `Host[Unpinned]` memory",
+        );
     }
 
     #[test]
@@ -243,24 +283,9 @@ mod tests {
         {
             let available =
                 device.addressable_memories().unwrap().iter().any(|memory| memory.kind().unwrap() == memory_kind);
+            assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
             let host_type = input_type.clone().with_memory(memory);
             let values = [i64::MIN, i64::MAX, 9_007_199_254_740_993, -9_007_199_254_740_993];
-            // CUDA exposes pinned host buffers, but not an unpinned host allocation tier. Reject an unavailable
-            // placement explicitly rather than silently allocating the buffer in device memory.
-            if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
-                && memory == (Memory::Host { pinned: false })
-            {
-                assert!(!available);
-                assert!(matches!(
-                    Array::from_host_buffer(&engine, host_type, mesh.clone(), None, values_to_bytes(&values).as_slice()),
-                    Err(Error::Array(error)) if matches!(error.as_ref(),
-                        ArrayError::UnsupportedMemory { device_id: actual_device, memory: actual_memory }
-                            if *actual_device == device_id && *actual_memory == memory,
-                    ),
-                ));
-                continue;
-            }
-            assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
             let source = Array::from_host_buffer(
                 &engine,
                 input_type.clone(),
@@ -270,12 +295,56 @@ mod tests {
             )
             .unwrap();
 
+            // A transfer whose value stays inside the program needs no boundary in host memory, so it round trips on
+            // every platform.
+            let round_trip: CompiledFunction<ArrayType, ArrayType> = compile(
+                |input| input.transfer_to_memory(memory).unwrap().transfer_to_memory(Memory::Device).unwrap(),
+                input_type.clone(),
+                &engine,
+                mesh.clone(),
+            )
+            .unwrap();
+            let output = round_trip.executable().execute(&engine, source.clone()).unwrap();
+            assert_eq!(output.r#type().as_ref(), &input_type);
+            let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
+            assert_eq!(
+                values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
+                values,
+            );
+
+            // XLA's CUDA compiler places no program argument or result in unpinned host memory, although its plugin
+            // can hold buffers there, so a program with such a boundary is rejected when it is lowered.
+            if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
+                && memory == (Memory::Host { pinned: false })
+            {
+                let to_host: Result<CompiledFunction<ArrayType, ArrayType>, Error> = compile(
+                    |input| input.transfer_to_memory(memory).unwrap(),
+                    input_type.clone(),
+                    &engine,
+                    mesh.clone(),
+                );
+                assert!(matches!(
+                    to_host,
+                    Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
+                        if actual == memory && platform == "cuda",
+                ));
+                let identity: Result<CompiledFunction<ArrayType, ArrayType>, Error> =
+                    compile(|input| input, host_type, &engine, mesh.clone());
+                assert!(matches!(
+                    identity,
+                    Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
+                        if actual == memory && platform == "cuda",
+                ));
+                continue;
+            }
+
             // A compiled host result must occupy the requested host memory, not just carry host metadata on a device
             // buffer.
             let to_host: CompiledFunction<ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())
                     .unwrap();
-            let host = to_host.executable().execute(&engine, source.clone()).unwrap();
+            let host = to_host.executable().execute(&engine, source).unwrap();
             assert_eq!(host.r#type().as_ref(), &host_type);
             let buffer = host.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), memory_kind);
@@ -301,22 +370,6 @@ mod tests {
                 compile(|input| input.transfer_to_memory(Memory::Device).unwrap(), host_type, &engine, mesh.clone())
                     .unwrap();
             let output = to_device.executable().execute(&engine, host).unwrap();
-            assert_eq!(output.r#type().as_ref(), &input_type);
-            let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
-            assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
-            assert_eq!(
-                values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
-                values,
-            );
-
-            let round_trip: CompiledFunction<ArrayType, ArrayType> = compile(
-                |input| input.transfer_to_memory(memory).unwrap().transfer_to_memory(Memory::Device).unwrap(),
-                input_type.clone(),
-                &engine,
-                mesh.clone(),
-            )
-            .unwrap();
-            let output = round_trip.executable().execute(&engine, source).unwrap();
             assert_eq!(output.r#type().as_ref(), &input_type);
             let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
@@ -354,6 +407,19 @@ mod tests {
                 to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap(),
                 expected,
             );
+
+            // A program compiled for CUDA can place its boundary in pinned host memory only.
+            let lowered =
+                lower_mlir_module_for_program(&program, &[], &types, &types, "main", None, None, Some("cuda"));
+            if memory == (Memory::Host { pinned: true }) {
+                assert_eq!(lowered.unwrap().into_stable_hlo(), expected);
+            } else {
+                assert!(matches!(
+                    lowered,
+                    Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
+                        if actual == memory && platform == "cuda",
+                ));
+            }
         }
     }
 }

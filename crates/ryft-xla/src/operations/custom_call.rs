@@ -1805,7 +1805,7 @@ mod tests {
         let session = session_with_client(client);
         let mesh = domain_mesh(client, "x", 1);
 
-        // A call without array inputs binds directly in the eager session and runs a source kernel that only fills its
+        // A call without array inputs binds directly in the session and runs a source kernel that only fills its
         // output.
         let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[4])]);
         let outputs = operation.call(&session, &[]).unwrap();
@@ -2001,7 +2001,7 @@ mod tests {
         let input = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
 
         // The bare operation rejects differentiation, so a composite supplies its rules. The primal and the forward
-        // rule execute the kernel through the projection of the eager session onto arrays, and the backward rule passes
+        // rule execute the kernel through the projection of the session onto arrays, and the backward rule passes
         // the cotangent through because d(x + 1)/dx is the identity.
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2])]);
         let function = Composite::from_custom_call(operation.clone()).with_vjp(
