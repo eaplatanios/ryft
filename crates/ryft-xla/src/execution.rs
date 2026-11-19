@@ -2200,16 +2200,16 @@ mod tests {
 
         // Derive Shardy attributes from runtime arrays, as just-in-time compilation does.
         let context = ryft_mlir::Context::new();
-        let mesh_module = context.module(context.unknown_location()).unwrap();
+        let location = context.unknown_location();
+        let mesh_module = context.module(location).unwrap();
         let mesh_operation = mesh_module
             .body()
             .unwrap()
-            .append_operation(left_array.sharding().mesh().to_mlir(context.unknown_location()).unwrap())
+            .append_operation(left_array.sharding().mesh().to_mlir(location).unwrap())
             .unwrap()
             .to_string();
-        let left_sharding_attribute = left_array.to_shardy_tensor_sharding_attribute().unwrap();
-        let right_sharding_attribute = right_array.to_shardy_tensor_sharding_attribute().unwrap();
-        let output_sharding_attribute = left_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let left_sharding_attribute = left_array.sharding().to_mlir(location).unwrap().to_string();
+        let right_sharding_attribute = right_array.sharding().to_mlir(location).unwrap().to_string();
 
         assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
         assert_eq!(left_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
@@ -2222,7 +2222,7 @@ mod tests {
                         func.func @main(
                             %arg0: tensor<8x4xf32> {{sdy.sharding = {left_sharding_attribute}}},
                             %arg1: tensor<4x2xf32> {{sdy.sharding = {right_sharding_attribute}}}
-                        ) -> (tensor<8x2xf32> {{sdy.sharding = {output_sharding_attribute}}}) {{
+                        ) -> (tensor<8x2xf32> {{sdy.sharding = {left_sharding_attribute}}}) {{
                             %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0]
                                 : (tensor<8x4xf32>, tensor<4x2xf32>) -> tensor<8x2xf32>
                             return %0 : tensor<8x2xf32>

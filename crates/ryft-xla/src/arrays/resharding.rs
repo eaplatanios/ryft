@@ -12,6 +12,7 @@ use ryft_pjrt::{Buffer, BufferType, Client, Device as PjrtDevice, DeviceId, Erro
 use crate::arrays::placement::ArrayPlacement;
 use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError};
+use crate::types::DataTypeExtension;
 use crate::{CompiledFunction, Error, FromPjrt, Options, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
@@ -523,7 +524,7 @@ impl Array {
                             destination: device.id(),
                             transfer_key,
                             device: destination_device,
-                            element_type: Self::physical_buffer_type(data_type),
+                            element_type: data_type.executable_buffer_type(),
                             dimensions: cross_host_shape(destination.index(), &piece.shape())?,
                         });
                     }
@@ -618,7 +619,7 @@ impl Array {
         regions: &[Vec<ShardRegion>],
     ) -> Result<Option<HashMap<StaticShape, ryft_pjrt::Layout>>, Error> {
         let mut layouts = HashMap::new();
-        let element_type = Self::physical_buffer_type(self.data_type());
+        let element_type = self.data_type().executable_buffer_type();
         for (destination, regions) in destinations.iter().zip(regions) {
             for region in regions {
                 let source = self.shards()[region.source].device();

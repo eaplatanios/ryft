@@ -40,11 +40,12 @@ use ryft_core::{
     ValueDomainDispatch, WhilePredicate, Xor,
 };
 use ryft_macros::Parameter;
-use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
+use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
 use crate::arrays::metadata::ArrayMetadata;
 use crate::arrays::statistics::ArrayRegistration;
-use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
+use crate::types::DataTypeExtension;
+use crate::{Error, FromPjrt, Session, ToPjrt, Type};
 
 pub mod host;
 pub mod metadata;
@@ -464,7 +465,7 @@ impl Array {
     /// Returns an [`Error::Pjrt`] that wraps an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error if
     /// `session` belongs to a different PJRT client. The array's addressable shard buffers belong to its original
     /// client.
-    pub fn with_session(mut self, session: &Session) -> Result<Self, Error> {
+    pub(crate) fn with_session(mut self, session: &Session) -> Result<Self, Error> {
         if !std::ptr::eq(self.client(), session.client()) {
             return Err(PjrtError::invalid_argument(
                 "cannot associate an array with a session of a different PJRT client",
@@ -638,22 +639,6 @@ impl Array {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Renders the Shardy tensor sharding attribute (i.e., `#sdy.sharding<...>`) implied by this array, using the
-    /// canonical `@mesh` symbol name.
-    pub fn to_shardy_tensor_sharding_attribute(&self) -> Result<String, ryft_mlir::Error> {
-        let context = ryft_mlir::Context::new();
-        self.sharding().to_mlir(context.unknown_location()).map(|attribute| attribute.to_string())
-    }
-
-    /// Selects the buffer representation required by the current StableHLO executable boundary. General PJRT type
-    /// conversion remains faithful to native one-bit types, and only this array execution path uses predicate carriers.
-    pub(crate) fn physical_buffer_type(data_type: DataType) -> BufferType {
-        match data_type {
-            DataType::I1 | DataType::U1 => BufferType::Predicate,
-            _ => data_type.to_pjrt(),
-        }
-    }
-
     /// Returns the [`ArrayType`] and runtime placement of an array of type `r#type` that is constructed on `mesh` with
     /// the optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type
     /// carries the placement without its auto mesh axes. Without `sharding`, the placement is the sharding of
@@ -749,7 +734,7 @@ impl Array {
         // Zero-space values and one-bit integers use predicate carriers in this execution path. Converting a
         // carrier back to a `DataType` would incorrectly relabel those logical arrays as Boolean.
         let buffer_type = buffer.element_type()?;
-        let expected_buffer_type = Self::physical_buffer_type(r#type.data_type());
+        let expected_buffer_type = r#type.data_type().executable_buffer_type();
         let data_type =
             if buffer_type == expected_buffer_type { r#type.data_type() } else { DataType::from_pjrt(buffer_type)? };
         let shape = StaticShape::new(
@@ -1290,6 +1275,7 @@ mod tests {
         assert_send_sync, cpu_client, execution_client, logical_mesh_2x2, other_cpu_client, replicated_array,
         values_from_bytes, values_to_bytes,
     };
+    use crate::types::DataTypeExtension;
     use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
 
     use super::{Array, ArrayError, ArrayOutputPlan, ArrayTypeExtension, block_until_ready, ready};
@@ -1320,9 +1306,7 @@ mod tests {
             .iter()
             .zip(&devices)
             .map(|(bytes, device)| {
-                client
-                    .buffer(*bytes, Array::physical_buffer_type(data_type), [], None, device.clone(), None)
-                    .unwrap()
+                client.buffer(*bytes, data_type.executable_buffer_type(), [], None, device.clone(), None).unwrap()
             })
             .collect();
         Array::from_addressable_buffers(session, r#type, mesh, None, buffers).unwrap()
@@ -1914,33 +1898,6 @@ mod tests {
             Array::from_addressable_buffers(&other_session, array_type, mesh, Some(sharding), Vec::new()).unwrap();
         assert_eq!(array.addressable_shards().count(), 0);
         assert!(std::ptr::eq(array.client(), other_client));
-    }
-
-    #[test]
-    fn test_array_to_shardy_tensor_sharding_attribute() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 2);
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            mesh,
-            Some(sharding),
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        assert_eq!(array.to_shardy_tensor_sharding_attribute(), Ok("#sdy.sharding<@mesh, [{\"x\"}]>".to_string()));
-    }
-
-    #[test]
-    fn test_array_physical_buffer_type() {
-        assert_eq!(Array::physical_buffer_type(DataType::I1), BufferType::Predicate);
-        assert_eq!(Array::physical_buffer_type(DataType::U1), BufferType::Predicate);
-        assert_eq!(Array::physical_buffer_type(DataType::Boolean), BufferType::Predicate);
-        assert_eq!(Array::physical_buffer_type(DataType::I2), BufferType::I2);
-        assert_eq!(DataType::I1.to_pjrt(), BufferType::I1);
-        assert_eq!(DataType::U1.to_pjrt(), BufferType::U1);
     }
 
     #[test]

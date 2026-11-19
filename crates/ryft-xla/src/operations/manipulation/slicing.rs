@@ -704,6 +704,7 @@ mod tests {
         domain_mesh, f32_vector, program_array, read_first_shard, replicated_scalar_type, replicated_vector_type,
     };
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::types::DataTypeExtension;
     use crate::{Array, ArrayConstant, Constant, Options, Session, Type, Value, to_mlir_module_for_program};
 
     use super::*;
@@ -1100,7 +1101,7 @@ mod tests {
                 let inputs = [
                     (values_to_bytes(&values), BufferType::I64, vec![4]),
                     (values_to_bytes(&[42i64]), BufferType::I64, vec![1]),
-                    (index_bytes.clone(), Array::physical_buffer_type(index_type.data_type()), vec![]),
+                    (index_bytes.clone(), index_type.data_type().executable_buffer_type(), vec![]),
                     (values_to_bytes(&[size]), BufferType::I32, vec![]),
                 ]
                 .into_iter()

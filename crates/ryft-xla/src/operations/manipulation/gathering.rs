@@ -280,6 +280,7 @@ mod tests {
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::types::DataTypeExtension;
     use crate::{Array, ArrayConstant, Options, Session, Type, to_mlir_module_for_program};
 
     #[test]
@@ -490,7 +491,7 @@ mod tests {
                         client
                             .buffer(
                                 value.storage_bytes(),
-                                Array::physical_buffer_type(value.r#type().data_type()),
+                                value.r#type().data_type().executable_buffer_type(),
                                 value
                                     .r#type()
                                     .static_shape()

@@ -13,6 +13,7 @@ use ryft_pjrt::{
 use crate::arrays::shards::{ArrayShard, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError, ArrayTypeExtension};
 use crate::sessions::synchronization::HostCopy;
+use crate::types::DataTypeExtension;
 use crate::{Error, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
@@ -250,7 +251,7 @@ impl Array {
             let shard_shape = shard.shape();
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let shard_slice = shard.slice();
-            let buffer_type = Self::physical_buffer_type(data_type);
+            let buffer_type = data_type.executable_buffer_type();
             let zero_summand = mesh
                 .device_coordinates(shard.index())
                 .is_some_and(|coordinates| unreduced_axis_indices.iter().any(|&axis| coordinates[axis] != 0));
@@ -433,7 +434,7 @@ impl Array {
             return Self::zero(session, r#type, Some(sharding), mesh);
         }
 
-        let buffer_type = Self::physical_buffer_type(data_type);
+        let buffer_type = data_type.executable_buffer_type();
         let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
         let mut work = session.reserve_work();
         let mut buffers = Vec::with_capacity(uploads.len());
@@ -637,7 +638,7 @@ impl Array {
     pub(crate) fn relayout_through_host(&self, session: &Session, layout: &Layout) -> Result<Array, Error> {
         let r#type = self.r#type().into_owned().with_layout(layout.clone());
         let device_layout = layout.to_pjrt()?;
-        let buffer_type = Array::physical_buffer_type(self.data_type());
+        let buffer_type = self.data_type().executable_buffer_type();
         let client = session.client();
         let mut work = session.reserve_work();
         let mut buffers = Vec::new();

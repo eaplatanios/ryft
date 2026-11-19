@@ -455,9 +455,9 @@ impl Session {
     /// and dropping array handles changes nothing until the last handle of an array is dropped. All handles of the
     /// session share the counts, and independently built sessions count separately, even on the same PJRT client.
     ///
-    /// An array counts towards the session whose handle created its storage, and it keeps doing so after
-    /// [`Array::with_session`] changes the session used for dispatch. Each call to [`RetainedArray::to_array`] creates
-    /// a new logical array counted by the session that creates it. The new array shares the retained device buffers.
+    /// An array counts towards the session that created its storage, even when another session dispatches operations
+    /// on it. Each call to [`RetainedArray::to_array`] creates a logical array that counts towards the receiving
+    /// session and shares the retained device buffers.
     ///
     /// The counts are maintained without locks and cost nothing when arrays are cloned or dropped, so they are always
     /// available. A count of live arrays that keeps growing across the steps of a loop indicates retained arrays, and
@@ -1478,7 +1478,7 @@ impl SessionBuilder {
         self
     }
 
-    /// Builds a [`Session`] with a fresh [`EffectScope`].
+    /// Builds a [`Session`] with a fresh effect scope.
     ///
     /// # Errors
     ///
@@ -2299,14 +2299,20 @@ pub(crate) mod tests {
 
     #[test]
     fn test_session_named_axis() {
-        let client = execution_client();
-        assert!(Session::builder().client(client).build().unwrap().named_axis("x").is_none());
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
+        assert!(session.named_axis("x").is_none());
+        assert!(session.with_device_mesh(mesh).named_axis("x").is_none());
     }
 
     #[test]
     fn test_session_named_axes() {
-        let client = execution_client();
-        assert!(Session::builder().client(client).build().unwrap().named_axes().is_empty());
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Manual);
+        assert!(session.named_axes().is_empty());
+        assert!(session.with_device_mesh(mesh).named_axes().is_empty());
     }
 
     #[test]

@@ -254,6 +254,23 @@ impl FromPjrt<BufferType> for DataType {
     }
 }
 
+/// Extends [`DataType`] with its representation at the XLA executable boundary.
+pub(crate) trait DataTypeExtension {
+    /// Returns the PJRT buffer type for this data type in a StableHLO executable. Signed and unsigned one-bit
+    /// integers both lower to signless `i1` and use predicate buffers. Other types use their [`ToPjrt`] representation.
+    fn executable_buffer_type(self) -> BufferType;
+}
+
+impl DataTypeExtension for DataType {
+    #[inline]
+    fn executable_buffer_type(self) -> BufferType {
+        match self {
+            Self::I1 | Self::U1 => BufferType::Predicate,
+            _ => self.to_pjrt(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -411,5 +428,13 @@ mod tests {
             DataType::from_pjrt(BufferType::Invalid),
             Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: `invalid`",
         ));
+    }
+
+    #[test]
+    fn test_data_type_executable_buffer_type() {
+        assert_eq!(DataType::I1.executable_buffer_type(), BufferType::Predicate);
+        assert_eq!(DataType::U1.executable_buffer_type(), BufferType::Predicate);
+        assert_eq!(DataType::Boolean.executable_buffer_type(), BufferType::Predicate);
+        assert_eq!(DataType::I2.executable_buffer_type(), BufferType::I2);
     }
 }
