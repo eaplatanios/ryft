@@ -1,12 +1,3 @@
-//! Arrays that are kept alive without their sessions, for use as constants of staged programs.
-//!
-//! An [`Array`] carries the [`Session`] that it belongs to and caches of values derived from it, so a program that
-//! held one would keep alive the session whose caches hold the program. [`RetainedArray`] is the part of an array
-//! that is safe to store in a program. [`RetainedArray::new`] takes it from an array, and
-//! [`RetainedArray::to_array`] turns it back into an array of a chosen session.
-
-// TODO(eaplatanios): Review the module docstring.
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -22,15 +13,15 @@ use ryft_pjrt::{Client, DeviceId, ExecutionFence};
 use crate::Session;
 use crate::arrays::{Array, ArrayParts, ArrayShard, ShardIndex};
 
-/// Storage of an [`Array`] that is kept alive without the [`Session`] of that array, so that staged programs
-/// can hold it as a constant. A trace whose capture table cannot hold runtime arrays (e.g., the body of a
+/// Storage of an [`Array`] that is kept alive without the [`Session`] of that array, so that staged
+/// programs can hold it as a constant. A trace whose capture table cannot hold runtime arrays (e.g., the body of a
 /// [`rematerialize`](ryft_core::rematerialize) call or of a [`composite`](ryft_core::composite) and its rules, which
 /// are traced over constants alone) still needs to refer to the runtime arrays that a compiled function it calls has
-/// captured. Importing such an array through [`ThroughSession`](crate::ThroughSession) retains it and stages it as an immediate
-/// [`Constant::Session`](crate::Constant::Session), which can appear in any region of any program, including lazily traced derivative rules.
-/// Lifting that constant in a [`Session`] turns it back into an [`Array`], and lowering turns every distinct retained
-/// array of a program into a hidden executable argument that follows the captures of the program, so that compiled
-/// executables depend only on the array's type and never on its data.
+/// captured. Importing such an array through [`ThroughSession`](crate::ThroughSession) retains it and stages it as an
+/// immediate [`Constant::Session`](crate::Constant::Session), which can appear in any region of any program, including
+/// lazily traced derivative rules. Lifting that constant in a [`Session`] turns it back into an [`Array`], and lowering
+/// turns every distinct retained array of a program into a hidden executable argument that follows the captures of the
+/// program, so that compiled executables depend only on the array's type and never on its data.
 ///
 /// # Differences from [`Array`]
 ///
@@ -59,9 +50,9 @@ use crate::arrays::{Array, ArrayParts, ArrayShard, ShardIndex};
 /// [`Array`].
 #[derive(Clone, Parameter)]
 pub struct RetainedArray {
-    /// [`ArrayType`] that this retained array declares as a constant of a program, which is what [`Typed::r#type`]
-    /// returns. It is [`Self::actual_type`] until [`Self::rename_type_identities`] renames the identities in it
-    /// (i.e., the dimension variables of a bounded dynamic shape), which changes only this field.
+    /// [`ArrayType`] that this retained array declares as a constant of a program, which is what its [`Typed`]
+    /// implementation returns. It is [`Self::actual_type`] until [`Self::rename_type_identities`] renames the
+    /// identities in it (i.e., the dimension variables of a bounded dynamic shape), which changes only this field.
     declared_type: Arc<ArrayType>,
 
     /// [`ArrayType`] of the [`Array`] that was retained, shared with it. It never changes, and the arrays that
@@ -95,14 +86,13 @@ pub struct RetainedArray {
     client: &'static Client<'static>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl RetainedArray {
     /// Retains `array` without its session and its caches. Its device buffers stay alive for as long as the returned
-    /// value or any of its clones exists. Retaining one array more than once returns equal values, so that
-    /// repeatedly importing the same captured array (e.g., the weights that a compiled function captures) stages the
-    /// same constant every time.
-    pub(crate) fn new(array: &Array) -> Self {
+    /// value or any of its clones exists. Retaining one array more than once returns equal values, so that repeatedly
+    /// importing the same captured array (e.g., the weights that a compiled function captures) stages the same constant
+    /// every time.
+    #[inline]
+    pub fn new(array: &Array) -> Self {
         Self {
             declared_type: Arc::clone(&array.parts.r#type),
             actual_type: Arc::clone(&array.parts.r#type),
@@ -121,19 +111,21 @@ impl RetainedArray {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError::Type`] error if the buffers are owned by another PJRT client than the one of
-    /// `session`, which cannot use them.
-    pub(crate) fn to_array(&self, session: &Session) -> Result<Array, ProgramError> {
+    /// Returns a [`ProgramError::Type`] error if the buffers are owned by another PJRT client than the one
+    /// of `session`, which cannot use them.
+    pub fn to_array(&self, session: &Session) -> Result<Array, ProgramError> {
         if !std::ptr::eq(self.client, session.client()) {
             return Err(TypeError::invalid(format!(
-                "session constant `{self}` retains an array of a different PJRT client than the client of this \
-                 session",
+                "session constant `{self}` retains an array of a different PJRT client \
+                 than the client of this session",
             ))
             .into());
         }
+
+        crate::telemetry::array_constructed();
+
         // The new array has storage of its own, with empty value-local caches, and its shards refer to the same device
         // buffers. The parts need no validation because they come from an array that was already validated.
-        crate::telemetry::array_constructed();
         Ok(Array {
             parts: Arc::new(ArrayParts::new(
                 Arc::clone(&self.actual_type),
@@ -149,7 +141,8 @@ impl RetainedArray {
     }
 
     /// Returns this retained array with the identities of its type renamed by `renaming`.
-    pub(crate) fn rename_type_identities(
+    #[inline]
+    pub fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
@@ -157,10 +150,11 @@ impl RetainedArray {
     }
 }
 
-// The shards have no useful `Debug` representation, so retained arrays are described by their type and by the
-// identity of the array storage that they were created from, which is what distinguishes them.
 impl Debug for RetainedArray {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The shards have no useful `Debug` representation, so retained arrays are described by their type and by the
+        // identity of the array storage that they were created from, which is what distinguishes them.
         formatter
             .debug_struct("RetainedArray")
             .field("type", &self.declared_type)
@@ -169,11 +163,19 @@ impl Debug for RetainedArray {
     }
 }
 
-// Retained arrays are identified by the array storage that they were created from and by their type. The identity
-// of that storage stays reserved for as long as any of them holds it, so equal identities always mean the same array.
+impl Display for RetainedArray {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session:{}", self.declared_type)
+    }
+}
+
 impl PartialEq for RetainedArray {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        // Retained arrays are identified by the array storage that they were created from and by their type. The
+        // identity of that storage stays reserved for as long as any of them holds it, so equal identities always
+        // mean the same array.
         Weak::ptr_eq(&self.identity, &other.identity) && self.declared_type == other.declared_type
     }
 }
@@ -185,13 +187,6 @@ impl Hash for RetainedArray {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.identity.as_ptr().hash(state);
         self.declared_type.hash(state);
-    }
-}
-
-impl Display for RetainedArray {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "session:{}", self.declared_type)
     }
 }
 
