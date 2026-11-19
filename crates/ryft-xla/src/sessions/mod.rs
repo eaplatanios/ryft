@@ -276,10 +276,10 @@ impl Session {
         Self::builder().build()
     }
 
-    /// Returns a handle of this session whose default mesh is `mesh`. Eager values that are created from no array
-    /// inputs (e.g., arrays uploaded through [`Self::array`], constants, and zeros) are placed on it, and it is the
-    /// [`MeshContext::default_mesh`] of the handle, so eager code can omit meshes (e.g., `shard_map(.., None, ..)`).
-    /// The handle shares the resources and the effect scope of this session.
+    /// Returns a handle of this session whose default mesh is `mesh`. Host uploads through [`Array::from_host_buffer`]
+    /// and eager operations without array inputs, such as creating constants or zeros, use this mesh when none is
+    /// specified. The handle also exposes it through [`MeshContext::default_mesh`] for calls like
+    /// `shard_map(.., None, ..)`. The handle shares the resources and the effect scope of this session.
     #[inline]
     pub fn with_device_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
@@ -456,9 +456,8 @@ impl Session {
     /// session share the counts, and independently built sessions count separately, even on the same PJRT client.
     ///
     /// An array counts towards the session whose handle created its storage, and it keeps doing so after
-    /// [`Array::associate`] moves it to another session. Every array that [`RetainedArray::to_array`] creates is a new
-    /// logical array of the session that it is created in, even though it shares its device buffers with the array
-    /// that was retained.
+    /// [`Array::with_session`] changes the session used for dispatch. Each call to [`RetainedArray::to_array`] creates
+    /// a new logical array counted by the session that creates it. The new array shares the retained device buffers.
     ///
     /// The counts are maintained without locks and cost nothing when arrays are cloned or dropped, so they are always
     /// available. A count of live arrays that keeps growing across the steps of a loop indicates retained arrays, and
@@ -2039,11 +2038,11 @@ pub(crate) mod tests {
         assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 2 });
 
         // All handles of a session share its counts, while another session on the same client counts separately. An
-        // array keeps counting towards the session that created it after it is associated with another one.
+        // array keeps counting towards its original session after changing the session used for dispatch.
         let other_session = Session::builder().client(client).build().unwrap();
         let array = f32_vector(&session.with_new_effect_scope(), &mesh, &[1.0]);
         let retained = RetainedArray::new(&array);
-        let array = array.associate(&other_session).unwrap();
+        let array = array.with_session(&other_session).unwrap();
         assert_eq!(session.array_statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 3 });
         assert_eq!(other_session.array_statistics(), ArrayStatistics { live_arrays: 0, created_arrays: 0 });
 

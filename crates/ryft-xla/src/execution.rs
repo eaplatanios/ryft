@@ -649,7 +649,7 @@ impl Session {
             let expected = physical_type.layout().unwrap();
             if let Some(actual) = input.layout() {
                 if actual != expected {
-                    let source = input.clone().associate(self)?;
+                    let source = input.clone().with_session(self)?;
                     *input = source.cast(source.r#type().into_owned().with_layout(expected.clone()), &[])?;
                 }
             } else {
@@ -1395,7 +1395,7 @@ impl Session {
 
             // The operation runs in this session, which executes the program and is not necessarily the session of
             // the input.
-            let input = input.clone().associate(self)?;
+            let input = input.clone().with_session(self)?;
             physical_inputs[physical_input_index] =
                 input.pad(&zero, vec![0i64; rank].as_slice(), padding.as_slice(), vec![0usize; rank].as_slice())?;
         }

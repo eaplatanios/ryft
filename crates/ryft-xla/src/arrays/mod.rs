@@ -454,18 +454,17 @@ impl Array {
         self
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Associates this [`Array`] with `session` for future receiver-based dispatch, keeping its storage. This selects
-    /// a different effect scope or mesh of the same session, or a different session on the same PJRT client. It does
-    /// not merge or retroactively order work that was previously submitted through the array's former scope.
+    /// Returns this [`Array`] with `session` as the session for future receiver-based dispatch. This lets the handle
+    /// use another session, effect scope, or session mesh while keeping the array's storage, device placement, and
+    /// completion fences. Existing clones keep their session, and previously submitted work keeps its original scope
+    /// and ordering.
     ///
     /// # Errors
     ///
     /// Returns an [`Error::Pjrt`] that wraps an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error if
-    /// `session` belongs to a different PJRT client than this array. Arrays cannot move between clients because their
-    /// addressable shard buffers are owned by the client they were created on.
-    pub fn associate(mut self, session: &Session) -> Result<Self, Error> {
+    /// `session` belongs to a different PJRT client. The array's addressable shard buffers belong to its original
+    /// client.
+    pub fn with_session(mut self, session: &Session) -> Result<Self, Error> {
         if !std::ptr::eq(self.client(), session.client()) {
             return Err(PjrtError::invalid_argument(
                 "cannot associate an array with a session of a different PJRT client",
@@ -474,31 +473,6 @@ impl Array {
         }
         self.session = session.clone();
         Ok(self)
-    }
-
-    /// Returns the PJRT [`Client`] that this [`Array`] lives on, which is the client of its session.
-    ///
-    /// Note that the client cannot be recovered from the addressable shard buffers themselves. [`Buffer`]s only store
-    /// a raw handle to their owning PJRT client, by design, to avoid carrying the
-    /// [`KeyValueStore`](ryft_pjrt::KeyValueStore) lifetime. [`Client`] is an owning wrapper whose [`Drop`]
-    /// implementation destroys the underlying PJRT client, so no `&Client` can be materialized from that raw handle.
-    /// The session is therefore threaded through explicitly at array construction time instead, and
-    /// [`Buffer::is_owned_by`] validates that its client owns every addressable shard buffer.
-    #[inline]
-    pub fn client(&self) -> &'static Client<'static> {
-        self.session.client()
-    }
-
-    /// Returns the [`Session`] this [`Array`] belongs to.
-    #[inline]
-    pub fn session(&self) -> &Session {
-        &self.session
-    }
-
-    /// Returns the whole-execution completion fence shared by the outputs of this array's producer, when it has one.
-    #[inline]
-    pub(crate) fn execution_fence(&self) -> Option<&ExecutionFence> {
-        self.execution_fence.as_ref()
     }
 
     /// Returns the [`DataType`] of the elements stored in this [`Array`].
@@ -519,9 +493,8 @@ impl Array {
         self.parts.metadata.r#type().layout()
     }
 
-    /// Returns the runtime placement of this [`Array`] over all mesh axes, which corresponds to `jax.Array.sharding`.
-    /// Unlike the sharding of its [`Typed`] type, which records only placement over explicit and manual mesh axes and
-    /// corresponds to `jax.typeof(x).sharding`, it also records placement over auto mesh axes.
+    /// Returns the runtime placement of this [`Array`] over all mesh axes. Unlike the sharding of its [`Typed`] type,
+    /// which records only placement over explicit and manual mesh axes, it also records placement over auto mesh axes.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
         self.parts.metadata.sharding()
@@ -567,6 +540,32 @@ impl Array {
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
         self.parts.metadata.r#type().size_in_bytes()
     }
+
+    /// Returns the whole-execution completion fence shared by the outputs of this array's producer, when it has one.
+    #[inline]
+    pub fn execution_fence(&self) -> Option<&ExecutionFence> {
+        self.execution_fence.as_ref()
+    }
+
+    /// Returns the [`Session`] this [`Array`] belongs to.
+    #[inline]
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Returns the PJRT [`Client`] that this [`Array`] lives on, which is the client of its session. Note that the
+    /// client cannot be recovered from the addressable shard buffers themselves. [`Buffer`]s only store a raw handle to
+    /// their owning PJRT client, by design, to avoid carrying the [`KeyValueStore`](ryft_pjrt::KeyValueStore) lifetime.
+    /// [`Client`] is an owning wrapper whose [`Drop`] implementation destroys the underlying PJRT client, so no
+    /// `&Client` can be materialized from that raw handle. The session is therefore threaded through explicitly at
+    /// array construction time instead, and [`Buffer::is_owned_by`] validates that its client owns every addressable
+    /// shard buffer.
+    #[inline]
+    pub fn client(&self) -> &'static Client<'static> {
+        self.session.client()
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns whether this array has no clones and every addressable shard buffer is uniquely owned by it. An array
     /// without any shard buffers (e.g., a bufferless zero-space array) is never reported as uniquely owned, so it is
@@ -1778,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_associate() {
+    fn test_array_with_session() {
         let client = cpu_client(1);
         let other_client = other_cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
@@ -1786,40 +1785,38 @@ mod tests {
             .unwrap();
         let original = array.clone();
 
-        // Associating with a handle of the same session that has a new effect scope switches the effect scope while
-        // keeping the array's storage.
+        // A handle of the same session with a new effect scope switches the scope while sharing storage.
         let fork = session.with_new_effect_scope();
-        let reassociated = array.clone().associate(&fork).unwrap();
-        assert!(reassociated.session().is_same_session(&session));
-        assert!(shares_effect_scope(reassociated.session(), &fork));
-        assert!(!shares_effect_scope(reassociated.session(), original.session()));
-        assert_eq!(reassociated, original);
+        let scoped = array.clone().with_session(&fork).unwrap();
+        assert!(scoped.session().is_same_session(&session));
+        assert!(shares_effect_scope(scoped.session(), &fork));
+        assert!(!shares_effect_scope(scoped.session(), original.session()));
+        assert_eq!(scoped, original);
 
-        // Associating with a handle of another session on the same client switches the session, and therefore its
-        // compilation cache and effect scope, while keeping the array's storage.
+        // A different session on the same client uses its own compilation cache and effect scope.
         let other_session = Session::builder().client(client).build().unwrap();
-        let reassociated = array.associate(&other_session.with_new_effect_scope()).unwrap();
-        assert!(reassociated.session().is_same_session(&other_session));
-        assert!(std::ptr::eq(reassociated.client(), client));
-        assert_eq!(reassociated, original);
+        let switched = array.with_session(&other_session.with_new_effect_scope()).unwrap();
+        assert!(switched.session().is_same_session(&other_session));
+        assert!(std::ptr::eq(switched.client(), client));
+        assert_eq!(switched, original);
 
-        // Receiver-based operations on the reassociated array compile and execute in the other session.
-        let negated = Neg::neg(&reassociated).unwrap();
+        // Receiver-based operations use the other session for compilation and execution.
+        let negated = Neg::neg(&switched).unwrap();
         assert_eq!(negated.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![-1f32]);
         assert_eq!(other_session.cached_program_count(), 1);
         assert_eq!(session.cached_program_count(), 0);
 
-        // Re-association never affects the clones that existed beforehand, which keep their original session.
+        // Existing clones keep their original session and scope.
         assert!(original.session().is_same_session(&session));
         assert!(shares_effect_scope(original.session(), &session));
 
-        // Association rejects a session of a different client, even when no numerical buffer could establish
+        // `with_session` rejects a session of a different client, even when no numerical buffer could establish
         // ownership (e.g., for bufferless zero-space arrays).
         let other_client_session = Session::builder().client(other_client).build().unwrap();
         let zero = Array::from_host_buffer(&session, ArrayType::scalar(DataType::Zero), None, None, []).unwrap();
         for array in [original, zero] {
             assert!(matches!(
-                array.associate(&other_client_session),
+                array.with_session(&other_client_session),
                 Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))
                     if message == "cannot associate an array with a session of a different PJRT client",
             ));
