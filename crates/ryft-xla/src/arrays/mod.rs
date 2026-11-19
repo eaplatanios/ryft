@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
     Add, And, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, Device, DeviceId, DeviceMesh,
@@ -53,9 +53,11 @@ pub mod device_put;
 pub(crate) mod host;
 pub(crate) mod materialization;
 pub mod placement;
+pub mod retained;
 
 pub use device_put::{DevicePutLeaf, DevicePutOptions};
 pub use placement::DevicePutTarget;
+pub use retained::RetainedArray;
 
 /// Represents errors produced while validating distributed [`Array`] metadata and buffers, placing arrays on devices,
 /// or materializing arrays on the host.
@@ -1085,76 +1087,6 @@ impl Array {
     pub fn to_shardy_tensor_sharding_attribute(&self) -> Result<String, ryft_mlir::Error> {
         let context = ryft_mlir::Context::new();
         self.sharding().to_mlir(context.unknown_location()).map(|attribute| attribute.to_string())
-    }
-
-    /// Returns a weak handle to the storage that this [`Array`] shares with its clones. It identifies that storage
-    /// without keeping it or its value-local caches alive. For as long as the handle exists, the address of the
-    /// storage stays reserved, so no other array can have the same identity. A [`RetainedArray`](crate::RetainedArray)
-    /// holds it to recognize repeated retentions of one array.
-    #[inline]
-    pub(crate) fn storage_identity(&self) -> Weak<ArrayParts> {
-        Arc::downgrade(&self.parts)
-    }
-
-    /// Returns the shared handle to the [`ArrayType`] of this [`Array`], for callers that need to share it with
-    /// another array without copying it. Use [`Self::r#type`] to only read the type.
-    #[inline]
-    pub(crate) fn shared_type(&self) -> &Arc<ArrayType> {
-        &self.parts.r#type
-    }
-
-    /// Returns the shared handle to the runtime [`Sharding`] of this [`Array`], for callers that need to share it
-    /// with another array without copying it. Use [`Self::sharding`] to only read the sharding.
-    #[inline]
-    pub(crate) fn shared_sharding(&self) -> &Arc<Sharding> {
-        &self.parts.sharding
-    }
-
-    /// Returns the shared handle to the lookup table that maps each [`DeviceId`] to the [`ShardIndex`] of its shard,
-    /// for callers that need to share it with another array without copying it.
-    #[inline]
-    pub(crate) fn shared_shard_index_by_device(&self) -> &Arc<HashMap<DeviceId, ShardIndex>> {
-        &self.parts.shard_index_by_device
-    }
-
-    /// Returns the shared handle to the [`DeviceMesh`] of this [`Array`], for callers that need to share it with
-    /// another array without copying it. Use [`Self::mesh`] to only read the mesh.
-    #[inline]
-    pub(crate) fn shared_mesh(&self) -> &Arc<DeviceMesh> {
-        &self.parts.mesh
-    }
-
-    /// Returns the completion fence of the cross-host sends of the placement that produced this array, when it
-    /// issued any. Refer to the `send_fence` field of [`Array`] for more information.
-    #[inline]
-    pub(crate) fn send_fence(&self) -> Option<&ExecutionFence> {
-        self.send_fence.as_ref()
-    }
-
-    /// Creates an [`Array`] that belongs to `session` from parts that it shares with an existing array (i.e., the
-    /// values that [`Self::shared_type`], [`Self::shared_sharding`], [`Self::shards`],
-    /// [`Self::shared_shard_index_by_device`], [`Self::shared_mesh`], [`Self::execution_fence`], and
-    /// [`Self::send_fence`] return for that array). The new array has storage of its own with empty value-local
-    /// caches, while its shards refer to the same device buffers. The parts are not validated, because they come from
-    /// an array that already was.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_shared_parts(
-        session: &Session,
-        r#type: Arc<ArrayType>,
-        sharding: Arc<Sharding>,
-        shards: Vec<ArrayShard>,
-        shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
-        mesh: Arc<DeviceMesh>,
-        execution_fence: Option<ExecutionFence>,
-        send_fence: Option<ExecutionFence>,
-    ) -> Self {
-        crate::telemetry::array_constructed();
-        Self {
-            parts: Arc::new(ArrayParts::new(r#type, sharding, shards, shard_index_by_device, mesh)),
-            execution_fence,
-            send_fence,
-            session: session.clone(),
-        }
     }
 
     /// Selects the buffer representation required by the current StableHLO executable boundary. General PJRT type
@@ -2202,9 +2134,8 @@ impl ArrayTypeExtension for ArrayType {
     }
 }
 
-/// Immutable storage of an [`Array`] that its clones share. Other modules only name this type to hold the
-/// identity that [`Array::storage_identity`] returns.
-pub(crate) struct ArrayParts {
+/// Immutable storage of an [`Array`] that its clones share.
+struct ArrayParts {
     /// [`ArrayType`] of the [`Array`], shared with the other arrays produced for the same compiled program output. Its
     /// sharding is [`Self::sharding`] without auto mesh axes, because types never record placement over those axes.
     r#type: Arc<ArrayType>,

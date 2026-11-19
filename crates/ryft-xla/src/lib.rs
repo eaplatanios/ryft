@@ -36,8 +36,8 @@ pub mod types;
 pub mod values;
 
 pub use arrays::{
-    Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutTarget, ShardDescriptor, ShardIndex,
-    ShardLayout, block_until_ready, ready,
+    Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutTarget, RetainedArray, ShardDescriptor,
+    ShardIndex, ShardLayout, block_until_ready, ready,
 };
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
@@ -82,7 +82,7 @@ pub use operations::{
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use sessions::{
     CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, Platform,
-    RUNTIME_REQUIREMENTS_ATTRIBUTE, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
+    RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
     RuntimeRequirement, Session, SessionBuilder, SessionError, Target, TargetDevice, ThroughSession, Tracer,
     normalize_runtime_requirements,
 };
