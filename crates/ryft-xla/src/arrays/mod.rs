@@ -1341,14 +1341,13 @@ impl ArrayOutputLayout {
 }
 
 /// Provides XLA-specific helpers for [`ArrayType`]s.
-pub(crate) trait ArrayTypeExtension {
+pub trait ArrayTypeExtension {
     /// Returns the number of logical payload bytes required by a dense [`Array`] of this [`ArrayType`].
     /// [`DataType::Zero`] requires no payload bytes even though a backend may use a temporary private carrier.
     fn size_in_bytes(&self) -> Result<usize, Error>;
 }
 
 impl ArrayTypeExtension for ArrayType {
-    #[inline]
     fn size_in_bytes(&self) -> Result<usize, Error> {
         if self.data_type().is_zero() {
             return Ok(0);
@@ -1359,7 +1358,8 @@ impl ArrayTypeExtension for ArrayType {
         let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
         element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
-                "dense byte size for array type `{self}` exceeds the maximum allowed size of {}",
+                "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
+                self,
                 usize::MAX,
             ),
         })
@@ -1388,7 +1388,7 @@ struct ArrayParts {
     /// Value-local cache of lazily padded device materializations with bound shapes, allocated on first use.
     bounded_materializations: OnceLock<Arc<BoundedMaterializationCache>>,
 
-    /// Value-local LRU of device-resident scalar arguments for bounded logical extents.
+    /// Value-local Least Recently Used (LRU) cache of device-resident scalar arguments for bounded logical extents.
     logical_extent_scalars: Mutex<VecDeque<(i32, Array)>>,
 
     /// Registration of this storage as one logical array of the session that created it, which keeps the array counted
