@@ -364,7 +364,7 @@ impl Array {
             .map(|descriptor| {
                 let buffer = buffers_by_device.remove(&descriptor.device().id());
                 if zero_space && buffer.is_some() {
-                    ArrayShard::new_zero(descriptor)
+                    ArrayShard::zero(descriptor)
                 } else {
                     ArrayShard::new(descriptor, buffer)
                 }
@@ -421,7 +421,7 @@ impl Array {
                             process_index,
                         }));
                     }
-                    Ok(ArrayShard::new_zero(descriptor))
+                    Ok(ArrayShard::zero(descriptor))
                 } else {
                     Ok(ArrayShard::new(descriptor, None))
                 }
@@ -485,7 +485,7 @@ impl Array {
             .map(|(descriptor, position)| match position {
                 // Zero-space outputs need no storage. A returned carrier holds only false bits and is discarded like in
                 // the validating constructors, and a program may also return no carrier at all.
-                Some(_) if zero_space => ArrayShard::new_zero(descriptor.clone()),
+                Some(_) if zero_space => ArrayShard::zero(descriptor.clone()),
                 Some(position) => {
                     let buffer = buffers.get_mut(*position).and_then(Option::take).map(Arc::new);
                     ArrayShard::new(descriptor.clone(), buffer)

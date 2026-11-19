@@ -15,14 +15,14 @@ use crate::{Error, Session};
 /// [`ArrayShard::descriptor`]. They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the
 /// current process, a bufferless marker for the unique value of [`DataType::Zero`](ryft_core::DataType::Zero), or
 /// metadata only when the shard belongs to another process. This lets an array describe its full global layout
-/// without allocating meaningless zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s so
-/// cloned arrays can share them.
+/// without allocating meaningless zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s
+/// so that cloned arrays can share them.
 #[derive(Clone)]
 pub struct ArrayShard {
     /// Refer to the documentation of [`Self::descriptor`] for information on this field.
     descriptor: ShardDescriptor,
 
-    /// Physical storage state for this shard.
+    /// Physical storage state for this [`ArrayShard`].
     storage: ArrayShardStorage,
 }
 
@@ -35,9 +35,9 @@ impl ArrayShard {
         Self { descriptor, storage }
     }
 
-    /// Creates a process-local bufferless [`DataType::Zero`](ryft_core::DataType::Zero) shard.
+    /// Creates a process-local bufferless [`DataType::Zero`](ryft_core::DataType::Zero)-valued [`ArrayShard`].
     #[inline]
-    pub(super) fn new_zero(descriptor: ShardDescriptor) -> Self {
+    pub fn zero(descriptor: ShardDescriptor) -> Self {
         Self { descriptor, storage: ArrayShardStorage::Zero }
     }
 
@@ -49,7 +49,7 @@ impl ArrayShard {
     }
 
     /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
-    /// addressable bufferless [`DataType::Zero`](ryft_core::DataType::Zero) shard.
+    /// addressable bufferless [`DataType::Zero`](ryft_core::DataType::Zero)-valued shard.
     #[inline]
     pub fn buffer(&self) -> Option<&Arc<Buffer<'static>>> {
         match &self.storage {
@@ -58,25 +58,25 @@ impl ArrayShard {
         }
     }
 
-    /// Returns this [`ArrayShard`]'s global index.
+    /// Returns this [`ArrayShard`]'s [`ShardDescriptor::index`].
     #[inline]
     pub fn index(&self) -> ShardIndex {
         self.descriptor.index()
     }
 
-    /// Returns the [`Device`] that owns this [`ArrayShard`].
+    /// Returns this [`ArrayShard`]'s [`ShardDescriptor::device`].
     #[inline]
     pub fn device(&self) -> Device {
         self.descriptor.device()
     }
 
-    /// Returns the [`ShardDescriptor::slice`] covered by this [`ArrayShard`].
+    /// Returns this [`ArrayShard`]'s [`ShardDescriptor::slice`].
     #[inline]
     pub fn slice(&self) -> &[Range<usize>] {
         self.descriptor.slice()
     }
 
-    /// Returns the local [`StaticShape`] of this [`ArrayShard`].
+    /// Returns this [`ArrayShard`]'s [`ShardDescriptor::shape`].
     #[inline]
     pub fn shape(&self) -> StaticShape {
         self.descriptor.shape()
@@ -96,16 +96,19 @@ impl ArrayShard {
     /// These bytes are a tile of the [`Array`](crate::Array) that this shard belongs to, unless the [`Sharding`] of
     /// that array has unreduced axes, in which case they are the separate value that this device holds for that tile
     /// (e.g., a summand). This function also observes only this shard's buffer. Use
-    /// [`Array::copy_to_host`](crate::Array::copy_to_host) to read the whole value of an array and to surface the
-    /// errors of the whole execution that produced it.
+    /// [`Array::copy_to_host`](crate::Array::copy_to_host) to read the whole value
+    /// of an array and to surface the errors of the whole execution that produced it.
     ///
     /// # Errors
     ///
     /// Returns [`ArrayError::MissingShardBuffer`] when this shard lives in another process. PJRT transfer failures
     /// are returned unchanged.
+    #[inline]
     pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
         self.copy_to_host_internal(None)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Copies this shard, tracking the transfer when the caller has its owning session.
     pub(super) fn copy_to_host_internal(&self, session: Option<&Session>) -> Result<Vec<u8>, Error> {
@@ -428,17 +431,17 @@ impl ShardLayout {
     }
 }
 
-/// Physical storage state of one [`ArrayShard`].
+/// Physical storage state of an [`ArrayShard`].
 #[derive(Clone)]
 enum ArrayShardStorage {
     /// The shard belongs to another process and has no process-local storage.
     Remote,
 
     /// The shard is process-local but represents the unique value of
-    /// [`DataType::Zero`](ryft_core::DataType::Zero) without a buffer.
+    /// [`DataType::Zero`](ryft_core::DataType::Zero) without an underlying buffer.
     Zero,
 
-    /// The shard is process-local and backed by a PJRT buffer.
+    /// The shard is process-local and backed by a PJRT [`Buffer`].
     Buffer(Arc<Buffer<'static>>),
 }
 
