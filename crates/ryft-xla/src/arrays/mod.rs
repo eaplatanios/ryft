@@ -42,10 +42,12 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
 
+use crate::arrays::metadata::ArrayMetadata;
 use crate::arrays::statistics::ArrayRegistration;
 use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
 
 pub mod host;
+pub mod metadata;
 pub mod placement;
 pub mod resharding;
 pub mod retained;
@@ -282,14 +284,8 @@ impl Array {
         buffers: Vec<Arc<Buffer<'static>>>,
         validate_zero_carriers: bool,
     ) -> Result<Self, Error> {
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
-
-        // Compute the global `ShardLayout` implied by the runtime placement and concrete device mesh.
-        let shape = r#type
-            .static_shape()
-            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
-        let (descriptors, shard_index_by_device) = layout.into_parts();
+        // Derive the metadata and the global shard descriptors implied by the runtime placement and the device mesh.
+        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh)?;
 
         // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device and
         // buffers that the session's client does not own.
@@ -297,9 +293,9 @@ impl Array {
         for buffer in buffers {
             let device_id = Self::validate_addressable_buffer(
                 session.client(),
-                &r#type,
+                metadata.r#type(),
                 &descriptors,
-                &shard_index_by_device,
+                metadata.shard_index_by_device(),
                 &buffer,
                 validate_zero_carriers,
             )?;
@@ -311,7 +307,7 @@ impl Array {
 
         // Materialize the global shard list with local storage attached to the shards addressable from this process.
         // A validated zero-space carrier is discarded because its false bits carry no logical information.
-        let zero_space = r#type.data_type().is_zero();
+        let zero_space = metadata.r#type().data_type().is_zero();
         let shards = descriptors
             .into_iter()
             .map(|descriptor| {
@@ -325,14 +321,7 @@ impl Array {
             .collect::<Vec<_>>();
 
         Ok(Self {
-            parts: Arc::new(ArrayParts::new(
-                session,
-                Arc::new(r#type),
-                Arc::new(sharding),
-                shards,
-                Arc::new(shard_index_by_device),
-                Arc::new(mesh),
-            )),
+            parts: Arc::new(ArrayParts::new(session, Arc::new(metadata), shards)),
             execution_fence: None,
             send_fence: None,
             session: session.clone(),
@@ -355,12 +344,7 @@ impl Array {
             .into());
         }
 
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
-        let shape = r#type
-            .static_shape()
-            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
-        let (descriptors, shard_index_by_device) = layout.into_parts();
+        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh)?;
         let client = session.client();
         let process_index = client.process_index()?;
         let addressable_device_ids =
@@ -384,14 +368,7 @@ impl Array {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            parts: Arc::new(ArrayParts::new(
-                session,
-                Arc::new(r#type),
-                Arc::new(sharding),
-                shards,
-                Arc::new(shard_index_by_device),
-                Arc::new(mesh),
-            )),
+            parts: Arc::new(ArrayParts::new(session, Arc::new(metadata), shards)),
             execution_fence: None,
             send_fence: None,
             session: session.clone(),
@@ -401,19 +378,19 @@ impl Array {
     // TODO(eaplatanios): Review from here onwards.
 
     /// Creates an [`Array`] that belongs to `session` from the per-device `buffers` that one execution of a compiled
-    /// program returned for one of its outputs, placed according to that output's precomputed `layout`. The buffers
-    /// must be ordered like the addressable devices that `layout` was created for, and `fence` is the whole-execution
+    /// program returned for one of its outputs, placed according to that output's precomputed `plan`. The buffers
+    /// must be ordered like the addressable devices that `plan` was created for, and `fence` is the whole-execution
     /// completion fence of the launch.
     ///
     /// Unlike [`Self::from_addressable_buffers`], this constructor does not query the buffers' devices, memories,
     /// element types, or dimensions, because XLA guarantees those properties for the buffers that it returns from a
     /// program whose signature Ryft lowered, and skipping the queries keeps each execution free of per-output PJRT
-    /// calls. Low-level compile options can override the layouts and the memories of that signature, so the execution
-    /// plan that provides `layout` exists only for an executable whose reported layouts and memory kinds match the
-    /// declared output types. In builds with debug assertions, every buffer is still validated with the same checks.
+    /// calls. Low-level compile options can override the layouts and the memories of that signature, so an execution
+    /// plan provides `plan` only for an executable whose reported layouts and memory kinds match the declared output
+    /// types. In builds with debug assertions, every buffer is still validated with the same checks.
     pub(crate) fn from_execution_output(
         session: &Session,
-        layout: &ArrayOutputLayout,
+        plan: &ArrayOutputPlan,
         buffers: Vec<Buffer<'static>>,
         fence: ExecutionFence,
     ) -> Self {
@@ -421,26 +398,27 @@ impl Array {
         for (position, buffer) in buffers.iter().enumerate() {
             let device_id = Self::validate_addressable_buffer(
                 session.client(),
-                &layout.r#type,
-                &layout.descriptors,
-                &layout.shard_index_by_device,
+                plan.metadata.r#type(),
+                &plan.descriptors,
+                plan.metadata.shard_index_by_device(),
                 buffer,
                 false,
             );
             debug_assert!(
                 device_id.as_ref().is_ok_and(|device_id| {
-                    layout.descriptors[layout.shard_index_by_device[device_id]].device().id() == *device_id
-                        && layout.buffer_positions[layout.shard_index_by_device[device_id]] == Some(position)
+                    let shard_index = plan.metadata.shard_index_by_device()[device_id];
+                    plan.descriptors[shard_index].device().id() == *device_id
+                        && plan.buffer_positions[shard_index] == Some(position)
                 }),
                 "execution output buffer {position} does not match its planned placement: {device_id:?}",
             );
         }
-        let zero_space = layout.r#type.data_type().is_zero();
+        let zero_space = plan.metadata.r#type().data_type().is_zero();
         let mut buffers = buffers.into_iter().map(Some).collect::<Vec<_>>();
-        let shards = layout
+        let shards = plan
             .descriptors
             .iter()
-            .zip(layout.buffer_positions.iter())
+            .zip(plan.buffer_positions.iter())
             .map(|(descriptor, position)| match position {
                 // Zero-space outputs need no storage. A returned carrier holds only false bits and is discarded like in
                 // the validating constructors, and a program may also return no carrier at all.
@@ -453,14 +431,7 @@ impl Array {
             })
             .collect::<Vec<_>>();
         Self {
-            parts: Arc::new(ArrayParts::new(
-                session,
-                Arc::clone(&layout.r#type),
-                Arc::clone(&layout.sharding),
-                shards,
-                Arc::clone(&layout.shard_index_by_device),
-                Arc::clone(&layout.mesh),
-            )),
+            parts: Arc::new(ArrayParts::new(session, Arc::clone(&plan.metadata), shards)),
             execution_fence: Some(fence),
             send_fence: None,
             session: session.clone(),
@@ -532,19 +503,19 @@ impl Array {
     /// Returns the [`DataType`] of the elements stored in this [`Array`].
     #[inline]
     pub fn data_type(&self) -> DataType {
-        self.parts.r#type.data_type()
+        self.parts.metadata.r#type().data_type()
     }
 
     /// Returns the global [`StaticShape`] of this [`Array`].
     #[inline]
     pub fn shape(&self) -> StaticShape {
-        self.parts.r#type.static_shape().unwrap()
+        self.parts.metadata.r#type().static_shape().unwrap()
     }
 
     /// Returns the physical storage [`Layout`] of this [`Array`] if it is known.
     #[inline]
     pub fn layout(&self) -> Option<&Layout> {
-        self.parts.r#type.layout()
+        self.parts.metadata.r#type().layout()
     }
 
     /// Returns the runtime placement of this [`Array`] over all mesh axes, which corresponds to `jax.Array.sharding`.
@@ -552,14 +523,14 @@ impl Array {
     /// corresponds to `jax.typeof(x).sharding`, it also records placement over auto mesh axes.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
-        &self.parts.sharding
+        self.parts.metadata.sharding()
     }
 
     /// Returns the concrete [`DeviceMesh`] implied by this [`Array`]'s global shard placement metadata (i.e., the
     /// mesh that the array was constructed over).
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
-        &self.parts.mesh
+        self.parts.metadata.mesh()
     }
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
@@ -578,7 +549,8 @@ impl Array {
     /// [`DeviceId`], if such a shard exists.
     #[inline]
     pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard> {
-        self.parts.shard_index_by_device.get(&device_id).and_then(|index| self.parts.shards.get(*index))
+        let index = self.parts.metadata.shard_index_by_device().get(&device_id)?;
+        self.parts.shards.get(*index)
     }
 
     /// Returns the _addressable_ [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
@@ -592,7 +564,7 @@ impl Array {
     /// Bufferless [`DataType::Zero`] arrays occupy zero bytes.
     #[inline]
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
-        self.parts.r#type.size_in_bytes()
+        self.parts.metadata.r#type().size_in_bytes()
     }
 
     /// Returns whether this array has no clones and every addressable shard buffer is uniquely owned by it. An array
@@ -815,8 +787,8 @@ impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Array")
-            .field("type", &self.parts.r#type)
-            .field("sharding", &self.parts.sharding)
+            .field("type", self.parts.metadata.r#type())
+            .field("sharding", self.parts.metadata.sharding())
             .field("shards", &self.shards())
             .finish()
     }
@@ -824,7 +796,7 @@ impl Debug for Array {
 
 impl Display for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "array(type={})", self.parts.r#type)
+        write!(formatter, "array(type={})", self.parts.metadata.r#type())
     }
 }
 
@@ -840,8 +812,8 @@ impl PartialEq for Array {
     fn eq(&self, other: &Self) -> bool {
         let (left, right) = (&self.parts, &other.parts);
         Arc::ptr_eq(left, right)
-            || (left.r#type == right.r#type
-                && left.sharding == right.sharding
+            || (left.metadata.r#type() == right.metadata.r#type()
+                && left.metadata.sharding() == right.metadata.sharding()
                 && left.shards.len() == right.shards.len()
                 && left.shards.iter().zip(right.shards.iter()).all(|(left, right)| {
                     match (left.storage(), right.storage()) {
@@ -859,7 +831,7 @@ impl Typed for Array {
     type Type = ArrayType;
 
     fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.parts.r#type)
+        Cow::Borrowed(self.parts.metadata.r#type())
     }
 }
 
@@ -1197,13 +1169,11 @@ pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Resul
 
 /// Placement of one output of a compiled program, computed once per program so that every execution can build that
 /// output's [`Array`] from the returned buffers (refer to [`Array::from_execution_output`]) without deriving or
-/// validating its placement again. Every array built from one layout shares its type, device index, and mesh.
-pub(crate) struct ArrayOutputLayout {
-    /// [`ArrayType`] of the output, which has a static shape and sharding metadata.
-    r#type: Arc<ArrayType>,
-
-    /// Runtime placement of the output over all mesh axes.
-    sharding: Arc<Sharding>,
+/// validating its placement again. Every array built from one plan shares its [`ArrayMetadata`].
+pub(crate) struct ArrayOutputPlan {
+    /// Type and runtime placement of the output, which every array built from this plan shares. The type has a
+    /// static shape and sharding metadata.
+    metadata: Arc<ArrayMetadata>,
 
     /// Shard descriptors of the output, in mesh order.
     descriptors: Vec<ShardDescriptor>,
@@ -1211,16 +1181,10 @@ pub(crate) struct ArrayOutputLayout {
     /// For each shard, the position of its buffer among the executable's addressable devices, or [`None`] for a shard
     /// that is not addressable from the current process.
     buffer_positions: Vec<Option<usize>>,
-
-    /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es.
-    shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
-
-    /// Concrete [`DeviceMesh`] that the output is placed on.
-    mesh: Arc<DeviceMesh>,
 }
 
-impl ArrayOutputLayout {
-    /// Creates the layout of an output of type `r#type` placed on `mesh` according to `sharding`, whose buffers an
+impl ArrayOutputPlan {
+    /// Creates the plan of an output of type `r#type` placed on `mesh` according to `sharding`, whose buffers an
     /// execution returns in the order of `addressable_device_ids`. When `sharding` is [`None`], the output is placed
     /// according to the sharding of `r#type`, or replicated when `r#type` has no sharding.
     ///
@@ -1231,28 +1195,17 @@ impl ArrayOutputLayout {
     pub(crate) fn new(
         r#type: ArrayType,
         sharding: Option<Sharding>,
-        mesh: Arc<DeviceMesh>,
+        mesh: &DeviceMesh,
         addressable_device_ids: &[DeviceId],
     ) -> Result<Self, Error> {
-        let (r#type, sharding) = Array::resolve_placement(r#type, sharding, &mesh)?;
-        let shape = r#type
-            .static_shape()
-            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-        let (descriptors, shard_index_by_device) = ShardLayout::new(&shape, &mesh, &sharding)?.into_parts();
+        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh.clone())?;
         let buffer_positions = descriptors
             .iter()
             .map(|descriptor| {
                 addressable_device_ids.iter().position(|device_id| *device_id == descriptor.device().id())
             })
             .collect();
-        Ok(Self {
-            r#type: Arc::new(r#type),
-            sharding: Arc::new(sharding),
-            descriptors,
-            buffer_positions,
-            shard_index_by_device: Arc::new(shard_index_by_device),
-            mesh,
-        })
+        Ok(Self { metadata: Arc::new(metadata), descriptors, buffer_positions })
     }
 }
 
@@ -1284,22 +1237,13 @@ impl ArrayTypeExtension for ArrayType {
 
 /// Immutable storage of an [`Array`] that its clones share.
 struct ArrayParts {
-    /// [`ArrayType`] of the [`Array`], shared with the other arrays produced for the same compiled program output. Its
-    /// sharding is [`Self::sharding`] without auto mesh axes, because types never record placement over those axes.
-    r#type: Arc<ArrayType>,
+    /// Type and runtime placement of the [`Array`]. It is shared because it does not depend on the device buffers, so
+    /// the arrays that one compiled program produces for the same output share it, and so do the retained arrays and
+    /// the live array descriptions that are created from the array.
+    metadata: Arc<ArrayMetadata>,
 
-    /// Runtime placement of the [`Array`] over all mesh axes, including the auto mesh axes that its type omits.
-    sharding: Arc<Sharding>,
-
-    /// [`ArrayShard`]s that make up the [`Array`].
+    /// [`ArrayShard`]s that make up the [`Array`], in the order of the shard indices of [`Self::metadata`].
     shards: Vec<ArrayShard>,
-
-    /// Lookup table that maps each [`DeviceId`] to the [`ShardIndex`] of its shard in [`Self::shards`]. It is shared
-    /// because it depends only on the placement, so arrays produced by one compiled program share it.
-    shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
-
-    /// Concrete [`DeviceMesh`] implied by the global shard placement, shared for the same reason.
-    mesh: Arc<DeviceMesh>,
 
     /// Registration of this storage as one logical array of the session that created it, which keeps the array counted
     /// as live in [`Session::array_statistics`] until the storage is dropped. It is the last field so that the shards
@@ -1310,16 +1254,9 @@ struct ArrayParts {
 impl ArrayParts {
     /// Creates new [`ArrayParts`] and registers them as one logical array of `session`.
     /// Storage can only be created through this function, so every logical array is counted exactly once.
-    fn new(
-        session: &Session,
-        r#type: Arc<ArrayType>,
-        sharding: Arc<Sharding>,
-        shards: Vec<ArrayShard>,
-        shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
-        mesh: Arc<DeviceMesh>,
-    ) -> Self {
-        let registration = session.array_tracker().register(&r#type, &sharding, &mesh, &shards);
-        Self { r#type, sharding, shards, shard_index_by_device, mesh, _registration: registration }
+    fn new(session: &Session, metadata: Arc<ArrayMetadata>, shards: Vec<ArrayShard>) -> Self {
+        let registration = session.array_tracker().register(&metadata, &shards);
+        Self { metadata, shards, _registration: registration }
     }
 }
 
@@ -1348,7 +1285,7 @@ mod tests {
     };
     use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
 
-    use super::{Array, ArrayError, ArrayOutputLayout, ArrayTypeExtension, block_until_ready, ready};
+    use super::{Array, ArrayError, ArrayOutputPlan, ArrayTypeExtension, block_until_ready, ready};
 
     // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
     // separate values `device_bytes` that the two devices of the client of `session` hold.
@@ -1715,16 +1652,11 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let layout = ArrayOutputLayout::new(
-            array_type.clone(),
-            Some(sharding.clone()),
-            Arc::new(mesh.clone()),
-            device_ids.as_slice(),
-        )
-        .unwrap();
+        let plan =
+            ArrayOutputPlan::new(array_type.clone(), Some(sharding.clone()), &mesh, device_ids.as_slice()).unwrap();
 
         // Planned outputs describe the same placement as the validating constructor, and every output built from one
-        // layout shares its metadata. Their types record none of the placement over the auto mesh axes.
+        // plan shares its metadata. Their types record none of the placement over the auto mesh axes.
         let expected = Array::from_addressable_buffers(
             &session,
             array_type.clone(),
@@ -1733,9 +1665,9 @@ mod tests {
             shard_buffers(),
         )
         .unwrap();
-        let output = Array::from_execution_output(&session, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
+        let output = Array::from_execution_output(&session, &plan, shard_buffers(), ExecutionFence::new(Vec::new()));
         let other_output =
-            Array::from_execution_output(&session, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
+            Array::from_execution_output(&session, &plan, shard_buffers(), ExecutionFence::new(Vec::new()));
         assert_eq!(output.r#type(), expected.r#type());
         assert_eq!(output.sharding(), &sharding);
         assert_eq!(output.mesh(), &mesh);
@@ -1744,18 +1676,16 @@ mod tests {
             expected.shards().iter().map(ArrayShard::descriptor).collect::<Vec<_>>(),
         );
         assert!(output.shards().iter().all(ArrayShard::is_addressable));
-        assert!(Arc::ptr_eq(&output.parts.r#type, &other_output.parts.r#type));
-        assert!(Arc::ptr_eq(&output.parts.mesh, &other_output.parts.mesh));
+        assert!(Arc::ptr_eq(&output.parts.metadata, &other_output.parts.metadata));
         output.block_until_ready().unwrap();
         let shard_bytes = output.device_shard(device_ids[3]).unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), vec![30.0, 31.0, 32.0, 33.0]);
 
         // Zero-space outputs need no returned carriers.
         let zero_type = array_type.with_data_type(DataType::Zero);
-        let zero_layout =
-            ArrayOutputLayout::new(zero_type, Some(sharding), Arc::new(mesh), device_ids.as_slice()).unwrap();
+        let zero_plan = ArrayOutputPlan::new(zero_type, Some(sharding), &mesh, device_ids.as_slice()).unwrap();
         let zero_output =
-            Array::from_execution_output(&session, &zero_layout, Vec::new(), ExecutionFence::new(Vec::new()));
+            Array::from_execution_output(&session, &zero_plan, Vec::new(), ExecutionFence::new(Vec::new()));
         assert_eq!(zero_output.r#type().data_type(), DataType::Zero);
         assert_eq!(zero_output.r#type().sharding(), output.r#type().sharding());
         assert!(zero_output.shards().iter().all(|shard| shard.is_addressable() && shard.buffer().is_none()));
@@ -1772,7 +1702,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let layout = ArrayOutputLayout::new(array_type, Some(sharding), Arc::new(mesh), device_ids.as_slice()).unwrap();
+        let plan = ArrayOutputPlan::new(array_type, Some(sharding), &mesh, device_ids.as_slice()).unwrap();
 
         // Release builds trust XLA to return buffers in addressable device order, while debug builds still validate
         // that every returned buffer matches its planned shard.
@@ -1784,7 +1714,7 @@ mod tests {
                 client.buffer(bytes.as_slice(), BufferType::F32, [2u64], None, device.clone(), None).unwrap()
             })
             .collect::<Vec<_>>();
-        drop(Array::from_execution_output(&session, &layout, buffers, ExecutionFence::new(Vec::new())));
+        drop(Array::from_execution_output(&session, &plan, buffers, ExecutionFence::new(Vec::new())));
     }
 
     #[test]

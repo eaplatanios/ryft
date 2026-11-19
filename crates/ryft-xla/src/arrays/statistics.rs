@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ryft_core::{ArrayType, DeviceId, DeviceMesh, Sharding, Typed};
 
+use crate::arrays::metadata::ArrayMetadata;
 use crate::arrays::shards::ArrayShard;
 use crate::{Error, ToPjrt};
 
@@ -52,14 +53,8 @@ pub struct ArrayStatistics {
 /// array can donate its buffers to an execution.
 #[derive(Clone, Debug)]
 pub struct LiveArray {
-    /// [`ArrayType`] of the array, shared with it.
-    r#type: Arc<ArrayType>,
-
-    /// Runtime placement of the array over all mesh axes, shared with it.
-    sharding: Arc<Sharding>,
-
-    /// Concrete [`DeviceMesh`] that the array is placed on, shared with it.
-    mesh: Arc<DeviceMesh>,
+    /// Type and runtime placement of the array, shared with it.
+    metadata: Arc<ArrayMetadata>,
 
     /// Device buffers that the current process holds for the array, one per shard that has a buffer.
     buffers: Vec<LiveArrayBuffer>,
@@ -69,13 +64,13 @@ impl LiveArray {
     /// Returns the runtime placement of the array over all mesh axes, including the auto mesh axes that its type omits.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
-        &self.sharding
+        self.metadata.sharding()
     }
 
     /// Returns the concrete [`DeviceMesh`] that the array is placed on.
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
-        &self.mesh
+        self.metadata.mesh()
     }
 
     /// Returns the number of logical payload bytes in the device buffers that the current process holds for the array.
@@ -99,7 +94,7 @@ impl LiveArray {
 
     /// Returns the number of logical payload bytes of `buffer`, which must be one of the buffers of this array.
     fn buffer_size_in_bytes(&self, buffer: &LiveArrayBuffer) -> Result<usize, Error> {
-        let element_size_in_bytes = self.r#type.data_type().to_pjrt().element_size_in_bytes()?;
+        let element_size_in_bytes = self.metadata.r#type().data_type().to_pjrt().element_size_in_bytes()?;
         buffer.element_count.checked_mul(element_size_in_bytes).ok_or_else(|| self.size_limit_exceeded())
     }
 
@@ -108,7 +103,7 @@ impl LiveArray {
         Error::SizeLimitExceeded {
             message: format!(
                 "device buffer size for live array of type `{}` exceeds the maximum allowed size of {}",
-                self.r#type,
+                self.metadata.r#type(),
                 usize::MAX,
             ),
         }
@@ -120,7 +115,7 @@ impl Typed for LiveArray {
 
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(self.r#type.as_ref())
+        Cow::Borrowed(self.metadata.r#type())
     }
 }
 
@@ -210,8 +205,8 @@ impl ArrayTracker {
         Ok(Some(sizes))
     }
 
-    /// Counts a new logical array with the provided type, placement, and shards, and returns the [`ArrayRegistration`]
-    /// that its storage must hold for as long as it is alive.
+    /// Counts a new logical array with the provided metadata and shards, and returns the [`ArrayRegistration`] that
+    /// its storage must hold for as long as it is alive.
     ///
     /// A tracker that keeps descriptions of the live arrays records one from the arguments. The description shares the
     /// metadata of the array, and it identifies each device buffer by its address without referring to it. An address
@@ -219,9 +214,7 @@ impl ArrayTracker {
     /// it.
     pub(crate) fn register(
         self: &Arc<Self>,
-        r#type: &Arc<ArrayType>,
-        sharding: &Arc<Sharding>,
-        mesh: &Arc<DeviceMesh>,
+        metadata: &Arc<ArrayMetadata>,
         shards: &[ArrayShard],
     ) -> ArrayRegistration {
         // The counters order nothing and are only read for diagnostics, so relaxed updates suffice.
@@ -238,12 +231,7 @@ impl ArrayTracker {
                     })
                 })
                 .collect();
-            let array = LiveArray {
-                r#type: Arc::clone(r#type),
-                sharding: Arc::clone(sharding),
-                mesh: Arc::clone(mesh),
-                buffers,
-            };
+            let array = LiveArray { metadata: Arc::clone(metadata), buffers };
             live_arrays.lock().expect("live array registry mutex should not be poisoned").insert(index, array);
         }
         ArrayRegistration { tracker: Arc::clone(self), index }
@@ -427,15 +415,13 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.0]));
-        let r#type = Arc::new(array.r#type().into_owned());
-        let sharding = Arc::new(array.sharding().clone());
-        let mesh = Arc::new(mesh);
+        let metadata = Arc::clone(&array.parts.metadata);
 
         // Every registration counts one created and one live array, and dropping it counts the array as released.
         let tracker = Arc::new(ArrayTracker::new(false));
-        let first = tracker.register(&r#type, &sharding, &mesh, array.shards());
+        let first = tracker.register(&metadata, array.shards());
         assert_eq!(tracker.statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 1 });
-        let second = tracker.register(&r#type, &sharding, &mesh, array.shards());
+        let second = tracker.register(&metadata, array.shards());
         assert_eq!(tracker.statistics(), ArrayStatistics { live_arrays: 2, created_arrays: 2 });
         drop(first);
         assert_eq!(tracker.statistics(), ArrayStatistics { live_arrays: 1, created_arrays: 2 });
@@ -446,7 +432,7 @@ mod tests {
         // A tracker that keeps descriptions records one per registration and removes it with the registration. The
         // registrations own the tracker, and the descriptions refer to neither the storage nor the buffers.
         let tracker = Arc::new(ArrayTracker::new(true));
-        let registration = tracker.register(&r#type, &sharding, &mesh, array.shards());
+        let registration = tracker.register(&metadata, array.shards());
         let live_arrays = tracker.live_arrays().unwrap();
         assert_eq!(live_arrays.len(), 1);
         assert_eq!(live_arrays[0].addressable_size_in_bytes().unwrap(), 8);

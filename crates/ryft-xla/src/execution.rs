@@ -2,7 +2,7 @@
 //!
 //! Every [`CompiledProgram`] carries an `ExecutionPlan` that is derived once when the program is compiled or loaded.
 //! The plan records the physical input types, the default donation requests, the addressable devices, and, when every
-//! output has a static type and a fixed placement, the output layouts, so that each execution only reads it.
+//! output has a static type and a fixed placement, the output plans, so that each execution only reads it.
 //!
 //! Programs without external reference state execute through `Session::execute_compiled_async`, which validates the
 //! inputs, materializes their physical form (i.e., pads bounded dynamic inputs, allocates carriers for inputs of the
@@ -30,7 +30,7 @@ use ryft_pjrt::{
     ExecutionInput, LoadedExecutable,
 };
 
-use crate::arrays::ArrayOutputLayout;
+use crate::arrays::ArrayOutputPlan;
 use crate::lowering::signature::ExecutableSignature;
 use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
@@ -156,7 +156,7 @@ pub(super) struct ExecutionPlan {
     /// `Unconstrained` dimensions for every output, which XLA must then honor, and the executable reports the memory
     /// of every output, which [`Self::new`] compares with the declared one. The outputs of such programs are built
     /// directly from the returned buffers.
-    output_layouts: Option<Vec<ArrayOutputLayout>>,
+    output_plans: Option<Vec<ArrayOutputPlan>>,
 }
 
 impl ExecutionPlan {
@@ -210,7 +210,7 @@ impl ExecutionPlan {
         }
         // The same compile options can override the MLIR memory attributes, so the memories of the compiled ABI are
         // validated like its layouts. A plugin that does not report them leaves the inputs to the execution itself and
-        // the outputs to the validation of their returned buffers, which the planned output layouts below skip. Device
+        // the outputs to the validation of their returned buffers, which the output plans below skip. Device
         // placement means the default memory of the plugin, whose kind is platform-dependent.
         let devices = executable.addressable_devices()?;
         let default_memory_kind = match devices.first() {
@@ -298,19 +298,13 @@ impl ExecutionPlan {
                 && output_shardings.iter().all(|sharding| {
                     !sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Unconstrained))
                 });
-        let output_layouts = if static_outputs && declared_placement && output_memory_kinds.is_some() {
-            let mesh = Arc::new(mesh.clone());
+        let output_plans = if static_outputs && declared_placement && output_memory_kinds.is_some() {
             Some(
                 output_types
                     .iter()
                     .zip(output_shardings)
                     .map(|(output_type, sharding)| {
-                        ArrayOutputLayout::new(
-                            output_type.clone(),
-                            Some(sharding.clone()),
-                            Arc::clone(&mesh),
-                            &addressable_device_ids,
-                        )
+                        ArrayOutputPlan::new(output_type.clone(), Some(sharding.clone()), mesh, &addressable_device_ids)
                     })
                     .collect::<Result<Vec<_>, Error>>()?,
             )
@@ -324,7 +318,7 @@ impl ExecutionPlan {
             addressable_device_ids,
             static_inputs,
             zero_space_inputs,
-            output_layouts,
+            output_plans,
         })
     }
 }
@@ -484,7 +478,7 @@ impl Session {
         )?;
         // Static outputs cannot disagree with the input refinements, so only builds with debug assertions re-validate
         // them.
-        if program.plan().output_layouts.is_none() || cfg!(debug_assertions) {
+        if program.plan().output_plans.is_none() || cfg!(debug_assertions) {
             validate_compiled_output_refinements(program, &input_refinements, program.all_output_types(), &outputs)?;
         }
         if physical_outputs.iter().any(Option::is_some) {
@@ -1464,9 +1458,9 @@ impl Session {
         fence: ExecutionFence,
         logical_indices: impl IntoIterator<Item = usize>,
     ) -> Result<Vec<Array>, Error> {
-        // Programs with only static outputs build each output directly from its planned layout, without querying the
-        // returned buffers or re-deriving their placement.
-        if let Some(layouts) = &program.plan().output_layouts {
+        // Programs with only static outputs build each output directly from its plan, without querying the returned
+        // buffers or re-deriving their placement.
+        if let Some(output_plans) = &program.plan().output_plans {
             return logical_indices
                 .into_iter()
                 .map(|logical_index| {
@@ -1481,7 +1475,7 @@ impl Session {
                         }
                         None => Vec::new(),
                     };
-                    Ok(Array::from_execution_output(self, &layouts[logical_index], buffers, fence.clone()))
+                    Ok(Array::from_execution_output(self, &output_plans[logical_index], buffers, fence.clone()))
                 })
                 .collect();
         }
@@ -2020,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_plan_new_plans_static_output_layouts_on_multiple_cpu_devices() {
+    fn test_execution_plan_new_plans_static_outputs_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
@@ -2038,9 +2032,9 @@ mod tests {
         .into_inner();
         let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
-        assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), Some(1));
+        assert_eq!(compiled.compiled_program().plan().output_plans.as_ref().map(Vec::len), Some(1));
 
-        // Outputs are built from the program's planned layouts, which place every shard like the validating
+        // Outputs are built from the program's output plans, which place every shard like the validating
         // constructors do and are shared by the outputs of every execution.
         let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
         let input = Array::from_host_buffer(
@@ -2085,7 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_plan_new_plans_no_output_layouts_without_declared_placement() {
+    fn test_execution_plan_new_plans_no_outputs_without_declared_placement() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
@@ -2097,7 +2091,7 @@ mod tests {
         let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
 
         // XLA chooses the placement of outputs with open (i.e., `Unconstrained`) dimensions and of outputs without
-        // declared shardings, so their programs plan no trusted output layouts and validate the returned buffers
+        // declared shardings, so their programs have no output plans and validate the returned buffers
         // instead.
         for input_type in [unconstrained_type, unsharded_type] {
             let staged = crate::stage::<_, ArrayType, ArrayType>(
@@ -2109,9 +2103,9 @@ mod tests {
             .into_inner();
             let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
-            assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
+            assert_eq!(compiled.compiled_program().plan().output_plans.as_ref().map(Vec::len), None);
 
-            // Without planned layouts, the outputs are built from the returned buffers by the validating constructor.
+            // Without output plans, the outputs are built from the returned buffers by the validating constructor.
             let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
             let input = f32_vector(&session, &mesh, values.as_slice());
             let Value::Array(output) = compiled.executable().execute(&session, Value::Array(input)).unwrap() else {
@@ -2677,7 +2671,7 @@ mod tests {
         assert_eq!(executable_options.partition_count, 1);
         assert!(!executable_options.use_spmd_partitioning);
         assert!(!executable_options.use_shardy_partitioner);
-        assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
+        assert_eq!(compiled.compiled_program().plan().output_plans.as_ref().map(Vec::len), None);
 
         for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
             let actual_type =

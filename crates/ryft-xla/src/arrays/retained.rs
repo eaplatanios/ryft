@@ -1,17 +1,15 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
-use ryft_core::{
-    ArrayType, DeviceMesh, Parameter, ProgramError, Sharding, Type as CoreType, TypeError, TypeIdentityRenaming, Typed,
-};
+use ryft_core::{ArrayType, Parameter, ProgramError, Type as CoreType, TypeError, TypeIdentityRenaming, Typed};
 use ryft_macros::Parameter;
-use ryft_pjrt::{Client, DeviceId, ExecutionFence};
+use ryft_pjrt::{Client, ExecutionFence};
 
 use crate::Session;
-use crate::arrays::shards::{ArrayShard, ShardIndex};
+use crate::arrays::metadata::ArrayMetadata;
+use crate::arrays::shards::ArrayShard;
 use crate::arrays::{Array, ArrayParts};
 
 /// Storage of an [`Array`] that is kept alive without the [`Session`] of that array, so that staged
@@ -49,29 +47,20 @@ use crate::arrays::{Array, ArrayParts};
 #[derive(Clone, Parameter)]
 pub struct RetainedArray {
     /// [`ArrayType`] that this retained array declares as a constant of a program, which is what its [`Typed`]
-    /// implementation returns. It is [`Self::actual_type`] until [`Self::rename_type_identities`] renames the
-    /// identities in it (i.e., the dimension variables of a bounded dynamic shape), which changes only this field.
-    declared_type: Arc<ArrayType>,
+    /// implementation returns. It is the type in [`Self::metadata`] until [`Self::rename_type_identities`] renames
+    /// the identities in it (i.e., the dimension variables of a bounded dynamic shape), which changes only this field.
+    declared_type: ArrayType,
 
-    /// [`ArrayType`] of the [`Array`] that was retained, shared with it. It never changes, and the arrays that
-    /// [`Self::to_array`] creates have it.
-    actual_type: Arc<ArrayType>,
+    /// Type and runtime placement of the [`Array`] that was retained, shared with it. It never changes, and the
+    /// arrays that [`Self::to_array`] creates share it as well.
+    metadata: Arc<ArrayMetadata>,
 
     /// Identity of the storage of the [`Array`] that was retained, which is the same for every retention of that
     /// array. It keeps the address of that storage reserved without keeping the storage alive.
     identity: Weak<ArrayParts>,
 
-    /// Runtime placement of the retained array over all mesh axes.
-    sharding: Arc<Sharding>,
-
     /// [`ArrayShard`]s of the retained array, which refer to its device buffers.
     shards: Arc<[ArrayShard]>,
-
-    /// Lookup table that maps each [`DeviceId`] to the [`ShardIndex`] of its shard in [`Self::shards`].
-    shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
-
-    /// Concrete [`DeviceMesh`] that the retained array is placed on.
-    mesh: Arc<DeviceMesh>,
 
     /// Whole-execution completion fence of the launch that produced the retained array, if any.
     execution_fence: Option<ExecutionFence>,
@@ -91,13 +80,10 @@ impl RetainedArray {
     #[inline]
     pub fn new(array: &Array) -> Self {
         Self {
-            declared_type: Arc::clone(&array.parts.r#type),
-            actual_type: Arc::clone(&array.parts.r#type),
+            declared_type: array.parts.metadata.r#type().clone(),
+            metadata: Arc::clone(&array.parts.metadata),
             identity: Arc::downgrade(&array.parts),
-            sharding: Arc::clone(&array.parts.sharding),
             shards: Arc::from(array.parts.shards.as_slice()),
-            shard_index_by_device: Arc::clone(&array.parts.shard_index_by_device),
-            mesh: Arc::clone(&array.parts.mesh),
             execution_fence: array.execution_fence.clone(),
             send_fence: array.send_fence.clone(),
             client: array.client(),
@@ -122,14 +108,7 @@ impl RetainedArray {
         // The new array has storage of its own, and its shards refer to the same device buffers.
         // The parts need no validation because they come from an array that was already validated.
         Ok(Array {
-            parts: Arc::new(ArrayParts::new(
-                session,
-                Arc::clone(&self.actual_type),
-                Arc::clone(&self.sharding),
-                self.shards.to_vec(),
-                Arc::clone(&self.shard_index_by_device),
-                Arc::clone(&self.mesh),
-            )),
+            parts: Arc::new(ArrayParts::new(session, Arc::clone(&self.metadata), self.shards.to_vec())),
             execution_fence: self.execution_fence.clone(),
             send_fence: self.send_fence.clone(),
             session: session.clone(),
@@ -142,7 +121,7 @@ impl RetainedArray {
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as CoreType>::Identity>,
     ) -> Result<Self, TypeError> {
-        Ok(Self { declared_type: Arc::new(self.declared_type.rename_identities(renaming)?), ..self.clone() })
+        Ok(Self { declared_type: self.declared_type.rename_identities(renaming)?, ..self.clone() })
     }
 }
 
@@ -197,6 +176,8 @@ impl Typed for RetainedArray {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use pretty_assertions::assert_eq;
 
     use ryft_core::{DataType, DimensionBounds, DimensionVariable};
@@ -217,8 +198,8 @@ mod tests {
         // device buffers alive after the array itself is dropped.
         let retained = RetainedArray::new(&array);
         assert_eq!(RetainedArray::new(&array), retained);
-        assert!(Arc::ptr_eq(&retained.declared_type, &array.parts.r#type));
-        assert!(Arc::ptr_eq(&retained.actual_type, &array.parts.r#type));
+        assert_eq!(&retained.declared_type, array.parts.metadata.r#type());
+        assert!(Arc::ptr_eq(&retained.metadata, &array.parts.metadata));
         drop(array);
         let restored = retained.to_array(&session).unwrap();
         assert_eq!(restored.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1f32]);
@@ -280,7 +261,7 @@ mod tests {
         let renamed = retained.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed, retained);
         assert_eq!(renamed.declared_type, retained.declared_type);
-        assert!(Arc::ptr_eq(&renamed.actual_type, &retained.actual_type));
+        assert!(Arc::ptr_eq(&renamed.metadata, &retained.metadata));
         assert!(Arc::ptr_eq(&renamed.shards, &retained.shards));
     }
 
@@ -292,7 +273,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             format!("{:?}", RetainedArray::new(&array)),
-            format!("RetainedArray {{ type: {:?}, storage: {:?} }}", array.parts.r#type, Arc::as_ptr(&array.parts)),
+            format!(
+                "RetainedArray {{ type: {:?}, storage: {:?} }}",
+                array.parts.metadata.r#type(),
+                Arc::as_ptr(&array.parts),
+            ),
         );
     }
 
@@ -337,7 +322,8 @@ mod tests {
         assert_eq!(hash_of(&retained), hash_of(&RetainedArray::new(&first)));
         assert_ne!(hash_of(&retained), hash_of(&other));
 
-        // Retained arrays can therefore be looked up by retaining their array again.
+        // Retained arrays hash and compare by storage identity and declared type. Both stay stable as keys.
+        #[allow(clippy::mutable_key_type)]
         let constants = HashMap::from([(retained, "first"), (other.clone(), "second")]);
         assert_eq!(constants.get(&RetainedArray::new(&first)), Some(&"first"));
         assert_eq!(constants.get(&other), Some(&"second"));
