@@ -8,8 +8,8 @@ use ryft_core::{
 };
 use ryft_pjrt::Buffer;
 
+use crate::Error;
 use crate::arrays::ArrayError;
-use crate::{Error, Session};
 
 /// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
 /// [`ArrayShard::descriptor`]. They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the
@@ -99,19 +99,15 @@ impl ArrayShard {
     /// [`Array::copy_to_host`](crate::Array::copy_to_host) to read the whole value
     /// of an array and to surface the errors of the whole execution that produced it.
     ///
+    /// Note that a shard belongs to no session, so the copy is not registered with one. It is complete when this
+    /// function returns, and [`Session::synchronize`](crate::Session::synchronize) neither waits for it nor reports
+    /// its failure.
+    ///
     /// # Errors
     ///
     /// Returns [`ArrayError::MissingShardBuffer`] when this shard lives in another process. PJRT transfer failures
     /// are returned unchanged.
-    #[inline]
-    pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
-        self.copy_to_host_internal(None)
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Copies this shard, tracking the transfer when the caller has its owning session.
-    pub(super) fn copy_to_host_internal(&self, session: Option<&Session>) -> Result<Vec<u8>, Error> {
+    pub fn copy_to_host_bytes(&self) -> Result<Vec<u8>, Error> {
         let buffer = match &self.storage {
             ArrayShardStorage::Buffer(buffer) => buffer,
             ArrayShardStorage::Zero => return Ok(Vec::new()),
@@ -131,14 +127,11 @@ impl ArrayShard {
         }
 
         // Request row-major bytes explicitly, because the device buffer may have another physical layout.
-        let mut work = session.map(Session::reserve_work);
         let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
-        let bytes = match &mut work {
-            Some(work) => work.track_host_copy(copy).wait(),
-            None => copy.r#await(),
-        }?;
-        Ok(bytes)
+        Ok(copy.r#await()?)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Compares this shard's storage identity with `other`.
     pub(super) fn storage_eq(&self, other: &Self) -> bool {
@@ -452,6 +445,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType};
 
+    use crate::Session;
     use crate::arrays::Array;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{
@@ -490,19 +484,19 @@ mod tests {
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();
-        assert_eq!(values_from_bytes::<f32>(&array.shards()[1].copy_to_host().unwrap()), vec![3f32, 4.]);
+        assert_eq!(values_from_bytes::<f32>(&array.shards()[1].copy_to_host_bytes().unwrap()), vec![3f32, 4.]);
 
         // Bufferless zero shards and buffer-backed shards with no elements produce no bytes.
         let zero = replicated_array(&session, &mesh, DataType::Zero, &[3], &[]);
         assert!(zero.shards()[0].buffer().is_none());
-        assert_eq!(zero.shards()[0].copy_to_host().unwrap(), Vec::<u8>::new());
+        assert_eq!(zero.shards()[0].copy_to_host_bytes().unwrap(), Vec::<u8>::new());
         let empty = replicated_array(&session, &mesh, DataType::F32, &[0], &[]);
         assert!(empty.shards()[0].buffer().is_some());
-        assert_eq!(empty.shards()[0].copy_to_host().unwrap(), Vec::<u8>::new());
+        assert_eq!(empty.shards()[0].copy_to_host_bytes().unwrap(), Vec::<u8>::new());
 
         // A remote shard has no buffer in the current process.
         let remote = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);
-        let error = remote.copy_to_host().unwrap_err();
+        let error = remote.copy_to_host_bytes().unwrap_err();
         assert!(matches!(
             &error,
             Error::Array(error) if matches!(error.as_ref(),
