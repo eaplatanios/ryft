@@ -19,9 +19,8 @@
 //! uploads and the readback of whole arrays, including the combination of the separate values that devices hold along
 //! unreduced mesh axes. [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host
 //! values to other devices or shardings. The [`placement`](mod@placement) module defines what a placement is and how to
-//! request one, and the [`resharding`](mod@resharding) module implements the moves. Finally, the
-//! [`materialization`](mod@materialization) module pads arrays on their devices to the static bounds of executables
-//! compiled for bounded dynamic shapes. Array failures are reported through [`Error::Array`] with an [`ArrayError`].
+//! request one, and the [`resharding`](mod@resharding) module implements the moves. Array failures are reported through
+//! [`Error::Array`] with an [`ArrayError`].
 //!
 //! Every session counts the arrays that are created through it, which [`ArrayStatistics`] reports, and can describe
 //! the ones that are still alive as [`LiveArray`]s. The unit that it counts is the storage that an array shares with
@@ -47,7 +46,6 @@ use crate::arrays::statistics::ArrayRegistration;
 use crate::{Error, FromPjrt, Session, ToMlir, ToPjrt, Type};
 
 pub mod host;
-pub mod materialization;
 pub mod placement;
 pub mod resharding;
 pub mod retained;
