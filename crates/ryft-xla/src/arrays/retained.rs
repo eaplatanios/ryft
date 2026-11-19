@@ -11,7 +11,8 @@ use ryft_macros::Parameter;
 use ryft_pjrt::{Client, DeviceId, ExecutionFence};
 
 use crate::Session;
-use crate::arrays::{Array, ArrayParts, ArrayShard, ShardIndex};
+use crate::arrays::shards::{ArrayShard, ShardIndex};
+use crate::arrays::{Array, ArrayParts};
 
 /// Storage of an [`Array`] that is kept alive without the [`Session`] of that array, so that staged
 /// programs can hold it as a constant. A trace whose capture table cannot hold runtime arrays (e.g., the body of a

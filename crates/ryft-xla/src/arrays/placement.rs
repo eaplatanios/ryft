@@ -13,7 +13,8 @@ use ryft_macros::Parameter;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError, ExecutionFence};
 
-use crate::arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+use crate::arrays::{Array, ArrayError};
 use crate::{CompiledFunction, Error, FromPjrt, Options, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.

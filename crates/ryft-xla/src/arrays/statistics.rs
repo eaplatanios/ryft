@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ryft_core::{ArrayType, DeviceId, DeviceMesh, Sharding, Typed};
 
-use crate::arrays::ArrayShard;
+use crate::arrays::shards::ArrayShard;
 use crate::{Error, ToPjrt};
 
 /// Snapshot of the logical array counts of a [`Session`](crate::Session), which
