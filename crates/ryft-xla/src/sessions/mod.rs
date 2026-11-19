@@ -1354,18 +1354,16 @@ impl SessionBuilder {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Handle to an array that a [`Session`] retains on behalf of a trace whose capture table cannot hold runtime arrays.
-/// Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of a
-/// [`composite`](ryft_core::composite) and its rules, which are traced over constants alone) still needs to refer to
-/// the runtime arrays that a compiled function it calls has captured. Importing such an array through
+/// Handle to an array that a [`Session`] retains on behalf of a trace whose capture table cannot hold
+/// runtime arrays. Such a trace (e.g., the body of a [`rematerialize`](ryft_core::rematerialize) call or of
+/// a [`composite`](ryft_core::composite) and its rules, which are traced over constants alone) still needs
+/// to refer to the runtime arrays that a compiled function it calls has captured. Importing such an array through
 /// [`ThroughSession`] stages this handle as an immediate constant, which can appear in any region of any program,
 /// including lazily traced derivative rules.
 ///
-/// An eager session resolves the handle to its array when lifting it, and lowering turns every distinct handle of a
-/// program into a hidden executable argument that follows the captures of the program, so that compiled executables
-/// depend only on the array's type and never on its data.
+/// Lifting the handle in a [`Session`] resolves it to its array, and lowering turns every distinct handle of a program
+/// into a hidden executable argument that follows the captures of the program, so that compiled executables depend only
+/// on the array's type and never on its data.
 ///
 /// # Ownership
 ///
@@ -1382,9 +1380,11 @@ pub struct SessionConstant {
     /// Storage of the retained array, shared by the clones of this handle.
     storage: Arc<RetainedArray>,
 
-    /// PJRT client that owns the buffers of the retained array.
+    /// PJRT [`Client`] that owns the buffers of the retained array.
     client: &'static Client<'static>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl SessionConstant {
     /// Retains the storage of `array` and returns a handle that owns it. The storage stays retained for as long as
