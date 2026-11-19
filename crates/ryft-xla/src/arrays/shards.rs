@@ -303,8 +303,6 @@ impl ShardDescriptor {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`ShardLayout`] that is obtained by applying a [`Sharding`] to a [`StaticShape`] over a [`DeviceMesh`].
 /// [`ShardLayout`] is the bridge between type-level device placement metadata and runtime array metadata. It expands
 /// the logical sharding specification into one [`ShardDescriptor`] per [`Device`], in the row-major device order that
@@ -320,11 +318,11 @@ pub struct ShardLayout {
 }
 
 impl ShardLayout {
-    /// Constructs a new [`ShardLayout`] by applying the provided [`Sharding`] to the provided [`StaticShape`]
-    /// over the provided [`DeviceMesh`]. The returned layout contains one [`ShardDescriptor`] per [`Device`].
-    /// For each array dimension, replicated and unconstrained dimensions map every device to the full dimension range,
-    /// while sharded dimensions are split across the product of the referenced mesh axes. If the dimension size is not
-    /// evenly divisible by the partition count, earlier partitions receive one extra element.
+    /// Constructs a new [`ShardLayout`] by applying the provided [`Sharding`] to the provided [`StaticShape`] over the
+    /// provided [`DeviceMesh`]. The returned layout contains one [`ShardDescriptor`] per [`Device`]. For each array
+    /// dimension, replicated and unconstrained dimensions map every device to the full dimension range, while sharded
+    /// dimensions are split across the product of the referenced mesh axes. If the dimension size is not evenly
+    /// divisible by the partition count, earlier partitions receive one extra element.
     ///
     /// # Parameters
     ///
@@ -343,8 +341,7 @@ impl ShardLayout {
         let dimensions = shape.as_slice();
 
         // Resolve each sharded array dimension to mesh axis indices. This keeps axis name lookups and their allocations
-        // out of the inner per-device loop and centralizes defensive validation before any shard descriptors are
-        // built.
+        // out of the inner per-device loop and centralizes defensive validation before any shard descriptors are built.
         let mut used_axis_names = HashSet::new();
         let dimension_axis_indices = sharding
             .dimensions()
@@ -379,7 +376,6 @@ impl ShardLayout {
             // `DeviceMesh` stores devices in row-major mesh order, so the loop index is also the global shard index.
             // Convert it back into mesh coordinates so sharded dimensions can pick the partition owned by this device.
             let device_coordinates = mesh.device_coordinates(index).unwrap();
-
             let mut slices = Vec::with_capacity(dimensions.len());
             for (dimension, dimension_size) in dimensions.iter().copied().enumerate() {
                 let axis_indices = &dimension_axis_indices[dimension];
@@ -410,7 +406,6 @@ impl ShardLayout {
                 };
                 slices.push(range);
             }
-
             shard_index_by_device.insert(device.id(), index);
             descriptors.push(ShardDescriptor::new(index, device, slices));
         }
@@ -418,8 +413,8 @@ impl ShardLayout {
         Ok(Self { descriptors, shard_index_by_device })
     }
 
-    /// Returns the [`ShardDescriptor`]s for all global shards in row-major [`DeviceMesh`] order. The position of each
-    /// descriptor in this vector is the descriptor's [`ShardDescriptor::index`].
+    /// Returns the [`ShardDescriptor`]s for all global shards in row-major [`DeviceMesh`] order.
+    /// The position of each descriptor in this vector is the descriptor's [`ShardDescriptor::index`].
     #[inline]
     pub fn descriptors(&self) -> &[ShardDescriptor] {
         &self.descriptors
@@ -435,7 +430,7 @@ impl ShardLayout {
 
     /// Consumes this [`ShardLayout`] and returns its [`ShardDescriptor`]s and its lookup table from devices to shards.
     #[inline]
-    pub(crate) fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<DeviceId, ShardIndex>) {
+    pub fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<DeviceId, ShardIndex>) {
         (self.descriptors, self.shard_index_by_device)
     }
 }
@@ -445,6 +440,7 @@ impl ShardLayout {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
     use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType};
 
     use crate::Session;
