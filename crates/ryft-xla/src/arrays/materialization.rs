@@ -1,11 +1,3 @@
-//! Padded copies of an [`Array`] that bounded dynamic executables consume, with the cache that retains them.
-//!
-//! An executable compiled for bounded dynamic shapes takes every such input with its static bound shape, followed by
-//! a scalar argument for each logical extent. [`materialize_bounded_dynamic_inputs`] produces those physical inputs.
-//! It reuses every input whose shape equals its bound, and it pads every smaller input through the host and retains
-//! the padded copy in the [`BoundedMaterializationCache`] of the source array, which every clone of that array shares.
-//! Concurrent requests for the same [`BoundedMaterializationKey`] wait for a single producer.
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -306,7 +298,9 @@ impl MaterializedBoundedInputs {
     }
 }
 
-/// Pads bounded-dynamic inputs to static executable storage and appends their logical extents.
+/// Pads bounded-dynamic inputs to static executable storage and appends their logical extents. An executable compiled
+/// for bounded dynamic shapes takes every such input with its static bound shape, followed by a scalar argument for
+/// each logical extent, and this function produces those physical inputs.
 ///
 /// Every input takes one of two paths. An input whose actual shape equals its physical bound reuses the source array.
 /// A smaller input uses a retained materialization that the clones of the source array share, with one single-flight

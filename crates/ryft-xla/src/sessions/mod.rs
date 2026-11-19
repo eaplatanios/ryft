@@ -1656,7 +1656,7 @@ pub(crate) mod tests {
         values_to_bytes,
     };
     use crate::{
-        CompileTracer, CompiledFunctionDispatcher, DevicePutTarget, Dimension, ExecutionError, FlatProgram, FromPjrt,
+        ArrayPlacement, CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
         JitCallOperation, ProgramBuilder, Reference, jit,
     };
 
@@ -2207,7 +2207,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
-        let (source_mesh, _) = DevicePutTarget::device(mesh.devices()[0]).resolve(1).unwrap();
+        let (source_mesh, _) = ArrayPlacement::device(mesh.devices()[0]).resolve(1).unwrap();
         let scoped = session.with_new_effect_scope().with_device_mesh(source_mesh);
 
         let input = Array::from_host_buffer(
@@ -2223,7 +2223,7 @@ pub(crate) mod tests {
         let output = Neg::neg(&input).unwrap();
         assert_eq!(session.state.work.snapshot(), 2);
 
-        let placed = output.into_placement(&scoped, DevicePutTarget::device(mesh.devices()[1])).unwrap();
+        let placed = output.into_placement(&scoped, ArrayPlacement::device(mesh.devices()[1])).unwrap();
         assert_eq!(session.state.work.snapshot(), 3);
 
         let copy = placed.begin_copy_to_host().unwrap();

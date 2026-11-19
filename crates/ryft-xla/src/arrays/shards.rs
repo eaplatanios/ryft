@@ -1,15 +1,3 @@
-//! Shards of device arrays and the layouts that place them on the devices of a mesh.
-//!
-//! [`ShardLayout`] expands a [`Sharding`] of a [`StaticShape`] over a [`DeviceMesh`] into one [`ShardDescriptor`] per
-//! device, in the row-major device order that a [`ShardIndex`] refers to. Each descriptor records a device and the
-//! slice of the global array that the device holds. An [`ArrayShard`] pairs a descriptor with the storage that the
-//! current process holds for it, which is a PJRT [`Buffer`] for ordinary local data and nothing for a shard of
-//! [`DataType::Zero`](ryft_core::DataType::Zero) or for a shard that lives in another process.
-//!
-//! These types describe placement and storage without referring to [`Array`](crate::Array), which keeps one
-//! [`ArrayShard`] per device of its mesh. The sibling modules that transfer, place, retain, and count arrays are
-//! written in terms of them.
-
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
@@ -307,8 +295,9 @@ impl ShardDescriptor {
 
 /// [`ShardLayout`] that is obtained by applying a [`Sharding`] to a [`StaticShape`] over a [`DeviceMesh`].
 /// [`ShardLayout`] is the bridge between type-level device placement metadata and runtime array metadata. It expands
-/// the logical sharding specification into one [`ShardDescriptor`] per [`Device`] and also records a device ID
-/// lookup table for routing local [`Buffer`]s back to their global shard descriptors.
+/// the logical sharding specification into one [`ShardDescriptor`] per [`Device`], in the row-major device order that
+/// a [`ShardIndex`] refers to, and also records a device ID lookup table for routing local [`Buffer`]s back to their
+/// global shard descriptors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardLayout {
     /// Refer to the documentation of [`Self::descriptors`] for information on this field.

@@ -563,7 +563,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[cfg(feature = "cuda-13")]
-    use crate::DevicePutTarget;
+    use crate::ArrayPlacement;
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::test_spmd_compilation_options;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
@@ -828,7 +828,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     fn probe_cross_host_placements(
         client: &'static Client<'static>,
-        place: impl Fn(Array, &Session, DevicePutTarget) -> Result<Array, Error>,
+        place: impl Fn(Array, &Session, ArrayPlacement) -> Result<Array, Error>,
     ) {
         let rank = client.process_index().unwrap();
         match client.cross_host_transfers_extension() {
@@ -866,27 +866,27 @@ mod tests {
             (
                 "sharded_to_reversed_sharded",
                 array(&forward_mesh, sharded(&forward_mesh), [9.0, 10.0, 11.0, 12.0]),
-                DevicePutTarget::placement(reversed_mesh.clone(), sharded(&reversed_mesh)).unwrap(),
+                ArrayPlacement::mesh(reversed_mesh.clone(), sharded(&reversed_mesh)).unwrap(),
             ),
             (
                 "replicated_to_replicated",
                 array(&process_0_mesh, replicated(&process_0_mesh), [1.0, 2.0, 3.0, 4.0]),
-                DevicePutTarget::placement(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
+                ArrayPlacement::mesh(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
             ),
             (
                 "replicated_to_sharded",
                 array(&process_0_mesh, replicated(&process_0_mesh), [5.0, 6.0, 7.0, 8.0]),
-                DevicePutTarget::placement(forward_mesh.clone(), sharded(&forward_mesh)).unwrap(),
+                ArrayPlacement::mesh(forward_mesh.clone(), sharded(&forward_mesh)).unwrap(),
             ),
             (
                 "sharded_to_reversed_replicated",
                 array(&forward_mesh, sharded(&forward_mesh), [13.0, 14.0, 15.0, 16.0]),
-                DevicePutTarget::placement(reversed_mesh.clone(), replicated(&reversed_mesh)).unwrap(),
+                ArrayPlacement::mesh(reversed_mesh.clone(), replicated(&reversed_mesh)).unwrap(),
             ),
             (
                 "replicated_to_replicated_again",
                 array(&process_0_mesh, replicated(&process_0_mesh), [17.0, 18.0, 19.0, 20.0]),
-                DevicePutTarget::placement(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
+                ArrayPlacement::mesh(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
             ),
         ];
         for (name, source, target) in placements {

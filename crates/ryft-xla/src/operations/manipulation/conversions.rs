@@ -3505,7 +3505,7 @@ mod tests {
             let moved = output
                 .to_placement(
                     &session,
-                    crate::arrays::DevicePutTarget::Placement {
+                    crate::arrays::ArrayPlacement::Mesh {
                         sharding: Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
                         mesh: destination_mesh,
                     },

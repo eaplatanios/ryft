@@ -1,15 +1,3 @@
-//! Transfers between host memory and device arrays, including the merging of shards and of unreduced values.
-//!
-//! [`Array::from_host_buffer`] uploads a dense row-major host value to the local shards of a new array, and
-//! [`Array::from_host_shards`] uploads the bytes that each local device holds separately.
-//!
-//! [`Array::begin_copy_to_host`] issues the device-to-host copies of the shards that hold the value of an array without
-//! waiting for them, and [`DenseArrayHostCopy::finish`] then waits for those copies and assembles the dense row-major
-//! bytes of the array, which is what [`Array::copy_to_host`] returns. Separating the two steps lets callers issue the
-//! copies of several arrays before blocking on any one of them. This module also provides the host round trips that
-//! must preserve the separate values that devices hold along unreduced mesh axes (i.e.,
-//! [`Array::relayout_through_host`] and [`Array::validate_host_round_trip`]).
-
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
@@ -29,11 +17,13 @@ use crate::{Error, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 
-/// In-flight copies for materializing one array as dense row-major host bytes.
+/// In-flight copies for materializing one array as dense row-major host bytes, which
+/// [`Array::begin_copy_to_host`] returns.
 ///
 /// Construction starts every needed shard copy without waiting. [`Self::finish`] then awaits the transfers that were
-/// already issued and merges the shards when there is more than one. This separation lets callers issue copies for
-/// several arrays before blocking on any one transfer.
+/// already issued, merges the shards when there is more than one, and combines the separate values that devices hold
+/// along unreduced mesh axes. Its result is what [`Array::copy_to_host`] returns. This separation lets callers issue
+/// copies for several arrays before blocking on any one transfer.
 pub(crate) struct DenseArrayHostCopy {
     /// Global logical shape of the source array.
     global_shape: StaticShape,
@@ -463,6 +453,27 @@ impl Array {
             buffers.push(buffer);
         }
         Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)
+    }
+
+    /// Copies the value of this [`Array`] to the host and returns its dense row-major bytes, irrespective of the
+    /// physical [`Layout`] of its shard buffers. This is an explicit synchronization boundary. It blocks the current
+    /// thread until the copies and the whole execution that produced this array complete, so it also surfaces the
+    /// errors of that execution.
+    ///
+    /// One shard is copied for each distinct tile of the array, so a replicated array is read from a single device.
+    /// When the [`Sharding`] of this array has unreduced axes, along which the devices hold separate values of each
+    /// tile (e.g., summands), every shard is copied and those values are combined with the [`UnreducedKind`] of the
+    /// sharding. Arrays with no elements and [`DataType::Zero`] arrays produce no bytes and issue no copies. Use
+    /// [`ArrayShard::copy_to_host`] to read the bytes that a single device holds instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrayError::MissingShardBuffer`] when the current process does not hold the whole value. That is
+    /// the case when a shard lives in another process and either the addressable shards do not cover the array or its
+    /// sharding has unreduced axes. PJRT transfer failures and the errors of the producing execution are returned
+    /// unchanged.
+    pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
+        self.begin_copy_to_host()?.finish()
     }
 
     /// Starts copies for the shards of this array that hold its whole value without awaiting them. Those are all the
@@ -1454,6 +1465,60 @@ mod tests {
         assert_eq!(array.sharding(), &sharding);
         assert_eq!(array.r#type().sharding(), Some(&sharding.without_auto_axes()));
         assert_eq!(array.copy_to_host().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_array_copy_to_host() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+
+        // Sharded and replicated arrays read back as the dense row-major bytes of their whole value.
+        for sharding in [sharded.clone(), replicated.clone()] {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), None, values.as_slice()).unwrap();
+            assert_eq!(array.copy_to_host().unwrap(), values);
+        }
+
+        // An array with no elements produces no bytes.
+        let r#type = ArrayType::new_static(DataType::F32, [0]).with_sharding(sharded.clone()).unwrap();
+        let empty = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
+        assert_eq!(empty.copy_to_host().unwrap(), Vec::<u8>::new());
+
+        // When the second mesh device lives in another process, the current process holds a replicated value in full,
+        // but only half of a sharded value and only one of the summands of an unreduced value.
+        let remote_device =
+            Device::new(devices.iter().map(Device::id).max().unwrap() + 1, client.process_index().unwrap() + 1);
+        let remote_mesh = DeviceMesh::new(logical_mesh, vec![devices[0], remote_device]).unwrap();
+        let with_remote_shard = |sharding: Sharding, local_values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            let dimensions = [local_values.len() as u64];
+            let bytes = values_to_bytes(local_values);
+            let buffer =
+                client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, client_devices[0].clone(), None);
+            Array::from_addressable_buffers(&session, r#type, remote_mesh.clone(), None, vec![buffer.unwrap()]).unwrap()
+        };
+        assert_eq!(with_remote_shard(replicated, &[1., 2., 3., 4.]).copy_to_host().unwrap(), values);
+        for (sharding, local_values) in [(sharded, [1f32, 2.].as_slice()), (unreduced, [1f32, 2., 3., 4.].as_slice())] {
+            let error = with_remote_shard(sharding, local_values).copy_to_host().unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Array(error) if matches!(error.as_ref(),
+                    ArrayError::MissingShardBuffer { shard_index: 1, device_id } if *device_id == remote_device.id(),
+                ),
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!("array shard #1 on device {} has no addressable buffer", remote_device.id()),
+            );
+        }
     }
 
     #[test]
