@@ -172,9 +172,8 @@ pub enum ArrayError {
 /// types.
 #[derive(Clone, Parameter)]
 pub struct Array {
-    // TODO(eaplatanios): Review from here onwards.
-    /// Type and shards of this [`Array`]. They are immutable once constructed and shared by
-    /// every clone, so cloning an array costs a few reference-count increments rather than a deep copy.
+    /// Type and shards of this [`Array`]. They are immutable once constructed and shared by every clone,
+    /// so cloning an array costs a few reference-count increments rather than a deep copy.
     parts: Arc<ArrayParts>,
 
     /// Whole-execution completion fence for arrays produced by an asynchronous PJRT launch. This is separate from
@@ -199,6 +198,8 @@ pub struct Array {
     /// receiver-based operations use this value's session, so `x + y` and `y + x` may select different scopes.
     session: Session,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
