@@ -9,13 +9,12 @@ use ryft_macros::Parameter;
 use crate::arrays::{Array, ArrayError};
 use crate::{Error, FromPjrt, Session};
 
-// TODO(eaplatanios): Review this module.
-
-/// Placement of an [`Array`] on devices, which is where [`Session::place`], [`Array::to_placement`], and
-/// [`Array::into_placement`] put a value and what [`PlacementOptions::source`] expects of one. It models the subset
-/// of the `device` and `src` arguments of JAX's `jax.device_put` that `ryft` currently supports. [`Self::Device`]
-/// places a value on a single concrete device, which is represented internally as a mesh of size 1 with fully
-/// replicated sharding, and [`Self::Mesh`] places it on an explicit mesh with an explicit sharding.
+/// Target placement of an [`Array`] on devices, which is where [`Session::place`], [`Array::to_placement`],
+/// and [`Array::into_placement`] put a value and what [`PlacementOptions::source`] expects of one. It models
+/// the subset of the `device` and `src` arguments of JAX's
+/// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) that Ryft currently supports.
+/// [`Self::Device`] places a value on a single concrete device, which is represented internally as a mesh of size `1`
+/// with fully replicated sharding, and [`Self::Mesh`] places it on an explicit mesh with an explicit sharding.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum ArrayPlacement {
     /// Commit the value to one concrete device.
@@ -30,6 +29,8 @@ pub enum ArrayPlacement {
         sharding: Sharding,
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ArrayPlacement {
     /// Creates a single-device placement.
@@ -362,6 +363,43 @@ trait IntoDenseHostArray {
     fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>);
 }
 
+macro_rules! impl_into_dense_host_array {
+    // Implements `IntoDenseHostArray` for the scalar `DenseHostElement` type `$ty` as a rank-0 host array.
+    ($ty:ty) => {
+        impl IntoDenseHostArray for $ty {
+            #[inline]
+            fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
+                let mut bytes = Vec::with_capacity(size_of::<$ty>());
+                self.append_ne_bytes(&mut bytes);
+                (Vec::new(), <$ty as DenseHostElement>::DATA_TYPE, bytes)
+            }
+        }
+    };
+}
+
+impl_into_dense_host_array!(bool);
+impl_into_dense_host_array!(i8);
+impl_into_dense_host_array!(i16);
+impl_into_dense_host_array!(i32);
+impl_into_dense_host_array!(i64);
+impl_into_dense_host_array!(u8);
+impl_into_dense_host_array!(u16);
+impl_into_dense_host_array!(u32);
+impl_into_dense_host_array!(u64);
+impl_into_dense_host_array!(bf16);
+impl_into_dense_host_array!(f16);
+impl_into_dense_host_array!(f32);
+impl_into_dense_host_array!(f64);
+
+impl IntoDenseHostArray for CoreArray {
+    #[inline]
+    fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
+        // A host array holds materialized storage, which only a type with static extents can describe.
+        let shape = self.r#type().static_shape().unwrap();
+        (shape.as_slice().to_vec(), self.r#type().data_type(), self.logical_bytes())
+    }
+}
+
 /// Element of a dense host value that [`Session::place`] uploads.
 trait DenseHostElement {
     /// [`DataType`] of the uploaded elements.
@@ -369,19 +407,6 @@ trait DenseHostElement {
 
     /// Appends the bytes of this element in native byte order to `bytes`.
     fn append_ne_bytes(&self, bytes: &mut Vec<u8>);
-}
-
-macro_rules! impl_dense_host_element {
-    // Implements `DenseHostElement` for the primitive type `$ty`, whose native-endian bytes encode `$data_type`.
-    ($ty:ty, $data_type:expr) => {
-        impl DenseHostElement for $ty {
-            const DATA_TYPE: DataType = $data_type;
-
-            fn append_ne_bytes(&self, bytes: &mut Vec<u8>) {
-                bytes.extend_from_slice(&self.to_ne_bytes());
-            }
-        }
-    };
 }
 
 impl DenseHostElement for bool {
@@ -408,6 +433,20 @@ impl DenseHostElement for f16 {
     }
 }
 
+macro_rules! impl_dense_host_element {
+    // Implements `DenseHostElement` for the primitive type `$ty`, whose native-endian bytes encode `$data_type`.
+    ($ty:ty, $data_type:expr) => {
+        impl DenseHostElement for $ty {
+            const DATA_TYPE: DataType = $data_type;
+
+            #[inline]
+            fn append_ne_bytes(&self, bytes: &mut Vec<u8>) {
+                bytes.extend_from_slice(&self.to_ne_bytes());
+            }
+        }
+    };
+}
+
 impl_dense_host_element!(i8, DataType::I8);
 impl_dense_host_element!(i16, DataType::I16);
 impl_dense_host_element!(i32, DataType::I32);
@@ -418,41 +457,6 @@ impl_dense_host_element!(u32, DataType::U32);
 impl_dense_host_element!(u64, DataType::U64);
 impl_dense_host_element!(f32, DataType::F32);
 impl_dense_host_element!(f64, DataType::F64);
-
-macro_rules! impl_scalar_dense_host_leaf {
-    // Implements `IntoDenseHostArray` for the scalar `DenseHostElement` type `$ty` as a rank-0 host array.
-    ($ty:ty) => {
-        impl IntoDenseHostArray for $ty {
-            fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
-                let mut bytes = Vec::with_capacity(size_of::<$ty>());
-                self.append_ne_bytes(&mut bytes);
-                (Vec::new(), <$ty as DenseHostElement>::DATA_TYPE, bytes)
-            }
-        }
-    };
-}
-
-impl_scalar_dense_host_leaf!(bool);
-impl_scalar_dense_host_leaf!(i8);
-impl_scalar_dense_host_leaf!(i16);
-impl_scalar_dense_host_leaf!(i32);
-impl_scalar_dense_host_leaf!(i64);
-impl_scalar_dense_host_leaf!(u8);
-impl_scalar_dense_host_leaf!(u16);
-impl_scalar_dense_host_leaf!(u32);
-impl_scalar_dense_host_leaf!(u64);
-impl_scalar_dense_host_leaf!(bf16);
-impl_scalar_dense_host_leaf!(f16);
-impl_scalar_dense_host_leaf!(f32);
-impl_scalar_dense_host_leaf!(f64);
-
-impl IntoDenseHostArray for CoreArray {
-    fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
-        // A host array holds materialized storage, which only a type with static extents can describe.
-        let shape = self.r#type().static_shape().unwrap();
-        (shape.as_slice().to_vec(), self.r#type().data_type(), self.logical_bytes())
-    }
-}
 
 #[cfg(test)]
 mod tests {
