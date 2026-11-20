@@ -343,7 +343,7 @@ mod tests {
                       %7:3 = stablehlo.optimization_barrier %arg1, %arg2, %5 : tensor<i64>, tensor<2xf64>, !stablehlo.token
                       stablehlo.return %arg2, %5, %6 : tensor<2xf64>, !stablehlo.token, !stablehlo.token
                     }) : (tensor<i1>) -> (tensor<2xf64>, !stablehlo.token, !stablehlo.token)
-                    %3 = stablehlo.custom_call @ryft.print(%2#0, %2#2) {api_version = 4 : i32, backend_config = {label = "value"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%2#0, %2#2) {api_version = 4 : i32, backend_config = {label = "value"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
                     return %2#0 : tensor<2xf64>
                   }
                 }
@@ -470,7 +470,7 @@ mod tests {
                       }) : (tensor<i1>) -> tensor<2xf64>
                       stablehlo.return %9, %7, %8 : tensor<2xf64>, !stablehlo.token, !stablehlo.token
                     }) : (tensor<i1>) -> (tensor<2xf64>, !stablehlo.token, !stablehlo.token)
-                    %3 = stablehlo.custom_call @ryft.print(%2#0, %2#2) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%2#0, %2#2) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
                     return %2#0 : tensor<2xf64>
                   }
                 }
@@ -670,7 +670,7 @@ mod tests {
                   func.func @main(%arg0: tensor<i1>, %arg1: tensor<f64>) -> tensor<f64> {
                     %0 = stablehlo.after_all  : !stablehlo.token
                     %1:2 = "stablehlo.if"(%arg0) ({
-                      %2 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "taken"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %2 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "taken"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                       %3 = stablehlo.negate %arg1 : tensor<f64>
                       stablehlo.return %3, %2 : tensor<f64>, !stablehlo.token
                     }, {
@@ -762,7 +762,7 @@ mod tests {
                       %4 = stablehlo.custom_call @ryft.assert(%3, %arg1, %0) {api_version = 4 : i32, backend_config = {actor = "assert", kind = "generic", label_0 = "scalar", label_count = "1", message = "scalar must equal itself"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
                       stablehlo.return %arg1, %4, %1 : tensor<i64>, !stablehlo.token, !stablehlo.token
                     }, {
-                      %3 = stablehlo.custom_call @ryft.print(%arg1, %1) {api_version = 4 : i32, backend_config = {label = "false"}, has_side_effect = true} : (tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      %3 = stablehlo.custom_call @ryft.print(%arg1, %1) {api_version = 4 : i32, backend_config = {label = "false"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<i64>, !stablehlo.token) -> !stablehlo.token
                       stablehlo.return %arg1, %0, %3 : tensor<i64>, !stablehlo.token, !stablehlo.token
                     }) : (tensor<i1>) -> (tensor<i64>, !stablehlo.token, !stablehlo.token)
                     return %2#0 : tensor<i64>
@@ -862,10 +862,10 @@ mod tests {
                   func.func @main(%arg0: tensor<f64>, %arg1: tensor<i1>) {
                     %0 = stablehlo.after_all  : !stablehlo.token
                     %1 = "stablehlo.if"(%arg1) ({
-                      %2 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "true backward"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %2 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "true backward"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                       stablehlo.return %2 : !stablehlo.token
                     }, {
-                      %2 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "false backward"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %2 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "false backward"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                       stablehlo.return %2 : !stablehlo.token
                     }) : (tensor<i1>) -> !stablehlo.token
                     return
@@ -934,13 +934,13 @@ mod tests {
                   func.func @main(%arg0: tensor<i1>, %arg1: tensor<f64>) {
                     %0 = stablehlo.after_all  : !stablehlo.token
                     %1 = "stablehlo.if"(%arg0) ({
-                      %3 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "true"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %3 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "true"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                       stablehlo.return %3 : !stablehlo.token
                     }, {
-                      %3 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "false"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %3 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "false"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                       stablehlo.return %3 : !stablehlo.token
                     }) : (tensor<i1>) -> !stablehlo.token
-                    %2 = stablehlo.custom_call @ryft.print(%arg1, %1) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%arg1, %1) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                     return
                   }
                 }
@@ -1584,10 +1584,10 @@ mod tests {
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
                       %2 = stablehlo.compare LT, %iterArg, %cst, FLOAT : (tensor<f64>, tensor<f64>) -> tensor<i1>
                       %3:2 = "stablehlo.if"(%2) ({
-                        %5 = stablehlo.custom_call @ryft.print(%iterArg, %iterArg_1) {api_version = 4 : i32, backend_config = {label = "first"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                        %5 = stablehlo.custom_call @ryft.print(%iterArg, %iterArg_1) {api_version = 4 : i32, backend_config = {label = "first"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                         stablehlo.return %iterArg, %5 : tensor<f64>, !stablehlo.token
                       }, {
-                        %5 = stablehlo.custom_call @ryft.print(%iterArg, %iterArg_1) {api_version = 4 : i32, backend_config = {label = "later"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                        %5 = stablehlo.custom_call @ryft.print(%iterArg, %iterArg_1) {api_version = 4 : i32, backend_config = {label = "later"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                         stablehlo.return %iterArg, %5 : tensor<f64>, !stablehlo.token
                       }) : (tensor<i1>) -> (tensor<f64>, !stablehlo.token)
                       %4 = stablehlo.add %3#0, %cst : tensor<f64>
@@ -1713,11 +1713,11 @@ mod tests {
                       %cst_4 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                       %5 = stablehlo.compare GT, %4, %cst_4, FLOAT : (tensor<f64>, tensor<f64>) -> tensor<i1>
                       %6:2 = "stablehlo.if"(%5) ({
-                        %10 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config = {label = "positive"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                        %10 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config = {label = "positive"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                         %11 = stablehlo.add %iterArg_0, %4 : tensor<f64>
                         stablehlo.return %11, %10 : tensor<f64>, !stablehlo.token
                       }, {
-                        %10 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config = {label = "nonpositive"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                        %10 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config = {label = "nonpositive"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
                         %11 = stablehlo.subtract %iterArg_0, %4 : tensor<f64>
                         stablehlo.return %11, %10 : tensor<f64>, !stablehlo.token
                       }) : (tensor<i1>) -> (tensor<f64>, !stablehlo.token)

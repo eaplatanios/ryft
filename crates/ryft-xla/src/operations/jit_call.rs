@@ -3027,9 +3027,9 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
                     %0 = stablehlo.after_all  : !stablehlo.token
-                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "callee"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
+                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "callee"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
                     %2 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
-                    %3 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "callee"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "callee"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
                     %4 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
                     %5 = stablehlo.add %2, %4 : tensor<4xf32>
                     return %5 : tensor<4xf32>
@@ -3144,7 +3144,7 @@ mod tests {
                       %14 = stablehlo.slice %13 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
                       stablehlo.return %14 : tensor<2xf64>
                     }) : (tensor<i1>) -> tensor<2xf64>
-                    %12 = stablehlo.custom_call @ryft.print(%11, %10) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %12 = stablehlo.custom_call @ryft.print(%11, %10) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
                     return %11 : tensor<2xf64>
                   }
                 }
@@ -5767,9 +5767,10 @@ mod tests {
         ensure_print_handler_registered(client).unwrap();
         let (known, lines) =
             with_captured_prints(|| execute_f32_program(client, warm.known_program(), vec![vec![2.0]]));
-        assert_eq!(lines, vec!["known: f32[] 0x00008040"]);
+        assert_eq!(lines, vec!["known: 4.0"]);
         let known_output_count = warm.outputs().iter().filter(|output| output.is_known()).count();
-        for (unknown, unknown_hex, product_hex) in [(3.0, "00004040", "00004041"), (5.0, "0000a040", "0000a041")] {
+        for unknown in [3.0, 5.0] {
+            let product = unknown * 4.0;
             let inputs = warm
                 .residual_inputs()
                 .iter()
@@ -5783,8 +5784,8 @@ mod tests {
                 .collect();
             let (outputs, lines) =
                 with_captured_prints(|| execute_f32_program(client, warm.residual_program(), inputs));
-            assert_eq!(outputs, vec![vec![unknown * 4.0]]);
-            assert_eq!(lines, vec![format!("residual: f32[] 0x{product_hex}")]);
+            assert_eq!(outputs, vec![vec![product]]);
+            assert_eq!(lines, vec![format!("residual: {product:?}")]);
 
             let inputs = partition
                 .residual_inputs()
@@ -5797,14 +5798,10 @@ mod tests {
                 .collect();
             let (outputs, lines) =
                 with_captured_prints(|| execute_f32_program(client, partition.residual_program(), inputs));
-            assert_eq!(outputs, vec![vec![unknown * 4.0]]);
+            assert_eq!(outputs, vec![vec![product]]);
             assert_eq!(
                 lines,
-                vec![
-                    format!("before: f32[] 0x{unknown_hex}"),
-                    "known: f32[] 0x00008040".to_string(),
-                    format!("residual: f32[] 0x{product_hex}")
-                ],
+                vec![format!("before: {unknown:?}"), "known: 4.0".to_string(), format!("residual: {product:?}")],
             );
         }
     }
@@ -5838,11 +5835,11 @@ mod tests {
         let client = execution_client();
         ensure_print_handler_registered(client).unwrap();
         assert_eq!(execute_f32_program(client, partition.known_program(), vec![vec![2.0]]), vec![vec![4.0]]);
-        for (unknown, unknown_hex) in [(3.0, "00004040"), (5.0, "0000a040")] {
+        for unknown in [3.0, 5.0] {
             let (outputs, lines) =
                 with_captured_prints(|| execute_f32_program(client, partition.residual_program(), vec![vec![unknown]]));
             assert_eq!(outputs, Vec::<Vec<f32>>::new());
-            assert_eq!(lines, vec![format!("residual: f32[] 0x{unknown_hex}")]);
+            assert_eq!(lines, vec![format!("residual: {unknown:?}")]);
         }
         assert_eq!(warm.residual_program().to_string(), partition.residual_program().to_string());
     }

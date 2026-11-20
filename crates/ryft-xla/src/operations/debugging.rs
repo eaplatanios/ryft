@@ -1,10 +1,9 @@
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, EffectClass, PrintOperation};
+use ryft_core::{Array as CoreArray, ArrayAddressing, ArrayType, DataType, EffectClass, PrintOperation, Typed};
 use ryft_mlir::dialects::stable_hlo;
-use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
+use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue,
     ValueRef,
@@ -13,13 +12,14 @@ use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiOutput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
-use ryft_pjrt::{Client, Error as PjrtError};
+use ryft_pjrt::{BufferType, Client, Error as PjrtError};
 
+use crate::lowering::types::{lower_signed_one_bit_to_mlir, lower_tensor_type};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
-    Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension, RuntimeProvider,
-    RuntimeRequirement,
+    Error, ExecutionError, FromPjrt, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension,
+    RuntimeProvider, RuntimeRequirement,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -37,9 +37,8 @@ use crate::operations::assertions::copy_cuda_bytes;
 ///   - `api_version` is `4` (i.e., the typed FFI API version), so that the `backend_config` dictionary entries arrive
 ///     in the XLA FFI call frame as decoded [`FfiAttribute`]s.
 ///   - `has_side_effect` is `true`, so that the XLA compiler never elides or reorders the call.
-///   - `backend_config` is a dictionary attribute containing a single [`PRINT_LABEL_ATTRIBUTE`] (i.e., `"label"`)
-///     entry whose value is the string label to print.
-///   - The operands are `[value, token]`, which consist of the dense array value to print followed by a
+///   - `backend_config` contains the string label to print and may supply the logical type of the printed buffer.
+///   - The operands are `[value, token]`, which consist of the dense row-major array value to print followed by a
 ///     `!stablehlo.token` that orders this print relative to other operations with side effects.
 ///   - The single result is a `!stablehlo.token` that continues the effect ordering token chain.
 ///
@@ -53,9 +52,8 @@ pub const PRINT_CUSTOM_CALL_TARGET: &str = "ryft.print";
 /// custom call. Refer to the documentation of [`PRINT_CUSTOM_CALL_TARGET`] for the full calling convention.
 pub const PRINT_LABEL_ATTRIBUTE: &str = "label";
 
-/// Maximum number of raw bytes included in the fallback hexadecimal rendering of printed values whose element
-/// type has no dedicated numeric rendering. Longer buffers are truncated with a trailing ellipsis.
-const MAX_RENDERED_FALLBACK_BYTES: usize = 128;
+/// Name of the optional attribute that identifies a logical type whose formatting differs from its FFI carrier.
+const PRINT_LOGICAL_TYPE_ATTRIBUTE: &str = "logical_type";
 
 /// Serializes [`with_captured_prints`] sessions across threads. Because the print sink is process-global,
 /// two concurrently capturing tests would otherwise interleave their captured lines. Holding this lock for
@@ -147,17 +145,19 @@ impl LowerableOperation for PrintOperation<ArrayType> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let _ = (input_types, output_types);
+        let _ = output_types;
         // `print` is the identity on its data flow output, and its observable effect lowers to a host callback custom
         // call that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain
         // instead of the value data flow.
         check_count!("input", input_values, 1, ProgramError);
+        check_count!("input type", input_types, 1, TypeError);
         lowerer.require_runtime(RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET))?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
         lower_print_to_custom_call(
             self.label(),
             self.effect_class().is_ordered(),
             input_values[0],
+            &input_types[0],
             lowerer.effect_tokens_mut(),
             &mut block,
             context,
@@ -238,16 +238,18 @@ enum PrintBufferMemory {
 ///
 /// ```mlir
 /// %token_out = stablehlo.custom_call @"ryft.print"(%value, %token_in)
-///   {api_version = 4 : i32, backend_config = {label = "<label>"}, has_side_effect = true}
+///   {api_version = 4 : i32, backend_config = {label = "<label>"}, has_side_effect = true, ...}
 ///   : (tensor<...>, !stablehlo.token) -> !stablehlo.token
 /// ```
 ///
 /// The custom call's only result is the continuation token, while the `print` operation's data flow output is the
 /// forwarded input value, which the caller returns directly.
+#[allow(clippy::too_many_arguments)]
 fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     label: &str,
     ordered: bool,
     value: ValueRef<'b, 'c, 't>,
+    value_type: &ArrayType,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -258,9 +260,42 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     let effect_tokens = if ordered { effect_tokens } else { &mut local_tokens };
     let input_token = current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?;
     let token_type = context.stable_hlo_token_type()?;
-    let backend_config = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier(PRINT_LABEL_ATTRIBUTE), context.string_attribute(label))
-    ]);
+    let mut attributes =
+        vec![context.named_attribute(context.identifier(PRINT_LABEL_ATTRIBUTE), context.string_attribute(label))];
+    let data_type = value_type.data_type();
+    if matches!(data_type, DataType::Zero | DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN) {
+        attributes.push(context.named_attribute(
+            context.identifier(PRINT_LOGICAL_TYPE_ATTRIBUTE),
+            context.string_attribute(data_type.to_string().as_str()),
+        ));
+    }
+    let backend_config = context.dictionary_attribute(&attributes);
+    let value = if data_type == DataType::I1 {
+        lower_signed_one_bit_to_mlir(value, block, context, location)?
+    } else {
+        // XLA can pack sub-byte elements, and the FFI buffer view does not describe that packing.
+        let carrier = match data_type {
+            DataType::I2 | DataType::I4 => Some(DataType::I8),
+            DataType::U1 | DataType::U2 | DataType::U4 => Some(DataType::U8),
+            DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN => Some(DataType::F32),
+            _ => None,
+        };
+        if let Some(carrier) = carrier {
+            let carrier_type = lower_tensor_type(&value_type.clone().with_data_type(carrier), context, location)?;
+            block
+                .append_operation(stable_hlo::convert(value, carrier_type, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            value
+        }
+    };
+    // An FFI view carries dimensions and an element type. Pin the layout so its bytes are in logical order.
+    let memory_layouts = CustomCallMemoryLayouts {
+        operands: vec![(0..value_type.rank()).rev().collect(), Vec::new()],
+        results: vec![Vec::new()],
+    };
     let operation = block.append_operation(stable_hlo::custom_call(
         &[value, input_token],
         PRINT_CUSTOM_CALL_TARGET,
@@ -268,7 +303,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
         Some(backend_config.as_ref()),
         CustomCallApiVersion::TypedFfi,
         &[],
-        None,
+        Some(memory_layouts),
         &[],
         None,
         &[token_type],
@@ -328,7 +363,7 @@ unsafe fn print_handler_for_memory(
 /// Decodes a [`PRINT_CUSTOM_CALL_TARGET`] call frame, writes one `"<label>: <rendered value>"` line to the
 /// process-global print sink, and fills any non-token result buffers.
 fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>, memory: PrintBufferMemory) -> Result<(), FfiError> {
-    let label = decode_label(call_frame)?;
+    let (label, logical_type) = decode_print_attributes(call_frame)?;
     let mut value = None;
     for input in call_frame.inputs() {
         let FfiInput::Buffer { buffer } = input?;
@@ -342,8 +377,23 @@ fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>, memory: PrintBufferMem
             "expected the `{PRINT_CUSTOM_CALL_TARGET}` custom call to have one non-token input buffer",
         )));
     };
-    emit_print_line(format!("{label}: {}", render_buffer(&value, memory)?));
-    copy_value_to_outputs(call_frame, &value, memory)
+    let array = read_print_buffer(&value, memory)?;
+    let byte_count = array.storage_bytes().len();
+    let array = match (logical_type, value.element_type()) {
+        (None, _) => Ok(array),
+        (Some(DataType::Zero), FfiBufferType::Predicate) => {
+            CoreArray::new(array.r#type().into_owned().with_data_type(DataType::Zero), Vec::new())
+        }
+        (Some(data_type), FfiBufferType::F32) if !data_type.is_zero() => array.converted_to(data_type),
+        (Some(data_type), carrier) => {
+            return Err(FfiError::invalid_argument(format!(
+                "invalid `{PRINT_CUSTOM_CALL_TARGET}` buffer type `{carrier}` for logical type `{data_type}`",
+            )));
+        }
+    }
+    .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
+    emit_print_line(format!("{label}: {array}"));
+    copy_value_to_outputs(call_frame, &value, memory, byte_count)
 }
 
 /// Writes one line to the process-global print sink, which is standard error by default, or the active
@@ -358,127 +408,106 @@ fn emit_print_line(line: String) {
     }
 }
 
-/// Decodes the [`PRINT_LABEL_ATTRIBUTE`] string attribute of a [`PRINT_CUSTOM_CALL_TARGET`] call frame.
-fn decode_label<'o>(call_frame: &FfiCallFrame<'o>) -> Result<&'o str, FfiError> {
+/// Decodes the print label and optional logical element type from a print call frame.
+fn decode_print_attributes<'o>(call_frame: &FfiCallFrame<'o>) -> Result<(&'o str, Option<DataType>), FfiError> {
+    let mut label = None;
+    let mut logical_type = None;
     for attribute in call_frame.attributes() {
         let (name, attribute) = attribute?;
+        if !matches!(name, PRINT_LABEL_ATTRIBUTE | PRINT_LOGICAL_TYPE_ATTRIBUTE) {
+            continue;
+        }
+        let FfiAttribute::String { string } = attribute else {
+            return Err(FfiError::invalid_argument(format!(
+                "expected the `{name}` attribute of the `{PRINT_CUSTOM_CALL_TARGET}` custom call to be a string",
+            )));
+        };
         if name == PRINT_LABEL_ATTRIBUTE {
-            return match attribute {
-                FfiAttribute::String { string } => Ok(string),
-                _ => Err(FfiError::invalid_argument(format!(
-                    "expected the `{PRINT_LABEL_ATTRIBUTE}` attribute of the `{PRINT_CUSTOM_CALL_TARGET}` custom \
-                     call to be a string",
-                ))),
-            };
+            label = Some(string);
+        } else {
+            logical_type = Some(match string {
+                "zero" => DataType::Zero,
+                "f4e2m1fn" => DataType::F4E2M1FN,
+                "f6e2m3fn" => DataType::F6E2M3FN,
+                "f6e3m2fn" => DataType::F6E3M2FN,
+                _ => {
+                    return Err(FfiError::invalid_argument(format!(
+                        "unsupported logical type `{string}` for the `{PRINT_CUSTOM_CALL_TARGET}` custom call",
+                    )));
+                }
+            });
         }
     }
-    Err(FfiError::invalid_argument(format!(
-        "missing required `{PRINT_LABEL_ATTRIBUTE}` string attribute in the `{PRINT_CUSTOM_CALL_TARGET}` custom call",
-    )))
+    let label = label.ok_or_else(|| {
+        FfiError::invalid_argument(format!(
+            "missing required `{PRINT_LABEL_ATTRIBUTE}` string attribute in the `{PRINT_CUSTOM_CALL_TARGET}` custom call",
+        ))
+    })?;
+    Ok((label, logical_type))
 }
 
-/// Returns the number of elements stored in the provided [`FfiBuffer`] (i.e., the product of its dimensions).
-fn element_count(buffer: &FfiBuffer<'_>) -> usize {
-    buffer.dimensions().iter().map(|&dimension| dimension.max(0) as usize).product()
-}
-
-/// Returns the number of bytes used to store each element of the provided [`FfiBufferType`], and `None` for
-/// types without a defined host byte width. Sub-byte integer types are backed by bytes in XLA FFI buffers (i.e., they
-/// store one logical element per byte).
-fn element_size_in_bytes(element_type: FfiBufferType) -> Option<usize> {
-    match element_type {
-        FfiBufferType::Invalid | FfiBufferType::Token => None,
-        FfiBufferType::Predicate
-        | FfiBufferType::I1
-        | FfiBufferType::I2
-        | FfiBufferType::I4
-        | FfiBufferType::I8
-        | FfiBufferType::U1
-        | FfiBufferType::U2
-        | FfiBufferType::U4
-        | FfiBufferType::U8
-        | FfiBufferType::F4E2M1FN
-        | FfiBufferType::F8E3M4
-        | FfiBufferType::F8E4M3
-        | FfiBufferType::F8E4M3FN
-        | FfiBufferType::F8E4M3FNUZ
-        | FfiBufferType::F8E4M3B11FNUZ
-        | FfiBufferType::F8E5M2
-        | FfiBufferType::F8E5M2FNUZ
-        | FfiBufferType::F8E8M0FNU => Some(1),
-        FfiBufferType::I16 | FfiBufferType::U16 | FfiBufferType::BF16 | FfiBufferType::F16 => Some(2),
-        FfiBufferType::I32 | FfiBufferType::U32 | FfiBufferType::F32 => Some(4),
-        FfiBufferType::I64 | FfiBufferType::U64 | FfiBufferType::F64 | FfiBufferType::C64 => Some(8),
-        FfiBufferType::C128 => Some(16),
+/// Materializes a checked host array from a dense row-major print buffer.
+fn read_print_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Result<CoreArray, FfiError> {
+    let data_type = DataType::from_pjrt(BufferType::from_proto(buffer.element_type().proto()))
+        .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
+    if data_type.is_token() || !data_type.bit_width().is_multiple_of(8) {
+        return Err(FfiError::invalid_argument(format!(
+            "the `{PRINT_CUSTOM_CALL_TARGET}` custom call requires a byte-aligned value buffer, got `{data_type}`",
+        )));
     }
+    let dimensions = buffer
+        .dimensions()
+        .iter()
+        .map(|&dimension| {
+            usize::try_from(dimension).map_err(|_| {
+                FfiError::invalid_argument(format!("invalid `{PRINT_CUSTOM_CALL_TARGET}` buffer dimension {dimension}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let array_type = ArrayType::new_static(data_type, dimensions);
+    let byte_count = ArrayAddressing::new(array_type.clone())
+        .map_err(|error| FfiError::invalid_argument(error.to_string()))?
+        .storage_byte_len();
+    if byte_count > isize::MAX as usize {
+        return Err(FfiError::invalid_argument(format!(
+            "`{PRINT_CUSTOM_CALL_TARGET}` buffer exceeds the maximum slice length",
+        )));
+    }
+    let bytes = read_print_buffer_bytes(buffer, memory, byte_count)?;
+    CoreArray::new(array_type, bytes).map_err(|error| FfiError::invalid_argument(error.to_string()))
 }
 
-/// Returns the leading `byte_count` bytes of the provided [`FfiBuffer`], which are borrowed in place for host buffers
-/// and copied through the invocation's stream for CUDA device buffers.
-fn leading_bytes<'o>(
-    buffer: &'o FfiBuffer<'_>,
+/// Reads the checked byte length of a print buffer from host memory or through the current CUDA stream.
+fn read_print_buffer_bytes(
+    buffer: &FfiBuffer<'_>,
     memory: PrintBufferMemory,
     byte_count: usize,
-) -> Result<Cow<'o, [u8]>, FfiError> {
-    // SAFETY: The data pointer is provided by the XLA runtime and is valid for the duration of the handler
-    // invocation. It is only dereferenced after checking that it is non-null and only for `byte_count` bytes, which
-    // the callers bound by the element count and size that the runtime guarantees the allocation holds.
+) -> Result<Vec<u8>, FfiError> {
+    // An empty buffer may have a null data pointer.
+    if byte_count == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: XLA keeps the buffer allocation alive for the entire callback invocation.
     let data = unsafe { buffer.data() };
-    if byte_count > 0 && data.is_null() {
+    if data.is_null() {
         return Err(FfiError::internal(format!(
             "encountered null data pointer for a non-empty `{PRINT_CUSTOM_CALL_TARGET}` input buffer",
         )));
     }
-    // An empty buffer may have a null data pointer, from which no slice can be built.
-    if byte_count == 0 {
-        return Ok(Cow::Borrowed(&[]));
-    }
     match memory {
         PrintBufferMemory::Host => {
-            // SAFETY: Host buffers stay readable for the whole invocation, which outlives the borrow of `buffer`.
-            Ok(Cow::Borrowed(unsafe { std::slice::from_raw_parts(data as *const u8, byte_count) }))
+            // SAFETY: The handler receives host memory in this path. The dense byte-aligned layout and the checked
+            // buffer shape bound the byte count to the allocation and to the maximum slice size.
+            Ok(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), byte_count) }.to_vec())
         }
         #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
         PrintBufferMemory::Cuda(stream) => {
             let mut bytes = vec![0u8; byte_count];
-            // SAFETY: `data` is the device allocation of the buffer, which holds at least `byte_count` bytes and stays
-            // valid for the whole invocation, `bytes` holds `byte_count` bytes, and `stream` is the stream of this
-            // invocation.
+            // SAFETY: The device allocation and the host destination each hold at least `byte_count` bytes, and
+            // the stream is the stream of this invocation.
             unsafe { copy_cuda_bytes(data, bytes.as_mut_ptr().cast(), byte_count, stream) }?;
-            Ok(Cow::Owned(bytes))
+            Ok(bytes)
         }
-    }
-}
-
-/// Renders the provided [`FfiBuffer`] as a human-readable string. `f64` buffers are rendered numerically, with rank-0
-/// buffers rendered as a bare scalar (e.g., `3.5`) and buffers of higher rank as a flat row-major list (e.g.,
-/// `[1.5, 2.5]`). All other element types fall back to a `<type>[<dimensions>] 0x<bytes>` hexadecimal rendering,
-/// truncated to [`MAX_RENDERED_FALLBACK_BYTES`] bytes.
-fn render_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Result<String, FfiError> {
-    let element_type = buffer.element_type();
-    let count = element_count(buffer);
-    if element_type == FfiBufferType::F64 {
-        let bytes = leading_bytes(buffer, memory, count * size_of::<f64>())?;
-        let values = bytes
-            .as_chunks::<{ size_of::<f64>() }>()
-            .0
-            .iter()
-            .map(|chunk| format!("{:?}", f64::from_ne_bytes(*chunk)))
-            .collect::<Vec<_>>();
-        return if buffer.rank() == 0 { Ok(values[0].clone()) } else { Ok(format!("[{}]", values.join(", "))) };
-    }
-    let dimensions = buffer.dimensions().iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>();
-    let dimensions = dimensions.join(",");
-    match element_size_in_bytes(element_type) {
-        Some(element_size) if count > 0 => {
-            let byte_count = count * element_size;
-            let rendered_byte_count = byte_count.min(MAX_RENDERED_FALLBACK_BYTES);
-            let bytes = leading_bytes(buffer, memory, rendered_byte_count)?;
-            let rendered_bytes = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            let ellipsis = if byte_count > rendered_byte_count { "…" } else { "" };
-            Ok(format!("{element_type}[{dimensions}] 0x{rendered_bytes}{ellipsis}"))
-        }
-        _ => Ok(format!("{element_type}[{dimensions}]")),
     }
 }
 
@@ -491,6 +520,7 @@ fn copy_value_to_outputs(
     call_frame: &FfiCallFrame<'_>,
     value: &FfiBuffer<'_>,
     memory: PrintBufferMemory,
+    byte_count: usize,
 ) -> Result<(), FfiError> {
     for output in call_frame.outputs() {
         let FfiOutput::Buffer { buffer: output } = output?;
@@ -512,19 +542,12 @@ fn copy_value_to_outputs(
                  printed value buffer",
             )));
         }
-        let Some(element_size) = element_size_in_bytes(value.element_type()) else {
-            return Err(FfiError::invalid_argument(format!(
-                "cannot copy a `{PRINT_CUSTOM_CALL_TARGET}` value buffer with element type `{}` to an output",
-                value.element_type(),
-            )));
-        };
-        let byte_count = element_count(value) * element_size;
         if byte_count == 0 {
             continue;
         }
         // SAFETY: Both data pointers are provided by the XLA runtime, are valid for the duration of the handler
         // invocation, and are backed by allocations of at least `byte_count` bytes, as the shape and element type
-        // equality checks above ensure. The runtime allocates inputs and outputs separately so they do not overlap.
+        // equality checks above ensure. A custom call may declare an input-output alias.
         unsafe {
             let source = value.data() as *const u8;
             let destination = output.data() as *mut u8;
@@ -533,7 +556,7 @@ fn copy_value_to_outputs(
                     "encountered null data pointer while copying a `{PRINT_CUSTOM_CALL_TARGET}` value to an output",
                 )));
             }
-            std::ptr::copy_nonoverlapping(source, destination, byte_count);
+            std::ptr::copy(source, destination, byte_count);
         }
     }
     Ok(())
@@ -546,9 +569,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, Dimension as CoreDimension,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Print, PrintOperation, ProjectedContext, Shape, Sharding,
-        Typed, batch,
+        AddOperation, ArrayType, BatchAxis, DataType, Device, DeviceMesh, Dimension as CoreDimension, Layout,
+        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Print, PrintOperation, Shape, Sharding, TiledLayout, Typed,
+        batch,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
@@ -561,7 +584,9 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::sessions::tests::{domain_mesh, f64_vector, read_first_shard};
-    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{
         Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile,
         to_mlir_module_for_program,
@@ -573,28 +598,23 @@ mod tests {
     /// the payload passes through unchanged.
     fn assert_eager_bind_executes_print_effect(client: &'static Client<'static>) {
         let mesh = domain_mesh(client, "x", 1);
-        let domain = ProjectedContext::<Session, ArrayType>::new(Session::builder().client(client).build().unwrap());
-        ensure_print_handler_registered(client).unwrap();
+        let session = Session::builder().client(client).build().unwrap();
+        let values = [1.5f32, 2.5, 3.5, 4.5, 5.5, 6.5];
+        let r#type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+        let input = Array::from_host_buffer(&session, r#type, mesh, None, values_to_bytes(&values)).unwrap();
+        let input_type = input.r#type().into_owned();
 
-        // The effectful `print` rides the compiled program of the operation as a `@ryft.print` custom call that threads
-        // a token. Eagerly binding it fires the host callback once and passes the payload through unchanged.
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let input = Array::from_host_buffer(
-            domain.parent(),
-            r#type,
-            mesh.clone(),
-            None,
-            values_to_bytes::<f64>(&[1.5, 2.5]).as_slice(),
-        )
-        .unwrap();
-        let (outputs, lines) =
-            with_captured_prints(|| domain.bind(PrintOperation::<ArrayType>::new("x"), Vec::new(), &[input]).unwrap());
+        // Eager dispatch registers the callback and prints the matrix in logical order despite its storage layout.
+        let (output, lines) = with_captured_prints(|| {
+            let output = input.print("x").unwrap();
+            session.synchronize().unwrap();
+            output
+        });
 
-        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f64>().unwrap(), vec![1.5, 2.5]);
+        assert_eq!(lines, vec!["x: [[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]]"]);
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
     }
 
     #[test]
@@ -605,7 +625,7 @@ mod tests {
         ensure_print_handler_registered(client).unwrap();
 
         // The program threads one token chain through three prints of an `f64` vector argument, an `f64` scalar
-        // constant, and an `f32` constant that exercises the hexadecimal fallback rendering.
+        // constant, and an `f32` vector constant.
         let program = Program::Mlir {
             bytecode: indoc! {r#"
                 module {
@@ -654,18 +674,7 @@ mod tests {
             assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), input_values.to_vec());
         });
 
-        let expected_floats_bytes = values_to_bytes::<f32>(&[1.0f32, 2.0f32])
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(
-            lines,
-            vec![
-                "x: [1.5, 2.5]".to_string(),
-                "scalar: 3.5".to_string(),
-                format!("floats: f32[2] 0x{expected_floats_bytes}"),
-            ],
-        );
+        assert_eq!(lines, vec!["x: [1.5, 2.5]", "scalar: 3.5", "floats: [1.0, 2.0]"]);
     }
 
     #[test]
@@ -749,8 +758,8 @@ mod tests {
                   func.func @main(%arg0: tensor<2xf64>) -> tensor<2xf64> {
                     %0 = stablehlo.add %arg0, %arg0 : tensor<2xf64>
                     %1 = stablehlo.after_all  : !stablehlo.token
-                    %2 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "first"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
-                    %3 = stablehlo.custom_call @ryft.print(%0, %2) {api_version = 4 : i32, backend_config = {label = "second"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "first"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%0, %2) {api_version = 4 : i32, backend_config = {label = "second"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
                     %4 = stablehlo.add %arg0, %0 : tensor<2xf64>
                     return %4 : tensor<2xf64>
                   }
@@ -813,8 +822,9 @@ mod tests {
                     module {
                       func.func @main(%arg0: tensor<f32>, %arg1: !stablehlo.token) -> !stablehlo.token {
                         %0 = stablehlo.custom_call @ryft.print(%arg0, %arg1) {api_version = 4 : i32, backend_config = \
-                            {label = \"value\"}, has_side_effect = true} : (tensor<f32>, !stablehlo.token) -> \
-                            !stablehlo.token
+                            {label = \"value\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, \
+                            dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : \
+                            (tensor<f32>, !stablehlo.token) -> !stablehlo.token
                         return %0 : !stablehlo.token
                       }
                     }
@@ -825,8 +835,9 @@ mod tests {
                       func.func @main(%arg0: tensor<f32>) {
                         %0 = stablehlo.after_all  : !stablehlo.token
                         %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = \
-                            {label = \"value\"}, has_side_effect = true} : (tensor<f32>, !stablehlo.token) -> \
-                            !stablehlo.token
+                            {label = \"value\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, \
+                            dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : \
+                            (tensor<f32>, !stablehlo.token) -> !stablehlo.token
                         return
                       }
                     }
@@ -911,6 +922,32 @@ mod tests {
     }
 
     #[test]
+    fn test_print_operation_lower_preserves_sub_byte_and_zero_values() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        for (data_type, bytes, expected) in [
+            (DataType::I1, &[0, 1][..], "x: [0, -1]"),
+            (DataType::I4, &[14, 3], "x: [-2, 3]"),
+            (DataType::U2, &[2, 3], "x: [2, 3]"),
+            (DataType::F4E2M1FN, &[0x02, 0x0a], "x: [1, -1]"),
+            (DataType::F6E2M3FN, &[0x08, 0x28], "x: [1, -1]"),
+            (DataType::F6E3M2FN, &[0x0c, 0x2c], "x: [1, -1]"),
+            (DataType::Zero, &[], "x: [zero, zero]"),
+        ] {
+            let input = replicated_array(&session, &mesh, data_type, &[2], bytes);
+            let (output, lines) = with_captured_prints(|| {
+                let output = input.print("x").unwrap();
+                session.synchronize().unwrap();
+                output
+            });
+            assert_eq!(lines, vec![expected], "{data_type}");
+            assert_eq!(output.data_type(), data_type);
+            assert_eq!(output.copy_to_host_bytes().unwrap().as_slice(), bytes);
+        }
+    }
+
+    #[test]
     fn test_print_operation_lower_executes_batched_prints_on_cpu() {
         let client = cpu_client(1);
         ensure_print_handler_registered(client).unwrap();
@@ -948,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_buffer() {
+    fn test_read_print_buffer() {
         let ffi_buffer = |r#type: FfiBufferType, bytes: &[u8], dimensions: &[i64]| XLA_FFI_Buffer {
             struct_size: size_of::<XLA_FFI_Buffer>(),
             extension_start: std::ptr::null_mut(),
@@ -958,30 +995,30 @@ mod tests {
             dimensions: dimensions.as_ptr(),
         };
 
-        // `f64` buffers render numerically, as a bare scalar at rank 0 and as a flat list otherwise.
-        let scalar = 3.5f64.to_ne_bytes();
-        let scalar = ffi_buffer(FfiBufferType::F64, &scalar, &[]);
-        let scalar = unsafe { FfiBuffer::from_c_api(&scalar) }.unwrap();
-        assert_eq!(render_buffer(&scalar, PrintBufferMemory::Host), Ok("3.5".to_string()));
-        let vector = values_to_bytes(&[1.5f64, -2.0]);
+        let dimensions = [2, 2];
+        let integers = ffi_buffer(FfiBufferType::I8, &[255, 2, 3, 4], &dimensions);
+        let integers = unsafe { FfiBuffer::from_c_api(&integers) }.unwrap();
+        assert_eq!(read_print_buffer(&integers, PrintBufferMemory::Host).unwrap().to_string(), "[[-1, 2], [3, 4]]");
+
         let dimensions = [2];
-        let vector = ffi_buffer(FfiBufferType::F64, &vector, &dimensions);
-        let vector = unsafe { FfiBuffer::from_c_api(&vector) }.unwrap();
-        assert_eq!(render_buffer(&vector, PrintBufferMemory::Host), Ok("[1.5, -2.0]".to_string()));
+        let predicates = ffi_buffer(FfiBufferType::Predicate, &[0, 1], &dimensions);
+        let predicates = unsafe { FfiBuffer::from_c_api(&predicates) }.unwrap();
+        assert_eq!(read_print_buffer(&predicates, PrintBufferMemory::Host).unwrap().to_string(), "[false, true]");
 
-        // Other element types fall back to their raw bytes, truncated with an ellipsis.
-        let bytes = (0..=255u8).collect::<Vec<_>>();
-        let dimensions = [2, 128];
-        let large = ffi_buffer(FfiBufferType::U8, &bytes, &dimensions);
-        let large = unsafe { FfiBuffer::from_c_api(&large) }.unwrap();
-        let rendered_bytes =
-            bytes[..MAX_RENDERED_FALLBACK_BYTES].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        assert_eq!(render_buffer(&large, PrintBufferMemory::Host), Ok(format!("u8[2,128] 0x{rendered_bytes}…")),);
-
-        // Empty buffers render only their type and shape, even with a null data pointer.
-        let dimensions = [0, 3];
+        // Empty buffers may have a null data pointer and still render their outer dimensions.
+        let dimensions = [2, 0];
         let empty = XLA_FFI_Buffer { data: std::ptr::null_mut(), ..ffi_buffer(FfiBufferType::F32, &[], &dimensions) };
         let empty = unsafe { FfiBuffer::from_c_api(&empty) }.unwrap();
-        assert_eq!(render_buffer(&empty, PrintBufferMemory::Host), Ok("f32[0,3]".to_string()));
+        assert_eq!(read_print_buffer(&empty, PrintBufferMemory::Host).unwrap().to_string(), "[[], []]");
+
+        // Raw sub-byte buffers lack the packing information needed to read their storage.
+        let dimensions = [2];
+        let packed = XLA_FFI_Buffer { data: std::ptr::null_mut(), ..ffi_buffer(FfiBufferType::I4, &[], &dimensions) };
+        let packed = unsafe { FfiBuffer::from_c_api(&packed) }.unwrap();
+        assert!(matches!(
+            read_print_buffer(&packed, PrintBufferMemory::Host),
+            Err(FfiError::InvalidArgument { message, .. })
+                if message == "the `ryft.print` custom call requires a byte-aligned value buffer, got `i4`",
+        ));
     }
 }

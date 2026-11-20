@@ -526,7 +526,13 @@ pub(in crate::lowering) mod tests {
                   func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
                     %0 = stablehlo.after_all  : !stablehlo.token
                     %1:2 = stablehlo.optimization_barrier %arg0, %0 : tensor<2xf32>, !stablehlo.token
-                    %2 = stablehlo.custom_call @ryft.print(%1#0, %1#1) {api_version = 4 : i32, backend_config = {label = "body"}, has_side_effect = true} : (tensor<2xf32>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%1#0, %1#1) {\
+                        api_version = 4 : i32, \
+                        backend_config = {label = "body"}, \
+                        has_side_effect = true, \
+                        operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
+                        result_layouts = [dense<> : tensor<0xindex>]\
+                    } : (tensor<2xf32>, !stablehlo.token) -> !stablehlo.token
                     %3 = stablehlo.add %1#0, %1#0 : tensor<2xf32>
                     return %3 : tensor<2xf32>
                   }

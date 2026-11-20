@@ -512,7 +512,7 @@ mod tests {
                     module {
                       func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
                         %0 = stablehlo.after_all  : !stablehlo.token
-                        %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "primal"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
+                        %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "primal"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
                         %2 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
                         return %2 : tensor<4xf32>
                       }

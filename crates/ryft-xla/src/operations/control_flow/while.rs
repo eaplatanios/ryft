@@ -1024,7 +1024,9 @@ mod tests {
                 has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
                     %2 = stablehlo.after_all  : !stablehlo.token
                     %3 = stablehlo.custom_call @ryft.print(%arg0, %2) {api_version = 4 : i32, backend_config = {label \
-                = \"condition\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
+                = \"condition\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<i1>, !stablehlo.token) -> \
+                !stablehlo.token
                     %4:5 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0, %iterArg_1 = %arg0, %iterArg_2 = %1, \
                 %iterArg_3 = %3) : tensor<i64>, tensor<i1>, tensor<i1>, !stablehlo.token, !stablehlo.token
                     cond {
@@ -1042,8 +1044,9 @@ mod tests {
                 backend_config = {actor = \"assert\", kind = \"generic\", label_count = \"0\", message = \"condition \
                 must be true\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
                         %9 = stablehlo.custom_call @ryft.print(%iterArg_0, %iterArg_3) {api_version = 4 : i32, \
-                backend_config = {label = \"condition\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> \
-                !stablehlo.token
+                backend_config = {label = \"condition\"}, has_side_effect = true, operand_layouts = [dense<> : \
+                tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : \
+                (tensor<i1>, !stablehlo.token) -> !stablehlo.token
                         stablehlo.return %iterArg_0, %8, %9 : tensor<i1>, !stablehlo.token, !stablehlo.token
                       }, {
                         stablehlo.return %iterArg_1, %iterArg_2, %iterArg_3 : tensor<i1>, !stablehlo.token, \

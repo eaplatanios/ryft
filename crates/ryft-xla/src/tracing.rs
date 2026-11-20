@@ -515,7 +515,13 @@ mod tests {
                   func.func @main(%arg0: tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = stablehlo.after_all  : !stablehlo.token
                     %1 = sdy.manual_computation(%arg0, %0) in_shardings=[<@mesh, [{"x"}]>, <@mesh, []>] out_shardings=[<@mesh, []>] manual_axes={"x"} (%arg1: tensor<2xf64>, %arg2: !stablehlo.token) {
-                      %2 = stablehlo.custom_call @ryft.print(%arg1, %arg2) {api_version = 4 : i32, backend_config = {label = "body"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                      %2 = stablehlo.custom_call @ryft.print(%arg1, %arg2) {\
+                        api_version = 4 : i32, \
+                        backend_config = {label = "body"}, \
+                        has_side_effect = true, \
+                        operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
+                        result_layouts = [dense<> : tensor<0xindex>]\
+                      } : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
                       sdy.return %2 : !stablehlo.token
                     } : (tensor<4xf64>, !stablehlo.token) -> !stablehlo.token
                     return %arg0 : tensor<4xf64>

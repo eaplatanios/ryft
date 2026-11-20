@@ -3497,7 +3497,13 @@ pub(crate) mod tests {
                     %c = stablehlo.constant dense<false> : tensor<i1>
                     %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
                     %1 = stablehlo.after_all  : !stablehlo.token
-                    %2 = stablehlo.custom_call @ryft.print(%0, %1) {api_version = 4 : i32, backend_config = {label = "zero"}, has_side_effect = true} : (tensor<3xi1>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%0, %1) {\
+                        api_version = 4 : i32, \
+                        backend_config = {label = "zero", logical_type = "zero"}, \
+                        has_side_effect = true, \
+                        operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
+                        result_layouts = [dense<> : tensor<0xindex>]\
+                    } : (tensor<3xi1>, !stablehlo.token) -> !stablehlo.token
                     return
                   }
                 }

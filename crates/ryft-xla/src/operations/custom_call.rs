@@ -664,8 +664,9 @@ mod tests {
                         1]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<2x3xf32>, tensor<2x3xf32>, \
                         !stablehlo.token) -> (tensor<2x3xf32>, tensor<2x3xf32>, !stablehlo.token)
                     %2 = stablehlo.custom_call @ryft.print(%arg1, %1#2) {api_version = 4 : i32, backend_config = \
-                        {label = \"between\"}, has_side_effect = true} : (tensor<2x3xf32>, !stablehlo.token) -> \
-                        !stablehlo.token
+                        {label = \"between\"}, has_side_effect = true, operand_layouts = [dense<[1, 0]> : \
+                        tensor<2xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : \
+                        (tensor<2x3xf32>, !stablehlo.token) -> !stablehlo.token
                     %3:2 = stablehlo.custom_call @ryft.test.record(%arg1, %2) {api_version = 4 : i32, \
                         backend_config = {}, has_side_effect = true, operand_layouts = [dense<[1, 0]> : \
                         tensor<2xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<[1, 0]> : \

@@ -2520,8 +2520,9 @@ mod tests {
                 i32, backend_config = {actor = \"assert\", kind = \"generic\", label_0 = \"value\", label_1 = \
                 \"carry\", label_count = \"2\", message = \"scan value must equal carry\"}, has_side_effect = true} \
                 : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
-                      %7 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config \
-                = {label = \"iteration\"}, has_side_effect = true} : (tensor<i64>, !stablehlo.token) -> \
+                      %7 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config = \
+                {label = \"iteration\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> \
+                : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<i64>, !stablehlo.token) -> \
                 !stablehlo.token
                       %c_4 = stablehlo.constant dense<1> : tensor<i64>
                       %8 = stablehlo.add %iterArg, %c_4 : tensor<i64>
@@ -2571,7 +2572,9 @@ mod tests {
                 tensor<1xf64>
                       %3 = stablehlo.reshape %2 : (tensor<1xf64>) -> tensor<f64>
                       %4 = stablehlo.custom_call @ryft.print(%3, %iterArg_2) {api_version = 4 : i32, backend_config = \
-                {label = \"item\"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                {label = \"item\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> \
+                !stablehlo.token
                       %5 = stablehlo.add %iterArg_0, %3 : tensor<f64>
                       %c_3 = stablehlo.constant dense<1> : tensor<i64>
                       %6 = stablehlo.add %iterArg, %c_3 : tensor<i64>
@@ -3404,7 +3407,9 @@ mod tests {
                 -> tensor<1xf64>
                         %5 = stablehlo.reshape %4 : (tensor<1xf64>) -> tensor<f64>
                         %6 = stablehlo.custom_call @ryft.print(%5, %iterArg_2) {api_version = 4 : i32, backend_config \
-                = {label = \"item\"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                = {label = \"item\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> \
+                !stablehlo.token
                         %7 = stablehlo.add %iterArg_0, %5 : tensor<f64>
                         %c_3 = stablehlo.constant dense<1> : tensor<i64>
                         %8 = stablehlo.add %iterArg, %c_3 : tensor<i64>
@@ -3551,7 +3556,9 @@ mod tests {
                 tensor<i64>) -> tensor<1xf64>
                         %5 = stablehlo.reshape %4 : (tensor<1xf64>) -> tensor<f64>
                         %6 = stablehlo.custom_call @ryft.print(%5, %iterArg_7) {api_version = 4 : i32, backend_config \
-                = {label = \"item\"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                = {label = \"item\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> \
+                !stablehlo.token
                         %7 = stablehlo.add %iterArg_5, %5 : tensor<f64>
                         %c_8 = stablehlo.constant dense<1> : tensor<i64>
                         %8 = stablehlo.add %iterArg_4, %c_8 : tensor<i64>

@@ -1736,7 +1736,9 @@ mod tests {
                     %3:3 = stablehlo.optimization_barrier %arg0, %arg1, %2 : tensor<i64>, tensor<2xf64>, \
                         !stablehlo.token
                     %4 = stablehlo.custom_call @ryft.print(%arg1, %2) {api_version = 4 : i32, backend_config = {label \
-                        = \"value\"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                        = \"value\"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, dense<> : \
+                        tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, \
+                        !stablehlo.token) -> !stablehlo.token
                     return %arg1 : tensor<2xf64>
                   }
                 }
@@ -1931,8 +1933,9 @@ mod tests {
                         !stablehlo.token
                     %13:2 = stablehlo.optimization_barrier %arg2, %12 : tensor<3xf64>, !stablehlo.token
                     %14 = stablehlo.custom_call @ryft.print(%arg3, %12) {api_version = 4 : i32, backend_config = \
-                        {label = \"row\"}, has_side_effect = true} : (tensor<3xf64>, !stablehlo.token) -> \
-                        !stablehlo.token
+                        {label = \"row\"}, has_side_effect = true, operand_layouts = [dense<0> : tensor<1xindex>, \
+                        dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<3xf64>, \
+                        !stablehlo.token) -> !stablehlo.token
                     return %13#0, %arg3 : tensor<3xf64>, tensor<3xf64>
                   }
                 }
@@ -2449,8 +2452,9 @@ mod tests {
                         !stablehlo.token) -> !stablehlo.token
                     %13 = stablehlo.after_all  : !stablehlo.token
                     %14 = stablehlo.custom_call @ryft.print(%arg0, %13) {api_version = 4 : i32, backend_config = \
-                        {label = \"value\"}, has_side_effect = true} : (tensor<i64>, !stablehlo.token) -> \
-                        !stablehlo.token
+                        {label = \"value\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, \
+                        dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<i64>, \
+                        !stablehlo.token) -> !stablehlo.token
                     %15 = stablehlo.compare EQ, %0, %6, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
                     %16 = stablehlo.custom_call @ryft.assert(%15, %0, %6, %12) {api_version = 4 : i32, backend_config \
                         = {actor = \"assert\", kind = \"generic\", label_0 = \"left_dimension\", label_1 = \
