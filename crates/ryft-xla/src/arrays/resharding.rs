@@ -59,7 +59,7 @@ impl Array {
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: [`ArrayPlacement`] that resolves to the destination [`DeviceMesh`] and [`Sharding`].
     pub fn to_placement(&self, session: &Session, target: ArrayPlacement) -> Result<Self, Error> {
-        let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
+        let (target_mesh, target_sharding) = target.resolve(session, self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
         }
@@ -81,7 +81,7 @@ impl Array {
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: [`ArrayPlacement`] that resolves to the destination [`DeviceMesh`] and [`Sharding`].
     pub fn into_placement(self, session: &Session, target: ArrayPlacement) -> Result<Self, Error> {
-        let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
+        let (target_mesh, target_sharding) = target.resolve(session, self.sharding().rank())?;
         if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
         }
@@ -747,7 +747,7 @@ impl Array {
         shape: StaticShape,
         buffer: Arc<Buffer<'static>>,
     ) -> Result<Self, Error> {
-        let (mesh, sharding) = ArrayPlacement::Device(device).resolve(shape.rank())?;
+        let (mesh, sharding) = ArrayPlacement::Device(device).resolve(session, shape.rank())?;
         let layout = Layout::from_pjrt(buffer.specification()?.layout)?;
         let r#type = ArrayType::new(data_type, shape.into()).with_layout(layout);
         Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, vec![buffer], false)

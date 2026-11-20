@@ -9,12 +9,12 @@ use ryft_macros::Parameter;
 use crate::arrays::{Array, ArrayError};
 use crate::{Error, FromPjrt, Session};
 
-/// Target placement of an [`Array`] on devices, which is where [`Session::place`], [`Array::to_placement`],
-/// and [`Array::into_placement`] put a value and what [`PlacementOptions::source`] expects of one. It models
-/// the subset of the `device` and `src` arguments of JAX's
-/// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) that Ryft currently supports.
-/// [`Self::Device`] places a value on a single concrete device, which is represented internally as a mesh of size `1`
-/// with fully replicated sharding, and [`Self::Mesh`] places it on an explicit mesh with an explicit sharding.
+/// Placement of an [`Array`] on devices. It specifies a destination for [`Session::place`],
+/// [`Array::to_placement`], and [`Array::into_placement`], or an expected source in [`PlacementOptions`].
+/// [`Self::Device`] uses replicated sharding on a single device. [`Self::Mesh`] pairs a concrete mesh with a
+/// sharding. [`Self::Sharding`] uses the session's [default mesh](Session::device_mesh), whose logical topology
+/// must match the sharding. Destination and source trees in [`PlacementOptions`] can use `Some(placement)` and
+/// `None` together. A `None` leaf omits the option for its branch.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum ArrayPlacement {
     /// Commit the value to one concrete device.
@@ -28,6 +28,9 @@ pub enum ArrayPlacement {
         /// Sharding to apply over `mesh`.
         sharding: Sharding,
     },
+
+    /// Use this sharding on the session's configured default mesh.
+    Sharding(Sharding),
 }
 
 impl ArrayPlacement {
@@ -48,27 +51,28 @@ impl ArrayPlacement {
         Ok(Self::Mesh { mesh, sharding })
     }
 
-    /// Resolves this target into the destination [`DeviceMesh`] and [`Sharding`] of a value of rank `rank`.
-    /// A [`Self::Device`] target resolves to a mesh with one auto axis named `device` of size 1 and to the
+    /// Resolves this placement into the concrete [`DeviceMesh`] and [`Sharding`] of a value of rank `rank`.
+    /// A [`Self::Device`] placement resolves to a mesh with one auto axis named `device` of size 1 and to the
     /// replicated sharding over that mesh.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the sharding of a [`Self::Mesh`] target refers to a different logical mesh than
-    /// its mesh.
-    pub(crate) fn resolve(self, rank: usize) -> Result<(DeviceMesh, Sharding), Error> {
-        match self {
+    /// Returns [`SessionError::MissingMesh`](crate::SessionError::MissingMesh) when [`Self::Sharding`] needs a
+    /// default mesh and the session has none, or [`ShardingError::MeshMismatch`](ryft_core::ShardingError::MeshMismatch)
+    /// when the sharding and the concrete mesh have different logical topologies.
+    pub(crate) fn resolve(self, session: &Session, rank: usize) -> Result<(DeviceMesh, Sharding), Error> {
+        let (mesh, sharding) = match self {
             Self::Device(device) => {
                 let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
                 let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
                 let sharding = Sharding::replicated(mesh.logical_mesh().clone(), rank);
-                Ok((mesh, sharding))
+                return Ok((mesh, sharding));
             }
-            Self::Mesh { mesh, sharding } => {
-                check_sharding!(&mesh, &sharding);
-                Ok((mesh, sharding))
-            }
-        }
+            Self::Mesh { mesh, sharding } => (mesh, sharding),
+            Self::Sharding(sharding) => (session.device_mesh()?.clone(), sharding),
+        };
+        check_sharding!(&mesh, &sharding);
+        Ok((mesh, sharding))
     }
 }
 
@@ -84,7 +88,8 @@ impl From<Device> for ArrayPlacement {
 /// Options of [`Session::place`].
 ///
 /// Each field follows JAX's tree prefix semantics, so when a field is present, its structure is broadcast over the
-/// input tree and applied leafwise.
+/// input tree and applied leafwise. Destination and source prefixes can contain [`ArrayPlacement`] leaves or
+/// `Option<ArrayPlacement>` leaves. A `None` leaf omits the corresponding option for that branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementOptions<Target = ArrayPlacement, Source = ArrayPlacement, Donate = bool, MayAlias = Option<bool>> {
     /// Destination placement tree prefix. When absent, host leaves are committed to the default local device and
@@ -206,14 +211,14 @@ impl<T: IntoDenseHostArray + Parameter> Placeable for T {
         let client = session.client();
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let (mesh, sharding) = match target {
-            Some(target) => target.resolve(shape.len())?,
+            Some(target) => target.resolve(session, shape.len())?,
             None => {
                 let device = client
                     .addressable_devices()?
                     .into_iter()
                     .next()
                     .ok_or_else(|| Error::from(ArrayError::MissingDefaultDevice))?;
-                ArrayPlacement::device(Device::from_pjrt(device)?).resolve(shape.len())?
+                ArrayPlacement::device(Device::from_pjrt(device)?).resolve(session, shape.len())?
             }
         };
         let r#type = ArrayType::new(element_type, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
@@ -230,29 +235,28 @@ impl Placeable for Array {
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array, Error> {
-        let current_mesh = self.mesh().clone();
-        let current_sharding = self.sharding().clone();
         if let Some(source) = source {
-            let (expected_mesh, expected_sharding) = source.resolve(current_sharding.rank())?;
-            if expected_mesh != current_mesh || expected_sharding != current_sharding {
+            let (expected_mesh, expected_sharding) = source.resolve(session, self.sharding().rank())?;
+            if &expected_mesh != self.mesh() || &expected_sharding != self.sharding() {
                 return Err(Error::from(ArrayError::SourcePlacementMismatch {
                     expected_mesh,
                     expected_sharding,
-                    actual_mesh: current_mesh.clone(),
-                    actual_sharding: current_sharding.clone(),
+                    actual_mesh: self.mesh().clone(),
+                    actual_sharding: self.sharding().clone(),
                 }));
             }
         }
 
-        let (target_mesh, target_sharding) = match target {
-            Some(target) => target.resolve(self.sharding().rank())?,
-            None => (current_mesh.clone(), current_sharding.clone()),
-        };
-        let output = if target_mesh == current_mesh && target_sharding == current_sharding {
-            self
+        let output = if let Some(target) = target {
+            let (mesh, sharding) = target.resolve(session, self.sharding().rank())?;
+            if &mesh == self.mesh() && &sharding == self.sharding() {
+                self
+            } else {
+                let target = ArrayPlacement::Mesh { mesh, sharding };
+                if donate { self.into_placement(session, target)? } else { self.to_placement(session, target)? }
+            }
         } else {
-            let target = ArrayPlacement::mesh(target_mesh, target_sharding)?;
-            if donate { self.into_placement(session, target)? } else { self.to_placement(session, target)? }
+            self
         };
 
         // The result is this leaf when the placement does not change, and it otherwise shares the buffers of the
@@ -271,10 +275,11 @@ impl Session {
     ///
     /// The input `x` may be one supported leaf or a [`Parameterized`] tree of supported leaves (i.e., of
     /// [`Placeable`]s). Any provided `target`, `source`, `donate`, and `may_alias` options follow tree prefix
-    /// broadcasting semantics over `x`.
+    /// broadcasting semantics over `x`. The destination and source prefixes accept optional placement leaves,
+    /// so a single tree can mix explicit placements with `None` for branches where the option is omitted.
     ///
-    /// Host leaves are committed to the default local device when `options.target()` is absent. Existing
-    /// [`Array`] leaves preserve their current placement when `options.target()` is absent.
+    /// With no destination, a host leaf goes to the first addressable device and an existing [`Array`] leaf keeps
+    /// its current placement. Use [`ArrayPlacement::Sharding`] to place a leaf on the session's default mesh.
     ///
     /// # Parameters
     ///
@@ -283,8 +288,10 @@ impl Session {
     pub fn place<
         P: Placeable,
         Input: Parameterized<P>,
-        Target: Parameterized<ArrayPlacement>,
-        Source: Parameterized<ArrayPlacement>,
+        TargetPlacement: Parameter + Into<Option<ArrayPlacement>>,
+        Target: Parameterized<TargetPlacement>,
+        SourcePlacement: Parameter + Into<Option<ArrayPlacement>>,
+        Source: Parameterized<SourcePlacement>,
         Donate: Parameterized<bool>,
         MayAlias: Parameterized<Option<bool>>,
     >(
@@ -294,7 +301,7 @@ impl Session {
     ) -> Result<<Input as Parameterized<P>>::To<Array>, Error>
     where
         <Input as Parameterized<P>>::Family: ParameterizedFamily<Array>
-            + ParameterizedFamily<ArrayPlacement>
+            + ParameterizedFamily<Option<ArrayPlacement>>
             + ParameterizedFamily<bool>
             + ParameterizedFamily<Option<bool>>,
     {
@@ -303,22 +310,20 @@ impl Session {
         let (target, source, donate, may_alias) = options.into_parts();
 
         let target_values = match target {
-            Some(target) => Input::To::<ArrayPlacement>::from_broadcasted_named_parameters(
+            Some(target) => Input::To::<Option<ArrayPlacement>>::from_broadcasted_named_parameters(
                 structure.clone(),
-                target.into_named_parameters(),
+                target.into_named_parameters().map(|(path, placement)| (path, placement.into())),
             )?
             .into_parameters()
-            .map(Some)
             .collect::<Vec<_>>(),
             None => vec![None; leaf_count],
         };
         let source_values = match source {
-            Some(source) => Input::To::<ArrayPlacement>::from_broadcasted_named_parameters(
+            Some(source) => Input::To::<Option<ArrayPlacement>>::from_broadcasted_named_parameters(
                 structure.clone(),
-                source.into_named_parameters(),
+                source.into_named_parameters().map(|(path, placement)| (path, placement.into())),
             )?
             .into_parameters()
-            .map(Some)
             .collect::<Vec<_>>(),
             None => vec![None; leaf_count],
         };
@@ -465,9 +470,13 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{DeviceMesh, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, Typed};
+    use ryft_core::{
+        DeviceMesh, Error as CoreError, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        ShardingError, Typed,
+    };
     use ryft_pjrt::BufferType;
 
+    use crate::SessionError;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, device_mesh_2x2, values_from_bytes, values_to_bytes};
 
@@ -509,11 +518,13 @@ mod tests {
 
     #[test]
     fn test_array_placement_resolve() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+
         // A device target resolves to a replicated placement on a mesh with one auto axis of size 1.
         let device = Device::new(3, 0);
         let device_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         assert_eq!(
-            ArrayPlacement::Device(device).resolve(2).unwrap(),
+            ArrayPlacement::Device(device).resolve(&session, 2).unwrap(),
             (DeviceMesh::new(device_mesh.clone(), vec![device]).unwrap(), Sharding::replicated(device_mesh, 2)),
         );
 
@@ -521,8 +532,33 @@ mod tests {
         let mesh = device_mesh_2x2();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(
-            ArrayPlacement::Mesh { mesh: mesh.clone(), sharding: sharding.clone() }.resolve(1).unwrap(),
-            (mesh, sharding),
+            ArrayPlacement::Mesh { mesh: mesh.clone(), sharding: sharding.clone() }
+                .resolve(&session, 1)
+                .unwrap(),
+            (mesh.clone(), sharding.clone()),
+        );
+
+        // A bare sharding needs a configured mesh with matching topology.
+        let placement = ArrayPlacement::Sharding(sharding.clone());
+        assert!(matches!(placement.clone().resolve(&session, 1), Err(Error::Session(SessionError::MissingMesh))));
+        let configured = session.with_device_mesh(mesh.clone());
+        assert_eq!(placement.resolve(&configured, 1).unwrap(), (mesh.clone(), sharding));
+
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Auto).unwrap()]).unwrap();
+        let error = ArrayPlacement::Sharding(Sharding::replicated(other_mesh.clone(), 1))
+            .resolve(&configured, 1)
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Core(error) if matches!(
+                error.as_ref(),
+                CoreError::Sharding(ShardingError::MeshMismatch { expected, actual })
+                    if expected == mesh.logical_mesh() && actual == &other_mesh,
+            ),
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("mesh mismatch; expected `{:?}` but got `{other_mesh:?}`", mesh.logical_mesh())
         );
     }
 
@@ -665,6 +701,58 @@ mod tests {
     }
 
     #[test]
+    fn test_session_place_broadcasts_optional_placement_prefixes() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let values = vec![1f32, 2., 3., 4.];
+        let host = CoreArray::vector(values.clone()).unwrap();
+
+        // An explicit sharding uses the session mesh. The None prefix sends both leaves to the first local device.
+        let (partitioned, [local, other_local]) = session
+            .place(
+                (host.clone(), [host.clone(), host]),
+                PlacementOptions::<_, ArrayPlacement>::new(
+                    Some((Some(ArrayPlacement::Sharding(sharded.clone())), None)),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(partitioned.mesh(), &mesh);
+        assert_eq!(partitioned.sharding(), &sharded);
+        assert_eq!(shard_values(&partitioned), vec![vec![1., 2.], vec![3., 4.]]);
+        for array in [&local, &other_local] {
+            assert_eq!(array.mesh().devices(), &mesh.devices()[..1]);
+            assert_eq!(shard_values(array), vec![values.clone()]);
+        }
+
+        // For existing arrays, None leaves preserve their destination or omit their source check independently.
+        let (moved, kept) = session
+            .place(
+                (local, partitioned.clone()),
+                PlacementOptions::<_, _>::new(
+                    Some((Some(ArrayPlacement::Sharding(replicated.clone())), None)),
+                    Some((None, Some(ArrayPlacement::Sharding(sharded)))),
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(moved.mesh(), &mesh);
+        assert_eq!(moved.sharding(), &replicated);
+        assert_eq!(shard_values(&moved), vec![values.clone(), values]);
+        assert_eq!(kept.mesh(), partitioned.mesh());
+        assert_eq!(kept.sharding(), partitioned.sharding());
+        for (kept_shard, source_shard) in kept.shards().iter().zip(partitioned.shards()) {
+            assert!(Arc::ptr_eq(kept_shard.buffer().unwrap(), source_shard.buffer().unwrap()));
+        }
+    }
+
+    #[test]
     fn test_session_place_donation_and_aliasing() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -802,15 +890,16 @@ mod tests {
             values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(),
         )
         .unwrap();
-        let expected_source = ArrayPlacement::device(Device::new(source_device.id() + 1, 0)).resolve(1).unwrap();
+        let expected_placement = ArrayPlacement::device(Device::new(source_device.id() + 1, 0));
+        let expected_source = expected_placement.clone().resolve(&session, 1).unwrap();
         let actual_source = (source_mesh, source_sharding);
 
         let error = session
             .place(
-                source_array,
+                (source_array.clone(), source_array),
                 PlacementOptions::new(
                     Option::<ArrayPlacement>::None,
-                    Some(ArrayPlacement::device(Device::new(source_device.id() + 1, 0))),
+                    Some((None, Some(expected_placement))),
                     Option::<bool>::None,
                     Option::<Option<bool>>::None,
                 ),
