@@ -56,7 +56,7 @@ pub mod retained;
 pub mod shards;
 pub mod statistics;
 
-pub use placement::{ArrayPlacement, Placeable, PlacementOptions};
+pub use placement::{ArrayPlacement, ArrayPlacementTarget, Placeable, PlacementOptions};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
@@ -88,6 +88,12 @@ pub enum ArrayError {
         actual_mesh: DeviceMesh,
         actual_sharding: Sharding,
     },
+
+    #[error("expected source memory `{expected}` but the array uses `{actual}`")]
+    SourceMemoryMismatch { expected: Memory, actual: Memory },
+
+    #[error("expected source layout `{expected}` but the array declares `{actual:?}`")]
+    SourceLayoutMismatch { expected: Layout, actual: Option<Layout> },
 
     #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
     ManualReshardingAxis { axis_name: String },

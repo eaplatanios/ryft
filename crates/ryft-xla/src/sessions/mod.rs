@@ -2209,7 +2209,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
-        let (source_mesh, _) = ArrayPlacement::device(mesh.devices()[0]).resolve(1).unwrap();
+        let (source_mesh, _, _, _) = ArrayPlacement::device(mesh.devices()[0]).resolve(&session, 1).unwrap();
         let scoped = session.with_new_effect_scope().with_device_mesh(source_mesh);
 
         let input = Array::from_host_buffer(

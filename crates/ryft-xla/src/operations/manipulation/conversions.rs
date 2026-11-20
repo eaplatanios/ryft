@@ -3499,10 +3499,11 @@ mod tests {
             let moved = output
                 .to_placement(
                     &session,
-                    crate::arrays::ArrayPlacement::Mesh {
-                        sharding: Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
-                        mesh: destination_mesh,
-                    },
+                    crate::arrays::ArrayPlacement::mesh(
+                        destination_mesh.clone(),
+                        Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             assert_eq!(moved.layout(), Some(&layout));
