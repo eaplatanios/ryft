@@ -1,12 +1,9 @@
 //! Moving values between concrete placements, which is the Ryft analogue of JAX's
 //! [`device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html). A [`Placement`] names where an
 //! array lives concretely (i.e., a [`Sharding`] over the devices of a [`DeviceMesh`](crate::DeviceMesh), optionally
-//! with a [`Memory`](crate::Memory)
-//! space and a storage [`Layout`](crate::Layout)). Moving a value to another placement never changes its elements,
-//! shape, or data
-//! type, and unlike a [`Reshard`](crate::Reshard), which redistributes a value over the mesh that it already lives on,
-//! it can move the
-//! value onto the devices of another mesh.
+//! with a [`Memory`](crate::Memory) space and a storage [`Layout`](crate::Layout)). Moving a value to another placement
+//! never changes its elements, shape, or data type, and unlike a [`Reshard`](crate::Reshard), which redistributes a
+//! value over the mesh that it already lives on, it can move the value onto the devices of another mesh.
 //!
 //! The module is organized around the following entities:
 //!
@@ -22,8 +19,8 @@
 //!     tracers report the placement of the value that they wrap, and batched values report that of their batch items.
 //!   - [`PlaceDispatch`] places one leaf with an optional target and a given copy policy through the
 //!     [`Value::Dispatch`] policy of its value type. Values that dispatch through their domain bind a
-//!     [`PlaceOperation`] in their own context, reference [`Array`]s record the placement in their types, and array IR
-//!     values place their array members.
+//!     [`PlaceOperation`] in their own context, reference [`Array`]s record the placement in their types,
+//!     and array IR values place their array members.
 //!   - [`Place`] is the value capability through which callers place individual values and the leaves of structured
 //!     values, with one target per leaf, preserving their structure and static fields. Its results may share storage
 //!     with its inputs, and callers that need results with storage of their own use [`PlaceDispatch`] directly.
@@ -32,14 +29,11 @@
 //! created, which transposition needs in order to move the cotangent back to those devices, because types do not record
 //! them. Type inference checks a source against what the input type tracks, while backends that execute a placement on
 //! a concrete value move it from wherever it actually lives. When a caller of [`Place`] omits the source of a leaf, the
-//! leaf's [`Placed`] placement is used instead, so concrete backend arrays record where they actually live, as JAX's
-//! `device_put` infers its sources from concrete arrays, while staged values leave the source unknown. Inside batched
-//! functions, the placement of a batch item also records how its batch is distributed (refer to
-//! [`Placement::batch_shardings`]), so a source inferred from a batch item is lifted back to where the packed value
-//! lives, an explicit target places every batch item where it says, and a placement without a target leaves the
-//! packed value where it is.
-
-// TODO(eaplatanios): Review this module.
+//! leaf's [`Placed`] placement is used instead, so concrete backend arrays record where they actually live, while
+//! staged values leave the source unknown. Inside batched functions, the placement of a batch item also records how its
+//! batch is distributed (refer to [`Placement::batch_shardings`]), so a source inferred from a batch item is lifted
+//! back to where the packed value lives, an explicit target places every batch item where it says, and a placement
+//! without a target leaves the packed value where it is.
 
 use std::fmt::Display;
 use std::sync::Arc;
@@ -57,6 +51,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
+use crate::operations::sharding::validate_preserved_mesh_axes;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialTracer, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -65,43 +60,40 @@ use crate::programs::{
 };
 use crate::tracing::Tracer;
 
-use super::validate_preserved_mesh_axes;
-
 /// Canonical operation name for [`PlaceOperation`].
 pub const PLACE_OPERATION_NAME: &str = "place";
 
 /// [`Operation`] that moves its input to a target [`Placement`], possibly on the devices of another
-/// [`DeviceMesh`](crate::DeviceMesh).
-/// This operation is the Ryft analogue of JAX's `device_put` primitive (refer to
-/// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html)). The array's elements, shape,
-/// and data type are unchanged. Type inference returns the input type with its sharding replaced by the target
-/// sharding without its [`MeshAxisType::Auto`] mesh axes (which array types cannot record, refer to
-/// [`Sharding::without_auto_axes`]), its memory replaced by the target memory when the target names one, and its
-/// layout replaced by the target layout when the target names one.
+/// [`DeviceMesh`](crate::DeviceMesh). This operation is the Ryft analogue of JAX's
+/// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html). The array's elements, shape,
+/// and data type are unchanged. Type inference returns the input type with its sharding replaced by the target sharding
+/// without its [`MeshAxisType::Auto`] mesh axes (which array types cannot record, refer to
+/// [`Sharding::without_auto_axes`]), its memory replaced by the target memory when the target
+/// names one, and its layout replaced by the target layout when the target names one.
 ///
-/// The target is optional, like the device of JAX's `device_put` primitive. Without a target, the value stays where it
-/// is (i.e., its devices, sharding, memory, and layout are unchanged), and type inference returns the input type. Such
-/// an operation still records its source, which transposition uses to move the cotangent back to it, and its copy
-/// policy, so that it can force a copy of a concrete value. An operation without a target, without a source, and
-/// whose output may share storage with its input is therefore an identity.
+/// The target is optional. Without a target, the value stays where it is (i.e., its devices, sharding, memory, and
+/// layout are unchanged), and type inference returns the input type. Such an operation still records its source, which
+/// transposition uses to move the cotangent back to it, and its copy policy, so that it can force a copy of a concrete
+/// value. An operation without a target, without a source, and whose output may share storage with its input is
+/// therefore an identity.
 ///
 /// Unlike a [`ReshardOperation`](crate::ReshardOperation), which redistributes a value over the mesh that it already
-/// lives on, a placement
-/// may move the value to another mesh, so the target mesh need not define the axes of the input's mesh. A placement
-/// still changes only where a value lives and never its reduction state, so the target sharding must restate the
-/// unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and the target mesh
-/// must define each of those axes with the same size and type as the input's mesh. Every shard of a partitioned
-/// dimension has the same extent, so for each dimension that the target sharding partitions, the number of shards
-/// along it (i.e., the product of the sizes of the mesh axes that shard it, [`MeshAxisType::Auto`] axes included) must
-/// divide its static extent, as JAX's `device_put` also requires. A dynamic extent is only known when a backend
-/// places a concrete value, so type inference accepts any split of it and backends check it when they place the value.
+/// lives on, a placement may move the value to another mesh, so the target mesh need not define the axes of the input's
+/// mesh. A placement still changes only where a value lives and never its reduction state, so the target sharding must
+/// restate the unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and the
+/// target mesh must define each of those axes with the same size and type as the input's mesh. Every shard of a
+/// partitioned dimension has the same extent, so for each dimension that the target sharding partitions, the number
+/// of shards along it (i.e., the product of the sizes of the mesh axes that shard it, [`MeshAxisType::Auto`] axes
+/// included) must divide its static extent, as JAX's `device_put` also requires. A dynamic extent is only known when a
+/// backend places a concrete value, so type inference accepts any split of it and backends check it when they place the
+/// value.
 ///
 /// A value inside a manual region lives on the devices of that region, so it cannot be moved, and nothing can be moved
 /// into such a region either. Types show such values through their variation along [`MeshAxisType::Manual`] mesh axes
 /// (refer to [`Sharding::varying_manual_axes`]) or their reduction state over them, so neither the target or source
 /// sharding nor the tracked sharding of an input that is moved to a target may have either. An operation without a
-/// target leaves such a value where it is, so it accepts it unless its source describes it. A global array outside any
-/// manual region can still be tiled over a manual axis of its mesh, and it is moved like any other array. Backends
+/// target leaves such a value where it is, so it accepts it unless its source describes it. A global array outside
+/// any manual region can still be tiled over a manual axis of its mesh, and it is moved like any other array. Backends
 /// separately reject placements onto a target inside active manual regions when they lower a program. A target layout
 /// must address the shape of the input (refer to [`ArrayType::validate_layout`]).
 ///
@@ -112,13 +104,13 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// and unreduced kind, which are empty and a sum for an input without a tracked sharding) over a mesh that defines
 /// those axes like the input's mesh. When the input type tracks a sharding, the source sharding without its auto axes
 /// must also equal it. These checks guarantee that the cotangent that transposition moves back to the source devices
-/// has the cotangent type of the input (up to a placement-only broadcast for an input without a tracked sharding). The
-/// memory and layout of the source are not compared with the input type. Backends that execute the operation on a
+/// has the cotangent type of the input (up to a placement-only broadcast for an input without a tracked sharding).
+/// The memory and layout of the source are not compared with the input type. Backends that execute the operation on a
 /// concrete value move the value from wherever it actually lives, without comparing that placement with the source.
 ///
-/// The operation also carries a copy policy (refer to [`Self::with_may_alias`]), which is the analogue of the
-/// `copy_semantics` of JAX's `device_put` primitive. By default, the output may share storage with the input (e.g., a
-/// placement that leaves a concrete value where it already lives can return that value), and with `may_alias` set to
+/// The operation also carries a copy policy (refer to [`Self::with_may_alias`]), which is the Ryft analogue of the
+/// `copy_semantics` of JAX's `device_put` primitive. By default, the output may share storage with the input (e.g.,
+/// a placement that leaves a concrete value where it already lives can return that value), and with `may_alias` set to
 /// `false`, the output has storage of its own, which no other value shares. The policy does not affect type inference.
 /// It only matters for concrete values, whose storage other handles can observe. A compiled program has no observable
 /// buffer identity, because its outputs are buffers that its execution allocates (or donated inputs, which no other
@@ -132,12 +124,12 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// where it says, and a source gets the placement that the packed input type records for its batch dimension. This
 /// differs from JAX, whose batching rule applies an unchanged target to the packed value positionally, so that a target
 /// that splits the first dimension of a batch item splits the batch dimension instead when the batch is mapped at
-/// position 0. An omitted target stays omitted and leaves the packed value where it is. Differentiation places the
+/// position `0`. An omitted target stays omitted and leaves the packed value where it is. Differentiation places the
 /// tangent with the same target, source, and copy policy as the primal but without the layouts of the target and
 /// source, which need not be valid for the element type of the tangent. When the operation has no source, both use the
 /// concrete placement of the primal as their source, if it has one. Transposition moves the cotangent back to where
-/// the input lived, and it always forces a copy, as JAX's `device_put` transpose does (refer to the transposition rule
-/// of this operation for the details).
+/// the input lived, and it always forces a copy, as JAX's `device_put` transpose does (refer to the transposition
+/// rule of this operation for the details).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaceOperation {
     /// Optional target [`Placement`] that the input is moved to. When it is [`None`], the input stays where it is.
@@ -150,6 +142,8 @@ pub struct PlaceOperation {
     /// have storage of its own.
     may_alias: bool,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl PlaceOperation {
     /// Creates a new [`PlaceOperation`] that moves its input to `target`, or leaves it where it is when `target` is
