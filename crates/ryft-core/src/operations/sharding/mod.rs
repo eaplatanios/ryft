@@ -256,4 +256,33 @@ mod tests {
         .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32).with_sharding(target).unwrap()));
     }
+
+    #[test]
+    fn test_validate_preserved_mesh_axes() {
+        let x = MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap();
+        let y = MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap();
+        let free = MeshAxis::new("free", 4, MeshAxisType::Auto).unwrap();
+        let input = LogicalMesh::new(vec![x.clone(), free, y.clone()]).unwrap();
+        let preserved = ["unknown".to_owned(), "x".to_owned(), "y".to_owned()];
+
+        // The target may reorder the preserved axes and omit the unselected axis. Unknown input names are skipped.
+        let reordered = LogicalMesh::new(vec![y, x.clone()]).unwrap();
+        assert_eq!(validate_preserved_mesh_axes(RESHARD_OPERATION_NAME, &input, &preserved, &reordered), Ok(()));
+
+        // A matching first axis still leaves the second axis to validate.
+        for (replacement, expected) in [
+            (None, "an undefined axis"),
+            (Some(MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap()), "`'y'=4:manual`"),
+            (Some(MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap()), "`'y'=2:auto`"),
+        ] {
+            let target = LogicalMesh::new(std::iter::once(x.clone()).chain(replacement).collect()).unwrap();
+            assert_eq!(
+                validate_preserved_mesh_axes(RESHARD_OPERATION_NAME, &input, &preserved, &target),
+                Err(TypeError::invalid(format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot redefine preserved manual mesh axis \
+                     `'y'=2:manual` as {expected}",
+                ))),
+            );
+        }
+    }
 }

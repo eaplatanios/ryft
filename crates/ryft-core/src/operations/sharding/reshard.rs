@@ -15,15 +15,13 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
+use crate::operations::sharding::validate_preserved_mesh_axes;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
     ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
 };
-
-#[cfg(doc)]
-use crate::operations::sharding::constrain_sharding::{ConstrainSharding, ConstrainShardingOperation};
 
 /// Canonical operation name for [`ReshardOperation`].
 pub const RESHARD_OPERATION_NAME: &str = "reshard";
@@ -42,8 +40,9 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// the same size and type, explicit axes included, whereas it may add or drop other axes. Each Ryft type carries its
 /// own mesh, so without this check a target could silently redefine such an axis (e.g., JAX's `reshard` does not
 /// validate reduction state). The target may only name explicit mesh axes. Placement over auto axes belongs to backend
-/// compilers and can be constrained using [`ConstrainShardingOperation`]s while transitions over manual axes require
-/// their corresponding collectives. Refer to the documentation of [`Reshard`] for more information.
+/// compilers and can be constrained using [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)s while
+/// transitions over manual axes require their corresponding collectives. Refer to the documentation of [`Reshard`]
+/// for more information.
 ///
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
 /// sharding into the target at the new batch axis, without the axes that are auto in the target mesh (which the target
@@ -143,28 +142,16 @@ impl Operation for ReshardOperation {
         // target mesh must therefore define every axis that carries such state identically, explicit axes included,
         // whereas it may still add or drop other axes.
         if let Some(input_sharding) = input.sharding() {
-            let input_mesh = input_sharding.mesh();
-            let target_mesh = self.sharding.mesh();
-            let preserved_axes = input_sharding
-                .varying_manual_axes()
-                .iter()
-                .chain(input_sharding.unreduced_axes())
-                .chain(input_sharding.reduced_axes())
-                .filter_map(|axis_name| input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index]));
-            for input_axis in preserved_axes {
-                let target_axis = target_mesh.axis_index(input_axis.name()).map(|index| &target_mesh.axes()[index]);
-                if target_axis != Some(input_axis) {
-                    let target_axis =
-                        target_axis.map_or_else(|| "an undefined axis".to_owned(), |axis| format!("`{axis}`"));
-                    return Err(TypeError::invalid(format!(
-                        "`{}` cannot redefine preserved {} mesh axis `{}` as {}",
-                        RESHARD_OPERATION_NAME,
-                        input_axis.r#type(),
-                        input_axis,
-                        target_axis,
-                    )));
-                }
-            }
+            validate_preserved_mesh_axes(
+                RESHARD_OPERATION_NAME,
+                input_sharding.mesh(),
+                input_sharding
+                    .varying_manual_axes()
+                    .iter()
+                    .chain(input_sharding.unreduced_axes())
+                    .chain(input_sharding.reduced_axes()),
+                self.sharding.mesh(),
+            )?;
         }
 
         // A reshard changes placement only. Reduction state over explicit and auto axes records pending or completed
@@ -453,13 +440,13 @@ impl<
 /// while replacing its tracked sharding with the target, extended with its manual variation and reduction facts. Target
 /// partitioning uses explicit mesh axes, and the target restates the leaf's explicit reduction state unchanged (refer
 /// to [`ReshardOperation`]); placement over [`Auto`](MeshAxisType::Auto) axes is constrained through
-/// [`ConstrainSharding::constrain_sharding`].
+/// [`ConstrainSharding::constrain_sharding`](crate::ConstrainSharding::constrain_sharding).
 ///
 /// Concrete single-device arrays record the target on their type without changing their payload. Context-carrying
 /// values stage a [`ReshardOperation`], so interpretation over staging and transform values preserves the transition.
 /// Differentiation reshards tangents to the same target; transposition reshards cotangents to the dual of the input's
-/// sharding. Cross-mesh reshards are not representable inside one staged program: backends transfer values between
-/// placements outside traced programs.
+/// sharding. A reshard stays on the mesh of its input, and moving a value to the devices of another mesh is a placement
+/// (refer to [`Place`](crate::Place)), which programs can express as well.
 ///
 /// The leaf parameter `P` defaults to `Self`: a value is a one-leaf structure accepting one `Sharding`, while nested
 /// tuples, vectors, maps, and custom structures accept the corresponding `Self::To<Sharding>`. Parameter paths must
