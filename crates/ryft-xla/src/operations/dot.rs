@@ -621,12 +621,14 @@ mod tests {
 
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options,
-        to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy, unproject_plain_program,
+        ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
+        unproject_plain_program,
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::sessions::tests::{domain_mesh, two_device_mesh};
-    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, Options, Session, ToPjrt, TracedProgram, Type,
         to_mlir_module_for_program, trace,
@@ -719,7 +721,7 @@ mod tests {
             group_sizes_shape.dimensions().iter().map(|dimension| *dimension as u64).collect::<Vec<_>>();
         let client = cpu_client(1);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         let left = client
@@ -1596,7 +1598,7 @@ mod tests {
         assert!(matches!(
             client.compile(
                 &PjrtProgram::Mlir { bytecode: module.into_bytes() },
-                &ragged_dot_cpu_compilation_options(),
+                &test_compilation_options(client, None),
             ),
             Err(PjrtError::Unimplemented { message, .. })
                 if message
@@ -1891,7 +1893,7 @@ mod tests {
 
         let client = cpu_client(1);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         // The physical buffers deliberately carry garbage rather than zeros in every slot beyond the live prefix of the
@@ -2220,7 +2222,11 @@ mod tests {
         // axes to auto axes, like in JAX. The contracted axes of the first two inputs below are sharded alike over
         // two devices, which explicit placement of their contraction rejects as ambiguous.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.logical_mesh().clone(), dimensions);
         let shardings = [

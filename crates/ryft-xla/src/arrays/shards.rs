@@ -4,12 +4,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    Device, DeviceId, DeviceMesh, Sharding, ShardingDimension, ShardingError, StaticShape, check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, LayoutError, Memory, Sharding, ShardingDimension,
+    ShardingError, StaticShape, check_sharding,
 };
-use ryft_pjrt::Buffer;
+use ryft_pjrt::{Buffer, Client, Error as PjrtError};
 
-use crate::Error;
 use crate::arrays::ArrayError;
+use crate::types::DataTypeExtension;
+use crate::{Error, FromPjrt};
 
 /// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
 /// [`ArrayShard::descriptor`]. They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the
@@ -435,6 +437,121 @@ impl ShardLayout {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
+/// Validates one addressable `buffer` of an array of type `r#type` whose shards are described by `descriptors` and
+/// `shard_index_by_device`, returning the identifier of the device that owns it. The buffer must be owned by `client`,
+/// live on a device of the mesh in the process that the mesh expects, live in the memory that `r#type` requests, and
+/// have the physical element type and the shard shape implied by `r#type`. When `validate_zero_carriers` is set, the
+/// buffer of a zero-space array must also contain only false bits.
+pub(super) fn validate_addressable_buffer(
+    client: &Client<'_>,
+    r#type: &ArrayType,
+    descriptors: &[ShardDescriptor],
+    shard_index_by_device: &HashMap<DeviceId, ShardIndex>,
+    buffer: &Buffer<'_>,
+    validate_zero_carriers: bool,
+) -> Result<DeviceId, Error> {
+    let device = Device::from_pjrt(buffer.device()?)?;
+    let device_id = device.id();
+    if !buffer.is_owned_by(client) {
+        return Err(PjrtError::invalid_argument(format!(
+            "the session's client does not own the addressable shard buffer for device {}",
+            device.id(),
+        ))
+        .into());
+    }
+
+    let shard_index = shard_index_by_device
+        .get(&device_id)
+        .ok_or_else(|| Error::from(ArrayError::DeviceNotInMesh { device_id }))?;
+    let descriptor = descriptors.get(*shard_index).unwrap();
+
+    // Validate that each buffer is owned by the process expected for the corresponding mesh device.
+    let process_index = device.process_index();
+    if process_index != descriptor.device().process_index() {
+        return Err(Error::from(ArrayError::DeviceProcessIndexMismatch {
+            device_id,
+            expected: descriptor.device().process_index(),
+            actual: process_index,
+        }));
+    }
+
+    // A type's placement must describe the actual buffer, not merely relabel its storage. Device placement
+    // means the plugin's default memory, whose kind is platform-dependent (e.g., CPU uses host memory).
+    let buffer_memory = buffer.memory()?;
+    let buffer_device = buffer.device()?;
+    let memory_matches = match r#type.memory() {
+        Memory::Device => buffer_memory == buffer_device.default_memory()?,
+        Memory::Host { pinned: true } => buffer_memory.kind()? == "pinned_host",
+        Memory::Host { pinned: false } => buffer_memory.kind()? == "unpinned_host",
+    };
+    if !memory_matches {
+        return Err(Error::from(ArrayError::BufferMemoryMismatch {
+            device_id,
+            expected: r#type.memory(),
+            actual: buffer_memory.kind()?.to_string(),
+        }));
+    }
+
+    if let Some(expected) = r#type.layout() {
+        let actual = Layout::from_pjrt(buffer.specification()?.layout)?;
+        if &actual != expected {
+            return Err(LayoutError::InvalidLayout {
+                message: format!(
+                    "buffer on device {device_id} uses layout `{actual}` but its type declares `{expected}`",
+                ),
+            }
+            .into());
+        }
+    }
+
+    // Validate the concrete buffer type against the physical representation of the logical shard type.
+    // Zero-space values and one-bit integers use predicate carriers in this execution path. Converting
+    // a carrier back to a `DataType` would incorrectly relabel those logical arrays as Boolean.
+    let buffer_type = buffer.element_type()?;
+    let expected_buffer_type = r#type.data_type().executable_buffer_type();
+    let data_type =
+        if buffer_type == expected_buffer_type { r#type.data_type() } else { DataType::from_pjrt(buffer_type)? };
+    let shape = StaticShape::new(
+        buffer
+            .unpadded_dimensions()?
+            .iter()
+            .map(|size| {
+                usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded {
+                    message: format!(
+                        "buffer dimension size {} exceeds the maximum allowed size of {}",
+                        size,
+                        usize::MAX,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
+    if buffer_type != expected_buffer_type && matches!(r#type.data_type(), DataType::I1 | DataType::U1) {
+        return Err(Error::from(ArrayError::BufferTypeMismatch {
+            expected: ArrayType::new(DataType::Boolean, shape.clone().into()),
+            actual: ArrayType::new(data_type, shape.into()),
+        }));
+    }
+
+    let array_type = ArrayType::new(data_type, shape.into());
+    let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
+    if array_type != expected_array_type {
+        return Err(Error::from(ArrayError::BufferTypeMismatch { expected: expected_array_type, actual: array_type }));
+    }
+
+    if validate_zero_carriers
+        && r#type.data_type().is_zero()
+        && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
+    {
+        return Err(Error::from(ArrayError::NonCanonicalZeroBuffer { device_id }));
+    }
+
+    Ok(device_id)
+}
+
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[allow(clippy::single_range_in_vec_init)]
 #[cfg(test)]
@@ -442,6 +559,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_pjrt::BufferType;
 
     use crate::Session;
     use crate::arrays::Array;
@@ -869,6 +987,40 @@ mod tests {
                 ],
                 HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]),
             ),
+        );
+    }
+
+    #[test]
+    fn test_validate_addressable_buffer() {
+        let client = cpu_client(1);
+        let pjrt_device = client.addressable_devices().unwrap().remove(0);
+        let device = Device::from_pjrt(&pjrt_device).unwrap();
+        let device_id = device.id();
+        let r#type = ArrayType::scalar(DataType::I32);
+        let buffer = client.buffer(&7i32.to_ne_bytes(), BufferType::I32, [], None, pjrt_device, None).unwrap();
+        let shard_index_by_device = HashMap::from([(device_id, 0)]);
+        let descriptors = [ShardDescriptor::new(0, device, Vec::new())];
+        assert_eq!(
+            validate_addressable_buffer(client, &r#type, &descriptors, &shard_index_by_device, &buffer, true).unwrap(),
+            device_id,
+        );
+
+        // A matching device ID still requires the process index declared by the mesh.
+        let process_index = device.process_index();
+        let other_process_index = process_index + 1;
+        let descriptors = [ShardDescriptor::new(0, Device::new(device_id, other_process_index), Vec::new())];
+        let error = validate_addressable_buffer(client, &r#type, &descriptors, &shard_index_by_device, &buffer, true)
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(error.as_ref(),
+                ArrayError::DeviceProcessIndexMismatch { device_id: actual_device_id, expected, actual }
+                    if *actual_device_id == device_id && *expected == other_process_index && *actual == process_index,
+            ),
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("device {device_id} reports process index {process_index}, but expected {other_process_index}"),
         );
     }
 }

@@ -158,9 +158,9 @@ mod tests {
     use ryft_pjrt::Program as PjrtProgram;
 
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::lowering::tests::{test_manual_mesh, test_spmd_compilation_options};
+    use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::{execute_inputs_on_cpu_devices, test_logical_mesh_2x2};
-    use crate::tests::cpu_client;
+    use crate::tests::{cpu_client, test_compilation_options};
     use crate::{ArrayTracer, TracedProgram, to_mlir_module_for_program, trace_with_context};
 
     use super::*;
@@ -218,7 +218,7 @@ mod tests {
         // for a CPU target fails earlier with a precise error.
         let client = cpu_client(2);
         assert!(matches!(
-            client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2)),
+            client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2))),
             Err(ryft_pjrt::Error::Unimplemented { message, .. })
                 if message.contains("HLO opcode `collective-broadcast` is not supported by XLA:CPU"),
         ));

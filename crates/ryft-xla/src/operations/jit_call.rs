@@ -2311,7 +2311,6 @@ mod tests {
         ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
-    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
     use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::lower_mlir_module_for_program;
@@ -2322,7 +2321,7 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, read_first_shard};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
+    use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes, vector_type};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, CustomCallOperationExtension, Options, RuntimeRequirement,
         StagedFunction, ToPjrt, Type, Value, compile, stage, to_mlir_module_for_program,
@@ -2453,18 +2452,7 @@ mod tests {
         let output_types = program.output_types().iter().map(array_type).collect::<Vec<_>>();
         let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
         let executable = client
-            .compile(
-                &PjrtProgram::Mlir { bytecode: module.into_bytes() },
-                &CompilationOptions {
-                    executable_build_options: Some(ExecutableCompilationOptions {
-                        device_ordinal: -1,
-                        replica_count: 1,
-                        partition_count: 1,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            )
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         assert_eq!(values.len(), program.input_count());

@@ -346,11 +346,11 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Client, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{
-        ProgramBuilder, lowered_unary_module, test_spmd_compilation_options, to_mlir_module_for_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program};
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{ArrayConstant, Session};
 
     use super::*;
@@ -405,7 +405,7 @@ mod tests {
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(1))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(1)))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         let left = client

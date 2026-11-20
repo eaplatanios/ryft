@@ -657,13 +657,13 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options,
-        test_vector_type, to_mlir_module_for_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type,
+        to_mlir_module_for_plain_program,
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::read_first_shard;
-    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Constant, Session, to_mlir_module_for_program};
 
     use super::*;
@@ -928,7 +928,7 @@ mod tests {
 
         let client = cpu_client(1);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let mut executions = executable
             .execute(vec![ExecutionDeviceInputs::default()], Vec::new(), 0, None, Some(file!()), None, None, &[])
@@ -1485,7 +1485,7 @@ mod tests {
         );
         let client = cpu_client(1);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         for extent in [2i32, 0] {

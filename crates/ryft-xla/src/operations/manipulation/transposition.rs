@@ -32,10 +32,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::ArrayConstant;
-    use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, to_mlir_module_for_plain_program,
-    };
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program};
+    use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -109,7 +107,7 @@ mod tests {
         );
         let client = execution_client();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         // Integers beyond exact f64 precision detect accidental numeric conversion. Negative imaginary parts and

@@ -558,10 +558,10 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
     use crate::lowering::lower_mlir_module_for_program_with_reference_state;
-    use crate::lowering::tests::{ProgramBuilder, ragged_dot_cpu_compilation_options, unproject_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::sessions::tests::{domain_mesh, f64_vector, read_first_shard};
-    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RuntimeError, Session, compile,
         to_mlir_module_for_program,
@@ -630,7 +630,7 @@ mod tests {
             .into_bytes(),
         };
 
-        let executable = client.compile(&program, &ragged_dot_cpu_compilation_options()).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, None)).unwrap();
         let device = executable.addressable_devices().unwrap()[0].clone();
         let input_values = [1.5f64, 2.5f64];
         let input_bytes = values_to_bytes::<f64>(&input_values);

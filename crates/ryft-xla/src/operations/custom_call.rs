@@ -580,14 +580,14 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, static_sharded_array_type, test_matrix_type,
-        test_spmd_compilation_options, unproject_plain_program,
+        unproject_plain_program,
     };
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{
-        ADD_ONE_CUSTOM_CALL_TARGET, cpu_client, ensure_add_one_handler_registered, replicated_array, values_from_bytes,
-        values_to_bytes,
+        ADD_ONE_CUSTOM_CALL_TARGET, cpu_client, ensure_add_one_handler_registered, replicated_array,
+        test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError, RuntimeError,
@@ -2023,7 +2023,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(2))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 2);

@@ -1501,7 +1501,9 @@ mod tests {
 
     use crate::FromPjrt;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{cpu_client, four_device_mesh_x, logical_mesh_2x2, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, four_device_mesh_x, logical_mesh_2x2, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
 
     use super::*;
 
@@ -1708,7 +1710,11 @@ mod tests {
     #[test]
     fn test_array_to_placement_preserves_host_memory() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = four_device_mesh_x(client);
         let single_device_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -1917,7 +1923,11 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_replicated_to_sharded_on_same_mesh() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [10.0f32, 11.0, 12.0, 13.0];
@@ -1947,7 +1957,11 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_sharded_to_replicated_on_same_mesh() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [20.0f32, 21.0, 22.0, 23.0];
@@ -1974,7 +1988,11 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2029,7 +2047,11 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_with_explicit_mesh_axes() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -2228,7 +2250,11 @@ mod tests {
     #[test]
     fn test_array_to_placement_compiled_reshard_caches_executable_across_calls() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [30.0f32, 31.0, 32.0, 33.0];
@@ -2489,7 +2515,11 @@ mod tests {
     #[test]
     fn test_array_into_placement_donates_source_and_returns_independently_readable_output() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = four_device_mesh_x(client);
 
         let values = [300.0f32, 301.0, 302.0, 303.0];
@@ -2522,7 +2552,11 @@ mod tests {
     #[test]
     fn test_array_reshard_on_devices() {
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()

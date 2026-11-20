@@ -564,9 +564,9 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::ArrayPlacement;
-    #[cfg(feature = "cuda-13")]
-    use crate::lowering::tests::test_spmd_compilation_options;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
+    #[cfg(feature = "cuda-13")]
+    use crate::tests::test_compilation_options;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Type, Value, compile_statefully};
 
@@ -1619,7 +1619,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             for (name, module) in modules {
                 let compiled = client.compile(
                     &PjrtProgram::Mlir { bytecode: module.trim_start().as_bytes().to_vec() },
-                    &test_spmd_compilation_options(2),
+                    &test_compilation_options(client, Some(2)),
                 );
                 let executable = match compiled {
                     Ok(executable) => executable,

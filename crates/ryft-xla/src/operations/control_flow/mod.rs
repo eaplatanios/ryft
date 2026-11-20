@@ -517,11 +517,11 @@ mod tests {
     use ryft_pjrt::{Client, Program as PjrtProgram};
 
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::lowering::tests::{dynamic_dimension, test_spmd_compilation_options, test_vector_type};
+    use crate::lowering::tests::{dynamic_dimension, test_vector_type};
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program};
 
     use super::*;
@@ -582,7 +582,10 @@ mod tests {
         inputs: &[(&ArrayType, Option<&Sharding>, &[f32])],
     ) -> Vec<Vec<Vec<f32>>> {
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &test_spmd_compilation_options(2))
+            .compile(
+                &PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() },
+                &test_compilation_options(client, Some(2)),
+            )
             .unwrap();
         let session = Session::builder().client(client).build().unwrap();
         let device_ids = executable

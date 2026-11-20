@@ -340,12 +340,11 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_vector_type,
-        to_mlir_module_for_plain_program,
+        ProgramBuilder, dynamic_dimension, test_vector_type, to_mlir_module_for_plain_program,
     };
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Constant, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
@@ -590,7 +589,7 @@ mod tests {
                 .unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
             let inputs = vec![
@@ -751,7 +750,7 @@ mod tests {
                     let executable = client
                         .compile(
                             &PjrtProgram::Mlir { bytecode: module.into_bytes() },
-                            &ragged_dot_cpu_compilation_options(),
+                            &test_compilation_options(client, None),
                         )
                         .unwrap();
                     let device = executable.addressable_devices().unwrap().remove(0);

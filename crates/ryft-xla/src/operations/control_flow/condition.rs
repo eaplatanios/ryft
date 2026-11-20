@@ -161,8 +161,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch,
-        ragged_dot_cpu_compilation_options, unproject_plain_program,
+        MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch, unproject_plain_program,
     };
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::control_flow::tests::{
@@ -171,7 +170,7 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
-    use crate::tests::{execution_client, replicated_array, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, test_compilation_options, values_to_bytes};
     use crate::{Constant, Session, Value, to_mlir_module_for_program};
 
     use super::*;
@@ -186,7 +185,10 @@ mod tests {
     ) -> Vec<String> {
         ensure_print_handler_registered(client).unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &ragged_dot_cpu_compilation_options())
+            .compile(
+                &PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() },
+                &test_compilation_options(client, None),
+            )
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         let inputs = inputs

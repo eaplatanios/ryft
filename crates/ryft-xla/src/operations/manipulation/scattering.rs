@@ -417,12 +417,12 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::lowering::tests::{
-        ProgramBuilder, ragged_dot_cpu_compilation_options, to_mlir_module_for_plain_program, unproject_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, to_mlir_module_for_plain_program, unproject_plain_program};
     use crate::operations::{FlatProgram, Operation};
     use crate::sessions::tests::{domain_mesh, read_first_shard};
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{Array, ArrayConstant, Constant, Options, Session, ToPjrt, Type, to_mlir_module_for_program};
 
     use super::*;
@@ -617,7 +617,7 @@ mod tests {
                 let executable = client
                     .compile(
                         &PjrtProgram::Mlir { bytecode: module.into_bytes() },
-                        &ragged_dot_cpu_compilation_options(),
+                        &test_compilation_options(client, None),
                     )
                     .unwrap();
                 let device = executable.addressable_devices().unwrap().remove(0);
@@ -749,7 +749,7 @@ mod tests {
                 builder.build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![], vec![Placeholder]).unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let outputs = executable
                 .execute(
@@ -920,7 +920,7 @@ mod tests {
                 continue;
             }
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
             let (input, updates, expected, buffer_type) = if data_type == DataType::C128 {

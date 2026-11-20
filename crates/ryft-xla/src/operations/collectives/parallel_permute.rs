@@ -80,8 +80,8 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::lowering::tests::static_sharded_array_type;
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
     use super::*;
@@ -169,7 +169,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(2))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 2);
@@ -223,7 +223,7 @@ mod tests {
             )
             .unwrap();
             let program = Program::Mlir { bytecode: traced.to_mlir_module("main").unwrap().into_bytes() };
-            let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+            let executable = client.compile(&program, &test_compilation_options(client, Some(2))).unwrap();
             assert_eq!(
                 executable
                     .addressable_devices()

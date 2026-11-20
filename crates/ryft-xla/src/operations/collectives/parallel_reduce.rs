@@ -218,11 +218,9 @@ pub(crate) mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::tests::{
-        static_sharded_array_type, test_manual_mesh, test_spmd_compilation_options, test_vector_type,
-    };
+    use crate::lowering::tests::{static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::operations::{Operation, ProgramBuilder};
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, Session, TracedProgram, Type, trace};
 
     use super::*;
@@ -264,7 +262,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = Program::Mlir { bytecode: traced.to_mlir_module("main").unwrap().into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(4))).unwrap();
         let buffers = devices
             .iter()
             .zip(shards)
@@ -386,7 +384,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(4))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 4);
@@ -557,7 +555,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let inputs = [1000.0f32, 1001.0, 1002.0, f32::NEG_INFINITY];
         let buffers = devices

@@ -260,8 +260,8 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
 
-    use crate::lowering::tests::{test_sharding, test_spmd_compilation_options};
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::lowering::tests::test_sharding;
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{ensure_print_handler_registered, with_captured_prints};
 
     use super::*;
@@ -538,7 +538,7 @@ mod tests {
         let client = cpu_client(2);
         ensure_print_handler_registered(client).unwrap();
         let executable = client
-            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let shards = [vec![1.5f64, 2.5], vec![3.5f64, 4.5]];
         let inputs = executable

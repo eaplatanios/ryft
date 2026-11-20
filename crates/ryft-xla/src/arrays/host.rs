@@ -10,6 +10,7 @@ use ryft_pjrt::{
     Memory as PjrtMemory,
 };
 
+use crate::arrays::metadata::resolve_placement;
 use crate::arrays::shards::{ArrayShard, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError, ArrayTypeExtension};
 use crate::sessions::synchronization::HostCopy;
@@ -178,7 +179,7 @@ impl Array {
         let buffer = buffer.as_ref();
         // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
         // sharding is interpreted as one replicated logical array over the provided mesh.
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
+        let (r#type, sharding) = resolve_placement(r#type, sharding, &mesh)?;
 
         // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
         let expected_byte_count = r#type.size_in_bytes()?;
@@ -385,7 +386,7 @@ impl Array {
         sharding: Option<Sharding>,
         shards: impl IntoIterator<Item = (DeviceId, B)>,
     ) -> Result<Self, Error> {
-        let (r#type, sharding) = Self::resolve_placement(r#type, sharding, &mesh)?;
+        let (r#type, sharding) = resolve_placement(r#type, sharding, &mesh)?;
         let shape = r#type
             .static_shape()
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;

@@ -2384,13 +2384,12 @@ pub(crate) mod tests {
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
     use ryft_mlir::{Attribute, ElementsAttribute, Operation as MlirOperation, Region, Size as MlirSize};
-    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::LoweringError;
     use crate::lowering::regions::tests::lower_plain_program_outputs;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         ArrayTracer, FlatProgram, JitCallOperation, ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram,
         trace, trace_with_context,
@@ -2632,31 +2631,6 @@ pub(crate) mod tests {
         traced.to_mlir_module("main")
     }
 
-    /// Compilation options for an SPMD executable with `partition_count` partitions, partitioned by Shardy.
-    pub(crate) fn test_spmd_compilation_options(partition_count: usize) -> ryft_pjrt::protos::CompilationOptions {
-        CompilationOptions {
-            argument_layouts: Vec::new(),
-            parameter_is_tupled_arguments: false,
-            executable_build_options: Some(ExecutableCompilationOptions {
-                device_ordinal: -1,
-                replica_count: 1,
-                partition_count: partition_count as i64,
-                use_spmd_partitioning: true,
-                use_shardy_partitioner: true,
-                ..Default::default()
-            }),
-            compile_portable_executable: false,
-            profile_version: 0,
-            individually_defined_output_indices: Vec::new(),
-            serialized_multi_slice_configuration: Vec::new(),
-            environment_option_overrides: HashMap::new(),
-            target_config: None,
-            allow_in_place_mlir_modification: false,
-            matrix_unit_operand_precision: Precision::Default as i32,
-            ..Default::default()
-        }
-    }
-
     /// Dynamic dimension of a fresh non-negative variable named `name`, bounded above by `exclusive_upper_bound` when it
     /// is provided and unbounded otherwise.
     pub(crate) fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> CoreDimension {
@@ -2700,7 +2674,7 @@ pub(crate) mod tests {
         // Lowering may synthesize runtime checks (e.g., entry guards of mixed region entries), so register their handler.
         ensure_assertion_handler_registered(client)?;
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())?;
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))?;
         let device = executable.addressable_devices()?.remove(0);
         let mut buffers = Vec::with_capacity(inputs.len() + extents.len());
         for input in inputs {
@@ -2859,30 +2833,6 @@ pub(crate) mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         to_mlir_module_for_plain_program(&program, "main")
-    }
-
-    /// Compilation options for a single-device CPU executable with one replica and one partition, shared by ragged dot
-    /// execution and rejection tests and by other single-device execution helpers (e.g., [`execute_mixed_program`]).
-    pub(crate) fn ragged_dot_cpu_compilation_options() -> ryft_pjrt::protos::CompilationOptions {
-        CompilationOptions {
-            argument_layouts: Vec::new(),
-            parameter_is_tupled_arguments: false,
-            executable_build_options: Some(ExecutableCompilationOptions {
-                device_ordinal: -1,
-                replica_count: 1,
-                partition_count: 1,
-                ..Default::default()
-            }),
-            compile_portable_executable: false,
-            profile_version: 0,
-            individually_defined_output_indices: Vec::new(),
-            serialized_multi_slice_configuration: Vec::new(),
-            environment_option_overrides: Default::default(),
-            target_config: None,
-            allow_in_place_mlir_modification: false,
-            matrix_unit_operand_precision: Precision::Default as i32,
-            ..Default::default()
-        }
     }
 
     /// Builds a one-instruction program reducing an input of the given data type and dimensions, and returns the
@@ -3912,7 +3862,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(1);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         let input = client

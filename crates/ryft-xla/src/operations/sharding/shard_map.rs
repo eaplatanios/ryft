@@ -406,7 +406,7 @@ pub(crate) mod tests {
 
     use crate::lowering::tests::{
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
-        test_spmd_compilation_options, test_vector_type,
+        test_vector_type,
     };
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::collectives::parallel_reduce::tests::execute_parallel_reduce_on_cpu;
@@ -417,7 +417,7 @@ pub(crate) mod tests {
         FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
     };
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, ExecutionArguments, FromPjrt, Options, Platform, Reference, Session,
         TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
@@ -491,7 +491,7 @@ pub(crate) mod tests {
         let client = cpu_client(N);
         ensure_assertion_handler_registered(client).unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(N))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(N)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -919,7 +919,11 @@ pub(crate) mod tests {
         let devices = client.addressable_devices().unwrap();
         let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
         let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let inputs = input_types
             .into_iter()
             .zip(input_bytes)
@@ -997,7 +1001,11 @@ pub(crate) mod tests {
         let devices = client.addressable_devices().unwrap();
         let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
         let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let xla_values = |types: &[ArrayType], bytes: &[Vec<u8>]| {
             types
                 .iter()
@@ -1510,7 +1518,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(4))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 4);
@@ -1583,7 +1591,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(4);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -1696,7 +1704,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(4);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -1818,7 +1826,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(4);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -1896,7 +1904,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(2);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -2464,7 +2472,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(2);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -2574,7 +2582,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(2);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let inputs = executable
             .addressable_devices()
@@ -2647,7 +2655,7 @@ pub(crate) mod tests {
 
         let client = cpu_client(4);
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let outputs = executable
             .execute(
@@ -2784,7 +2792,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(8)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(8))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 8);
@@ -2841,7 +2849,11 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 0);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
@@ -2940,7 +2952,11 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let along_x_and_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
         let caller_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x_and_y).unwrap();
@@ -3013,7 +3029,11 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let input_sharding = Sharding::new(
             logical_mesh.clone(),
@@ -3128,7 +3148,11 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
         let inputs = program.input_types().into_owned();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
@@ -3179,7 +3203,11 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
         let mut input_types = program.input_types().into_owned();
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
@@ -3243,7 +3271,11 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharding = Sharding::replicated(logical_mesh.clone(), 1);
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
         let reference_type = Type::Reference(ReferenceType::new(array_type.clone()));
@@ -3315,7 +3347,11 @@ pub(crate) mod tests {
         // devices hold `[2, 4]` afterwards.
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let reference_type = Type::Reference(ReferenceType::new(referent_type.clone()));
         let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
@@ -3349,7 +3385,11 @@ pub(crate) mod tests {
         // logical destination `[5, 7]`, uploaded as the summands `[5, 7]` and `[0, 0]`, becomes `[10, 14]`.
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let (program, referent_type) = doubling_reduced_reference_program(mesh.logical_mesh());
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let cotangent_type =
@@ -3389,7 +3429,11 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
@@ -3482,7 +3526,11 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
@@ -3623,7 +3671,7 @@ pub(crate) mod tests {
         );
 
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let outputs = executable
             .execute(
@@ -3876,7 +3924,7 @@ pub(crate) mod tests {
             let executable = client
                 .compile(
                     &PjrtProgram::Mlir { bytecode: program.into_bytes() },
-                    &test_spmd_compilation_options(device_count),
+                    &test_compilation_options(client, Some(device_count)),
                 )
                 .unwrap();
             let shared_buffers = client_devices
@@ -4046,7 +4094,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let shared_buffers = client_devices
             .iter()
@@ -4179,7 +4227,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let shared_buffers = client_devices
             .iter()
@@ -4322,7 +4370,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let data_buffers = devices
             .iter()
@@ -4477,7 +4525,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let data_buffers = devices
             .iter()
@@ -4657,7 +4705,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let inputs = vec![
             Array::from_host_buffer(&session, query_type, device_mesh.clone(), None, values_to_bytes(&[0.0f32]))
@@ -4813,7 +4861,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_compilation_options(client, Some(4)))
             .unwrap();
         let inputs = [1.5f32, 2.0, 3.0, 20.0];
         let buffers = devices
@@ -4964,7 +5012,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(
+                &PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() },
+                &test_compilation_options(client, Some(4)),
+            )
             .unwrap();
         let device_ids = executable
             .addressable_devices()
@@ -5116,7 +5167,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() }, &test_spmd_compilation_options(4))
+            .compile(
+                &PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() },
+                &test_compilation_options(client, Some(4)),
+            )
             .unwrap();
         let device_ids = executable
             .addressable_devices()
@@ -5226,7 +5280,7 @@ pub(crate) mod tests {
         let module = lower_replicated_shard_map_body(program, 2).unwrap();
         let client = cpu_client(2);
         ensure_print_handler_registered(client).unwrap();
-        let options = test_spmd_compilation_options(2);
+        let options = test_compilation_options(client, Some(2));
         let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options).unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
         let bytes = values_to_bytes(&values);
@@ -5408,7 +5462,11 @@ pub(crate) mod tests {
         // and the second map squares each summand of that unreduced input. The devices return `[1]` and `[4]`, whose
         // sum `5` host materialization recovers.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let logical_mesh = test_manual_mesh("x", 2);
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
@@ -5453,7 +5511,11 @@ pub(crate) mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let replicated = Sharding::replicated(map_mesh.clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(
@@ -5522,7 +5584,11 @@ pub(crate) mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let replicated = Sharding::replicated(map_mesh.clone(), 0);
         let input_type = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -5580,7 +5646,11 @@ pub(crate) mod tests {
         // declares one mesh, which assigns device ids to coordinates, while `axis_index` computes coordinates from the
         // axis order of the mesh of its own map, so maps over meshes with other axis orders must not share a module.
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = test_logical_mesh_2x2();
         let reordered_mesh = LogicalMesh::new(vec![
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -5674,7 +5744,11 @@ pub(crate) mod tests {
         // result tiled like the output of the map, and every device returns one element instead of both. The first
         // output has no placement and the second one is replicated explicitly.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh = || {
             let devices = client.addressable_devices().unwrap();

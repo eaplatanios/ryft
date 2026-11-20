@@ -134,10 +134,8 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::tests::{
-        shard_map_module, static_sharded_array_type, test_manual_mesh, test_spmd_compilation_options, test_vector_type,
-    };
-    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, trace};
 
     use super::*;
@@ -241,7 +239,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(4))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();

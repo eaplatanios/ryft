@@ -234,12 +234,11 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type,
-        to_mlir_module_for_plain_program,
+        ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, to_mlir_module_for_plain_program,
     };
     use crate::lowering::types::physical_bound_type;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
-    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, Type, compile,
         to_mlir_module_for_program,
@@ -547,7 +546,7 @@ mod tests {
                 let executable = client
                     .compile(
                         &PjrtProgram::Mlir { bytecode: module.into_bytes() },
-                        &ragged_dot_cpu_compilation_options(),
+                        &test_compilation_options(client, None),
                     )
                     .unwrap();
                 let device = executable.addressable_devices().unwrap().remove(0);
@@ -669,7 +668,11 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
             |(first, second)| first.concatenate_with([&second], 0).unwrap(),
             (input_type.clone(), input_type.clone()),

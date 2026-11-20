@@ -1000,7 +1000,7 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, replicated_array, test_compilation_options, values_to_bytes};
     use crate::{Array, Session, Tracer, to_mlir_module_for_program};
 
     use super::*;
@@ -1856,7 +1856,11 @@ mod tests {
         // the reference backend over inputs without a sharding. A key that is sharded along its sequence shards the
         // scores along the dimension over which the softmax reduces its maximum.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(client, "x", 2).devices().to_vec()).unwrap();
         let values = |start: f32, count: usize| (0..count).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();

@@ -32,20 +32,19 @@ use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
 use ryft_core::{
-    Add, And, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, Device, DeviceId, DeviceMesh,
-    DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation,
-    DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, LayoutError, Memory, Mul, Neg, Not,
-    Operation as CoreOperation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
-    ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind, Value as CoreValue,
-    ValueDomainDispatch, WhilePredicate, Xor,
+    Add, And, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, DeviceId, DeviceMesh, DimensionError,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
+    DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul, Neg, Not, Operation as CoreOperation, Or,
+    Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape, ShapeChangingCollectiveValue, Sharding,
+    StaticShape, Sub, Typed, UnreducedKind, Value as CoreValue, ValueDomainDispatch, WhilePredicate, Xor,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
-use crate::arrays::metadata::ArrayMetadata;
+use crate::arrays::metadata::{ArrayMetadata, ArrayOutputPlan};
+use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
-use crate::types::DataTypeExtension;
-use crate::{Error, FromPjrt, Session, ToPjrt, Type};
+use crate::{Error, Session, ToPjrt, Type};
 
 pub mod host;
 pub mod metadata;
@@ -292,7 +291,7 @@ impl Array {
         // buffers that the session's client does not own.
         let mut buffers_by_device = HashMap::with_capacity(buffers.len());
         for buffer in buffers {
-            let device_id = Self::validate_addressable_buffer(
+            let device_id = validate_addressable_buffer(
                 session.client(),
                 metadata.r#type(),
                 &descriptors,
@@ -392,32 +391,35 @@ impl Array {
         buffers: Vec<Buffer<'static>>,
         fence: ExecutionFence,
     ) -> Self {
+        let metadata = plan.metadata();
+        let descriptors = plan.descriptors();
+        let buffer_positions = plan.buffer_positions();
+
         #[cfg(debug_assertions)]
         for (position, buffer) in buffers.iter().enumerate() {
-            let device_id = Self::validate_addressable_buffer(
+            let device_id = validate_addressable_buffer(
                 session.client(),
-                plan.metadata.r#type(),
-                &plan.descriptors,
-                plan.metadata.shard_index_by_device(),
+                metadata.r#type(),
+                descriptors,
+                metadata.shard_index_by_device(),
                 buffer,
                 false,
             );
             debug_assert!(
                 device_id.as_ref().is_ok_and(|device_id| {
-                    let shard_index = plan.metadata.shard_index_by_device()[device_id];
-                    plan.descriptors[shard_index].device().id() == *device_id
-                        && plan.buffer_positions[shard_index] == Some(position)
+                    let shard_index = metadata.shard_index_by_device()[device_id];
+                    descriptors[shard_index].device().id() == *device_id
+                        && buffer_positions[shard_index] == Some(position)
                 }),
                 "execution output buffer {position} does not match its planned placement: {device_id:?}",
             );
         }
 
-        let is_zero = plan.metadata.r#type().data_type().is_zero();
+        let is_zero = metadata.r#type().data_type().is_zero();
         let mut buffers = buffers.into_iter().map(Some).collect::<Vec<_>>();
-        let shards = plan
-            .descriptors
+        let shards = descriptors
             .iter()
-            .zip(plan.buffer_positions.iter())
+            .zip(buffer_positions)
             .map(|(descriptor, position)| match position {
                 // Zero-space outputs need no storage. A returned carrier holds only false bits and is discarded like
                 // in the validating constructors, and a program may also return no carrier at all.
@@ -431,7 +433,7 @@ impl Array {
             .collect::<Vec<_>>();
 
         Self {
-            parts: Arc::new(ArrayParts::new(session, Arc::clone(&plan.metadata), shards)),
+            parts: Arc::new(ArrayParts::new(session, Arc::clone(metadata), shards)),
             execution_fence: Some(fence),
             send_fence: None,
             session: session.clone(),
@@ -636,144 +638,9 @@ impl Array {
 
         Ok(())
     }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the [`ArrayType`] and runtime placement of an array of type `r#type` that is constructed on `mesh` with
-    /// the optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type
-    /// carries the placement without its auto mesh axes. Without `sharding`, the placement is the sharding of
-    /// `r#type` if present and replication over `mesh` otherwise.
-    fn resolve_placement(
-        r#type: ArrayType,
-        sharding: Option<Sharding>,
-        mesh: &DeviceMesh,
-    ) -> Result<(ArrayType, Sharding), Error> {
-        let sharding = match (sharding, r#type.sharding()) {
-            (Some(sharding), Some(type_sharding)) if *type_sharding != sharding.without_auto_axes() => {
-                return Err(Error::from(ArrayError::PlacementTypeMismatch {
-                    type_sharding: type_sharding.clone(),
-                    sharding,
-                }));
-            }
-            (Some(sharding), _) => sharding,
-            (None, Some(type_sharding)) => type_sharding.clone(),
-            (None, None) => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
-        };
-        let r#type = r#type.with_sharding(sharding.without_auto_axes())?;
-        Ok((r#type, sharding))
-    }
-
-    /// Validates one addressable `buffer` of an array of type `r#type` whose shards are described by `descriptors` and
-    /// `shard_index_by_device`, returning the identifier of the device that owns it. The buffer must be owned by
-    /// `client`, live on a device of the mesh in the process that the mesh expects, live in the memory that `r#type`
-    /// requests, and have the physical element type and the shard shape implied by `r#type`. When
-    /// `validate_zero_carriers` is set, the buffer of a zero-space array must also contain only false bits.
-    fn validate_addressable_buffer(
-        client: &Client<'_>,
-        r#type: &ArrayType,
-        descriptors: &[ShardDescriptor],
-        shard_index_by_device: &HashMap<DeviceId, ShardIndex>,
-        buffer: &Buffer<'_>,
-        validate_zero_carriers: bool,
-    ) -> Result<DeviceId, Error> {
-        let device = Device::from_pjrt(buffer.device()?)?;
-        if !buffer.is_owned_by(client) {
-            return Err(PjrtError::invalid_argument(format!(
-                "the session's client does not own the addressable shard buffer for device {}",
-                device.id(),
-            ))
-            .into());
-        }
-        let device_id = device.id();
-
-        let shard_index = shard_index_by_device
-            .get(&device_id)
-            .ok_or_else(|| Error::from(ArrayError::DeviceNotInMesh { device_id }))?;
-        let descriptor = descriptors.get(*shard_index).unwrap();
-
-        // Validate that each buffer is owned by the process expected for the corresponding mesh device.
-        let process_index = device.process_index();
-        if process_index != descriptor.device().process_index() {
-            return Err(Error::from(ArrayError::DeviceProcessIndexMismatch {
-                device_id,
-                expected: descriptor.device().process_index(),
-                actual: process_index,
-            }));
-        }
-
-        // A type's placement must describe the actual buffer, not merely relabel its storage. Device placement
-        // means the plugin's default memory, whose kind is platform-dependent (e.g., CPU uses host memory).
-        let buffer_memory = buffer.memory()?;
-        let buffer_device = buffer.device()?;
-        let memory_matches = match r#type.memory() {
-            Memory::Device => buffer_memory == buffer_device.default_memory()?,
-            Memory::Host { pinned: true } => buffer_memory.kind()? == "pinned_host",
-            Memory::Host { pinned: false } => buffer_memory.kind()? == "unpinned_host",
-        };
-        if !memory_matches {
-            return Err(Error::from(ArrayError::BufferMemoryMismatch {
-                device_id,
-                expected: r#type.memory(),
-                actual: buffer_memory.kind()?.to_string(),
-            }));
-        }
-
-        if let Some(expected) = r#type.layout() {
-            let actual = Layout::from_pjrt(buffer.specification()?.layout)?;
-            if &actual != expected {
-                return Err(LayoutError::InvalidLayout {
-                    message: format!(
-                        "buffer on device {device_id} uses layout `{actual}` but its type declares `{expected}`",
-                    ),
-                }
-                .into());
-            }
-        }
-
-        // Validate the concrete buffer type against the physical representation of the logical shard type.
-        // Zero-space values and one-bit integers use predicate carriers in this execution path. Converting a
-        // carrier back to a `DataType` would incorrectly relabel those logical arrays as Boolean.
-        let buffer_type = buffer.element_type()?;
-        let expected_buffer_type = r#type.data_type().executable_buffer_type();
-        let data_type =
-            if buffer_type == expected_buffer_type { r#type.data_type() } else { DataType::from_pjrt(buffer_type)? };
-        let shape = StaticShape::new(
-            buffer
-                .unpadded_dimensions()?
-                .iter()
-                .map(|size| {
-                    usize::try_from(*size).map_err(|_| Error::SizeLimitExceeded {
-                        message: format!(
-                            "buffer dimension size {size} exceeds the maximum allowed size of {}",
-                            usize::MAX,
-                        ),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        if buffer_type != expected_buffer_type && matches!(r#type.data_type(), DataType::I1 | DataType::U1) {
-            return Err(Error::from(ArrayError::BufferTypeMismatch {
-                expected: ArrayType::new(DataType::Boolean, shape.clone().into()),
-                actual: ArrayType::new(data_type, shape.into()),
-            }));
-        }
-        let array_type = ArrayType::new(data_type, shape.into());
-        let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
-        if array_type != expected_array_type {
-            return Err(Error::from(ArrayError::BufferTypeMismatch {
-                expected: expected_array_type,
-                actual: array_type,
-            }));
-        }
-        if validate_zero_carriers
-            && r#type.data_type().is_zero()
-            && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
-        {
-            return Err(Error::from(ArrayError::NonCanonicalZeroBuffer { device_id }));
-        }
-        Ok(device_id)
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1159,48 +1026,6 @@ pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Resul
     Ok(())
 }
 
-/// Placement of one output of a compiled program, computed once per program so that every execution can build that
-/// output's [`Array`] from the returned buffers (refer to [`Array::from_execution_output`]) without deriving or
-/// validating its placement again. Every array built from one plan shares its [`ArrayMetadata`].
-pub(crate) struct ArrayOutputPlan {
-    /// Type and runtime placement of the output, which every array built from this plan shares. The type has a
-    /// static shape and sharding metadata.
-    metadata: Arc<ArrayMetadata>,
-
-    /// Shard descriptors of the output, in mesh order.
-    descriptors: Vec<ShardDescriptor>,
-
-    /// For each shard, the position of its buffer among the executable's addressable devices, or [`None`] for a shard
-    /// that is not addressable from the current process.
-    buffer_positions: Vec<Option<usize>>,
-}
-
-impl ArrayOutputPlan {
-    /// Creates the plan of an output of type `r#type` placed on `mesh` according to `sharding`, whose buffers an
-    /// execution returns in the order of `addressable_device_ids`. When `sharding` is [`None`], the output is placed
-    /// according to the sharding of `r#type`, or replicated when `r#type` has no sharding.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`Error`] if `r#type` does not have a static shape, if `sharding` disagrees with the sharding of
-    /// `r#type`, or if the placement is not valid on `mesh`.
-    pub(crate) fn new(
-        r#type: ArrayType,
-        sharding: Option<Sharding>,
-        mesh: &DeviceMesh,
-        addressable_device_ids: &[DeviceId],
-    ) -> Result<Self, Error> {
-        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh.clone())?;
-        let buffer_positions = descriptors
-            .iter()
-            .map(|descriptor| {
-                addressable_device_ids.iter().position(|device_id| *device_id == descriptor.device().id())
-            })
-            .collect();
-        Ok(Self { metadata: Arc::new(metadata), descriptors, buffer_positions })
-    }
-}
-
 /// Provides XLA-specific helpers for [`ArrayType`]s.
 pub trait ArrayTypeExtension {
     /// Returns the number of logical payload bytes required by a dense [`Array`] of this [`ArrayType`].
@@ -1268,6 +1093,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
+    use crate::arrays::metadata::ArrayOutputPlan;
     use crate::arrays::shards::ArrayShard;
     use crate::arrays::statistics::ArrayStatistics;
     use crate::sessions::tests::{domain_mesh, shares_effect_scope};
@@ -1278,7 +1104,7 @@ mod tests {
     use crate::types::DataTypeExtension;
     use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
 
-    use super::{Array, ArrayError, ArrayOutputPlan, ArrayTypeExtension, block_until_ready, ready};
+    use super::{Array, ArrayError, ArrayTypeExtension, block_until_ready, ready};
 
     // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
     // separate values `device_bytes` that the two devices of the client of `session` hold.

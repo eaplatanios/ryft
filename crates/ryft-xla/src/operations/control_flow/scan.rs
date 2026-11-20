@@ -673,16 +673,16 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
 
-    use crate::lowering::tests::{
-        MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
-    };
+    use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program, test_vector_type};
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{
         Array, CompiledFunction, Constant, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
         to_mlir_module_for_program,
@@ -2380,7 +2380,7 @@ mod tests {
 
         let client = execution_client();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: stablehlo.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: stablehlo.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         // Runs the scan over the first `batch` generator states, each a pair of `u64` words, of `states`, and returns

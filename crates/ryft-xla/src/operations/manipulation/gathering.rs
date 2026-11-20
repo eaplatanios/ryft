@@ -275,11 +275,11 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{
-        ProgramBuilder, ragged_dot_cpu_compilation_options, to_mlir_module_for_plain_program, unproject_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, to_mlir_module_for_plain_program, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, read_first_shard};
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::types::DataTypeExtension;
     use crate::{Array, ArrayConstant, Options, Session, Type, to_mlir_module_for_program};
 
@@ -481,7 +481,7 @@ mod tests {
                 .unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
             let inputs = [&input, &indices]
@@ -571,7 +571,7 @@ mod tests {
             )
             .unwrap();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
             for query_size in [2i32, 1, 0] {

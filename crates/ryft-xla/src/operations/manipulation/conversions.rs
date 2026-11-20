@@ -1128,13 +1128,15 @@ mod tests {
 
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
-        test_spmd_compilation_options, to_mlir_module_for_plain_program,
+        to_mlir_module_for_plain_program,
     };
     use crate::operations::debugging::with_captured_prints;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, f32_vector, read_first_shard};
-    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
         to_mlir_module_for_program,
@@ -1156,7 +1158,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(shards.len()), ..Default::default() }))?;
         let executable = client.compile(
             &PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() },
-            &test_spmd_compilation_options(shards.len()),
+            &test_compilation_options(&client, Some(shards.len())),
         )?;
         let devices = executable.addressable_devices()?;
         assert_eq!(devices.len(), shards.len());
@@ -3437,7 +3439,7 @@ mod tests {
         );
         let client = execution_client();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(1))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(1)))
             .unwrap();
         let device = client.addressable_devices().unwrap().remove(0);
         let values = vec![1f32, 2., 3., 4., 5., 6.];
@@ -3662,7 +3664,12 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap()
+            .with_device_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F64, [4, 3])
             .with_sharding(
                 Sharding::new(
@@ -4203,8 +4210,8 @@ mod tests {
             "},
         );
         let client = cpu_client(2);
-        let Err(error) =
-            client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
+        let Err(error) = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
         else {
             panic!("bounded-dynamic sharded module unexpectedly compiled for two devices");
         };

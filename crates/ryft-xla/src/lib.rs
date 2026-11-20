@@ -106,13 +106,16 @@ pub(crate) mod tests {
         FfiAttribute, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
         FfiOutput, FfiScalar, FfiTypeId, XLA_FFI_Handler,
     };
+    use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
+    use crate::{Array, FromPjrt, Session};
+
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::{Array, FromPjrt, Session};
 
     /// Returns a CPU client with `device_count` addressable devices, for tests that need a fixed device count or that
     /// exercise CPU-only behavior. Tests that only need some single device use [`execution_client`] instead.
@@ -206,6 +209,35 @@ pub(crate) mod tests {
             eprintln!("execution test platform: {platform}; addressable devices: {devices:?}");
         });
         client
+    }
+
+    /// Builds test compilation options with `HloShardingV3` enabled on CPU. `partition_count` selects Shardy SPMD
+    /// partitioning when supplied. `None` selects single-device compilation, or lets a [`Session`] choose the execution
+    /// mode from its device mesh.
+    pub(crate) fn test_compilation_options(client: &Client<'_>, partition_count: Option<usize>) -> CompilationOptions {
+        // MLIR export reads the explicit debug options before the HLO compiler applies its defaults.
+        // TODO(eaplatanios): Set `xla_enable_hlo_sharding_v3` via `environment_option_overrides` once
+        //  CPU PJRT applies those overrides before MLIR export.
+        let debug_options = client.platform_name().unwrap().eq_ignore_ascii_case("cpu").then(|| DebugOptions {
+            // The CPU compiler requires a positive split count when replacing its default options.
+            xla_cpu_parallel_codegen_split_count: Some(1),
+            // Preserve XLA's default of no per-heap size limit.
+            xla_multi_heap_size_constraint_per_heap: Some(-1),
+            xla_enable_hlo_sharding_v3: Some(true),
+            ..Default::default()
+        });
+        CompilationOptions {
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                debug_options,
+                replica_count: 1,
+                partition_count: partition_count.unwrap_or(1) as i64,
+                use_spmd_partitioning: partition_count.is_some(),
+                use_shardy_partitioner: partition_count.is_some(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     /// Returns the `f64` vector type with four elements that staged program fixtures use for their values.

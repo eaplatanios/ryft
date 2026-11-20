@@ -1455,7 +1455,7 @@ mod tests {
         domain_mesh, f32_scalar, f64_vector, program_array, read_first_shard, replicated_scalar_type,
         replicated_vector_type,
     };
-    use crate::tests::{cpu_client, values_to_bytes};
+    use crate::tests::{cpu_client, test_compilation_options, values_to_bytes};
     use crate::{
         Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Type, Value, with_captured_prints,
     };
@@ -2000,7 +2000,11 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))

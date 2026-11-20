@@ -1654,8 +1654,8 @@ pub(crate) mod tests {
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::sessions::effects::EffectCallbackGuard;
     use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, other_cpu_client, replicated_array, values_from_bytes,
-        values_to_bytes,
+        assert_send_sync, cpu_client, execution_client, other_cpu_client, replicated_array, test_compilation_options,
+        values_from_bytes, values_to_bytes,
     };
     use crate::{
         ArrayPlacement, CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
@@ -2872,7 +2872,11 @@ pub(crate) mod tests {
     fn test_session_bind_dispatch_cache_keys_every_lowering_input() {
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         fn negate(session: &Session, input: Array) {
             let inputs = [Value::Array(input)];
             session.bind(Operation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
@@ -3116,7 +3120,13 @@ pub(crate) mod tests {
     fn test_session_bind_executes_elementwise_operation_on_sharded_inputs() {
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let domain = ProjectedContext::<Session, ArrayType>::new(Session::builder().client(client).build().unwrap());
+        let domain = ProjectedContext::<Session, ArrayType>::new(
+            Session::builder()
+                .client(client)
+                .compilation_options(test_compilation_options(client, None))
+                .build()
+                .unwrap(),
+        );
 
         // A vector sharded over a mesh with 2 devices executes eagerly through SPMD compilation of the operation, and
         // each device adds its own shard of 2 elements.
@@ -3599,7 +3609,11 @@ pub(crate) mod tests {
     fn test_session_bind_executes_scan_with_sharded_stacked_inputs() {
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         // The same cumulative sum scan as above, but with the stacked input sharded over the scanned leading axis of a
@@ -3686,7 +3700,11 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
 
         // Manual `shard_map` body `local -> local + local` over `f32[4]` sharded across the mesh with 2 devices. Each
         // device doubles its own shard of 2 elements inside the manual region.
@@ -3747,7 +3765,11 @@ pub(crate) mod tests {
         // along `x` places the dimension that its axes select. Repeating a map at the same signature hits the dispatch
         // cache.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let logical_mesh = test_manual_mesh("x", 2);
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
@@ -3816,7 +3838,11 @@ pub(crate) mod tests {
         // enclosing map (its context's default mesh) and makes the remaining axis `y` manual, as JAX's
         // `shard_map(mesh=None)` does inside a `shard_map` body. Outside of every manual region, a map needs a mesh.
         let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -4030,7 +4056,11 @@ pub(crate) mod tests {
         // Sharding over two devices requires a CPU client with two devices.
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let primal = Array::from_host_buffer(
@@ -4146,7 +4176,11 @@ pub(crate) mod tests {
         // Sharding over two devices requires a CPU client with two devices.
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         // The batched basis tangents carry the sharding of the primal, with a replicated batch axis, so that their
@@ -4186,7 +4220,11 @@ pub(crate) mod tests {
         // Sharding over two devices requires a CPU client with two devices.
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
         let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0]);

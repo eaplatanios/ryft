@@ -589,11 +589,11 @@ mod tests {
         GpuPlatform, Program as PjrtProgram,
     };
 
+    #[cfg(feature = "cuda-13")]
+    use crate::lowering::tests::static_sharded_array_type;
     use crate::lowering::tests::{shard_map_module, test_sharding};
     #[cfg(feature = "cuda-13")]
-    use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
-    #[cfg(feature = "cuda-13")]
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::tests::{test_compilation_options, values_from_bytes, values_to_bytes};
     #[cfg(feature = "cuda-13")]
     use crate::{Array, ExecutionArguments, FromPjrt, Platform, Session};
     use crate::{ArrayTracer, TracedProgram, trace};
@@ -929,7 +929,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(1))
+                .compile(
+                    &PjrtProgram::Mlir { bytecode: program.into_bytes() },
+                    &test_compilation_options(client, Some(1)),
+                )
                 .unwrap();
             let mut outputs = executable
                 .execute(
@@ -1191,7 +1194,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(
+                &PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() },
+                &test_compilation_options(client, Some(2)),
+            )
             .unwrap();
         let execution_device_ids = executable
             .addressable_devices()
@@ -1344,7 +1350,10 @@ mod tests {
             .unwrap()
         }));
         let gradient_executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: gradient_program.into_bytes() }, &test_spmd_compilation_options(2))
+            .compile(
+                &PjrtProgram::Mlir { bytecode: gradient_program.into_bytes() },
+                &test_compilation_options(client, Some(2)),
+            )
             .unwrap();
         let gradient_device_ids = gradient_executable
             .addressable_devices()

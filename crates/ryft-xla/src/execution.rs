@@ -30,7 +30,7 @@ use ryft_pjrt::{
     ExecutionInput, LoadedExecutable,
 };
 
-use crate::arrays::ArrayOutputPlan;
+use crate::arrays::metadata::ArrayOutputPlan;
 use crate::lowering::signature::ExecutableSignature;
 use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
@@ -1721,16 +1721,16 @@ mod tests {
         StagedFunction as CoreStagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
-    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision, Shape as ShapeProto};
+    use ryft_pjrt::protos::Shape as ShapeProto;
     use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program};
 
     use crate::execution::ExecutionArguments;
-    use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
+    use crate::lowering::tests::static_sharded_array_type;
     use crate::sessions::tests::{
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_first_shard, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, two_device_mesh,
     };
-    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET, Platform,
         ProgramBuilder, Reference, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, ToMlir,
@@ -2017,7 +2017,12 @@ mod tests {
     fn test_execution_plan_new_plans_static_outputs_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap()
+            .with_device_mesh(mesh.clone());
         // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
@@ -2082,7 +2087,12 @@ mod tests {
     fn test_execution_plan_new_plans_no_outputs_without_declared_placement() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap()
+            .with_device_mesh(mesh.clone());
         let unconstrained_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
         let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
@@ -2231,28 +2241,7 @@ mod tests {
                 "#
         );
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let compilation_options = CompilationOptions {
-            argument_layouts: Vec::new(),
-            parameter_is_tupled_arguments: false,
-            executable_build_options: Some(ExecutableCompilationOptions {
-                device_ordinal: -1,
-                replica_count: 1,
-                partition_count: 8,
-                use_spmd_partitioning: true,
-                use_shardy_partitioner: true,
-                ..Default::default()
-            }),
-            compile_portable_executable: false,
-            profile_version: 0,
-            individually_defined_output_indices: Vec::new(),
-            serialized_multi_slice_configuration: Vec::new(),
-            environment_option_overrides: HashMap::new(),
-            target_config: None,
-            allow_in_place_mlir_modification: false,
-            matrix_unit_operand_precision: Precision::Default as i32,
-            ..Default::default()
-        };
-        let executable = client.compile(&program, &compilation_options).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(8))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 8);
@@ -2381,7 +2370,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+        let executable = client.compile(&program, &test_compilation_options(client, Some(4))).unwrap();
 
         let execution_devices = executable.addressable_devices().unwrap();
         assert_eq!(execution_devices.len(), 4);
@@ -2640,7 +2629,12 @@ mod tests {
     fn test_session_execute_program_bounded_dynamic_program_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap()
+            .with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
@@ -2959,7 +2953,12 @@ mod tests {
     fn test_session_reshard_inputs_if_needed() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap()
+            .with_device_mesh(mesh.clone());
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_values = |array: &Array| {
@@ -3138,7 +3137,11 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = bounded_vector_type(sharding.clone());
         let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
@@ -3452,7 +3455,11 @@ mod tests {
         let client = cpu_client(2);
         // Types record placement over explicit mesh axes only, so the statically sharded state uses an explicit axis.
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
             .with_sharding(sharding)

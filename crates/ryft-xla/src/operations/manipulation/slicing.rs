@@ -696,14 +696,15 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, to_mlir_module_for_plain_program,
-        unproject_plain_program,
+        ProgramBuilder, test_matrix_type, to_mlir_module_for_plain_program, unproject_plain_program,
     };
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{
         domain_mesh, f32_vector, program_array, read_first_shard, replicated_scalar_type, replicated_vector_type,
     };
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::types::DataTypeExtension;
     use crate::{Array, ArrayConstant, Constant, Options, Session, Type, Value, to_mlir_module_for_program};
 
@@ -1093,7 +1094,7 @@ mod tests {
             )
             .unwrap();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
             let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
@@ -1499,7 +1500,7 @@ mod tests {
         )
         .unwrap();
         let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
@@ -1612,7 +1613,7 @@ mod tests {
             )
             .unwrap();
             let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
             let start_buffer_type = if start_type == DataType::U64 { BufferType::U64 } else { BufferType::I64 };
