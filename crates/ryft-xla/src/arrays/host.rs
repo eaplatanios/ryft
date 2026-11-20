@@ -698,10 +698,8 @@ fn row_major_element_strides(shape: &[usize], element_type: DataType) -> Result<
     Ok(strides)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Merges one contiguous segment of shard bytes into `global_bytes` at `global_byte_offset` and records the written
-/// range in `written_intervals`, which stays sorted and disjoint. Returns
+/// Merges one contiguous segment of shard bytes into `global_bytes` at `global_byte_offset`
+/// and records the written range in `written_intervals`, which stays sorted and disjoint. Returns
 /// [`ArrayError::InconsistentOverlappingShardData`] when two overlapping shards disagree on the value of a byte.
 #[allow(clippy::single_range_in_vec_init)]
 fn merge_shard_byte_segment(
@@ -716,12 +714,14 @@ fn merge_shard_byte_segment(
     if source_bytes.is_empty() {
         return Ok(());
     }
+
     let range = global_byte_offset..global_byte_offset + source_bytes.len();
     let insertion_index = written_intervals.partition_point(|written| written.start <= range.start);
     let mut first_overlap = insertion_index.saturating_sub(1);
     while first_overlap < written_intervals.len() && written_intervals[first_overlap].end <= range.start {
         first_overlap += 1;
     }
+
     let mut overlap_index = first_overlap;
     while overlap_index < written_intervals.len() && written_intervals[overlap_index].start < range.end {
         let written = &written_intervals[overlap_index];
@@ -734,6 +734,7 @@ fn merge_shard_byte_segment(
         }
         overlap_index += 1;
     }
+
     global_bytes[range.clone()].copy_from_slice(source_bytes);
 
     let mut merged_start = range.start;
@@ -744,13 +745,16 @@ fn merge_shard_byte_segment(
         merged_start = merged_start.min(written_intervals[remove_start].start);
         merged_end = merged_end.max(written_intervals[remove_start].end);
     }
+
     let mut remove_end = remove_start;
     while remove_end < written_intervals.len() && written_intervals[remove_end].start <= merged_end {
         merged_end = merged_end.max(written_intervals[remove_end].end);
         remove_end += 1;
     }
+
     // The replacement is one interval, not the elements of a range.
     written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
+
     Ok(())
 }
 
@@ -807,8 +811,11 @@ fn merge_dense_shard_bytes(
             written_intervals,
         )?;
     }
+
     Ok(())
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[allow(clippy::single_range_in_vec_init)]
