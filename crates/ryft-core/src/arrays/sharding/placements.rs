@@ -28,11 +28,11 @@ pub struct Placement {
     /// [`DeviceMesh`] whose devices hold the shards of the array.
     mesh: DeviceMesh,
 
-    /// Optional storage [`Layout`] of the array.
-    layout: Option<Layout>,
-
     /// [`Sharding`] of the array over [`Self::mesh`].
     sharding: Sharding,
+
+    /// Optional storage [`Layout`] of the array.
+    layout: Option<Layout>,
 
     /// Optional [`Memory`] space of the array.
     memory: Option<Memory>,
@@ -49,7 +49,7 @@ impl Placement {
     #[inline]
     pub fn new(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ShardingError> {
         check_sharding!(mesh, sharding);
-        Ok(Self { mesh, layout: None, sharding, memory: None })
+        Ok(Self { mesh, sharding, layout: None, memory: None })
     }
 
     /// Returns this [`Placement`] with its storage [`Layout`] set to `layout`.
@@ -72,17 +72,17 @@ impl Placement {
         &self.mesh
     }
 
-    /// Returns the storage [`Layout`] of the array, or [`None`] if this [`Placement`] does not specify one.
-    #[inline]
-    pub fn layout(&self) -> Option<&Layout> {
-        self.layout.as_ref()
-    }
-
     /// Returns the [`Sharding`] of the array over [`Self::mesh`]. Its logical mesh has the same topology as that of
     /// [`Self::mesh`], although the two may type their axes differently.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
         &self.sharding
+    }
+
+    /// Returns the storage [`Layout`] of the array, or [`None`] if this [`Placement`] does not specify one.
+    #[inline]
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_ref()
     }
 
     /// Returns the [`Memory`] space of the array, or [`None`] if this [`Placement`] does not specify one.
@@ -91,10 +91,10 @@ impl Placement {
         self.memory
     }
 
-    /// Consumes this placement and returns its mesh, layout, sharding, and memory.
+    /// Consumes this placement and returns its mesh, sharding, layout, and memory.
     #[inline]
-    pub fn into_parts(self) -> (DeviceMesh, Option<Layout>, Sharding, Option<Memory>) {
-        (self.mesh, self.layout, self.sharding, self.memory)
+    pub fn into_parts(self) -> (DeviceMesh, Sharding, Option<Layout>, Option<Memory>) {
+        (self.mesh, self.sharding, self.layout, self.memory)
     }
 }
 
@@ -145,8 +145,8 @@ mod tests {
         let sharding = Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let placement = Placement::new(mesh.clone(), sharding.clone()).unwrap();
         assert_eq!(placement.mesh(), &mesh);
-        assert_eq!(placement.layout(), None);
         assert_eq!(placement.sharding(), &sharding);
+        assert_eq!(placement.layout(), None);
         assert_eq!(placement.memory(), None);
         assert_eq!(
             placement.to_string(),
@@ -193,12 +193,12 @@ mod tests {
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(3, 1)]).unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let placement = Placement::new(mesh.clone(), sharding.clone()).unwrap();
-        assert_eq!(placement.clone().into_parts(), (mesh.clone(), None, sharding.clone(), None));
+        assert_eq!(placement.clone().into_parts(), (mesh.clone(), sharding.clone(), None, None));
 
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let memory = Memory::Host { pinned: true };
         let placement = placement.with_layout(layout.clone()).with_memory(memory);
-        assert_eq!(placement.into_parts(), (mesh, Some(layout), sharding, Some(memory)));
+        assert_eq!(placement.into_parts(), (mesh, sharding, Some(layout), Some(memory)));
     }
 
     #[test]
