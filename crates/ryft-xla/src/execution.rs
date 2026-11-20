@@ -2054,12 +2054,7 @@ mod tests {
     fn test_execution_plan_new_plans_static_outputs_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap()
-            .with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
@@ -2124,12 +2119,7 @@ mod tests {
     fn test_execution_plan_new_plans_no_outputs_without_declared_placement() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap()
-            .with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let unconstrained_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
         let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
@@ -2665,12 +2655,7 @@ mod tests {
     fn test_session_execute_program_bounded_dynamic_program_on_multiple_cpu_devices() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap()
-            .with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
@@ -2989,11 +2974,7 @@ mod tests {
     fn test_session_prepare_compiled_execution_preserves_unreduced_shards_during_relayout() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap();
         let shape = [2, 2];
         let input_type = ArrayType::new_static(DataType::F32, shape).with_sharding(sharding.clone()).unwrap();
@@ -3044,12 +3025,7 @@ mod tests {
     fn test_session_reshard_inputs_if_needed() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap()
-            .with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_values = |array: &Array| {
@@ -3228,11 +3204,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = bounded_vector_type(sharding.clone());
         let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -3546,11 +3518,7 @@ mod tests {
         let client = cpu_client(2);
         // Types record placement over explicit mesh axes only, so the statically sharded state uses an explicit axis.
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)

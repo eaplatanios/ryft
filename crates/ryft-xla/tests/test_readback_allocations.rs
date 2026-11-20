@@ -87,14 +87,22 @@ fn test_array_copy_to_host_bytes_payload_allocations() {
     .unwrap();
     let bytes = (0..OUTPUT_BYTES).map(|index| (index % 251) as u8).collect::<Vec<_>>();
     let rows = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
+    let subrow_shape = [1, SHAPE[0], SHAPE[1]];
+    let subrows =
+        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
     let columns = vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])];
     let replicated = vec![ShardingDimension::replicated(), ShardingDimension::replicated()];
 
-    // Rows and replicas each use a single output allocation as the copy destination. The column layout allocates
-    // one tile buffer per shard, including the replicas, and a separate output buffer for the merge.
-    for (dimensions, expected_allocations) in [(rows, (0, 1)), (columns, (devices.len(), 1)), (replicated, (0, 1))] {
+    // A tile can copy directly into the output when it covers whole rows or a partial slice followed by whole trailing
+    // dimensions. The column layout allocates one tile buffer per shard and a separate output buffer for the merge.
+    for (shape, dimensions, expected_allocations) in [
+        (SHAPE.as_slice(), rows, (0, 1)),
+        (subrow_shape.as_slice(), subrows, (0, 1)),
+        (SHAPE.as_slice(), columns, (devices.len(), 1)),
+        (SHAPE.as_slice(), replicated, (0, 1)),
+    ] {
         let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
-        let r#type = ArrayType::new_static(DataType::U8, SHAPE).with_sharding(sharding.clone()).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, shape).with_sharding(sharding.clone()).unwrap();
         let array = Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes.as_slice()).unwrap();
         array.block_until_ready().unwrap();
 

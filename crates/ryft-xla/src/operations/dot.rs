@@ -2221,11 +2221,7 @@ mod tests {
         // axes to auto axes, like in JAX. The contracted axes of the first two inputs below are sharded alike over
         // two devices, which explicit placement of their contraction rejects as ambiguous.
         let client = cpu_client(2);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.logical_mesh().clone(), dimensions);
         let shardings = [

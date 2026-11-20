@@ -3661,12 +3661,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap()
-            .with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F64, [4, 3])
             .with_sharding(
                 Sharding::new(

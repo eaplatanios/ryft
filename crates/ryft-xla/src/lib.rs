@@ -98,7 +98,6 @@ pub(crate) mod tests {
     use std::mem::MaybeUninit;
     use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
-    use prost::Message;
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
         StaticShape,
@@ -108,11 +107,12 @@ pub(crate) mod tests {
         FfiOutput, FfiScalar, FfiTypeId, XLA_FFI_Handler,
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions};
-    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
+    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
+    use crate::compilation::options::probe_debug_options;
     use crate::{Array, FromPjrt, Session};
 
     #[cfg(feature = "cuda-13")]
@@ -212,9 +212,8 @@ pub(crate) mod tests {
         client
     }
 
-    /// Builds test compilation options with `HloShardingV3` enabled on CPU and CUDA 13. `partition_count` selects
-    /// Shardy SPMD partitioning when supplied. `None` selects single-device compilation, or lets a [`Session`] choose
-    /// the execution mode from its device mesh.
+    /// Builds options for tests that call [`Client::compile`] directly, with `HloShardingV3` enabled on CPU and CUDA 13.
+    /// `partition_count` selects Shardy SPMD partitioning when supplied. `None` selects single-device compilation.
     pub(crate) fn test_compilation_options(client: &Client<'_>, partition_count: Option<usize>) -> CompilationOptions {
         static CPU_DEBUG_OPTIONS: OnceLock<DebugOptions> = OnceLock::new();
 
@@ -251,52 +250,8 @@ pub(crate) mod tests {
 
     /// Enables V3 on top of the plugin's effective debug options, which include its `XLA_FLAGS` overrides.
     fn probe_v3_debug_options(client: &Client<'_>) -> DebugOptions {
-        /// Configuration field of XLA's `HloModuleProtoWithConfig`.
-        #[derive(prost::Message)]
-        struct HloModuleProtoWithConfig {
-            #[prost(message, optional, tag = "2")]
-            config: Option<HloModuleConfigProto>,
-        }
-
-        /// Debug options field of XLA's `HloModuleConfigProto`.
-        #[derive(prost::Message)]
-        struct HloModuleConfigProto {
-            #[prost(message, optional, tag = "14")]
-            debug_options: Option<DebugOptions>,
-        }
-
-        // A portable executable lets each rank read the options without assigning a device or using collectives.
-        let program = Program::Mlir {
-            bytecode: indoc::indoc! {"
-                module @ryft_debug_options {
-                    func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
-                        return %arg0 : tensor<f32>
-                    }
-                }
-            "}
-            .as_bytes()
-            .to_vec(),
-        };
-        let options = CompilationOptions {
-            executable_build_options: Some(ExecutableCompilationOptions {
-                device_ordinal: -1,
-                replica_count: 1,
-                partition_count: 1,
-                ..Default::default()
-            }),
-            compile_portable_executable: true,
-            ..Default::default()
-        };
-        // Keep the loaded executable alive while reading its optimized HLO.
-        let loaded = client.compile(&program, &options).unwrap();
-        let Program::HloWithConfig { proto } = loaded.executable().unwrap().optimized_program().unwrap() else {
-            panic!("expected optimized HLO with its module configuration");
-        };
-        let mut options = HloModuleProtoWithConfig::decode(proto.as_slice())
-            .unwrap()
-            .config
-            .and_then(|config| config.debug_options)
-            .expect("expected debug options in the optimized HLO configuration");
+        let mut options =
+            probe_debug_options(client).expect("expected debug options in the optimized HLO configuration");
         options.xla_enable_hlo_sharding_v3 = Some(true);
         options
     }

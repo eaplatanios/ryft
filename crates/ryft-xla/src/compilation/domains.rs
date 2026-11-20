@@ -22,7 +22,7 @@ use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
 use crate::compilation::CompilationError;
 use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
-use crate::compilation::options::{FeedbackDirectedProfile, Options};
+use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options};
 use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
@@ -446,7 +446,7 @@ impl Session {
                     .to_string(),
             }));
         }
-        let compilation_options = jit_compilation_options(
+        let mut compilation_options = jit_compilation_options(
             options.compilation_options().unwrap_or_else(|| self.compilation_options()),
             options.mesh().devices(),
             use_shardy_partitioner,
@@ -455,7 +455,14 @@ impl Session {
         // The target platform gates platform-specific lowerings such as fused attention. A client whose platform
         // cannot be queried cannot compile the program either, so a failed query fails the lowering.
         let target = self.target()?;
-        let target_platform = Some(target.platform_name());
+        let platform = target.platform_name();
+        if use_shardy_partitioner
+            && options.mesh().devices().len() > 1
+            && (platform.eq_ignore_ascii_case("cpu") || platform.eq_ignore_ascii_case("cuda"))
+        {
+            resolve_shardy_debug_options(self.client(), &mut compilation_options);
+        }
+        let target_platform = Some(platform);
         // Shardy currently rejects bounded dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
@@ -954,7 +961,7 @@ mod tests {
         boolean_scalar, domain_mesh, f32_scalar, f32_vector, read_first_shard, replicated_scalar_type,
         replicated_vector_type,
     };
-    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, Constant, Error, FlatProgram, FromPjrt, JitCallOperation, Operation, ProgramBuilder, Session, Type,
         Value,
@@ -1283,11 +1290,7 @@ mod tests {
             .collect::<Vec<_>>();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, devices.clone()).unwrap();
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
@@ -1513,12 +1516,7 @@ mod tests {
     fn test_session_lower_program_uses_the_replica_path_for_internal_dynamic_tensors() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap()
-            .with_device_mesh(mesh.clone());
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -1790,11 +1788,7 @@ mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });

@@ -960,9 +960,7 @@ mod tests {
         unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
-    use crate::tests::{
-        cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
-    };
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayConstant, CompiledFunction, Session, compile, to_mlir_module_for_program};
 
     use super::*;
@@ -1191,11 +1189,7 @@ mod tests {
     fn test_reduce_operation_lower_product_sharded_gradient() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> =
@@ -1905,11 +1899,7 @@ mod tests {
         // they recognize. Floating-point extrema over two devices still propagate NaNs and order negative zero below
         // positive zero, wherever the shards hold them.
         let client = cpu_client(2);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(client, "x", 2).devices().to_vec()).unwrap();
         let sharded = |data_type: DataType, dimensions: &[usize], axis: usize, bytes: Vec<u8>| {

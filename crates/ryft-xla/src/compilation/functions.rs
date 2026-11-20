@@ -2243,8 +2243,7 @@ mod tests {
         two_device_mesh,
     };
     use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes,
-        values_to_bytes,
+        assert_send_sync, cpu_client, execution_client, other_cpu_client, values_from_bytes, values_to_bytes,
     };
     use crate::{
         Array, Constant, Error, ExecutionError, JitCallOperation, Operation, RaggedDotLoweringStrategy, Reference,
@@ -2306,11 +2305,7 @@ mod tests {
     fn test_compiled_function_dispatcher_execute_specializes_on_input_placement_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]);
@@ -3520,11 +3515,7 @@ mod tests {
     fn test_executable_function_execute_reshards_mismatched_inputs() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
 
         // The executable expects an input sharded along `x` across both devices, but the caller passes a fully
         // replicated array, which `ExecutableFunction::execute` silently reshards before executing.
@@ -3958,11 +3949,7 @@ mod tests {
     fn test_compiled_function_call_constrains_inputs_to_input_sharding_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(1)).unwrap();
@@ -4058,11 +4045,7 @@ mod tests {
     fn test_compiled_function_call_returns_output_sharding_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = replicated_vector_type(&mesh, 4);
         let input = Array::from_host_buffer(
@@ -4105,11 +4088,7 @@ mod tests {
     fn test_compiled_function_call_agrees_with_execution_for_auto_axis_overrides() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
@@ -5349,11 +5328,7 @@ mod tests {
     fn test_compiled_function_batch_places_batch_dimension() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let vector_type = replicated_vector_type(&mesh, 3);
         let matrix_sharding = Sharding::new(
             mesh.logical_mesh().clone(),
@@ -6156,11 +6131,7 @@ mod tests {
         // a replicated integer label match the unsharded arithmetic.
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let logits_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
         let label_type = replicated_scalar_type(&mesh, DataType::I32);
@@ -6685,11 +6656,7 @@ mod tests {
     fn test_compile_with_captures_keeps_captured_array_placement_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
@@ -6770,11 +6737,7 @@ mod tests {
     fn test_compile_with_options_input_shardings_override_replaces_input_sharding() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
 
         // `input_type` carries the abstract shape and data type but a replicated sharding, which the `input_shardings`
         // override replaces with a sharding along `x` before tracing, so the compiled program shards the input across
@@ -6841,11 +6804,7 @@ mod tests {
     fn test_compile_with_options_output_shardings_override_propagates_to_output_array() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();

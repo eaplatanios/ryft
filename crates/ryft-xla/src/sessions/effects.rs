@@ -373,7 +373,7 @@ mod tests {
     use ryft_pjrt::{Buffer, BufferSpecification, BufferType, Client, EventPromise, ExecutionFence};
 
     use crate::sessions::tests::{f64_vector, two_device_mesh};
-    use crate::tests::{cpu_client, test_compilation_options, values_to_bytes};
+    use crate::tests::{cpu_client, values_to_bytes};
     use crate::{
         Array, Constant, Error, ExecutionError, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
         Session, ensure_print_handler_registered, with_captured_prints,
@@ -740,11 +740,7 @@ mod tests {
     fn test_effect_reservation_wait_for_predecessor_tokens_preserves_per_device_dependencies() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         ensure_print_handler_registered(client).unwrap();
         let r#type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(

@@ -565,7 +565,9 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::ArrayPlacement;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
-    use crate::tests::{test_compilation_options, values_from_bytes, values_to_bytes};
+    #[cfg(feature = "cuda-13")]
+    use crate::tests::test_compilation_options;
+    use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Type, Value, compile_statefully};
 
     use super::{
@@ -629,11 +631,7 @@ mod tests {
             .filter(|(_, device)| device.process_index() == process_index)
             .map(|(position, _)| position)
             .collect::<Vec<_>>();
-        let session = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(manual_mesh.clone(), devices.clone()).unwrap();
         let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1728,11 +1726,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 .iter()
                 .map(|device| Device::from_pjrt(device).unwrap())
                 .collect::<Vec<_>>();
-            let session = Session::builder()
-                .client(client)
-                .compilation_options(test_compilation_options(client, None))
-                .build()
-                .unwrap();
+            let session = Session::builder().client(client).build().unwrap();
             let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
             let mesh = DeviceMesh::new(manual_mesh.clone(), devices).unwrap();
             let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();

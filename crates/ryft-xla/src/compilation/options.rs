@@ -8,12 +8,14 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use prost::Message;
 use sha2::{Digest, Sha256};
 
 use ryft_core::{DeviceMesh, Parameterized, Sharding};
-use ryft_pjrt::protos::CompilationOptions;
+use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionValue};
+use ryft_pjrt::{Client, Program};
 
 use crate::compilation::keys::canonical_compilation_options_bytes;
 use crate::{Error, KernelCompilerBinding, RaggedDotLoweringStrategy};
@@ -406,6 +408,95 @@ impl Hash for Options {
         self.kernel_compiler.hash(state);
         self.compilation_options.hash(state);
     }
+}
+
+/// Cached XLA defaults of one process-lifetime PJRT client.
+struct ClientDebugOptions {
+    /// Client that resolves the defaults.
+    client: &'static Client<'static>,
+
+    /// Result of the portable compilation probe, including when the plugin cannot provide defaults.
+    defaults: OnceLock<Option<DebugOptions>>,
+}
+
+/// Supplies the client's default debug options to MLIR export when CPU or CUDA Shardy compilation will import V3.
+pub(super) fn resolve_shardy_debug_options(client: &'static Client<'static>, options: &mut CompilationOptions) {
+    let Some(build_options) = options.executable_build_options.as_mut() else { return };
+    if build_options.debug_options.is_some() {
+        return;
+    }
+    let requested_v3 = match options.environment_option_overrides.get("xla_enable_hlo_sharding_v3") {
+        None => None,
+        Some(option) => match option.value.as_ref() {
+            Some(OptionValue::BoolField(true)) => Some(true),
+            Some(OptionValue::StringField(value)) if value == "True" => Some(true),
+            _ => return,
+        },
+    };
+
+    // TODO(eaplatanios): Remove this workaround when CPU and CUDA PJRT resolve defaults and apply option overrides
+    //  before MLIR export. Reference: https://github.com/openxla/xla/issues/52711
+    static CLIENT_DEFAULTS: Mutex<Vec<Arc<ClientDebugOptions>>> = Mutex::new(Vec::new());
+    let entry = {
+        let mut clients = CLIENT_DEFAULTS.lock().unwrap_or_else(PoisonError::into_inner);
+        match clients.iter().find(|entry| std::ptr::eq(entry.client, client)) {
+            Some(entry) => Arc::clone(entry),
+            None => {
+                let entry = Arc::new(ClientDebugOptions { client, defaults: OnceLock::new() });
+                clients.push(Arc::clone(&entry));
+                entry
+            }
+        }
+    };
+    // A client's probe can compile without holding the cache lock or blocking probes for other clients.
+    if let Some(defaults) = entry.defaults.get_or_init(|| probe_debug_options(client))
+        && requested_v3.or(defaults.xla_enable_hlo_sharding_v3) == Some(true)
+    {
+        let mut debug_options = defaults.clone();
+        debug_options.xla_enable_hlo_sharding_v3 = Some(true);
+        build_options.debug_options = Some(debug_options);
+    }
+}
+
+/// Reads XLA's effective debug options, including the flags that the client resolved. Returns `None` when the
+/// plugin cannot compile the probe or does not expose an optimized HLO module with configuration.
+pub(crate) fn probe_debug_options(client: &Client<'_>) -> Option<DebugOptions> {
+    /// Configuration field of XLA's `HloModuleProtoWithConfig`.
+    #[derive(Message)]
+    struct HloModuleProtoWithConfig {
+        #[prost(message, optional, tag = "2")]
+        config: Option<HloModuleConfigProto>,
+    }
+
+    /// Debug options field of XLA's `HloModuleConfigProto`.
+    #[derive(Message)]
+    struct HloModuleConfigProto {
+        #[prost(message, optional, tag = "14")]
+        debug_options: Option<DebugOptions>,
+    }
+
+    // A portable executable lets each rank query the defaults without assigning devices or organizing collectives.
+    let program = Program::Mlir {
+        bytecode: b"module @ryft_debug_options {
+                       func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
+                           return %arg0 : tensor<f32>
+                       }
+                   }"
+        .to_vec(),
+    };
+    let options = CompilationOptions {
+        executable_build_options: Some(ExecutableCompilationOptions {
+            device_ordinal: -1,
+            replica_count: 1,
+            partition_count: 1,
+            ..Default::default()
+        }),
+        compile_portable_executable: true,
+        ..Default::default()
+    };
+    let loaded = client.compile(&program, &options).ok()?;
+    let Program::HloWithConfig { proto } = loaded.executable().ok()?.optimized_program().ok()? else { return None };
+    HloModuleProtoWithConfig::decode(proto.as_slice()).ok()?.config?.debug_options
 }
 
 #[cfg(test)]

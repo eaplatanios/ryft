@@ -1038,17 +1038,8 @@ impl ArrayTypeExtension for ArrayType {
         if self.data_type().is_zero() {
             return Ok(0);
         }
-        let element_count = self
-            .element_count()?
-            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: self.shape().clone() }))?;
         let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
-        element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
-            message: format!(
-                "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
-                self,
-                usize::MAX,
-            ),
-        })
+        dense_size_in_bytes(self, element_size_in_bytes)
     }
 }
 
@@ -1093,6 +1084,20 @@ impl ArrayParts {
         let registration = session.array_tracker().register(&metadata, &shards);
         Self { metadata, shards, _registration: registration }
     }
+}
+
+/// Returns the checked dense byte count of a non-zero-space array type using its previously computed element size.
+fn dense_size_in_bytes(r#type: &ArrayType, element_size_in_bytes: usize) -> Result<usize, Error> {
+    let element_count = r#type
+        .element_count()?
+        .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
+    element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+        message: format!(
+            "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
+            r#type,
+            usize::MAX,
+        ),
+    })
 }
 
 #[cfg(test)]

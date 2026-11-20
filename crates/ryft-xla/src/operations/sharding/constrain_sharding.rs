@@ -151,7 +151,7 @@ mod tests {
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::Operation;
     use crate::sessions::tests::two_device_mesh;
-    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{Array, CompiledFunction, Options, Session, compile_with_options};
 
     use super::*;
@@ -297,11 +297,7 @@ mod tests {
         // array carries the sharding derived from its input on each device.
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let engine = Session::builder()
-            .client(client)
-            .compilation_options(test_compilation_options(client, None))
-            .build()
-            .unwrap();
+        let engine = Session::builder().client(client).build().unwrap();
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();

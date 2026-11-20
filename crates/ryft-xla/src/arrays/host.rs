@@ -2,14 +2,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use ryft_core::{
-    Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Min, Sharding, StaticShape, Typed, UnreducedKind,
-};
+use ryft_core::{Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Min, Sharding, Typed, UnreducedKind};
 use ryft_pjrt::{DeviceId, ExecutionFence, HostBuffer, HostDestination};
 
 use crate::arrays::metadata::resolve_placement;
 use crate::arrays::shards::{ArrayShard, ShardIndex, ShardLayout};
-use crate::arrays::{Array, ArrayError, ArrayTypeExtension};
+use crate::arrays::{Array, ArrayError, ArrayTypeExtension, dense_size_in_bytes};
 use crate::devices::PjrtDeviceExtension;
 use crate::types::DataTypeExtension;
 use crate::{Error, Session, ToPjrt};
@@ -408,7 +406,8 @@ impl Array {
             return Ok(Vec::new());
         }
 
-        let total_byte_count = self.r#type().size_in_bytes()?;
+        let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes()?;
+        let total_byte_count = dense_size_in_bytes(self.r#type().as_ref(), element_size_in_bytes)?;
         let mesh = self.mesh();
         let unreduced_axis_indices = mesh
             .logical_mesh()
@@ -450,26 +449,41 @@ impl Array {
         };
 
         let mut work = self.session().reserve_work();
+        let compute_global_strides = || row_major_element_strides(global_shape.as_slice(), element_type);
+        let direct_copy_strides =
+            if unreduced_axis_indices.is_empty() { Some(compute_global_strides()?) } else { None };
 
         // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile
         // suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only
         // the leading dimension is sharded, or for a replicated array), each is copied directly into that range of
         // one destination.
-        if unreduced_axis_indices.is_empty() {
+        if let Some(global_strides) = &direct_copy_strides {
             let mut tiles = Vec::<(&ArrayShard, Range<usize>)>::new();
             let mut contiguous = true;
             for shard in &shards {
-                if tiles.iter().any(|(tile, _)| tile.slice() == shard.slice()) {
+                let slices = shard.slice();
+                if tiles.iter().any(|(tile, _)| tile.slice() == slices) {
                     continue;
                 }
 
-                match contiguous_tile_byte_range(shard.slice(), global_shape.as_slice(), element_type)? {
-                    Some(range) => tiles.push((shard, range)),
-                    None => {
-                        contiguous = false;
-                        break;
-                    }
+                // A tile occupies one contiguous span if every dimension after the first non-unit slice is whole.
+                let first_non_unit_dimension = slices.iter().position(|slice| slice.len() != 1).unwrap_or(slices.len());
+                let trailing_dimensions_are_whole = slices
+                    .iter()
+                    .zip(global_shape.as_slice())
+                    .skip(first_non_unit_dimension + 1)
+                    .all(|(slice, extent)| slice.start == 0 && slice.end == *extent);
+                if !trailing_dimensions_are_whole {
+                    contiguous = false;
+                    break;
                 }
+
+                // The checked global byte count bounds the size of every tile.
+                let byte_count = slices.iter().map(Range::len).product::<usize>() * element_size_in_bytes;
+                let start =
+                    slices.iter().zip(global_strides).map(|(slice, stride)| slice.start * stride).sum::<usize>()
+                        * element_size_in_bytes;
+                tiles.push((shard, start..start + byte_count));
             }
 
             if contiguous {
@@ -512,7 +526,8 @@ impl Array {
                 let shard_shape = shard.shape();
                 let event = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?;
                 let copy = work.track_host_copy(event);
-                let expected_byte_count = ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?;
+                let shard_type = ArrayType::new(element_type, shard_shape.into());
+                let expected_byte_count = dense_size_in_bytes(&shard_type, element_size_in_bytes)?;
                 Ok((shard, copy, expected_byte_count))
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -564,18 +579,24 @@ impl Array {
         // Merge tiles into the global buffer, recording written ranges to detect replicas with inconsistent data.
         let mut global_bytes = vec![0u8; total_byte_count];
         let mut written_intervals = Vec::new();
-        for (shard_index, slices, bytes) in shards {
-            // A scalar shard occupies one byte range starting at zero.
-            if slices.is_empty() {
-                merge_dense_byte_segment(bytes.as_slice(), 0, shard_index, &mut global_bytes, &mut written_intervals)?;
-                continue;
-            }
 
-            // The strides map each packed shard row to its position in the global row-major buffer.
-            let global_strides = row_major_element_strides(global_shape.as_slice(), element_type)?;
+        // Shards have the array's rank. Every scalar shard occupies one byte range starting at zero.
+        if global_shape.rank() == 0 {
+            for (shard_index, _, bytes) in shards {
+                merge_dense_byte_segment(bytes.as_slice(), 0, shard_index, &mut global_bytes, &mut written_intervals)?;
+            }
+            return Ok(global_bytes);
+        }
+
+        // Reuse the destination strides from the direct-copy check when it ran.
+        let global_strides = match direct_copy_strides {
+            Some(strides) => strides,
+            None => compute_global_strides()?,
+        };
+
+        for (shard_index, slices, bytes) in shards {
             let shard_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
             let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
-            let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes()?;
             merge_dense_shard_bytes_recursive(
                 bytes.as_slice(),
                 slices.as_slice(),
@@ -614,37 +635,6 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
         })?;
     }
     Ok(strides)
-}
-
-/// Returns the byte range that the tile covering `slices` of an array of shape `global_shape` and element type
-/// `element_type` occupies in the dense row-major representation of the array, or [`None`] when that range is not
-/// contiguous or the element type is not byte-addressable. A tile is contiguous when it spans one index along every
-/// dimension before some dimension and the whole extent along every dimension after it.
-fn contiguous_tile_byte_range(
-    slices: &[Range<usize>],
-    global_shape: &[usize],
-    element_type: DataType,
-) -> Result<Option<Range<usize>>, Error> {
-    let element_size = element_type.to_pjrt().element_size_in_bytes()?;
-    let tile_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-    let tile_element_count = tile_shape.iter().product::<usize>();
-    if ArrayType::new(element_type, StaticShape::new(tile_shape).into()).size_in_bytes()?
-        != tile_element_count * element_size
-    {
-        return Ok(None);
-    }
-    let first_partial = slices.iter().position(|slice| slice.len() != 1).unwrap_or(slices.len());
-    let trailing_dimensions_are_whole = slices
-        .iter()
-        .zip(global_shape)
-        .skip(first_partial + 1)
-        .all(|(slice, extent)| slice.start == 0 && slice.end == *extent);
-    if !trailing_dimensions_are_whole {
-        return Ok(None);
-    }
-    let strides = row_major_element_strides(global_shape, element_type)?;
-    let start = slices.iter().zip(&strides).map(|(slice, stride)| slice.start * stride).sum::<usize>() * element_size;
-    Ok(Some(start..start + tile_element_count * element_size))
 }
 
 /// Combines the host copies of the shards of an array whose sharding has unreduced axes into one copy per tile, which
@@ -813,7 +803,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        ProgramError, Shape, Sharding, ShardingDimension, TiledLayout,
+        ProgramError, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout,
     };
     use ryft_pjrt::{BufferSpecification, BufferType, Error as PjrtError, ExecutionFence};
 
@@ -1423,17 +1413,6 @@ mod tests {
         );
         assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
         assert_eq!(error.to_string(), message);
-    }
-
-    #[test]
-    fn test_contiguous_tile_byte_range() {
-        // Whole rows of a `[4, 2]` array and a partial row followed by whole trailing dimensions are contiguous.
-        assert_eq!(contiguous_tile_byte_range(&[1..3, 0..2], &[4, 2], DataType::F32).unwrap(), Some(8..24));
-        assert_eq!(contiguous_tile_byte_range(&[1..2, 2..5, 0..4], &[3, 6, 4], DataType::F32).unwrap(), Some(128..176),);
-        assert_eq!(contiguous_tile_byte_range(&[], &[], DataType::F64).unwrap(), Some(0..8));
-
-        // A column of a `[4, 2]` array spans several byte ranges.
-        assert_eq!(contiguous_tile_byte_range(&[0..4, 0..1], &[4, 2], DataType::F32).unwrap(), None);
     }
 
     #[test]
