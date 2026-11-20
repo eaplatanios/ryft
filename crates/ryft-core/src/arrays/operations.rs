@@ -26,8 +26,8 @@ use crate::operations::{
     ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
     OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
     ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Place, PlaceOperation, PowOperation,
-    Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Place, PlaceOperation, Placed,
+    PowOperation, Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
     ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
     ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
     ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
@@ -204,6 +204,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Compare<Self, T>
     + Select<T>
     + ManipulationOperations<T>
+    + Placed
     + Place<T>
     + ShardingOperations<Self, T>
     + StopGradient<T>
@@ -239,6 +240,7 @@ impl<
         + Compare<V, T>
         + Select<T>
         + ManipulationOperations<T>
+        + Placed
         + Place<T>
         + ShardingOperations<V, T>
         + StopGradient<T>

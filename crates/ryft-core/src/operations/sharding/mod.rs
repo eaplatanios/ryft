@@ -54,8 +54,9 @@
 //! [`ConstrainShardingOperation::lowered_sharding`] for more information), so that the emitted constraint never
 //! contradicts the type the program was checked against.
 //!
-//! The [`Reshard`] and [`ConstrainSharding`] capabilities apply resharding and sharding constraints to every leaf
-//! of a structured value through primitive value dispatch, preserving its structure and static fields.
+//! [`Reshard`], [`ConstrainSharding`], and [`Place`] apply to individual values and to the leaves of structured
+//! values, preserving their structure and static fields. [`ShardingOperations`] groups the two capabilities that
+//! take logical shardings. [`Place`] takes concrete placements and infers an omitted source for each leaf.
 //!
 //! # Example
 //!
@@ -119,7 +120,7 @@ pub use axis_types::{AxisTypesError, auto_axes, explicit_axes};
 pub use constrain_sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
 };
-pub use place::{PLACE_OPERATION_NAME, Place, PlaceOperation, Placed};
+pub use place::{PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed};
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
     LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue, SHARD_MAP_OPERATION_NAME, ShardMap,
