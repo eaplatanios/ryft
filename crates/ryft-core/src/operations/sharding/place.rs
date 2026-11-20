@@ -632,26 +632,21 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Reports the [`Placement`] that a value concretely lives on. Devices and placement over [`MeshAxisType::Auto`] mesh
 /// axes are runtime state that types do not record, so only the values that hold device buffers have a placement
 /// (e.g., the arrays of a backend). Staged values have none, because where they live is decided when their program is
 /// compiled and executed, and neither do reference [`Array`]s, which are host values. A value that wraps another value
-/// (e.g., a [`PartialTracer`] or a [`DifferentiationTracer`]) reports the placement of the value that it wraps. A
-/// batched value (i.e., an [`ArrayBatch`], an [`ArrayIrBatch`], or a [`BatchingTracer`] whose batch reports a
+/// (e.g., a [`PartialTracer`] or a [`DifferentiationTracer`]) reports the placement of the value that it wraps.
+/// A batched value (i.e., an [`ArrayBatch`], an [`ArrayIrBatch`], or a [`BatchingTracer`] whose batch reports a
 /// placement) reports the placement of the batch items that a batched function observes. That is the placement of its
 /// packed value with the batch dimension removed from the sharding, because the placement of that dimension describes
 /// how the batch is distributed rather than how each batch item is placed, and without a layout, because a layout of
-/// the packed value does not describe a batch item. The placement of the removed dimension is recorded as the
-/// innermost batch sharding of the reported placement instead (refer to [`Placement::batch_shardings`]), because a
-/// batch item does not live on the whole mesh when its batch is split, and the batching rule of [`PlaceOperation`] puts
-/// it back. A replicated value is its own batch item, so it reports the placement of its packed value with a
-/// replicated batch recorded. Every batching level thus records exactly one batch sharding, so that nested batching
-/// levels each take their own off.
-///
-/// When a source is omitted, [`Place`] uses this trait on each leaf to record its concrete
-/// placement. This is how JAX's `device_put` infers sources from concrete arrays.
+/// the packed value does not describe a batch item. The placement of the removed dimension is recorded as the innermost
+/// batch sharding of the reported placement instead (refer to [`Placement::batch_shardings`]), because a batch item
+/// does not live on the whole mesh when its batch is split, and the batching rule of [`PlaceOperation`] puts it back.
+/// A replicated value is its own batch item, so it reports the placement of its packed value with a replicated batch
+/// recorded. Every batching level thus records exactly one batch sharding, so that nested batching levels each take
+/// their own off. When a source is omitted, [`Place`] uses this trait on each leaf to record its concrete placement.
 pub trait Placed {
     /// Returns the [`Placement`] that this value concretely lives on, or [`None`] if it has none.
     fn placement(&self) -> Option<Placement>;
@@ -722,8 +717,8 @@ impl<V: Value<Type = ArrayIrType> + Placed> Placed for ArrayIrBatch<V> {
 impl<C: Context, P: BatchingPolicy<C, Batch: Placed>> Placed for BatchingTracer<C, P> {
     #[inline]
     fn placement(&self) -> Option<Placement> {
-        // The policy-selected batch owns the batch dimension of the packed value, so it also owns how the placement of
-        // a batch item follows from the placement of that packed value.
+        // The policy-selected batch owns the batch dimension of the packed value, so it also owns how the placement
+        // of a batch item follows from the placement of that packed value.
         self.batch().placement()
     }
 }
@@ -735,6 +730,8 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
         self.primal().placement()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Executes one [`PlaceOperation`] for a leaf through its [`Value::Dispatch`] policy. A domain-dispatched leaf binds
 /// the operation in its own context. Direct backends can implement this trait on [`ValueDirectDispatch`] for their
