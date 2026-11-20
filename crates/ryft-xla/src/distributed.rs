@@ -1728,7 +1728,11 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 .iter()
                 .map(|device| Device::from_pjrt(device).unwrap())
                 .collect::<Vec<_>>();
-            let session = Session::builder().client(client).build().unwrap();
+            let session = Session::builder()
+                .client(client)
+                .compilation_options(test_compilation_options(client, None))
+                .build()
+                .unwrap();
             let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
             let mesh = DeviceMesh::new(manual_mesh.clone(), devices).unwrap();
             let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();

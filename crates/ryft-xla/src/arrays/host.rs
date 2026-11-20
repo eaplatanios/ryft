@@ -565,11 +565,26 @@ impl Array {
         let mut global_bytes = vec![0u8; total_byte_count];
         let mut written_intervals = Vec::new();
         for (shard_index, slices, bytes) in shards {
-            merge_dense_shard_bytes(
+            // A scalar shard occupies one byte range starting at zero.
+            if slices.is_empty() {
+                merge_dense_byte_segment(bytes.as_slice(), 0, shard_index, &mut global_bytes, &mut written_intervals)?;
+                continue;
+            }
+
+            // The strides map each packed shard row to its position in the global row-major buffer.
+            let global_strides = row_major_element_strides(global_shape.as_slice(), element_type)?;
+            let shard_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
+            let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
+            let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes()?;
+            merge_dense_shard_bytes_recursive(
                 bytes.as_slice(),
-                global_shape.as_slice(),
                 slices.as_slice(),
-                element_type,
+                global_strides.as_slice(),
+                shard_strides.as_slice(),
+                0,
+                0,
+                0,
+                element_size_in_bytes,
                 shard_index,
                 &mut global_bytes,
                 &mut written_intervals,
@@ -680,44 +695,10 @@ fn combine_unreduced_values(
         .collect())
 }
 
-/// Merges one shard's dense row-major host bytes into `global_bytes`, which holds the dense row-major bytes of an array
-/// of shape `global_shape`. `written_intervals` holds the sorted, disjoint byte ranges of `global_bytes` that earlier
-/// shards wrote, which [`merge_dense_byte_segment`] uses to detect inconsistent overlapping data.
-fn merge_dense_shard_bytes(
-    shard_bytes: &[u8],
-    global_shape: &[usize],
-    shard_slices: &[Range<usize>],
-    element_type: DataType,
-    shard_index: ShardIndex,
-    global_bytes: &mut [u8],
-    written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), Error> {
-    if shard_slices.is_empty() {
-        return merge_dense_byte_segment(shard_bytes, 0, shard_index, global_bytes, written_intervals);
-    }
-
-    let global_strides = row_major_element_strides(global_shape, element_type)?;
-    let shard_shape = shard_slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-    let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
-    let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes()?;
-    merge_dense_shard_bytes_recursive(
-        shard_bytes,
-        shard_slices,
-        global_strides.as_slice(),
-        shard_strides.as_slice(),
-        0,
-        0,
-        0,
-        element_size_in_bytes,
-        shard_index,
-        global_bytes,
-        written_intervals,
-    )
-}
-
 /// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
-/// element offsets `base_global_element_offset` and `base_shard_element_offset` (refer to
-/// [`merge_dense_shard_bytes`]).
+/// element offsets `base_global_element_offset` and `base_shard_element_offset`. The strides are row-major element
+/// strides. [`merge_dense_byte_segment`] uses the sorted, disjoint byte ranges in `written_intervals` to detect
+/// inconsistent overlapping data.
 #[allow(clippy::too_many_arguments)]
 fn merge_dense_shard_bytes_recursive(
     shard_bytes: &[u8],
@@ -1493,15 +1474,19 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_dense_shard_bytes() {
+    fn test_merge_dense_shard_bytes_recursive() {
         // The second column of a `[2, 2]` array occupies two separate byte ranges of its dense representation.
         let mut global_bytes = vec![0u8; 16];
         let mut written_intervals = Vec::new();
-        merge_dense_shard_bytes(
+        merge_dense_shard_bytes_recursive(
             values_to_bytes(&[1f32, 2.]).as_slice(),
-            &[2, 2],
             &[0..2, 1..2],
-            DataType::F32,
+            &[2, 1],
+            &[1, 1],
+            0,
+            0,
+            0,
+            size_of::<f32>(),
             0,
             &mut global_bytes,
             &mut written_intervals,
@@ -1509,14 +1494,6 @@ mod tests {
         .unwrap();
         assert_eq!(values_from_bytes::<f32>(global_bytes.as_slice()), vec![0., 1., 0., 2.]);
         assert_eq!(written_intervals, vec![4..8, 12..16]);
-
-        // A rank-0 shard covers the whole array.
-        let mut global_bytes = vec![0u8; 4];
-        let mut written_intervals = Vec::new();
-        merge_dense_shard_bytes(&[1, 2, 3, 4], &[], &[], DataType::F32, 0, &mut global_bytes, &mut written_intervals)
-            .unwrap();
-        assert_eq!(global_bytes, vec![1, 2, 3, 4]);
-        assert_eq!(written_intervals, vec![0..4]);
     }
 
     #[test]

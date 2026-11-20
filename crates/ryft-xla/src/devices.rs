@@ -76,7 +76,7 @@ impl MemoryExtension for Memory {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::tests::execution_client;
+    use crate::tests::{cpu_client, execution_client};
 
     use super::*;
 
@@ -87,6 +87,15 @@ mod tests {
         let expected = Device::new(devices[0].id().unwrap(), devices[0].process_index().unwrap());
         assert_eq!(Device::from_pjrt(&devices[0]), Ok(expected));
         assert_eq!(Device::from_pjrt(devices[0].clone()), Ok(expected));
+    }
+
+    #[test]
+    fn test_pjrt_device_memory() {
+        let devices = cpu_client(1).addressable_devices().unwrap();
+        let device = &devices[0];
+        assert_eq!(device.memory(Memory::Device).unwrap(), device.default_memory().unwrap());
+        assert_eq!(device.memory(Memory::Host { pinned: true }).unwrap().kind().unwrap(), "pinned_host");
+        assert_eq!(device.memory(Memory::Host { pinned: false }).unwrap().kind().unwrap(), "unpinned_host");
     }
 
     #[test]

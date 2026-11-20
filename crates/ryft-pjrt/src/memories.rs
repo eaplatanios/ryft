@@ -96,6 +96,33 @@ impl Memory<'_> {
                 .collect::<Result<Vec<_>, _>>()
         })
     }
+
+    /// Checks whether this memory and `other` compare equal under [`PartialEq`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a mismatch or when a lookup required to compare the memories fails. If the kind-name
+    /// fallback read this memory's name successfully, the result carries it for use in a diagnostic.
+    pub fn compare(&self, other: &Self) -> Result<(), Option<Cow<'_, str>>> {
+        if !matches!((self.id(), other.id()), (Ok(self_id), Ok(other_id)) if self_id == other_id) {
+            return Err(None);
+        }
+
+        // Compare kind names when either plugin does not expose kind IDs.
+        match (self.kind_id(), other.kind_id()) {
+            (Ok(self_kind_id), Ok(other_kind_id)) if self_kind_id == other_kind_id => Ok(()),
+            (Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }), Ok(_))
+            | (Ok(_), Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }))
+            | (
+                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }),
+                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }),
+            ) => match (self.kind(), other.kind()) {
+                (Ok(self_kind), Ok(other_kind)) if self_kind == other_kind => Ok(()),
+                (self_kind, _) => Err(self_kind.ok()),
+            },
+            _ => Err(None),
+        }
+    }
 }
 
 impl Display for Memory<'_> {
@@ -129,30 +156,9 @@ impl Debug for Memory<'_> {
 }
 
 impl PartialEq for Memory<'_> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        let self_id = self.id();
-        let other_id = other.id();
-        if self_id.is_err() || other_id.is_err() || self_id != other_id {
-            return false;
-        }
-
-        // Some PJRT plugins do not support memory kind IDs so if it is unimplemented we simply ignore it.
-        let self_kind_id = self.kind_id();
-        let other_kind_id = other.kind_id();
-        match (&self_kind_id, &other_kind_id) {
-            (Ok(_), Ok(_)) => self_kind_id == other_kind_id,
-            (Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }), Ok(_))
-            | (Ok(_), Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }))
-            | (
-                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }),
-                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }),
-            ) => {
-                let self_kind = self.kind();
-                let other_kind = other.kind();
-                self_kind.is_ok() && other_kind.is_ok() && self_kind == other_kind
-            }
-            _ => false,
-        }
+        self.compare(other).is_ok()
     }
 }
 
@@ -356,8 +362,15 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::ptr::{from_ref, null_mut};
+
+    use crate::errors::ffi::PJRT_Error;
+    use crate::ffi::PJRT_Api;
     use crate::tests::test_cpu_client;
-    use crate::{Error, Memory};
+    use crate::{Api, Error, Memory};
+
+    use super::ffi::{PJRT_Memory_Id_Args, PJRT_Memory_Kind_Args};
 
     #[test]
     fn test_memory() {
@@ -405,5 +418,65 @@ mod tests {
             Err(Error::InvalidArgument { message, .. })
                 if message == "the provided PJRT memory handle is a null pointer",
         ));
+    }
+
+    #[test]
+    fn test_memory_compare() {
+        /// Memory handle in a fixture with no kind IDs.
+        struct TestMemory {
+            /// Name returned by the kind callback.
+            kind: &'static str,
+
+            /// Number of kind lookups on this handle.
+            kind_lookups: Cell<usize>,
+        }
+
+        /// Gives the two fixture memories the same ID so comparison proceeds to their kinds.
+        unsafe extern "C" fn memory_id(args: *mut PJRT_Memory_Id_Args) -> *mut PJRT_Error {
+            // SAFETY: the PJRT invocation macro passes a live, writable argument struct to this callback.
+            unsafe { (*args).id = 0 };
+            null_mut()
+        }
+
+        /// Returns the name of the memory and counts the lookup.
+        unsafe extern "C" fn memory_kind(args: *mut PJRT_Memory_Kind_Args) -> *mut PJRT_Error {
+            // SAFETY: the macro provides the argument struct, and its memory handle points to a live fixture value.
+            let args = unsafe { &mut *args };
+            let memory = unsafe { &*args.memory.cast::<TestMemory>() };
+            memory.kind_lookups.set(memory.kind_lookups.get() + 1);
+            args.kind = memory.kind.as_ptr().cast();
+            args.kind_size = memory.kind.len();
+            null_mut()
+        }
+
+        // SAFETY: the table contains only integers, raw pointers, and optional function pointers. An empty slot
+        // makes the corresponding API function unavailable, including the kind ID lookup.
+        let mut table: PJRT_Api = unsafe { std::mem::zeroed() };
+        table.struct_size = size_of::<PJRT_Api>();
+        table.PJRT_Memory_Id = Some(memory_id);
+        table.PJRT_Memory_Kind = Some(memory_kind);
+        let device = TestMemory { kind: "device", kind_lookups: Cell::new(0) };
+        let host = TestMemory { kind: "pinned_host", kind_lookups: Cell::new(0) };
+
+        // SAFETY: the table and fixture values live through every memory operation below.
+        let api = unsafe { Api::from_c_api(&table) }.unwrap();
+        let device_memory = unsafe { Memory::from_c_api(from_ref(&device).cast_mut().cast(), api) }.unwrap();
+        let host_memory = unsafe { Memory::from_c_api(from_ref(&host).cast_mut().cast(), api) }.unwrap();
+
+        // The kind name used for comparison also supplies the mismatch diagnostic.
+        assert_eq!(device_memory.compare(&host_memory).unwrap_err().as_deref(), Some("device"));
+        assert_eq!(device.kind_lookups.replace(0), 1);
+        assert_eq!(host.kind_lookups.get(), 1);
+
+        // A matching kind name still counts as equal when kind IDs are unavailable.
+        assert_eq!(device_memory.compare(&device_memory), Ok(()));
+        assert_eq!(device.kind_lookups.get(), 2);
+        assert_ne!(device_memory, host_memory);
+        assert_eq!(device_memory, device_memory);
+
+        // A mismatch on memory IDs leaves the kind name for the caller to look up.
+        let client = test_cpu_client();
+        let memories = client.addressable_memories().unwrap();
+        assert_eq!(memories[0].compare(&memories[3]), Err(None));
     }
 }

@@ -480,7 +480,11 @@ pub(super) fn validate_addressable_buffer(
     let buffer_memory = buffer.memory()?;
     let expected_memory = r#type.memory();
     let mismatched_kind = match expected_memory {
-        Memory::Device => buffer_memory.kind_if_different(&buffer_device.default_memory()?)?,
+        Memory::Device => match buffer_memory.compare(&buffer_device.default_memory()?) {
+            Ok(()) => None,
+            Err(Some(kind)) => Some(kind),
+            Err(None) => Some(buffer_memory.kind()?),
+        },
         Memory::Host { .. } => {
             // Host placement accepts any memory space of the requested kind. `device.memory(...)`
             // selects one addressable space for allocation.
@@ -566,6 +570,7 @@ mod tests {
 
     use crate::Session;
     use crate::arrays::Array;
+    use crate::devices::PjrtDeviceExtension;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{
         cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, replicated_array, values_from_bytes,
@@ -1000,13 +1005,25 @@ mod tests {
         let device = Device::from_pjrt(&pjrt_device).unwrap();
         let device_id = device.id();
         let r#type = ArrayType::scalar(DataType::I32);
-        let buffer = client.buffer(&7i32.to_ne_bytes(), BufferType::I32, [], None, pjrt_device, None).unwrap();
+        let bytes = 7i32.to_ne_bytes();
+        let buffer = client.buffer(bytes.as_slice(), BufferType::I32, [], None, pjrt_device.clone(), None).unwrap();
         let shard_index_by_device = HashMap::from([(device_id, 0)]);
         let descriptors = [ShardDescriptor::new(0, device, Vec::new())];
         assert_eq!(
             validate_addressable_buffer(client, &r#type, &descriptors, &shard_index_by_device, &buffer, true).unwrap(),
             device_id,
         );
+
+        // Device placement requires the default memory. A host buffer reports its actual kind on mismatch.
+        let pinned_memory = pjrt_device.memory(Memory::Host { pinned: true }).unwrap();
+        let pinned_buffer = client.buffer(bytes.as_slice(), BufferType::I32, [], None, pinned_memory, None).unwrap();
+        assert!(matches!(
+            validate_addressable_buffer(client, &r#type, &descriptors, &shard_index_by_device, &pinned_buffer, true),
+            Err(Error::Array(error)) if matches!(error.as_ref(),
+                ArrayError::BufferMemoryMismatch { device_id: actual_device_id, expected: Memory::Device, actual }
+                    if *actual_device_id == device_id && actual == "pinned_host",
+            ),
+        ));
 
         // A matching device ID still requires the process index declared by the mesh.
         let process_index = device.process_index();
