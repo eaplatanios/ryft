@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ryft_pjrt::{Buffer, Error as PjrtError, Event, ExecutionFence};
@@ -9,10 +10,10 @@ use crate::{Error, ExecutionError};
 /// Tracks submissions from the moment they are registered until they complete. An owner registers each submission
 /// before its first native enqueue, so a wait over a snapshot of the registered identities also covers submissions that
 /// are still being prepared. Successful submissions are retired as soon as they complete, while failures are kept in
-/// registration order until the owner removes them. A [`Session`](crate::Session) owns one tracker for the work of all
-/// of its handles and reports each failure once. Each [`EffectScope`](crate::sessions::effects::EffectScope) owns
-/// another one for its executions with effects and keeps their failures until they are acknowledged. `T` is a tag
-/// that the owner stores with each submission, and `E` is the failure that a submission may record.
+/// registration order until the owner removes them. A [`SessionWorkTracker`] uses several trackers for submissions
+/// from different threads. Each [`EffectScope`](crate::sessions::effects::EffectScope) owns one tracker for its
+/// executions with effects and keeps their failures until they are acknowledged. `T` is the tag stored with each
+/// submission, and `E` is the failure that a submission may record.
 pub(super) struct WorkTracker<T, E> {
     /// Registration order, pending submissions, and failures that the owner has yet to remove.
     state: Mutex<WorkTrackerState<T, E>>,
@@ -29,7 +30,7 @@ impl<T, E> WorkTracker<T, E> {
         let mut state = self.lock();
         let identity = state.next_identity;
         state.next_identity += 1;
-        state.pending.insert(identity, PendingWork { tag, remaining: 1, error: None });
+        state.insert_pending(identity, tag);
         identity
     }
 
@@ -88,41 +89,6 @@ impl<T, E> WorkTracker<T, E> {
     }
 }
 
-impl WorkTracker<(), Error> {
-    /// Registers a submission before its first native enqueue.
-    pub(super) fn reserve(self: &Arc<Self>) -> WorkReservation {
-        WorkReservation {
-            work: Arc::clone(self),
-            identity: Some(self.register(())),
-            fence: None,
-            events: Vec::new(),
-            error: None,
-        }
-    }
-
-    /// Waits for every submission already registered and reports its failures in registration order.
-    pub(super) fn synchronize(&self) -> Result<(), Error> {
-        self.wait_for_snapshot(self.snapshot())
-    }
-
-    /// Waits for work registered before `end` and removes its failures from the session report.
-    fn wait_for_snapshot(&self, end: u64) -> Result<(), Error> {
-        let mut state = self.wait(end);
-        let later_failures = state.failures.split_off(&end);
-        let failures = std::mem::replace(&mut state.failures, later_failures);
-
-        // Convert errors after releasing the tracker mutex.
-        drop(state);
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            let failures = failures.into_iter().map(|(identity, ((), error))| (identity, error)).collect();
-            Err(ExecutionError::SynchronizationFailures { failures }.into())
-        }
-    }
-}
-
 impl<T, E> Default for WorkTracker<T, E> {
     fn default() -> Self {
         Self { state: Mutex::new(WorkTrackerState::default()), completed: Condvar::new() }
@@ -131,7 +97,7 @@ impl<T, E> Default for WorkTracker<T, E> {
 
 /// Identities and results of the submissions of a [`WorkTracker`].
 pub(super) struct WorkTrackerState<T, E> {
-    /// Identity to use for the next registration.
+    /// Identity to use for the next registration in a standalone tracker.
     pub(super) next_identity: u64,
 
     /// Submissions that still have work to publish or finish.
@@ -141,16 +107,130 @@ pub(super) struct WorkTrackerState<T, E> {
     pub(super) failures: BTreeMap<u64, (T, E)>,
 }
 
+impl<T, E> WorkTrackerState<T, E> {
+    /// Adds the pending submission for an identity allocated while this state is locked.
+    fn insert_pending(&mut self, identity: u64, tag: T) {
+        self.pending.insert(identity, PendingWork { tag, remaining: 1, error: None });
+    }
+}
+
 impl<T, E> Default for WorkTrackerState<T, E> {
     fn default() -> Self {
         Self { next_identity: 0, pending: BTreeMap::new(), failures: BTreeMap::new() }
     }
 }
 
+/// Tracks submissions across all handles of one [`Session`](crate::Session). Partitions submissions by thread across
+/// several mutexes while sharing a registration sequence and reporting each failure once.
+#[derive(Default)]
+pub(super) struct SessionWorkTracker {
+    /// Exclusive upper bound of the identities registered across all shards.
+    next_identity: AtomicU64,
+
+    /// Pending work and failures partitioned by the submitting thread.
+    shards: [Arc<WorkTracker<(), Error>>; Self::SHARD_COUNT],
+
+    /// Serializes removal of failures across shards after the caller's snapshot has completed.
+    reporting: Mutex<()>,
+}
+
+impl SessionWorkTracker {
+    /// Number of independent mutexes for session submissions.
+    const SHARD_COUNT: usize = 8;
+
+    /// Registers a submission before its first native enqueue.
+    pub(super) fn reserve(&self) -> WorkReservation {
+        SESSION_WORK_SHARD.with(|&shard| self.reserve_in_shard(shard))
+    }
+
+    /// Returns the exclusive upper bound of a snapshot of all registered submissions.
+    pub(super) fn snapshot(&self) -> u64 {
+        self.next_identity.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the submissions in one snapshot and reports their failures in registration order.
+    pub(super) fn synchronize(&self) -> Result<(), Error> {
+        self.wait_for_snapshot(self.snapshot())
+    }
+
+    /// Returns whether any shard still has outstanding submissions.
+    #[cfg(test)]
+    pub(super) fn has_pending_work(&self) -> bool {
+        self.shards.iter().any(|shard| !shard.lock().pending.is_empty())
+    }
+
+    /// Registers a submission in the given shard.
+    fn reserve_in_shard(&self, shard: usize) -> WorkReservation {
+        let work = &self.shards[shard];
+        let mut state = work.lock();
+
+        // Take the identity with the shard locked so a snapshot that includes it also observes the insertion.
+        let identity = self.next_identity.fetch_add(1, Ordering::SeqCst);
+        state.insert_pending(identity, ());
+
+        // Keep reservation construction outside the shared lock.
+        drop(state);
+
+        WorkReservation {
+            work: Arc::clone(work),
+            identity: Some(identity),
+            fence: None,
+            events: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// Waits for work registered before `end` and removes its failures from the session report.
+    fn wait_for_snapshot(&self, end: u64) -> Result<(), Error> {
+        let mut has_failures = false;
+
+        for shard in &self.shards {
+            let state = shard.wait(end);
+            has_failures |= state.failures.first_key_value().is_some_and(|(&identity, _)| identity < end);
+        }
+
+        if !has_failures {
+            return Ok(());
+        }
+
+        // Every shard has retired the snapshot. Claim its errors across the session as one operation.
+        let reporting = self.reporting.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut failures = Vec::new();
+        for shard in &self.shards {
+            let mut state = shard.lock();
+            let later_failures = state.failures.split_off(&end);
+            let earlier_failures = std::mem::replace(&mut state.failures, later_failures);
+
+            // Allow this shard to accept more work while the report collects its failures.
+            drop(state);
+
+            failures.extend(earlier_failures.into_iter().map(|(identity, ((), error))| (identity, error)));
+        }
+
+        // The claimed errors are independent of subsequent reports.
+        drop(reporting);
+
+        if failures.is_empty() {
+            return Ok(());
+        }
+
+        failures.sort_unstable_by_key(|(identity, _)| *identity);
+        Err(ExecutionError::SynchronizationFailures { failures }.into())
+    }
+}
+
+thread_local! {
+    /// Stable shard choice for each submitting thread. Completions use the original reservation's shard.
+    static SESSION_WORK_SHARD: usize = {
+        static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+        NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SessionWorkTracker::SHARD_COUNT
+    };
+}
+
 /// Completion for a registered execution or batch of transfers. Dropping it publishes whatever work was
 /// enqueued, including on early returns. A reservation without any attached work completes immediately.
 pub(crate) struct WorkReservation {
-    /// Tracker shared by the submitting handle and every other handle of its session.
+    /// Shard that owns this reservation and receives its completion notifications.
     work: Arc<WorkTracker<(), Error>>,
 
     /// Registration ID. Taking it prevents publication from running twice.
@@ -403,7 +483,7 @@ mod tests {
     use crate::tests::execution_client;
     use crate::{Error, ExecutionError};
 
-    use super::{HostCopy, HostCopyCompletion, HostCopyState, PendingHostCopy, WorkTracker};
+    use super::{HostCopy, HostCopyCompletion, HostCopyState, PendingHostCopy, SessionWorkTracker, WorkTracker};
 
     #[test]
     fn test_work_tracker_register() {
@@ -506,25 +586,26 @@ mod tests {
     }
 
     #[test]
-    fn test_work_tracker_reserve() {
-        let work = Arc::new(WorkTracker::default());
+    fn test_session_work_tracker_reserve() {
+        let work = SessionWorkTracker::default();
         let reservation = work.reserve();
-        assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(1));
+        let shard = Arc::clone(&reservation.work);
+        assert_eq!(shard.lock().pending.get(&0).map(|pending| pending.remaining), Some(1));
 
         // Canceling before enqueue retires the registration without reporting a failure.
         drop(reservation);
-        let state = work.lock();
+        let state = shard.lock();
         assert!(state.pending.is_empty());
         assert!(state.failures.is_empty());
     }
 
     #[test]
-    fn test_work_tracker_synchronize() {
-        let work = Arc::new(WorkTracker::default());
-        let mut first = work.reserve();
-        let mut second = work.reserve();
+    fn test_session_work_tracker_synchronize() {
+        let work = SessionWorkTracker::default();
+        let mut first = work.reserve_in_shard(1);
+        let mut second = work.reserve_in_shard(0);
         let snapshot = work.snapshot();
-        let mut later = work.reserve();
+        let mut later = work.reserve_in_shard(0);
 
         // Failures arrive in reverse registration order, and the latest failure belongs to a later snapshot.
         later.track_error(PjrtError::aborted("later failed").into());
@@ -555,14 +636,51 @@ mod tests {
     }
 
     #[test]
+    fn test_session_work_tracker_synchronize_concurrent_snapshots() {
+        let work = SessionWorkTracker::default();
+        let mut first = work.reserve_in_shard(1);
+        let mut second = work.reserve_in_shard(0);
+        let snapshot = work.snapshot();
+        let later = work.reserve_in_shard(0);
+
+        thread::scope(|threads| {
+            let (sender, receiver) = channel();
+            for _ in 0..2 {
+                let sender = sender.clone();
+                let work = &work;
+                threads.spawn(move || sender.send(work.wait_for_snapshot(snapshot)).unwrap());
+            }
+            first.track_error(PjrtError::aborted("first failed").into());
+            second.track_error(PjrtError::aborted("second failed").into());
+            drop(second);
+            drop(first);
+
+            // Both callers must return while the later reservation is pending. One caller claims both failures.
+            let first_result = receiver.recv_timeout(Duration::from_secs(5));
+            let second_result = receiver.recv_timeout(Duration::from_secs(5));
+            drop(later);
+            let (Ok(()), Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))) =
+                (match (first_result.unwrap(), second_result.unwrap()) {
+                    (Err(error), Ok(())) => (Ok(()), Err(error)),
+                    results => results,
+                })
+            else {
+                panic!("one caller should claim both failures");
+            };
+            assert_eq!(failures.into_iter().map(|(identity, _)| identity).collect::<Vec<_>>(), vec![0, 1]);
+        });
+        work.synchronize().unwrap();
+    }
+
+    #[test]
     fn test_work_reservation_track_host_copy() {
         let client = execution_client();
-        let work = Arc::new(WorkTracker::default());
+        let work = SessionWorkTracker::default();
         let (event, promise) = client.event(vec![1, 2, 3]).unwrap();
         let abandoned_payload = Arc::new(());
         let retained_payload = Arc::downgrade(&abandoned_payload);
         let (abandoned_event, abandoned_promise) = client.event(abandoned_payload).unwrap();
-        let mut reservation = work.reserve();
+        let mut reservation = work.reserve_in_shard(0);
         let copy = reservation.track_host_copy(event);
         let abandoned = reservation.track_host_copy(abandoned_event);
         drop(reservation);
@@ -570,7 +688,7 @@ mod tests {
 
         // The callback retains the abandoned copy's event and payload while the copy is pending.
         assert_eq!(retained_payload.strong_count(), 1);
-        assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(2));
+        assert_eq!(work.shards[0].lock().pending.get(&0).map(|pending| pending.remaining), Some(2));
 
         // The held copy can complete without its consumer, and its payload stays available after synchronization.
         promise.set(None).unwrap();
@@ -586,14 +704,14 @@ mod tests {
 
     #[test]
     fn test_work_reservation_track_host_copy_already_ready() {
-        let work = Arc::new(WorkTracker::default());
+        let work = SessionWorkTracker::default();
         let (event, promise) = execution_client().event(()).unwrap();
         promise.set(Some(PjrtError::aborted("copy failed before tracking"))).unwrap();
-        let mut reservation = work.reserve();
+        let mut reservation = work.reserve_in_shard(0);
         let copy = reservation.track_host_copy(event);
 
         // A ready readback reports its native error without adding a pending dependency.
-        assert_eq!(work.lock().pending.get(&0).map(|pending| pending.remaining), Some(1));
+        assert_eq!(work.shards[0].lock().pending.get(&0).map(|pending| pending.remaining), Some(1));
         assert!(matches!(
             copy.wait(),
             Err(PjrtError::Aborted { message, .. }) if message == "copy failed before tracking",
@@ -610,11 +728,11 @@ mod tests {
     #[test]
     fn test_work_reservation_finish() {
         let client = execution_client();
-        let work = Arc::new(WorkTracker::default());
+        let work = SessionWorkTracker::default();
         let (first_event, first_promise) = client.event(()).unwrap();
         let (second_event, second_promise) = client.event(()).unwrap();
         let second_fence = ExecutionFence::new(vec![second_event]);
-        let mut reservation = work.reserve();
+        let mut reservation = work.reserve_in_shard(0);
         reservation.track_fence(ExecutionFence::new(vec![first_event]));
         reservation.track_fence(second_fence.clone());
         let fence = reservation.finish().unwrap();
@@ -623,7 +741,7 @@ mod tests {
         second_promise.set(Some(PjrtError::aborted("second fence failed"))).unwrap();
         let error = second_fence.block_until_ready().unwrap_err();
         assert_eq!(fence.is_ready(), Ok(false));
-        assert!(work.lock().pending.contains_key(&0));
+        assert!(work.shards[0].lock().pending.contains_key(&0));
 
         // The returned fence and the session tracker both observe the joined completion.
         first_promise.set(None).unwrap();
@@ -638,14 +756,14 @@ mod tests {
 
     #[test]
     fn test_work_reservation_drop() {
-        let work = Arc::new(WorkTracker::default());
+        let work = SessionWorkTracker::default();
         let (event, promise) = execution_client().event(()).unwrap();
-        let mut reservation = work.reserve();
+        let mut reservation = work.reserve_in_shard(0);
         reservation.track_events([event]);
 
         // Leaving the submission early still tracks the transfer already enqueued.
         drop(reservation);
-        assert!(work.lock().pending.contains_key(&0));
+        assert!(work.shards[0].lock().pending.contains_key(&0));
         promise.set(Some(PjrtError::aborted("copy failed"))).unwrap();
         assert!(matches!(
             work.synchronize(),

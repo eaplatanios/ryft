@@ -30,9 +30,10 @@ use std::hash::{Hash, Hasher};
 use ryft_core::{
     Add, Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, CaptureConstant,
     CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context, DataType, DimensionType,
-    DimensionValue, Div, EagerContext, LiteralIdentity, Mul, Neg, Parameter, ProgramError, ProjectedContext,
-    ProjectedValue, ReferenceId, ReferenceType, Sub, Type as CoreType, TypeError, TypeIdentityRenaming, Typed,
-    Value as CoreValue, ValueDirectDispatch, ValueDomainDispatch, ValueProjection, WhilePredicate,
+    DimensionValue, Div, EagerContext, LiteralIdentity, Mul, Neg, Parameter, Placed, Placement, ProgramError,
+    ProjectedContext, ProjectedValue, ReferenceId, ReferenceType, Sub, Type as CoreType, TypeError,
+    TypeIdentityRenaming, Typed, Value as CoreValue, ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
+    WhilePredicate,
 };
 use ryft_macros::Parameter;
 
@@ -327,6 +328,16 @@ impl Typed for Value {
             Self::Dimension(value) => Type::Dimension(value.r#type().into_owned()),
             Self::Reference(value) => Type::Reference(value.r#type().into_owned()),
         })
+    }
+}
+
+impl Placed for Value {
+    fn placement(&self) -> Option<Placement> {
+        // Only the array members of an XLA value live on devices.
+        match self {
+            Self::Array(value) => value.placement(),
+            Self::Dimension(_) | Self::Reference(_) => None,
+        }
     }
 }
 

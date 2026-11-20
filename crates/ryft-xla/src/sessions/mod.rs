@@ -110,7 +110,7 @@ use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
-use crate::sessions::synchronization::{WorkReservation, WorkTracker};
+use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
     Array, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
     LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
@@ -788,9 +788,10 @@ impl Context for Session {
         // Work that involves no device computation never reaches the compilation cache. Reference operations act on
         // handles on the host, while dimension operations, dimension casts and comparisons, and conversions between
         // dimensions and scalars are decided on the host. Only their array results are uploaded, as replicated scalars
-        // with eager placement. A literal constant is host data already, so it is uploaded as well. Reference operands
-        // of any other operation, and reference state carried by attached regions, are rejected because XLA eager
-        // execution lowers each operation.
+        // with eager placement. A literal constant is host data already, so it is uploaded as well. A placement may
+        // move its input to the devices of another mesh, so it is carried out like `Array::to_placement`, which
+        // compiles a program only when the shards themselves change. Reference operands of any other operation, and
+        // reference state carried by attached regions, are rejected because XLA eager execution lowers each operation.
 
         ensure_effect_dispatch_is_allowed()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
@@ -951,6 +952,39 @@ impl Context for Session {
                 };
 
                 let output = Array::from_host_buffer(self, r#type, None, None, bytes)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                return Ok(vec![Value::Array(output)]);
+            }
+            Operation::Array(ArrayOperation::Place(operation)) => {
+                // A placement can move a value to the devices of another mesh, which no single compiled program can
+                // do, because a program runs on the devices of one mesh. The move is therefore decided on the host and
+                // carried out like `Array::to_placement`, which shares the buffers of whole shards that stay on their
+                // devices, copies whole shards between devices, and compiles a program only when the shards themselves
+                // change. The binding never donates its input, because other handles may share it. The result has the
+                // type that type inference returns, because a memory or layout that the target omits keeps the memory
+                // or layout of the array.
+                check_count!("input", inputs, 1, ProgramError);
+                let array = <Value as ValueProjection<ArrayType>>::into_projected(inputs[0].clone())?;
+                operation.infer_output_types(&[array.r#type().into_owned()], &[])?;
+
+                // The result belongs to this session, so its buffers must belong to the client of this session. An
+                // array of another client is therefore rejected like the inputs of any other operation, even when it
+                // lives on devices with the same IDs, rather than returned as it is or mixed with buffers of this
+                // client.
+                self.validate_input_placement(std::slice::from_ref(&array))?;
+
+                // The source of the operation says where the value was expected to live when the operation was staged,
+                // which transposition needs. It is not compared with the placement of the array, which is known exactly
+                // here and can legitimately differ from it. For example, a gradient seed is created on the mesh of this
+                // session and not on the mesh of the output that it seeds, and a cotangent computed on the target mesh
+                // can be placed along auto mesh axes differently from what the source of the transposed placement says.
+                // Type inference has already checked the sharding that types do track. A placement that must not alias
+                // its input copies whatever buffers the result still shares with any other array (e.g., the input
+                // itself, which the caller still holds, when the placement leaves it where it is),
+                // as `Session::place` does for an `Array` leaf.
+                let output = array
+                    .run_placement_dispatch(self, operation.target(), false)
+                    .and_then(|output| if operation.may_alias() { Ok(output) } else { output.into_unaliased(self) })
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 return Ok(vec![Value::Array(output)]);
             }
@@ -1281,7 +1315,7 @@ struct SessionState {
     runtimes: RuntimeRegistry,
 
     /// Pending work and synchronization failures shared by all handles of the session.
-    work: Arc<WorkTracker<(), Error>>,
+    work: SessionWorkTracker,
 
     /// Counts of the logical arrays created through the session, and descriptions of the live ones if the session
     /// tracks them. Array storage holds its own handle, which lets it update the counts when it is dropped.
@@ -1518,7 +1552,7 @@ impl SessionBuilder {
                 compilation_cache,
                 eager_dispatch_cache: SpecializationCache::new(self.eager_dispatch_cache_capacity),
                 runtimes: RuntimeRegistry::new(client, self.runtime_extensions),
-                work: Arc::new(WorkTracker::default()),
+                work: SessionWorkTracker::default(),
                 array_tracker: Arc::new(ArrayTracker::new(self.live_array_tracking)),
             }),
             mesh: None,
@@ -1628,13 +1662,14 @@ pub(crate) mod tests {
         ConstantOperation, DataType, DenseDifferentiableType, Device, Dimension as CoreDimension,
         DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionError, DimensionFromScalarOperation,
         DimensionSizeOperation, DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation,
-        DomainTracer, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Fill, Layout,
-        MeshAxisType, Mul, MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Placeholder,
-        ProjectedContext, ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceType, ScanOperation, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation,
-        ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, SubOperation, TiledLayout,
-        Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, ZeroOperation, batch, differentiate_at, i4,
-        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        DomainTracer, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Fill, Layout, Memory,
+        MeshAxisType, Mul, MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Place,
+        PlaceDispatch, PlaceOperation, Placeholder, Placement, ProjectedContext, ProjectedValue, Reduce, ReductionKind,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ScanOperation, SelectOperation, Shape,
+        ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension,
+        ShardingError, StaticShape, SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue,
+        WhileOperation, ZeroOperation, batch, differentiate_at, i4, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
@@ -2209,7 +2244,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
-        let (source_mesh, _, _, _) = ArrayPlacement::device(mesh.devices()[0]).resolve(&session, 1).unwrap();
+        let source_mesh = ArrayPlacement::device(mesh.devices()[0]).resolve(&session, 1).unwrap().mesh().clone();
         let scoped = session.with_new_effect_scope().with_device_mesh(source_mesh);
 
         let input = Array::from_host_buffer(
@@ -2234,7 +2269,7 @@ pub(crate) mod tests {
 
         // The original handle can wait for the submissions made through the scoped handle.
         session.synchronize().unwrap();
-        assert!(session.state.work.lock().pending.is_empty());
+        assert!(!session.state.work.has_pending_work());
         assert_eq!(bytes, values_to_bytes(&[-1.0f32, -2.0]));
     }
 
@@ -2638,6 +2673,144 @@ pub(crate) mod tests {
         assert_eq!(read_first_shard::<f32>(client, &context.fill(&r#type, 2.5f32).unwrap()), vec![2.5, 2.5]);
         assert_eq!(read_first_shard::<f32>(client, &context.fill(&r#type, 3.5f32).unwrap()), vec![3.5, 3.5]);
         assert_eq!(session.cached_program_count(), 1);
+    }
+
+    #[test]
+    fn test_session_bind_place() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh, 1);
+        let input = f32_vector(&session, &first_mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let source = Placement::new(first_mesh.clone(), replicated.clone()).unwrap();
+        let output_type = |operation: PlaceOperation| operation.infer_output_types(&[input.r#type().into_owned()], &[]);
+
+        // The array moves to the device of the target mesh, and its type is the one that type inference returns.
+        let target = Placement::new(second_mesh.clone(), replicated.clone()).unwrap();
+        let moved = input.place(&target, None).unwrap();
+        assert_eq!(moved.mesh(), &second_mesh);
+        assert_eq!(moved.sharding(), &replicated);
+        assert_eq!(
+            vec![moved.r#type().into_owned()],
+            output_type(PlaceOperation::new(target.clone(), Some(source.clone()))).unwrap(),
+        );
+        assert_eq!(moved.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        // A target memory is recorded in the type of the result and selects the memory of its buffers.
+        let memory = Memory::Host { pinned: true };
+        let pinned = input.place(&target.clone().with_memory(memory), None).unwrap();
+        assert_eq!(pinned.r#type().memory(), memory);
+        assert_eq!(pinned.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+        assert_eq!(pinned.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        // A target over both devices replicates the array on them.
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        let replicated = input.place(&target, None).unwrap();
+        assert_eq!(replicated.mesh(), &mesh);
+        assert_eq!(read_first_shard::<f32>(client, &replicated), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(replicated.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        // Whole shards moved in all of the placements above, so none of them compiled a program.
+        assert_eq!((session.state.eager_dispatch_cache.len(), session.cached_program_count()), (0, 0));
+
+        // The array is moved from where it actually lives, whatever devices the source names.
+        let other_source = Placement::new(second_mesh.clone(), source.sharding().clone()).unwrap();
+        assert_eq!(input.place(&target, Some(&other_source)).unwrap().mesh(), &mesh);
+        assert_eq!(input.place(&target, Some(&source)).unwrap().mesh(), &mesh);
+
+        // A layout that the target omits is kept, also when the shards themselves change.
+        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharded = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]).with_layout(layout.clone()),
+            mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+        )
+        .unwrap();
+        let target =
+            Placement::new(first_mesh.clone(), Sharding::replicated(first_mesh.logical_mesh().clone(), 1)).unwrap();
+        let gathered = sharded.place(&target, None).unwrap();
+        assert_eq!(gathered.mesh(), &first_mesh);
+        assert_eq!(gathered.layout(), Some(&layout));
+        assert_eq!(
+            vec![gathered.r#type().into_owned()],
+            PlaceOperation::new(target, Some(Placement::new(mesh, sharding).unwrap().with_layout(layout)))
+                .infer_output_types(&[sharded.r#type().into_owned()], &[])
+                .unwrap(),
+        );
+        assert_eq!(gathered.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_session_bind_place_may_alias() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![mesh.devices()[0]]).unwrap();
+        let input = f32_vector(&session, &first_mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let place = |target: &Placement, may_alias: bool| {
+            <Array as CoreValue>::Dispatch::place(&input, target, None, may_alias).unwrap()
+        };
+        let shares_input_buffer = |array: &Array| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| Arc::ptr_eq(shard.buffer().unwrap(), input.shards()[0].buffer().unwrap()))
+                .collect::<Vec<_>>()
+        };
+
+        // A placement that leaves the array where it is returns the array itself unless it must not alias its input,
+        // in which case it returns a copy of its buffers with the same type, placement, and values.
+        let target = Placement::new(first_mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap();
+        assert_eq!(shares_input_buffer(&place(&target, true)), vec![true]);
+        let copied = place(&target, false);
+        assert_eq!(copied.r#type(), input.r#type());
+        assert_eq!(copied.mesh(), &first_mesh);
+        assert_eq!(shares_input_buffer(&copied), vec![false]);
+        assert_eq!(copied.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        // A shard that stays on its device keeps the buffer of the input unless the result must not alias its input.
+        let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        assert_eq!(shares_input_buffer(&place(&target, true)), vec![true, false]);
+        let copied = place(&target, false);
+        assert_eq!(copied.mesh(), &mesh);
+        assert_eq!(shares_input_buffer(&copied), vec![false, false]);
+        assert_eq!(read_first_shard::<f32>(client, &copied), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(copied.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_session_bind_place_rejects_arrays_of_other_clients() {
+        // Both clients have a device with ID 0, so only the identity of the client tells the two arrays apart.
+        let client = cpu_client(1);
+        let other_client = other_cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let other_session = Session::builder().client(other_client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let other_mesh = domain_mesh(other_client, "x", 1);
+        assert_eq!(mesh, other_mesh);
+        let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        let input = f32_vector(&other_session, &other_mesh, &[1.0, 2.0]);
+        assert_eq!(
+            session.bind(PlaceOperation::new(target, None), Vec::new(), &[Value::Array(input)]),
+            Err(ProgramError::InvalidArgument {
+                message: "received incompatible devices for eager XLA execution: input #0 is owned by a different \
+                          PJRT client than this session's client"
+                    .to_owned(),
+            }),
+        );
     }
 
     #[test]
