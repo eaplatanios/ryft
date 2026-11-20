@@ -1,24 +1,31 @@
-//! Operations that control how arrays are distributed over a device mesh. A reshard and a sharding constraint place an
-//! array without changing its elements: both are identity functions on their data and carry a target [`Sharding`], and
-//! they only differ in whether the type system tracks that sharding, which mirrors the split between JAX's
-//! [`reshard`](https://docs.jax.dev/en/latest/jax.sharding.html) and
+//! Operations that control how arrays are distributed over a device mesh. A reshard and a sharding constraint
+//! place an array without changing its elements: both are identity functions on their data and carry a target
+//! [`Sharding`](crate::Sharding), and they only differ in whether the type system tracks that sharding, which
+//! mirrors the split between JAX's [`reshard`](https://docs.jax.dev/en/latest/jax.sharding.html) and
 //! [`with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
 //! A [`shard_map`](fn@shard_map), in contrast, does not redistribute a value but runs a local computation once per
 //! device of a manual SPMD computation over a mesh, which mirrors JAX's
 //! [`shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). This module provides the following:
 //!
 //!   - The [`Reshard`] value capability and the [`ReshardOperation`] it stages, which perform a tracked sharding
-//!     transition over [`Explicit`](MeshAxisType::Explicit) mesh axes. Type inference replaces the output's sharding
-//!     with the requested one, so the transition is visible to every later type check, and transposition reshards the
-//!     cotangent to the dual of the input's sharding so that the input cotangent is distributed like the input.
-//!     Requests that name [`Auto`](MeshAxisType::Auto) axes are rejected, because placement over those axes belongs
-//!     to a backend-specific compiler.
+//!     transition over [`Explicit`](crate::MeshAxisType::Explicit) mesh axes. Type inference replaces the output's
+//!     sharding with the requested one, so the transition is visible to every later type check, and transposition
+//!     reshards the cotangent to the dual of the input's sharding so that the input cotangent is distributed like the
+//!     input. Requests that name [`Auto`](crate::MeshAxisType::Auto) axes are rejected, because placement over those
+//!     axes belongs to a backend-specific compiler.
 //!   - The [`ConstrainSharding`] value capability and the [`ConstrainShardingOperation`] it stages, which record a
-//!     sharding constraint over [`Auto`](MeshAxisType::Auto) mesh axes that the type system does not track. Type
-//!     inference is the identity, so the constraint never becomes type-level state, transposition applies the same
+//!     sharding constraint over [`Auto`](crate::MeshAxisType::Auto) mesh axes that the type system does not track.
+//!     Type inference is the identity, so the constraint never becomes type-level state, transposition applies the same
 //!     constraint to the cotangent, and the constraint is enforced when a backend lowers the program (i.e., the backend
 //!     compiler must place the value as requested over the auto axes, and remains free everywhere the constraint is
 //!     unconstrained). Requests that shard a dimension over a non-auto axis are rejected in favor of a reshard.
+//!   - The [`Place`] value capability and the [`PlaceOperation`] it stages, which move a value to a concrete
+//!     [`Placement`](crate::Placement) (i.e., a sharding over the devices of a [`DeviceMesh`](crate::DeviceMesh),
+//!     optionally with a memory and a layout), possibly on another mesh, mirroring JAX's
+//!     [`device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html). Type inference records the
+//!     target sharding without its [`Auto`](crate::MeshAxisType::Auto) axes, and transposition moves the cotangent back
+//!     to the source placement of the value when it is known. A value reports the placement that it concretely lives on
+//!     through the [`Placed`] trait.
 //!   - The [`ShardMap`] context capability and the global [`shard_map()`](fn@shard_map) function, which trace a local
 //!     body and bind it on input values, and the [`ShardMapOperation`] they stage, which runs its local body once per
 //!     device coordinate along the active manual axes of a [`ShardMapBoundary`]. Both take [`ShardMapOptions`], which
@@ -33,10 +40,10 @@
 //!     [`trace`](crate::trace)). Refer to the [`shard_map`](mod@shard_map) module for its complete
 //!     semantics, including the ownership contract for references that cross its boundary.
 //!   - The global [`auto_axes()`](fn@auto_axes) and [`explicit_axes()`](fn@explicit_axes) functions, which switch
-//!     selected mesh axes to [`Auto`](MeshAxisType::Auto) or [`Explicit`](MeshAxisType::Explicit) for the duration of
-//!     a function, mirroring JAX's `jax.sharding.auto_axes` and `jax.sharding.explicit_axes`. They retype the inputs
-//!     and outputs of the function through reshards and run the function inline, so they add no operation of their
-//!     own. Refer to the [`axis_types`](mod@axis_types) module for their conceptual model.
+//!     selected mesh axes to [`Auto`](crate::MeshAxisType::Auto) or [`Explicit`](crate::MeshAxisType::Explicit) for the
+//!     duration of a function, mirroring JAX's `jax.sharding.auto_axes` and `jax.sharding.explicit_axes`. They retype
+//!     the inputs and outputs of the function through reshards and run the function inline, so they add no operation
+//!     of their own. Refer to the [`axis_types`](mod@axis_types) module for their conceptual model.
 //!
 //! Batching lifts the reshard and the sharding constraint by inserting an entry for the new batch axis into the target
 //! sharding (i.e., a reshard takes the mapped axis's own sharding without the axes that are auto in its target mesh,
@@ -97,14 +104,14 @@
 //! output type still records only `target` as placement over `a` is enforced during lowering rather than being tracked
 //! by the type system. Neither operation changes the array's logical shape or elements.
 
+use crate::arrays::LogicalMesh;
 use crate::operations::Capability;
 use crate::parameters::Parameter;
-
-#[cfg(doc)]
-use crate::arrays::{ArrayIrType, ArrayType, MeshAxisType, Sharding};
+use crate::programs::TypeError;
 
 pub mod axis_types;
 pub mod constrain_sharding;
+pub mod place;
 pub mod reshard;
 pub mod shard_map;
 
@@ -112,6 +119,7 @@ pub use axis_types::{AxisTypesError, auto_axes, explicit_axes};
 pub use constrain_sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
 };
+pub use place::{PLACE_OPERATION_NAME, Place, PlaceOperation, Placed};
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
     LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue, SHARD_MAP_OPERATION_NAME, ShardMap,
@@ -124,15 +132,54 @@ pub use shard_map::{
 /// for a single value; structured receivers use the same bundle with their nested leaf type.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// leaves use [`ArrayType`] and array IR leaves use [`ArrayIrType`], the two universes that implement this bundle (for
-/// a structured receiver, the universe of its leaf `P`). Both members execute in that universe, and generic operation
-/// bundles forward it explicitly rather than discarding their execution-family constraint.
+/// leaves use [`ArrayType`](crate::ArrayType) and array IR leaves use [`ArrayIrType`](crate::ArrayIrType), the two
+/// universes that implement this bundle (for a structured receiver, the universe of its leaf `P`). Both members execute
+/// in that universe, and generic operation bundles forward it explicitly rather than discarding their execution-family
+/// constraint.
 pub trait ShardingOperations<P: Parameter + Capability = Self, T = <P as Capability>::Universe>:
     Reshard<P, T> + ConstrainSharding<P, T>
 {
 }
 
 impl<T, P: Parameter + Capability, S: Reshard<P, T> + ConstrainSharding<P, T>> ShardingOperations<P, T> for S {}
+
+/// Validates that `target_mesh` defines every mesh axis of `input_mesh` that `preserved_axes` names identically (i.e.,
+/// with the same name, size, and type). Operations that redistribute or move a value preserve its manual variation and
+/// reduction state by axis name, while the size and type of a mesh axis are semantic. Each Ryft type carries its own
+/// mesh, so without this check a target could silently redefine such an axis (e.g., turn an explicit unreduced axis
+/// into an auto axis, over which array types record no reduction state). Names that `input_mesh` does not define are
+/// skipped, because sharding validation already rejects them.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the validating operation, used in error messages.
+///   - `input_mesh`: [`LogicalMesh`] over which the input's state is recorded.
+///   - `preserved_axes`: Names of the mesh axes of `input_mesh` that carry the preserved state.
+///   - `target_mesh`: [`LogicalMesh`] that must define each preserved axis identically.
+fn validate_preserved_mesh_axes<'o, I: IntoIterator<Item = &'o String>>(
+    operation_name: &str,
+    input_mesh: &LogicalMesh,
+    preserved_axes: I,
+    target_mesh: &LogicalMesh,
+) -> Result<(), TypeError> {
+    let preserved_axes = preserved_axes
+        .into_iter()
+        .filter_map(|axis_name| input_mesh.axis_index(axis_name).map(|index| &input_mesh.axes()[index]));
+    for input_axis in preserved_axes {
+        let target_axis = target_mesh.axis_index(input_axis.name()).map(|index| &target_mesh.axes()[index]);
+        if target_axis != Some(input_axis) {
+            let target_axis = target_axis.map_or_else(|| "an undefined axis".to_owned(), |axis| format!("`{axis}`"));
+            return Err(TypeError::invalid(format!(
+                "`{}` cannot redefine preserved {} mesh axis `{}` as {}",
+                operation_name,
+                input_axis.r#type(),
+                input_axis,
+                target_axis,
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

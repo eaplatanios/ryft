@@ -1,11 +1,14 @@
 use std::fmt::Display;
 
+use ryft_macros::Parameter;
+
 use crate::arrays::sharding::ShardingError;
 use crate::arrays::sharding::meshes::DeviceMesh;
 use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
 use crate::macros::check_sharding;
+use crate::parameters::Parameter;
 
 /// Resolved placement of an array on concrete devices. A [`Placement`] combines a [`DeviceMesh`], a [`Sharding`] over
 /// that mesh, and optionally the [`Memory`] space and storage [`Layout`] of the array. It is to [`DeviceMesh`] what
@@ -20,7 +23,7 @@ use crate::macros::check_sharding;
 /// created. Transposition uses it to move the cotangent back to those devices, and type inference checks it against
 /// what the type of the value tracks, while backends that execute the operation on a concrete value move the value
 /// from wherever it actually lives without comparing that placement with the source.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Placement {
     /// [`DeviceMesh`] whose devices hold the shards of the array.
     mesh: DeviceMesh,
@@ -86,6 +89,12 @@ impl Placement {
     #[inline]
     pub fn memory(&self) -> Option<Memory> {
         self.memory
+    }
+
+    /// Consumes this placement and returns its mesh, layout, sharding, and memory.
+    #[inline]
+    pub fn into_parts(self) -> (DeviceMesh, Option<Layout>, Sharding, Option<Memory>) {
+        (self.mesh, self.layout, self.sharding, self.memory)
     }
 }
 
@@ -177,6 +186,19 @@ mod tests {
         assert_eq!(placement.layout(), None);
         assert_eq!(placement.memory(), Some(Memory::Host { pinned: true }));
         assert_eq!(placement.to_string(), "{mesh<[]>, devices=[3], sharding={mesh<[]>, []}, memory=Host[Pinned]}");
+    }
+
+    #[test]
+    fn test_placement_into_parts() {
+        let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(3, 1)]).unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let placement = Placement::new(mesh.clone(), sharding.clone()).unwrap();
+        assert_eq!(placement.clone().into_parts(), (mesh.clone(), None, sharding.clone(), None));
+
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let memory = Memory::Host { pinned: true };
+        let placement = placement.with_layout(layout.clone()).with_memory(memory);
+        assert_eq!(placement.into_parts(), (mesh, Some(layout), sharding, Some(memory)));
     }
 
     #[test]
