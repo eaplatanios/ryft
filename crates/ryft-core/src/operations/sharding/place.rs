@@ -7,8 +7,8 @@
 //!
 //! The module is organized around the following entities:
 //!
-//!   - [`PlaceOperation`] is the operation that a placement stages. It carries an optional target placement, an
-//!     optional source placement, and a copy policy that states whether its output may share storage with its input,
+//!   - [`PlaceOperation`] is the operation that a placement stages. It carries an optional source placement, an
+//!     optional target placement, and a copy policy that states whether its output may share storage with its input,
 //!     and it owns the type inference rule that validates both placements (e.g., that the target preserves the
 //!     reduction state of the input and splits every static extent evenly) along with the interpretation, partial
 //!     evaluation, batching, differentiation, and transposition rules of a placement. Without a target, the value
@@ -116,8 +116,8 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// buffer identity, because its outputs are buffers that its execution allocates (or donated inputs, which no other
 /// handle can observe), so backends ignore the policy when they lower the operation.
 ///
-/// Interpretation moves the value through the [`PlaceDispatch`] primitive of [`Place`] with the operation's target,
-/// source, and copy policy. Batching keeps the copy policy and extends the target and source shardings with an entry
+/// Interpretation moves the value through the [`PlaceDispatch`] primitive of [`Place`] with the operation's source,
+/// target, and copy policy. Batching keeps the copy policy and extends the source and target shardings with an entry
 /// for the batch dimension. A target or source that records how its batch is distributed (refer to
 /// [`Placement::batch_shardings`]), such as the placement that a batch item reports (refer to [`Placed`]), gets that
 /// distribution back. Otherwise, an explicit target replicates the batch dimension, so that it places every batch item
@@ -132,26 +132,24 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// rule of this operation for the details).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaceOperation {
-    /// Optional target [`Placement`] that the input is moved to. When it is [`None`], the input stays where it is.
-    target: Option<Placement>,
-
     /// Optional source [`Placement`] where the input is expected to live, which is informative only.
     source: Option<Placement>,
+
+    /// Optional target [`Placement`] that the input is moved to. When it is [`None`], the input stays where it is.
+    target: Option<Placement>,
 
     /// Boolean indicating whether the output may share storage with the input. When it is `false`, the output must
     /// have storage of its own.
     may_alias: bool,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl PlaceOperation {
-    /// Creates a new [`PlaceOperation`] that moves its input to `target`, or leaves it where it is when `target` is
-    /// [`None`], recording `source` as where the input is expected to live when it is known. The output of the new
-    /// operation may share storage with its input (refer to [`Self::with_may_alias`]).
+    /// Creates a new [`PlaceOperation`] that records `source` as the expected placement of its input and moves it to
+    /// `target`. A [`None`] source means the expected placement is unknown. A [`None`] target leaves the input where
+    /// it is. The output may share storage with its input (refer to [`Self::with_may_alias`]).
     #[inline]
-    pub fn new(target: impl Into<Option<Placement>>, source: Option<Placement>) -> Self {
-        Self { target: target.into(), source, may_alias: true }
+    pub fn new(source: Option<Placement>, target: impl Into<Option<Placement>>) -> Self {
+        Self { source, target: target.into(), may_alias: true }
     }
 
     /// Returns this [`PlaceOperation`] with its copy policy replaced by `may_alias`. With `true`, which is the default,
@@ -164,16 +162,16 @@ impl PlaceOperation {
         self
     }
 
-    /// Returns the target [`Placement`] that the input is moved to, or [`None`] if the input stays where it is.
-    #[inline]
-    pub fn target(&self) -> Option<&Placement> {
-        self.target.as_ref()
-    }
-
     /// Returns the source [`Placement`] where the input is expected to live, or [`None`] if it is not known.
     #[inline]
     pub fn source(&self) -> Option<&Placement> {
         self.source.as_ref()
+    }
+
+    /// Returns the target [`Placement`] that the input is moved to, or [`None`] if the input stays where it is.
+    #[inline]
+    pub fn target(&self) -> Option<&Placement> {
+        self.target.as_ref()
     }
 
     /// Returns whether the output may share storage with the input (refer to [`Self::with_may_alias`]).
@@ -205,6 +203,7 @@ impl Operation for PlaceOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
+
         let input = &input_types[0];
         let target = self.target.as_ref().map(Placement::sharding);
         if let Some(target) = target
@@ -249,8 +248,8 @@ impl Operation for PlaceOperation {
         }) || source.is_some_and(is_manual_region_sharding)
         {
             return Err(TypeError::invalid(format!(
-                "`{PLACE_OPERATION_NAME}` cannot move values that vary along manual mesh axes or carry reduction state \
-                 over them",
+                "`{PLACE_OPERATION_NAME}` cannot move values that vary along manual mesh axes \
+                 or carry reduction state over them",
             )));
         }
 
@@ -267,15 +266,18 @@ impl Operation for PlaceOperation {
                 validate_preserved_mesh_axes(PLACE_OPERATION_NAME, input_sharding.mesh(), reduction_axes(), mesh)?;
             }
         }
+
         let (unreduced_axes, reduced_axes) = match input.sharding() {
             Some(sharding) => (sharding.unreduced_axes().clone(), sharding.reduced_axes().clone()),
             None => Default::default(),
         };
+
         let has_input_reduction_state = |sharding: &Sharding| {
             sharding.unreduced_axes() == &unreduced_axes
                 && sharding.reduced_axes() == &reduced_axes
                 && sharding.unreduced_kind() == input.unreduced_kind()
         };
+
         if let Some(source) = source
             && !has_input_reduction_state(source)
         {
@@ -284,6 +286,7 @@ impl Operation for PlaceOperation {
                  type `{input}`",
             )));
         }
+
         if target.is_some_and(|target| !has_input_reduction_state(target)) {
             return Err(TypeError::invalid(format!(
                 "`{PLACE_OPERATION_NAME}` cannot change reduction state; use a reduction (or the corresponding \
@@ -319,8 +322,8 @@ impl Operation for PlaceOperation {
                 continue;
             };
 
-            // The product is over distinct axes of one mesh, so it never exceeds the device count of that mesh, which
-            // fits `usize`.
+            // The product is over distinct axes of one mesh, so it never exceeds the device count of that mesh,
+            // which fits `usize`.
             let shard_count = axis_names.iter().filter_map(|name| target.mesh().axis_size(name)).product::<usize>();
             if extent % shard_count != 0 {
                 return Err(TypeError::invalid(format!(
@@ -334,6 +337,7 @@ impl Operation for PlaceOperation {
         if let Some(memory) = placement.memory() {
             output = output.with_memory(memory);
         }
+
         if let Some(layout) = placement.layout() {
             // A target layout must address the output shape, so that a malformed request fails here rather than only
             // when a backend materializes or lowers the output.
@@ -342,23 +346,24 @@ impl Operation for PlaceOperation {
                 TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
             })?;
         }
+
         Ok(vec![output])
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // An omitted target or source is not rendered, and neither is the default copy policy, so that the rendering
+        // An omitted source or target is not rendered, and neither is the default copy policy, so that the rendering
         // of a placement stays compact. An identity placement therefore renders as its name alone.
         let formatter = OperationFormatter::new(formatter, indentation, self.name())?;
-        if self.target.is_none() && self.source.is_none() && self.may_alias {
+        if self.source.is_none() && self.target.is_none() && self.may_alias {
             return Ok(());
         }
         formatter.bracketed(|operation| {
-            if let Some(target) = &self.target {
-                operation.field("target", target)?;
-            }
             if let Some(source) = &self.source {
                 operation.field("source", source)?;
+            }
+            if let Some(target) = &self.target {
+                operation.field("target", target)?;
             }
             if !self.may_alias {
                 operation.field("may_alias", false)?;
@@ -367,6 +372,8 @@ impl Operation for PlaceOperation {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for PlaceOperation
 where
@@ -382,7 +389,7 @@ where
         // copy policy, so that interpretation over staging values (e.g., program batching, re-tracing, etc.) preserves
         // them, while concrete values move to the target or stay where they are without one.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![place_with_inferred_source(&inputs[0], self.target.as_ref(), self.source.as_ref(), self.may_alias)?])
+        Ok(vec![place_with_inferred_source(&inputs[0], self.source.as_ref(), self.target.as_ref(), self.may_alias)?])
     }
 }
 
@@ -458,7 +465,7 @@ where
 
         // Placement changes preserve the packed shape and mapped batch axis, and the copy policy applies to the packed
         // value unchanged.
-        let output = place_with_inferred_source(input.value(), target.as_ref(), source.as_ref(), self.may_alias)?;
+        let output = place_with_inferred_source(input.value(), source.as_ref(), target.as_ref(), self.may_alias)?;
         Ok(vec![ArrayBatch::new(output, input.batch_axis())?])
     }
 }
@@ -483,13 +490,13 @@ impl_differentiable_operation! {
             let may_alias = operation.may_alias();
             let source = operation.source().cloned().or_else(|| inputs[0].primal().placement());
             let primal =
-                place_with_inferred_source(inputs[0].primal(), operation.target(), source.as_ref(), may_alias)?;
+                place_with_inferred_source(inputs[0].primal(), source.as_ref(), operation.target(), may_alias)?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(place_with_inferred_source(
                     tangent,
-                    operation.target().map(placement_without_layout).as_ref(),
                     source.as_ref().map(placement_without_layout).as_ref(),
+                    operation.target().map(placement_without_layout).as_ref(),
                     may_alias,
                 )?),
             };
@@ -524,13 +531,14 @@ impl_differentiable_operation! {
                 let result = Placement::new(placement.mesh().clone(), placement.sharding().cotangent()?)?;
                 Ok(placement_with_batch_shardings(result, placement.batch_shardings())?)
             };
-            let transposed = match (operation.target(), operation.source()) {
+            let transposed = match (operation.source(), operation.target()) {
                 // With a known source, the cotangent moves back to the source mesh, and the old target becomes the
                 // new source.
-                (Some(target), Some(source)) => PlaceOperation::new(
-                    cotangent_placement(source)?.with_memory(input_type.memory()),
-                    Some(cotangent_placement(target)?),
-                ),
+                (Some(source), Some(target)) => {
+                    let transposed_target = cotangent_placement(source)?.with_memory(input_type.memory());
+                    let transposed_source = cotangent_placement(target)?;
+                    PlaceOperation::new(Some(transposed_source), transposed_target)
+                }
 
                 // Without a source, the value is not known to have changed meshes, so the cotangent stays on the
                 // target mesh and gets the input's tracked sharding and memory back. This deliberately differs from
@@ -538,7 +546,7 @@ impl_differentiable_operation! {
                 // an unknown source where it is. Restoring the input's tracked sharding and memory keeps the
                 // cotangent well typed, and it is exact inside a compiled program, which runs on a single mesh. An
                 // input that is tracked over another mesh did change meshes, and its devices are not known.
-                (Some(target), None) => {
+                (None, Some(target)) => {
                     let sharding = match input_cotangent_type.sharding() {
                         Some(sharding) if sharding.mesh().has_same_topology(target.mesh().logical_mesh()) => {
                             sharding.clone()
@@ -557,15 +565,15 @@ impl_differentiable_operation! {
                     let placement = Placement::new(target.mesh().clone(), sharding)
                         .and_then(|placement| placement_with_batch_shardings(placement, target.batch_shardings()))
                         .map_err(TypeError::from)?;
-                    PlaceOperation::new(placement.with_memory(input_type.memory()), None)
+                    PlaceOperation::new(None, placement.with_memory(input_type.memory()))
                 }
 
                 // Without a target, the forward placement left the value where it was, which its source describes
                 // when it has one. The cotangent therefore moves to the source, as JAX's transpose does when it swaps
                 // the devices and sources of `device_put`, and it has no source of its own, because the forward
                 // placement did not say where the output lives.
-                (None, Some(source)) => {
-                    PlaceOperation::new(cotangent_placement(source)?.with_memory(input_type.memory()), None)
+                (Some(source), None) => {
+                    PlaceOperation::new(None, cotangent_placement(source)?.with_memory(input_type.memory()))
                 }
 
                 // Without a target and a source, the forward placement is an identity up to its copy policy, and so is
@@ -733,8 +741,8 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
 /// return a value whose storage no other value shares, and implementations for staged values must stage the
 /// placement with that policy, so that the copy happens when the staged placement executes on concrete values.
 pub trait PlaceDispatch<T: Type, V: Value<Type = T>> {
-    /// Places `input` on `target`, or leaves it where it is when `target` is [`None`], with `source` describing where
-    /// it was expected to live. The result may share storage with `input` only when `may_alias` is `true`.
+    /// Records `source` as the expected placement of `input` and moves it to `target`. A [`None`] target leaves it
+    /// where it is. The result may share storage with `input` only when `may_alias` is `true`.
     ///
     /// # Errors
     ///
@@ -746,8 +754,8 @@ pub trait PlaceDispatch<T: Type, V: Value<Type = T>> {
     /// when a transfer to the devices of `target` fails), and staging contexts return the errors of staging it.
     fn place(
         input: &V,
-        target: Option<&Placement>,
         source: Option<Placement>,
+        target: Option<&Placement>,
         may_alias: bool,
     ) -> Result<V, ProgramError>;
 }
@@ -755,8 +763,8 @@ pub trait PlaceDispatch<T: Type, V: Value<Type = T>> {
 impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
     fn place(
         input: &Array,
-        target: Option<&Placement>,
         source: Option<Placement>,
+        target: Option<&Placement>,
         may_alias: bool,
     ) -> Result<Array, ProgramError> {
         // A reference array is a host value without devices, so placing it keeps its elements unchanged. Its type
@@ -767,7 +775,7 @@ impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
         // Otherwise, the logical bytes are re-encoded for the output layout into new storage, which preserves the
         // exact element bits (including low-precision encodings and NaN payloads), as in `Cast` for `Array`. Without
         // a target, the output type is the input type, so the storage is shared or copied as the copy policy says.
-        let operation = PlaceOperation::new(target.cloned(), source).with_may_alias(may_alias);
+        let operation = PlaceOperation::new(source, target.cloned()).with_may_alias(may_alias);
         let mut output_types = operation.infer_output_types(&[input.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
         let output_type = output_types.remove(0);
@@ -791,12 +799,12 @@ impl<
 {
     fn place(
         input: &V,
-        target: Option<&Placement>,
         source: Option<Placement>,
+        target: Option<&Placement>,
         may_alias: bool,
     ) -> Result<V, ProgramError> {
         let outputs = input.domain().bind(
-            PlaceOperation::new(target.cloned(), source).with_may_alias(may_alias),
+            PlaceOperation::new(source, target.cloned()).with_may_alias(may_alias),
             Vec::new(),
             std::slice::from_ref(input),
         )?;
@@ -812,12 +820,12 @@ impl<
 {
     fn place(
         input: &V,
-        target: Option<&Placement>,
         source: Option<Placement>,
+        target: Option<&Placement>,
         may_alias: bool,
     ) -> Result<V, ProgramError> {
         let input = input.clone().into_projected()?;
-        let output = <V::Projected as Value>::Dispatch::place(&input, target, source, may_alias)?;
+        let output = <V::Projected as Value>::Dispatch::place(&input, source, target, may_alias)?;
         Ok(V::from_projected(output))
     }
 }
@@ -967,7 +975,7 @@ fn place_parameters<
     let outputs = input
         .parameters()
         .zip(targets.parameters())
-        .map(|(input, target)| place_with_inferred_source(input, Some(target), sources.next().flatten(), true))
+        .map(|(input, target)| place_with_inferred_source(input, sources.next().flatten(), Some(target), true))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(S::from_parameters(input.parameter_structure(), outputs)?)
 }
@@ -977,12 +985,12 @@ fn place_parameters<
 /// if any.
 fn place_with_inferred_source<V: Value<Dispatch: PlaceDispatch<V::Type, V>> + Placed>(
     input: &V,
-    target: Option<&Placement>,
     source: Option<&Placement>,
+    target: Option<&Placement>,
     may_alias: bool,
 ) -> Result<V, ProgramError> {
     let source = source.cloned().or_else(|| input.placement());
-    V::Dispatch::place(input, target, source, may_alias)
+    V::Dispatch::place(input, source, target, may_alias)
 }
 
 /// Returns the placement of the batch items of a packed value that lives on `placement` and whose batch dimension is
@@ -1257,25 +1265,25 @@ mod tests {
 
     #[test]
     fn test_place_operation() {
-        let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
         let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
-        let operation = PlaceOperation::new(target.clone(), Some(source.clone()));
+        let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
+        let operation = PlaceOperation::new(Some(source.clone()), target.clone());
         assert_eq!(operation.name(), PLACE_OPERATION_NAME);
-        assert_eq!(operation.target(), Some(&target));
         assert_eq!(operation.source(), Some(&source));
+        assert_eq!(operation.target(), Some(&target));
         assert!(operation.may_alias());
         assert_eq!(
             operation.to_string(),
             indoc! {"
                 place [
-                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                 ]"
             },
         );
 
         // An unknown source is not rendered.
-        let operation = PlaceOperation::new(target, None);
+        let operation = PlaceOperation::new(None, target);
         assert_eq!(operation.source(), None);
         assert_eq!(
             operation.to_string(),
@@ -1288,9 +1296,9 @@ mod tests {
 
         // An omitted target leaves the input where it is and is not rendered either, so that a placement without a
         // target and a source renders as its name alone.
-        let operation = PlaceOperation::new(None, Some(source.clone()));
-        assert_eq!(operation.target(), None);
+        let operation = PlaceOperation::new(Some(source.clone()), None);
         assert_eq!(operation.source(), Some(&source));
+        assert_eq!(operation.target(), None);
         assert_eq!(
             operation.to_string(),
             indoc! {"
@@ -1300,20 +1308,20 @@ mod tests {
             },
         );
         let operation = PlaceOperation::new(None, None);
-        assert_eq!(operation.target(), None);
         assert_eq!(operation.source(), None);
+        assert_eq!(operation.target(), None);
         assert_eq!(operation.to_string(), PLACE_OPERATION_NAME);
     }
 
     #[test]
     fn test_place_operation_with_may_alias() {
-        let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
         let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
-        let aliasing = PlaceOperation::new(target.clone(), Some(source.clone()));
+        let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
+        let aliasing = PlaceOperation::new(Some(source.clone()), target.clone());
         let copying = aliasing.clone().with_may_alias(false);
         assert!(!copying.may_alias());
-        assert_eq!(copying.target(), Some(&target));
         assert_eq!(copying.source(), Some(&source));
+        assert_eq!(copying.target(), Some(&target));
         assert!(copying.clone().with_may_alias(true).may_alias());
 
         // The copy policy takes part in equality and hashing.
@@ -1325,20 +1333,19 @@ mod tests {
         assert!(operations.contains(&aliasing));
         assert!(operations.contains(&copying));
 
-        // A forced copy is rendered after the source, or after the target when the source is unknown, and alone when
-        // both are omitted.
+        // A forced copy is rendered after the placements, or alone when both are omitted.
         assert_eq!(
             copying.to_string(),
             indoc! {"
                 place [
-                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     may_alias=false,
                 ]"
             },
         );
         assert_eq!(
-            PlaceOperation::new(target, None).with_may_alias(false).to_string(),
+            PlaceOperation::new(None, target).with_may_alias(false).to_string(),
             indoc! {"
                 place [
                     target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
@@ -1360,7 +1367,7 @@ mod tests {
         // The output adopts the target sharding, also when the input is tracked on another mesh, and keeps its storage
         // unless the target names one.
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), None),
+            operation = PlaceOperation::new(None, target.clone()),
             cases = [{
                 input_types = [input_type.clone()],
                 output_types = [input_type.clone().with_sharding(target.sharding().clone()).unwrap()],
@@ -1381,7 +1388,7 @@ mod tests {
         );
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone().with_memory(PINNED_HOST).with_layout(layout.clone()), None),
+            operation = PlaceOperation::new(None, target.clone().with_memory(PINNED_HOST).with_layout(layout.clone())),
             cases = [{
                 input_types = [x_input_type.clone()],
                 output_types = [input_type
@@ -1401,7 +1408,7 @@ mod tests {
         )
         .unwrap();
         check_operation_type_inference!(
-            operation = PlaceOperation::new(auto_target, None),
+            operation = PlaceOperation::new(None, auto_target),
             cases = [{
                 input_types = [x_input_type.clone()],
                 output_types = [input_type.clone().with_sharding(Sharding::replicated(auto_mesh.clone(), 1)).unwrap()],
@@ -1411,7 +1418,7 @@ mod tests {
         // A target layout must address the output shape.
         let rank_3_layout = Layout::Tiled(TiledLayout::new(vec![0, 1, 2], vec![]));
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone().with_layout(rank_3_layout), None),
+            operation = PlaceOperation::new(None, target.clone().with_layout(rank_3_layout)),
             cases = [{
                 input_types = [input_type.clone()],
                 error = format!(
@@ -1429,14 +1436,14 @@ mod tests {
         .unwrap();
         let replicated_source = placement(&mesh_x(), vec![ShardingDimension::Replicated]);
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), Some(auto_source)),
+            operation = PlaceOperation::new(Some(auto_source), target.clone()),
             cases = [{
                 input_types = [input_type.clone().with_sharding(Sharding::replicated(auto_mesh.clone(), 1)).unwrap()],
                 output_types = [input_type.clone().with_sharding(target.sharding().clone()).unwrap()],
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), Some(replicated_source.clone())),
+            operation = PlaceOperation::new(Some(replicated_source.clone()), target.clone()),
             cases = [{
                 input_types = [input_type.clone()],
                 output_types = [input_type.clone().with_sharding(target.sharding().clone()).unwrap()],
@@ -1450,7 +1457,7 @@ mod tests {
         );
         let rank_2_source = placement(&mesh_x(), vec![ShardingDimension::Replicated; 2]);
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), Some(rank_2_source)),
+            operation = PlaceOperation::new(Some(rank_2_source), target.clone()),
             cases = [{
                 input_types = [input_type.clone()],
                 error = format!("`{PLACE_OPERATION_NAME}` source sharding rank (2) does not match the input rank (1)"),
@@ -1463,7 +1470,7 @@ mod tests {
             Sharding::replicated(mesh_x().logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let unreduced_source = Placement::new(mesh_x(), unreduced_sharding.clone()).unwrap();
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), Some(unreduced_source.clone())),
+            operation = PlaceOperation::new(Some(unreduced_source.clone()), target.clone()),
             cases = [{
                 input_types = [input_type.clone()],
                 error = format!(
@@ -1478,12 +1485,12 @@ mod tests {
             .unwrap();
         check_operation_type_inference!(
             operation = PlaceOperation::new(
+                Some(unreduced_source),
                 Placement::new(
                     mesh_x(),
                     unreduced_sharding.clone().with_unreduced_kind(UnreducedKind::Max).unwrap(),
                 )
                 .unwrap(),
-                Some(unreduced_source),
             ),
             cases = [{
                 input_types = [max_input_type.clone()],
@@ -1497,8 +1504,8 @@ mod tests {
             Sharding::replicated(mesh_x().logical_mesh().clone(), 1).with_reduced_axes(["x"]).unwrap();
         check_operation_type_inference!(
             operation = PlaceOperation::new(
-                Placement::new(mesh_x(), reduced_sharding.clone()).unwrap(),
                 Some(replicated_source.clone()),
+                Placement::new(mesh_x(), reduced_sharding.clone()).unwrap(),
             ),
             cases = [{
                 input_types = [input_type.clone().with_sharding(reduced_sharding.clone()).unwrap()],
@@ -1520,7 +1527,7 @@ mod tests {
              over them",
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), None),
+            operation = PlaceOperation::new(None, target.clone()),
             cases = [{
                 input_types = [input_type.clone().with_sharding(varying_sharding.clone()).unwrap()],
                 error = manual_error.clone(),
@@ -1539,14 +1546,14 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(Placement::new(mesh_x(), varying_sharding.clone()).unwrap(), None),
+            operation = PlaceOperation::new(None, Placement::new(mesh_x(), varying_sharding.clone()).unwrap()),
             cases = [{
                 input_types = [input_type.clone()],
                 error = manual_error.clone(),
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), Some(Placement::new(mesh_x(), varying_sharding).unwrap())),
+            operation = PlaceOperation::new(Some(Placement::new(mesh_x(), varying_sharding).unwrap()), target.clone()),
             cases = [{
                 input_types = [input_type.clone()],
                 error = manual_error,
@@ -1566,8 +1573,8 @@ mod tests {
             Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         check_operation_type_inference!(
             operation = PlaceOperation::new(
-                single_device,
                 Some(Placement::new(mesh_x(), manual_tiled_sharding.clone()).unwrap()),
+                single_device,
             ),
             cases = [{
                 input_types = [input_type.clone().with_sharding(manual_tiled_sharding.clone()).unwrap()],
@@ -1575,7 +1582,7 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(Placement::new(mesh_x(), manual_tiled_sharding.clone()).unwrap(), None),
+            operation = PlaceOperation::new(None, Placement::new(mesh_x(), manual_tiled_sharding.clone()).unwrap()),
             cases = [{
                 input_types = [input_type.clone()],
                 output_types = [input_type.clone().with_sharding(manual_tiled_sharding).unwrap()],
@@ -1593,12 +1600,12 @@ mod tests {
         );
         check_operation_type_inference!(
             operation = PlaceOperation::new(
+                None,
                 Placement::new(
                     mesh_x(),
                     Sharding::replicated(mesh_x().logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap(),
                 )
                 .unwrap(),
-                None,
             ),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
@@ -1615,7 +1622,7 @@ mod tests {
         // over an axis that the target mesh does not define.
         let explicit_axis = MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap();
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), None),
+            operation = PlaceOperation::new(None, target.clone()),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
                 error = format!(
@@ -1636,7 +1643,7 @@ mod tests {
                 .unwrap();
         let unreduced_placement = Placement::new(mesh_x(), unreduced_input_type.sharding().unwrap().clone()).unwrap();
         check_operation_type_inference!(
-            operation = PlaceOperation::new(auto_unreduced.clone(), None),
+            operation = PlaceOperation::new(None, auto_unreduced.clone()),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
                 error = format!(
@@ -1646,7 +1653,7 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(wide_unreduced.clone(), None),
+            operation = PlaceOperation::new(None, wide_unreduced.clone()),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
                 error = format!(
@@ -1656,7 +1663,7 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(unreduced_placement.clone(), Some(auto_unreduced)),
+            operation = PlaceOperation::new(Some(auto_unreduced), unreduced_placement.clone()),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
                 error = format!(
@@ -1666,7 +1673,7 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(unreduced_placement.clone(), Some(wide_unreduced)),
+            operation = PlaceOperation::new(Some(wide_unreduced), unreduced_placement.clone()),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
                 error = format!(
@@ -1676,7 +1683,7 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(unreduced_placement.clone(), Some(unreduced_placement)),
+            operation = PlaceOperation::new(Some(unreduced_placement.clone()), unreduced_placement),
             cases = [{
                 input_types = [unreduced_input_type.clone()],
                 output_types = [unreduced_input_type],
@@ -1685,7 +1692,7 @@ mod tests {
 
         // The operation cannot own nested regions.
         assert_eq!(
-            PlaceOperation::new(target, None).infer_output_types(
+            PlaceOperation::new(None, target).infer_output_types(
                 std::slice::from_ref(&input_type),
                 &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
             ),
@@ -1737,7 +1744,7 @@ mod tests {
         let replicated_input_type =
             input_type.clone().with_sharding(Sharding::replicated(mesh_x().logical_mesh().clone(), 1)).unwrap();
         check_operation_type_inference!(
-            operation = PlaceOperation::new(None, Some(source.clone())),
+            operation = PlaceOperation::new(Some(source.clone()), None),
             cases = [{
                 input_types = [pinned_input_type.clone()],
                 output_types = [pinned_input_type],
@@ -1764,7 +1771,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let scalar_target = placement(&mesh_y(), vec![]);
         check_operation_type_inference!(
-            operation = PlaceOperation::new(scalar_target.clone(), Some(placement(&mesh_x(), vec![]))),
+            operation = PlaceOperation::new(Some(placement(&mesh_x(), vec![])), scalar_target.clone()),
             cases = [{
                 input_types = [scalar_type.clone()],
                 output_types = [scalar_type.clone().with_sharding(scalar_target.sharding().clone()).unwrap()],
@@ -1782,7 +1789,7 @@ mod tests {
         );
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), None),
+            operation = PlaceOperation::new(None, target.clone()),
             cases = [{
                 input_types = [dynamic_type.clone()],
                 output_types = [dynamic_type.clone().with_sharding(target.sharding().clone()).unwrap()],
@@ -1810,7 +1817,7 @@ mod tests {
         )
         .unwrap();
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target, None),
+            operation = PlaceOperation::new(None, target),
             cases = [{
                 input_types = [ArrayType::new_static(DataType::I32, [5, 12])],
                 output_types = [ArrayType::new_static(DataType::I32, [5, 12])
@@ -1831,7 +1838,7 @@ mod tests {
             }],
         );
         check_operation_type_inference!(
-            operation = PlaceOperation::new(placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]), None),
+            operation = PlaceOperation::new(None, placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])])),
             cases = [{
                 input_types = [ArrayType::new_static(DataType::I32, [5])],
                 error = format!(
@@ -1843,9 +1850,9 @@ mod tests {
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         check_operation_type_inference!(
             operation = PlaceOperation::new(
+                None,
                 Placement::new(mesh_x(), Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
                     .unwrap(),
-                None,
             ),
             cases = [{
                 input_types = [ArrayType::new_static(DataType::I32, [5])],
@@ -1867,7 +1874,7 @@ mod tests {
         );
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
         check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), None),
+            operation = PlaceOperation::new(None, target.clone()),
             cases = [{
                 input_types = [dynamic_type.clone()],
                 output_types = [dynamic_type.with_sharding(target.sharding().clone()).unwrap()],
@@ -1880,7 +1887,7 @@ mod tests {
         // Reference arrays have no devices, so interpretation keeps the payload unchanged while recording the
         // placement in the value's type so that it matches the declared output type.
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]).with_memory(PINNED_HOST);
-        let operation = PlaceOperation::new(target.clone(), None);
+        let operation = PlaceOperation::new(None, target.clone());
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let outputs = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
@@ -1917,7 +1924,7 @@ mod tests {
         let scalar_target = placement(&mesh_x(), vec![]);
         let scalar = Array::scalar(3.0f32).unwrap();
         assert_eq!(
-            PlaceOperation::new(scalar_target.clone(), None).interpret(
+            PlaceOperation::new(None, scalar_target.clone()).interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 std::slice::from_ref(&scalar),
@@ -1999,7 +2006,7 @@ mod tests {
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
         check_operation_partial_evaluation!(
-            operation = PlaceOperation::new(target.clone(), None),
+            operation = PlaceOperation::new(None, target.clone()),
             inputs = [input.clone()],
             expected = input.place(&target, None).unwrap(),
         );
@@ -2013,7 +2020,7 @@ mod tests {
         let input = Array::from_logical_bytes(ArrayType::new_static(DataType::U8, [2]), &[10, 20]).unwrap();
         let layout = Layout::Strided(StridedLayout::new(vec![-1]));
         check_operation_partial_evaluation!(
-            operation = PlaceOperation::new(target.clone().with_layout(layout.clone()), None),
+            operation = PlaceOperation::new(None, target.clone().with_layout(layout.clone())),
             inputs = [input],
             expected = Array::new(
                 ArrayType::new_static(DataType::U8, [2])
@@ -2059,10 +2066,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 4] .
                 let %1:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] = place [
-                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
-                        sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
                     source={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
                 ] %0
                 in (%1)"
             },
@@ -2089,10 +2096,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4, 2] .
                 let %1:f32[4, 2][sharding={mesh<['y'=4:explicit]>, [{'y'}, {}]}] = place [
-                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
-                        sharding={mesh<['y'=4:explicit]>, [{'y'}, {}]}},
                     source={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{'y'}, {}]}},
                 ] %0
                 in (%1)"
             },
@@ -2107,7 +2114,7 @@ mod tests {
             |x| {
                 Ok(batch(
                     move |item| {
-                        <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&item, Some(&target), None, false)
+                        <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&item, None, Some(&target), false)
                     },
                     x,
                     BatchAxis::new(0),
@@ -2143,7 +2150,7 @@ mod tests {
             ArrayBatch::new(Array::matrix(4, 1, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 4)
             .with_axis_sharding(ShardingDimension::sharded(["y"]));
-        let outputs = PlaceOperation::new(target.clone(), None)
+        let outputs = PlaceOperation::new(None, target.clone())
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -2162,7 +2169,7 @@ mod tests {
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 4)
             .with_axis_sharding(ShardingDimension::sharded(["x"]));
         let split_target = target.with_batch_sharding(ShardingDimension::sharded(["y"])).unwrap();
-        let outputs = PlaceOperation::new(split_target, None)
+        let outputs = PlaceOperation::new(None, split_target)
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -2218,9 +2225,9 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
                 let %1:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] = place [
+                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}},
                     target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}},
                 ] %0
                 in (%1)"
             },
@@ -2259,7 +2266,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             context.0.borrow().as_slice(),
-            &[ArrayOperation::Place(PlaceOperation::new(None, Some(packed.clone())))],
+            &[ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), None))],
         );
         assert_eq!(output.array, array);
         assert_eq!(output.placement, Some(packed));
@@ -2301,8 +2308,8 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(replicated_placement.clone(), Some(packed.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(None, Some(packed.clone()))),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), replicated_placement.clone())),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), None)),
             ],
         );
         assert_eq!(replicated.array, array);
@@ -2335,8 +2342,8 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(replicated_placement.clone(), Some(packed.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(None, Some(packed.clone()))),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), replicated_placement.clone())),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), None)),
             ],
         );
         assert_eq!(
@@ -2398,7 +2405,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             context.0.borrow().as_slice(),
-            &[ArrayOperation::Place(PlaceOperation::new(unmapped_placement.clone(), Some(unmapped_placement.clone())))],
+            &[ArrayOperation::Place(PlaceOperation::new(Some(unmapped_placement.clone()), unmapped_placement.clone()))],
         );
         assert_eq!(output.placement, Some(unmapped_placement));
     }
@@ -2409,7 +2416,7 @@ mod tests {
         // a replicated input keeps its rank and is placed with the unchanged target.
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]).with_layout(layout.clone());
-        let operation = PlaceOperation::new(target.clone(), None);
+        let operation = PlaceOperation::new(None, target.clone());
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
         let mapped =
             ArrayBatch::new(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap();
@@ -2448,7 +2455,7 @@ mod tests {
         // Symbolic zero tangents keep the type of the placed primal without staging a placement of their own.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(ArrayType::new_static(DataType::F32, [2]));
-        let duals = PlaceOperation::new(target, None)
+        let duals = PlaceOperation::new(None, target)
             .jvp(
                 &DifferentiationContext::fused(context.clone()),
                 &EmptyRegionDriver,
@@ -2467,7 +2474,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(x, t)| {
                 Ok(differentiate_at(x).jvp(t, |x| {
-                    <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, Some(&target), None, false)
+                    <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, None, Some(&target), false)
                 })?)
             },
             (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [4])),
@@ -2547,14 +2554,14 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 4], %1:f32[2, 4] .
                 let %2:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] = place [
+                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
                     target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
                 ] %0
                     %3:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] = place [
+                        source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
                         target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                             sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
-                        source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
                     ] %1
                 in (%2, %3)"
             },
@@ -2585,10 +2592,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] .
                 let %1:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] = place [
-                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
-                        sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}, memory=Device},
                     source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}, memory=Device},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -2635,9 +2642,9 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(target.clone(), Some(packed.clone()))),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), target.clone())),
                 ArrayOperation::Place(
-                    PlaceOperation::new(gradient_placement.clone(), Some(target)).with_may_alias(false),
+                    PlaceOperation::new(Some(target), gradient_placement.clone()).with_may_alias(false),
                 ),
             ],
         );
@@ -2694,9 +2701,9 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(target.clone(), Some(packed))),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed), target.clone())),
                 ArrayOperation::Place(
-                    PlaceOperation::new(gradient_placement.clone(), Some(target)).with_may_alias(false),
+                    PlaceOperation::new(Some(target), gradient_placement.clone()).with_may_alias(false),
                 ),
             ],
         );
@@ -2743,9 +2750,9 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(None, Some(packed.clone()))),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), None)),
                 ArrayOperation::Place(
-                    PlaceOperation::new(gradient_placement.clone(), Some(packed)).with_may_alias(false),
+                    PlaceOperation::new(Some(packed), gradient_placement.clone()).with_may_alias(false),
                 ),
             ],
         );
@@ -2825,9 +2832,9 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(None, Some(packed.clone()))),
+                ArrayOperation::Place(PlaceOperation::new(Some(packed.clone()), None)),
                 ArrayOperation::Place(
-                    PlaceOperation::new(gradient_placement.clone(), Some(packed)).with_may_alias(false),
+                    PlaceOperation::new(Some(packed), gradient_placement.clone()).with_may_alias(false),
                 ),
             ],
         );
@@ -2899,10 +2906,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
-                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
                     source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -2972,7 +2979,7 @@ mod tests {
         let source = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
         let input = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let (output, pullback) = differentiate_at(input.clone())
-            .vjp(|x| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, None, Some(source.clone()), true))
+            .vjp(|x| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, Some(source.clone()), None, true))
             .unwrap();
         assert_eq!(output, input);
         let cotangent = Array::vector(vec![5.0f32, 6.0, 7.0, 8.0]).unwrap();
@@ -3023,8 +3030,8 @@ mod tests {
             .vjp(|x| {
                 <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(
                     &x,
-                    Some(&target),
                     Some(source.clone()),
+                    Some(&target),
                     false,
                 )
             })
@@ -3041,10 +3048,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
-                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
                     source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -3066,9 +3073,9 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = place [
+                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}]}, memory=Device},
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     may_alias=false,
                 ] %0
                     %2:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %1
@@ -3098,10 +3105,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}] = place [
-                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
-                        sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}, memory=Device},
                     source={mesh<['x'=2:explicit]>, devices=[2, 3], \
                         sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}, memory=Device},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -3123,10 +3130,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}] = place [
-                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
-                        sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}, memory=Device},
                     source={mesh<['x'=2:explicit]>, devices=[2, 3], \
                         sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}, memory=Device},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -3157,7 +3164,7 @@ mod tests {
         let inputs = [PartialValue::Unknown(input_type.clone())];
         let cotangent = context.input(sum_type.cotangent().unwrap());
         assert_eq!(
-            PlaceOperation::new(target, Some(Placement::new(mesh_x(), maximum).unwrap())).transpose(
+            PlaceOperation::new(Some(Placement::new(mesh_x(), maximum).unwrap()), target).transpose(
                 &mut rule_context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -3191,9 +3198,9 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:auto]>, [{}]}] = place [
+                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:auto]>, [{'x'}]}, memory=Device},
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -3249,9 +3256,9 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = place [
+                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}]}, memory=Host[Pinned]},
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -3315,9 +3322,9 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}]@Host[Pinned] = place [
+                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{'y'}]}, memory=Host[Pinned]},
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     may_alias=false,
                 ] %0
                 in (%1)"
@@ -3334,7 +3341,7 @@ mod tests {
         let mut rule_context = TranspositionContext::new(context.clone());
         let inputs = [PartialValue::Unknown(input_type.clone())];
         let accumulators = rule_context.cotangent_accumulators(&inputs, &[]).unwrap();
-        PlaceOperation::new(target.clone(), None)
+        PlaceOperation::new(None, target.clone())
             .transpose(
                 &mut rule_context,
                 &EmptyRegionDriver,
@@ -3353,7 +3360,7 @@ mod tests {
     fn test_place_operation_provider() {
         // Homogeneous array families provide the placement directly, and array IR families through their array
         // projection.
-        let operation = PlaceOperation::new(placement(&mesh_x(), vec![ShardingDimension::Replicated]), None);
+        let operation = PlaceOperation::new(None, placement(&mesh_x(), vec![ShardingDimension::Replicated]));
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         assert_eq!(
             ArrayOperation::<Array>::provide(operation.clone(), &[&array_type]).unwrap().to_string(),
@@ -3458,10 +3465,10 @@ mod tests {
         .unwrap();
 
         // A reference array shares its storage by default and copies it when the copy policy forbids sharing it.
-        let shared = ValueDirectDispatch::place(&input, Some(&target), None, true).unwrap();
+        let shared = ValueDirectDispatch::place(&input, None, Some(&target), true).unwrap();
         assert_eq!(shared, expected);
         assert!(Arc::ptr_eq(input.shared_storage_bytes(), shared.shared_storage_bytes()));
-        let copied = ValueDirectDispatch::place(&input, Some(&target), None, false).unwrap();
+        let copied = ValueDirectDispatch::place(&input, None, Some(&target), false).unwrap();
         assert_eq!(copied, expected);
         assert!(!Arc::ptr_eq(input.shared_storage_bytes(), copied.shared_storage_bytes()));
 
@@ -3473,7 +3480,7 @@ mod tests {
         assert_eq!(copied, input);
         assert!(!Arc::ptr_eq(input.shared_storage_bytes(), copied.shared_storage_bytes()));
         assert_eq!(
-            ValueDirectDispatch::place(&input, None, Some(placement(&mesh_x(), vec![])), true),
+            ValueDirectDispatch::place(&input, Some(placement(&mesh_x(), vec![])), None, true),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{PLACE_OPERATION_NAME}` source sharding rank (0) does not match the input rank (1)",
             )))),
@@ -3481,7 +3488,7 @@ mod tests {
 
         // Array IR values pass the copy policy on to their array members.
         let ir_input = ArrayIrValue::Array(input.clone());
-        let ArrayIrValue::Array(copied) = ValueDirectDispatch::place(&ir_input, Some(&target), None, false).unwrap()
+        let ArrayIrValue::Array(copied) = ValueDirectDispatch::place(&ir_input, None, Some(&target), false).unwrap()
         else {
             panic!("placing an array member must produce an array member");
         };
@@ -3493,14 +3500,14 @@ mod tests {
         let source = placement(&mesh_y(), vec![ShardingDimension::Replicated]);
         let placed = context.lift(Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()).unwrap();
         let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
-        ValueDomainDispatch::place(&placed, Some(&target), Some(source.clone()), false).unwrap();
-        ValueDomainDispatch::place(&placed, Some(&target), None, true).unwrap();
+        ValueDomainDispatch::place(&placed, Some(source.clone()), Some(&target), false).unwrap();
+        ValueDomainDispatch::place(&placed, None, Some(&target), true).unwrap();
         ValueDomainDispatch::place(&placed, None, None, false).unwrap();
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(target.clone(), Some(source)).with_may_alias(false)),
-                ArrayOperation::Place(PlaceOperation::new(target, None)),
+                ArrayOperation::Place(PlaceOperation::new(Some(source), target.clone()).with_may_alias(false)),
+                ArrayOperation::Place(PlaceOperation::new(None, target)),
                 ArrayOperation::Place(PlaceOperation::new(None, None).with_may_alias(false)),
             ],
         );
@@ -3549,10 +3556,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
-                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{}]}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                 ] %0
                 in (%1)"
             },
@@ -3639,9 +3646,9 @@ mod tests {
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
-                ArrayOperation::Place(PlaceOperation::new(target.clone(), Some(concrete))),
-                ArrayOperation::Place(PlaceOperation::new(target.clone(), Some(explicit))),
-                ArrayOperation::Place(PlaceOperation::new(target, None)),
+                ArrayOperation::Place(PlaceOperation::new(Some(concrete), target.clone())),
+                ArrayOperation::Place(PlaceOperation::new(Some(explicit), target.clone())),
+                ArrayOperation::Place(PlaceOperation::new(None, target)),
             ],
         );
     }
@@ -3707,9 +3714,9 @@ mod tests {
         assert_eq!(
             context.0.take(),
             vec![
-                ArrayOperation::Place(PlaceOperation::new(y.clone(), Some(x.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(x.clone(), Some(y.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(x.clone(), None)),
+                ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), y.clone())),
+                ArrayOperation::Place(PlaceOperation::new(Some(y.clone()), x.clone())),
+                ArrayOperation::Place(PlaceOperation::new(None, x.clone())),
             ]
         );
 
@@ -3718,9 +3725,9 @@ mod tests {
         assert_eq!(
             context.0.take(),
             vec![
-                ArrayOperation::Place(PlaceOperation::new(y.clone(), Some(y.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(x.clone(), Some(x.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(x.clone(), Some(y.clone()))),
+                ArrayOperation::Place(PlaceOperation::new(Some(y.clone()), y.clone())),
+                ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), x.clone())),
+                ArrayOperation::Place(PlaceOperation::new(Some(y.clone()), x.clone())),
             ]
         );
 
@@ -3728,9 +3735,9 @@ mod tests {
         assert_eq!(
             context.0.take(),
             vec![
-                ArrayOperation::Place(PlaceOperation::new(y, Some(x.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(x.clone(), Some(x.clone()))),
-                ArrayOperation::Place(PlaceOperation::new(x, None)),
+                ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), y)),
+                ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), x.clone())),
+                ArrayOperation::Place(PlaceOperation::new(None, x)),
             ]
         );
     }
