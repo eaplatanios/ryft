@@ -51,6 +51,17 @@
 //! instruction over the physical [`ArrayType`]s of its inputs, which is then lowered, compiled through the compilation
 //! cache of the session, and executed on the client of the session.
 //!
+//! An eager operation runs on the devices of its array inputs, which must be the same devices. The arrays that the
+//! regions of the operation capture (i.e., [`RetainedArray`] session constants) take part in this like inputs. When
+//! the operands are on different devices, uncommitted inputs follow committed inputs and captures, as in JAX, so they
+//! are moved to the devices of those before the operation is built (refer to [`Array::is_committed`]). Without
+//! committed operands, uncommitted inputs move to the default mesh of the session, which is its mesh or, without one,
+//! the first device of its client. Inputs that are not replicated and are sharded over another logical mesh, inputs
+//! that are not fully addressable, and inputs whose target mesh has devices of other processes never move, and
+//! committed operands on different devices are rejected. The results of an operation are committed when one of its
+//! inputs or captures is, and the results of an operation without array inputs are committed when the session has
+//! a default mesh.
+//!
 //! Each session retains the compiled programs of eager applications in its eager dispatch cache, keyed by the
 //! operation, the structure of its attached regions, its inputs, the execution mesh, and the compilation options.
 //! A cache hit only revalidates the placement of its inputs, so a repeated application skips program construction,
@@ -97,13 +108,14 @@ use ryft_core::{
     DimensionType, DimensionValue, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
     ImportingContext, InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
     NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, ProgramError, Provenance,
-    ProvenanceScope, RegionDriver, RegionRef, SpecializationCache, SpecializationCacheEntry,
+    ProvenanceScope, RegionDriver, RegionRef, RegionRole, Sharding, SpecializationCache, SpecializationCacheEntry,
     SpecializationCacheStatistics, TracingContext, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection,
     Zero, ZeroOperation,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
 
+use crate::arrays::host::HostUploadWorkers;
 use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -112,7 +124,7 @@ use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
-    Array, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
+    Array, ArrayShard, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
     LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
@@ -278,8 +290,9 @@ impl Session {
 
     /// Returns a handle of this session whose default mesh is `mesh`. Host uploads through [`Array::from_host_buffer`]
     /// and eager operations without array inputs, such as creating constants or zeros, use this mesh when none is
-    /// specified. The handle also exposes it through [`MeshContext::default_mesh`] for calls like
-    /// `shard_map(.., None, ..)`. The handle shares the resources and the effect scope of this session.
+    /// specified, and their results are then [committed](Array::is_committed) to it. The handle also exposes it through
+    /// [`MeshContext::default_mesh`] for calls like `shard_map(.., None, ..)`. The handle shares the resources and the
+    /// effect scope of this session.
     #[inline]
     pub fn with_device_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
@@ -370,6 +383,7 @@ impl Session {
     /// derive `logical_mesh` from the first sharded output. This lets transforms place nullary constants through
     /// [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on sessions without
     /// a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller omits the mesh.
+    /// Whether the value is committed to the resolved mesh is decided by [`Self::commits_placement`].
     pub(crate) fn device_mesh_for(
         &self,
         inputs: &[Array],
@@ -423,6 +437,19 @@ impl Session {
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         DeviceMesh::new(logical_mesh, vec![device])
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+    }
+
+    /// Returns whether a value that is computed from the array inputs `inputs` and placed where
+    /// [`Self::device_mesh_for`] places it is committed to its devices (refer to [`Array::is_committed`]). This is the
+    /// one rule that decides the commitment of eager results and of host uploads without a mesh. The value is committed
+    /// when its mesh was chosen on purpose, which is the case when an input is committed or, without array inputs, when
+    /// this handle has a configured mesh. It is uncommitted when its mesh is only a fallback, which is the case when
+    /// all inputs are uncommitted or, without array inputs, when this handle has no mesh and the value is placed on
+    /// devices that the client enumerates first. Values with array inputs are placed on the mesh of their inputs rather
+    /// than on the mesh of this handle, so that mesh does not commit them.
+    #[inline]
+    pub(crate) fn commits_placement(&self, inputs: &[Array]) -> bool {
+        if inputs.is_empty() { self.mesh.is_some() } else { inputs.iter().any(Array::is_committed) }
     }
 
     /// Returns whether `other` is a handle of the same underlying [`Session`] as this one (i.e., whether the two share
@@ -658,15 +685,135 @@ impl Session {
         self.state.work.reserve()
     }
 
-    /// Validates that every input lives on this session's PJRT client and that all inputs share one device placement,
-    /// mirroring JAX's incompatible devices diagnostic for compiled computations on the eager path. Every [`Array`]
-    /// belongs to a session whose client owns its addressable shard buffers, which is validated at construction, so
-    /// client identity is exact and also rejects arrays with the same device IDs that a _different_ client owns.
-    fn validate_input_placement(&self, inputs: &[Array]) -> Result<(), ProgramError> {
-        if inputs.is_empty() {
-            return Ok(());
+    /// Returns the [`HostUploadWorkers`] that all handles of this session share, which run the host uploads that
+    /// continue in the background after their destination buffers have been handed out.
+    pub(crate) fn host_upload_workers(&self) -> &HostUploadWorkers {
+        &self.state.host_upload_workers
+    }
+
+    /// Moves the uncommitted arrays among `inputs` to the mesh that an eager operation runs on, given the arrays that
+    /// the operation captures, `captures`, and returns the inputs after the move, or [`None`] if nothing moved. This is
+    /// how uncommitted inputs follow committed operands (refer to [`Array::is_committed`]), where the operands are the
+    /// inputs and the captures, which take part exactly as inputs do. The target mesh is the mesh of the first
+    /// committed input or, without one, of the first committed capture. Without committed operands, uncommitted
+    /// operands on different devices move to the default mesh of this session, as in JAX, which is the mesh of this
+    /// handle or, without one, the mesh of the first device of the client (refer to [`Self::device_mesh_for`]), and
+    /// uncommitted operands on the same devices stay where they are. An input moves when it is uncommitted and its
+    /// mesh differs from the target mesh. It keeps its sharding when that sharding is over the logical mesh of the
+    /// target, and it is replicated over that logical mesh when it is replicated. The move uses device work only,
+    /// never donates the input, and shares the buffers of shards that stay on their devices, so an input on the same
+    /// devices is not copied. The moved arrays stay uncommitted. Captures are not moved here, because they are passed
+    /// to the compiled program as constants, which execution places on the mesh of the program.
+    ///
+    /// Nothing moves when all operands share one mesh, which is the common case and costs one comparison of meshes
+    /// for each operand, when an operand belongs to another PJRT client, when two committed operands live on different
+    /// devices, when the session has no default mesh, and when an uncommitted input that would have to move cannot
+    /// (i.e., when it is not replicated and is sharded over another logical mesh, or when it is not fully addressable,
+    /// or when the target mesh is not fully addressable from this process). [`Self::validate_input_placement`] then
+    /// reports operands on different devices. Distributed arrays are excluded because an uncommitted array lives on
+    /// devices that each process chooses for itself, so the processes would not agree on the transfers of a move.
+    fn place_uncommitted_inputs(
+        &self,
+        inputs: &[Array],
+        captures: &[RetainedArray],
+    ) -> Result<Option<Vec<Array>>, ProgramError> {
+        // Arrays produced by the same program, or cloned from one array, share their mesh allocation, so pointer
+        // equality settles the common case without comparing meshes.
+        let Some(first) = inputs.first() else {
+            return Ok(None);
+        };
+
+        let first_mesh = first.mesh();
+        let operand_meshes = || inputs.iter().skip(1).map(Array::mesh).chain(captures.iter().map(RetainedArray::mesh));
+        if operand_meshes().all(|mesh| std::ptr::eq(mesh, first_mesh) || mesh == first_mesh) {
+            return Ok(None);
         }
 
+        if inputs.iter().any(|input| !std::ptr::eq(input.client(), self.client()))
+            || captures.iter().any(|capture| capture.validate_session_client(self).is_err())
+        {
+            return Ok(None);
+        }
+
+        let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(Device::id).collect::<Vec<_>>();
+        let mut committed_meshes = inputs
+            .iter()
+            .filter(|input| input.is_committed())
+            .map(Array::mesh)
+            .chain(captures.iter().filter(|capture| capture.is_committed()).map(RetainedArray::mesh));
+        let default_mesh;
+        let target = match committed_meshes.next() {
+            Some(target) => {
+                let target_device_ids = device_ids(target);
+                if committed_meshes.any(|mesh| device_ids(mesh) != target_device_ids) {
+                    return Ok(None);
+                }
+                target
+            }
+            None => {
+                let first_device_ids = device_ids(first_mesh);
+                if operand_meshes().all(|mesh| device_ids(mesh) == first_device_ids) {
+                    return Ok(None);
+                }
+                let Ok(mesh) = self.device_mesh_for(&[], None) else {
+                    return Ok(None);
+                };
+                default_mesh = mesh;
+                &default_mesh
+            }
+        };
+
+        let process_index = self
+            .client()
+            .process_index()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        if target.devices().iter().any(|device| device.process_index() != process_index) {
+            return Ok(None);
+        }
+
+        // Every move is decided before the first one starts, so that an input that cannot move leaves all of them
+        // where they are instead of copying some of them for an operation that then fails.
+        let mut shardings = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let sharding = if input.is_committed() || input.mesh() == target {
+                None
+            } else if !input.shards().iter().all(ArrayShard::is_addressable) {
+                return Ok(None);
+            } else if input.sharding().mesh() == target.logical_mesh() {
+                Some(input.sharding().clone())
+            } else if input.sharding().is_replicated() {
+                Some(Sharding::replicated(target.logical_mesh().clone(), input.sharding().rank()))
+            } else {
+                return Ok(None);
+            };
+            shardings.push(sharding);
+        }
+
+        inputs
+            .iter()
+            .zip(shardings)
+            .map(|(input, sharding)| match sharding {
+                Some(sharding) => input
+                    .clone()
+                    .reshard_on_devices(self, target, &sharding, false)
+                    .map(|input| input.with_committed(false))
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }),
+                None => Ok(input.clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    /// Validates that every input lives on this session's PJRT client, that all inputs share one device placement, and
+    /// that every committed array among `captures` (i.e., the arrays that the operation captures) shares that device
+    /// placement too, mirroring JAX's incompatible devices diagnostic for compiled computations on the eager path.
+    /// Without inputs, the committed captures must share the device placement of the first of them. Uncommitted
+    /// captures are not checked, because execution places them on the mesh of the program. Every [`Array`] belongs
+    /// to a session whose client owns its addressable shard buffers, which is validated at construction, so client
+    /// identity is exact and also rejects arrays with the same device IDs that a _different_ client owns. Eager
+    /// binding calls it after [`Self::place_uncommitted_inputs`], so it rejects operands on different devices
+    /// only when they could not follow committed operands or move to the default mesh of this session.
+    fn validate_input_placement(&self, inputs: &[Array], captures: &[RetainedArray]) -> Result<(), ProgramError> {
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
         for (index, input) in inputs.iter().enumerate() {
             if !std::ptr::eq(input.client(), self.client()) {
@@ -679,18 +826,47 @@ impl Session {
 
         // Arrays produced by the same program, or cloned from one array, share their mesh allocation, so pointer
         // equality settles the common case without comparing devices.
-        let first_mesh = inputs[0].mesh();
-        for (index, input) in inputs.iter().enumerate().skip(1) {
-            let mesh = input.mesh();
-            if !std::ptr::eq(mesh, first_mesh)
-                && !mesh.devices().iter().map(Device::id).eq(first_mesh.devices().iter().map(Device::id))
-            {
+        let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(Device::id).collect::<Vec<_>>();
+        let shares_devices = |mesh: &DeviceMesh, other: &DeviceMesh| {
+            std::ptr::eq(mesh, other)
+                || mesh.devices().iter().map(Device::id).eq(other.devices().iter().map(Device::id))
+        };
+        if let Some(first) = inputs.first() {
+            let first_mesh = first.mesh();
+            for (index, input) in inputs.iter().enumerate().skip(1) {
+                let mesh = input.mesh();
+                if !shares_devices(mesh, first_mesh) {
+                    return Err(invalid_argument(format!(
+                        "received incompatible devices for eager XLA execution: input #{} is placed on devices {:?} \
+                         but input #0 is placed on devices {:?}",
+                        index,
+                        device_ids(mesh),
+                        device_ids(first_mesh),
+                    )));
+                }
+            }
+        }
+
+        // Committed captures must share the devices of the inputs or, without inputs, of the first committed capture.
+        let mut committed_captures = captures.iter().enumerate().filter(|(_, capture)| capture.is_committed());
+        let (reference, reference_mesh) = match inputs.first() {
+            Some(first) => ("input #0".to_string(), first.mesh()),
+            None => match committed_captures.next() {
+                Some((index, capture)) => (format!("captured array #{index}"), capture.mesh()),
+                None => return Ok(()),
+            },
+        };
+
+        for (index, capture) in committed_captures {
+            let mesh = capture.mesh();
+            if !shares_devices(mesh, reference_mesh) {
                 return Err(invalid_argument(format!(
-                    "received incompatible devices for eager XLA execution: input #{} is placed on devices {:?} \
-                     but input #0 is placed on devices {:?}",
+                    "received incompatible devices for eager XLA execution: captured array #{} is placed on devices \
+                     {:?} but {} is placed on devices {:?}",
                     index,
-                    mesh.devices().iter().map(Device::id).collect::<Vec<_>>(),
-                    first_mesh.devices().iter().map(Device::id).collect::<Vec<_>>(),
+                    device_ids(mesh),
+                    reference,
+                    device_ids(reference_mesh),
                 )));
             }
         }
@@ -846,14 +1022,18 @@ impl Context for Session {
         }
 
         // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone would
-        // miss a pure pass-through or capture of a reference type. The borrowed closure scan covers dormant rule
-        // regions too without cloning their program graphs. Although those rules do not execute in this eager bind,
-        // ordinary XLA rejects unresolved references across the whole artifact, so accepting one here would only
-        // defer failure to compilation with a less targeted diagnostic.
+        // miss a pure pass-through or capture of a reference type. The regions that are scanned are the ones that
+        // lowering emits, which are also the ones that the compiler admits (refer to `contains_unresolved_state` and
+        // `contains_unresolved_references` in the lowering module). Dormant rule regions (e.g., a derivative rule that
+        // no transform calls) never run in this eager bind, and a transform that activates them handles their
+        // references itself.
         if operation.effects().classes().contains(EffectClass::OrderedState)
-            || regions.regions().any(|region| {
-                region.contains_effect_in_closure(EffectClass::OrderedState)
-                    || region.contains_atom_type_in_closure(CoreType::is_reference)
+            || lowered_regions(&operation, &regions).any(|region| {
+                region.atoms().iter().any(|atom| atom.r#type().is_reference())
+                    || region.instructions().iter().any(|instruction| {
+                        let effects = instruction.operation().effects();
+                        effects.classes().contains(EffectClass::OrderedState) || effects.has_reference_effects()
+                    })
             })
         {
             return Err(ProgramError::UnsupportedOperation {
@@ -865,13 +1045,47 @@ impl Context for Session {
             });
         }
 
-        let array_inputs = inputs
+        let mut array_inputs = inputs
             .iter()
             .filter_map(|input| match input {
                 Value::Array(array) => Some(array.clone()),
                 Value::Dimension(_) | Value::Reference(_) => None,
             })
             .collect::<Vec<_>>();
+
+        // Lowering passes the session constants of the lowered regions to the compiled program as hidden arguments, so
+        // the arrays that this application captures take part in its placement like array inputs do. They are collected
+        // from the regions of this application before any deduplication, because the commitment of a handle is not part
+        // of the identity of its session constant, and a cached program may have been built from other handles of the
+        // same arrays.
+        let captures = lowered_regions(&operation, &regions)
+            .flat_map(|region| {
+                region.atoms().iter().filter_map(|atom| match atom.as_constant() {
+                    Some(Constant::Session(constant)) => Some(constant.clone()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Uncommitted inputs follow committed inputs and captures, so they are moved to the mesh of those before
+        // anything observes their placement. Everything that follows, including type inference, the eager dispatch
+        // cache key, and the mesh that `Self::device_mesh_for` selects, sees the inputs after the move.
+        let moved_inputs; // TODO(eaplatanios): Can we avoid the need for an uninitialized variable like this?
+        let inputs = match self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice())? {
+            Some(moved_array_inputs) => {
+                let mut moved_arrays = moved_array_inputs.iter();
+                moved_inputs = inputs
+                    .iter()
+                    .map(|input| match input {
+                        Value::Array(_) => Value::Array(moved_arrays.next().unwrap().clone()),
+                        input => input.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                array_inputs = moved_array_inputs;
+                moved_inputs.as_slice()
+            }
+            None => inputs,
+        };
 
         // These operations are decided on the host and return without compiling a program. `Context::bind` has already
         // rejected attached regions for the operations that declare no region slots, which includes all of them. Every
@@ -971,7 +1185,7 @@ impl Context for Session {
                 // array of another client is therefore rejected like the inputs of any other operation, even when it
                 // lives on devices with the same IDs, rather than returned as it is or mixed with buffers of this
                 // client.
-                self.validate_input_placement(std::slice::from_ref(&array))?;
+                self.validate_input_placement(std::slice::from_ref(&array), &[])?;
 
                 // The source of the operation says where the value was expected to live when the operation was staged,
                 // which transposition needs. It is not compared with the placement of the array, which is known exactly
@@ -1008,7 +1222,7 @@ impl Context for Session {
                         ),
                     });
                 }
-                self.validate_input_placement(&array_inputs)?;
+                self.validate_input_placement(&array_inputs, &captures)?;
                 for input in &array_inputs {
                     input
                         .block_until_ready()
@@ -1063,20 +1277,27 @@ impl Context for Session {
         // lowering, and compilation key construction and only revalidates its input placement. Hits are looked up
         // through a borrowed query, and the owned key is only built on a miss.
         let region_keys = regions.regions().map(RegionRef::key).collect::<Vec<_>>();
+
+        // The program runs on the mesh of its first array input. Without array inputs, a committed capture decides
+        // where it runs, like a committed input would.
+        let operand_mesh = array_inputs
+            .first()
+            .map(Array::mesh)
+            .or_else(|| captures.iter().find(|capture| capture.is_committed()).map(RetainedArray::mesh));
         let query = EagerDispatchQuery::new(
             &operation,
             region_keys.as_slice(),
             inputs,
-            // This is the mesh that `Self::device_mesh_for` resolves for these inputs when it does not have to fall
-            // back to the devices of the client, and it must stay in agreement with that function. The fallbacks depend
-            // only on the operation and the client, which the key already covers, and leaving them out keeps cache hits
-            // free of device queries.
-            array_inputs.first().map(Array::mesh).or(self.mesh.as_ref()),
+            // This is the mesh that the program runs on when it does not have to fall back to the mesh that
+            // `Self::device_mesh_for` derives from the devices of the client, and it must stay in agreement with the
+            // mesh that a miss selects below. The fallbacks depend only on the operation and the client, which the key
+            // already covers, and leaving them out keeps cache hits free of device queries.
+            operand_mesh.or(self.mesh.as_ref()),
         );
 
         let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
             Some(compiled) => {
-                self.validate_input_placement(array_inputs.as_slice())?;
+                self.validate_input_placement(array_inputs.as_slice(), captures.as_slice())?;
                 compiled
             }
             None => {
@@ -1091,7 +1312,7 @@ impl Context for Session {
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 match entry {
                     SpecializationCacheEntry::Occupied(compiled) => {
-                        self.validate_input_placement(array_inputs.as_slice())?;
+                        self.validate_input_placement(array_inputs.as_slice(), captures.as_slice())?;
                         compiled
                     }
                     SpecializationCacheEntry::Vacant(producer) => {
@@ -1140,7 +1361,7 @@ impl Context for Session {
 
                         // Adding the instruction has inferred the output types, so type errors are reported before
                         // placement errors.
-                        self.validate_input_placement(array_inputs.as_slice())?;
+                        self.validate_input_placement(array_inputs.as_slice(), captures.as_slice())?;
                         let builder =
                             Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
 
@@ -1182,7 +1403,10 @@ impl Context for Session {
                             .collect::<Result<Vec<_>, _>>()?;
                         let logical_mesh =
                             output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
-                        let mesh = self.device_mesh_for(array_inputs.as_slice(), logical_mesh)?;
+                        let mesh = match operand_mesh {
+                            Some(mesh) => mesh.clone(),
+                            None => self.device_mesh_for(&[], logical_mesh)?,
+                        };
                         let mut options = Options::new(mesh);
 
                         // Arguments are placed as their runtime arrays are, including over the auto mesh axes that
@@ -1213,9 +1437,15 @@ impl Context for Session {
         };
 
         // Execution produces outputs that belong to this session, so chained eager operations and transforms over them
-        // keep executing in the same session and effect scope. Arrays of session constants precede the inputs.
+        // keep executing in the same session and effect scope. Arrays of session constants precede the inputs. The
+        // outputs are committed when the mesh was chosen on purpose or when an array that this application captures is
+        // committed, like the outputs of a compiled function that captures it. The captures of this application decide
+        // that rather than the session constants of the cached program, which may come from other handles of the same
+        // arrays, so the commitment of the outputs depends neither on the order of the captures nor on the cache.
         let mut arguments =
             compiled.constants.iter().map(|constant| constant.to_array(self)).collect::<Result<Vec<_>, _>>()?;
+        let committed =
+            self.commits_placement(array_inputs.as_slice()) || captures.iter().any(RetainedArray::is_committed);
         arguments.extend(array_inputs);
         let mut arrays = self
             .execute_program(&compiled.program, arguments)
@@ -1225,9 +1455,13 @@ impl Context for Session {
             .outputs
             .iter()
             .map(|output| match output {
-                EagerDispatchOutput::Array => arrays.next().map(Value::Array).ok_or_else(|| {
-                    ProgramError::MalformedProgram("eager program returned fewer arrays than its outputs".to_string())
-                }),
+                EagerDispatchOutput::Array => {
+                    arrays.next().map(|array| Value::Array(array.with_committed(committed))).ok_or_else(|| {
+                        ProgramError::MalformedProgram(
+                            "eager program returned fewer arrays than its outputs".to_string(),
+                        )
+                    })
+                }
                 EagerDispatchOutput::Dimension(value) => {
                     Ok(Value::Dimension(Dimension::new(value.clone(), self.clone())))
                 }
@@ -1262,6 +1496,23 @@ impl Context for Session {
         let _ = scope;
         function()
     }
+}
+
+// TODO(eaplatanios): Why do we need this helper?
+/// Returns the regions of an application of `operation` to `regions` that lowering emits, which are its attached
+/// computation regions and their own computation regions (i.e., the regions that [`RegionRef::computation_regions`]
+/// visits from the entry region of the program that eager binding compiles for the application). Dormant rule regions
+/// (e.g., derivative rules that no transform has called) are excluded, as they are from the admission checks and the
+/// session constants of the compiler.
+fn lowered_regions<'s>(
+    operation: &'s Operation,
+    regions: &'s AttachedRegions<'_, Constant, Operation>,
+) -> impl Iterator<Item = RegionRef<'s, Constant, Operation>> {
+    regions
+        .regions()
+        .enumerate()
+        .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
+        .flat_map(|(_, region)| region.computation_regions())
 }
 
 impl Zero<Value> for Session {
@@ -1323,6 +1574,10 @@ struct SessionState {
     /// Counts of the logical arrays created through the session, and descriptions of the live ones if the session
     /// tracks them. Array storage holds its own handle, which lets it update the counts when it is dropped.
     array_tracker: Arc<ArrayTracker>,
+
+    /// Bounded workers that run the background host uploads of the session. They start lazily and exit once this state
+    /// is dropped and their queued uploads have run.
+    host_upload_workers: HostUploadWorkers,
 }
 
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
@@ -1557,6 +1812,7 @@ impl SessionBuilder {
                 runtimes: RuntimeRegistry::new(client, self.runtime_extensions),
                 work: SessionWorkTracker::default(),
                 array_tracker: Arc::new(ArrayTracker::new(self.live_array_tracking)),
+                host_upload_workers: HostUploadWorkers::default(),
             }),
             mesh: None,
             effect_scope: Arc::new(EffectScope::default()),
@@ -1671,7 +1927,7 @@ pub(crate) mod tests {
         ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ScanOperation, SelectOperation, Shape,
         ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension,
         ShardingError, StaticShape, SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue,
-        WhileOperation, ZeroOperation, batch, differentiate_at, i4, shard_map, shard_map_along,
+        WhileOperation, ZeroOperation, batch, differentiate_at, i4, rematerialize, shard_map, shard_map_along,
         shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::protos::Precision;
@@ -1697,7 +1953,7 @@ pub(crate) mod tests {
     };
     use crate::{
         ArrayPlacement, CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
-        JitCallOperation, ProgramBuilder, Reference, jit,
+        JitCallOperation, PlacementOptions, ProgramBuilder, Reference, jit,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -1827,6 +2083,25 @@ pub(crate) mod tests {
     /// Reads the first addressable shard, interpreting each nonzero byte as `true`.
     pub(crate) fn read_booleans(client: &Client<'_>, array: &Array) -> Vec<bool> {
         read_first_shard::<u8>(client, array).into_iter().map(|value| value != 0).collect()
+    }
+
+    /// Adds the arrays in `captures` to `input` in a rematerialized function that captures them in that order, so that
+    /// the eager application of the function refers to them as session constants of its region.
+    fn add_captures(input: &Array, captures: &[Array]) -> Result<Array, ProgramError> {
+        let function = rematerialize(|input: Tracer| {
+            let captures = captures
+                .iter()
+                .map(|capture| {
+                    ImportingContext::<Session, ThroughSession>::import(input.context(), Value::Array(capture.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut sum = ValueProjection::<ArrayType>::into_projected(input)?;
+            for capture in captures {
+                sum = sum.add(&ValueProjection::<ArrayType>::into_projected(capture)?)?;
+            }
+            Ok(sum.into_value())
+        });
+        Ok(ValueProjection::<ArrayType>::into_projected(function.call(Value::Array(input.clone()))?)?)
     }
 
     #[test]
@@ -2411,6 +2686,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_bind_commits_results_whose_placement_was_chosen() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let meshed_session = session.with_device_mesh(mesh.clone());
+        let literal = || ConstantOperation::new(CoreArray::scalar(1.5f32).unwrap());
+        let r#type = Type::Array(ArrayType::new_static(DataType::F32, [2]));
+        let negate = |session: &Session, input: &Value| {
+            let operation = Operation::Array(NegOperation::new().into());
+            session.bind(operation, Vec::new(), std::slice::from_ref(input)).unwrap().remove(0)
+        };
+
+        // Without array inputs, a result is committed when the mesh of the session decides where it lives, and it is
+        // uncommitted when it lives on the first device of the client only because the session has no mesh.
+        let constant = session.bind(literal(), Vec::new(), &[]).unwrap().remove(0);
+        assert!(!program_array(&constant).is_committed());
+        assert!(program_array(&meshed_session.bind(literal(), Vec::new(), &[]).unwrap()[0]).is_committed());
+        assert!(!program_array(&session.zero(&r#type).unwrap()).is_committed());
+        assert!(program_array(&meshed_session.zero(&r#type).unwrap()).is_committed());
+        assert!(!program_array(&session.lift(Constant::Boolean(true)).unwrap()).is_committed());
+        assert!(program_array(&meshed_session.lift(Constant::Boolean(true)).unwrap()).is_committed());
+
+        // With array inputs, a result is committed when one of its inputs is, whatever the mesh of the session.
+        assert!(!program_array(&negate(&meshed_session, &constant)).is_committed());
+        let committed = Value::Array(f32_scalar(&session, &mesh, 2.0));
+        assert!(program_array(&negate(&session, &committed)).is_committed());
+    }
+
+    #[test]
     fn test_session_bind_rejects_managed_callbacks() {
         let session = Session::builder().client(execution_client()).build().unwrap();
         let _guard = EffectCallbackGuard::enter();
@@ -2513,20 +2817,22 @@ pub(crate) mod tests {
             }),
         );
 
-        // Reference state confined to a dormant custom derivative rule region is rejected too. Ordinary XLA rejects
-        // unresolved reference artifacts across the whole program, so eager binding matches that policy instead of
-        // deferring the failure to compilation with a less targeted diagnostic.
+        // Reference state confined to a dormant custom derivative rule region is admitted, because lowering emits only
+        // the computation regions of an application, and the compiler admits such a program as well. The rule would
+        // only run under a transform, which discharges or rejects its references itself.
+        let input = f32_scalar(&session, &mesh, 2.0);
+        let input_type = input.r#type().into_owned();
         let primal = {
             let mut builder = ProgramBuilder::new();
-            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let state = builder.add_input(input_type.clone().into());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![state], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
         };
         let rule = {
             let mut builder = ProgramBuilder::new();
-            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
-            let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let state = builder.add_input(input_type.clone().into());
+            let state_tangent = builder.add_input(input_type.clone().into());
             let reference =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let output =
@@ -2539,25 +2845,20 @@ pub(crate) mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(
-            session.bind(
+        let outputs = session
+            .bind(
                 Operation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 vec![primal.clone(), rule],
-                &[],
-            ),
-            Err(ProgramError::UnsupportedOperation {
-                message: "`composite` carries reference state that XLA eager execution cannot lower; \
-                          discharge references before lowering"
-                    .to_string(),
-            }),
-        );
+                &[Value::Array(input.clone())],
+            )
+            .unwrap();
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![2.0]);
 
-        // A pure capture of a reference type in the dormant rule has no `OrderedState` effect, so only the type scan
-        // over the complete arena can keep the eager and compiled XLA rejection policies aligned.
+        // The same holds for a pure capture of a reference type in the dormant rule, without an `OrderedState` effect.
         let pure_reference_rule = {
             let mut builder = ProgramBuilder::new();
-            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
-            let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let state = builder.add_input(input_type.clone().into());
+            let state_tangent = builder.add_input(input_type.into());
             builder.add_constant(Constant::Captured(CaptureReference::new(
                 0,
                 Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
@@ -2570,18 +2871,14 @@ pub(crate) mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(
-            session.bind(
+        let outputs = session
+            .bind(
                 Operation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
                 vec![primal, pure_reference_rule],
-                &[],
-            ),
-            Err(ProgramError::UnsupportedOperation {
-                message: "`composite` carries reference state that XLA eager execution cannot lower; \
-                          discharge references before lowering"
-                    .to_string(),
-            }),
-        );
+                &[Value::Array(input)],
+            )
+            .unwrap();
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![2.0]);
     }
 
     #[test]
@@ -2753,6 +3050,32 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         assert_eq!(gathered.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_session_bind_place_commits_results_with_a_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let input = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        let target = Placement::new(input.mesh().clone(), input.sharding().clone()).unwrap();
+        let place = |operation: PlaceOperation, input: &Array| {
+            let outputs = session.bind(operation, Vec::new(), &[Value::Array(input.clone())]).unwrap();
+            program_array(&outputs[0]).clone()
+        };
+        assert!(!input.is_committed());
+
+        // A placement with a target commits its result, even one that leaves the array where it is.
+        assert!(place(PlaceOperation::new(target.clone(), None), &input).is_committed());
+        assert!(place(PlaceOperation::new(target, None).with_may_alias(false), &input).is_committed());
+
+        // A placement without a target keeps the commitment of its input, also when it copies the input.
+        assert!(!place(PlaceOperation::new(Option::<Placement>::None, None), &input).is_committed());
+        assert!(
+            !place(PlaceOperation::new(Option::<Placement>::None, None).with_may_alias(false), &input).is_committed()
+        );
+        let committed = input.with_committed(true);
+        assert!(place(PlaceOperation::new(Option::<Placement>::None, None), &committed).is_committed());
     }
 
     #[test]
@@ -4147,6 +4470,279 @@ pub(crate) mod tests {
                 ),
             }),
         );
+    }
+
+    #[test]
+    fn test_session_bind_moves_uncommitted_inputs_to_the_devices_of_committed_inputs() {
+        // A host scalar placed without a destination lives on the first device without being committed to it, so an
+        // operation with an array that is committed to the second device runs on that device, in both input orders.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
+        let scalar = session.place(2f32, PlacementOptions::defaults()).unwrap();
+        let committed = f32_scalar(&session, &second_mesh, 3.0);
+        let operation = Operation::Array(AddOperation::new().into());
+        let inputs = [Value::Array(scalar.clone()), Value::Array(committed.clone())];
+        let outputs = session.bind(operation.clone(), Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &second_mesh);
+        assert!(program_array(&outputs[0]).is_committed());
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![5.0]);
+        let inputs = [Value::Array(committed), Value::Array(scalar.clone())];
+        let outputs = session.bind(operation, Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &second_mesh);
+        assert!(program_array(&outputs[0]).is_committed());
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![5.0]);
+
+        // The eager dispatch cache sees the inputs after the move, so both orders share one compiled program.
+        assert_eq!(session.eager_dispatch_statistics().hits, 1);
+        assert_eq!(session.cached_program_count(), 1);
+
+        // The uncommitted input itself stays where it was.
+        assert_eq!(scalar.mesh().devices(), [wide_mesh.devices()[0]]);
+        assert!(!scalar.is_committed());
+    }
+
+    #[test]
+    fn test_session_bind_moves_uncommitted_inputs_without_copying_buffers_that_stay_on_their_devices() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let committed = f32_scalar(&session, &mesh, 3.0);
+        let operation = Operation::Array(AddOperation::new().into());
+
+        // An uncommitted input that already lives on the mesh of the committed input is used as it is, so the only
+        // array that the operation creates is its result.
+        let uncommitted =
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
+                .unwrap();
+        assert_eq!(uncommitted.mesh(), &mesh);
+        assert!(!uncommitted.is_committed());
+        let created_arrays = session.array_statistics().created_arrays;
+        let inputs = [Value::Array(uncommitted), Value::Array(committed.clone())];
+        let outputs = session.bind(operation.clone(), Vec::new(), &inputs).unwrap();
+        assert_eq!(session.array_statistics().created_arrays, created_arrays + 1);
+        assert!(program_array(&outputs[0]).is_committed());
+        assert_eq!(read_first_shard::<f32>(client, program_array(&outputs[0])), vec![5.0]);
+
+        // An uncommitted input on the same device but on a mesh with another axis moves to the mesh of the committed
+        // input, and its shard keeps its buffer.
+        let uncommitted = session.place(2f32, PlacementOptions::defaults()).unwrap();
+        assert_ne!(uncommitted.mesh(), &mesh);
+        assert_eq!(uncommitted.mesh().devices(), mesh.devices());
+        let moved = session.place_uncommitted_inputs(&[uncommitted.clone(), committed.clone()], &[]).unwrap().unwrap();
+        assert_eq!(moved[0].mesh(), &mesh);
+        assert!(!moved[0].is_committed());
+        assert!(Arc::ptr_eq(moved[0].shards()[0].buffer().unwrap(), uncommitted.shards()[0].buffer().unwrap()));
+        assert_eq!(moved[1], committed);
+        let inputs = [Value::Array(uncommitted), Value::Array(committed)];
+        let outputs = session.bind(operation, Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &mesh);
+        assert!(program_array(&outputs[0]).is_committed());
+        assert_eq!(read_first_shard::<f32>(client, program_array(&outputs[0])), vec![5.0]);
+    }
+
+    #[test]
+    fn test_session_bind_moves_uncommitted_inputs_on_different_devices_to_the_default_mesh() {
+        // Without a committed input, uncommitted inputs on different devices move to the default mesh of the session,
+        // which is its first device when the session has no mesh, in both input orders, and the result stays
+        // uncommitted.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![wide_mesh.devices()[0]]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
+        let first = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        let second = f32_scalar(&session, &second_mesh, 2.0).with_committed(false);
+        assert_eq!(first.mesh(), &first_mesh);
+        assert!(!first.is_committed());
+        let operation = Operation::Array(AddOperation::new().into());
+        let inputs = [Value::Array(first.clone()), Value::Array(second.clone())];
+        let outputs = session.bind(operation.clone(), Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &first_mesh);
+        assert!(!program_array(&outputs[0]).is_committed());
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![3.0]);
+        let inputs = [Value::Array(second.clone()), Value::Array(first.clone())];
+        let outputs = session.bind(operation.clone(), Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &first_mesh);
+        assert!(!program_array(&outputs[0]).is_committed());
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![3.0]);
+
+        // A session handle with a mesh moves them to that mesh instead.
+        let meshed_session = session.with_device_mesh(second_mesh.clone());
+        let inputs = [Value::Array(first.clone()), Value::Array(second.clone())];
+        let outputs = meshed_session.bind(operation.clone(), Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &second_mesh);
+        assert!(!program_array(&outputs[0]).is_committed());
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![3.0]);
+
+        // Uncommitted inputs on the same devices stay there, and the result is uncommitted.
+        let inputs = [Value::Array(second.clone()), Value::Array(second)];
+        let outputs = session.bind(operation, Vec::new(), &inputs).unwrap();
+        assert_eq!(program_array(&outputs[0]).mesh(), &second_mesh);
+        assert!(!program_array(&outputs[0]).is_committed());
+        assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![4.0]);
+    }
+
+    #[test]
+    fn test_session_bind_rejects_uncommitted_inputs_that_cannot_move() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let operation = Operation::Array(AddOperation::new().into());
+
+        // An uncommitted input that is sharded over a mesh other than the mesh of the committed input keeps its
+        // placement, because its sharding means nothing on that mesh, so the operation fails as it did before the
+        // input could move (here, already in type inference), and no array is moved.
+        let sharded_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::new(sharded_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let sharded =
+            Array::from_host_buffer(&session, sharded_type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        assert!(!sharded.is_committed());
+        let committed_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![devices[1]],
+        )
+        .unwrap();
+        let committed = f32_vector(&session, &committed_mesh, &[3.0, 4.0]);
+        let created_arrays = session.array_statistics().created_arrays;
+        assert!(matches!(
+            session.bind(operation.clone(), Vec::new(), &[Value::Array(sharded), Value::Array(committed)]),
+            Err(ProgramError::Type(_)),
+        ));
+        assert_eq!(session.array_statistics().created_arrays, created_arrays);
+
+        // An uncommitted input does not move to a committed input with shards in other processes, because each process
+        // chooses the devices of its uncommitted arrays for itself, so the operation fails with the placement error.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let remote = Device::new(devices[1].id() + 1, devices[1].process_index() + 1);
+        let remote_mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(logical_mesh, 1))
+            .unwrap();
+        let remote_array =
+            Array::from_addressable_buffers(&session, r#type.clone(), remote_mesh, None, Vec::new()).unwrap();
+        let uncommitted = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        assert!(!uncommitted.is_committed());
+        assert_eq!(
+            session.bind(
+                operation.clone(),
+                Vec::new(),
+                &[Value::Array(uncommitted.clone()), Value::Array(remote_array.clone())],
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "received incompatible devices for eager XLA execution: input #1 is placed on devices {:?} but \
+                     input #0 is placed on devices {:?}",
+                    vec![remote.id()],
+                    vec![uncommitted.mesh().devices()[0].id()],
+                ),
+            }),
+        );
+
+        // Without a committed input, an uncommitted input with shards in other processes does not move to the default
+        // mesh of the session either.
+        let inputs = [Value::Array(uncommitted.clone()), Value::Array(remote_array.with_committed(false))];
+        assert_eq!(
+            session.bind(operation, Vec::new(), &inputs),
+            Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "received incompatible devices for eager XLA execution: input #1 is placed on devices {:?} but \
+                     input #0 is placed on devices {:?}",
+                    vec![remote.id()],
+                    vec![uncommitted.mesh().devices()[0].id()],
+                ),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_session_bind_moves_uncommitted_inputs_to_the_devices_of_committed_captures() {
+        // A captured array that is committed to the second device decides where a computation runs, like a committed
+        // input does, so the uncommitted input moves to that device and the result is committed to it.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![wide_mesh.devices()[0]]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
+        let input = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 2f32.to_ne_bytes())
+            .unwrap();
+        let captured = f32_scalar(&session, &second_mesh, 3.0);
+        assert_eq!(input.mesh(), &first_mesh);
+        assert!(!input.is_committed());
+        let output = add_captures(&input, std::slice::from_ref(&captured)).unwrap();
+        assert_eq!(output.mesh(), &second_mesh);
+        assert!(output.is_committed());
+        assert_eq!(read_sharded_f32_array(&output), vec![5.0]);
+
+        // An uncommitted captured array follows a committed input instead.
+        let committed = f32_scalar(&session, &first_mesh, 2.0);
+        let output = add_captures(&committed, &[captured.with_committed(false)]).unwrap();
+        assert_eq!(output.mesh(), &first_mesh);
+        assert!(output.is_committed());
+        assert_eq!(read_sharded_f32_array(&output), vec![5.0]);
+    }
+
+    #[test]
+    fn test_session_bind_rejects_inputs_and_captures_committed_to_different_devices() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![wide_mesh.devices()[0]]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
+        let input = f32_scalar(&session, &first_mesh, 2.0);
+        let captured = f32_scalar(&session, &second_mesh, 3.0);
+        assert_eq!(
+            add_captures(&input, &[captured]),
+            Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "received incompatible devices for eager XLA execution: captured array #0 is placed on devices \
+                     {:?} but input #0 is placed on devices {:?}",
+                    vec![second_mesh.devices()[0].id()],
+                    vec![first_mesh.devices()[0].id()],
+                ),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_session_bind_commits_results_independently_of_capture_order_and_cache_history() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let input = session.place(1f32, PlacementOptions::defaults()).unwrap();
+        let committed = input.clone().with_committed(true);
+        assert!(!input.is_committed());
+
+        // An uncommitted array and its committed alias are one session constant, and a result that uses both is
+        // committed in either capture order.
+        let output = add_captures(&input, &[input.clone(), committed.clone()]).unwrap();
+        assert!(output.is_committed());
+        assert_eq!(read_sharded_f32_array(&output), vec![3.0]);
+        let output = add_captures(&input, &[committed.clone(), input.clone()]).unwrap();
+        assert!(output.is_committed());
+        assert_eq!(read_sharded_f32_array(&output), vec![3.0]);
+
+        // Applications that differ only in the commitment of their captured arrays share one cached program, and the
+        // commitment of each result follows the arrays that its own application captures.
+        session.clear_cache();
+        let hits = session.eager_dispatch_statistics().hits;
+        assert!(!add_captures(&input, std::slice::from_ref(&input)).unwrap().is_committed());
+        assert!(add_captures(&input, std::slice::from_ref(&committed)).unwrap().is_committed());
+        assert!(!add_captures(&input, std::slice::from_ref(&input)).unwrap().is_committed());
+        assert_eq!(session.eager_dispatch_statistics().hits, hits + 2);
+        assert_eq!(session.cached_program_count(), 1);
     }
 
     #[test]
