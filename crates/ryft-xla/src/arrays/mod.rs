@@ -45,7 +45,8 @@ use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 use crate::arrays::metadata::{ArrayMetadata, ArrayOutputPlan};
 use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
-use crate::{Error, Session, ToPjrt, Type};
+use crate::types::ArrayTypeExtension;
+use crate::{Error, Session, Type};
 
 pub mod host;
 pub mod metadata;
@@ -168,8 +169,8 @@ pub enum ArrayError {
 ///
 /// Note that the current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays
 /// retain their logical `I1` or `U1` type while using one byte per element in this physical representation. This
-/// executable convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer
-/// types.
+/// executable convention is separate from [`ToPjrt`](crate::ToPjrt) for [`DataType`], which preserves native PJRT
+/// one-bit integer types.
 #[derive(Clone, Parameter)]
 pub struct Array {
     /// Type and shards of this [`Array`]. They are immutable once constructed and shared by every clone,
@@ -542,7 +543,7 @@ impl Array {
     /// Bufferless [`DataType::Zero`] arrays occupy zero bytes.
     #[inline]
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
-        self.parts.metadata.r#type().size_in_bytes()
+        self.parts.metadata.r#type().dense_size_in_bytes()
     }
 
     /// Returns the whole-execution completion fence shared by the outputs of this array's producer, when it has one.
@@ -1026,23 +1027,6 @@ impl std::ops::BitXor for Array {
     }
 }
 
-/// Provides XLA-specific helpers for [`ArrayType`]s.
-pub trait ArrayTypeExtension {
-    /// Returns the number of logical payload bytes required by a dense [`Array`] of this [`ArrayType`].
-    /// [`DataType::Zero`] requires no payload bytes even though a backend may use a temporary private carrier.
-    fn size_in_bytes(&self) -> Result<usize, Error>;
-}
-
-impl ArrayTypeExtension for ArrayType {
-    fn size_in_bytes(&self) -> Result<usize, Error> {
-        if self.data_type().is_zero() {
-            return Ok(0);
-        }
-        let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
-        dense_size_in_bytes(self, element_size_in_bytes)
-    }
-}
-
 /// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
 #[inline]
 pub async fn ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
@@ -1086,20 +1070,6 @@ impl ArrayParts {
     }
 }
 
-/// Returns the checked dense byte count of a non-zero-space array type using its previously computed element size.
-fn dense_size_in_bytes(r#type: &ArrayType, element_size_in_bytes: usize) -> Result<usize, Error> {
-    let element_count = r#type
-        .element_count()?
-        .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
-    element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
-        message: format!(
-            "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
-            r#type,
-            usize::MAX,
-        ),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::pin::pin;
@@ -1127,7 +1097,7 @@ mod tests {
     use crate::types::DataTypeExtension;
     use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
 
-    use super::{Array, ArrayError, ArrayTypeExtension, block_until_ready, ready};
+    use super::{Array, ArrayError, block_until_ready, ready};
 
     /// Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
     /// separate values `device_bytes` that the two devices of the client of `session` hold.
@@ -2339,38 +2309,6 @@ mod tests {
         assert_eq!((truths.clone() | mixed.clone()).copy_to_host_bytes().unwrap(), vec![1u8, 1, 1, 0]);
         assert_eq!((truths ^ mixed.clone()).copy_to_host_bytes().unwrap(), vec![0u8, 1, 1, 0]);
         assert_eq!((!mixed).copy_to_host_bytes().unwrap(), vec![0u8, 1, 0, 1]);
-    }
-
-    #[test]
-    fn test_array_type_size_in_bytes() {
-        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let scalar_type = ArrayType::scalar(DataType::C128);
-        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(4)]));
-
-        assert_eq!(matrix_type.size_in_bytes().unwrap(), 24);
-        assert_eq!(scalar_type.size_in_bytes().unwrap(), 16);
-        assert_eq!(token_type.size_in_bytes().unwrap(), 0);
-
-        let dynamic_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
-        );
-        let error = dynamic_type.size_in_bytes().unwrap_err();
-        assert!(matches!(&error,
-            Error::Array(error) if matches!(error.as_ref(),
-                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
-            ),
-        ));
-        assert_eq!(error.to_string(), "expected static shape but got `[dynamic]`");
-
-        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));
-        let error = oversized_type.size_in_bytes().unwrap_err();
-        let message = format!(
-            "dense byte size for array type `{oversized_type}` exceeds the maximum allowed size of {}",
-            usize::MAX,
-        );
-        assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
-        assert_eq!(error.to_string(), message);
     }
 
     #[test]

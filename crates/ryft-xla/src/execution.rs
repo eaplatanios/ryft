@@ -1425,7 +1425,7 @@ impl Session {
             let data_type = input.data_type();
             let zero_type =
                 ArrayType::scalar(data_type).with_sharding(Sharding::replicated(input.sharding().mesh().clone(), 0))?;
-            let zero_bytes = vec![0u8; data_type.to_pjrt().element_size_in_bytes()?];
+            let zero_bytes = vec![0u8; data_type.size_in_bytes()?];
             let zero = Array::from_host_buffer(self, zero_type, input.mesh().clone(), None, zero_bytes)?;
 
             // The operation runs in this session, which executes the program and is not necessarily the session of

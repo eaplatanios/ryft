@@ -1,15 +1,19 @@
-//! Conversions between `ryft-core` data types and layouts and their PJRT representations. This module implements
-//! [`ToPjrt`] and [`FromPjrt`] for [`DataType`] (i.e., PJRT [`BufferType`]s) and for [`Layout`], [`TiledLayout`],
-//! [`StridedLayout`], [`Tile`], and [`TileDimension`]. Tiled and strided layout conversions are fallible because
-//! PJRT stores minor-to-major dimension indices as unsigned 64-bit integers and strides as signed 64-bit integers.
+//! PJRT representations of `ryft-core` data types and layouts, and dense byte counts for host transfers.
+//! This module implements [`ToPjrt`] and [`FromPjrt`] for [`DataType`] (i.e., PJRT [`BufferType`]s) and for
+//! [`Layout`], [`TiledLayout`], [`StridedLayout`], [`Tile`], and [`TileDimension`]. Tiled and strided layout
+//! conversions are fallible because PJRT stores minor-to-major dimension indices as unsigned 64-bit integers
+//! and strides as signed 64-bit integers. [`ArrayTypeExtension`] uses the logical size of a single element to
+//! compute the dense byte count of a whole array.
 
-use ryft_core::{DataType, DataTypeError, Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
+use ryft_core::{
+    ArrayType, DataType, DataTypeError, Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout,
+};
 use ryft_pjrt::{
     BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
     TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
 };
 
-use crate::{FromPjrt, ToPjrt};
+use crate::{ArrayError, Error, FromPjrt, ToPjrt};
 
 impl ToPjrt for TileDimension {
     type Output = PjrtTileDimension;
@@ -254,14 +258,26 @@ impl FromPjrt<BufferType> for DataType {
     }
 }
 
-/// Extends [`DataType`] with its representation at the XLA executable boundary.
+/// Extends [`DataType`] with its PJRT executable representation and logical payload size.
 pub(crate) trait DataTypeExtension {
+    /// Returns the number of bytes one element occupies in a dense array. [`DataType::Zero`] has no logical
+    /// payload even when PJRT uses a temporary predicate buffer to represent it.
+    fn size_in_bytes(self) -> Result<usize, Error>;
+
     /// Returns the PJRT buffer type for this data type in a StableHLO executable. Signed and unsigned one-bit
     /// integers both lower to signless `i1` and use predicate buffers. Other types use their [`ToPjrt`] representation.
     fn executable_buffer_type(self) -> BufferType;
 }
 
 impl DataTypeExtension for DataType {
+    #[inline]
+    fn size_in_bytes(self) -> Result<usize, Error> {
+        if self.is_zero() {
+            return Ok(0);
+        }
+        Ok(self.to_pjrt().element_size_in_bytes()?)
+    }
+
     #[inline]
     fn executable_buffer_type(self) -> BufferType {
         match self {
@@ -271,9 +287,43 @@ impl DataTypeExtension for DataType {
     }
 }
 
+/// Extends [`ArrayType`] with the dense byte counts used by the XLA backend.
+pub trait ArrayTypeExtension {
+    /// Returns the number of logical payload bytes required by a dense [`Array`](crate::Array) of this type.
+    /// [`DataType::Zero`] requires no payload bytes even when the backend uses a temporary buffer for it.
+    ///
+    /// # Errors
+    ///
+    /// For types other than [`DataType::Zero`], returns an error if the element count cannot be determined from
+    /// the shape or if either the element count or byte count overflows [`usize`].
+    fn dense_size_in_bytes(&self) -> Result<usize, Error>;
+}
+
+impl ArrayTypeExtension for ArrayType {
+    fn dense_size_in_bytes(&self) -> Result<usize, Error> {
+        let data_type = self.data_type();
+        if data_type.is_zero() {
+            return Ok(0);
+        }
+        let element_size_in_bytes = data_type.size_in_bytes()?;
+        let element_count = self
+            .element_count()?
+            .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: self.shape().clone() }))?;
+        element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+            message: format!(
+                "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
+                self,
+                usize::MAX,
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
+    use ryft_core::{Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -436,5 +486,47 @@ mod tests {
         assert_eq!(DataType::U1.executable_buffer_type(), BufferType::Predicate);
         assert_eq!(DataType::Boolean.executable_buffer_type(), BufferType::Predicate);
         assert_eq!(DataType::I2.executable_buffer_type(), BufferType::I2);
+    }
+
+    #[test]
+    fn test_data_type_size_in_bytes() {
+        assert_eq!(DataType::Zero.size_in_bytes().unwrap(), 0);
+        assert_eq!(DataType::Token.size_in_bytes().unwrap(), 0);
+        assert_eq!(DataType::I1.size_in_bytes().unwrap(), 1);
+        assert_eq!(DataType::F32.size_in_bytes().unwrap(), size_of::<f32>());
+    }
+
+    #[test]
+    fn test_array_type_dense_size_in_bytes() {
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let scalar_type = ArrayType::scalar(DataType::C128);
+        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(4)]));
+        let zero_type = ArrayType::new(DataType::Zero, matrix_type.shape().clone());
+
+        assert_eq!(matrix_type.dense_size_in_bytes().unwrap(), 24);
+        assert_eq!(scalar_type.dense_size_in_bytes().unwrap(), 16);
+        assert_eq!(token_type.dense_size_in_bytes().unwrap(), 0);
+        assert_eq!(zero_type.dense_size_in_bytes().unwrap(), 0);
+
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
+        );
+        let error = dynamic_type.dense_size_in_bytes().unwrap_err();
+        assert!(matches!(&error,
+            Error::Array(error) if matches!(error.as_ref(),
+                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
+            ),
+        ));
+        assert_eq!(error.to_string(), "expected static shape but got `[dynamic]`");
+
+        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));
+        let error = oversized_type.dense_size_in_bytes().unwrap_err();
+        let message = format!(
+            "dense byte size for array type `{oversized_type}` exceeds the maximum allowed size of {}",
+            usize::MAX,
+        );
+        assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
+        assert_eq!(error.to_string(), message);
     }
 }

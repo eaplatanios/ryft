@@ -1577,9 +1577,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let shardy_lowered = lowered.clone().with_stable_hlo(annotated.into_parts().0).with_compilation_options(
-            jit_compilation_options(session.compilation_options(), mesh.devices(), true, None),
-        );
+        let mut shardy_options = jit_compilation_options(session.compilation_options(), mesh.devices(), true, None);
+        resolve_shardy_debug_options(client, &mut shardy_options);
+        let shardy_lowered =
+            lowered.clone().with_stable_hlo(annotated.into_parts().0).with_compilation_options(shardy_options);
         let Err(error) = session.compile_program(&shardy_lowered) else {
             panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
         };

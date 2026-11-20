@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use ryft_core::{ArrayType, DeviceId, DeviceMesh, Sharding, Typed};
 
+use crate::Error;
 use crate::arrays::metadata::ArrayMetadata;
 use crate::arrays::shards::ArrayShard;
-use crate::{Error, ToPjrt};
+use crate::types::DataTypeExtension;
 
 /// Snapshot of the logical array counts of a [`Session`](crate::Session), which
 /// [`Session::array_statistics`](crate::Session::array_statistics) returns for diagnosing array churn and retention.
@@ -94,7 +95,7 @@ impl LiveArray {
 
     /// Returns the number of logical payload bytes of `buffer`, which must be one of the buffers of this array.
     fn buffer_size_in_bytes(&self, buffer: &LiveArrayBuffer) -> Result<usize, Error> {
-        let element_size_in_bytes = self.metadata.r#type().data_type().to_pjrt().element_size_in_bytes()?;
+        let element_size_in_bytes = self.metadata.r#type().data_type().size_in_bytes()?;
         buffer.element_count.checked_mul(element_size_in_bytes).ok_or_else(|| self.size_limit_exceeded())
     }
 

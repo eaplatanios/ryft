@@ -7,9 +7,9 @@ use ryft_pjrt::{DeviceId, ExecutionFence, HostBuffer, HostDestination};
 
 use crate::arrays::metadata::resolve_placement;
 use crate::arrays::shards::{ArrayShard, ShardIndex, ShardLayout};
-use crate::arrays::{Array, ArrayError, ArrayTypeExtension, dense_size_in_bytes};
+use crate::arrays::{Array, ArrayError};
 use crate::devices::PjrtDeviceExtension;
-use crate::types::DataTypeExtension;
+use crate::types::{ArrayTypeExtension, DataTypeExtension};
 use crate::{Error, Session, ToPjrt};
 
 impl Array {
@@ -70,7 +70,7 @@ impl Array {
         let (r#type, sharding) = resolve_placement(r#type, sharding, &mesh)?;
 
         // Validate that the host buffer contains exactly the dense row-major bytes for the full logical array.
-        let expected_byte_count = r#type.size_in_bytes()?;
+        let expected_byte_count = r#type.dense_size_in_bytes()?;
         if buffer.len() != expected_byte_count {
             return Err(Error::from(ArrayError::HostBufferByteCountMismatch {
                 expected: expected_byte_count,
@@ -147,7 +147,7 @@ impl Array {
                 .device_coordinates(shard.index())
                 .is_some_and(|coordinates| unreduced_axis_indices.iter().any(|&axis| coordinates[axis] != 0));
             let uploaded = if zero_summand {
-                let byte_count = ArrayType::new(data_type, shard_shape.clone().into()).size_in_bytes()?;
+                let byte_count = ArrayType::new(data_type, shard_shape.clone().into()).dense_size_in_bytes()?;
                 client.buffer(
                     Arc::<[u8]>::from(vec![0u8; byte_count]),
                     buffer_type,
@@ -319,7 +319,7 @@ impl Array {
             let bytes = host_shards.remove(&device_id).ok_or(ArrayError::MissingHostShard { device_id })?;
             let shape = descriptor.shape();
 
-            let expected = ArrayType::new(data_type, shape.clone().into()).size_in_bytes()?;
+            let expected = ArrayType::new(data_type, shape.clone().into()).dense_size_in_bytes()?;
             let actual = bytes.as_ref().len();
             if actual != expected {
                 return Err(ArrayError::HostShardByteCountMismatch { device_id, expected, actual }.into());
@@ -406,8 +406,20 @@ impl Array {
             return Ok(Vec::new());
         }
 
-        let element_size_in_bytes = element_type.to_pjrt().element_size_in_bytes()?;
-        let total_byte_count = dense_size_in_bytes(self.r#type().as_ref(), element_size_in_bytes)?;
+        // The array and its shards have static shapes and share one element type. Look up its size once for both
+        // the dense byte counts and the copy offsets.
+        let element_size_in_bytes = element_type.size_in_bytes()?;
+        let dense_byte_count = |r#type: &ArrayType| -> Result<usize, Error> {
+            let element_count = r#type.element_count()?.unwrap();
+            element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
+                    r#type,
+                    usize::MAX,
+                ),
+            })
+        };
+        let total_byte_count = dense_byte_count(self.r#type().as_ref())?;
         let mesh = self.mesh();
         let unreduced_axis_indices = mesh
             .logical_mesh()
@@ -527,7 +539,7 @@ impl Array {
                 let event = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?;
                 let copy = work.track_host_copy(event);
                 let shard_type = ArrayType::new(element_type, shard_shape.into());
-                let expected_byte_count = dense_size_in_bytes(&shard_type, element_size_in_bytes)?;
+                let expected_byte_count = dense_byte_count(&shard_type)?;
                 Ok((shard, copy, expected_byte_count))
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -539,8 +551,7 @@ impl Array {
             completion.block_until_ready()?;
         }
 
-        // Shards with the same slices and unreduced coordinates are replicas of one per-device value. Those
-        // with different unreduced coordinates contribute separate values to the tile and must be combined.
+        // Wait for the copies, check their byte counts, and record which coordinates along unreduced axes each holds.
         let shards = copies
             .into_iter()
             .map(|(shard, copy, expected_byte_count)| {
@@ -560,7 +571,51 @@ impl Array {
                 Ok((shard.index(), shard.slice().to_vec(), unreduced_coordinates, bytes))
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let mut shards = combine_unreduced_values(shards, element_type, self.sharding().unreduced_kind())?;
+
+        let mut shards = if shards.iter().all(|(_, _, unreduced_coordinates, _)| unreduced_coordinates.is_empty()) {
+            shards
+                .into_iter()
+                .map(|(shard_index, slices, _, bytes)| (shard_index, slices, bytes))
+                .collect::<Vec<_>>()
+        } else {
+            // Shards with the same slices and unreduced coordinates are replicas of one contribution to the tile.
+            // Check that the replicas agree before keeping just one copy of each contribution.
+            let mut contributions = Vec::<(Vec<Range<usize>>, Vec<usize>, ShardIndex, Vec<u8>)>::new();
+            for (shard_index, slices, unreduced_coordinates, bytes) in shards {
+                match contributions.iter().find(|(contribution_slices, contribution_coordinates, _, _)| {
+                    *contribution_slices == slices && *contribution_coordinates == unreduced_coordinates
+                }) {
+                    Some((_, _, _, contribution_bytes)) if *contribution_bytes != bytes => {
+                        return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
+                    }
+                    Some(_) => {}
+                    None => contributions.push((slices, unreduced_coordinates, shard_index, bytes)),
+                }
+            }
+
+            // Combine distinct contributions to each tile elementwise using the sharding's unreduced kind.
+            let unreduced_kind = self.sharding().unreduced_kind();
+            let mut tiles = Vec::<(ShardIndex, Vec<Range<usize>>, CoreArray)>::new();
+            for (slices, _, shard_index, bytes) in contributions {
+                let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
+                let contribution = CoreArray::new(ArrayType::new_static(element_type, shape), bytes)?;
+                match tiles.iter_mut().find(|(_, tile_slices, _)| *tile_slices == slices) {
+                    Some((_, _, tile)) => {
+                        *tile = match unreduced_kind {
+                            UnreducedKind::Sum => Add::add(&*tile, &contribution)?,
+                            UnreducedKind::Max => Max::max(&*tile, &contribution)?,
+                            UnreducedKind::Min => Min::min(&*tile, &contribution)?,
+                        }
+                    }
+                    None => tiles.push((shard_index, slices, contribution)),
+                }
+            }
+
+            tiles
+                .into_iter()
+                .map(|(shard_index, slices, tile)| (shard_index, slices, tile.logical_bytes()))
+                .collect()
+        };
 
         // Reuse a single full tile's bytes when the copies and any reduction already produced the complete value.
         if shards.len() == 1 {
@@ -635,54 +690,6 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
         })?;
     }
     Ok(strides)
-}
-
-/// Combines the host copies of the shards of an array whose sharding has unreduced axes into one copy per tile, which
-/// holds the logical value of that tile, and returns the copies of an array without unreduced axes unchanged. Each
-/// copy carries its shard index, the global slices that it covers, its device's coordinates along the unreduced axes,
-/// and its dense row-major bytes. Copies that cover the same slices and agree on those coordinates are replicas of
-/// one per-device value and must hold the same bytes. The per-device values of a tile, which are the copies of its
-/// slices that differ in those coordinates, are combined elementwise with `unreduced_kind` (i.e., added, or reduced to
-/// their maximum or minimum).
-fn combine_unreduced_values(
-    shards: Vec<(ShardIndex, Vec<Range<usize>>, Vec<usize>, Vec<u8>)>,
-    element_type: DataType,
-    unreduced_kind: UnreducedKind,
-) -> Result<Vec<(ShardIndex, Vec<Range<usize>>, Vec<u8>)>, Error> {
-    if shards.iter().all(|(_, _, unreduced_coordinates, _)| unreduced_coordinates.is_empty()) {
-        return Ok(shards.into_iter().map(|(shard_index, slices, _, bytes)| (shard_index, slices, bytes)).collect());
-    }
-    let mut summands = Vec::<(Vec<Range<usize>>, Vec<usize>, ShardIndex, Vec<u8>)>::new();
-    for (shard_index, slices, unreduced_coordinates, bytes) in shards {
-        match summands.iter().find(|(summand_slices, summand_coordinates, _, _)| {
-            *summand_slices == slices && *summand_coordinates == unreduced_coordinates
-        }) {
-            Some((_, _, _, summand_bytes)) if *summand_bytes != bytes => {
-                return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
-            }
-            Some(_) => {}
-            None => summands.push((slices, unreduced_coordinates, shard_index, bytes)),
-        }
-    }
-    let mut tiles = Vec::<(ShardIndex, Vec<Range<usize>>, CoreArray)>::new();
-    for (slices, _, shard_index, bytes) in summands {
-        let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-        let summand = CoreArray::new(ArrayType::new_static(element_type, shape), bytes)?;
-        match tiles.iter_mut().find(|(_, tile_slices, _)| *tile_slices == slices) {
-            Some((_, _, tile)) => {
-                *tile = match unreduced_kind {
-                    UnreducedKind::Sum => Add::add(&*tile, &summand)?,
-                    UnreducedKind::Max => Max::max(&*tile, &summand)?,
-                    UnreducedKind::Min => Min::min(&*tile, &summand)?,
-                }
-            }
-            None => tiles.push((shard_index, slices, summand)),
-        }
-    }
-    Ok(tiles
-        .into_iter()
-        .map(|(shard_index, slices, tile)| (shard_index, slices, tile.logical_bytes()))
-        .collect())
 }
 
 /// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
@@ -1383,6 +1390,52 @@ mod tests {
     }
 
     #[test]
+    fn test_array_copy_to_host_bytes_unreduced_replicas() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding).unwrap();
+        let readback = |values: [[f32; 2]; 4]| {
+            let buffers = values
+                .iter()
+                .zip(&devices)
+                .map(|(values, device)| {
+                    client
+                        .buffer(values_to_bytes(values).as_slice(), BufferType::F32, [2], None, device.clone(), None)
+                        .unwrap()
+                })
+                .collect();
+            Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), None, buffers)
+                .unwrap()
+                .copy_to_host_bytes()
+        };
+
+        // The two shards at each coordinate along `x` are replicas, so each summand contributes once.
+        let first = [1f32, 2.];
+        let second = [10f32, 20.];
+        assert_eq!(readback([first, first, second, second]).unwrap(), values_to_bytes(&[11f32, 22.]));
+
+        // Shards at the same coordinate must agree before their contribution is combined with the others.
+        let error = readback([first, [1., 3.], second, second]).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 1 }),
+        ));
+        assert_eq!(error.to_string(), "array move found inconsistent overlapping data while materializing shard #1");
+    }
+
+    #[test]
     fn test_array_copy_to_host_bytes_preserves_producer_errors_without_payload() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -1413,43 +1466,6 @@ mod tests {
         );
         assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
         assert_eq!(error.to_string(), message);
-    }
-
-    #[test]
-    fn test_combine_unreduced_values() {
-        // Copies without unreduced coordinates are returned unchanged.
-        let tiles = vec![(0, vec![0..2], Vec::new(), vec![1u8, 2]), (1, vec![2..4], Vec::new(), vec![3u8, 4])];
-        assert_eq!(
-            combine_unreduced_values(tiles, DataType::U8, UnreducedKind::Sum).unwrap(),
-            vec![(0, vec![0..2], vec![1u8, 2]), (1, vec![2..4], vec![3u8, 4])],
-        );
-
-        // The per-device values of a tile are combined, while its replicas contribute once.
-        let summands = vec![
-            (0, vec![0..2], vec![0], values_to_bytes(&[1f32, 2.])),
-            (1, vec![0..2], vec![1], values_to_bytes(&[10f32, 20.])),
-            (2, vec![0..2], vec![0], values_to_bytes(&[1f32, 2.])),
-        ];
-        assert_eq!(
-            combine_unreduced_values(summands.clone(), DataType::F32, UnreducedKind::Sum).unwrap(),
-            vec![(0, vec![0..2], values_to_bytes(&[11f32, 22.]))],
-        );
-        assert_eq!(
-            combine_unreduced_values(summands, DataType::F32, UnreducedKind::Min).unwrap(),
-            vec![(0, vec![0..2], values_to_bytes(&[1f32, 2.]))],
-        );
-
-        // Replicas of one per-device value must agree.
-        let inconsistent = vec![
-            (0, vec![0..2], vec![0], values_to_bytes(&[1f32, 2.])),
-            (1, vec![0..2], vec![0], values_to_bytes(&[1f32, 3.])),
-        ];
-        let error = combine_unreduced_values(inconsistent, DataType::F32, UnreducedKind::Sum).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Array(error) if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 1 }),
-        ));
-        assert_eq!(error.to_string(), "array move found inconsistent overlapping data while materializing shard #1");
     }
 
     #[test]
