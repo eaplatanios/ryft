@@ -373,12 +373,11 @@ impl Operation for PlaceOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for PlaceOperation
 where
     C::Value: Placed + Value<Dispatch: PlaceDispatch<ArrayType, C::Value>>,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -393,10 +392,11 @@ where
     }
 }
 
-// Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PlaceOperation where
-    C::Operation: From<PlaceOperation>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PlaceOperation
+where
+    C::Operation: From<PlaceOperation>,
 {
+    // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
 }
 
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
@@ -413,23 +413,22 @@ where
         // The batching rule places the packed value, so the target and source shardings gain an entry for the batch
         // dimension. Every batching level records exactly one batch sharding in the placements of the batch items that
         // it reports (refer to `Placed`), so this level takes the innermost recorded batch sharding off the target and
-        // the source, also for an unmapped input, which has no batch dimension to put it back into and keeps the
-        // target and source otherwise unchanged. For a mapped input, a placement that records how its batch is
-        // distributed puts that sharding back at the batch dimension. That makes the source that a batch item reports
-        // for itself (e.g., the source that a placement inside a batched function infers from its input) the placement
-        // of the packed input, including the split of the batch dimension over auto mesh axes that the packed input
-        // type does not record, and it makes the transposed placement of such a source move the cotangent back there.
-        // Every recorded batch sharding names only axes of the mesh of its placement, so it can always be put back.
+        // the source, also for an unmapped input, which has no batch dimension to put it back into and keeps the target
+        // and source otherwise unchanged. For a mapped input, a placement that records how its batch is distributed
+        // puts that sharding back at the batch dimension. That makes the source that a batch item reports for itself
+        // (e.g., the source that a placement inside a batched function infers from its input) the placement of the
+        // packed input, including the split of the batch dimension over auto mesh axes that the packed input type does
+        // not record, and it makes the transposed placement of such a source move the cotangent back there. Every
+        // recorded batch sharding names only axes of the mesh of its placement, so it can always be put back.
         //
         // An explicit target that records nothing places every batch item where it says, so its batch dimension is
         // replicated (e.g., a replicated target replicates the packed value, also when it is split along mesh axes).
         // This deliberately differs from JAX, whose batching rule binds `device_put` on the packed value with the
-        // unchanged target, so that its partition specification applies positionally to the packed dimensions (e.g., a
-        // target `P(x)` for a `[6]` batch item mapped at position 0 of a `[4, 6]` value splits the batch dimension,
-        // whereas this rule splits the item dimension). An omitted target stays omitted, so that the packed
-        // value stays where it is. A source that records nothing gains the placement that the packed input type
-        // records for its batch dimension, so that it keeps describing where the packed input lives as far as its
-        // type can tell.
+        // unchanged target, so that its partition specification applies positionally to the packed dimensions (e.g.,
+        // a target `P(x)` for a `[6]` batch item mapped at position 0 of a `[4, 6]` value splits the batch dimension,
+        // whereas this rule splits the item dimension). An omitted target stays omitted, so that the packed value stays
+        // where it is. A source that records nothing gains the placement that the packed input type records for its
+        // batch dimension, so that it keeps describing where the packed input lives as far as its type can tell.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let mut target = self.target.clone();
@@ -445,13 +444,16 @@ where
                     ),
                 });
             }
+
             let batched = |placement: &Placement, batch_sharding: ShardingDimension| {
                 let sharding = placement.sharding().batched(batch_axis, batch_sharding)?;
                 Ok::<_, BatchingError>(placement_with_sharding(placement, sharding).map_err(TypeError::from)?)
             };
+
             if let Some(placement) = &target {
                 target = Some(batched(placement, target_batch_sharding.unwrap_or(ShardingDimension::Replicated))?);
             }
+
             if let Some(placement) = &source {
                 let batch_sharding = source_batch_sharding.unwrap_or_else(|| {
                     input
@@ -475,8 +477,8 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<PlaceOperation>,
         C::Value: Placed + Value<Dispatch: PlaceDispatch<ArrayType, C::Value>>,
+        C::Operation: From<PlaceOperation>,
     {
         |operation, _context, _driver, inputs| {
             // A placement is linear, so the tangent is placed on the same devices, with the same sharding, in the same
@@ -517,13 +519,14 @@ impl_differentiable_operation! {
             // placement forces a copy, as JAX's `device_put` transpose does, so that the input cotangent never shares
             // storage with the output cotangent that the caller provided. Symbolic zero cotangents propagate unchanged.
             // Every placement that the transposed placement derives from the target or the source keeps the batch
-            // shardings that it records (refer to `Placement::batch_shardings`), so that the transposed placement of a
-            // batch item inside a batched function still moves the cotangent back to how its batch was distributed.
+            // shardings that it records (refer to `Placement::batch_shardings`), so that the transposed placement of
+            // a batch item inside a batched function still moves the cotangent back to how its batch was distributed.
             // A source that splits a static extent unevenly (e.g., an extent of 3 over 2 devices) cannot be the target
             // of the transposed placement, because type inference requires even splits, so transposition fails for it.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
+
             let MaybeZero::Value(cotangent) = &outputs[0] else { return Ok(()) };
             let input_type = inputs[0].r#type();
             let input_cotangent_type = input_type.cotangent()?;
@@ -531,22 +534,22 @@ impl_differentiable_operation! {
                 let result = Placement::new(placement.mesh().clone(), placement.sharding().cotangent()?)?;
                 Ok(placement_with_batch_shardings(result, placement.batch_shardings())?)
             };
+
             let transposed = match (operation.source(), operation.target()) {
-                // With a known source, the cotangent moves back to the source mesh, and the old target becomes the
-                // new source.
                 (Some(source), Some(target)) => {
+                    // With a known source, the cotangent moves back to the source mesh, and the old target
+                    // becomes the new source.
                     let transposed_target = cotangent_placement(source)?.with_memory(input_type.memory());
                     let transposed_source = cotangent_placement(target)?;
                     PlaceOperation::new(Some(transposed_source), transposed_target)
                 }
-
-                // Without a source, the value is not known to have changed meshes, so the cotangent stays on the
-                // target mesh and gets the input's tracked sharding and memory back. This deliberately differs from
-                // JAX, whose transpose swaps the devices and sources of `device_put` and so leaves a cotangent with
-                // an unknown source where it is. Restoring the input's tracked sharding and memory keeps the
-                // cotangent well typed, and it is exact inside a compiled program, which runs on a single mesh. An
-                // input that is tracked over another mesh did change meshes, and its devices are not known.
                 (None, Some(target)) => {
+                    // Without a source, the value is not known to have changed meshes, so the cotangent stays on the
+                    // target mesh and gets the input's tracked sharding and memory back. This deliberately differs from
+                    // JAX, whose transpose swaps the devices and sources of `device_put` and so leaves a cotangent with
+                    // an unknown source where it is. Restoring the input's tracked sharding and memory keeps the
+                    // cotangent well typed, and it is exact inside a compiled program, which runs on a single mesh.
+                    // An input that is tracked over another mesh did change meshes, and its devices are not known.
                     let sharding = match input_cotangent_type.sharding() {
                         Some(sharding) if sharding.mesh().has_same_topology(target.mesh().logical_mesh()) => {
                             sharding.clone()
@@ -567,19 +570,20 @@ impl_differentiable_operation! {
                         .map_err(TypeError::from)?;
                     PlaceOperation::new(None, placement.with_memory(input_type.memory()))
                 }
-
-                // Without a target, the forward placement left the value where it was, which its source describes
-                // when it has one. The cotangent therefore moves to the source, as JAX's transpose does when it swaps
-                // the devices and sources of `device_put`, and it has no source of its own, because the forward
-                // placement did not say where the output lives.
                 (Some(source), None) => {
+                    // Without a target, the forward placement left the value where it was, which its source describes
+                    // when it has one. The cotangent therefore moves to the source, as JAX's transpose does when it
+                    // swaps the devices and sources of `device_put`, and it has no source of its own, because the
+                    // forward placement did not say where the output lives.
                     PlaceOperation::new(None, cotangent_placement(source)?.with_memory(input_type.memory()))
                 }
-
-                // Without a target and a source, the forward placement is an identity up to its copy policy, and so is
-                // its transpose, which still forces a copy, as JAX's `device_put` transpose does.
-                (None, None) => PlaceOperation::new(None, None),
+                (None, None) => {
+                    // Without a target and a source, the forward placement is an identity up to its copy policy,
+                    // and so is its transpose, which still forces a copy, as JAX's `device_put` transpose does.
+                    PlaceOperation::new(None, None)
+                },
             };
+
             let transposed = transposed.with_may_alias(false);
             let mut placed = context.stage_operation(transposed, Vec::new(), std::slice::from_ref(cotangent))?;
             check_count!("output", placed, 1, ProgramError);
@@ -595,7 +599,9 @@ impl_differentiable_operation! {
                     &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
                 )?
             };
+
             accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
+
             Ok(())
         }
     },
@@ -618,13 +624,15 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 
     #[inline]
     fn provide(request: PlaceOperation, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
-        // Array IR families select the placement through their array projection, so that the provided operation is
-        // the canonical array member (e.g., `ArrayIrOperation::Array(ArrayOperation::Place(_))`).
+        // Array IR families select the placement through their array projection, so that the provided operation
+        // is the canonical array member (e.g., `ArrayIrOperation::Array(ArrayOperation::Place(_))`).
         check_count!("input", input_types, 1, ProgramError);
         let operation: <Self as OperationProjection<ArrayType>>::Projected = request.into();
         Ok(operation.into())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reports the [`Placement`] that a value concretely lives on. Devices and placement over [`MeshAxisType::Auto`] mesh
 /// axes are runtime state that types do not record, so only the values that hold device buffers have a placement
@@ -981,7 +989,7 @@ fn place_parameters<
 }
 
 /// Places `input` on the optional `target` through its [`PlaceDispatch`] primitive with the copy policy `may_alias`,
-/// using `source` when it is given and otherwise the placement that `input` concretely lives on (refer to [`Placed`]),
+/// using `source` when it is given and otherwise the placement that `input` concretely lives on (i.e., via [`Placed`]),
 /// if any.
 fn place_with_inferred_source<V: Value<Dispatch: PlaceDispatch<V::Type, V>> + Placed>(
     input: &V,
