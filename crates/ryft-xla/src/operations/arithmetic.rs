@@ -369,7 +369,7 @@ mod tests {
     /// Executes subtraction after converting to `data_types`, using I64 boundary values to keep sub-byte integer
     /// transport out of the oracle. Unsigned U64 values above I64::MAX use the I64 encoding with the same bits.
     fn execute_saturating_sub(
-        client: &Client<'_>,
+        client: &'static Client<'static>,
         data_types: [DataType; 2],
         left: &[i64],
         right: &[i64],

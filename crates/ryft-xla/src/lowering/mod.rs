@@ -2384,7 +2384,7 @@ pub(crate) mod tests {
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
     use ryft_mlir::{Attribute, ElementsAttribute, Operation as MlirOperation, Region, Size as MlirSize};
-    use ryft_pjrt::protos::ShapeChecks;
+    use ryft_pjrt::protos::{OptionOverride, OptionValue, ShapeChecks};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::LoweringError;
@@ -2658,7 +2658,7 @@ pub(crate) mod tests {
     /// receives the matching entry of `inputs` (i.e., array storage sized to the allocation bound, or one dimension), and
     /// every bounded dynamic input axis then receives its runtime extent from `extents` in boundary order.
     pub(crate) fn execute_mixed_program(
-        client: &ryft_pjrt::Client<'_>,
+        client: &'static ryft_pjrt::Client<'static>,
         program: &FlatProgram,
         inputs: &[MixedValue],
         extents: &[i32],
@@ -2677,8 +2677,10 @@ pub(crate) mod tests {
         let mut options = test_compilation_options(client, None);
         if client.platform_name()?.eq_ignore_ascii_case("cuda") {
             // CUDA's DynamicPadder can reject mismatched inputs before the Ryft assertions these fixtures exercise.
-            let debug_options = options.executable_build_options.as_mut().unwrap().debug_options.as_mut().unwrap();
-            debug_options.xla_gpu_shape_checks = Some(ShapeChecks::Ignore as i32);
+            options.environment_option_overrides.insert(
+                "xla_gpu_shape_checks".to_string(),
+                OptionOverride { value: Some(OptionValue::IntField(ShapeChecks::Ignore as i64)) },
+            );
         }
         let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options)?;
         let device = executable.addressable_devices()?.remove(0);

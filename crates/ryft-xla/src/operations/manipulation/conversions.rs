@@ -1121,10 +1121,7 @@ mod tests {
         FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
         XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
     };
-    use ryft_pjrt::{
-        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
-        load_cpu_plugin,
-    };
+    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
@@ -1153,12 +1150,10 @@ mod tests {
         shards: &[Vec<f64>],
         dimensions: &[u64],
     ) -> Result<Vec<(Vec<f64>, ryft_pjrt::Layout)>, ryft_pjrt::Error> {
-        let plugin = load_cpu_plugin()?;
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(shards.len()), ..Default::default() }))?;
+        let client = cpu_client(shards.len());
         let executable = client.compile(
             &PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() },
-            &test_compilation_options(&client, Some(shards.len())),
+            &test_compilation_options(client, Some(shards.len())),
         )?;
         let devices = executable.addressable_devices()?;
         assert_eq!(devices.len(), shards.len());

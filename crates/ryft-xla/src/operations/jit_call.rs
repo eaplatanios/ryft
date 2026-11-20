@@ -2389,7 +2389,7 @@ mod tests {
 
     /// Compiles and executes an array-only `f32` fixture using its declared unsharded program signature.
     fn execute_f32_program(
-        client: &ryft_pjrt::Client<'_>,
+        client: &'static ryft_pjrt::Client<'static>,
         program: &Program<Vec<Constant>, Vec<Constant>>,
         values: Vec<Vec<f32>>,
     ) -> Vec<Vec<f32>> {
@@ -2439,7 +2439,7 @@ mod tests {
     /// Compiles and executes an array-only fixture using its declared unsharded program signature, with each input
     /// and output given as the native-endian bytes of its elements.
     fn execute_array_program(
-        client: &ryft_pjrt::Client<'_>,
+        client: &'static ryft_pjrt::Client<'static>,
         program: &Program<Vec<Constant>, Vec<Constant>>,
         values: Vec<Vec<u8>>,
     ) -> Vec<Vec<u8>> {
@@ -2601,7 +2601,7 @@ mod tests {
     /// selects (at most two) compute the same primal output, tangent, and cotangents on fixed inputs, up to the
     /// rounding differences that recomputing transcendental functions in differently fused XLA kernels introduces.
     fn assert_residual_demand_linearizations_match(
-        client: &ryft_pjrt::Client<'_>,
+        client: &'static ryft_pjrt::Client<'static>,
         actual: &FlatProgram,
         expected: &FlatProgram,
         input_indices: &[usize],

@@ -106,13 +106,13 @@ pub(crate) mod tests {
         FfiAttribute, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
         FfiOutput, FfiScalar, FfiTypeId, XLA_FFI_Handler,
     };
-    use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions};
+    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
-    use crate::compilation::options::probe_debug_options;
+    use crate::compilation::options::resolve_shardy_debug_options;
     use crate::{Array, FromPjrt, Session};
 
     #[cfg(feature = "cuda-13")]
@@ -212,32 +212,15 @@ pub(crate) mod tests {
         client
     }
 
-    /// Builds options for tests that call [`Client::compile`] directly, with `HloShardingV3` enabled on CPU and CUDA 13.
+    /// Builds options for tests that call [`Client::compile`] directly, preserving the client's Shardy defaults.
     /// `partition_count` selects Shardy SPMD partitioning when supplied. `None` selects single-device compilation.
-    pub(crate) fn test_compilation_options(client: &Client<'_>, partition_count: Option<usize>) -> CompilationOptions {
-        static CPU_DEBUG_OPTIONS: OnceLock<DebugOptions> = OnceLock::new();
-
-        #[cfg(feature = "cuda-13")]
-        static CUDA_DEBUG_OPTIONS: OnceLock<DebugOptions> = OnceLock::new();
-
-        // MLIR export reads the explicit debug options before the HLO compiler applies its defaults.
-        // TODO(eaplatanios): Remove the debug options probe after Ryft pins an XLA revision that resolves defaults
-        //  and applies `environment_option_overrides` before MLIR export on both backends. Set
-        //  `xla_enable_hlo_sharding_v3` through those overrides if needed and verify V3 import on both.
-        //  Reference: https://github.com/openxla/xla/issues/52711
-        let platform = client.platform_name().unwrap();
-        let debug_options_cache = match platform.as_ref() {
-            platform if platform.eq_ignore_ascii_case("cpu") => Some(&CPU_DEBUG_OPTIONS),
-            #[cfg(feature = "cuda-13")]
-            platform if platform.eq_ignore_ascii_case("cuda") => Some(&CUDA_DEBUG_OPTIONS),
-            _ => None,
-        };
-        let debug_options =
-            debug_options_cache.map(|cache| cache.get_or_init(|| probe_v3_debug_options(client)).clone());
-        CompilationOptions {
+    pub(crate) fn test_compilation_options(
+        client: &'static Client<'static>,
+        partition_count: Option<usize>,
+    ) -> CompilationOptions {
+        let mut options = CompilationOptions {
             executable_build_options: Some(ExecutableCompilationOptions {
                 device_ordinal: -1,
-                debug_options,
                 replica_count: 1,
                 partition_count: partition_count.unwrap_or(1) as i64,
                 use_spmd_partitioning: partition_count.is_some(),
@@ -245,14 +228,11 @@ pub(crate) mod tests {
                 ..Default::default()
             }),
             ..Default::default()
+        };
+        let platform = client.platform_name().unwrap();
+        if platform.eq_ignore_ascii_case("cpu") || platform.eq_ignore_ascii_case("cuda") {
+            resolve_shardy_debug_options(client, &mut options);
         }
-    }
-
-    /// Enables V3 on top of the plugin's effective debug options, which include its `XLA_FLAGS` overrides.
-    fn probe_v3_debug_options(client: &Client<'_>) -> DebugOptions {
-        let mut options =
-            probe_debug_options(client).expect("expected debug options in the optimized HLO configuration");
-        options.xla_enable_hlo_sharding_v3 = Some(true);
         options
     }
 

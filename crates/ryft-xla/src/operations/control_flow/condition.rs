@@ -179,7 +179,7 @@ mod tests {
     /// scalar input per entry of `inputs`, given as its native-endian bytes and buffer type, and returns the lines that
     /// its prints emit.
     fn execute_module_without_outputs(
-        client: &ryft_pjrt::Client<'_>,
+        client: &'static ryft_pjrt::Client<'static>,
         module: &str,
         inputs: &[(&[u8], BufferType)],
     ) -> Vec<String> {

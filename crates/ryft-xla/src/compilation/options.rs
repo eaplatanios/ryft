@@ -420,7 +420,7 @@ struct ClientDebugOptions {
 }
 
 /// Supplies the client's default debug options to MLIR export when CPU or CUDA Shardy compilation will import V3.
-pub(super) fn resolve_shardy_debug_options(client: &'static Client<'static>, options: &mut CompilationOptions) {
+pub(crate) fn resolve_shardy_debug_options(client: &'static Client<'static>, options: &mut CompilationOptions) {
     let Some(build_options) = options.executable_build_options.as_mut() else { return };
     if build_options.debug_options.is_some() {
         return;
@@ -460,7 +460,7 @@ pub(super) fn resolve_shardy_debug_options(client: &'static Client<'static>, opt
 
 /// Reads XLA's effective debug options, including the flags that the client resolved. Returns `None` when the
 /// plugin cannot compile the probe or does not expose an optimized HLO module with configuration.
-pub(crate) fn probe_debug_options(client: &Client<'_>) -> Option<DebugOptions> {
+fn probe_debug_options(client: &Client<'_>) -> Option<DebugOptions> {
     /// Configuration field of XLA's `HloModuleProtoWithConfig`.
     #[derive(Message)]
     struct HloModuleProtoWithConfig {

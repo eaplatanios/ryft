@@ -406,20 +406,18 @@ impl Array {
             return Ok(Vec::new());
         }
 
-        // The array and its shards have static shapes and share one element type. Look up its size once for both
-        // the dense byte counts and the copy offsets.
+        // Look up the element size once for the array and all its shards. The checked global byte count bounds the
+        // byte offsets of tiles that copy directly into the destination.
         let element_size_in_bytes = element_type.size_in_bytes()?;
-        let dense_byte_count = |r#type: &ArrayType| -> Result<usize, Error> {
-            let element_count = r#type.element_count()?.unwrap();
-            element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+        let global_element_count = global_shape.element_count()?;
+        let total_byte_count =
+            global_element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
                 message: format!(
                     "dense byte size for array type `{}` exceeds the maximum allowed size of {}",
-                    r#type,
+                    self.r#type(),
                     usize::MAX,
                 ),
-            })
-        };
-        let total_byte_count = dense_byte_count(self.r#type().as_ref())?;
+            })?;
         let mesh = self.mesh();
         let unreduced_axis_indices = mesh
             .logical_mesh()
@@ -449,7 +447,7 @@ impl Array {
 
                 let covered =
                     tiles.iter().map(|slices| slices.iter().map(|slice| slice.len()).product::<usize>()).sum::<usize>();
-                if !unreduced_axis_indices.is_empty() || covered != global_shape.as_slice().iter().product::<usize>() {
+                if !unreduced_axis_indices.is_empty() || covered != global_element_count {
                     return Err(Error::from(ArrayError::MissingShardBuffer {
                         shard_index: missing.index(),
                         device_id: missing.device().id(),
@@ -538,8 +536,16 @@ impl Array {
                 let shard_shape = shard.shape();
                 let event = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?;
                 let copy = work.track_host_copy(event);
-                let shard_type = ArrayType::new(element_type, shard_shape.into());
-                let expected_byte_count = dense_byte_count(&shard_type)?;
+                let element_count = shard_shape.element_count()?;
+                let expected_byte_count =
+                    element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
+                        message: format!(
+                            "dense byte size for array type `{}{}` exceeds the maximum allowed size of {}",
+                            element_type,
+                            shard_shape,
+                            usize::MAX,
+                        ),
+                    })?;
                 Ok((shard, copy, expected_byte_count))
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -638,7 +644,7 @@ impl Array {
         // Shards have the array's rank. Every scalar shard occupies one byte range starting at zero.
         if global_shape.rank() == 0 {
             for (shard_index, _, bytes) in shards {
-                merge_dense_byte_segment(bytes.as_slice(), 0, shard_index, &mut global_bytes, &mut written_intervals)?;
+                merge_shard_byte_segment(bytes.as_slice(), 0, shard_index, &mut global_bytes, &mut written_intervals)?;
             }
             return Ok(global_bytes);
         }
@@ -652,7 +658,7 @@ impl Array {
         for (shard_index, slices, bytes) in shards {
             let shard_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
             let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
-            merge_dense_shard_bytes_recursive(
+            merge_dense_shard_bytes(
                 bytes.as_slice(),
                 slices.as_slice(),
                 global_strides.as_slice(),
@@ -694,11 +700,11 @@ fn row_major_element_strides(shape: &[usize], element_type: DataType) -> Result<
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Merges `source_bytes` into `global_bytes` starting at `global_byte_offset` and records the written range in
-/// `written_intervals`, which stays sorted and disjoint. Returns [`ArrayError::InconsistentOverlappingShardData`] when
-/// two overlapping shards disagree on the value of a byte.
+/// Merges one contiguous segment of shard bytes into `global_bytes` at `global_byte_offset` and records the written
+/// range in `written_intervals`, which stays sorted and disjoint. Returns
+/// [`ArrayError::InconsistentOverlappingShardData`] when two overlapping shards disagree on the value of a byte.
 #[allow(clippy::single_range_in_vec_init)]
-fn merge_dense_byte_segment(
+fn merge_shard_byte_segment(
     source_bytes: &[u8],
     global_byte_offset: usize,
     shard_index: ShardIndex,
@@ -750,10 +756,10 @@ fn merge_dense_byte_segment(
 
 /// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
 /// element offsets `base_global_element_offset` and `base_shard_element_offset`. The strides are row-major element
-/// strides. [`merge_dense_byte_segment`] uses the sorted, disjoint byte ranges in `written_intervals` to detect
+/// strides. [`merge_shard_byte_segment`] uses the sorted, disjoint byte ranges in `written_intervals` to detect
 /// inconsistent overlapping data.
 #[allow(clippy::too_many_arguments)]
-fn merge_dense_shard_bytes_recursive(
+fn merge_dense_shard_bytes(
     shard_bytes: &[u8],
     shard_slices: &[Range<usize>],
     global_strides: &[usize],
@@ -773,7 +779,7 @@ fn merge_dense_shard_bytes_recursive(
         let global_byte_offset = global_element_offset.checked_mul(element_size_in_bytes).unwrap();
         let shard_byte_offset = base_shard_element_offset.checked_mul(element_size_in_bytes).unwrap();
         let byte_count = slice.len().checked_mul(element_size_in_bytes).unwrap();
-        return merge_dense_byte_segment(
+        return merge_shard_byte_segment(
             &shard_bytes[shard_byte_offset..shard_byte_offset + byte_count],
             global_byte_offset,
             shard_index,
@@ -787,7 +793,7 @@ fn merge_dense_shard_bytes_recursive(
             base_global_element_offset + global_index.checked_mul(global_strides[dimension]).unwrap();
         let next_shard_element_offset =
             base_shard_element_offset + local_index.checked_mul(shard_strides[dimension]).unwrap();
-        merge_dense_shard_bytes_recursive(
+        merge_dense_shard_bytes(
             shard_bytes,
             shard_slices,
             global_strides,
@@ -1471,11 +1477,11 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_dense_shard_bytes_recursive() {
+    fn test_merge_dense_shard_bytes() {
         // The second column of a `[2, 2]` array occupies two separate byte ranges of its dense representation.
         let mut global_bytes = vec![0u8; 16];
         let mut written_intervals = Vec::new();
-        merge_dense_shard_bytes_recursive(
+        merge_dense_shard_bytes(
             values_to_bytes(&[1f32, 2.]).as_slice(),
             &[0..2, 1..2],
             &[2, 1],
@@ -1494,24 +1500,24 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_dense_byte_segment() {
+    fn test_merge_shard_byte_segment() {
         let mut global_bytes = vec![0u8; 6];
         let mut written_intervals = Vec::new();
-        merge_dense_byte_segment(&[1, 2], 0, 0, &mut global_bytes, &mut written_intervals).unwrap();
-        merge_dense_byte_segment(&[5, 6], 4, 1, &mut global_bytes, &mut written_intervals).unwrap();
+        merge_shard_byte_segment(&[1, 2], 0, 0, &mut global_bytes, &mut written_intervals).unwrap();
+        merge_shard_byte_segment(&[5, 6], 4, 1, &mut global_bytes, &mut written_intervals).unwrap();
         assert_eq!(written_intervals, vec![0..2, 4..6]);
 
         // A segment that agrees with the bytes that it overlaps joins the intervals that it touches.
-        merge_dense_byte_segment(&[2, 3, 4, 5], 1, 2, &mut global_bytes, &mut written_intervals).unwrap();
+        merge_shard_byte_segment(&[2, 3, 4, 5], 1, 2, &mut global_bytes, &mut written_intervals).unwrap();
         assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(written_intervals, vec![0..6]);
 
         // Empty segments record nothing.
-        merge_dense_byte_segment(&[], 6, 3, &mut global_bytes, &mut written_intervals).unwrap();
+        merge_shard_byte_segment(&[], 6, 3, &mut global_bytes, &mut written_intervals).unwrap();
         assert_eq!(written_intervals, vec![0..6]);
 
         // A segment that disagrees with the bytes that it overlaps is rejected.
-        let error = merge_dense_byte_segment(&[9], 2, 4, &mut global_bytes, &mut written_intervals).unwrap_err();
+        let error = merge_shard_byte_segment(&[9], 2, 4, &mut global_bytes, &mut written_intervals).unwrap_err();
         assert!(matches!(
             &error,
             Error::Array(error) if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 4 }),

@@ -1802,6 +1802,24 @@ impl StaticShape {
         &self.dimensions
     }
 
+    /// Returns the number of elements described by this [`StaticShape`]. A scalar shape has one element,
+    /// and a zero extent makes the count zero even when multiplying the other extents would overflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the element count does not fit in [`usize`].
+    #[inline]
+    pub fn element_count(&self) -> Result<usize, TypeError> {
+        if self.dimensions.contains(&0) {
+            return Ok(0);
+        }
+        self.dimensions
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or_else(|| TypeError::invalid(format!("shape {self} element count does not fit in `usize`")))
+    }
+
     /// Returns the row-major (i.e., the last dimension corresponds to the fastest moving index) strides over element
     /// indices for arrays with this [`StaticShape`].
     pub fn row_major_strides(&self) -> Vec<usize> {
@@ -2694,6 +2712,17 @@ mod tests {
         assert_eq!(s2[1usize], 1);
         assert_eq!(s2[-1isize], 1);
         assert_eq!(s2[-2isize], 4);
+    }
+
+    #[test]
+    fn test_static_shape_element_count() {
+        assert_eq!(StaticShape::scalar().element_count(), Ok(1));
+        assert_eq!(StaticShape::new(vec![2, 3, 4]).element_count(), Ok(24));
+        assert_eq!(StaticShape::new(vec![usize::MAX, 2, 0]).element_count(), Ok(0));
+        assert_eq!(
+            StaticShape::new(vec![usize::MAX, 2]).element_count(),
+            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in `usize`", usize::MAX))),
+        );
     }
 
     #[test]
