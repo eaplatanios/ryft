@@ -32,11 +32,12 @@ use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
 use ryft_core::{
-    Add, And, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, DeviceId, DeviceMesh, DimensionError,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
-    DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul, Neg, Not, Operation as CoreOperation, Or,
-    Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape, ShapeChangingCollectiveValue, Sharding,
-    StaticShape, Sub, Typed, UnreducedKind, Value as CoreValue, ValueDomainDispatch, WhilePredicate, Xor,
+    Add, And, Array as CoreArray, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType, DeviceId,
+    DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
+    DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul,
+    Neg, Not, Operation as CoreOperation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
+    ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind, Value as CoreValue,
+    ValueDomainDispatch, WhilePredicate, Xor,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -697,16 +698,15 @@ impl Typed for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl CoreValue for Array {
     // A concrete `Array` binds and executes every operation through its PJRT-backed `Session`. It uses
-    // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (e.g., arithmetic, comparison,
-    // selection, manipulation, and reductions) bind their operations through `domain()` and execute them eagerly, op by
-    // op, through the session recovered below, and free transform entry points (e.g., `ryft_core::batching::batch`)
+    // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (e.g., arithmetic, comparison, selection,
+    // manipulation, and reductions) bind their operations through `domain()` and execute them eagerly, operation by
+    // operation, through the session recovered below, and free transform entry points (e.g., `ryft_core::batch`)
     // recover the same session. Only capabilities without blanket implementations that bind operations (e.g.,
-    // `Concretizable<bool>`, `WhilePredicate`, and the foreign `std::ops` sugar) get the direct implementations that
-    // follow.
+    // `Concretizable<bool>`, `WhilePredicate`, and the foreign `std::ops` sugar) get the direct implementations
+    // that follow.
+
     type Dispatch = ValueDomainDispatch;
     type Domain = ProjectedContext<Session, ArrayType>;
 
@@ -719,15 +719,15 @@ impl CoreValue for Array {
     }
 }
 
-// Every eager value capability of `Array` follows the JAX-style op-by-op dispatch shape. The blanket capability
-// implementations in `ryft-core` (e.g., arithmetic, logical, comparison, selection, manipulation, and reductions)
-// bind each operation through `ryft_core::Value::domain`, which for a concrete `Array` recovers the PJRT-backed
-// `Session` that the array belongs to. That session executes the operation through a single-operation program that its
-// session caches per operation application, so a repeated eager operation skips program construction and lowering.
-// The implementations that follow therefore only cover the capabilities that those blankets cannot cover, which are
-// the capabilities that read values back to the host, such as `Concretizable` and `WhilePredicate`, and the foreign
-// `std::ops` operator sugar, which the orphan rule requires to be implemented per type. Backend arrays opt into the
-// shared shape-changing collective capabilities through `ShapeChangingCollectiveValue`.
+// Every eager value capability of `Array` follows the JAX-style operation-by-operation dispatch shape. The blanket
+// capability implementations in `ryft-core` (e.g., arithmetic, logical, comparison, selection, manipulation, and
+// reductions) bind each operation through `ryft_core::Value::domain`, which for a concrete `Array` recovers the
+// PJRT-backed `Session` that the array belongs to. That session executes the operation through a single-operation
+// program that its session caches per operation application, so a repeated eager operation skips program construction
+// and lowering. The implementations that follow therefore only cover the capabilities that those blankets cannot cover,
+// which are the capabilities that read values back to the host, such as `Concretizable` and `WhilePredicate`, and the
+// foreign `std::ops` operator sugar, which the orphan rule requires to be implemented per type. Backend arrays opt into
+// the shared shape-changing collective capabilities through `ShapeChangingCollectiveValue`.
 
 impl Concretizable<bool> for Array {
     fn concretize(&self) -> Result<bool, ProgramError> {
@@ -757,15 +757,108 @@ impl Concretizable<i128> for Array {
         let bytes = self
             .copy_to_host_bytes()
             .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
-        ryft_core::Array::new(self.r#type().into_owned(), bytes)?.concretize()
+        CoreArray::new(self.r#type().into_owned(), bytes)?.concretize()
     }
 }
 
-// Batched while predicate semantics for `Array`, mirroring the reference semantics of `ryft_core::arrays::Array`.
-// `WhilePredicate::any_true` reduces the whole Boolean payload with `or` by reading every shard back to the host, and
-// `WhilePredicate::select` broadcasts the predicate against the operands along its leading prefix axes on device
-// before selecting.
+impl AssertionValue for Array {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        // The host array keeps the full type of this array, including its sharding, so that errors name the type
+        // that the caller sees.
+        let bytes = self
+            .copy_to_host_bytes()
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        CoreArray::new(self.r#type().into_owned(), bytes)?.assertion_observation()
+    }
+
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
+        Ok(Some(self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?))
+    }
+}
+
+impl DimensionSize<ArrayType> for Array {
+    type Extent = usize;
+
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
+        // Returns the concrete global extent of `axis` from this array's complete shard metadata. The descriptor
+        // list includes remote shards, so taking the greatest exclusive slice end recovers the global extent without
+        // synchronizing a device buffer. Constructing a `DimensionValue` validates that extent against the identity
+        // and bounds of the selected declared axis before the host integer is returned.
+        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
+        let extent = self.shards().iter().map(|shard| shard.slice()[operation.axis()].end).max().ok_or_else(|| {
+            ProgramError::Concretization {
+                message: format!(
+                    "cannot read the extent of an array of type `{}` with no shard metadata",
+                    self.r#type()
+                ),
+            }
+        })?;
+        DimensionValue::new(operation.output_type().clone(), extent)?;
+        Ok(extent)
+    }
+}
+
+impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
+    fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        // Copies this rank-0 integer array to the host and grants its checked value first-class dimension authority.
+        let operation = DimensionFromScalarOperation::new(output.into());
+        let mut output_types = operation.infer_output_types(&[Type::Array(self.r#type().into_owned())], &[])?;
+        let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
+        let bytes = self
+            .copy_to_host_bytes()
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+
+        let invalid_extent = |value: String| ProgramError::InvalidArgument {
+            message: format!(
+                "`{}` scalar input must be a nonnegative host-representable extent but is {value}",
+                operation.name(),
+            ),
+        };
+
+        let extent = match self.data_type() {
+            DataType::I8 => {
+                let value = i8::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I16 => {
+                let value = i16::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I32 => {
+                let value = i32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I64 => {
+                let value = i64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::U8 => usize::from(u8::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
+            DataType::U16 => usize::from(u16::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
+            DataType::U32 => {
+                let value = u32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::U64 => {
+                let value = u64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            _ => unreachable!("`dimension_from_scalar` input type is validated before reading its payload"),
+        };
+
+        Ok(DimensionValue::new(output_type, extent)?)
+    }
+}
+
+impl ShapeChangingCollectiveValue for Array {
+    // Backend arrays opt into the shared homogeneous collective staging rules of `ryft-core`.
+}
+
 impl WhilePredicate for Array {
+    // The batched while predicate semantics for `Array`, mirror the reference semantics of `ryft_core::Array`.
+    // `WhilePredicate::any_true` reduces the whole Boolean payload with `or` by reading every shard back to the host,
+    // and `WhilePredicate::select` broadcasts the predicate against the operands along its leading prefix axes on
+    // device before selecting.
+
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.data_type().is_boolean() {
             return Err(ProgramError::Concretization {
@@ -773,8 +866,8 @@ impl WhilePredicate for Array {
             });
         }
 
-        // The shards are read one at a time, so the whole execution that produced this array is observed first to
-        // surface its errors, including those that are not tied to an individual shard buffer.
+        // The shards are read one at a time, so the whole execution that produced this array is observed first
+        // to surface its errors, including those that are not tied to an individual shard buffer.
         if let Some(fence) = self.execution_fence() {
             fence
                 .block_until_ready()
@@ -817,6 +910,7 @@ impl WhilePredicate for Array {
                 ),
             });
         }
+
         Ok(any)
     }
 
@@ -833,8 +927,8 @@ impl WhilePredicate for Array {
             });
         }
 
-        // Broadcast a predicate whose shape is a prefix of the operand shape up to that full shape, mapping its axes to
-        // the leading output axes, so that the staged select receives operands with congruent shapes.
+        // Broadcast a predicate whose shape is a prefix of the operand shape up to that full shape, mapping its axes
+        // to the leading output axes, so that the staged select receives operands with congruent shapes.
         let condition = if self.r#type().shape() == on_true.r#type().shape() {
             self.clone()
         } else {
@@ -847,94 +941,6 @@ impl WhilePredicate for Array {
     }
 }
 
-impl AssertionValue for Array {
-    fn assertion_observation(&self) -> Result<String, ProgramError> {
-        // The host array keeps the full type of this array, including its sharding, so that errors name the type that
-        // the caller sees.
-        let bytes = self
-            .copy_to_host_bytes()
-            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
-        ryft_core::Array::new(self.r#type().into_owned(), bytes)?.assertion_observation()
-    }
-
-    fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
-        Ok(Some(self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?))
-    }
-}
-
-impl DimensionSize<ArrayType> for Array {
-    type Extent = usize;
-
-    fn dimension_size<AxisValue: Into<ryft_core::Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
-        // Returns the concrete global extent of `axis` from this array's complete shard metadata. The descriptor list
-        // includes remote shards, so taking the greatest exclusive slice end recovers the global extent without
-        // synchronizing a device buffer. Constructing a `DimensionValue` validates that extent against the identity
-        // and bounds of the selected declared axis before the host integer is returned.
-        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
-        let extent = self.shards().iter().map(|shard| shard.slice()[operation.axis()].end).max().ok_or_else(|| {
-            ProgramError::Concretization {
-                message: format!(
-                    "cannot read the extent of an array of type `{}` with no shard metadata",
-                    self.r#type()
-                ),
-            }
-        })?;
-        DimensionValue::new(operation.output_type().clone(), extent)?;
-        Ok(extent)
-    }
-}
-
-impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
-    fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
-        // Copies this rank-0 integer array to the host and grants its checked value first-class dimension authority.
-        let operation = DimensionFromScalarOperation::new(output.into());
-        let mut output_types = operation.infer_output_types(&[Type::Array(self.r#type().into_owned())], &[])?;
-        let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
-        let bytes = self
-            .copy_to_host_bytes()
-            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
-        let invalid_extent = |value: String| ProgramError::InvalidArgument {
-            message: format!(
-                "`{}` scalar input must be a nonnegative host-representable extent but is {value}",
-                operation.name(),
-            ),
-        };
-        let extent = match self.data_type() {
-            DataType::I8 => {
-                let value = i8::from_ne_bytes(bytes.as_slice().try_into().unwrap());
-                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
-            }
-            DataType::I16 => {
-                let value = i16::from_ne_bytes(bytes.as_slice().try_into().unwrap());
-                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
-            }
-            DataType::I32 => {
-                let value = i32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
-                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
-            }
-            DataType::I64 => {
-                let value = i64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
-                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
-            }
-            DataType::U8 => usize::from(u8::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
-            DataType::U16 => usize::from(u16::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
-            DataType::U32 => {
-                let value = u32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
-                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
-            }
-            DataType::U64 => {
-                let value = u64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
-                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
-            }
-            _ => unreachable!("`dimension_from_scalar` input type is validated before reading its payload"),
-        };
-        Ok(DimensionValue::new(output_type, extent)?)
-    }
-}
-
-// Backend arrays opt into the shared homogeneous collective staging rules of `ryft-core`.
-impl ShapeChangingCollectiveValue for Array {}
-
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values. These per-type implementations provide the ergonomic panicking sugar by delegating to
 // the fallible `ryft` capabilities.
@@ -942,6 +948,7 @@ impl ShapeChangingCollectiveValue for Array {}
 impl std::ops::Neg for Array {
     type Output = Self;
 
+    #[inline]
     fn neg(self) -> Self {
         Neg::neg(&self).expect("`neg` operation failed")
     }
@@ -950,6 +957,7 @@ impl std::ops::Neg for Array {
 impl std::ops::Add for Array {
     type Output = Self;
 
+    #[inline]
     fn add(self, right: Self) -> Self {
         Add::add(&self, &right).expect("`add` operation failed")
     }
@@ -958,6 +966,7 @@ impl std::ops::Add for Array {
 impl std::ops::Sub for Array {
     type Output = Self;
 
+    #[inline]
     fn sub(self, right: Self) -> Self {
         Sub::sub(&self, &right).expect("`sub` operation failed")
     }
@@ -966,6 +975,7 @@ impl std::ops::Sub for Array {
 impl std::ops::Mul for Array {
     type Output = Self;
 
+    #[inline]
     fn mul(self, right: Self) -> Self {
         Mul::mul(&self, &right).expect("`mul` operation failed")
     }
@@ -974,6 +984,7 @@ impl std::ops::Mul for Array {
 impl std::ops::Div for Array {
     type Output = Self;
 
+    #[inline]
     fn div(self, right: Self) -> Self {
         Div::div(&self, &right).expect("`div` operation failed")
     }
@@ -982,6 +993,7 @@ impl std::ops::Div for Array {
 impl std::ops::Not for Array {
     type Output = Self;
 
+    #[inline]
     fn not(self) -> Self {
         Not::not(&self).expect("`not` operation failed")
     }
@@ -990,6 +1002,7 @@ impl std::ops::Not for Array {
 impl std::ops::BitAnd for Array {
     type Output = Self;
 
+    #[inline]
     fn bitand(self, right: Self) -> Self {
         And::and(&self, &right).expect("`and` operation failed")
     }
@@ -998,6 +1011,7 @@ impl std::ops::BitAnd for Array {
 impl std::ops::BitOr for Array {
     type Output = Self;
 
+    #[inline]
     fn bitor(self, right: Self) -> Self {
         Or::or(&self, &right).expect("`or` operation failed")
     }
@@ -1006,10 +1020,13 @@ impl std::ops::BitOr for Array {
 impl std::ops::BitXor for Array {
     type Output = Self;
 
+    #[inline]
     fn bitxor(self, right: Self) -> Self {
         Xor::xor(&self, &right).expect("`xor` operation failed")
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
 #[inline]
