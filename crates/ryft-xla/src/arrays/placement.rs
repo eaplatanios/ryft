@@ -30,8 +30,6 @@ pub enum ArrayPlacement {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ArrayPlacement {
     /// Creates a single-device placement.
     #[inline]
@@ -50,9 +48,9 @@ impl ArrayPlacement {
         Ok(Self::Mesh { mesh, sharding })
     }
 
-    /// Resolves this target into the destination [`DeviceMesh`] and [`Sharding`] of a value of rank `rank`. A
-    /// [`Self::Device`] target resolves to a mesh with one auto axis named `device` of size 1 and to the replicated
-    /// sharding over that mesh.
+    /// Resolves this target into the destination [`DeviceMesh`] and [`Sharding`] of a value of rank `rank`.
+    /// A [`Self::Device`] target resolves to a mesh with one auto axis named `device` of size 1 and to the
+    /// replicated sharding over that mesh.
     ///
     /// # Errors
     ///
@@ -75,10 +73,13 @@ impl ArrayPlacement {
 }
 
 impl From<Device> for ArrayPlacement {
+    #[inline]
     fn from(value: Device) -> Self {
         Self::Device(value)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Options of [`Session::place`].
 ///

@@ -1547,25 +1547,11 @@ impl Shape {
         self[index].clone()
     }
 
-    /// Returns the number of elements in arrays with this [`Shape`]. A statically zero [`Dimension`] makes the result
-    /// exactly zero even when another [`Dimension`] is dynamic. Otherwise, a dynamic dimension produces `Ok(None)`.
-    /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays with this [`Shape`]. A statically zero [`Dimension`] makes the count
+    /// zero. Otherwise, the extents are multiplied in order, returning `Ok(None)` at the first dynamic dimension.
+    /// Returns a [`TypeError`] if the product overflows [`usize`] before reaching a dynamic dimension or the end.
     pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
-        if self.dimensions.contains(&Dimension::Static(0)) {
-            return Ok(Some(0));
-        }
-        let mut count = 1usize;
-        for dimension in self.dimensions.iter() {
-            match dimension {
-                Dimension::Static(extent) => {
-                    count = count.checked_mul(*extent).ok_or_else(|| {
-                        TypeError::invalid(format!("shape {self} element count does not fit in `usize`"))
-                    })?;
-                }
-                Dimension::Dynamic(_) => return Ok(None),
-            }
-        }
-        Ok(Some(count))
+        checked_element_count(self.dimensions.iter().map(Dimension::value), self)
     }
 
     /// Returns whether this [`Shape`] and `other` _provably_ contain the same number of elements, even when their
@@ -1810,14 +1796,7 @@ impl StaticShape {
     /// Returns a [`TypeError`] if the element count does not fit in [`usize`].
     #[inline]
     pub fn element_count(&self) -> Result<usize, TypeError> {
-        if self.dimensions.contains(&0) {
-            return Ok(0);
-        }
-        self.dimensions
-            .iter()
-            .copied()
-            .try_fold(1usize, usize::checked_mul)
-            .ok_or_else(|| TypeError::invalid(format!("shape {self} element count does not fit in `usize`")))
+        Ok(checked_element_count(self.dimensions.iter().copied().map(Some), self)?.unwrap())
     }
 
     /// Returns the row-major (i.e., the last dimension corresponds to the fastest moving index) strides over element
@@ -1900,6 +1879,25 @@ impl DimensionMemberType for DimensionType {
     fn as_dimension_type(&self) -> Result<&DimensionType, TypeError> {
         Ok(self)
     }
+}
+
+/// Counts elements without materializing the extents. A zero extent takes precedence anywhere in the shape.
+/// Otherwise, an unknown extent or overflow ends the count as soon as it is encountered.
+fn checked_element_count<E: Iterator<Item = Option<usize>> + Clone, S: Display>(
+    extents: E,
+    shape: &S,
+) -> Result<Option<usize>, TypeError> {
+    if extents.clone().any(|extent| extent == Some(0)) {
+        return Ok(Some(0));
+    }
+    let mut element_count = 1usize;
+    for extent in extents {
+        let Some(extent) = extent else { return Ok(None) };
+        element_count = element_count
+            .checked_mul(extent)
+            .ok_or_else(|| TypeError::invalid(format!("shape {shape} element count does not fit in `usize`")))?;
+    }
+    Ok(Some(element_count))
 }
 
 #[cfg(test)]
@@ -2528,6 +2526,23 @@ mod tests {
         assert_eq!(
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]).element_count(),
             Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in `usize`", usize::MAX))),
+        );
+
+        // Without a zero extent, the first dynamic dimension or overflowing product determines the result.
+        let dynamic = Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()));
+        let overflowing_prefix = Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), dynamic.clone()]);
+        assert_eq!(
+            overflowing_prefix.element_count(),
+            Err(TypeError::invalid(format!("shape {overflowing_prefix} element count does not fit in `usize`"))),
+        );
+        assert_eq!(
+            Shape::new(vec![dynamic.clone(), Dimension::Static(usize::MAX), Dimension::Static(2)]).element_count(),
+            Ok(None),
+        );
+        assert_eq!(
+            Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), dynamic, Dimension::Static(0)])
+                .element_count(),
+            Ok(Some(0)),
         );
     }
 
