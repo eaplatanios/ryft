@@ -731,8 +731,6 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Executes one [`PlaceOperation`] for a leaf through its [`Value::Dispatch`] policy. A domain-dispatched leaf binds
 /// the operation in its own context. Direct backends can implement this trait on [`ValueDirectDispatch`] for their
 /// values. [`Place`] supplies the leaf's inferred source when available, while this primitive uses the source that it
@@ -743,16 +741,16 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
 /// [`PlaceOperation::with_may_alias`]). Without a target, the value stays where it is (i.e., its devices, sharding,
 /// memory, and layout are unchanged), which places a value with its source recorded or, with `may_alias` set to
 /// `false`, gives it storage of its own. With `may_alias` set to `false`, implementations for concrete values must
-/// return a value whose storage no other value shares, and implementations for staged values must stage the
-/// placement with that policy, so that the copy happens when the staged placement executes on concrete values.
+/// return a value whose storage no other value shares, and implementations for staged values must stage the placement
+/// with that policy, so that the copy happens when the staged placement executes on concrete values.
 pub trait PlaceDispatch<T: Type, V: Value<Type = T>> {
     /// Records `source` as the expected placement of `input` and moves it to `target`. A [`None`] target leaves it
     /// where it is. The result may share storage with `input` only when `may_alias` is `true`.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects the target or the source for the
-    /// type of `input` (e.g., when their ranks differ from that of `input` or the target changes its reduction
+    /// Returns [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects the target or the source for
+    /// the type of `input` (e.g., when their ranks differ from that of `input` or the target changes its reduction
     /// state), and [`ProgramError::InvalidInputCount`] or [`ProgramError::InvalidOutputCount`] when a context binds
     /// the placement with an unexpected number of values. Array IR values return [`ProgramError::Type`] for a member
     /// that is not an array. Backends that execute the placement on concrete values return their own errors (e.g.,
@@ -772,14 +770,14 @@ impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
         target: Option<&Placement>,
         may_alias: bool,
     ) -> Result<Array, ProgramError> {
-        // A reference array is a host value without devices, so placing it keeps its elements unchanged. Its type
-        // still records the placement, and the output type comes from the `PlaceOperation` type inference rule
-        // itself, so that eager evaluation validates the target and source exactly like staged programs do. The
-        // layout determines how the physical storage addresses the elements, so the storage is shared only when the
-        // layout is unchanged and the copy policy allows it, and it is copied when that policy forbids sharing it.
-        // Otherwise, the logical bytes are re-encoded for the output layout into new storage, which preserves the
-        // exact element bits (including low-precision encodings and NaN payloads), as in `Cast` for `Array`. Without
-        // a target, the output type is the input type, so the storage is shared or copied as the copy policy says.
+        // A reference array is a host value without devices, so placing it keeps its elements unchanged. Its type still
+        // records the placement, and the output type comes from the `PlaceOperation` type inference rule itself, so
+        // that eager evaluation validates the target and source exactly like staged programs do. The layout determines
+        // how the physical storage addresses the elements, so the storage is shared only when the layout is unchanged
+        // and the copy policy allows it, and it is copied when that policy forbids sharing it. Otherwise, the logical
+        // bytes are re-encoded for the output layout into new storage, which preserves the exact element bits
+        // (including low-precision encodings and NaN payloads), as in `Cast` for `Array`. Without a target,
+        // the output type is the input type, so the storage is shared or copied as the copy policy says.
         let operation = PlaceOperation::new(source, target.cloned()).with_may_alias(may_alias);
         let mut output_types = operation.infer_output_types(&[input.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
@@ -802,6 +800,7 @@ impl<
         >,
 > PlaceDispatch<ArrayType, V> for ValueDomainDispatch
 {
+    #[inline]
     fn place(
         input: &V,
         source: Option<Placement>,
@@ -823,6 +822,7 @@ impl<
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, V::Projected>>>,
 > PlaceDispatch<ArrayIrType, V> for V::Dispatch
 {
+    #[inline]
     fn place(
         input: &V,
         source: Option<Placement>,
@@ -834,6 +834,8 @@ impl<
         Ok(V::from_projected(output))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Moves a value to a target [`Placement`], possibly on the devices of another [`DeviceMesh`](crate::DeviceMesh),
 /// without changing its
