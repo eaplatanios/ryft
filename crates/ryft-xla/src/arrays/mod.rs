@@ -1292,6 +1292,34 @@ mod tests {
     }
 
     #[test]
+    fn test_array_from_addressable_buffers_rejects_mismatched_layout() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let mesh = domain_mesh(client, "x", 1);
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+
+        // Reject a row-major buffer whose logical type declares the column-major layout.
+        let bytes = values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]);
+        let buffer = client.buffer(bytes.as_slice(), BufferType::F64, [2, 3], None, device.clone(), None).unwrap();
+        let error = Array::from_addressable_buffers(
+            &session,
+            ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout),
+            mesh,
+            None,
+            vec![buffer],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid layout: buffer on device {} uses layout `tiled{{1,0}}` but its type declares `tiled{{0,1}}`",
+                device.id().unwrap(),
+            ),
+        );
+    }
+
+    #[test]
     fn test_array_from_addressable_buffers_rejects_noncanonical_zero_carrier() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();

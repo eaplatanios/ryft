@@ -455,14 +455,8 @@ impl Session {
         // The target platform gates platform-specific lowerings such as fused attention. A client whose platform
         // cannot be queried cannot compile the program either, so a failed query fails the lowering.
         let target = self.target()?;
-        let platform = target.platform_name();
-        if use_shardy_partitioner
-            && options.mesh().devices().len() > 1
-            && (platform.eq_ignore_ascii_case("cpu") || platform.eq_ignore_ascii_case("cuda"))
-        {
-            resolve_shardy_debug_options(self.client(), &mut compilation_options);
-        }
-        let target_platform = Some(platform);
+        resolve_shardy_debug_options(self.client(), &mut compilation_options);
+        let target_platform = Some(target.platform_name());
         // Shardy currently rejects bounded dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());

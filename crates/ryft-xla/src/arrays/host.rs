@@ -815,14 +815,13 @@ fn merge_dense_shard_bytes(
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[allow(clippy::single_range_in_vec_init)]
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
         Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         ProgramError, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout,
@@ -870,6 +869,15 @@ mod tests {
                 .unwrap();
         assert_eq!(array.mesh(), &default_mesh);
 
+        // The host buffer must hold exactly the dense bytes of the array.
+        let error = Array::from_host_buffer(&session, r#type.clone(), None, None, &bytes[..4]).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error)
+                if matches!(error.as_ref(), ArrayError::HostBufferByteCountMismatch { expected: 8, actual: 4 }),
+        ));
+        assert_eq!(error.to_string(), "host buffer needs 8 byte(s) but got 4");
+
         // A sharding over more devices than the client has cannot be inferred.
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let r#type = r#type.with_sharding(Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
@@ -885,53 +893,29 @@ mod tests {
         ));
     }
 
-    #[test]
     #[allow(deprecated)] // PJRT currently exposes actual buffer layout only through this query.
+    #[test]
     fn test_array_from_host_buffer_layout() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
-        let device = client.addressable_devices().unwrap().remove(0);
         let mesh = domain_mesh(client, "x", 1);
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let array = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone()),
-            mesh.clone(),
+            mesh,
             None,
             values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]),
         )
         .unwrap();
+
+        // The device buffer is stored in the layout of the type, and reading it back restores the row-major order.
         assert_eq!(array.layout(), Some(&layout));
         assert_eq!(
             array.addressable_shards().next().unwrap().buffer().unwrap().layout(),
-            Ok(layout.to_pjrt().unwrap())
+            Ok(layout.to_pjrt().unwrap()),
         );
         assert_eq!(array.copy_to_host().unwrap().elements::<f64>().unwrap(), vec![1., 2., 3., 4., 5., 6.]);
-        let wrong_buffer = client
-            .buffer(
-                values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]).as_slice(),
-                BufferType::F64,
-                [2, 3],
-                None,
-                device.clone(),
-                None,
-            )
-            .unwrap();
-        let error = Array::from_addressable_buffers(
-            &session,
-            ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout),
-            mesh,
-            None,
-            vec![wrong_buffer],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "invalid layout: buffer on device {} uses layout `tiled{{1,0}}` but its type declares `tiled{{0,1}}`",
-                device.id().unwrap(),
-            )
-        );
     }
 
     #[test]
@@ -1054,6 +1038,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
+        // Zero-space arrays are created without device buffers and read back as no bytes.
         let array = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
         assert_eq!(array.size_in_bytes().unwrap(), 0);
@@ -1062,6 +1047,7 @@ mod tests {
         assert_eq!(array, array.clone());
         assert_eq!(array.copy_to_host_bytes().unwrap(), Vec::<u8>::new());
 
+        // So are zero-space arrays that have no elements.
         let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(0)]));
         let zero_sized = Array::from_host_buffer(&session, zero_sized_type, array.mesh().clone(), None, []).unwrap();
         assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
@@ -1078,8 +1064,8 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
+        // Shards on devices of other processes are described without being addressable.
         let array = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
-
         assert_eq!(array.shards().len(), 2);
         assert!(array.shards()[0].is_addressable());
         assert!(array.shards()[0].buffer().is_none());
@@ -1124,8 +1110,7 @@ mod tests {
                     │  0  │  1  │
                     └─────┴─────┘
                 "}
-            .trim_end()
-            .to_string()
+            .trim_end(),
         );
     }
 
@@ -1156,7 +1141,6 @@ mod tests {
             values_to_bytes::<f32>(values.as_slice()).as_slice(),
         )
         .unwrap();
-
         assert_eq!(array.addressable_shards().count(), 4);
         assert!(array.shards().iter().all(|shard| shard.buffer().is_some()));
         assert_eq!(
@@ -1172,9 +1156,9 @@ mod tests {
                     │     │     │
                     └─────┴─────┘
                 "}
-            .trim_end()
-            .to_string()
+            .trim_end(),
         );
+
         // Shards are ordered like the mesh devices, and each one holds its row-major `4x3` tile of the host value.
         assert_eq!(
             array
@@ -1212,6 +1196,8 @@ mod tests {
         let first_bytes = [1, 2].as_slice();
         let second_bytes = [3, 4].as_slice();
 
+        // Host shards are matched to their devices by identifier, in any order, and shards on devices of other
+        // processes need no bytes.
         let array = Array::from_host_shards(
             &session,
             r#type.clone(),
@@ -1227,11 +1213,13 @@ mod tests {
         assert_eq!(array.shards()[1].copy_to_host_bytes().unwrap(), second_bytes);
         assert!(!array.shards()[2].is_addressable());
 
+        // Every addressable device needs exactly one host shard of the size of its tile.
         let missing =
             Array::from_host_shards(&session, r#type.clone(), mesh.clone(), None, [(first, first_bytes)]).unwrap_err();
         assert!(matches!(
             &missing,
-            Error::Array(error) if matches!(error.as_ref(), ArrayError::MissingHostShard { device_id } if *device_id == second)
+            Error::Array(error)
+                if matches!(error.as_ref(), ArrayError::MissingHostShard { device_id } if *device_id == second),
         ));
         assert_eq!(missing.to_string(), format!("missing host shard for device {second}"));
 
@@ -1245,7 +1233,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             &duplicate,
-            Error::Array(error) if matches!(error.as_ref(), ArrayError::MultipleHostShardsOnDevice { device_id } if *device_id == first)
+            Error::Array(error) if matches!(
+                error.as_ref(),
+                ArrayError::MultipleHostShardsOnDevice { device_id } if *device_id == first,
+            ),
         ));
         assert_eq!(duplicate.to_string(), format!("got multiple host shards for device {first}"));
 
@@ -1261,22 +1252,31 @@ mod tests {
             &wrong_size,
             Error::Array(error) if matches!(
                 error.as_ref(),
-                ArrayError::HostShardByteCountMismatch { device_id, expected: 2, actual: 1 } if *device_id == second
-            )
+                ArrayError::HostShardByteCountMismatch { device_id, expected: 2, actual: 1 } if *device_id == second,
+            ),
         ));
         assert_eq!(wrong_size.to_string(), format!("host shard on device {second} needs 2 byte(s) but got 1"));
 
+        // Host shards can only be uploaded to devices of the mesh that this process can address.
         assert!(matches!(
             Array::from_host_shards(
                 &session,
-                r#type,
-                mesh,
+                r#type.clone(),
+                mesh.clone(),
                 None,
                 [(first, first_bytes), (second, second_bytes), (remote.id(), [5].as_slice())],
             ),
             Err(Error::Array(error)) if matches!(error.as_ref(), ArrayError::NonAddressableDevice { device_id, .. }
                 if *device_id == remote.id()),
         ));
+        let absent = remote.id() + 1;
+        let error = Array::from_host_shards(&session, r#type, mesh, None, [(absent, first_bytes)]).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error)
+                if matches!(error.as_ref(), ArrayError::DeviceNotInMesh { device_id } if *device_id == absent),
+        ));
+        assert_eq!(error.to_string(), format!("device {absent} is not present in the device mesh"));
     }
 
     #[test]
@@ -1288,6 +1288,8 @@ mod tests {
         let r#type = ArrayType::new_static(DataType::U8, [3]);
         let first = mesh.devices()[0].id();
         let second = mesh.devices()[1].id();
+
+        // The type of the array records none of the placement over the auto axis, while its runtime sharding does.
         let array = Array::from_host_shards(
             &session,
             r#type,
@@ -1304,6 +1306,32 @@ mod tests {
 
     #[test]
     fn test_array_copy_to_host() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let bytes = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [3, 2]),
+            mesh,
+            Some(sharding),
+            bytes.as_slice(),
+        )
+        .unwrap();
+
+        // The host array holds the whole value with the element type and the shape of the array but not its sharding.
+        let host_array = array.copy_to_host().unwrap();
+        assert_eq!(host_array, CoreArray::new(ArrayType::new_static(DataType::F32, [3, 2]), bytes).unwrap());
+        assert_eq!(host_array.elements::<f32>().unwrap(), vec![1., 2., 3., 4., 5., 6.]);
+    }
+
+    #[test]
+    fn test_array_copy_to_host_bytes() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
@@ -1357,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_copy_to_host_bytes() {
+    fn test_array_copy_to_host_bytes_reads_one_replica_per_tile() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
@@ -1375,6 +1403,7 @@ mod tests {
         let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let rows = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
         let replicated = vec![ShardingDimension::replicated(), ShardingDimension::replicated()];
+
         // Leave one readable shard per tile. Any extra replica copy would fail the readback.
         for (dimensions, tile_count) in [(rows, 2), (replicated, 1)] {
             let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
@@ -1445,7 +1474,8 @@ mod tests {
         let error = readback([first, [1., 3.], second, second]).unwrap_err();
         assert!(matches!(
             &error,
-            Error::Array(error) if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 1 }),
+            Error::Array(error)
+                if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 1 }),
         ));
         assert_eq!(error.to_string(), "array move found inconsistent overlapping data while materializing shard #1");
     }
@@ -1455,6 +1485,9 @@ mod tests {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
+
+        // Arrays without elements and zero-space arrays issue no copies, and the failure of the execution that
+        // produced them is still returned.
         for (data_type, shape) in [(DataType::F32, [0]), (DataType::Zero, [2])] {
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
@@ -1474,13 +1507,42 @@ mod tests {
         // A stride that overflows `usize` is an error.
         let error = row_major_element_strides(&[2, usize::MAX, 2], DataType::F32).unwrap_err();
         let message = format!(
-            "row-major stride for array with shape `[2, {}, 2]` and element type `f32` exceeds the maximum allowed size \
-             of {}",
+            "row-major stride for array with shape `[2, {}, 2]` and element type `f32` exceeds the maximum allowed \
+             size of {}",
             usize::MAX,
             usize::MAX,
         );
         assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
         assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn test_merge_shard_byte_segment() {
+        let mut global_bytes = vec![0u8; 6];
+        let mut written_intervals = Vec::new();
+
+        // Segments that do not touch are recorded as separate intervals.
+        merge_shard_byte_segment(&[1, 2], 0, 0, &mut global_bytes, &mut written_intervals).unwrap();
+        merge_shard_byte_segment(&[5, 6], 4, 1, &mut global_bytes, &mut written_intervals).unwrap();
+        assert_eq!(written_intervals, vec![0..2, 4..6]);
+
+        // A segment that agrees with the bytes that it overlaps joins the intervals that it touches.
+        merge_shard_byte_segment(&[2, 3, 4, 5], 1, 2, &mut global_bytes, &mut written_intervals).unwrap();
+        assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(written_intervals, vec![0..6]);
+
+        // Empty segments record nothing.
+        merge_shard_byte_segment(&[], 6, 3, &mut global_bytes, &mut written_intervals).unwrap();
+        assert_eq!(written_intervals, vec![0..6]);
+
+        // A segment that disagrees with the bytes that it overlaps is rejected.
+        let error = merge_shard_byte_segment(&[9], 2, 4, &mut global_bytes, &mut written_intervals).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error)
+                if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 4 }),
+        ));
+        assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -1504,31 +1566,5 @@ mod tests {
         .unwrap();
         assert_eq!(values_from_bytes::<f32>(global_bytes.as_slice()), vec![0., 1., 0., 2.]);
         assert_eq!(written_intervals, vec![4..8, 12..16]);
-    }
-
-    #[test]
-    fn test_merge_shard_byte_segment() {
-        let mut global_bytes = vec![0u8; 6];
-        let mut written_intervals = Vec::new();
-        merge_shard_byte_segment(&[1, 2], 0, 0, &mut global_bytes, &mut written_intervals).unwrap();
-        merge_shard_byte_segment(&[5, 6], 4, 1, &mut global_bytes, &mut written_intervals).unwrap();
-        assert_eq!(written_intervals, vec![0..2, 4..6]);
-
-        // A segment that agrees with the bytes that it overlaps joins the intervals that it touches.
-        merge_shard_byte_segment(&[2, 3, 4, 5], 1, 2, &mut global_bytes, &mut written_intervals).unwrap();
-        assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(written_intervals, vec![0..6]);
-
-        // Empty segments record nothing.
-        merge_shard_byte_segment(&[], 6, 3, &mut global_bytes, &mut written_intervals).unwrap();
-        assert_eq!(written_intervals, vec![0..6]);
-
-        // A segment that disagrees with the bytes that it overlaps is rejected.
-        let error = merge_shard_byte_segment(&[9], 2, 4, &mut global_bytes, &mut written_intervals).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Array(error) if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 4 }),
-        ));
-        assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
     }
 }

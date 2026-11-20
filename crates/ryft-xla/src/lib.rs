@@ -229,10 +229,7 @@ pub(crate) mod tests {
             }),
             ..Default::default()
         };
-        let platform = client.platform_name().unwrap();
-        if platform.eq_ignore_ascii_case("cpu") || platform.eq_ignore_ascii_case("cuda") {
-            resolve_shardy_debug_options(client, &mut options);
-        }
+        resolve_shardy_debug_options(client, &mut options);
         options
     }
 

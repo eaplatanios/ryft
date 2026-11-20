@@ -419,10 +419,14 @@ struct ClientDebugOptions {
     defaults: OnceLock<Option<DebugOptions>>,
 }
 
-/// Supplies the client's default debug options to MLIR export when CPU or CUDA Shardy compilation will import V3.
+/// Supplies the client's default debug options to MLIR export for multi-partition CPU or CUDA programs that use
+/// Shardy and will import V3.
 pub(crate) fn resolve_shardy_debug_options(client: &'static Client<'static>, options: &mut CompilationOptions) {
     let Some(build_options) = options.executable_build_options.as_mut() else { return };
-    if build_options.debug_options.is_some() {
+    if !build_options.use_shardy_partitioner
+        || build_options.partition_count <= 1
+        || build_options.debug_options.is_some()
+    {
         return;
     }
     let requested_v3 = match options.environment_option_overrides.get("xla_enable_hlo_sharding_v3") {
@@ -433,6 +437,12 @@ pub(crate) fn resolve_shardy_debug_options(client: &'static Client<'static>, opt
             _ => return,
         },
     };
+    if !client
+        .platform_name()
+        .is_ok_and(|platform| platform.eq_ignore_ascii_case("cpu") || platform.eq_ignore_ascii_case("cuda"))
+    {
+        return;
+    }
 
     // TODO(eaplatanios): Remove this workaround when CPU and CUDA PJRT resolve defaults and apply option overrides
     //  before MLIR export. Reference: https://github.com/openxla/xla/issues/52711
