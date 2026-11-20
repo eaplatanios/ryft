@@ -640,9 +640,8 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Debug for Array {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Array")
@@ -654,21 +653,22 @@ impl Debug for Array {
 }
 
 impl Display for Array {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "array(type={})", self.parts.metadata.r#type())
     }
 }
 
-// `Array` equality is *storage identity*, not element-wise value equality. Arrays that share their storage are equal.
-// Otherwise, ordinary arrays are equal only when they have the same type and sharding and every shard references the
-// same underlying `Buffer`, as determined by `Arc` pointer identity, while bufferless zero-space shards compare equal
-// because their type admits exactly one value, and shards on other processes never compare equal because they have no
-// local storage to compare. Arrays holding equal ordinary data in distinct buffers deliberately compare unequal, which
-// is the conservative answer that analyses comparing flowing values need and mirrors the `PartialEq` implementation of
-// `Tracer`, which compares staging identity. Element-wise equality would require device-to-host transfers and is
-// deliberately not what this implements.
 impl PartialEq for Array {
     fn eq(&self, other: &Self) -> bool {
+        // `Array` equality is _storage identity_, not element-wise value equality. Arrays that share their storage are
+        // equal. Otherwise, ordinary arrays are equal only when they have the same type and sharding and every shard
+        // references the same underlying `Buffer`, as determined by `Arc` pointer identity, while bufferless zero-space
+        // shards compare equal because their type admits exactly one value, and shards on other processes never compare
+        // equal because they have no local storage to compare. Arrays holding equal ordinary data in distinct buffers
+        // deliberately compare unequal, which is the conservative answer that analyses comparing flowing values need
+        // and mirrors the `PartialEq` implementation of `Tracer`, which compares staging identity. Element-wise
+        // equality would require device-to-host transfers and is deliberately not what this implements.
         let (left, right) = (&self.parts, &other.parts);
         Arc::ptr_eq(left, right)
             || (left.metadata.r#type() == right.metadata.r#type()
@@ -678,9 +678,11 @@ impl PartialEq for Array {
                     match (left.storage(), right.storage()) {
                         (ArrayShardStorage::Zero, ArrayShardStorage::Zero) => true,
                         (ArrayShardStorage::Buffer(left), ArrayShardStorage::Buffer(right)) => Arc::ptr_eq(left, right),
-                        // Two shards on other processes have no local storage to compare, so they are only known to
-                        // be the same storage when their arrays share their parts, which is checked first.
-                        _ => false,
+                        _ => {
+                            // Two shards on other processes have no local storage to compare, so they are only known
+                            // to be the same storage when their arrays share their parts, which is checked first.
+                            false
+                        }
                     }
                 }))
     }
@@ -689,10 +691,13 @@ impl PartialEq for Array {
 impl Typed for Array {
     type Type = ArrayType;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(self.parts.metadata.r#type())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl CoreValue for Array {
     // A concrete `Array` binds and executes every operation through its PJRT-backed `Session`. It uses
@@ -713,8 +718,6 @@ impl CoreValue for Array {
         ProjectedContext::new(self.session.clone())
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 // Every eager value capability of `Array` follows the JAX-style op-by-op dispatch shape. The blanket capability
 // implementations in `ryft-core` (e.g., arithmetic, logical, comparison, selection, manipulation, and reductions)
