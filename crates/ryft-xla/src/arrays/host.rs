@@ -3,127 +3,17 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayType, DataType, DeviceMesh, Layout, Memory, Sharding, StaticShape, Typed, UnreducedKind,
+    Array as CoreArray, ArrayType, DataType, DeviceMesh, Memory, Sharding, StaticShape, Typed, UnreducedKind,
 };
-use ryft_pjrt::{
-    Device as PjrtDevice, DeviceId, ExecutionFence, HostBuffer, HostDestination, HostDestinationSlice,
-    Memory as PjrtMemory,
-};
+use ryft_pjrt::{Device as PjrtDevice, DeviceId, ExecutionFence, HostBuffer, HostDestination, Memory as PjrtMemory};
 
 use crate::arrays::metadata::resolve_placement;
 use crate::arrays::shards::{ArrayShard, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError, ArrayTypeExtension};
-use crate::sessions::synchronization::HostCopy;
 use crate::types::DataTypeExtension;
 use crate::{Error, Session, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
-
-/// In-flight copies for materializing one array as dense row-major host bytes, which
-/// [`Array::begin_copy_to_host`] returns.
-///
-/// Construction starts every needed shard copy without waiting. [`Self::finish`] then awaits the transfers that were
-/// already issued, merges the shards when there is more than one, and combines the separate values that devices hold
-/// along unreduced mesh axes. Its result is what [`Array::copy_to_host`] returns. This separation lets callers issue
-/// copies for several arrays before blocking on any one transfer.
-pub(crate) struct DenseArrayHostCopy {
-    /// Global logical shape of the source array.
-    global_shape: StaticShape,
-
-    /// Element type of the source array.
-    element_type: DataType,
-
-    /// [`UnreducedKind`] that combines the per-device values of the source array along its unreduced axes.
-    unreduced_kind: UnreducedKind,
-
-    /// Total byte count of the global dense representation.
-    total_byte_count: usize,
-
-    /// In-flight copies of the shards.
-    shards: DenseShardHostCopies,
-
-    /// Producer completion, including when no payload copy is needed to observe an execution error.
-    completion: Option<ExecutionFence>,
-}
-
-impl DenseArrayHostCopy {
-    /// Waits for every previously issued copy and produces one dense row-major byte buffer.
-    pub(crate) fn finish(self) -> Result<Vec<u8>, Error> {
-        self.finish_with_measurements().map(|(bytes, _)| bytes)
-    }
-
-    /// Finishes this copy and reports whether a global merge buffer was allocated.
-    pub(crate) fn finish_with_measurements(self) -> Result<(Vec<u8>, bool), Error> {
-        if let Some(completion) = &self.completion {
-            completion.block_until_ready()?;
-        }
-        let shards = match self.shards {
-            DenseShardHostCopies::Merged(shards) if shards.is_empty() => return Ok((Vec::new(), false)),
-            DenseShardHostCopies::Merged(shards) => shards,
-            DenseShardHostCopies::Direct { destination, copies } => {
-                // Every slice is dropped once its copy completes, which makes the destination's bytes accessible.
-                for copy in copies {
-                    drop(copy.wait()?);
-                }
-                let bytes = destination.into_bytes().ok().unwrap();
-                return Ok((bytes, false));
-            }
-        };
-        let shards = shards
-            .into_iter()
-            .map(|shard| {
-                let PendingDenseShardHostCopy {
-                    copy,
-                    shard_index,
-                    device_id,
-                    expected_byte_count,
-                    slices,
-                    unreduced_coordinates,
-                } = shard;
-                let bytes = copy.wait()?;
-                if bytes.len() != expected_byte_count {
-                    return Err(Error::from(ArrayError::ShardByteCountMismatch {
-                        shard_index,
-                        device_id,
-                        expected: expected_byte_count,
-                        actual: bytes.len(),
-                    }));
-                }
-                Ok((shard_index, slices, unreduced_coordinates, bytes))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let mut shards = combine_unreduced_values(shards, self.element_type, self.unreduced_kind)?;
-
-        if shards.len() == 1 {
-            let (shard_index, slices, bytes) = shards.pop().unwrap();
-            let covers_global_shape = (slices.is_empty() && self.global_shape.rank() == 0)
-                || (slices.len() == self.global_shape.rank()
-                    && slices
-                        .iter()
-                        .zip(self.global_shape.as_slice())
-                        .all(|(slice, extent)| slice.start == 0 && slice.end == *extent));
-            if covers_global_shape && bytes.len() == self.total_byte_count {
-                return Ok((bytes, false));
-            }
-            shards.push((shard_index, slices, bytes));
-        }
-
-        let mut global_bytes = vec![0u8; self.total_byte_count];
-        let mut written_intervals = Vec::new();
-        for (shard_index, slices, bytes) in shards {
-            merge_dense_shard_bytes(
-                bytes.as_slice(),
-                self.global_shape.as_slice(),
-                slices.as_slice(),
-                self.element_type,
-                shard_index,
-                &mut global_bytes,
-                &mut written_intervals,
-            )?;
-        }
-        Ok((global_bytes, true))
-    }
-}
 
 impl Array {
     /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
@@ -468,59 +358,42 @@ impl Array {
     }
 
     /// Copies the value of this [`Array`] to the host and returns its dense row-major bytes, irrespective of the
-    /// physical [`Layout`] of its shard buffers. This is an explicit synchronization boundary. It blocks the current
-    /// thread until the copies and the whole execution that produced this array complete, so it also surfaces the
-    /// errors of that execution.
+    /// physical [`Layout`](ryft_core::Layout) of its shard buffers. This is an explicit synchronization boundary.
+    /// It blocks the current thread until the copies and the whole execution that produced this array complete, so
+    /// it also surfaces the errors of that execution.
     ///
-    /// One shard is copied for each distinct tile of the array, so a replicated array is read from a single device.
-    /// When the [`Sharding`] of this array has unreduced axes, along which the devices hold separate values of each
-    /// tile (e.g., summands), every shard is copied and those values are combined with the [`UnreducedKind`] of the
-    /// sharding. Arrays with no elements and [`DataType::Zero`] arrays produce no bytes and issue no copies. Use
-    /// [`ArrayShard::copy_to_host_bytes`] to read the bytes that a single device holds instead.
+    /// When each tile occupies a contiguous byte range of the dense array, one replica of each tile is copied
+    /// directly into the destination. Otherwise, the shard copies are merged on the host. When the [`Sharding`] has
+    /// unreduced axes, every shard is copied and the separate per-device values (e.g., summands) are combined with
+    /// the [`UnreducedKind`] of the sharding. Arrays with no elements and [`DataType::Zero`] arrays produce no bytes
+    /// and issue no copies. Use [`ArrayShard::copy_to_host_bytes`] to read the bytes that a single device holds.
     ///
     /// # Errors
     ///
     /// Returns [`ArrayError::MissingShardBuffer`] when the current process does not hold the whole value. That is
     /// the case when a shard lives in another process and either the addressable shards do not cover the array or its
-    /// sharding has unreduced axes. PJRT transfer failures and the errors of the producing execution are returned
-    /// unchanged.
+    /// sharding has unreduced axes. This is checked before issuing any copies. PJRT transfer failures and the errors
+    /// of the producing execution are returned unchanged.
     pub fn copy_to_host_bytes(&self) -> Result<Vec<u8>, Error> {
-        self.begin_copy_to_host()?.finish()
-    }
-
-    /// Starts copies for the shards of this array that hold its whole value without awaiting them. Those are all the
-    /// shards, or only the addressable ones when some shard lives in another process but the addressable ones cover the
-    /// array and it has no unreduced axes (e.g., for a replicated array).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArrayError::MissingShardBuffer`] before issuing any copy when the current process does not hold the
-    /// whole value. PJRT transfer failures are returned unchanged.
-    pub(crate) fn begin_copy_to_host(&self) -> Result<DenseArrayHostCopy, Error> {
-        let completion = self.execution_fence().cloned();
-        // Empty arrays have no payload either. Avoid asking PJRT for a dynamic copy of zero bytes, whose fallback for
-        // the size query can expose the bound allocation and its trailer instead of the empty logical value.
-        if self.data_type().is_zero() || self.shape().as_slice().contains(&0) {
-            return Ok(DenseArrayHostCopy {
-                global_shape: self.shape(),
-                element_type: self.data_type(),
-                unreduced_kind: self.sharding().unreduced_kind(),
-                total_byte_count: 0,
-                shards: DenseShardHostCopies::Merged(Vec::new()),
-                completion: Some(match completion {
-                    Some(completion) => completion,
-                    None => ExecutionFence::new(
-                        self.addressable_shards()
-                            .filter_map(|shard| shard.buffer())
-                            .map(|buffer| buffer.ready())
-                            .collect::<Result<Vec<_>, _>>()?,
-                    ),
-                }),
-            });
-        }
-
+        let completion = self.execution_fence();
         let global_shape = self.shape();
         let element_type = self.data_type();
+        // A PJRT size query for an empty dynamic buffer can expose its bound allocation and trailer. Skip transfers
+        // for arrays with no payload, and wait for the producer or local buffers so their errors still surface.
+        if element_type.is_zero() || global_shape.as_slice().contains(&0) {
+            if let Some(completion) = completion {
+                completion.block_until_ready()?;
+            } else {
+                let events = self
+                    .addressable_shards()
+                    .filter_map(|shard| shard.buffer())
+                    .map(|buffer| buffer.ready())
+                    .collect::<Result<Vec<_>, _>>()?;
+                ExecutionFence::new(events).block_until_ready()?;
+            }
+            return Ok(Vec::new());
+        }
+
         let total_byte_count = self.r#type().size_in_bytes()?;
         let mesh = self.mesh();
         let unreduced_axis_indices = mesh
@@ -558,7 +431,6 @@ impl Array {
                 addressable
             }
         };
-        let unreduced_kind = self.sharding().unreduced_kind();
         let mut work = self.session().reserve_work();
 
         // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile
@@ -593,77 +465,91 @@ impl Array {
                         Ok(work.track_host_copy(event))
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-                let shards = DenseShardHostCopies::Direct { destination, copies };
-                return Ok(DenseArrayHostCopy {
-                    global_shape,
-                    element_type,
-                    unreduced_kind,
-                    total_byte_count,
-                    shards,
-                    completion,
-                });
+                // Publish the readback to the session after issuing all copies, then check the producer before
+                // consuming the transfer results so any execution error takes precedence.
+                drop(work);
+                if let Some(completion) = completion {
+                    completion.block_until_ready()?;
+                }
+                // Drop each returned slice so the destination can yield its full byte buffer.
+                for copy in copies {
+                    drop(copy.wait()?);
+                }
+                return Ok(destination.into_bytes().ok().unwrap());
             }
         }
 
-        let shards = shards
+        // Non-contiguous tiles and per-device values along unreduced axes need separate host buffers. Request
+        // row-major bytes for the merge regardless of the source layouts, and issue all copies before waiting.
+        let copies = shards
             .into_iter()
             .map(|shard| {
-                let device = shard.device();
-                let shard_index = shard.index();
-                let buffer = shard.buffer().map(|buffer| buffer.as_ref()).unwrap();
+                let buffer = shard.buffer().unwrap();
                 let shard_shape = shard.shape();
-                // The merge consumes row-major bytes even when the device buffer has another physical layout.
                 let event = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shard_shape.rank())))?;
-                Ok(PendingDenseShardHostCopy {
-                    copy: work.track_host_copy(event),
-                    shard_index,
-                    device_id: device.id(),
-                    expected_byte_count: ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?,
-                    slices: shard.slice().to_vec(),
-                    unreduced_coordinates: match mesh.device_coordinates(shard_index) {
-                        Some(coordinates) => unreduced_axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
-                        None => Vec::new(),
-                    },
-                })
+                let copy = work.track_host_copy(event);
+                let expected_byte_count = ArrayType::new(element_type, shard_shape.into()).size_in_bytes()?;
+                Ok((shard, copy, expected_byte_count))
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let shards = DenseShardHostCopies::Merged(shards);
-        Ok(DenseArrayHostCopy { global_shape, element_type, unreduced_kind, total_byte_count, shards, completion })
-    }
-
-    /// Converts this array to `layout` by copying each of its addressable shards to the host and uploading it back to
-    /// the same memory in `layout`, so that every device keeps its own shard bytes. This is the host relayout for an
-    /// array whose sharding has unreduced axes, whose devices hold separate summands of its value. Materializing such
-    /// an array densely would add those summands, and uploading the sum would replace them with a canonical
-    /// decomposition of it, which an unchecked `shard_map` body could tell apart, because it observes the summands.
-    pub(crate) fn relayout_through_host(&self, session: &Session, layout: &Layout) -> Result<Array, Error> {
-        let r#type = self.r#type().into_owned().with_layout(layout.clone());
-        let device_layout = layout.to_pjrt()?;
-        let buffer_type = self.data_type().executable_buffer_type();
-        let client = session.client();
-        let mut work = session.reserve_work();
-        let mut buffers = Vec::new();
-        for shard in self.addressable_shards() {
-            let shard_index = shard.index();
-            let buffer = shard.buffer().ok_or_else(|| {
-                Error::from(ArrayError::MissingShardBuffer { shard_index, device_id: shard.device().id() })
-            })?;
-            let shape = shard.shape();
-            let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
-            let bytes = work.track_host_copy(copy).wait()?;
-            let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let uploaded = client.buffer(
-                Arc::<[u8]>::from(bytes),
-                buffer_type,
-                dimensions.as_slice(),
-                None,
-                buffer.memory()?,
-                Some(device_layout.clone()),
-            )?;
-            work.track_buffer(&uploaded);
-            buffers.push(uploaded);
+        // Publish the readback before waiting, and check the producer before consuming the transfer results.
+        drop(work);
+        if let Some(completion) = completion {
+            completion.block_until_ready()?;
         }
-        Array::from_addressable_buffers(session, r#type, self.mesh().clone(), Some(self.sharding().clone()), buffers)
+
+        // Shards with the same slices and unreduced coordinates are replicas of one per-device value. Those with
+        // different unreduced coordinates contribute separate values to the tile and must be combined.
+        let shards = copies
+            .into_iter()
+            .map(|(shard, copy, expected_byte_count)| {
+                let bytes = copy.wait()?;
+                if bytes.len() != expected_byte_count {
+                    return Err(Error::from(ArrayError::ShardByteCountMismatch {
+                        shard_index: shard.index(),
+                        device_id: shard.device().id(),
+                        expected: expected_byte_count,
+                        actual: bytes.len(),
+                    }));
+                }
+                let unreduced_coordinates = match mesh.device_coordinates(shard.index()) {
+                    Some(coordinates) => unreduced_axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
+                    None => Vec::new(),
+                };
+                Ok((shard.index(), shard.slice().to_vec(), unreduced_coordinates, bytes))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut shards = combine_unreduced_values(shards, element_type, self.sharding().unreduced_kind())?;
+
+        // Reuse a single full tile's bytes when the copies and any reduction already produced the complete value.
+        if shards.len() == 1 {
+            let (shard_index, slices, bytes) = shards.pop().unwrap();
+            let covers_global_shape = slices.len() == global_shape.rank()
+                && slices
+                    .iter()
+                    .zip(global_shape.as_slice())
+                    .all(|(slice, extent)| slice.start == 0 && slice.end == *extent);
+            if covers_global_shape && bytes.len() == total_byte_count {
+                return Ok(bytes);
+            }
+            shards.push((shard_index, slices, bytes));
+        }
+
+        // Merge tiles into the global buffer, recording written ranges to detect replicas with inconsistent data.
+        let mut global_bytes = vec![0u8; total_byte_count];
+        let mut written_intervals = Vec::new();
+        for (shard_index, slices, bytes) in shards {
+            merge_dense_shard_bytes(
+                bytes.as_slice(),
+                global_shape.as_slice(),
+                slices.as_slice(),
+                element_type,
+                shard_index,
+                &mut global_bytes,
+                &mut written_intervals,
+            )?;
+        }
+        Ok(global_bytes)
     }
 
     /// Resolves `memory` to the PJRT memory of `device` that holds the shards of an array placed in it, which is where
@@ -687,42 +573,6 @@ impl Array {
             }
         }
     }
-}
-
-/// One in-flight device-to-host shard copy and the metadata needed to merge it.
-struct PendingDenseShardHostCopy {
-    /// Tracked copy carrying the shard bytes.
-    copy: HostCopy<Vec<u8>>,
-
-    /// Stable global shard index used in diagnostics.
-    shard_index: ShardIndex,
-
-    /// Device identifier used in diagnostics.
-    device_id: DeviceId,
-
-    /// Expected byte count derived from the shard's logical shape.
-    expected_byte_count: usize,
-
-    /// Global slices covered by the shard.
-    slices: Vec<Range<usize>>,
-
-    /// Coordinates of the shard's device along the unreduced axes of the array's sharding, in mesh order, which are
-    /// empty for an array without unreduced axes. Shards that cover the same slices but differ in these coordinates
-    /// hold separate per-device values (e.g., summands) of that tile, while shards that also agree on them are
-    /// replicas of one per-device value.
-    unreduced_coordinates: Vec<usize>,
-}
-
-/// In-flight device-to-host copies of the shards of one array.
-enum DenseShardHostCopies {
-    /// Copies of the shards into buffers of their own, which [`DenseArrayHostCopy::finish`] combines along unreduced
-    /// axes and merges into the dense representation of the array.
-    Merged(Vec<PendingDenseShardHostCopy>),
-
-    /// Copies of one shard per distinct tile of the array directly into the range of `destination` that the tile
-    /// occupies in the dense representation of the array, which needs neither per-shard buffers nor a merge (refer to
-    /// [`contiguous_tile_byte_range`] for when this applies).
-    Direct { destination: HostDestination, copies: Vec<HostCopy<HostDestinationSlice>> },
 }
 
 /// Returns row-major element strides for `global_shape`. `strides[i]` is the number of logical elements skipped when
@@ -974,24 +824,16 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Device, DeviceMesh, Dimension as CoreDimension, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
-        ProgramError, Shape, Sharding, ShardingDimension, TiledLayout,
+        Device, DeviceMesh, Dimension as CoreDimension, Error as CoreError, Layout, LogicalMesh, MeshAxis,
+        MeshAxisType, ProgramError, Shape, Sharding, ShardingDimension, TiledLayout,
     };
-    use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
+    use ryft_pjrt::{BufferSpecification, BufferType, Error as PjrtError, ExecutionFence};
 
     use crate::FromPjrt;
     use crate::sessions::tests::{domain_mesh, replicated_vector_type};
     use crate::tests::{cpu_client, execution_client, logical_mesh_2x2, values_from_bytes, values_to_bytes};
 
     use super::*;
-
-    // Returns the number of device-to-host shard copies that `copy` has issued.
-    fn shard_copy_count(copy: &DenseArrayHostCopy) -> usize {
-        match &copy.shards {
-            DenseShardHostCopies::Merged(shards) => shards.len(),
-            DenseShardHostCopies::Direct { copies, .. } => copies.len(),
-        }
-    }
 
     #[test]
     fn test_array_from_host_buffer() {
@@ -1203,12 +1045,6 @@ mod tests {
             let candidates = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap();
             assert_eq!(materialize(&candidates), expected.to_vec());
         }
-
-        // A host relayout keeps every device's summand.
-        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
-        let relaid = summands.relayout_through_host(&session, &layout).unwrap();
-        assert_eq!(relaid.layout(), Some(&layout));
-        assert_eq!(device_values(&relaid), vec![vec![1., 2.], vec![3., 4.], vec![10., 20.], vec![30., 40.]]);
     }
 
     #[test]
@@ -1522,29 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_begin_copy_to_host_preserves_producer_errors_for_empty_arrays() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 1);
-        for data_type in [DataType::F32, DataType::Zero] {
-            let (event, promise) = client.event(()).unwrap();
-            promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
-            let array =
-                Array::from_host_buffer(&session, ArrayType::new_static(data_type, [0]), mesh.clone(), None, [])
-                    .unwrap()
-                    .with_execution_fence(ExecutionFence::new(vec![event]));
-            let copy = array.begin_copy_to_host().unwrap();
-            assert_eq!(shard_copy_count(&copy), 0);
-            assert_eq!(copy.finish().unwrap_err().to_string(), "empty producer failed");
-        }
-    }
-
-    #[test]
-    fn test_array_begin_copy_to_host_copies_contiguous_tiles_in_place() {
-        // On a `2x2` mesh, a `[4, 2]` array whose rows are sharded along `x` has two distinct tiles, each one
-        // contiguous range of the dense array, so one replica of each is copied directly into place without a merge.
-        // Sharding its columns makes the tiles non-contiguous, so every shard is copied into its own buffer and merged,
-        // and a replicated array needs a single copy.
+    fn test_array_copy_to_host_bytes() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
@@ -1558,23 +1372,53 @@ mod tests {
             devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
         )
         .unwrap();
-        let values = [1f32, 2., 3., 4., 5., 6., 7., 8.];
-        let materialize = |dimensions: Vec<ShardingDimension>| {
-            let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
-            let r#type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
-            let array =
-                Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&values)).unwrap();
-            let copy = array.begin_copy_to_host().unwrap();
-            let shard_copy_count = shard_copy_count(&copy);
-            let (bytes, merged) = copy.finish_with_measurements().unwrap();
-            (values_from_bytes::<f32>(bytes.as_slice()), shard_copy_count, merged)
-        };
+        let shape = [4, 2];
+        let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let rows = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
-        let columns = vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])];
         let replicated = vec![ShardingDimension::replicated(), ShardingDimension::replicated()];
-        assert_eq!(materialize(rows), (values.to_vec(), 2, false));
-        assert_eq!(materialize(columns), (values.to_vec(), 4, true));
-        assert_eq!(materialize(replicated), (values.to_vec(), 1, false));
+        // Leave one readable shard per tile. Any extra replica copy would fail the readback.
+        for (dimensions, tile_count) in [(rows, 2), (replicated, 1)] {
+            let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
+            let r#type = ArrayType::new_static(DataType::U8, shape).with_sharding(sharding).unwrap();
+            let tile_shape = [(shape[0] / tile_count) as u64, shape[1] as u64];
+            let replicas_per_tile = devices.len() / tile_count;
+            let tiles = bytes.chunks_exact(bytes.len() / tile_count).collect::<Vec<_>>();
+            let buffers = devices
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, device)| {
+                    if index.is_multiple_of(replicas_per_tile) {
+                        client.buffer(tiles[index / replicas_per_tile], BufferType::U8, tile_shape, None, device, None)
+                    } else {
+                        client.error_buffer(
+                            PjrtError::aborted("unexpected replica copy"),
+                            BufferSpecification::new(BufferType::U8, tile_shape),
+                            device,
+                        )
+                    }
+                    .unwrap()
+                })
+                .collect();
+            let array = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap();
+            assert_eq!(array.copy_to_host_bytes().unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn test_array_copy_to_host_bytes_preserves_producer_errors_without_payload() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        for (data_type, shape) in [(DataType::F32, [0]), (DataType::Zero, [2])] {
+            let (event, promise) = client.event(()).unwrap();
+            promise.set(Some(PjrtError::invalid_argument("empty producer failed"))).unwrap();
+            let array =
+                Array::from_host_buffer(&session, ArrayType::new_static(data_type, shape), mesh.clone(), None, [])
+                    .unwrap()
+                    .with_execution_fence(ExecutionFence::new(vec![event]));
+            assert_eq!(array.copy_to_host_bytes().unwrap_err().to_string(), "empty producer failed");
+        }
     }
 
     #[test]
