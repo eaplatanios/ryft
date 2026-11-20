@@ -730,7 +730,7 @@ impl Session {
         }
 
         if inputs.iter().any(|input| !std::ptr::eq(input.client(), self.client()))
-            || captures.iter().any(|capture| capture.validate_session_client(self).is_err())
+            || captures.iter().any(|capture| capture.validate_client(self.client()).is_err())
         {
             return Ok(None);
         }
@@ -1070,22 +1070,20 @@ impl Context for Session {
         // Uncommitted inputs follow committed inputs and captures, so they are moved to the mesh of those before
         // anything observes their placement. Everything that follows, including type inference, the eager dispatch
         // cache key, and the mesh that `Self::device_mesh_for` selects, sees the inputs after the move.
-        let moved_inputs; // TODO(eaplatanios): Can we avoid the need for an uninitialized variable like this?
-        let inputs = match self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice())? {
-            Some(moved_array_inputs) => {
-                let mut moved_arrays = moved_array_inputs.iter();
-                moved_inputs = inputs
-                    .iter()
-                    .map(|input| match input {
-                        Value::Array(_) => Value::Array(moved_arrays.next().unwrap().clone()),
-                        input => input.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                array_inputs = moved_array_inputs;
-                moved_inputs.as_slice()
-            }
-            None => inputs,
-        };
+        let moved_array_inputs = self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice())?;
+        let moved_inputs = moved_array_inputs.map(|moved_array_inputs| {
+            let mut moved_arrays = moved_array_inputs.iter();
+            let moved_inputs = inputs
+                .iter()
+                .map(|input| match input {
+                    Value::Array(_) => Value::Array(moved_arrays.next().unwrap().clone()),
+                    input => input.clone(),
+                })
+                .collect::<Vec<_>>();
+            array_inputs = moved_array_inputs;
+            moved_inputs
+        });
+        let inputs = moved_inputs.as_deref().unwrap_or(inputs);
 
         // These operations are decided on the host and return without compiling a program. `Context::bind` has already
         // rejected attached regions for the operations that declare no region slots, which includes all of them. Every
