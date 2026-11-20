@@ -126,8 +126,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, DataType, EagerContext, Placeholder, ReverseModeDifferentiate, Sharding,
-        Trace, TransferToMemory, Typed, ZeroOperation,
+        Array as CoreArray, ArrayOperation, DataType, DomainTracer, EagerContext, Placeholder,
+        ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed, ZeroOperation,
     };
 
     use crate::lowering::lower_mlir_module_for_program;
@@ -221,7 +221,7 @@ mod tests {
         // `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom calls are identical, byte
         // for byte, to the ones JAX emits for it.
         let (_, program) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::trace(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<CoreArray, ArrayOperation<CoreArray>>>| {
+            |x: DomainTracer<EagerContext<CoreArray, ArrayOperation<CoreArray>>>| {
                 let y = x.clone() * x;
                 let on_host = y.transfer_to_memory(Memory::Host { pinned: true })?;
                 let back = on_host.transfer_to_memory(Memory::Device)?;

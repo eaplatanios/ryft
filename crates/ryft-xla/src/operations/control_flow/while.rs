@@ -14,7 +14,7 @@
 //! constrained to that placement. Reference state is discharged before lowering.
 
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, EffectClasses, Operation as CoreOperation, ProgramError, ReductionKind,
+    ArrayType, ComparisonDirection, DataType, EffectClasses, Operation, ProgramError, ReductionKind,
     RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
@@ -514,8 +514,8 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, AssertOperation, BatchAxis, Compare, CompareOperation, Dimension as CoreDimension,
-        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
+        Add, AddOperation, AssertOperation, BatchAxis, Compare, CompareOperation, Dimension, DimensionBounds,
+        DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, Error as CoreError,
         MeshAxisType, NegOperation, OneLikeOperation, Placeholder, PrintOperation, Shape, Sharding, ShardingDimension,
         SubOperation, WhileOptions, batch, r#while,
     };
@@ -595,7 +595,7 @@ mod tests {
             WhileOperation::<ArrayType>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == expected_message,
             ),
         ));
@@ -606,7 +606,7 @@ mod tests {
             WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "operation `while` declares 2 region slots but 0 regions were attached",
             ),
         ));
@@ -617,7 +617,7 @@ mod tests {
             WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
             ),
         ));
     }
@@ -678,8 +678,7 @@ mod tests {
     fn test_while_operation_lower_forwards_dimension_carries() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let condition = {
@@ -918,7 +917,7 @@ mod tests {
         );
         let input_type = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![state_type.shape().dimensions()[0].clone(), CoreDimension::Static(3)]),
+            Shape::new(vec![state_type.shape().dimensions()[0].clone(), Dimension::Static(3)]),
         );
         let condition = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -1130,7 +1129,7 @@ mod tests {
         // the mask. The countdown `while (x > 0) { x - 1 }` over the items `[3, 1, 2]` terminates them after 3, 1, and
         // 2 iterations, so all of them land at 0, whereas a masking bug or a finished item that rejoins the loop would
         // leave nonzero or negative items.
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = ArrayIrProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
@@ -1318,11 +1317,11 @@ mod tests {
                 "},
             ),
         ] {
-            let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(2)]));
+            let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
             let state_type = ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![
-                    CoreDimension::Static(2),
+                    Dimension::Static(2),
                     dynamic_dimension("rows", upper_bound),
                     dynamic_dimension("columns", upper_bound),
                 ]),
@@ -1390,8 +1389,8 @@ mod tests {
         // while the condition region still `or`-reduces the batched predicate into the scalar continuation decision.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)]));
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(extent_type.clone().into());

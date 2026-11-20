@@ -36,8 +36,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayAddressing, Device, DeviceMesh, ReferenceCompletion as CoreReferenceCompletion, ReferenceCompletionBackend,
-    StatefulExecution, Typed,
+    ArrayAddressing, Device, DeviceMesh, ReferenceCompletion, ReferenceCompletionBackend, StatefulExecution, Typed,
 };
 use ryft_pjrt::{Client, Execution, ExecutionFence, KeyValueStore};
 use serde::{Deserialize, Serialize};
@@ -233,7 +232,7 @@ pub struct DistributedKernel<'o> {
     sizes: Vec<usize>,
 
     /// Previous pending call, whose completion later setup cannot overtake.
-    previous: Option<CoreReferenceCompletion>,
+    previous: Option<ReferenceCompletion>,
 }
 
 impl<'o> DistributedKernel<'o> {
@@ -343,7 +342,7 @@ impl<'o> DistributedKernel<'o> {
             Err(error) => return Err(self.coordination.report_failure(round, error)),
         };
         let outputs = execution.output().clone();
-        let completion = CoreReferenceCompletion::new(KernelCompletion {
+        let completion = ReferenceCompletion::new(KernelCompletion {
             coordination: Arc::clone(&self.coordination),
             round,
             deadline,
@@ -771,7 +770,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, ProgramError};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{cpu_client, execution_client};
@@ -782,7 +781,7 @@ mod tests {
     /// Produces a real scalar identity loaded on the CPU through the existing AOT persistence fixture.
     fn loaded(session: &crate::Session, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
-        crate::kernels::aot::tests::executable_bundle(session, mesh, ryft_core::DataType::I32, false, &compiler)
+        crate::kernels::aot::tests::executable_bundle(session, mesh, DataType::I32, false, &compiler)
             .load(session, &compiler, mesh)
             .unwrap()
     }
@@ -848,12 +847,12 @@ mod tests {
 
     #[test]
     fn test_distributed_kernel_error_roundtrip() {
-        let core = Error::from(DistributedKernelError::from(Error::from(ryft_core::ProgramError::PoisonedValue)));
+        let core = Error::from(DistributedKernelError::from(Error::from(ProgramError::PoisonedValue)));
         assert!(matches!(
             core,
             Error::Core(core_error) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue),
+                CoreError::Program(ProgramError::PoisonedValue),
             ),
         ));
 
@@ -962,7 +961,7 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let input = Array::from_host_buffer(
             &session,
-            ryft_core::ArrayType::scalar(ryft_core::DataType::I32),
+            ArrayType::scalar(DataType::I32),
             mesh.clone(),
             None,
             (10 + process as i32).to_ne_bytes(),

@@ -30,14 +30,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation, CastOperation,
-    CollectiveAxes, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType, DimensionValue,
+    Array, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation, CastOperation, CollectiveAxes,
+    CompositeKey, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType, DimensionValue,
     DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
     FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation, LogicalMesh, Memory,
     OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized,
     ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
-    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType,
-    TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation, ZeroOperation,
+    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as CoreType,
+    TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -267,7 +267,7 @@ where
     // The atom scan dominates for every well-formed program, because reference operations always touch an atom of a
     // reference type. The declaration scan is an independent check that still catches a core discharge bug which
     // retyped the boundary atoms but left a reference operation behind.
-    program.entry_region_ref().contains_atom_type_in_closure(RyftType::is_reference)
+    program.entry_region_ref().contains_atom_type_in_closure(CoreType::is_reference)
         || program.regions().iter().any(|region| {
             region
                 .instructions()
@@ -586,7 +586,7 @@ pub trait LowerableOperation: CoreOperation {
     /// implementation replaces. Families forward it to the variants that can hold such calls, and the calls of a family
     /// that does not are lowered without sharing their bodies.
     #[inline]
-    fn composite_key(&self) -> Option<&ryft_core::CompositeKey> {
+    fn composite_key(&self) -> Option<&CompositeKey> {
         None
     }
 }
@@ -605,7 +605,7 @@ impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> LowerableO
 ///
 /// This is the lowering counterpart of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their
 /// mixed member variants to it through [`lower_operation_variants`](crate::lower_operation_variants).
-pub trait MemberLowerableOperation<T: RyftType>: CoreOperation {
+pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
     /// Lowers this operation, applied by an instruction of the parent universe `T`, to one or more StableHLO
     /// operations emitted into the block of `lowerer`, returning one MLIR value per output.
     ///
@@ -636,7 +636,7 @@ pub fn lower_projected_operation<'b, 'c: 'b, 't: 'c, U, T, P, O: LowerableOperat
     output_types: &[T],
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    U: RyftType,
+    U: CoreType,
     P: LowerableOperation<Type = U>,
     for<'o> &'o U: TryFrom<&'o T, Error: Into<ProgramError>>,
 {
@@ -805,7 +805,7 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
 
 impl LowerableOperation for Operation {
     #[inline]
-    fn composite_key(&self) -> Option<&ryft_core::CompositeKey> {
+    fn composite_key(&self) -> Option<&CompositeKey> {
         match self {
             Self::Composite(operation) => operation.key(),
             Self::LiftedComposite(operation) => operation.key(),
@@ -1438,7 +1438,7 @@ where
 
 /// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
 /// values of [`ArrayOperation`] constants).
-pub(crate) trait MlirLowerableValue: 'static + CoreValue<Type = ArrayType> {
+pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
     /// Builds a dense-elements attribute containing this value.
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -1482,7 +1482,7 @@ impl MlirLowerableValue for ArrayConstant {
                 message: format!("session constant `{value}` cannot be materialized as a literal"),
             }
             .into()),
-            Self::Boolean(value) => CoreArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
+            Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
         }
     }
 
@@ -1525,7 +1525,7 @@ impl MlirLowerableValue for ArrayType {
 }
 
 // Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
-impl MlirLowerableValue for CoreArray {
+impl MlirLowerableValue for Array {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -2370,12 +2370,11 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array as CoreArray, AtomId, CaptureReference, CastOperation, Complex as ComplexNumber,
-        ConditionOperation, ConstantOperation, Context, Cos, Differentiate, Dimension as CoreDimension,
-        DimensionBounds, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClasses, Layout, MeshAxis, MeshAxisType,
-        NegOperation, OneLike, ParallelReduce, ParameterizedFamily, Placeholder, PrintOperation,
-        Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope,
+        AddOperation, Array, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation, ConstantOperation,
+        Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation, DimensionType,
+        DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClasses,
+        Error as CoreError, Layout, MeshAxis, MeshAxisType, NegOperation, OneLike, ParallelReduce, ParameterizedFamily,
+        Placeholder, PrintOperation, Program, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope,
         ReduceOperation, ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceType, ReferenceWriteOperation, ReshapeOperation, ReverseModeDifferentiate, ShardMap,
         ShardMapOperation, ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, ZeroLike, i1, i2,
@@ -2404,9 +2403,9 @@ pub(crate) mod tests {
     /// Homogeneous array program that [`ProgramBuilder`] builds, which operation tests across the crate lower through the
     /// test-only plain program lowering or lift into the array IR through [`unproject_plain_program`].
     pub(crate) type PlainProgram =
-        CoreProgram<ArrayConstant, ArrayOperation<ArrayConstant>, Vec<ArrayConstant>, Vec<ArrayConstant>>;
+        Program<ArrayConstant, ArrayOperation<ArrayConstant>, Vec<ArrayConstant>, Vec<ArrayConstant>>;
 
-    /// Lowers a plain traced [`CoreProgram`](ryft_core::Program) to a textual StableHLO MLIR module.
+    /// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
     pub(crate) fn to_mlir_module_for_plain_program<
         V: MlirLowerableValue,
         Input: Parameterized<V>,
@@ -2414,7 +2413,7 @@ pub(crate) mod tests {
         O: LowerableOperation<Type = ArrayType>,
         S: AsRef<str>,
     >(
-        program: &CoreProgram<V, O, Input, Output>,
+        program: &Program<V, O, Input, Output>,
         function_name: S,
     ) -> Result<String, Error> {
         to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
@@ -2433,7 +2432,7 @@ pub(crate) mod tests {
         O: LowerableOperation<Type = ArrayType>,
         S: AsRef<str>,
     >(
-        program: &CoreProgram<V, O, Input, Output>,
+        program: &Program<V, O, Input, Output>,
         function_name: S,
         ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     ) -> Result<String, Error> {
@@ -2548,12 +2547,12 @@ pub(crate) mod tests {
 
     /// Static `f32` vector type of `length` elements.
     pub(crate) fn test_vector_type(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]))
     }
 
     /// Static `f32` matrix type with `rows` rows and `columns` columns.
     pub(crate) fn test_matrix_type(rows: usize, columns: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(rows), CoreDimension::Static(columns)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
     }
 
     /// Global array type of `data_type` with the static `global_shape`, placed by `sharding`.
@@ -2562,7 +2561,7 @@ pub(crate) mod tests {
         global_shape: &[usize],
         sharding: Sharding,
     ) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(CoreDimension::Static).collect()))
+        ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(Dimension::Static).collect()))
             .with_sharding(sharding)
             .unwrap()
     }
@@ -2633,7 +2632,7 @@ pub(crate) mod tests {
 
     /// Dynamic dimension of a fresh non-negative variable named `name`, bounded above by `exclusive_upper_bound` when it
     /// is provided and unbounded otherwise.
-    pub(crate) fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> CoreDimension {
+    pub(crate) fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> Dimension {
         DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
     }
 
@@ -2824,8 +2823,7 @@ pub(crate) mod tests {
         data_type: DataType,
         dimensions: Vec<usize>,
     ) -> Result<String, Error> {
-        let input_type =
-            ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(CoreDimension::Static).collect()));
+        let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
@@ -2849,7 +2847,7 @@ pub(crate) mod tests {
     /// Computes `f(x, y) = x * y + sin(x)` for the pair `inputs` of `(x, y)`.
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
     where
-        T: Clone + ryft_core::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin().unwrap()
     }
@@ -2857,17 +2855,17 @@ pub(crate) mod tests {
     /// Computes `f(x) = x^4 + sin(x)`.
     fn scalar_quartic_plus_sin<T>(x: T) -> T
     where
-        T: Clone + ryft_core::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
     }
 
     /// Eager context over reference backend arrays that stages the scalar programs of the plain program lowering tests.
-    static TEST_ARRAY_DOMAIN: EagerContext<CoreArray, ArrayOperation<CoreArray>> =
-        EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new();
+    static TEST_ARRAY_DOMAIN: EagerContext<Array, ArrayOperation<Array>> =
+        EagerContext::<Array, ArrayOperation<Array>>::new();
 
     /// Copies the exact raw storage bytes from the MLIR dense attribute built for `literal`.
-    fn literal_dense_bytes(literal: &CoreArray, byte_count: usize) -> Vec<u8> {
+    fn literal_dense_bytes(literal: &Array, byte_count: usize) -> Vec<u8> {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
@@ -2879,7 +2877,7 @@ pub(crate) mod tests {
     fn test_collective_lowering_state_next_channel_id() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // Two manual regions in one module each emit a channeled `all_reduce`. The channel allocator of the module
         // hands out distinct handles (i.e., 1 and 2), which XLA requires across a module.
@@ -2953,7 +2951,7 @@ pub(crate) mod tests {
             state.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
             ),
         ));
@@ -2961,7 +2959,7 @@ pub(crate) mod tests {
             state.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
             ),
         ));
@@ -2992,7 +2990,7 @@ pub(crate) mod tests {
                 state.checked_collective_mesh("parallel_permute", "x", 2, Some(payload_mesh)),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
                 ),
             ));
@@ -3075,7 +3073,7 @@ pub(crate) mod tests {
             result,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`parallel_permute` cannot use tracked mesh metadata inside an unchecked manual binding",
             ),
         ));
@@ -3095,7 +3093,7 @@ pub(crate) mod tests {
             wrong_size,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "collective over axis `x` records size 3, but the enclosing mesh axis has size 2",
             ),
         ));
@@ -3109,7 +3107,7 @@ pub(crate) mod tests {
             wrong_mesh,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
             ),
         ));
@@ -3120,7 +3118,7 @@ pub(crate) mod tests {
             wrong_outputs,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`parallel_permute` output types do not match the enclosing manual mesh contract",
             ),
         ));
@@ -3456,7 +3454,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
         let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -3479,7 +3477,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_preserves_effects_that_produce_an_erased_output() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
         let output = builder
@@ -3538,7 +3536,7 @@ pub(crate) mod tests {
     #[test]
     fn test_to_mlir_module_for_program_isolates_bounded_dynamic_results_behind_one_barrier() {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(4))]));
-        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let dynamic = builder.add_input(dynamic_type.clone().into());
         let r#static = builder.add_input(static_type.clone().into());
@@ -3656,7 +3654,7 @@ pub(crate) mod tests {
     #[test]
     fn test_lower_mlir_module_for_program_with_reference_state() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let state_type = ArrayType::new_static(DataType::F32, [4]);
         let mut builder = crate::operations::ProgramBuilder::new();
         let _zero = builder.add_input(Type::Array(zero_type.clone()));
@@ -3780,7 +3778,7 @@ pub(crate) mod tests {
     #[test]
     fn test_lower_mlir_module_for_program_with_reference_state_rejects_bounded_dynamic_aliases() {
         let extent = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 1);
         let mut builder = crate::operations::ProgramBuilder::new();
@@ -3906,7 +3904,7 @@ pub(crate) mod tests {
     #[test]
     fn test_mlir_lowerable_value_to_dense_elements_attribute() {
         // Boolean values retain their logical order through MLIR's bit-packed dense representation.
-        let boolean = CoreArray::vector(vec![true, false, true]).unwrap();
+        let boolean = Array::vector(vec![true, false, true]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(boolean.r#type().as_ref(), &context, location).unwrap();
@@ -3919,11 +3917,11 @@ pub(crate) mod tests {
         // One-bit integers use the same packed MLIR representation as Boolean while retaining their Ryft data type.
         for (literal, expected) in [
             (
-                CoreArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
+                Array::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
             (
-                CoreArray::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
+                Array::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
         ] {
@@ -3934,10 +3932,10 @@ pub(crate) mod tests {
 
         // Wider sub-byte integers occupy one MLIR raw-buffer byte per element and preserve only their declared bits.
         for (literal, expected) in [
-            (CoreArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
-            (CoreArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
-            (CoreArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
-            (CoreArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (Array::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (Array::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (Array::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (Array::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
         ] {
             assert_eq!(literal_dense_bytes(&literal, expected.len()), expected);
         }
@@ -3945,24 +3943,24 @@ pub(crate) mod tests {
         // Every byte-aligned integer family preserves signedness, magnitude, and source order without floating-point
         // conversion. The `u64` case deliberately exceeds f64's exact-integer range.
         let integer_cases = vec![
-            (CoreArray::vector(vec![-127i8, 126]).unwrap(), values_to_bytes(&[-127i8, 126])),
-            (CoreArray::vector(vec![-0x1234i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234i16, 0x2345])),
+            (Array::vector(vec![-127i8, 126]).unwrap(), values_to_bytes(&[-127i8, 126])),
+            (Array::vector(vec![-0x1234i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234i16, 0x2345])),
             (
-                CoreArray::vector(vec![-0x0123_4567i32, 0x0234_5678]).unwrap(),
+                Array::vector(vec![-0x0123_4567i32, 0x0234_5678]).unwrap(),
                 values_to_bytes(&[-0x0123_4567i32, 0x0234_5678]),
             ),
             (
-                CoreArray::vector(vec![-0x0123_4567_89ab_cdefi64, 0x0234_5678_9abc_def0]).unwrap(),
+                Array::vector(vec![-0x0123_4567_89ab_cdefi64, 0x0234_5678_9abc_def0]).unwrap(),
                 values_to_bytes(&[-0x0123_4567_89ab_cdefi64, 0x0234_5678_9abc_def0]),
             ),
-            (CoreArray::vector(vec![0x12u8, 0xfe]).unwrap(), values_to_bytes(&[0x12u8, 0xfe])),
-            (CoreArray::vector(vec![0x1234u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234u16, 0xfedc])),
+            (Array::vector(vec![0x12u8, 0xfe]).unwrap(), values_to_bytes(&[0x12u8, 0xfe])),
+            (Array::vector(vec![0x1234u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234u16, 0xfedc])),
             (
-                CoreArray::vector(vec![0x1234_5678u32, 0xfedc_ba98]).unwrap(),
+                Array::vector(vec![0x1234_5678u32, 0xfedc_ba98]).unwrap(),
                 values_to_bytes(&[0x1234_5678u32, 0xfedc_ba98]),
             ),
             (
-                CoreArray::vector(vec![(1u64 << 53) + 1, u64::MAX - 1]).unwrap(),
+                Array::vector(vec![(1u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1u64 << 53) + 1, u64::MAX - 1]),
             ),
         ];
@@ -3989,13 +3987,13 @@ pub(crate) mod tests {
             (DataType::F8E5M2FNUZ, [0x07, 0x80], "dense<[5.340580e-05, 0x80]>"),
             (DataType::F8E8M0FNU, [0x08, 0xff], "dense<[1.504630e-36, 0xFF]>"),
         ] {
-            let literal = CoreArray::from_logical_bytes(
-                ArrayType::new(data_type, Shape::new(vec![CoreDimension::Static(bits.len())])),
+            let literal = Array::from_logical_bytes(
+                ArrayType::new(data_type, Shape::new(vec![Dimension::Static(bits.len())])),
                 &bits,
             )
             .unwrap();
             assert_eq!(literal_dense_bytes(&literal, bits.len()), bits, "low-precision literal type {data_type}");
-            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder
                 .add_instruction(
                     ArrayOperation::Constant(ConstantOperation::new(literal)),
@@ -4004,9 +4002,7 @@ pub(crate) mod tests {
                     None,
                 )
                 .unwrap()[0];
-            let program = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert!(stablehlo.contains(rendered_values), "low-precision literal {data_type}: {stablehlo}");
         }
@@ -4018,10 +4014,10 @@ pub(crate) mod tests {
         let f64_values =
             [f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY, f64::from_bits(0x7ff8_0000_0000_1234)];
         for (literal, expected) in [
-            (CoreArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
-            (CoreArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
-            (CoreArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
-            (CoreArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
+            (Array::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (Array::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (Array::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (Array::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
         ] {
             assert_eq!(
                 literal_dense_bytes(&literal, expected.len()),
@@ -4034,9 +4030,9 @@ pub(crate) mod tests {
         // Complex storage interleaves independently exact real and imaginary components in source order.
         let c64_components =
             [f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_1234), f32::INFINITY, f32::NEG_INFINITY];
-        let c64 = CoreArray::vector(vec![
-            ComplexNumber::new(c64_components[0], c64_components[1]),
-            ComplexNumber::new(c64_components[2], c64_components[3]),
+        let c64 = Array::vector(vec![
+            Complex::new(c64_components[0], c64_components[1]),
+            Complex::new(c64_components[2], c64_components[3]),
         ])
         .unwrap();
         assert_eq!(literal_dense_bytes(&c64, size_of_val(&c64_components)), values_to_bytes(&c64_components));
@@ -4046,23 +4042,22 @@ pub(crate) mod tests {
             f64::INFINITY,
             f64::NEG_INFINITY,
         ];
-        let c128 = CoreArray::vector(vec![
-            ComplexNumber::new(c128_components[0], c128_components[1]),
-            ComplexNumber::new(c128_components[2], c128_components[3]),
+        let c128 = Array::vector(vec![
+            Complex::new(c128_components[0], c128_components[1]),
+            Complex::new(c128_components[2], c128_components[3]),
         ])
         .unwrap();
         assert_eq!(literal_dense_bytes(&c128, size_of_val(&c128_components)), values_to_bytes(&c128_components));
 
         // Explicit physical layouts are traversed in logical row-major order before constructing the literal.
-        let layout_type =
-            ArrayType::new(DataType::I16, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]))
-                .with_layout(Some(StridedLayout::new(vec![2, 4]).into()));
-        let layout_literal = CoreArray::from_elements(layout_type, &[1i16, 2, 3, 4]).unwrap();
+        let layout_type = ArrayType::new(DataType::I16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+            .with_layout(Some(StridedLayout::new(vec![2, 4]).into()));
+        let layout_literal = Array::from_elements(layout_type, &[1i16, 2, 3, 4]).unwrap();
         assert_eq!(layout_literal.storage_bytes(), values_to_bytes(&[1i16, 3, 2, 4]));
         assert_eq!(literal_dense_bytes(&layout_literal, 8), values_to_bytes(&[1i16, 2, 3, 4]));
 
         // Empty tensors remain valid dense constants and carry no raw payload bytes.
-        let empty = CoreArray::vector(Vec::<i32>::new()).unwrap();
+        let empty = Array::vector(Vec::<i32>::new()).unwrap();
         let tensor_type = lower_tensor_type(empty.r#type().as_ref(), &context, location).unwrap();
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
@@ -4071,14 +4066,14 @@ pub(crate) mod tests {
         let tensor_type = context
             .tensor_type(context.signless_integer_type(1), &[MlirSize::Static(2)], None, location)
             .unwrap();
-        let zero = CoreArray::from_logical_bytes(ArrayType::new_static(DataType::Zero, [2]), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::new_static(DataType::Zero, [2]), &[]).unwrap();
         assert_eq!(
             zero.to_dense_elements_attribute(tensor_type, &context).unwrap().to_string(),
             "dense<false> : tensor<2xi1>",
         );
 
         // Tokens remain effect values and have no dense literal representation.
-        let token = CoreArray::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
+        let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
         assert!(matches!(
             token.to_dense_elements_attribute(tensor_type, &context),
             Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::Token, .. })),
@@ -4094,7 +4089,7 @@ pub(crate) mod tests {
             array_type.to_dense_elements_attribute(tensor_type, &context),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::Concretization { message })
+                CoreError::Program(ProgramError::Concretization { message })
                     if *message == "abstract XLA value `f32[]` cannot be materialized as a StableHLO literal",
             ),
         ));
@@ -4103,7 +4098,7 @@ pub(crate) mod tests {
             captured.to_dense_elements_attribute(tensor_type, &context),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::Concretization { message })
+                CoreError::Program(ProgramError::Concretization { message })
                     if *message == "captured constant #3 cannot be materialized as a literal without capture bindings",
             ),
         ));
@@ -4111,18 +4106,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program() {
-        let (_, compiled): (
-            CoreArray,
-            ryft_core::programs::Program<
-                CoreArray,
-                ryft_core::ArrayOperation<CoreArray>,
-                (CoreArray, CoreArray),
-                CoreArray,
-            >,
-        ) = TEST_ARRAY_DOMAIN
+        let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (CoreArray::scalar(2.0).unwrap(), CoreArray::scalar(3.0).unwrap()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
             )
             .unwrap();
 
@@ -4144,16 +4131,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_gradients() {
-        let (_, compiled): (
-            CoreArray,
-            ryft_core::programs::Program<CoreArray, ryft_core::ArrayOperation<CoreArray>, CoreArray, CoreArray>,
-        ) = TEST_ARRAY_DOMAIN
+        let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |x| {
                     let context = x.context().clone();
                     Ok(context.differentiate_at(x).gradient(scalar_quartic_plus_sin).unwrap())
                 },
-                CoreArray::scalar(2.0).unwrap(),
+                Array::scalar(2.0).unwrap(),
             )
             .unwrap();
 
@@ -4196,10 +4180,10 @@ pub(crate) mod tests {
         // residuals, as `stablehlo.multiply`s of the cotangent against the residual inputs rather than baking the primal
         // point in as constants. This is the analogue of the standalone `vjp_fn` of JAX, with the residuals threaded as
         // explicit arguments.
-        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |inputs, ()| Ok(scalar_bilinear_sin(inputs)),
-                (CoreArray::scalar(2.0).unwrap(), CoreArray::scalar(3.0).unwrap()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
                 (),
             )
             .unwrap();
@@ -4230,23 +4214,16 @@ pub(crate) mod tests {
     fn test_to_mlir_module_for_plain_program_lowers_staged_gradients() {
         // The gradient of `f` staged for JIT compilation stays symbolic, like `jit(grad(f))` in JAX. It uses the traced
         // gradient path, which traces through the VJP and its pullback.
-        let (_, compiled): (
-            (CoreArray, CoreArray),
-            ryft_core::programs::Program<
-                CoreArray,
-                ryft_core::ArrayOperation<CoreArray>,
-                (CoreArray, CoreArray),
-                (CoreArray, CoreArray),
-            >,
-        ) = TEST_ARRAY_DOMAIN
-            .interpret_and_trace(
-                |inputs| {
-                    let context = inputs.0.context().clone();
-                    Ok(context.differentiate_at(inputs).gradient(scalar_bilinear_sin).unwrap())
-                },
-                (CoreArray::scalar(2.0).unwrap(), CoreArray::scalar(3.0).unwrap()),
-            )
-            .unwrap();
+        let (_, compiled): ((Array, Array), Program<Array, ArrayOperation<Array>, (Array, Array), (Array, Array)>) =
+            TEST_ARRAY_DOMAIN
+                .interpret_and_trace(
+                    |inputs| {
+                        let context = inputs.0.context().clone();
+                        Ok(context.differentiate_at(inputs).gradient(scalar_bilinear_sin).unwrap())
+                    },
+                    (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+                )
+                .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         // `cos(x)` is computed symbolically from `%arg0` rather than baked in as a constant, both inputs are referenced, and
@@ -4500,7 +4477,7 @@ pub(crate) mod tests {
             lower_replicated_shard_map_body(body, 2),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
             ),
         ));

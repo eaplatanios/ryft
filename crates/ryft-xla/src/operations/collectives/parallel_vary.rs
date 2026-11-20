@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Operation as CoreOperation, ParallelVaryOperation, ProgramError};
+use ryft_core::{ArrayType, Operation, ParallelVaryOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};

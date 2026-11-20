@@ -947,10 +947,10 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArgMax, ArgMin, ArrayOperation, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh,
-        Dimension as CoreDimension, DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation,
-        Shape, Sharding, ShardingDimension, Sub, composite,
+        ArgMax, ArgMin, ArrayOperation, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh, Dimension,
+        DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation, Shape, Sharding, ShardingDimension, Sub,
+        composite,
     };
     use ryft_mlir::Location;
 
@@ -2421,7 +2421,7 @@ mod tests {
     fn test_reduce_operation_lower_dynamic_axes() {
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(3)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
@@ -2453,7 +2453,7 @@ mod tests {
         // an operand, so the lowering rejects a mean over a dynamically sized axis.
         let reduced = DimensionVariable::new("reduced", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(reduced), CoreDimension::Static(3)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(reduced), Dimension::Static(3)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
@@ -2480,9 +2480,8 @@ mod tests {
         // value paired with index zero. Its comparator picks the left pair when its value is greater or a NaN facing an
         // ordered value, or when the values are equivalent (i.e., equal under `FLOAT` semantics or both NaN) and the
         // left index is lower.
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]));
-        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let outputs = builder

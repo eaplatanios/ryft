@@ -1,6 +1,6 @@
 use ryft_core::{
-    ArrayType, ConcatenateOperation, DataType, Dimension as CoreDimension, DimensionAddOperation,
-    DimensionSizeOperation, DimensionType, EffectClass, Operation as CoreOperation, ProgramError, Shape,
+    ArrayType, ConcatenateOperation, DataType, Dimension, DimensionAddOperation, DimensionSizeOperation, DimensionType,
+    EffectClass, Operation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -64,10 +64,8 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             for (input, r#type) in array_inputs.iter().zip(array_input_types) {
                 let r#type = <&ArrayType>::try_from(r#type)?;
                 let extent = match r#type.shape().dimensions()[self.axis()] {
-                    CoreDimension::Static(extent) => {
-                        lower_static_index_constants(&[extent], block, context, location)?[0]
-                    }
-                    CoreDimension::Dynamic(_) => {
+                    Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+                    Dimension::Dynamic(_) => {
                         let extent =
                             block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
                         let extent = extent.result(0).unwrap().as_ref();
@@ -110,7 +108,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             }
             let mut inferred_dimensions = output_type.shape().dimensions().to_vec();
             // Native concatenation keeps the axis dynamic even when its bounds prove a singleton extent.
-            inferred_dimensions[self.axis()] = CoreDimension::Dynamic(inferred_extent.to_variable());
+            inferred_dimensions[self.axis()] = Dimension::Dynamic(inferred_extent.to_variable());
             let inferred_type = output_type.clone().with_shape(Shape::new(inferred_dimensions));
             let physical_input_type = physical_bound_type(&inferred_type)?;
             let physical_output_type = physical_bound_type(output_type)?;
@@ -225,9 +223,9 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation,
-        DimensionType, DimensionValue, DimensionVariable, EffectClasses, LogicalMesh, MeshAxis, MeshAxisType,
+        ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh, Dimension,
+        DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
+        DimensionValue, DimensionVariable, EffectClasses, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, Shape, Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
     };
     use ryft_mlir::Location;
@@ -282,7 +280,7 @@ mod tests {
         // Dynamic concatenation requires its derived result extent as an explicit operand rather than manufacturing
         // an unstable result identity.
         let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let first = builder.add_input(dynamic_type.clone());
         let second = builder.add_input(dynamic_type);
@@ -352,14 +350,10 @@ mod tests {
         // ordered assertion chain, and passes only the arrays to the StableHLO concatenate operation.
         let first_variable = DimensionVariable::new("first", DimensionBounds::new(0, Some(5)).unwrap());
         let second_variable = DimensionVariable::new("second", DimensionBounds::new(0, Some(5)).unwrap());
-        let first_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(first_variable), CoreDimension::Static(2)]),
-        );
-        let second_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(second_variable), CoreDimension::Static(2)]),
-        );
+        let first_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first_variable), Dimension::Static(2)]));
+        let second_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(second_variable), Dimension::Static(2)]));
         let first_size_operation = DimensionSizeOperation::new(&first_type, 0).unwrap();
         let second_size_operation = DimensionSizeOperation::new(&second_type, 0).unwrap();
         let add_operation =
@@ -428,9 +422,8 @@ mod tests {
         // A dynamic non-concatenated dimension is shared by the output cotangent and every input, so the transpose
         // slices it whole through a dynamic slice limit instead of looking up a hidden runtime size.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
-        let left_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), columns.clone().into()]));
-        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), columns.into()]));
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), columns.clone().into()]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), columns.into()]));
         let mut builder = ProgramBuilder::new();
         let left = builder.add_input(left_type.clone());
         let right = builder.add_input(right_type.clone());
@@ -717,7 +710,7 @@ mod tests {
             lower_concatenate_tree(&[], 0, &mut block.as_ref(), location.as_ref()),
             Err(Error::Core(error)) if matches!(
                 error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
             ),
         ));
 

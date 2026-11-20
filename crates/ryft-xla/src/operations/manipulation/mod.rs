@@ -28,13 +28,13 @@ mod transposition;
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, ArrayType, BatchAxis, ConcatenateOperation, DataType, Dimension as CoreDimension,
-        DimensionAddOperation, DimensionBounds, DimensionMulOperation, DimensionOperation, DimensionSize,
-        DimensionSizeOperation, DimensionValue, DimensionVariable, DynamicBroadcastOperation, DynamicGather,
-        DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
-        DynamicSliceWithDimensions, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions,
-        Indexing, Placeholder, Reshape, Scatter, ScatterMode, ScatterOptions, ScatterReductionKind, Shape,
-        TracingContext, Typed, TypedProgram, ValueProjection, batch, index,
+        ArrayOperation, ArrayType, BatchAxis, ConcatenateOperation, DataType, Dimension, DimensionAddOperation,
+        DimensionBounds, DimensionMulOperation, DimensionOperation, DimensionSize, DimensionSizeOperation,
+        DimensionValue, DimensionVariable, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
+        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
+        Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, Placeholder, Reshape,
+        Scatter, ScatterMode, ScatterOptions, ScatterReductionKind, Shape, TracingContext, Typed, TypedProgram,
+        ValueProjection, batch, index,
     };
 
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
@@ -101,7 +101,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 // Runtime dimension operations live in the mixed IR family. Explicitly retain that family while
@@ -212,27 +212,27 @@ mod tests {
             let input_type = ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![
-                    CoreDimension::Dynamic(DimensionVariable::new(
+                    Dimension::Dynamic(DimensionVariable::new(
                         "n",
                         DimensionBounds::new(if allows_empty_rows { 0 } else { 4 }, Some(6)).unwrap(),
                     )),
-                    CoreDimension::Static(4),
+                    Dimension::Static(4),
                 ]),
             );
             let index_count = if name == "mapped_source_slice" { 4 } else { 3 };
             let dynamic_query =
                 matches!(name, "dynamic_gather_query" | "dynamic_scatter_query" | "column_scatter_query");
             let query_dimension = if dynamic_query {
-                CoreDimension::Dynamic(DimensionVariable::new("queries", DimensionBounds::new(2, Some(4)).unwrap()))
+                Dimension::Dynamic(DimensionVariable::new("queries", DimensionBounds::new(2, Some(4)).unwrap()))
             } else {
-                CoreDimension::Static(index_count)
+                Dimension::Static(index_count)
             };
             let indices_type =
-                ArrayType::new(DataType::I32, Shape::new(vec![query_dimension.clone(), CoreDimension::Static(1)]));
+                ArrayType::new(DataType::I32, Shape::new(vec![query_dimension.clone(), Dimension::Static(1)]));
             let updates_type = if name == "column_scatter_query" {
                 ArrayType::new(DataType::F64, Shape::new(vec![input_type.dimension(0), query_dimension]))
             } else {
-                ArrayType::new(DataType::F64, Shape::new(vec![query_dimension, CoreDimension::Static(4)]))
+                ArrayType::new(DataType::F64, Shape::new(vec![query_dimension, Dimension::Static(4)]))
             };
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
@@ -327,7 +327,7 @@ mod tests {
                 // The axis conveniences and batching trace use the same symbolic boundary as the mixed graphs.
                 let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                     |inputs| {
-                        let indices = inputs[1].reshape(Shape::new(vec![CoreDimension::Static(index_count)])).unwrap();
+                        let indices = inputs[1].reshape(Shape::new(vec![Dimension::Static(index_count)])).unwrap();
                         vec![if name == "mapped_source_slice" {
                             batch(
                                 |(input, start)| input.dynamic_slice(&[start], &[2]),

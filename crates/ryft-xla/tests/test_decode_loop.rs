@@ -8,11 +8,10 @@ use std::sync::OnceLock;
 use pretty_assertions::assert_eq;
 use ryft_core::{
     Add, ArgMax, Array as CoreArray, ArrayOperation, ArrayType, Broadcast, Compare, ComparisonDirection, Context,
-    CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, Div,
-    DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, Iota,
-    LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Random, Reduce,
-    ReductionKind, Reshape, Select, Shape, Sharding, Sub, Tanh, TopK, Typed, Value as CoreValue, ValueProjection,
-    WhileOperation, ZeroLike,
+    CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, Dimension, Div, DomainTracingContext, Dot,
+    DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, Iota, LogicalMesh, Logistic,
+    MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, Reshape, Select,
+    Shape, Sharding, Sub, Tanh, TopK, Typed, Value as CoreValue, ValueProjection, WhileOperation, ZeroLike,
 };
 use ryft_pjrt::extensions::ffi::{
     FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
@@ -129,7 +128,7 @@ fn read_f32s(client: &Client<'_>, array: &Array) -> Vec<f32> {
 
 /// Returns a static [`Shape`] with the provided dimensions.
 fn static_shape(dimensions: &[usize]) -> Shape {
-    Shape::new(dimensions.iter().map(|&dimension| CoreDimension::Static(dimension)).collect())
+    Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect())
 }
 
 /// Returns `count` deterministic pseudo-random weight values in `[-0.5, 0.5)` derived from `seed` with an

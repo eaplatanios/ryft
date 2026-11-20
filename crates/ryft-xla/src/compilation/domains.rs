@@ -12,8 +12,8 @@ use std::time::Instant;
 use ryft_core::{
     ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DispatchInputs,
     ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, Parameterized, ProgramError,
-    ReferenceDischargeResult, Sharding, ShardingDimension, StagedProgram, Type as CoreType, TypeError, Typed,
-    TypedProgram,
+    ReferenceDischargeResult, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram,
+    Type as CoreType, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -291,7 +291,7 @@ impl Session {
             if let Some(sharding) = input_type.sharding()
                 && !sharding.mesh().has_same_topology(options.mesh().logical_mesh())
             {
-                return Err(ryft_core::ShardingError::MeshMismatch {
+                return Err(ShardingError::MeshMismatch {
                     expected: options.mesh().logical_mesh().clone(),
                     actual: sharding.mesh().clone(),
                 }
@@ -427,7 +427,7 @@ impl Session {
         // device count, and bounded dynamic tensors force Shardy off for the whole module.
         if !use_shardy_partitioner && contains_shard_map(program) {
             return Err(Error::Lowering(crate::LoweringError::UnsupportedOperation {
-                operation: ryft_core::SHARD_MAP_OPERATION_NAME.to_string(),
+                operation: SHARD_MAP_OPERATION_NAME.to_string(),
                 reason: "bounded-dynamic programs cannot contain `shard_map` regions because `sdy.manual_computation` \
                          requires the Shardy partitioner"
                     .to_string(),
@@ -498,7 +498,7 @@ impl Session {
         if let Some(mesh) = lowered_module.mesh()
             && !mesh.has_same_topology(options.mesh().logical_mesh())
         {
-            return Err(ryft_core::ShardingError::MeshMismatch {
+            return Err(ShardingError::MeshMismatch {
                 expected: options.mesh().logical_mesh().clone(),
                 actual: mesh.clone(),
             }
@@ -932,19 +932,19 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array as CoreArray, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
-        ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
+        AddOperation, Array as CoreArray, ArrayIrValue, ArrayReferenceTransform, ArrayReferenceTransformIndex,
+        ArraySliceAxis, ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
         CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain, CompilationTracer,
-        ConditionOperation, ConstantOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation, DataType,
-        Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
+        CompiledFunction, ConditionOperation, ConstantOperation, CotangentDestinationKind, CumulativeKind,
+        CumulativeOperation, DataType, Device, DeviceMesh, Dimension, DimensionAddOperation, DimensionBounds,
         DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, MulOperation, NegOperation, OneOperation, Operation as CoreOperation, Placeholder, ProgramError,
-        Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
-        Reshard, ScanOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin,
-        SliceOperation, StagedFunction as CoreStagedFunction, WhileOperation,
+        DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation, Operation as CoreOperation, Placeholder,
+        ProgramError, Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+        ReferenceWriteOperation, Reshard, ScanOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
+        ShardingDimension, Sin, SliceOperation, StagedFunction, WhileOperation,
     };
     use ryft_pjrt::protos::Precision;
 
@@ -968,15 +968,14 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let engine = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let options = Options::new(mesh.clone());
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type.clone(), options)
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
-            staged.lower(&engine).unwrap().compile(&engine).unwrap();
+        let compiled: CompiledFunction<Session, Type, Type> = staged.lower(&engine).unwrap().compile(&engine).unwrap();
 
         // Round-trip a small input through the `CompilationDomain` pipeline.
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -1019,8 +1018,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let _: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
-                staged.lower(&engine).unwrap().compile(&engine).unwrap();
+            let _: CompiledFunction<Session, Type, Type> = staged.lower(&engine).unwrap().compile(&engine).unwrap();
         }
         assert_eq!(
             engine.cached_program_count(),
@@ -1048,7 +1046,7 @@ mod tests {
             Ok(input)
         }
         assert!(matches!(
-            CoreStagedFunction::<Session, Type, Type>::stage(forward,
+            StagedFunction::<Session, Type, Type>::stage(forward,
                 Vec::new(),
                 reference_type.clone(),
                 Options::new(mesh.clone()).with_input_shardings(vec![scalar_sharding.clone()]),
@@ -1069,7 +1067,7 @@ mod tests {
             Ok(input.reference_new()?)
         }
         assert!(matches!(
-            CoreStagedFunction::<Session, Type, Type>::stage(allocate,
+            StagedFunction::<Session, Type, Type>::stage(allocate,
                 Vec::new(),
                 Type::Array(ArrayType::scalar(DataType::F32)),
                 Options::new(mesh.clone()).with_output_shardings(vec![scalar_sharding]),
@@ -1085,7 +1083,7 @@ mod tests {
         // Forwarding an external reference through an output is rejected by the same contract when lowered, because
         // the ABI has no protocol for handing an entering reference back through an output either.
         assert!(matches!(
-            CoreStagedFunction::<Session, Type, Type>::stage(forward,
+            StagedFunction::<Session, Type, Type>::stage(forward,
                 Vec::new(),
                 reference_type,
                 Options::new(mesh.clone()),
@@ -1115,7 +1113,7 @@ mod tests {
 
         // The stateful XLA ABI only restricts the outputs of a lowered program, so a function that returns a reference
         // stages successfully and is rejected when it is lowered on its own.
-        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
+        let staged = StagedFunction::<Session, Type, Type>::stage(
             allocate_reference,
             Vec::new(),
             Type::Array(array_type),
@@ -1151,7 +1149,7 @@ mod tests {
         // Staging traces exactly the input types that it receives, so lowering rejects a function whose input types
         // did not receive the requested input shardings before staging.
         let staged =
-            CoreStagedFunction::<Session, Type, Type>::stage(forward, Vec::new(), scalar_type.clone(), options.clone())
+            StagedFunction::<Session, Type, Type>::stage(forward, Vec::new(), scalar_type.clone(), options.clone())
                 .unwrap();
         assert!(matches!(
             staged.lower(&session).map(|_| ()),
@@ -1161,8 +1159,7 @@ mod tests {
         ));
 
         let input_types = with_input_shardings(scalar_type, &options).unwrap();
-        let staged =
-            CoreStagedFunction::<Session, Type, Type>::stage(forward, Vec::new(), input_types, options).unwrap();
+        let staged = StagedFunction::<Session, Type, Type>::stage(forward, Vec::new(), input_types, options).unwrap();
         staged.lower(&session).unwrap();
     }
 
@@ -1209,7 +1206,7 @@ mod tests {
         // Lowering checks rather than overwrites the placement that staged types track, so that calls of a staged
         // function return the output types of its executions.
         let mesh_explicit = mesh(MeshAxisType::Explicit);
-        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
+        let staged = StagedFunction::<Session, Type, Type>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1223,7 +1220,7 @@ mod tests {
                               not carry the sharding `{mesh<['x'=2:explicit]>, [{'x'}]}` requested by \
                               `output_shardings`; reshard the outputs to their overrides before staging them",
         ));
-        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
+        let staged = StagedFunction::<Session, Type, Type>::stage(
             reshard,
             Vec::new(),
             input_type(&mesh_explicit),
@@ -1235,7 +1232,7 @@ mod tests {
         // Staged types cannot record placement over auto mesh axes, so lowering applies it to the executable outputs,
         // whose types keep the staged placement while their runtime placements carry the override.
         let mesh_auto = mesh(MeshAxisType::Auto);
-        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
+        let staged = StagedFunction::<Session, Type, Type>::stage(
             forward,
             Vec::new(),
             input_type(&mesh_auto),
@@ -1292,7 +1289,7 @@ mod tests {
             .build()
             .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let operation = CumulativeOperation::new(0, CumulativeKind::Sum);
@@ -1457,7 +1454,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1)]))
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1598,7 +1595,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
 
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(replicated(1))
             .unwrap();
         assert!(matches!(
@@ -1612,7 +1609,7 @@ mod tests {
                               no executable buffer",
         ));
 
-        let host_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
+        let host_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(replicated(1))
             .unwrap()
             .with_memory(Memory::Host { pinned: true });
@@ -1627,7 +1624,7 @@ mod tests {
         ));
 
         let unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
-        let unbounded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(unbounded)]))
+        let unbounded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(unbounded)]))
             .with_sharding(replicated(1))
             .unwrap();
         assert!(matches!(
@@ -1645,7 +1642,7 @@ mod tests {
             LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let explicit_mesh = DeviceMesh::new(explicit_logical_mesh.clone(), mesh.devices().to_vec()).unwrap();
         let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(5)).unwrap());
-        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(bounded)]))
+        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded)]))
             .with_sharding(Sharding::new(explicit_logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         assert!(matches!(
@@ -1667,7 +1664,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Sharding(ryft_core::ShardingError::MeshMismatch { expected, actual })
+                CoreError::Sharding(ShardingError::MeshMismatch { expected, actual })
                     if expected == mesh.logical_mesh() && actual == &foreign_logical_mesh,
             ),
         ));
@@ -1768,15 +1765,15 @@ mod tests {
         assert_eq!(read_first_shard::<f32>(client, &outputs[0]), vec![5.0]);
         assert_eq!(read_first_shard::<f32>(client, &outputs[1]), vec![8.0]);
 
-        let eager_input = ryft_core::ArrayIrValue::Array(CoreArray::scalar(3.0f32).unwrap());
-        let eager_replacement = ryft_core::ArrayIrValue::Array(CoreArray::scalar(5.0f32).unwrap());
+        let eager_input = ArrayIrValue::Array(CoreArray::scalar(3.0f32).unwrap());
+        let eager_replacement = ArrayIrValue::Array(CoreArray::scalar(5.0f32).unwrap());
         let eager_reference = eager_input.reference_new().unwrap();
         eager_reference.write(&eager_replacement).unwrap();
         let eager_snapshot = eager_reference.read().unwrap();
         eager_reference.add_update(&eager_input).unwrap();
         let eager_final = eager_reference.freeze().unwrap();
-        assert_eq!(eager_snapshot, ryft_core::ArrayIrValue::Array(CoreArray::scalar(5.0f32).unwrap()));
-        assert_eq!(eager_final, ryft_core::ArrayIrValue::Array(CoreArray::scalar(8.0f32).unwrap()));
+        assert_eq!(eager_snapshot, ArrayIrValue::Array(CoreArray::scalar(5.0f32).unwrap()));
+        assert_eq!(eager_final, ArrayIrValue::Array(CoreArray::scalar(8.0f32).unwrap()));
     }
 
     #[test]
@@ -2219,7 +2216,7 @@ mod tests {
             session.lower_program(&program, 2, &Options::new(mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                CoreError::Program(ProgramError::InvalidArgument { message })
                     if *message == "`capture_count` is 2, but the program has only 1 flat input(s)",
             ),
         ));
@@ -2488,7 +2485,7 @@ mod tests {
         let runtime_length = builder.add_constant(Constant::Dimension(length.clone()));
         let reference = builder
             .add_instruction(
-                ScanOperation::new(1, CoreDimension::Dynamic(length_variable.clone())),
+                ScanOperation::new(1, Dimension::Dynamic(length_variable.clone())),
                 vec![body],
                 vec![reference, runtime_length],
                 None,
@@ -2505,7 +2502,7 @@ mod tests {
             panic!("expected dynamic scan operation");
         };
         assert_eq!(scan.carry_count(), 1);
-        assert_eq!(scan.iteration_count(), &CoreDimension::Dynamic(length_variable));
+        assert_eq!(scan.iteration_count(), &Dimension::Dynamic(length_variable));
         let runtime_length = *scan_instruction.inputs().last().unwrap();
         assert_eq!(
             program.entry_region_ref().atoms()[runtime_length.index()].as_constant(),
@@ -2828,7 +2825,7 @@ mod tests {
 
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
@@ -2842,7 +2839,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let foreign: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let foreign: CompiledFunction<Session, Type, Type> =
             staged.lower(&producer).unwrap().compile(&producer).unwrap();
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 
@@ -2882,7 +2879,7 @@ mod tests {
             staged.lower(&required_consumer).unwrap().compile(&required_consumer),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                CoreError::Program(ProgramError::InvalidArgument { message })
                     if *message == "compilation artifact exchange requirement was not satisfied: received compilation \
                         artifact is incompatible: incompatible XLA executable: cached executable has \
                         incompatible donation flags",

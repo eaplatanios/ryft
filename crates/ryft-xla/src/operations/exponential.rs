@@ -1,6 +1,6 @@
 use ryft_core::{
-    ArrayType, DataType, Dimension as CoreDimension, ExpM1Operation, ExpOperation, Ln1pOperation, LogAddExpOperation,
-    LogOperation, LogisticOperation,
+    ArrayType, DataType, Dimension, ExpM1Operation, ExpOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
+    LogisticOperation,
 };
 use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::dialects::{stable_hlo, tensor};
@@ -487,10 +487,10 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
         .iter()
         .enumerate()
         .map(|(axis, dimension)| match dimension {
-            CoreDimension::Static(extent) => {
+            Dimension::Static(extent) => {
                 Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
             }
-            CoreDimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
+            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let shape = lower_explicit_shape(&dimensions, block, context, location)?;
@@ -738,8 +738,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, Dimension as CoreDimension, ExpM1, Ln1p, Log, LogAddExp, Logistic, Placeholder, Shape,
-        differentiate_at,
+        ArrayOperation, Dimension, ExpM1, Ln1p, Log, LogAddExp, Logistic, Placeholder, Shape, differentiate_at,
     };
 
     use crate::lowering::tests::{
@@ -907,8 +906,8 @@ mod tests {
         // of the same sign and NaN operands through the plain `a + b` sum, while the ordinary arm shifts by the larger
         // operand so that the exponential never overflows.
         let mut builder = ProgramBuilder::new();
-        let left = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])));
-        let right = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])));
+        let left = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])));
+        let right = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])));
         let output = builder
             .add_instruction(ArrayOperation::LogAddExp(LogAddExpOperation::new()), Vec::new(), vec![left, right], None)
             .unwrap()[0];

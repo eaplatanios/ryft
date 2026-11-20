@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Operation as CoreOperation, ParallelReduceOperation, ProgramError, ReductionKind};
+use ryft_core::{ArrayType, Operation, ParallelReduceOperation, ProgramError, ReductionKind};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Value as MlirValue,
@@ -211,9 +211,9 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Batch, BatchAxis, BatchAxisSpecification, ConditionOperation, Context, DataType, Device, DeviceMesh,
-        Differentiate, Dimension as CoreDimension, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, Placeholder,
-        Reduce, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension, StagingContext, Typed,
-        Value as CoreValue, ValueProjection, shard_map,
+        Differentiate, Dimension, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation,
+        ParallelReduce, Placeholder, Reduce, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
+        StagingContext, Typed, Value, ValueProjection, shard_map,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, Program};
@@ -312,7 +312,7 @@ pub(crate) mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // A sum `parallel_reduce` over the manual mesh axis `"x"` resolves against the seeded body tracing context and
         // lowers to a `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard
@@ -605,7 +605,7 @@ pub(crate) mod tests {
     fn test_parallel_reduce_operation_lower_mean_divides_by_axis_size() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
@@ -676,7 +676,7 @@ pub(crate) mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
         )
         .unwrap();
 
@@ -709,7 +709,7 @@ pub(crate) mod tests {
     fn test_parallel_reduce_operation_lower_inside_condition() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // The sum `parallel_reduce` sits inside a `condition` branch inside the `shard_map` body, so it lowers through
         // the nested control flow path. The threaded collective lowering state resolves the manual mesh axis inside the
@@ -793,7 +793,7 @@ pub(crate) mod tests {
     fn test_parallel_reduce_operation_lower_inside_named_batch() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // A named `batch` level inside the `shard_map` body binds `"b"`, while the sum `parallel_reduce` names the
         // *mesh* axis `"x"`. The batching rule forwards the collective through the batch level to the seeded base
@@ -932,7 +932,7 @@ pub(crate) mod tests {
                 lower(operation, &checked, &replicated),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == "`parallel_reduce` without tracked mesh metadata types its outputs as invariant \
                                         along manual axis `x` inside a checked manual region",
                 ),
@@ -944,7 +944,7 @@ pub(crate) mod tests {
             lower(&tracked, &unchecked, &varying),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`parallel_reduce` cannot use tracked mesh metadata inside an unchecked manual binding",
             ),
         ));

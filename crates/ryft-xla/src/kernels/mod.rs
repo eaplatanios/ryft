@@ -41,8 +41,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis, MeshAxisType,
-    Operation as CoreOperation, ProgramError, ShardingDimension, TypeError, Typed,
+    ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis, MeshAxisType, Operation,
+    ProgramError, ShardingDimension, TypeError, Typed,
 };
 use ryft_kernels::{
     KERNEL_KEY_VERSION, KernelCompiler, KernelDefinition, KernelExtension as PortableKernelExtension, KernelSchedule,
@@ -175,7 +175,7 @@ pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
 /// cannot request external reference state slots or alter the kernel's logical inputs and results. An embedding
 /// implementing native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their
 /// token chain, because a pure call cannot discharge or silently discard an observable assertion.
-pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = Type> = NoKernelExtension> {
+pub trait KernelOutputEmbedding<Output, Extension: Operation<Type = Type> = NoKernelExtension> {
     /// Returns deterministic bytes covering target names, physical mappings, payload schemas, and plugin ABI facts.
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError>;
 
@@ -193,7 +193,7 @@ pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = Type> = 
 /// payload from masquerading as an unverified kernel. Binding emits the selected custom call only after validating
 /// the exact logical inputs. Its attributes participate in existing StableHLO-based compilation and persistence keys.
 #[derive(Clone, Debug)]
-pub struct CompiledKernel<Extension: CoreOperation<Type = Type> = NoKernelExtension> {
+pub struct CompiledKernel<Extension: Operation<Type = Type> = NoKernelExtension> {
     /// Immutable body and boundary that were verified before compilation and embedding.
     definition: KernelDefinition<Extension>,
 
@@ -410,7 +410,7 @@ pub(crate) fn placed_custom_call(
             })
             .collect::<Vec<_>>()
     };
-    if CoreOperation::infer_output_types(&placed, &array_types(input_types), &[])? != array_types(&logical) {
+    if Operation::infer_output_types(&placed, &array_types(input_types), &[])? != array_types(&logical) {
         return Err(TypeError::invalid(
             "selected kernel custom call does not have the result types of the kernel call that it replaces",
         ));
@@ -521,10 +521,10 @@ pub(crate) mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrOperation, ArrayIrValue, ArrayOperation, Context, DataType, Dimension,
-        DimensionBounds, DimensionSubOperation, DimensionType, DimensionValue, EffectClasses, LogicalMesh, MeshAxis,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite, Sharding, ShardingError,
-        TiledLayout, Tracer as CoreTracer, TracingContext,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Context, DataType, Dimension, DimensionBounds,
+        DimensionSubOperation, DimensionType, DimensionValue, EffectClasses, LogicalMesh, MeshAxis,
+        Operation as CoreOperation, Placeholder, ProgramBuilder as CoreProgramBuilder, ProvenanceScope, ReferenceRead,
+        ReferenceWrite, Sharding, ShardingError, TiledLayout, Tracer, TracingContext,
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, GridDimension, GridExecution, KernelCallOperation, KernelCompilationError,
@@ -539,7 +539,7 @@ pub(crate) mod tests {
     /// A scalar identity with a functional read-write alias and no external reference slot.
     pub(crate) fn definition() -> KernelDefinition {
         let mapping = BlockMapping::new(
-            CoreProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new()
+            CoreProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
                 .build(vec![], vec![], vec![])
                 .unwrap(),
             vec![],
@@ -565,7 +565,7 @@ pub(crate) mod tests {
     /// values up to 3, so the mapping requires a runtime assertion, although no point of the grid fails it.
     pub(crate) fn mapping_assertion_definition() -> KernelDefinition {
         let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(4)).unwrap());
-        let mut mapping = CoreProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new();
+        let mut mapping = CoreProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = mapping.add_input(coordinate.clone().into());
         let one = DimensionValue::constant(1).unwrap();
         let start = mapping.add_constant(ArrayIrValue::Dimension(one.clone()));
@@ -767,11 +767,9 @@ pub(crate) mod tests {
     fn test_compiled_kernel_from_output_provenance() {
         let operation = definition().operation().clone();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
-            references[0]
-                .context()
-                .invoke_with_provenance_scope(ryft_core::ProvenanceScope::new("copy_output"), || {
-                    references[0].write(&references[0].read()?)
-                })
+            references[0].context().invoke_with_provenance_scope(ProvenanceScope::new("copy_output"), || {
+                references[0].write(&references[0].read()?)
+            })
         })
         .unwrap();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -865,11 +863,11 @@ pub(crate) mod tests {
     fn test_compiled_kernel_from_output_rejects_external_body_effects() {
         for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
             let logical = definition().operation().clone();
-            let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
+            let mut builder = CoreProgramBuilder::<ArrayIrValue<Array>, PortableKernelOperation>::new();
             builder.add_input(logical.parameters()[0].body_type());
             builder
                 .add_instruction(
-                    ArrayOperation::<CoreArray>::CustomCall(
+                    ArrayOperation::<Array>::CustomCall(
                         CustomCallOperation::new("test.external", vec![]).with_effect_class(effect),
                     ),
                     vec![],
@@ -1013,7 +1011,7 @@ pub(crate) mod tests {
             CompiledKernel::from_output(&verified, b"configuration", &DeferredCopy { schema: 1 }, &DeferredEmbedding)
                 .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
             vec![Type::Array(ArrayType::scalar(DataType::I32))],
         )
         .unwrap();
@@ -1034,7 +1032,7 @@ pub(crate) mod tests {
             .trim_end(),
         );
         let error = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
             vec![Type::Array(ArrayType::scalar(DataType::F32))],
         )
         .unwrap_err();
@@ -1051,9 +1049,7 @@ pub(crate) mod tests {
         for sharding in [replicated.clone(), replicated.with_varying_manual_axes(["device"]).unwrap()] {
             let placed = Type::Array(ArrayType::scalar(DataType::I32).with_sharding(sharding).unwrap());
             let (output_types, program) = TracingContext::<Constant, Operation>::trace(
-                |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
-                    compiled.bind(inputs[0].context(), &inputs)
-                },
+                |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
                 vec![placed.clone()],
             )
             .unwrap();

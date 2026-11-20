@@ -11,8 +11,8 @@ use serde::Deserialize;
 #[cfg(any(test, feature = "cuda-13"))]
 use ryft_core::{
     ArrayType, BatchAxis, BatchAxisSpecification, DataType, Differentiate, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelRaggedAllToAll, ProgramError, ShardMapOptions, Sharding, ShardingDimension, Value as CoreValue,
-    ValueProjection, batch, shard_map,
+    ParallelRaggedAllToAll, ProgramError, ShardMapOptions, Sharding, ShardingDimension, Value, ValueProjection, batch,
+    shard_map,
 };
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{

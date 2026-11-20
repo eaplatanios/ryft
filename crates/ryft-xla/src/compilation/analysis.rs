@@ -452,7 +452,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayType, DataType, StagedFunction as CoreStagedFunction};
+    use ryft_core::{ArrayType, DataType, StagedFunction};
 
     use crate::compilation::options::Options;
     use crate::sessions::tests::domain_mesh;
@@ -535,7 +535,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Session, Type, Type>::stage(
+        let staged = StagedFunction::<Session, Type, Type>::stage(
             |_, _, input| Ok(input),
             Vec::new(),
             ArrayType::scalar(DataType::F32).into(),

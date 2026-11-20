@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_core::DeviceMesh;
-use ryft_core::{
-    CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation as CoreOperation, Typed,
-};
+use ryft_core::{CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation, Typed};
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
     CudaScalarType,
@@ -123,7 +121,7 @@ impl CudaKernelEmbedding {
     /// Reconstructs and validates a serialized CUDA artifact and its argument mapping before any native loading.
     /// Unknown versions, corruption, invalid canonical artifact metadata, and disagreement with the verified
     /// logical signature or buffer mapping are rejected. This does not invoke a compiler or load native code.
-    pub fn from_custom_call<Extension: CoreOperation<Type = Type>>(
+    pub fn from_custom_call<Extension: Operation<Type = Type>>(
         kernel: &VerifiedKernel<'_, Extension>,
         operation: &CustomCallOperation,
     ) -> Result<(Self, CudaKernelArtifact), KernelEmbeddingError> {
@@ -208,7 +206,7 @@ impl CudaKernelEmbedding {
 
     /// Resolves each logical array, in declaration order, to the existing custom call input and result buffer slots.
     /// Writable arguments use results so input liveness and donation remain XLA's ordinary functional alias policy.
-    pub fn argument_bindings<Extension: CoreOperation<Type = Type>>(
+    pub fn argument_bindings<Extension: Operation<Type = Type>>(
         &self,
         kernel: &VerifiedKernel<'_, Extension>,
     ) -> Result<Vec<CudaKernelBufferBinding>, KernelEmbeddingError> {
@@ -256,9 +254,7 @@ impl CudaKernelEmbedding {
     }
 }
 
-impl<Extension: CoreOperation<Type = Type>> KernelOutputEmbedding<CudaKernelArtifact, Extension>
-    for CudaKernelEmbedding
-{
+impl<Extension: Operation<Type = Type>> KernelOutputEmbedding<CudaKernelArtifact, Extension> for CudaKernelEmbedding {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         Ok(serde_json::to_vec(&(2u32, &self.target_name, &self.parameters, self.row_major_layouts, self.assertions))?)
     }

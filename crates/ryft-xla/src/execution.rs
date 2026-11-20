@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension as CoreDimension, Layout,
-    Memory, Pad, ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape, Sharding,
-    ShardingDimension, StatefulCompilationDomain, StatefulExecution, Type as CoreType, TypeRefinements, Typed,
-    TypedProgram, ValueProjection, validate_reference_boundary,
+    ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension, Layout, Memory, Pad,
+    ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceError, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape,
+    Sharding, ShardingDimension, ShardingError, StatefulCompilationDomain, StatefulExecution, Type as CoreType,
+    TypeRefinements, Typed, TypedProgram, ValueProjection, validate_reference_boundary,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Error as PjrtError, Execution, ExecutionDeviceInputs, ExecutionFence,
@@ -34,6 +34,7 @@ use crate::arrays::metadata::ArrayOutputPlan;
 use crate::lowering::signature::ExecutableSignature;
 use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
+use crate::types::DataTypeExtension;
 use crate::{
     Array, ArrayError, ArrayShard, CompilationError, CompiledProgram, Error, ExecutionResources, FromPjrt,
     RuntimeRequirement, Session, ToPjrt, Type, Value,
@@ -359,7 +360,7 @@ impl ExecutionArguments {
         }
         for (position, &device_id) in addressable_device_ids.iter().enumerate() {
             if addressable_device_ids[..position].contains(&device_id) {
-                return Err(ryft_core::ShardingError::DuplicateDeviceId { id: device_id }.into());
+                return Err(ShardingError::DuplicateDeviceId { id: device_id }.into());
             }
         }
 
@@ -640,7 +641,7 @@ impl Session {
         // A logical input without a layout constraint admits any physical representation. Match the compiled
         // signature before handing buffers to PJRT, which otherwise reads their storage in its expected order.
         // Known layouts convert on device through the existing capability. Unknown layouts require observing the
-        // shard buffers. Only a mismatch takes the dense host fallback, which also handles shards with differing
+        // shard buffers. Only a mismatch takes the host fallback, which also handles shards with differing
         // layouts.
         for (input, physical_type) in inputs.iter_mut().zip(&plan.physical_input_types) {
             if input.data_type().is_zero() {
@@ -664,8 +665,42 @@ impl Session {
                     }
                 }
                 if needs_conversion && !input.sharding().unreduced_axes().is_empty() {
-                    // The devices of an unreduced array hold separate summands, which a dense round trip would replace.
-                    *input = input.relayout_through_host(self, expected)?;
+                    // A dense readback would combine the values along unreduced axes. An unchecked shard_map can
+                    // observe each device's original value, so round-trip each addressable shard separately.
+                    let buffer_type = input.data_type().executable_buffer_type();
+                    let mut work = self.reserve_work();
+                    let mut buffers = Vec::new();
+                    for shard in input.addressable_shards() {
+                        let buffer = shard.buffer().ok_or_else(|| {
+                            Error::from(ArrayError::MissingShardBuffer {
+                                shard_index: shard.index(),
+                                device_id: shard.device().id(),
+                            })
+                        })?;
+                        // Read row-major bytes for the host upload API, then upload to the original memory with
+                        // the executable's layout. Track both transfers so session synchronization observes them.
+                        let shape = shard.shape();
+                        let layout = ryft_pjrt::Layout::dense_major_to_minor(shape.rank());
+                        let bytes = work.track_host_copy(buffer.copy_to_host(Some(layout))?).wait()?;
+                        let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+                        let uploaded = self.client().buffer(
+                            Arc::<[u8]>::from(bytes),
+                            buffer_type,
+                            dimensions.as_slice(),
+                            None,
+                            buffer.memory()?,
+                            Some(expected_buffer_layout.clone()),
+                        )?;
+                        work.track_buffer(&uploaded);
+                        buffers.push(uploaded);
+                    }
+                    *input = Array::from_addressable_buffers(
+                        self,
+                        input.r#type().into_owned().with_layout(expected.clone()),
+                        input.mesh().clone(),
+                        Some(input.sharding().clone()),
+                        buffers,
+                    )?;
                 } else if needs_conversion {
                     let bytes = input.copy_to_host_bytes()?;
                     *input = Array::from_host_buffer(
@@ -715,7 +750,7 @@ impl Session {
         reference: &'g ArrayReference<Array>,
     ) -> Result<ReadyOrPendingReferenceGuard<'g, Array>, Error> {
         reference.lock_storage().map_err(|error| {
-            if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
+            if let Some(reference_error) = error.downcast_custom::<ReferenceError>().cloned() {
                 Error::from(reference_error)
             } else {
                 Error::from(error)
@@ -1543,7 +1578,7 @@ impl Session {
                                                  axis {axis}",
                                             )))
                                         },
-                                        |extent| Ok(CoreDimension::Static(extent)),
+                                        |extent| Ok(Dimension::Static(extent)),
                                     )
                             })
                             .collect::<Result<Vec<_>, _>>()?;
@@ -1713,12 +1748,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
-        ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds,
+        CompiledFunction, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
         DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation, Error as CoreError,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation, ReductionKind,
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
-        StagedFunction as CoreStagedFunction, StaticShape, TiledLayout, Typed,
+        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError, StagedFunction,
+        StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::Shape as ShapeProto;
@@ -2025,7 +2060,7 @@ mod tests {
             .with_device_mesh(mesh.clone());
         // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let staged = crate::stage::<_, ArrayType, ArrayType>(
             |input| input.clone() + input,
             input_type.clone(),
@@ -2035,7 +2070,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let compiled: CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().plan().output_plans.as_ref().map(Vec::len), Some(1));
 
@@ -2095,10 +2130,10 @@ mod tests {
             .with_device_mesh(mesh.clone());
         let unconstrained_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
-        let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
+        let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(unconstrained_sharding)
             .unwrap();
-        let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // XLA chooses the placement of outputs with open (i.e., `Unconstrained`) dimensions and of outputs without
         // declared shardings, so their programs have no output plans and validate the returned buffers
@@ -2111,7 +2146,7 @@ mod tests {
             )
             .unwrap()
             .into_inner();
-            let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+            let compiled: CompiledFunction<Session, Type, Type> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
             assert_eq!(compiled.compiled_program().plan().output_plans.as_ref().map(Vec::len), None);
 
@@ -2188,9 +2223,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         let left_array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(4)]));
         let right_array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]));
         let left_array =
             Array::from_addressable_buffers(&session, left_array_type, mesh.clone(), Some(left_sharding), left_buffers)
                 .unwrap();
@@ -2310,7 +2345,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             boundary.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
-            &Shape::new(vec![CoreDimension::Static(2)]),
+            &Shape::new(vec![Dimension::Static(2)]),
         );
 
         let context = MlirContext::new();
@@ -2519,18 +2554,18 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let staged =
             crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let compiled: CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
-        let donated_staged: CoreStagedFunction<Session, Type, Type> = crate::stage::<_, ArrayType, ArrayType>(
+        let donated_staged: StagedFunction<Session, Type, Type> = crate::stage::<_, ArrayType, ArrayType>(
             |input| input,
             input_type.clone(),
             Options::new(mesh.clone()).with_donate(true),
@@ -2547,7 +2582,7 @@ mod tests {
         // Boolean values retain physical `i1` arguments and results while the identity over the zero data type has an
         // empty physical signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
-        let boolean_staged: CoreStagedFunction<Session, Type, Type> =
+        let boolean_staged: StagedFunction<Session, Type, Type> =
             crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
                 .unwrap()
                 .into_inner();
@@ -2572,10 +2607,10 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]))
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(sharding.clone())
             .unwrap();
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(sharding)
             .unwrap();
         let options = Options::new(mesh.clone()).with_donate((false, true));
@@ -2588,8 +2623,7 @@ mod tests {
         .into_inner();
         let lowered = staged.lower(&session).unwrap();
         assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
-        let compiled: ryft_core::compilation::CompiledFunction<Session, (Type, Type), (Type, Type)> =
-            lowered.compile(&session).unwrap();
+        let compiled: CompiledFunction<Session, (Type, Type), (Type, Type)> = lowered.compile(&session).unwrap();
         let value = Array::from_host_buffer(
             &session,
             value_type.clone(),
@@ -2642,10 +2676,10 @@ mod tests {
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![
-                CoreDimension::Static(4),
-                CoreDimension::Dynamic(rows),
-                CoreDimension::Dynamic(columns),
-                CoreDimension::Dynamic(depth),
+                Dimension::Static(4),
+                Dimension::Dynamic(rows),
+                Dimension::Dynamic(columns),
+                Dimension::Dynamic(depth),
             ]),
         )
         .with_sharding(sharding.clone())
@@ -2657,7 +2691,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let compiled: CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let executable_options =
             compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
@@ -2669,7 +2703,7 @@ mod tests {
 
         for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
             let actual_type =
-                ArrayType::new(DataType::F32, Shape::new(shape.into_iter().map(CoreDimension::Static).collect()))
+                ArrayType::new(DataType::F32, Shape::new(shape.into_iter().map(Dimension::Static).collect()))
                     .with_sharding(sharding.clone())
                     .unwrap();
             let values = (0..shape.iter().product()).map(|value| value as f32).collect::<Vec<_>>();
@@ -2703,7 +2737,7 @@ mod tests {
         // input sharding override.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Dynamic(extent)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(extent)]));
         let sharded = Sharding::new(
             mesh.logical_mesh().clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
@@ -2732,10 +2766,10 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
+        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(input_sharding.clone())
             .unwrap();
-        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(input_sharding)
             .unwrap();
         let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
@@ -2788,10 +2822,10 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
+        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(input_sharding.clone())
             .unwrap();
-        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(input_sharding)
             .unwrap();
         let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
@@ -2946,6 +2980,61 @@ mod tests {
                 Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
                     if message == "erased producer failed",
             ));
+        }
+    }
+
+    #[test]
+    fn test_session_prepare_compiled_execution_preserves_unreduced_shards_during_relayout() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let session = Session::builder()
+            .client(client)
+            .compilation_options(test_compilation_options(client, None))
+            .build()
+            .unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap();
+        let shape = [2, 2];
+        let input_type = ArrayType::new_static(DataType::F32, shape).with_sharding(sharding.clone()).unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+
+        // Supply buffers in a different layout from the executable's, with no layout declared on the input type.
+        let expected = compiled.plan().physical_input_types[0].layout().unwrap();
+        let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let layout = if expected == &row_major { column_major } else { row_major }.to_pjrt().unwrap();
+        let summands = [[1.0f32, 2.0, 3.0, 4.0], [10.0, 20.0, 30.0, 40.0]].map(|values| values_to_bytes(&values));
+        let buffers = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip(&summands)
+            .map(|(device, bytes)| {
+                client
+                    .buffer(
+                        bytes.as_slice(),
+                        BufferType::F32,
+                        shape.map(|extent| extent as u64),
+                        None,
+                        device,
+                        Some(layout.clone()),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let input = Array::from_addressable_buffers(&session, input_type, mesh, None, buffers).unwrap();
+        let prepared = session.prepare_compiled_execution(&compiled, vec![input], &[]).unwrap();
+
+        let input = &prepared.inputs[0];
+        assert_eq!(input.layout(), Some(expected));
+        assert_eq!(input.sharding(), &sharding);
+        for (shard, bytes) in input.addressable_shards().zip(summands) {
+            assert_eq!(shard.copy_to_host_bytes().unwrap(), bytes);
         }
     }
 
@@ -3144,7 +3233,7 @@ mod tests {
             .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = bounded_vector_type(sharding.clone());
-        let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
         let source_values = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
@@ -3206,10 +3295,10 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // The compiled module declares the `[3]` argument at its bounds, so a `[2]` runtime value below those bounds
         // must still produce a `[3]` carrier. The hidden extent scalar transports the logical size.
-        let physical_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
+        let physical_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(sharding.clone())
             .unwrap();
-        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
+        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
         let zero = Array::from_host_buffer(&session, runtime_zero_type, mesh, None, []).unwrap();
@@ -3245,7 +3334,7 @@ mod tests {
         .with_sharding(sharding.clone())
         .unwrap();
         let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
-        let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
+        let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
         let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh, None, []).unwrap();
@@ -3307,7 +3396,7 @@ mod tests {
                 session.execute_statefully(program, vec![update.clone(), update.clone()]).r#await(),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    CoreError::Program(ProgramError::InvalidArgument { message })
                         if *message == expected,
                 ),
             ));
@@ -3320,7 +3409,7 @@ mod tests {
                 session.execute_statefully(program, vec![reference.clone(), reference.clone()]).r#await(),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    CoreError::Program(ProgramError::InvalidArgument { message })
                         if *message == expected,
                 ),
             ));
@@ -3328,7 +3417,7 @@ mod tests {
                 session.execute_statefully(program, Vec::new()).r#await(),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+                    CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
                 ),
             ));
             assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
@@ -3364,7 +3453,7 @@ mod tests {
             compiled.execute_statefully_and_wait(&session, Value::Reference(Reference::new(view, session.clone()))),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                CoreError::Program(ProgramError::InvalidArgument { message: reason })
                     if *reason
                         == "external state input 0 must be a root reference handle that uses its allocation's stored \
                             type identities",
@@ -3384,7 +3473,7 @@ mod tests {
         )
         .unwrap();
         let session = Session::builder().client(client).build().unwrap();
-        let shape = Shape::new(vec![CoreDimension::Static(2)]);
+        let shape = Shape::new(vec![Dimension::Static(2)]);
         let replicated_type = ArrayType::new(DataType::F32, shape.clone())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -3440,7 +3529,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                CoreError::Program(ProgramError::InvalidArgument { message: reason })
                     if *reason == format!(
                         "external state input 0 reference type `{alternate_type}` does not refine effective \
                          compiled state type `{replicated_type}`",
@@ -3461,7 +3550,7 @@ mod tests {
             .build()
             .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
         let compiled = compile_statefully::<_, (Type, Type), Type>(
@@ -3536,7 +3625,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                CoreError::Program(ProgramError::InvalidArgument { message: reason })
                     if *reason == "external state input 0 reference mesh does not match the compiled device mesh",
             ),
         ));
@@ -3573,7 +3662,7 @@ mod tests {
                 &error,
                 Some(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    CoreError::Program(ProgramError::InvalidArgument { message })
                         if *message == "capture 0 and input 0 bind the same reference allocation",
                 ),
             ),
@@ -3760,7 +3849,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                CoreError::Program(ProgramError::InvalidArgument { message })
                     if *message == expected_error,
             ),
         ));
@@ -3925,7 +4014,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Reference(ReferenceError::Frozen),
+                CoreError::Reference(ReferenceError::Frozen),
             ),
         ));
         assert_eq!(read_first_shard::<f32>(client, &first.read().unwrap()), vec![1.0]);

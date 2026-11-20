@@ -1,7 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, GatherMode, GatherOperation, ReductionKind,
-};
+use ryft_core::{ArrayType, ComparisonDirection, DataType, Dimension, GatherMode, GatherOperation, ReductionKind};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
@@ -136,10 +134,8 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
     for &axis in dimensions.start_index_map() {
         let extent = match input_types[0].shape().dimensions()[axis] {
-            CoreDimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
-            CoreDimension::Dynamic(_) => {
-                lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?
-            }
+            Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?,
         };
         let window = lower_static_index_constants(&[operation.slice_sizes()[axis]], block, context, location)?[0];
         upper_bounds
@@ -266,12 +262,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
-        BatchingContext, Complex as ComplexNumber, DataType, Diagonal, Dimension as CoreDimension, DimensionBounds,
-        DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather,
-        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind,
-        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed,
-        TypedProgram, ValueProjection, differentiate_at, i1,
+        BatchingContext, Complex, DataType, Diagonal, Dimension, DimensionBounds, DimensionSize, DimensionVariable,
+        DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather, GatherDimensionNumbers, GatherMode,
+        GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind, ScatterDimensionNumbers,
+        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed, TypedProgram,
+        ValueProjection, differentiate_at, i1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -287,10 +283,8 @@ mod tests {
     fn test_gather_operation_lower() {
         // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array. Offset axis 1 carries the
         // row with slice sizes [1, 2], and axis 0 is collapsed because the start indices select it. Output is [2, 2].
-        let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let mut builder = ProgramBuilder::new();
         let operand = builder.add_input(operand_type);
@@ -324,13 +318,11 @@ mod tests {
         // a shape operand or lowered through `stablehlo.dynamic_gather`.
         let query = DimensionVariable::new("query", DimensionBounds::new(1, Some(5)).unwrap());
         let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Dynamic(query), CoreDimension::Static(1)]));
+            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(query), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]),
-        ));
+        let operand = builder
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])));
         let indices = builder.add_input(indices_type);
         let output = builder
             .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
@@ -362,10 +354,8 @@ mod tests {
         // `Clip` is the default out-of-bounds behavior of StableHLO `gather`, so a gather in `Clip` mode lowers to the
         // bare `stablehlo.gather` without extra clamp operations, just like the in-bounds default, rather than
         // failing.
-        let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
             .with_mode(GatherMode::Clip);
         let mut builder = ProgramBuilder::new();
@@ -456,16 +446,11 @@ mod tests {
                 values_to_bytes(&[297i64, 298, 299, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
-                CoreArray::from_elements(
-                    ArrayType::new_static(DataType::C64, [1]),
-                    &[ComplexNumber::new(2.0f32, -3.0)],
-                )
-                .unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::C64, [1]), &[Complex::new(2.0f32, -3.0)])
+                    .unwrap(),
                 CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0i32, 1]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]).with_mode(
-                    GatherMode::Fill {
-                        value: Some(Box::new(CoreArray::scalar(ComplexNumber::new(-0.0f32, 7.0)).unwrap())),
-                    },
+                    GatherMode::Fill { value: Some(Box::new(CoreArray::scalar(Complex::new(-0.0f32, 7.0)).unwrap())) },
                 ),
                 values_to_bytes(&[2.0f32, -3.0, -0.0, 7.0]),
             ),
@@ -531,14 +516,13 @@ mod tests {
         for mode in [GatherMode::Clip, GatherMode::Fill { value: None }] {
             let input_type = ArrayType::new(
                 DataType::I64,
-                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
                     "rows",
                     DimensionBounds::new(1, Some(5)).unwrap(),
                 ))]),
             );
-            let query =
-                CoreDimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(3)).unwrap()));
-            let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![query.clone(), CoreDimension::Static(1)]));
+            let query = Dimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(3)).unwrap()));
+            let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![query.clone(), Dimension::Static(1)]));
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let indices = builder.add_input(indices_type.clone());
@@ -624,9 +608,9 @@ mod tests {
         // The paired batching axis has a zero window, which lowering replaces with a window of one because the input
         // has at least one row. Clipping against the logical extents of a dynamic input gathers a second time, and
         // that gather must use the same windows.
-        let rows = CoreDimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap()));
-        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![rows.clone(), CoreDimension::Static(4)]));
-        let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![rows.clone(), CoreDimension::Static(1)]));
+        let rows = Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap()));
+        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![rows.clone(), Dimension::Static(4)]));
+        let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![rows.clone(), Dimension::Static(1)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let indices = builder.add_input(indices_type.clone());
@@ -832,9 +816,9 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, CoreDimension::Static(1)]));
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), Dimension::Static(4)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
             .with_mode(GatherMode::Clip);
         // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any

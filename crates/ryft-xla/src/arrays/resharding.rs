@@ -3,8 +3,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, Cast, Concatenate, DataType, Device, DeviceMesh, Layout, Memory, MeshAxisType, Sharding, Slice,
-    StaticShape, Typed, check_sharding,
+    ArrayType, Cast, Concatenate, DataType, Device, DeviceMesh, DimensionError, Layout, Memory, MeshAxisType,
+    ProgramError, Sharding, Slice, StaticShape, Typed, check_sharding,
 };
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError, ExecutionFence};
@@ -914,7 +914,7 @@ impl Array {
         // the canonical sender that drives all cross-host sends, and receiving processes use the same device ID as
         // the source of their cross-host receives.
         let canonical_source_device =
-            self.mesh().devices().first().copied().ok_or_else(|| ryft_core::ProgramError::InvalidArgument {
+            self.mesh().devices().first().copied().ok_or_else(|| ProgramError::InvalidArgument {
                 message: "cannot reshard an array on an empty self device mesh".to_string(),
             })?;
         let this_process_is_canonical_sender = canonical_source_device.process_index() == client_process_index;
@@ -1354,10 +1354,7 @@ fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<
                 Error::from(ArrayError::InvalidShardDimension {
                     shard_index,
                     dimension,
-                    source: ryft_core::DimensionError::ExtentExceedsBackendWidth {
-                        value: size,
-                        maximum: i64::MAX as usize,
-                    },
+                    source: DimensionError::ExtentExceedsBackendWidth { value: size, maximum: i64::MAX as usize },
                 })
             })
         })
@@ -1494,8 +1491,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        DataType, Dimension as CoreDimension, DimensionError, Layout, LogicalMesh, Memory, MeshAxis, Shape,
-        ShardingDimension, TiledLayout,
+        DataType, Dimension, DimensionError, Layout, LogicalMesh, Memory, MeshAxis, Shape, ShardingDimension,
+        TiledLayout,
     };
     use ryft_pjrt::{BufferType, ExecutionFence};
 
@@ -1550,7 +1547,7 @@ mod tests {
         // descriptors expect the exact logical shape of every device shard. Revisit this if a future XLA release or
         // backend handles uneven splits.
         let source_values = [0.0f32, 1.0, 2.0, 3.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(source_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -1600,7 +1597,7 @@ mod tests {
         let local_source_buffer = client
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
-        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
@@ -1633,7 +1630,7 @@ mod tests {
         .unwrap();
         let source_sharding =
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
@@ -1800,7 +1797,7 @@ mod tests {
         let mesh = four_device_mesh_x(client);
         let source_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
-        let source_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(4)]))
+        let source_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(layout.clone())
             .with_memory(Memory::Host { pinned: true })
             .with_sharding(source_sharding)
@@ -1892,7 +1889,7 @@ mod tests {
         )
         .unwrap();
         let values = [60.0f32, 61.0, 62.0, 63.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -1932,7 +1929,7 @@ mod tests {
 
         let values = [10.0f32, 11.0, 12.0, 13.0];
         let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -1967,7 +1964,7 @@ mod tests {
         let values = [20.0f32, 21.0, 22.0, 23.0];
         let sharded_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]));
         let source_array = Array::from_host_buffer(
             &session,
             source_type,
@@ -2011,8 +2008,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        let source_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]));
         let source_array = Array::from_host_buffer(
             &session,
             source_type,
@@ -2068,7 +2064,7 @@ mod tests {
 
         let values = [400.0f32, 401.0, 402.0, 403.0];
         let replicated_sharding = Sharding::replicated(explicit_mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2103,7 +2099,7 @@ mod tests {
         )
         .unwrap();
         let values = [10.0f32, 11.0, 12.0, 13.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2137,7 +2133,7 @@ mod tests {
         let source_sharding =
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [70.0f32, 71.0, 72.0, 73.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]));
         let source_array = Array::from_host_buffer(
             &session,
             source_type,
@@ -2170,7 +2166,7 @@ mod tests {
         let source_sharding =
             Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [80.0f32, 81.0, 82.0, 83.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]));
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]));
         let source_array = Array::from_host_buffer(
             &session,
             source_type,
@@ -2259,7 +2255,7 @@ mod tests {
 
         let values = [30.0f32, 31.0, 32.0, 33.0];
         let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2301,7 +2297,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let mesh = four_device_mesh_x(client);
         let values = (0..4096).map(|index| index as f32).collect::<Vec<_>>();
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2348,7 +2344,7 @@ mod tests {
         )
         .unwrap();
         let values = [100.0f32, 101.0, 102.0, 103.0];
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2440,7 +2436,7 @@ mod tests {
 
         let values = [40.0f32, 41.0, 42.0, 43.0];
         let replicated_sharding = Sharding::replicated(manual_mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2489,7 +2485,7 @@ mod tests {
         let local_source_buffer = client
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
-        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,
@@ -2524,7 +2520,7 @@ mod tests {
 
         let values = [300.0f32, 301.0, 302.0, 303.0];
         let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(values.len())]))
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(replicated_sharding)
             .unwrap();
         let source_array = Array::from_host_buffer(
@@ -2659,7 +2655,7 @@ mod tests {
         let local_source_buffer = client
             .buffer(values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
-        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let source_array = Array::from_addressable_buffers(
             &session,
             source_array_type,

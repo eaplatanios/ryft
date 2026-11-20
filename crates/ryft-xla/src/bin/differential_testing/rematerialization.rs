@@ -4,7 +4,7 @@
 //! Every case differentiates one rematerialized function of `x: f32[2, 3]` and `w: f32[3, 2]`, and of stacked layers
 //! `f32[2, 2, 2]` for the scan cases, whose arithmetic is exact in `f32` (i.e., dot products, products, and sums of
 //! small integers), so that both frameworks must produce identical values. Each case records its output, its
-//! Jacobian-vector product, and its input gradients, which are computed eagerly on core [`CoreArray`]s, together with
+//! Jacobian-vector product, and its input gradients, which are computed eagerly on core [`Array`]s, together with
 //! the values that reverse mode differentiation saves, which [`saved_residuals`] reports. The saved values are encoded
 //! numerically as their count and as their element counts and bit widths, sorted by element count and then by bit
 //! width, because the two frameworks report them in different orders and describe their sources differently. The
@@ -15,9 +15,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 
 use ryft_core::{
-    Add, Array as CoreArray, ArrayOperation, ArrayType, Broadcast, Compare, ComparisonDirection, Condition, DataType,
-    DomainTracer, Dot, DotDimensionNumbers, DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable, Memory,
-    Mul, NothingSavable, ProgramError, Reduce, ReductionKind, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    Add, Array, ArrayOperation, ArrayType, Broadcast, Compare, ComparisonDirection, Condition, DataType, DomainTracer,
+    Dot, DotDimensionNumbers, DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable, Memory, Mul,
+    NothingSavable, ProgramError, Reduce, ReductionKind, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
     SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, ScanOptions, StaticShape, StopGradient, Tag, Tracer,
     TracingContext, Typed, ValueProjection, ZeroLike, composite, differentiate_at, rematerialize, saved_residuals,
     scan,
@@ -29,7 +29,7 @@ use super::{DifferentialObservation, SCHEMA};
 // TODO(eaplatanios): Review this module.
 
 /// Tracer over which the bodies of the eagerly evaluated rematerialized functions are traced.
-type CoreTracer = Tracer<TracingContext<CoreArray, ArrayOperation<CoreArray>>>;
+type CoreTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 
 /// Tracer over which the bodies of the rematerialized functions staged for XLA are traced.
 type XlaTracer = DomainTracer<Session>;
@@ -193,17 +193,17 @@ fn project(value: XlaTracer) -> Result<ArrayTracer, ProgramError> {
 }
 
 /// Returns the `f32` array of the provided shape and values.
-fn array(shape: &[usize], values: &[f32]) -> Result<CoreArray, ProgramError> {
-    CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape.to_vec()), values)
+fn array(shape: &[usize], values: &[f32]) -> Result<Array, ProgramError> {
+    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape.to_vec()), values)
 }
 
 /// Returns the flattened values of `array`, which are exact `f32` values.
-fn values(array: CoreArray) -> Vec<Vec<f32>> {
+fn values(array: Array) -> Vec<Vec<f32>> {
     vec![array.to_f64s().into_iter().map(|value| value as f32).collect()]
 }
 
 /// Returns the shared inputs `x` and `w` together with their tangents `ẋ` and `ẇ`.
-fn inputs() -> Result<[CoreArray; 4], ProgramError> {
+fn inputs() -> Result<[Array; 4], ProgramError> {
     Ok([
         array(&[2, 3], &[1.0, 2.0, -1.0, 0.0, 1.0, 2.0])?,
         array(&[3, 2], &[1.0, -1.0, 2.0, 0.0, -1.0, 1.0])?,

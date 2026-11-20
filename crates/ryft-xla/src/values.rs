@@ -518,7 +518,7 @@ impl AssertionValue for Value {
         self.clone().into_array_ir_value().assertion_observation()
     }
 
-    fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         self.clone().into_array_ir_value().assertion_array()
     }
 }
@@ -966,14 +966,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AxisError, BatchAxis,
-        CaptureReference, Compare, ComparisonDirection, Concretizable, Context, ConvertElementType, DataType, Device,
-        DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionOperation, DimensionSize,
-        DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation, DimensionType, DimensionValue,
-        DimensionVariable, Gather, GatherMode, LogicalMesh, Max, Memory, MeshAxis, MeshAxisType, Min, OneOperation,
-        OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceType, ReferenceWrite,
-        Rem, SaturatingSub, Shape, Sort, SortDirection, TypeError, TypeIdentityRenaming, Typed, ValueProjection,
-        WhileOperation, WhilePredicate, ZeroOperation, batch, differentiate_at,
+        CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context, ConvertElementType,
+        DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
+        DimensionOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, Gather, GatherMode, LogicalMesh, Max, Memory, MeshAxis,
+        MeshAxisType, Min, OneOperation, OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind,
+        ReferenceAddUpdate, ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceType,
+        ReferenceWrite, Rem, SaturatingSub, Shape, Sort, SortDirection, SubOperation, TypeError, TypeIdentityRenaming,
+        Typed, ValueProjection, WhileOperation, WhilePredicate, ZeroOperation, batch, differentiate_at,
     };
     use ryft_pjrt::Client;
 
@@ -1498,7 +1498,7 @@ mod tests {
         let mesh = mesh_on(client, 0);
         let scalar = Value::Array(array(&session, &mesh, DataType::I32, &[42i32], &[]));
         assert_eq!(scalar.assertion_observation(), Ok("42".to_string()));
-        assert_eq!(scalar.assertion_array(), Ok(Some(ryft_core::Array::scalar(42i32).unwrap())));
+        assert_eq!(scalar.assertion_array(), Ok(Some(CoreArray::scalar(42i32).unwrap())));
         assert_eq!(dimension(&session, 3).assertion_observation(), Ok("3".to_string()));
         assert_eq!(dimension(&session, 3).assertion_array(), Ok(None));
     }
@@ -1679,7 +1679,7 @@ mod tests {
         let size_type = size_operation.output_type().clone();
         let size = builder.add_instruction(size_operation, Vec::new(), vec![x], None).unwrap()[0];
         let constant = DimensionValue::constant(2).unwrap();
-        let sum = ryft_core::DimensionAddOperation::new(&size_type, constant.r#type().as_ref()).unwrap();
+        let sum = DimensionAddOperation::new(&size_type, constant.r#type().as_ref()).unwrap();
         let two = builder.add_constant(Constant::Dimension(constant));
         let sum = builder
             .add_instruction(Operation::Dimension(DimensionOperation::Add(sum)), Vec::new(), vec![size, two], None)
@@ -1760,7 +1760,7 @@ mod tests {
             let state = builder.add_input(scalar_type.clone());
             let zero = Operation::provide(ZeroOperation::new(scalar_type.clone()), &[]).unwrap();
             let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
-            let comparison = ryft_core::CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThan);
+            let comparison = CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThan);
             let predicate = builder
                 .add_instruction(Operation::Array(comparison.into()), Vec::new(), vec![state, zero], None)
                 .unwrap()[0];
@@ -1773,7 +1773,7 @@ mod tests {
             let state = builder.add_input(scalar_type.clone());
             let one = Operation::provide(OneOperation::new(scalar_type.clone()), &[]).unwrap();
             let one = builder.add_instruction(one, Vec::new(), Vec::new(), None).unwrap()[0];
-            let subtraction = ryft_core::SubOperation::<ArrayType>::new();
+            let subtraction = SubOperation::<ArrayType>::new();
             let next = builder
                 .add_instruction(Operation::Array(subtraction.into()), Vec::new(), vec![state, one], None)
                 .unwrap()[0];

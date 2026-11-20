@@ -189,12 +189,11 @@ use ryft_core::{
     ArrayIrBatchingPolicy, ArrayType, Batch, BatchAxis, BatchAxisSpecification, BatchingError, BatchingTracer,
     ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, ConstrainSharding, Context, ContextProjection,
-    DeviceMesh, DifferentiableType, Dimension as CoreDimension, DimensionValue, DispatcherStatistics,
-    DomainTracingContext, ExecutableFunction as CoreExecutableFunction, ForwardModeDifferentiate, ImportingContext,
-    MeshAxisType, MeshContext, NamedAxes, Parameter, Parameterized, ParameterizedFamily, ProgramError,
-    ProjectedContext, ProjectedValue, Reshard, ReverseModeDifferentiate, Sharding, ShardingDimension,
-    StagedFunction as CoreStagedFunction, StatefulExecution, Tracer as CoreTracer, Typed, Value as CoreValue,
-    ValueProjection,
+    DeviceMesh, DifferentiableType, Dimension, DimensionValue, DispatcherStatistics, DomainTracingContext,
+    ExecutableFunction as CoreExecutableFunction, ForwardModeDifferentiate, ImportingContext, MeshAxisType,
+    MeshContext, NamedAxes, Parameter, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
+    ProjectedValue, Reshard, ReverseModeDifferentiate, Sharding, ShardingDimension,
+    StagedFunction as CoreStagedFunction, StatefulExecution, Tracer, Typed, Value as CoreValue, ValueProjection,
 };
 use ryft_pjrt::Execution;
 
@@ -211,7 +210,7 @@ use crate::{Array, Constant, Error, ExecutionError, Operation, Session, Type, Va
 /// # Stability
 ///
 /// This alias is experimental while the external reference ABI is evolving.
-pub type StatefulCompileTracer = CoreTracer<DomainTracingContext<Session, Value>>;
+pub type StatefulCompileTracer = Tracer<DomainTracingContext<Session, Value>>;
 
 /// Tracer leaf exposed by the public XLA compilation facade over arrays.
 pub type CompileTracer = ProjectedValue<ArrayType, StatefulCompileTracer>;
@@ -1579,7 +1578,7 @@ where
                 None => Ok(r#type),
                 Some(axis) => {
                     let position = axis.normalize(r#type.rank() + 1).map_err(ProgramError::from)?;
-                    Ok(r#type.batched(position, CoreDimension::Static(extent), batch_sharding.clone())?)
+                    Ok(r#type.batched(position, Dimension::Static(extent), batch_sharding.clone())?)
                 }
             })
             .collect::<Result<Vec<_>, BatchingError>>()
@@ -2221,10 +2220,10 @@ mod tests {
         ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis, BatchAxisSpecification, Broadcast,
         CaptureReference, Compare, ComparisonDirection, Condition, Context, ConvertElementType, Cos,
         CotangentAccumulator, CotangentDestinationKind, DataType, DifferentiableType, Differentiate,
-        DifferentiationError, Dimension as CoreDimension, DimensionBounds, DimensionSize, DimensionSizeOperation,
-        DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable, ErasedOperation, Error as CoreError,
+        DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable,
+        DomainTracer, Dot, DotDimensionNumbers, DotsSavable, ErasedOperation, Error as CoreError,
         ForwardModeDifferentiate, Hessian, ImportingContext, Jacobian, MaybeZero, Memory, MeshAxisType, Mul, Parameter,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind,
+        Placeholder, Program, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind,
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, ReshapeOperation,
         ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualRejection, ResidualStorage,
@@ -2260,7 +2259,7 @@ mod tests {
     fn accumulate_and_read_program(
         reference_type: &Type,
         array_type: &ArrayType,
-    ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
+    ) -> Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
         let (_, program) = <Session>::trace(
             |(reference, update): (DomainTracer<Session>, DomainTracer<Session>)| {
                 reference.add_update(&update)?;
@@ -3151,7 +3150,7 @@ mod tests {
             error,
             Error::Core(core_error) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "output 0 of the called function is a reference that the function allocates itself, \
                         which a nested call cannot return; allocate the reference in the caller and pass it to \
                         the function instead",
@@ -3165,7 +3164,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
+        let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let read = compile_statefully::<_, Type, Type>(
@@ -3189,7 +3188,7 @@ mod tests {
         ));
 
         for expected in [vec![1.0f32, 2.0], vec![1.0f32, 2.0, 3.0, 4.0]] {
-            let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(expected.len())]))
+            let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(expected.len())]))
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
             let reference = ArrayReference::new(
@@ -3269,7 +3268,7 @@ mod tests {
             result,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                CoreError::Program(ProgramError::InvalidArgument { message })
                     if *message == "capture 1 and capture 0 bind the same reference allocation",
             ),
         ));
@@ -3529,7 +3528,7 @@ mod tests {
 
         // The executable expects an input sharded along `x` across both devices, but the caller passes a fully
         // replicated array, which `ExecutableFunction::execute` silently reshards before executing.
-        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let replicated_input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated).unwrap();
@@ -4602,7 +4601,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let engine = Session::builder().client(client).build().unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -4735,7 +4734,7 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let mut body = CoreProgramBuilder::<Constant, Operation>::new();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(scalar_type.clone().into());
         body.add_input(slice_type.into());
@@ -4758,7 +4757,7 @@ mod tests {
                 let inputs = vec![initial.into_value(), elements, length];
                 let outputs = context
                     .bind(
-                        Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(extent.clone()))),
+                        Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(extent.clone()))),
                         AttachedRegions::Callees(std::slice::from_ref(&body)),
                         &inputs,
                     )
@@ -4836,7 +4835,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let engine = Session::builder().client(client).build().unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -5569,13 +5568,13 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
-            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(length)]));
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]));
             let reference_type = Type::Reference(ReferenceType::new(input_type.clone()));
 
             // The callee captures the complete root and receives the scan index as an ordinary input. It forms its
             // scalar view locally, so no view crosses the call boundary. Capture 0 must still resolve to that same root
             // when reference discharge runs before compilation lifts the captured constant into an ordinary operand.
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(reference_type.clone());
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let root = builder.add_constant(Constant::Captured(CaptureReference::new(0, reference_type.clone())));
@@ -5615,7 +5614,7 @@ mod tests {
             let callee = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![updated], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let root = builder.add_input(ReferenceType::new(input_type.clone()).into());
             // Compare selection inside the call with the direct discharge path over slices.
@@ -5671,7 +5670,7 @@ mod tests {
                 .unwrap();
 
             // Discharge the source directly before compilation can lift captured constants into ordinary operands.
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let reference =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -6028,7 +6027,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
 
@@ -6363,7 +6362,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let engine = Session::builder().client(client).build().unwrap();
 
-        let shape = Shape::new(vec![CoreDimension::Static(3)]);
+        let shape = Shape::new(vec![Dimension::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharding.clone()).unwrap();
         let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
@@ -6780,7 +6779,7 @@ mod tests {
         // `input_type` carries the abstract shape and data type but a replicated sharding, which the `input_shardings`
         // override replaces with a sharding along `x` before tracing, so the compiled program shards the input across
         // both devices of the mesh.
-        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let shape = Shape::new(vec![Dimension::Static(4)]);
         let abstract_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let abstract_input_type =
             ArrayType::new(DataType::F32, shape.clone()).with_sharding(abstract_sharding).unwrap();
@@ -6848,7 +6847,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated.clone()).unwrap();

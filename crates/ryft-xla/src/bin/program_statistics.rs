@@ -12,10 +12,10 @@ use std::ops::{Add, Mul};
 use serde::Serialize;
 
 use ryft_core::{
-    Array as CoreArray, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError,
-    Dimension as CoreDimension, Dot, DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh,
-    MeshAxis, MeshAxisType, Program as CoreProgram, ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape,
-    ShardMapOptions, Sharding, ShardingDimension, Sin, shard_map,
+    Array, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError, Dimension, Dot,
+    DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh, MeshAxis, MeshAxisType, Program,
+    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, ShardMapOptions, Sharding, ShardingDimension,
+    Sin, shard_map,
 };
 use ryft_xla::{ArrayTracer, Error, TracedProgram, trace};
 
@@ -172,21 +172,19 @@ fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T>>(x: T) ->
 
 /// Emits the plain JIT scalar bilinear case.
 fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, Error> {
-    let (_, program): (
-        CoreArray,
-        CoreProgram<CoreArray, ArrayOperation<CoreArray>, (CoreArray, CoreArray), CoreArray>,
-    ) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
-        |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-        (CoreArray::scalar(2.0)?, CoreArray::scalar(3.0)?),
-    )?;
+    let (_, program): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) =
+        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
+            |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
+            (Array::scalar(2.0)?, Array::scalar(3.0)?),
+        )?;
     Ok(program.statistics())
 }
 
 /// Emits the staged scalar bilinear pullback case.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Error> {
-    let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().vjp(
+    let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new().vjp(
         |inputs, ()| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-        (CoreArray::scalar(2.0)?, CoreArray::scalar(3.0)?),
+        (Array::scalar(2.0)?, Array::scalar(3.0)?),
         (),
     )?;
     let (pullback, _residuals) = pullback.into_transposed_parts()?;
@@ -196,8 +194,8 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Error> {
 
 /// Emits the staged scalar reverse mode gradient case.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
-    let (_, program): (CoreArray, CoreProgram<CoreArray, ArrayOperation<CoreArray>, CoreArray, CoreArray>) =
-        EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
+    let (_, program): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) =
+        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |x| {
                 let context = x.context().clone();
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
@@ -208,38 +206,36 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
             },
-            CoreArray::scalar(2.0)?,
+            Array::scalar(2.0)?,
         )?;
     Ok(program.statistics())
 }
 
 /// Emits the staged scalar value and gradient case.
 fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics, Error> {
-    let (_, program): (
-        (CoreArray, CoreArray),
-        CoreProgram<CoreArray, ArrayOperation<CoreArray>, CoreArray, (CoreArray, CoreArray)>,
-    ) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
-        |x| {
-            let context = x.context().clone();
-            // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
-            // differentiation error into a program error. A non-scalar gradient output cannot occur for this
-            // scalar case function.
-            context.differentiate_at(x).value_and_gradient(quartic_plus_sin).map_err(|error| match error {
-                DifferentiationError::Program(error) => error,
-                error => ProgramError::MalformedProgram(error.to_string()),
-            })
-        },
-        CoreArray::scalar(2.0)?,
-    )?;
+    let (_, program): ((Array, Array), Program<Array, ArrayOperation<Array>, Array, (Array, Array)>) =
+        EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
+            |x| {
+                let context = x.context().clone();
+                // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
+                // differentiation error into a program error. A non-scalar gradient output cannot occur for this
+                // scalar case function.
+                context.differentiate_at(x).value_and_gradient(quartic_plus_sin).map_err(|error| match error {
+                    DifferentiationError::Program(error) => error,
+                    error => ProgramError::MalformedProgram(error.to_string()),
+                })
+            },
+            Array::scalar(2.0)?,
+        )?;
     Ok(program.statistics())
 }
 
 /// Emits the directly linearized pushforward of `f(x) = x⁴ + sin(x)`, closed over its lifted residuals.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatistics, Error> {
-    let context = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new();
+    let context = EagerContext::<Array, ArrayOperation<Array>>::new();
     let (_, pushforward) = context.linearize(
         |x, ()| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?),
-        CoreArray::scalar(2.0)?,
+        Array::scalar(2.0)?,
         (),
     )?;
     let (_, pushforward, residuals, ..) = pushforward.into_parts();
@@ -257,7 +253,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
             let mut outputs = pushforward.interpret_in_context(&tracing_context, inputs)?;
             Ok(outputs.remove(0))
         },
-        CoreArray::scalar(1.0)?,
+        Array::scalar(1.0)?,
     )?;
     Ok(closed_pushforward.statistics())
 }
@@ -273,7 +269,7 @@ fn shard_map_mesh() -> LogicalMesh {
 ///
 ///   - `size`: Static vector length.
 fn vector_type(size: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
 }
 
 /// Returns a rank-2 case array type.
@@ -283,7 +279,7 @@ fn vector_type(size: usize) -> ArrayType {
 ///   - `rows`: Matrix row count.
 ///   - `columns`: Matrix column count.
 fn matrix_type(rows: usize, columns: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(rows), CoreDimension::Static(columns)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
 }
 
 /// Emits the basic traced `shard_map` case.

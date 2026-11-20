@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ryft_core::macros::check_count;
-use ryft_core::{Array as CoreArray, ArrayAddressing, ArrayType, DataType, EffectClass, PrintOperation, Typed};
+use ryft_core::{Array, ArrayAddressing, ArrayType, DataType, EffectClass, PrintOperation, Typed};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
 use ryft_mlir::{
@@ -382,7 +382,7 @@ fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>, memory: PrintBufferMem
     let array = match (logical_type, value.element_type()) {
         (None, _) => Ok(array),
         (Some(DataType::Zero), FfiBufferType::Predicate) => {
-            CoreArray::new(array.r#type().into_owned().with_data_type(DataType::Zero), Vec::new())
+            Array::new(array.r#type().into_owned().with_data_type(DataType::Zero), Vec::new())
         }
         (Some(data_type), FfiBufferType::F32) if !data_type.is_zero() => array.converted_to(data_type),
         (Some(data_type), carrier) => {
@@ -447,7 +447,7 @@ fn decode_print_attributes<'o>(call_frame: &FfiCallFrame<'o>) -> Result<(&'o str
 }
 
 /// Materializes a checked host array from a dense row-major print buffer.
-fn read_print_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Result<CoreArray, FfiError> {
+fn read_print_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Result<Array, FfiError> {
     let data_type = DataType::from_pjrt(BufferType::from_proto(buffer.element_type().proto()))
         .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
     if data_type.is_token() || !data_type.bit_width().is_multiple_of(8) {
@@ -474,7 +474,7 @@ fn read_print_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Resul
         )));
     }
     let bytes = read_print_buffer_bytes(buffer, memory, byte_count)?;
-    CoreArray::new(array_type, bytes).map_err(|error| FfiError::invalid_argument(error.to_string()))
+    Array::new(array_type, bytes).map_err(|error| FfiError::invalid_argument(error.to_string()))
 }
 
 /// Reads the checked byte length of a print buffer from host memory or through the current CUDA stream.
@@ -569,9 +569,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayType, BatchAxis, DataType, Device, DeviceMesh, Dimension as CoreDimension, Layout,
-        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Print, PrintOperation, Shape, Sharding, TiledLayout, Typed,
-        batch,
+        AddOperation, ArrayType, BatchAxis, DataType, Device, DeviceMesh, Dimension, Layout, LogicalMesh, MeshAxis,
+        MeshAxisType, Placeholder, Print, PrintOperation, Shape, Sharding, TiledLayout, Typed, batch,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
@@ -731,7 +730,7 @@ mod tests {
         // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
         // each print's data flow output is its forwarded operand. The final add therefore reads `%arg0` and `%0`
         // rather than custom call results.
-        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]));
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -859,7 +858,7 @@ mod tests {
         .unwrap();
         let engine = Session::builder().client(client).build().unwrap();
 
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(2)]))
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile(

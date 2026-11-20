@@ -379,7 +379,7 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayOperation, Atan2, Cos, Placeholder, Sin, Tanh, differentiate_at};
+    use ryft_core::{Accuracy, ArrayOperation, Atan2, Cos, Placeholder, Sin, Tanh, differentiate_at};
 
     use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program};
     use crate::sessions::tests::domain_mesh;
@@ -602,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::Tan(TanOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
+                ArrayOperation::Tan(TanOperation::new().with_accuracy(Accuracy::Highest)),
                 DataType::F32,
                 vec![2],
             )

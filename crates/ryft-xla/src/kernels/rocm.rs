@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use ryft_core::{
-    CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, Dimension as CoreDimension, EffectClass, Memory,
-    Operation as CoreOperation, Typed,
+    CustomCallAttribute, CustomCallOperation, DataType, DeviceMesh, Dimension, EffectClass, Memory, Operation, Typed,
 };
 use ryft_kernels::{GridExecution, KernelParameterAccess, VerifiedKernel};
 use ryft_pjrt::Client;
@@ -62,7 +61,7 @@ impl RocmKernelEmbedding {
 
     /// Reconstructs an artifact and validates its redundant payload and logical signature before loading native code.
     /// The digest detects corruption, but it does not authenticate executable code from an untrusted producer.
-    pub fn from_custom_call<Extension: CoreOperation<Type = Type>>(
+    pub fn from_custom_call<Extension: Operation<Type = Type>>(
         kernel: &VerifiedKernel<'_, Extension>,
         operation: &CustomCallOperation,
     ) -> Result<(Self, RocmKernelArtifact), KernelEmbeddingError> {
@@ -100,9 +99,7 @@ impl RocmKernelEmbedding {
     }
 }
 
-impl<Extension: CoreOperation<Type = Type>> KernelOutputEmbedding<RocmKernelArtifact, Extension>
-    for RocmKernelEmbedding
-{
+impl<Extension: Operation<Type = Type>> KernelOutputEmbedding<RocmKernelArtifact, Extension> for RocmKernelEmbedding {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         Ok(serde_json::to_vec(&(1u32, &self.target_name))?)
     }
@@ -124,7 +121,7 @@ impl<Extension: CoreOperation<Type = Type>> KernelOutputEmbedding<RocmKernelArti
         }
         let mut parallel = 1usize;
         for dimension in logical.grid().dimensions() {
-            let CoreDimension::Static(extent) = dimension.extent() else {
+            let Dimension::Static(extent) = dimension.extent() else {
                 return Err(KernelEmbeddingError::Invalid {
                     message: "rocm embedding requires a static parallel grid".into(),
                 });
@@ -473,9 +470,7 @@ unsafe extern "C" fn rocm_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{
-        Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, Placeholder, ProgramBuilder as CoreProgramBuilder,
-    };
+    use ryft_core::{Array, ArrayIrValue, ArrayOperation, ArrayType, Placeholder, ProgramBuilder};
     use ryft_kernels::{KernelDefinition, KernelOperation, kernel};
 
     use crate::{Platform, RuntimeError};
@@ -485,9 +480,9 @@ mod tests {
     /// Uses the same public portable macro and pointer order as the native vector fixture.
     #[kernel(crate = "ryft_kernels")]
     fn vector(
-        #[input(data_type = F32, rank = 1)] left: &ryft_core::Array,
-        #[input(data_type = F32, rank = 1)] right: &ryft_core::Array,
-        #[output(data_type = F32, shape = [256])] output: &mut ryft_core::Array,
+        #[input(data_type = F32, rank = 1)] left: &Array,
+        #[input(data_type = F32, rank = 1)] right: &Array,
+        #[output(data_type = F32, shape = [256])] output: &mut Array,
     ) {
         output.store(left.load() + right.load());
     }
@@ -592,11 +587,11 @@ mod tests {
     fn test_rocm_kernel_embedding_custom_call_rejects_effects() {
         for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
             let logical = crate::kernels::tests::definition().operation().clone();
-            let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, KernelOperation>::new();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
             builder.add_input(logical.parameters()[0].body_type());
             builder
                 .add_instruction(
-                    ArrayOperation::<CoreArray>::CustomCall(
+                    ArrayOperation::<Array>::CustomCall(
                         CustomCallOperation::new("test.external", vec![]).with_effect_class(effect),
                     ),
                     vec![],

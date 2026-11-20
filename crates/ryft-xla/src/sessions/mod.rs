@@ -2228,14 +2228,14 @@ pub(crate) mod tests {
         let placed = output.into_placement(&scoped, ArrayPlacement::device(mesh.devices()[1])).unwrap();
         assert_eq!(session.state.work.snapshot(), 3);
 
-        let copy = placed.begin_copy_to_host().unwrap();
+        let bytes = placed.copy_to_host_bytes().unwrap();
         assert_eq!(session.state.work.snapshot(), 4);
         drop((input, placed));
 
         // The original handle can wait for the submissions made through the scoped handle.
         session.synchronize().unwrap();
         assert!(session.state.work.lock().pending.is_empty());
-        assert_eq!(copy.finish().unwrap(), values_to_bytes(&[-1.0f32, -2.0]));
+        assert_eq!(bytes, values_to_bytes(&[-1.0f32, -2.0]));
     }
 
     #[test]

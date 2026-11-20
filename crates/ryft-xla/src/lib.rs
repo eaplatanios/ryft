@@ -98,9 +98,7 @@ pub(crate) mod tests {
     use std::mem::MaybeUninit;
     use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
-    #[cfg(feature = "cuda-13")]
     use prost::Message;
-
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
         StaticShape,
@@ -110,10 +108,10 @@ pub(crate) mod tests {
         FfiOutput, FfiScalar, FfiTypeId, XLA_FFI_Handler,
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions};
-    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, Program};
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     use crate::{Array, FromPjrt, Session};
 
@@ -218,23 +216,25 @@ pub(crate) mod tests {
     /// Shardy SPMD partitioning when supplied. `None` selects single-device compilation, or lets a [`Session`] choose
     /// the execution mode from its device mesh.
     pub(crate) fn test_compilation_options(client: &Client<'_>, partition_count: Option<usize>) -> CompilationOptions {
+        static CPU_DEBUG_OPTIONS: OnceLock<DebugOptions> = OnceLock::new();
+
+        #[cfg(feature = "cuda-13")]
+        static CUDA_DEBUG_OPTIONS: OnceLock<DebugOptions> = OnceLock::new();
+
         // MLIR export reads the explicit debug options before the HLO compiler applies its defaults.
-        // TODO(eaplatanios): Set `xla_enable_hlo_sharding_v3` via `environment_option_overrides` once
-        //  CPU PJRT applies those overrides before MLIR export.
+        // TODO(eaplatanios): Remove the debug options probe after Ryft pins an XLA revision that resolves defaults
+        //  and applies `environment_option_overrides` before MLIR export on both backends. Set
+        //  `xla_enable_hlo_sharding_v3` through those overrides if needed and verify V3 import on both.
+        //  Reference: https://github.com/openxla/xla/issues/52711
         let platform = client.platform_name().unwrap();
-        let debug_options = match platform.as_ref() {
-            platform if platform.eq_ignore_ascii_case("cpu") => Some(DebugOptions {
-                // The CPU compiler requires a positive split count when replacing its default options.
-                xla_cpu_parallel_codegen_split_count: Some(1),
-                // Preserve XLA's default of no per-heap size limit.
-                xla_multi_heap_size_constraint_per_heap: Some(-1),
-                xla_enable_hlo_sharding_v3: Some(true),
-                ..Default::default()
-            }),
+        let debug_options_cache = match platform.as_ref() {
+            platform if platform.eq_ignore_ascii_case("cpu") => Some(&CPU_DEBUG_OPTIONS),
             #[cfg(feature = "cuda-13")]
-            platform if platform.eq_ignore_ascii_case("cuda") => Some(cuda_test_debug_options(client)),
+            platform if platform.eq_ignore_ascii_case("cuda") => Some(&CUDA_DEBUG_OPTIONS),
             _ => None,
         };
+        let debug_options =
+            debug_options_cache.map(|cache| cache.get_or_init(|| probe_v3_debug_options(client)).clone());
         CompilationOptions {
             executable_build_options: Some(ExecutableCompilationOptions {
                 device_ordinal: -1,
@@ -249,9 +249,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Enables V3 on top of the CUDA plugin's effective debug options, which include its `XLA_FLAGS` overrides.
-    #[cfg(feature = "cuda-13")]
-    fn cuda_test_debug_options(client: &Client<'_>) -> DebugOptions {
+    /// Enables V3 on top of the plugin's effective debug options, which include its `XLA_FLAGS` overrides.
+    fn probe_v3_debug_options(client: &Client<'_>) -> DebugOptions {
         /// Configuration field of XLA's `HloModuleProtoWithConfig`.
         #[derive(prost::Message)]
         struct HloModuleProtoWithConfig {
@@ -266,44 +265,40 @@ pub(crate) mod tests {
             debug_options: Option<DebugOptions>,
         }
 
-        static OPTIONS: OnceLock<DebugOptions> = OnceLock::new();
-        OPTIONS
-            .get_or_init(|| {
-                // A portable executable lets each rank read the options without assigning a device or using collectives.
-                let program = Program::Mlir {
-                    bytecode: indoc::indoc! {"
-                        module @ryft_cuda_debug_options {
-                            func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
-                                return %arg0 : tensor<f32>
-                            }
-                        }
-                    "}
-                    .as_bytes()
-                    .to_vec(),
-                };
-                let options = CompilationOptions {
-                    executable_build_options: Some(ExecutableCompilationOptions {
-                        device_ordinal: -1,
-                        replica_count: 1,
-                        partition_count: 1,
-                        ..Default::default()
-                    }),
-                    compile_portable_executable: true,
-                    ..Default::default()
-                };
-                let executable = client.compile(&program, &options).unwrap().executable().unwrap();
-                let Program::HloWithConfig { proto } = executable.optimized_program().unwrap() else {
-                    panic!("expected optimized CUDA HLO with its module configuration");
-                };
-                let mut options = HloModuleProtoWithConfig::decode(proto.as_slice())
-                    .unwrap()
-                    .config
-                    .and_then(|config| config.debug_options)
-                    .expect("expected debug options in the optimized CUDA HLO configuration");
-                options.xla_enable_hlo_sharding_v3 = Some(true);
-                options
-            })
-            .clone()
+        // A portable executable lets each rank read the options without assigning a device or using collectives.
+        let program = Program::Mlir {
+            bytecode: indoc::indoc! {"
+                module @ryft_debug_options {
+                    func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
+                        return %arg0 : tensor<f32>
+                    }
+                }
+            "}
+            .as_bytes()
+            .to_vec(),
+        };
+        let options = CompilationOptions {
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                ..Default::default()
+            }),
+            compile_portable_executable: true,
+            ..Default::default()
+        };
+        // Keep the loaded executable alive while reading its optimized HLO.
+        let loaded = client.compile(&program, &options).unwrap();
+        let Program::HloWithConfig { proto } = loaded.executable().unwrap().optimized_program().unwrap() else {
+            panic!("expected optimized HLO with its module configuration");
+        };
+        let mut options = HloModuleProtoWithConfig::decode(proto.as_slice())
+            .unwrap()
+            .config
+            .and_then(|config| config.debug_options)
+            .expect("expected debug options in the optimized HLO configuration");
+        options.xla_enable_hlo_sharding_v3 = Some(true);
+        options
     }
 
     /// Returns the `f64` vector type with four elements that staged program fixtures use for their values.

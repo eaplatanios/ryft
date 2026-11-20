@@ -1,8 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension as CoreDimension, DimensionBounds, DimensionType,
-    DynamicSliceBounds, DynamicSliceOperation, DynamicUpdateSliceOperation, ProgramError, Shape, SliceOperation,
-    UpdateSliceOperation,
+    ArrayType, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionBounds, DimensionType, DynamicSliceBounds,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, ProgramError, Shape, SliceOperation, UpdateSliceOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -40,7 +39,7 @@ impl LowerableOperation for SliceOperation {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let static_limits = self.limits().iter().map(CoreDimension::value).collect::<Option<Vec<_>>>();
+        let static_limits = self.limits().iter().map(Dimension::value).collect::<Option<Vec<_>>>();
         if let Some(limits) = static_limits {
             let result = block.append_operation(stable_hlo::slice(
                 input_values[0],
@@ -359,9 +358,9 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
         let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
         let mut refined_type = output_type
             .clone()
-            .with_shape(Shape::new(physical_sizes.iter().copied().map(CoreDimension::Static).collect()));
+            .with_shape(Shape::new(physical_sizes.iter().copied().map(Dimension::Static).collect()));
         for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-            if !matches!(dimension, CoreDimension::Dynamic(_)) {
+            if !matches!(dimension, Dimension::Dynamic(_)) {
                 continue;
             }
             let size = block.append_operation(stable_hlo::convert(sizes[axis], i32_scalar_type, location)?)?;
@@ -402,7 +401,7 @@ impl DynamicSliceAxisPlan {
     fn new(
         axis: usize,
         stride: usize,
-        input_dimension: &CoreDimension,
+        input_dimension: &Dimension,
         start_type: &DimensionType,
         size_type: &DimensionType,
     ) -> Result<Self, Error> {
@@ -424,8 +423,8 @@ impl DynamicSliceAxisPlan {
             })?
         };
         let (input_minimum, input_physical_size) = match input_dimension {
-            CoreDimension::Static(extent) => (*extent, *extent),
-            CoreDimension::Dynamic(variable) => {
+            Dimension::Static(extent) => (*extent, *extent),
+            Dimension::Dynamic(variable) => {
                 let Some(upper) = variable.bounds().upper() else {
                     return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
@@ -686,11 +685,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, Array as CoreArray, ArrayOperation, ArrayType, ConstantOperation, Context, CotangentDestinationKind,
-        DataType, Dimension as CoreDimension, DimensionBounds, DimensionConstant, DimensionFromScalar,
-        DimensionFromScalarOperation, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Div,
-        DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EagerContext, Linearization, Pad, Placeholder, ReverseModeDifferentiate, Shape,
-        Slice, StagingContext, TracingContext, Typed, TypedProgram, UpdateSlice, UpdateSliceOperation, ValueProjection,
+        DataType, Dimension, DimensionBounds, DimensionConstant, DimensionFromScalar, DimensionFromScalarOperation,
+        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Div, DynamicBroadcastOperation,
+        DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+        DynamicUpdateSliceOperation, EagerContext, Error as CoreError, Linearization, Pad, Placeholder,
+        ReverseModeDifferentiate, Shape, Slice, StagingContext, TracingContext, Typed, TypedProgram, UpdateSlice,
+        UpdateSliceOperation, ValueProjection,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -810,7 +810,7 @@ mod tests {
         // extent nor a dynamic slice size operand is needed.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(3)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
@@ -867,15 +867,13 @@ mod tests {
         // A dynamic limit keeps its bounded dynamic axis whole. The lowering slices the physical allocation, whose
         // dynamic axis is widened to its bound, and then restores that axis's logical extent from the input.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Static(4)]),
-        );
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                SliceOperation::new(vec![0, 1], vec![CoreDimension::Dynamic(batch), CoreDimension::Static(4)])
+                SliceOperation::new(vec![0, 1], vec![Dimension::Dynamic(batch), Dimension::Static(4)])
                     .with_strides(vec![1, 2])
                     .unwrap(),
                 Vec::new(),
@@ -1057,7 +1055,7 @@ mod tests {
         ] {
             let input_type = ArrayType::new(
                 DataType::I64,
-                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
                     "rows",
                     DimensionBounds::new(2, Some(5)).unwrap(),
                 ))]),
@@ -1252,11 +1250,11 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
             vec![
-                ArrayType::new(DataType::F64, Shape::new(vec![extent, CoreDimension::Static(4)])),
+                ArrayType::new(DataType::F64, Shape::new(vec![extent, Dimension::Static(4)])),
                 ArrayType::new_static(DataType::F64, [2, 4]),
                 ArrayType::scalar(DataType::I32),
                 ArrayType::scalar(DataType::I32),
@@ -1759,7 +1757,7 @@ mod tests {
                 DynamicSliceOperation::<Type>::from_rank(1)
                     .with_strides(vec![2])
                     .unwrap()
-                    .with_bounds(ryft_core::DynamicSliceBounds::Clamp),
+                    .with_bounds(DynamicSliceBounds::Clamp),
                 Vec::new(),
                 vec![input, start, size],
                 None,
@@ -2014,7 +2012,7 @@ mod tests {
             DynamicSliceOperation::<Type>::from_rank(1).lower(&mut lowerer, &inputs, &[], &output_types),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
             ),
         ));
     }
@@ -2027,12 +2025,12 @@ mod tests {
 
         assert_eq!(
             unsupported_operation(
-                DynamicSliceAxisPlan::new(2, 1, &CoreDimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
+                DynamicSliceAxisPlan::new(2, 1, &Dimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
             ),
             "`dynamic_slice` size on axis 2 needs a finite upper bound",
         );
 
-        let unbounded_input = CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
+        let unbounded_input = Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
         assert_eq!(
             unsupported_operation(
                 DynamicSliceAxisPlan::new(1, 1, &unbounded_input, &bounded_start, &bounded_size).unwrap_err(),
@@ -2043,7 +2041,7 @@ mod tests {
         let overflowing_size = DimensionType::new("size", DimensionBounds::non_negative(Some(usize::MAX)).unwrap());
         assert_eq!(
             unsupported_operation(
-                DynamicSliceAxisPlan::new(3, 2, &CoreDimension::Static(usize::MAX), &bounded_start, &overflowing_size)
+                DynamicSliceAxisPlan::new(3, 2, &Dimension::Static(usize::MAX), &bounded_start, &overflowing_size)
                     .unwrap_err(),
             ),
             "`dynamic_slice` physical span overflows on axis 3",
@@ -2052,19 +2050,19 @@ mod tests {
         let unit_size = DimensionType::new("size", DimensionBounds::non_negative(Some(2)).unwrap());
         assert_eq!(
             unsupported_operation(
-                DynamicSliceAxisPlan::new(0, 1, &CoreDimension::Static(usize::MAX), &bounded_start, &unit_size)
+                DynamicSliceAxisPlan::new(0, 1, &Dimension::Static(usize::MAX), &bounded_start, &unit_size)
                     .unwrap_err(),
             ),
             "`dynamic_slice` padded input size overflows on axis 0",
         );
 
         assert_eq!(
-            DynamicSliceAxisPlan::new(0, 1, &CoreDimension::Static(3), &bounded_start, &bounded_size).unwrap(),
+            DynamicSliceAxisPlan::new(0, 1, &Dimension::Static(3), &bounded_start, &bounded_size).unwrap(),
             DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
         );
 
         let bounded_input =
-            CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
+            Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
         assert_eq!(
             DynamicSliceAxisPlan::new(0, 1, &bounded_input, &bounded_start, &bounded_size).unwrap(),
             DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
@@ -2073,7 +2071,7 @@ mod tests {
         let proven_start = DimensionType::new("start", DimensionBounds::non_negative(Some(1)).unwrap());
         let proven_size = DimensionType::new("size", DimensionBounds::non_negative(Some(4)).unwrap());
         assert_eq!(
-            DynamicSliceAxisPlan::new(0, 1, &CoreDimension::Static(4), &proven_start, &proven_size).unwrap(),
+            DynamicSliceAxisPlan::new(0, 1, &Dimension::Static(4), &proven_start, &proven_size).unwrap(),
             DynamicSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
         );
     }

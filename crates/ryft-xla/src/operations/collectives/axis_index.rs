@@ -129,8 +129,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AxisIndex, Broadcast, Context, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, ShardMapOptions, Sharding, ShardingDimension, Typed, Value as CoreValue, shard_map,
+        AxisIndex, Broadcast, Context, Device, DeviceMesh, Dimension, Error as CoreError, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, ShardMapOptions, Sharding, ShardingDimension, Typed, Value, shard_map,
     };
     use ryft_pjrt::{BufferType, Program};
 
@@ -155,7 +155,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(4)]));
 
         // `axis_index("x")` gives each device its own coordinate along the manual mesh axis `"x"`, added to the local
         // shard. A mesh with a single axis gives that axis unit stride and the full size, so the coordinate is just
@@ -281,7 +281,7 @@ mod tests {
         ])
         .unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(4)]));
 
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
@@ -353,7 +353,7 @@ mod tests {
             module,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`axis_index` requires mesh metadata inside a manual region",
             ),
         ));

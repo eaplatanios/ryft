@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
-use ryft_core::{ArrayType, Parameter, ProgramError, Type as CoreType, TypeError, TypeIdentityRenaming, Typed};
+use ryft_core::{ArrayType, Parameter, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed};
 use ryft_macros::Parameter;
 use ryft_pjrt::{Client, ExecutionFence};
 
@@ -119,7 +119,7 @@ impl RetainedArray {
     #[inline]
     pub fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as CoreType>::Identity>,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self { declared_type: self.declared_type.rename_identities(renaming)?, ..self.clone() })
     }

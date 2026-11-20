@@ -407,7 +407,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{CustomCallOperation, ReferenceCompletion as CoreReferenceCompletion, ReferenceCompletionBackend};
+    use ryft_core::{CustomCallOperation, ReferenceCompletion, ReferenceCompletionBackend};
     use ryft_kernels::{Grid, KernelCallOperation, KernelCompilationError, KernelDefinition};
 
     use super::*;
@@ -515,7 +515,7 @@ mod tests {
         fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
             StatefulExecution::pending(
                 Ok(()),
-                CoreReferenceCompletion::new(Completion(self.completed.clone())),
+                ReferenceCompletion::new(Completion(self.completed.clone())),
                 |message| KernelTuningError::Invalid { message: message.to_string() },
             )
         }
@@ -777,7 +777,7 @@ mod tests {
             fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 StatefulExecution::pending(
                     Ok(()),
-                    CoreReferenceCompletion::ready(Err("execution failed".into())),
+                    ReferenceCompletion::ready(Err("execution failed".into())),
                     |message| KernelTuningError::Invalid { message: message.to_string() },
                 )
             }
@@ -815,7 +815,7 @@ mod tests {
                 self.cancelled.store(true, Ordering::Release);
                 StatefulExecution::pending(
                     Ok(()),
-                    CoreReferenceCompletion::new(Completion(self.completed.clone())),
+                    ReferenceCompletion::new(Completion(self.completed.clone())),
                     |message| KernelTuningError::Invalid { message: message.to_string() },
                 )
             }

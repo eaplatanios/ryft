@@ -3,7 +3,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayType, DataType, DeviceMesh, Memory, Sharding, StaticShape, Typed, UnreducedKind,
+    Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Memory, Min, Sharding, StaticShape, Typed,
+    UnreducedKind,
 };
 use ryft_pjrt::{Device as PjrtDevice, DeviceId, ExecutionFence, HostBuffer, HostDestination, Memory as PjrtMemory};
 
@@ -652,16 +653,16 @@ fn combine_unreduced_values(
             None => summands.push((slices, unreduced_coordinates, shard_index, bytes)),
         }
     }
-    let mut tiles = Vec::<(ShardIndex, Vec<Range<usize>>, ryft_core::Array)>::new();
+    let mut tiles = Vec::<(ShardIndex, Vec<Range<usize>>, CoreArray)>::new();
     for (slices, _, shard_index, bytes) in summands {
         let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-        let summand = ryft_core::Array::new(ArrayType::new_static(element_type, shape), bytes)?;
+        let summand = CoreArray::new(ArrayType::new_static(element_type, shape), bytes)?;
         match tiles.iter_mut().find(|(_, tile_slices, _)| *tile_slices == slices) {
             Some((_, _, tile)) => {
                 *tile = match unreduced_kind {
-                    UnreducedKind::Sum => ryft_core::Add::add(&*tile, &summand)?,
-                    UnreducedKind::Max => ryft_core::Max::max(&*tile, &summand)?,
-                    UnreducedKind::Min => ryft_core::Min::min(&*tile, &summand)?,
+                    UnreducedKind::Sum => Add::add(&*tile, &summand)?,
+                    UnreducedKind::Max => Max::max(&*tile, &summand)?,
+                    UnreducedKind::Min => Min::min(&*tile, &summand)?,
                 }
             }
             None => tiles.push((shard_index, slices, summand)),
@@ -824,8 +825,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Device, DeviceMesh, Dimension as CoreDimension, Error as CoreError, Layout, LogicalMesh, MeshAxis,
-        MeshAxisType, ProgramError, Shape, Sharding, ShardingDimension, TiledLayout,
+        Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, MeshAxis, MeshAxisType, ProgramError,
+        Shape, Sharding, ShardingDimension, TiledLayout,
     };
     use ryft_pjrt::{BufferSpecification, BufferType, Error as PjrtError, ExecutionFence};
 
@@ -945,7 +946,7 @@ mod tests {
         // Verify physical placement and exact contents for every public memory variant. Exercise both scalar and
         // nonscalar uploads because their host buffer paths use different stride handling.
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
-            for shape in [Shape::new(vec![]), Shape::new(vec![CoreDimension::Static(2)])] {
+            for shape in [Shape::new(vec![]), Shape::new(vec![Dimension::Static(2)])] {
                 let count = if shape.rank() == 0 { 1 } else { 2 };
                 let r#type = ArrayType::new(DataType::I64, shape).with_memory(memory);
                 let array =
@@ -1052,7 +1053,7 @@ mod tests {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
         let array = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
@@ -1062,7 +1063,7 @@ mod tests {
         assert_eq!(array, array.clone());
         assert_eq!(array.copy_to_host_bytes().unwrap(), Vec::<u8>::new());
 
-        let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(0)]));
+        let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(0)]));
         let zero_sized = Array::from_host_buffer(&session, zero_sized_type, array.mesh().clone(), None, []).unwrap();
         assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
         assert!(zero_sized.addressable_shards().next().unwrap().buffer().is_none());
@@ -1076,7 +1077,7 @@ mod tests {
         let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
         let array = Array::from_host_buffer(&session, r#type, mesh, None, []).unwrap();
 
@@ -1094,7 +1095,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [0.0f32, 1.0, 2.0, 3.0, 4.0];
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(5)]));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(5)]));
 
         let array = Array::from_host_buffer(
             &session,
@@ -1146,8 +1147,7 @@ mod tests {
         )
         .unwrap();
         let values = (0..48).map(|value| value as f32).collect::<Vec<_>>();
-        let r#type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(6)]));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(6)]));
 
         let array = Array::from_host_buffer(
             &session,

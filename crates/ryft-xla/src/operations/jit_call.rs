@@ -11,19 +11,19 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayType, AtomId, AttachedRegions,
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, CaptureConstant,
-    CompositeKey, Concretizable, Context, CotangentDestinations, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero, Operation as CoreOperation,
-    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
+    CompositeKey, Concretizable, Context, CotangentAccumulator, CotangentDestinations, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero,
+    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PartitionedProgram, Program as CoreProgram, ProgramBatchingOutputAxesPolicy,
     ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId,
     RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier,
     ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, StagedCallOperation,
-    TangentActivity, Tracer as CoreTracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements,
-    Typed, TypedProgram, Value as CoreValue, ValueProjection, Zero,
+    TangentActivity, Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
+    Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -1215,10 +1215,10 @@ pub fn transpose_primal_jit_call<
     _operation: &JitCallOperation<Type>,
     context: &mut TracingContext<V, Operation<V>>,
     driver: &D,
-    inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
-    outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
-    cotangents: &CotangentDestinations<CoreTracer<TracingContext<V, Operation<V>>>>,
-) -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, ProgramError> {
+    inputs: &[PartialValue<Tracer<TracingContext<V, Operation<V>>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, Operation<V>>>>],
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, Operation<V>>>>,
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Operation<V>>>>>, ProgramError> {
     // A `jit_call` operation with no live output cotangents and no live reference operand is a zero linear map, so
     // every operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state
     // cotangent flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred
@@ -1328,14 +1328,14 @@ where
         &self,
         context: &mut TranspositionContext<V, Operation<V>>,
         driver: &D,
-        inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
-        outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
-        accumulators: &[ryft_core::CotangentAccumulator],
+        inputs: &[PartialValue<Tracer<TracingContext<V, Operation<V>>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, Operation<V>>>>],
+        accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions =
-            (|| -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, DifferentiationError> {
+            (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Operation<V>>>>>, DifferentiationError> {
                 let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
                 transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
                     .map_err(DifferentiationError::from)
@@ -2294,21 +2294,20 @@ mod tests {
         BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, ConvertElementTypeOperation,
         CosOperation, CotangentDestinationKind, CotangentDestinations, CustomCallOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, DifferentiableType, DifferentiationError, Dimension as CoreDimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
-        DimensionVariable, DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EffectClass,
-        EffectClasses, InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero, MeshAxis,
-        MeshAxisType, MulOperation, NamedComposite, NoStorage, NothingSavable, Operation as CoreOperation,
-        OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
-        PartialValue, Placeholder, PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError,
-        RecursiveBatchingDriver, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver,
-        RegionInterface, RegionRef, RematerializationPolicyFn, RematerializeOperation, ResidualCandidate,
-        ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection,
-        SaveOnlyTheseNames, ScanOperation, Shape, Sharding, ShardingDimension, Sin, SinOperation, StagingContext,
-        TagOperation, Tracer as CoreTracer, TracingContext, TransposeOperation, TransposedProgram,
-        TransposedProgramCotangent, TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram, ValueProjection,
-        ZeroLikeOperation, ZeroOperation,
+        CustomRuleRegistration, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
+        DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
+        DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses,
+        InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, NamedComposite, NoStorage, NothingSavable, Operation as CoreOperation, OutputRegionProvenance,
+        PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialValue,
+        Placeholder, PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface,
+        RegionRef, RematerializationPolicyFn, RematerializeOperation, ResidualCandidate, ResidualDecision,
+        ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection, SaveOnlyTheseNames,
+        ScanOperation, Shape, Sharding, ShardingDimension, Sin, SinOperation, StagingContext, TagOperation, Tracer,
+        TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver,
+        TypeError, TypeIdentity, Typed, TypedProgram, ValueProjection, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
     use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -3162,7 +3161,7 @@ mod tests {
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let symbolic = builder.add_input(n.clone().into());
-            let exact = builder.add_input(DimensionType::from(CoreDimension::Static(2)).into());
+            let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
             let zero = builder
                 .add_instruction(
                     Operation::Zero(ZeroOperation::new(ArrayType::new(
@@ -3183,7 +3182,7 @@ mod tests {
         assert!(callee.effects().classes().is_empty());
         let mut builder = ArrayIrProgramBuilder::new();
         let symbolic = builder.add_input(n.clone().into());
-        let exact = builder.add_input(DimensionType::from(CoreDimension::Static(2)).into());
+        let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         add_jit_call(&mut builder, &callee, vec![symbolic, exact]);
         let zero = add_jit_call(&mut builder, &callee, vec![symbolic, exact]);
@@ -4800,7 +4799,7 @@ mod tests {
 
         // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
         let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(dimension)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(dynamic_type.into());
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -5627,8 +5626,8 @@ mod tests {
                 &self,
                 _: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
                 _: usize,
-                _: Vec<PartialEvaluationValue<CoreTracer<TracingContext<Constant, Operation>>>>,
-            ) -> Result<Vec<PartialEvaluationValue<CoreTracer<TracingContext<Constant, Operation>>>>, ProgramError>
+                _: Vec<PartialEvaluationValue<Tracer<TracingContext<Constant, Operation>>>>,
+            ) -> Result<Vec<PartialEvaluationValue<Tracer<TracingContext<Constant, Operation>>>>, ProgramError>
             {
                 unreachable!("the split cache fixture does not recursively evaluate regions")
             }
@@ -5637,8 +5636,8 @@ mod tests {
                 &self,
                 _: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
                 _: RegionRef<'_, Constant, Operation>,
-                _: &[PartialValue<CoreTracer<TracingContext<Constant, Operation>>>],
-            ) -> Result<ryft_core::PartialEvaluation<TracingContext<Constant, Operation>>, ProgramError> {
+                _: &[PartialValue<Tracer<TracingContext<Constant, Operation>>>],
+            ) -> Result<PartialEvaluation<TracingContext<Constant, Operation>>, ProgramError> {
                 unreachable!("the split cache fixture does not recursively evaluate programs")
             }
 
@@ -5974,7 +5973,7 @@ mod tests {
         let driver = RecursiveBatchingDriver::new(&regions);
         let vector = Type::Array(ArrayType::new_static(DataType::F32, [3]));
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
                 let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
@@ -6033,7 +6032,7 @@ mod tests {
             let regions = AttachedRegions::Callees(&callees);
             let driver = RecursiveBatchingDriver::new(&regions);
             let (_, program) = TracingContext::<CoreArray, NamedAxisCallOperation>::trace_with_context_and_named_axes(
-                |parent, inputs: Vec<CoreTracer<TracingContext<CoreArray, NamedAxisCallOperation>>>| {
+                |parent, inputs: Vec<Tracer<TracingContext<CoreArray, NamedAxisCallOperation>>>| {
                     let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 3)
                         .with_axis_name("items".to_owned());
                     let inputs = inputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>();
@@ -6793,7 +6792,7 @@ mod tests {
     #[test]
     fn test_jit_call_transposition_uses_cotangent_descriptors_for_zero_cotangents() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -6845,8 +6844,8 @@ mod tests {
         // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
         let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
         let live = DimensionVariable::new("live", DimensionBounds::new(1, Some(5)).unwrap());
-        let dead_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(dead)])));
-        let live_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(live)])));
+        let dead_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dead)])));
+        let live_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(live)])));
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
             let dead = builder.add_input(dead_type.clone());
@@ -7409,7 +7408,7 @@ mod tests {
     #[test]
     fn test_jit_call_transposition_omits_disconnected_symbolic_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut callee_builder = ArrayIrProgramBuilder::new();
         callee_builder.add_input(dynamic_type.clone().into());
@@ -7452,8 +7451,8 @@ mod tests {
     fn test_jit_call_transposition_omits_zero_space_seeds_of_mixed_outputs() {
         // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
         // has no input for it and the transposed call consumes the value output's seed alone.
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]));
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
         let value_program_type = Type::Array(value_type.clone());
         let predicate_program_type = Type::Array(predicate_type.clone());
         let source = {

@@ -35,9 +35,9 @@ use ryft_core::{
     Add, And, Array as CoreArray, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType, DeviceId,
     DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
     DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul,
-    Neg, Not, Operation as CoreOperation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
-    ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind, Value as CoreValue,
-    ValueDomainDispatch, WhilePredicate, Xor,
+    Neg, Not, Operation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
+    ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind, Value, ValueDomainDispatch,
+    WhilePredicate, Xor,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -229,7 +229,7 @@ impl Array {
     /// # Parameters
     ///
     ///   - `session`: [`Session`] the new [`Array`] belongs to. Its client must own every provided buffer, and it is
-    ///     what eager execution and free transforms recover through [`CoreValue::domain`](ryft_core::Value::domain).
+    ///     what eager execution and free transforms recover through [`Value::domain`].
     ///   - `r#type`: Global [`ArrayType`] for the new [`Array`].
     ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
     ///   - `sharding`: Optional runtime [`Sharding`] over `mesh`.
@@ -698,7 +698,7 @@ impl Typed for Array {
     }
 }
 
-impl CoreValue for Array {
+impl Value for Array {
     // A concrete `Array` binds and executes every operation through its PJRT-backed `Session`. It uses
     // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (e.g., arithmetic, comparison, selection,
     // manipulation, and reductions) bind their operations through `domain()` and execute them eagerly, operation by
@@ -1104,11 +1104,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Neg, ProgramError, Reference, Shape,
-        Sharding, ShardingDimension, StaticShape, TiledLayout, TypeError, Typed, UnreducedKind, Value as CoreValue,
-        WhilePredicate,
+        Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh, Dimension,
+        DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Layout, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, Neg, ProgramError, Reference, Shape, Sharding, ShardingDimension, StaticShape,
+        TiledLayout, TypeError, Typed, UnreducedKind, Value, WhilePredicate,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
@@ -1274,14 +1273,14 @@ mod tests {
         .unwrap();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let dynamic = DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(10)).unwrap());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(dynamic.clone())]))
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dynamic.clone())]))
             .with_sharding(sharding)
             .unwrap();
 
         assert!(matches!(
             Array::from_addressable_buffers(&session, array_type, mesh, None, Vec::new()),
             Err(Error::Array(error)) if matches!(error.as_ref(),
-                ArrayError::DynamicShape { shape } if shape == &Shape::new(vec![CoreDimension::Dynamic(dynamic)]),
+                ArrayError::DynamicShape { shape } if shape == &Shape::new(vec![Dimension::Dynamic(dynamic)]),
             ),
         ));
     }
@@ -1324,7 +1323,7 @@ mod tests {
         let device = client.addressable_devices().unwrap()[0].clone();
         let device_id = device.id().unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8, 1u8, 0u8], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
         let error = Array::from_addressable_buffers(&session, r#type, mesh, None, vec![buffer]).unwrap_err();
@@ -1347,7 +1346,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let mesh = domain_mesh(client, "x", 1);
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8; 3], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
         let array = Array::from_addressable_buffers(&session, r#type, mesh, None, vec![buffer]).unwrap();
@@ -1420,8 +1419,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]));
         let shard_buffers = client_devices
             .iter()
             .enumerate()
@@ -1558,8 +1556,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]));
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]));
         let shard_buffers = || {
             client_devices
                 .iter()
@@ -1620,7 +1617,7 @@ mod tests {
         let device_ids = client_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let mesh = domain_mesh(client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let plan = ArrayOutputPlan::new(array_type, Some(sharding), &mesh, device_ids.as_slice()).unwrap();
 
         // Release builds trust XLA to return buffers in addressable device order, while debug builds still validate
@@ -1997,7 +1994,7 @@ mod tests {
     fn test_array_debug() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let shape = Shape::new(vec![CoreDimension::Static(2)]);
+        let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding =
@@ -2081,7 +2078,7 @@ mod tests {
         let array = replicated_array(&session, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
 
         // Arrays recover the session they were constructed in, together with its session and client.
-        let recovered = CoreValue::domain(&array);
+        let recovered = array.domain();
         assert!(std::ptr::eq(recovered.parent().client(), client));
         assert!(recovered.parent().is_same_session(&session));
     }
@@ -2341,10 +2338,9 @@ mod tests {
 
     #[test]
     fn test_array_type_size_in_bytes() {
-        let matrix_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let scalar_type = ArrayType::scalar(DataType::C128);
-        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![CoreDimension::Static(4)]));
+        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(4)]));
 
         assert_eq!(matrix_type.size_in_bytes().unwrap(), 24);
         assert_eq!(scalar_type.size_in_bytes().unwrap(), 16);
@@ -2362,7 +2358,7 @@ mod tests {
         ));
         assert_eq!(error.to_string(), "expected static shape but got `[dynamic]`");
 
-        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![CoreDimension::Static(usize::MAX)]));
+        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));
         let error = oversized_type.size_in_bytes().unwrap_err();
         let message = format!(
             "dense byte size for array type `{oversized_type}` exceeds the maximum allowed size of {}",

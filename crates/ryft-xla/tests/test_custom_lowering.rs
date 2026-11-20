@@ -4,8 +4,8 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayType, DataType, Operation as CoreOperation, Placeholder, ProgramBuilder as CoreProgramBuilder,
-    RegionInterface, TypeError,
+    AddOperation, ArrayType, DataType, Operation as CoreOperation, Placeholder, ProgramBuilder, RegionInterface,
+    TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
@@ -79,7 +79,7 @@ impl LowerableOperation for ExtendedOperation {
 #[test]
 fn test_downstream_operation_family_lowers_through_the_public_api() {
     let vector_type = ArrayType::new_static(DataType::F32, [3]);
-    let mut builder = CoreProgramBuilder::<Constant, ExtendedOperation>::new();
+    let mut builder = ProgramBuilder::<Constant, ExtendedOperation>::new();
     let input = builder.add_input(vector_type.clone().into());
     let doubled = builder
         .add_instruction(ExtendedOperation::Twice(TwiceOperation), Vec::new(), vec![input], None)

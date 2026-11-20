@@ -24,7 +24,7 @@ impl LowerableOperation for TagOperation<ArrayType> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::DataType;
+    use ryft_core::{DataType, Error as CoreError};
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::lowering::types::lower_tensor_type;
@@ -50,7 +50,7 @@ mod tests {
             tag.lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
             ),
         ));
     }

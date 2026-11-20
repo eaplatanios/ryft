@@ -949,8 +949,8 @@ impl<'o> From<&'o LoweredProgram> for InvocationMetadata<'o> {
 #[cfg(test)]
 mod tests {
     use ryft_core::{
-        ArrayType, CompiledFunction as CoreCompiledFunction, DataType, Dimension as CoreDimension, DimensionBounds,
-        DimensionVariable, ExternalReferenceBinding, ReferenceSource, Shape,
+        ArrayType, CompiledFunction, DataType, Dimension, DimensionBounds, DimensionVariable, ExternalReferenceBinding,
+        ReferenceSource, Shape,
     };
 
     use crate::compilation::functions::stage;
@@ -968,14 +968,14 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let compile = |upper: usize| {
             let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(upper)).unwrap());
-            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
             let staged =
                 stage::<_, ArrayType, ArrayType>(|input| input.clone() + input, input_type, Options::new(mesh.clone()))
                     .unwrap()
                     .into_inner();
-            let compiled: CoreCompiledFunction<Session, Type, Type> =
+            let compiled: CompiledFunction<Session, Type, Type> =
                 staged.lower(&session).unwrap().compile(&session).unwrap();
             compiled
         };
@@ -1102,7 +1102,7 @@ mod tests {
         let dynamic_boundary = || {
             vec![ArrayType::new(
                 DataType::F32,
-                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
                     "n",
                     DimensionBounds::new(0, Some(8)).unwrap(),
                 ))]),

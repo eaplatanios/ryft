@@ -28,7 +28,7 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{DataType, Dimension as CoreDimension, Placeholder, Shape};
+    use ryft_core::{DataType, Dimension, Placeholder, Shape};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::ArrayConstant;
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn test_transpose_operation_lower_dynamic_shape() {
-        let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), CoreDimension::Static(2)]);
+        let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), Dimension::Static(2)]);
         let mut builder = ProgramBuilder::new();
         let integer_input = builder.add_input(ArrayType::new(DataType::I64, shape.clone()));
         let complex_input = builder.add_input(ArrayType::new(DataType::C64, shape));

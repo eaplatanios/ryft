@@ -10,8 +10,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey, CompositeKey,
-    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DataType,
-    Dimension as CoreDimension, Parameterized, Placeholder, ProgramError, ReductionKind, Shape,
+    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DataType, Dimension,
+    Parameterized, Placeholder, ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -623,10 +623,10 @@ enum FmhaEligibility {
 }
 
 /// Canonical `[batch, sequence, heads, head_dimension]` dimensions of one rank-3 or rank-4 attention type.
-fn attention_dimensions(input_type: &ArrayType) -> Result<[CoreDimension; 4], Error> {
+fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Error> {
     match input_type.shape().dimensions() {
         [sequence, heads, head_dimension] => {
-            Ok([CoreDimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
+            Ok([Dimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
         [batch, sequence, heads, head_dimension] => {
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
@@ -642,10 +642,10 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[CoreDimension; 4], Er
 }
 
 /// Returns the physical maximum extent of one attention dimension.
-fn attention_physical_extent(dimension: &CoreDimension) -> Result<usize, Error> {
+fn attention_physical_extent(dimension: &Dimension) -> Result<usize, Error> {
     match dimension {
-        CoreDimension::Static(extent) => Ok(*extent),
-        CoreDimension::Dynamic(variable) => {
+        Dimension::Static(extent) => Ok(*extent),
+        Dimension::Dynamic(variable) => {
             variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
@@ -660,7 +660,7 @@ fn attention_physical_extent(dimension: &CoreDimension) -> Result<usize, Error> 
 }
 
 /// Returns an [`ArrayType`] with the provided data type and dimensions used by the attention lowerings.
-fn attention_array_type<D: Clone + Into<CoreDimension>>(data_type: DataType, dimensions: &[D]) -> ArrayType {
+fn attention_array_type<D: Clone + Into<Dimension>>(data_type: DataType, dimensions: &[D]) -> ArrayType {
     ArrayType::new(data_type, Shape::new(dimensions.iter().cloned().map(Into::into).collect()))
 }
 
@@ -947,7 +947,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
 fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     source: ValueRef<'b, 'c, 't>,
     source_axis: usize,
-    batch: &CoreDimension,
+    batch: &Dimension,
     physical_batch: usize,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -963,7 +963,7 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let mut lengths = lengths.result(0).unwrap().as_ref();
-    if matches!(batch, CoreDimension::Dynamic(_)) {
+    if matches!(batch, Dimension::Dynamic(_)) {
         let batch_size = block.append_operation(stable_hlo::get_dimension_size(source, 0, location)?)?;
         let batch_size = batch_size.result(0).unwrap().as_ref();
         let logical_type = attention_array_type(DataType::I32, std::slice::from_ref(batch));
@@ -989,8 +989,8 @@ mod tests {
         Array as CoreArray, ArrayOperation, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
         DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DeviceMesh, Differentiate, DimensionBounds,
         DimensionVariable, DomainTracingContext, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Mul,
-        ProjectedContext, Reduce, Sharding, ShardingDimension, Typed, Value as CoreValue,
-        differentiable_dot_product_attention, dot_product_attention,
+        ProjectedContext, Reduce, Sharding, ShardingDimension, Typed, Value, differentiable_dot_product_attention,
+        dot_product_attention,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
@@ -1951,14 +1951,14 @@ mod tests {
             ArrayType::new(
                 DataType::BF16,
                 Shape::new(vec![
-                    CoreDimension::Dynamic(batch.clone()),
-                    CoreDimension::Static(4),
-                    CoreDimension::Static(heads),
-                    CoreDimension::Static(8),
+                    Dimension::Dynamic(batch.clone()),
+                    Dimension::Static(4),
+                    Dimension::Static(heads),
+                    Dimension::Static(8),
                 ]),
             )
         };
-        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Dynamic(batch.clone())]));
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
         let boundary = |key_value_heads: usize, sequence_lengths: bool| {
             let mut input_types = vec![operand_type(2), operand_type(key_value_heads), operand_type(key_value_heads)];
             if sequence_lengths {

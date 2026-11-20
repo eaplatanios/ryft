@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Array as CoreArray, ArrayType, ConstantOperation, DataType, Dimension as CoreDimension, DimensionError,
-    FillLikeOperation, IotaLikeOperation, IotaOperation, Layout, OneLikeOperation, OneOperation,
-    Operation as CoreOperation, ProgramError, Shape, TypeError, ZeroLikeOperation, ZeroOperation,
+    Array, ArrayType, ConstantOperation, DataType, Dimension, DimensionError, FillLikeOperation, IotaLikeOperation,
+    IotaOperation, Layout, OneLikeOperation, OneOperation, Operation, ProgramError, Shape, TypeError,
+    ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -85,7 +85,7 @@ pub(crate) fn dynamic_constructor_types(
         .shape()
         .dimensions()
         .iter()
-        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         .count();
     if input_count != dynamic_count {
         return Err(ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_count }.into());
@@ -96,8 +96,8 @@ pub(crate) fn dynamic_constructor_types(
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            CoreDimension::Static(extent) => Ok(CoreDimension::Static(*extent)),
-            CoreDimension::Dynamic(variable) => {
+            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+            Dimension::Dynamic(variable) => {
                 let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: name.to_string(),
@@ -111,7 +111,7 @@ pub(crate) fn dynamic_constructor_types(
                     value: bound,
                     maximum: i32::MAX as usize,
                 })?;
-                Ok(CoreDimension::Static(bound))
+                Ok(Dimension::Static(bound))
             }
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -135,7 +135,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     // only when a dynamic axis is encountered rather than indexing by the physical axis number.
     let mut operands = input_values.iter();
     for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-        if !matches!(dimension, CoreDimension::Dynamic(_)) {
+        if !matches!(dimension, Dimension::Dynamic(_)) {
             continue;
         }
         let operand = *operands.next().unwrap();
@@ -192,7 +192,7 @@ impl LowerableOperation for IotaOperation<ArrayType> {
     }
 }
 
-impl LowerableOperation for ConstantOperation<CoreArray> {
+impl LowerableOperation for ConstantOperation<Array> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -501,7 +501,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
         // Allocation uses the declared bounds, while logical sizes come from the exemplar, including zero extents.
         let mut dimensions = Vec::new();
         for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, CoreDimension::Dynamic(_)) {
+            if matches!(dimension, Dimension::Dynamic(_)) {
                 let size = block.append_operation(stable_hlo::get_dimension_size(input_values[0], axis, location)?)?;
                 dimensions.push(size.result(0).unwrap().as_ref());
             }
@@ -585,10 +585,8 @@ fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     };
     let output_type = <&ArrayType>::try_from(output_type)?;
     let declared_dimensions = declared_type.shape().dimensions();
-    let dynamic_count = declared_dimensions
-        .iter()
-        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
-        .count();
+    let dynamic_count =
+        declared_dimensions.iter().filter(|dimension| matches!(dimension, Dimension::Dynamic(_))).count();
     if input_values.len() != dynamic_count {
         return Err(ProgramError::InvalidInputCount { expected: dynamic_count, actual: input_values.len() }.into());
     }
@@ -615,10 +613,10 @@ fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         .iter()
         .zip(output_type.shape().dimensions())
         .filter_map(|(declared, output)| match declared {
-            CoreDimension::Static(_) => None,
-            CoreDimension::Dynamic(_) => {
+            Dimension::Static(_) => None,
+            Dimension::Dynamic(_) => {
                 let input = *inputs.next().unwrap();
-                matches!(output, CoreDimension::Dynamic(_)).then_some(input)
+                matches!(output, Dimension::Dynamic(_)).then_some(input)
             }
         })
         .collect())
@@ -645,11 +643,10 @@ mod tests {
     use std::sync::Arc;
 
     use indoc::indoc;
-    use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, Complex as ComplexNumber, Context, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation,
+        ArrayIrOperation, ArrayOperation, Complex, Context, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Error as CoreError, Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation,
         OneOperation, Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Sharding, ShardingDimension,
         StaticShape, TiledLayout, TracingContext, Typed, TypedProgram, ZeroLikeOperation, ZeroOperation, i1, i2, i4,
         u1, u2, u4,
@@ -692,10 +689,10 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
         let error = dynamic_constructor_types("one_like", 1, &[output_type.into()]).unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
-        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
+        let CoreError::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
-            error.downcast_custom::<ryft_core::DimensionError>(),
-            Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth { value: bound, maximum: i32::MAX as usize }),
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::ExtentExceedsBackendWidth { value: bound, maximum: i32::MAX as usize }),
         );
     }
 
@@ -745,15 +742,13 @@ mod tests {
                 "},
             ),
         ] {
-            let value = CoreArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0])
-                .unwrap();
-            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let value =
+                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+            let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
-            let program = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected);
@@ -762,14 +757,14 @@ mod tests {
 
     #[test]
     fn test_constant_operation_lower_preserves_signed_zero_elements() {
-        let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
-        let literal = CoreArray::from_elements(test_vector_type(2), &[-0.0f32, 0.0]).unwrap();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let literal = Array::from_elements(test_vector_type(2), &[-0.0f32, 0.0]).unwrap();
         let output = context.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap().remove(0);
         let program = context
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -787,14 +782,12 @@ mod tests {
 
         // A rank-positive one-element literal remains an ordinary shaped dense constant rather than being rewritten
         // as a rank-0 constant plus broadcast.
-        let literal = CoreArray::from_elements(test_vector_type(1), &[2.5f32]).unwrap();
-        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+        let literal = Array::from_elements(test_vector_type(1), &[2.5f32]).unwrap();
+        let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let output = builder
             .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new(), None)
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
-            .unwrap();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -819,42 +812,42 @@ mod tests {
         let c128_components =
             [1.5f64, -2.0, f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_1234)];
         let cases = vec![
-            (CoreArray::vector(vec![true, false, true]).unwrap(), vec![1u8, 0, 1]),
-            (CoreArray::vector(vec![-0x1234i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234i16, 0x2345])),
+            (Array::vector(vec![true, false, true]).unwrap(), vec![1u8, 0, 1]),
+            (Array::vector(vec![-0x1234i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234i16, 0x2345])),
             (
-                CoreArray::vector(vec![(1u64 << 53) + 1, u64::MAX - 1]).unwrap(),
+                Array::vector(vec![(1u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1u64 << 53) + 1, u64::MAX - 1]),
             ),
-            (CoreArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
-            (CoreArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
-            (CoreArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
-            (CoreArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
+            (Array::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (Array::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (Array::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (Array::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
             (
-                CoreArray::vector(vec![
-                    ComplexNumber::new(c64_components[0], c64_components[1]),
-                    ComplexNumber::new(c64_components[2], c64_components[3]),
+                Array::vector(vec![
+                    Complex::new(c64_components[0], c64_components[1]),
+                    Complex::new(c64_components[2], c64_components[3]),
                 ])
                 .unwrap(),
                 values_to_bytes(&c64_components),
             ),
             (
-                CoreArray::vector(vec![
-                    ComplexNumber::new(c128_components[0], c128_components[1]),
-                    ComplexNumber::new(c128_components[2], c128_components[3]),
+                Array::vector(vec![
+                    Complex::new(c128_components[0], c128_components[1]),
+                    Complex::new(c128_components[2], c128_components[3]),
                 ])
                 .unwrap(),
                 values_to_bytes(&c128_components),
             ),
-            (CoreArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
-            (CoreArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
-            (CoreArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
-            (CoreArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
-            (CoreArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
-            (CoreArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
-            (CoreArray::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
+            (Array::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
+            (Array::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (Array::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (Array::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
+            (Array::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (Array::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (Array::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
         ];
 
-        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+        let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let outputs = cases
             .iter()
             .map(|(literal, _)| {
@@ -869,7 +862,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
+            .build::<Vec<Array>, Vec<Array>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
@@ -989,13 +982,11 @@ mod tests {
                 "},
             ),
         ] {
-            let value = CoreArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0])
-                .unwrap();
-            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let value =
+                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+            let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder.add_constant(value);
-            let program = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected);
@@ -1084,7 +1075,7 @@ mod tests {
                 ),
             ),
         ] {
-            let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_type = test_vector_type(4).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -1092,13 +1083,13 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected_vector);
 
-            let context = TracingContext::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_type = ArrayType::scalar(DataType::F32).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -1106,7 +1097,7 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected_scalar);
@@ -1119,7 +1110,7 @@ mod tests {
         let domain = ProjectedContext::<Session, ArrayType>::new(Session::builder().client(client).build().unwrap());
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
-            let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)])).with_memory(memory);
+            let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).with_memory(memory);
 
             // The fill literal is uploaded to the requested memory, but XLA's CUDA compiler cannot take it from
             // unpinned host memory as the argument of the program that broadcasts it.
@@ -1141,14 +1132,14 @@ mod tests {
             assert_eq!(read_first_shard::<f32>(client, &output), vec![2.5, 2.5, 2.5]);
         }
 
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let value = Complex::new(1.5f64, -2.0f64);
         let output = domain.fill(&r#type, value).unwrap();
         assert_eq!(read_first_shard::<f32>(client, &output), vec![1.5, 1.5]);
 
         // A complex fill value lowers as two real part splats composed through `stablehlo.complex`, and a `c64`
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
-        let r#type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(2)]));
+        let r#type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
         let value = Complex::new(1.5f32, -2.0f32);
         let output = domain.fill(&r#type, value).unwrap();
 
@@ -1157,7 +1148,7 @@ mod tests {
 
         // Integer literals remain exact through conversion and scalar constant lowering, including values that
         // cannot be represented exactly by the floating-point intermediary used for floating-point constants.
-        let r#type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
+        let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
         let value = u64::MAX - 1;
         let output = domain.fill(&r#type, value).unwrap();
         assert_eq!(read_first_shard::<u64>(client, &output), vec![value, value]);
@@ -1165,7 +1156,7 @@ mod tests {
 
     #[test]
     fn test_zero_operation_lower_zero_data_type() {
-        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = ProgramBuilder::new();
         let output = builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
         let program = builder
@@ -1250,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_zero_space_one_like_is_rejected() {
-        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         // Unsupported identities are rejected during inference before invalid IR can reach lowering.
@@ -1262,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_f8e8m0fnu_zero_like_is_rejected() {
-        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Static(3)]));
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         // Unsupported identities are rejected during inference before invalid IR can reach lowering.
@@ -1403,7 +1394,7 @@ mod tests {
             .unwrap();
         let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
-        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
+        let CoreError::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::ExtentExceedsBackendWidth {
@@ -1608,7 +1599,7 @@ mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f32).unwrap()).unwrap();
+        let fill = FillLikeOperation::<ArrayType>::new(Array::scalar(2.5f32).unwrap()).unwrap();
         let fill = builder.add_instruction(fill, Vec::new(), vec![input], None).unwrap()[0];
         let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I64).unwrap();
         let iota = builder.add_instruction(iota, Vec::new(), vec![input], None).unwrap()[0];
@@ -1636,13 +1627,11 @@ mod tests {
 
     #[test]
     fn test_lower_exemplar_shape_dynamic_shape() {
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![dynamic_dimension("size", Some(5)), CoreDimension::Static(2)]),
-        );
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(5)), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f32).unwrap()).unwrap();
+        let fill = FillLikeOperation::<ArrayType>::new(Array::scalar(2.5f32).unwrap()).unwrap();
         let fill = builder.add_instruction(fill, Vec::new(), vec![input], None).unwrap()[0];
         let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I32).unwrap();
         let iota = builder.add_instruction(iota, Vec::new(), vec![input], None).unwrap()[0];
@@ -1679,7 +1668,7 @@ mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
-        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f64).unwrap()).unwrap();
+        let fill = FillLikeOperation::<ArrayType>::new(Array::scalar(2.5f64).unwrap()).unwrap();
         let fill = builder.add_instruction(fill, Vec::new(), vec![input], None).unwrap()[0];
         let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I32).unwrap();
         let iota = builder.add_instruction(iota, Vec::new(), vec![input], None).unwrap()[0];
@@ -1728,7 +1717,7 @@ mod tests {
 
     #[test]
     fn test_lower_exemplar_shape_dynamic_shape_requires_finite_bound() {
-        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f32).unwrap()).unwrap();
+        let fill = FillLikeOperation::<ArrayType>::new(Array::scalar(2.5f32).unwrap()).unwrap();
         let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I32).unwrap();
         for operation in [ArrayOperation::FillLike(fill), ArrayOperation::IotaLike(iota)] {
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
@@ -1752,10 +1741,10 @@ mod tests {
         // One compiled program serves every runtime extent of the exemplar, including an empty one, and the
         // exemplar's elements never reach the results.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
-        let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), CoreDimension::Static(2)]));
+        let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), Dimension::Static(2)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let exemplar = builder.add_input(exemplar_type.into());
-        let fill = FillLikeOperation::<Type>::new(CoreArray::scalar(2.5f64).unwrap()).unwrap();
+        let fill = FillLikeOperation::<Type>::new(Array::scalar(2.5f64).unwrap()).unwrap();
         let fill = ArrayIrOperation::<ArrayConstant>::from(fill);
         let fill = builder.add_instruction(fill, Vec::new(), vec![exemplar], None).unwrap()[0];
         let iota = IotaLikeOperation::<Type>::new(0, DataType::I32).unwrap();

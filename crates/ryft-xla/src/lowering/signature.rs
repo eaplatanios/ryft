@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, Shape, Sharding};
+use ryft_core::{ArrayType, DataType, Dimension, Shape, Sharding};
 
 // TODO(eaplatanios): Review this module.
 
@@ -293,7 +293,7 @@ impl ExecutableSignature {
                     dimension
                         .upper_bound()
                         .and_then(|upper| upper.checked_sub(1))
-                        .map_or_else(|| dimension.clone(), CoreDimension::Static)
+                        .map_or_else(|| dimension.clone(), Dimension::Static)
                 })
                 .collect::<Vec<_>>();
             physical[physical_index] = physical[physical_index].clone().with_shape(Shape::new(dimensions));
@@ -377,9 +377,9 @@ mod tests {
 
     #[test]
     fn test_executable_signature_new() {
-        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("dynamic_zero", Some(3))]));
-        let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(3)]));
+        let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
         let signature = ExecutableSignature::new(
             &[static_zero.clone(), boolean.clone(), dynamic_zero.clone()],
             &[dynamic_zero, static_zero],
@@ -448,7 +448,7 @@ mod tests {
     fn test_executable_signature_physical_input_types() {
         // Every bounded dynamic axis of a materialized input becomes its physical bound, and each one appends a hidden
         // `i32` extent argument, while static zero-sized inputs are erased.
-        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(
             DataType::F32,
             Shape::new(vec![dynamic_dimension("rows", Some(3)), dynamic_dimension("columns", Some(5))]),
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn test_executable_signature_physical_output_types() {
         // Dynamic outputs keep their logical types and each bounded dynamic axis appends a hidden `i64` extent result.
-        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let signature = ExecutableSignature::new(&[], &[dynamic.clone(), static_zero.clone()]);
         assert_eq!(
@@ -481,7 +481,7 @@ mod tests {
         // Each hidden extent argument is a replicated scalar on the mesh of the input that owns the extent, and it
         // stays unannotated when that input is unannotated.
         let mesh = test_manual_mesh("x", 2);
-        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let signature = ExecutableSignature::new(&[static_zero, dynamic.clone(), dynamic], &[]);
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);

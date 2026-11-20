@@ -29,10 +29,9 @@ use serde_json::{Value as JsonValue, json};
 
 use ryft_core::{
     ArrayOperation, ArrayType, AttentionConfiguration, AttentionInputs, CompilationTracer, Compile,
-    CompiledFunction as CoreCompiledFunction, Cos, DataType, Device, DeviceMesh, Differentiate,
-    Dimension as CoreDimension, DiskCache, DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Mul, Reduce,
-    ReductionKind, Shape, Sharding, Sin, StagedFunction as CoreStagedFunction, Value as CoreValue, ValueProjection,
-    dot_product_attention,
+    CompiledFunction as CoreCompiledFunction, Cos, DataType, Device, DeviceMesh, Differentiate, Dimension, DiskCache,
+    DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Mul, Reduce, ReductionKind, Shape, Sharding, Sin,
+    StagedFunction, Value as CoreValue, ValueProjection, dot_product_attention,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
@@ -60,7 +59,7 @@ const ATTENTION_DIMENSIONS: [usize; 4] = [4, 2048, 32, 128];
 const SMOKE_ATTENTION_DIMENSIONS: [usize; 4] = [1, 16, 2, 8];
 
 /// Staged benchmark workload.
-type BenchmarkStagedFunction = CoreStagedFunction<Session, Type, Type>;
+type BenchmarkStagedFunction = StagedFunction<Session, Type, Type>;
 
 /// Compiled benchmark workload.
 type BenchmarkCompiledFunction = CoreCompiledFunction<Session, Type, Type>;
@@ -249,7 +248,7 @@ fn mesh(client: &Client<'_>) -> Result<DeviceMesh, Box<dyn std::error::Error>> {
 
 /// Returns the type of an `f32` vector of `size` elements that is replicated over `mesh`.
 fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::error::Error>> {
-    Ok(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
+    Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?)
 }
 
@@ -617,7 +616,7 @@ fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let start = Instant::now();
-    let staged: CoreStagedFunction<Session, Vec<Type>, Vec<Type>> = session.stage(
+    let staged: StagedFunction<Session, Vec<Type>, Vec<Type>> = session.stage(
         |inputs: Vec<CompilationTracer<Session>>| {
             let inputs = AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone());
             vec![attention.call(inputs).unwrap()]

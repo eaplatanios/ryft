@@ -28,9 +28,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, ArrayType, Cos, DataType, Device, DeviceMesh, Dimension as CoreDimension, DomainTracer, LogicalMesh,
-        MeshAxis, MeshAxisType, Mul, ProjectedValue, Reduce, Reshard, Shape, ShardMapOptions, Sharding,
-        ShardingDimension, Sin, Typed, ValueProjection, auto_axes, differentiate_at, explicit_axes, shard_map,
+        Add, ArrayType, Cos, DataType, Device, DeviceMesh, Dimension, DomainTracer, LogicalMesh, MeshAxis,
+        MeshAxisType, Mul, ProjectedValue, Reduce, Reshard, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin,
+        Typed, ValueProjection, auto_axes, differentiate_at, explicit_axes, shard_map,
     };
     use ryft_pjrt::Client;
 
@@ -158,7 +158,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();

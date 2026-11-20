@@ -4,9 +4,8 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::{
     ArrayReference, ArrayType, BatchAxis, Context, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
-    Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation,
-    ReferenceType, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value as CoreValue,
-    batch,
+    Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType, ShardMapBoundary,
+    ShardMapOperation, Sharding, ShardingDimension, TypedProgram, Value as CoreValue, batch,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, Constant, FromPjrt, Operation, Options, Reference, Session, Type, Value, compile_statefully};
@@ -34,7 +33,7 @@ fn test_shard_map_operation_from_program() {
         .unwrap();
     let global = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
     let reference_type = Type::Reference(ReferenceType::new(global.clone()));
-    let mut body = CoreProgramBuilder::<Constant, Operation>::new();
+    let mut body = ProgramBuilder::<Constant, Operation>::new();
     let reference = body.add_input(ReferenceType::new(local).into());
     let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
     let body = body
@@ -47,7 +46,7 @@ fn test_shard_map_operation_from_program() {
             .unwrap(),
     )
     .unwrap();
-    let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+    let mut builder = ProgramBuilder::<Constant, Operation>::new();
     let input = builder.add_input(reference_type.clone());
     let body = builder.import_program(body);
     let outputs = builder
@@ -86,7 +85,7 @@ fn test_batched_shard_map_mutates_mapped_reference_items_on_cpu() {
         ShardMapBoundary::new(logical_mesh.clone(), vec![sharded.clone(); 2], vec![sharded], vec!["x".to_string()])
             .unwrap();
     let body = {
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let local_type = boundary.local_input_type(0, &item_type).unwrap();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(local_type.clone())));
         let update = builder.add_input(Type::Array(local_type));

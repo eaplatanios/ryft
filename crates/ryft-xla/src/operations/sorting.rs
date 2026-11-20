@@ -227,9 +227,7 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{
-        Array as CoreArray, Dimension as CoreDimension, Error as CoreError, Placeholder, Shape, Sort, TopK,
-    };
+    use ryft_core::{Array, Dimension, Error as CoreError, Placeholder, Shape, Sort, TopK};
     use ryft_mlir::Location;
 
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
@@ -244,8 +242,8 @@ mod tests {
         // A descending sort of two operands in the total order (i.e., the top-k idiom) lowers to a stable
         // `stablehlo.sort` whose synthesized comparator compares the key pair with `GT` and `TOTALORDER` semantics,
         // and whose index passenger rides along unexamined.
-        let key_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let index_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(4)]));
+        let key_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let index_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
         let keys = builder.add_input(key_type.clone());
         let indices = builder.add_input(index_type.clone());
@@ -292,9 +290,9 @@ mod tests {
         // `f32` primary key, including its equality comparison so that NaN ties fall through deterministically, and
         // `SIGNED` for the `i32` secondary key. The `f32` key is first canonicalized like JAX's `lax.sort` comparator
         // does it, so that signed zeros and all NaNs compare equal.
-        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(4)]));
-        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
+        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
         let primary = builder.add_input(primary_type.clone());
         let secondary = builder.add_input(secondary_type.clone());
@@ -350,7 +348,7 @@ mod tests {
     fn test_sort_operation_lower_complex_keys() {
         // A complex key contributes its real part and then its imaginary part as two lexicographic comparison
         // components, each canonicalized like a real floating-point key.
-        let key_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]));
+        let key_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
         let keys = builder.add_input(key_type.clone());
         let outputs = builder
@@ -424,8 +422,8 @@ mod tests {
         let payload_values = [10f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
         let keys = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&key_values));
         let payloads = replicated_array(&session, &mesh, DataType::F32, &[8], &values_to_bytes(&payload_values));
-        let reference_keys = CoreArray::vector(key_values.to_vec()).unwrap();
-        let reference_payloads = CoreArray::vector(payload_values.to_vec()).unwrap();
+        let reference_keys = Array::vector(key_values.to_vec()).unwrap();
+        let reference_payloads = Array::vector(payload_values.to_vec()).unwrap();
         for ordering in [SortOrdering::Canonical, SortOrdering::Total] {
             for direction in [SortDirection::Ascending, SortDirection::Descending] {
                 let sorted =
@@ -440,7 +438,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     sorted.iter().map(|output| output.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
-                    reference_sorted.iter().map(CoreArray::logical_bytes).collect::<Vec<_>>(),
+                    reference_sorted.iter().map(Array::logical_bytes).collect::<Vec<_>>(),
                     "{ordering} {direction}",
                 );
             }

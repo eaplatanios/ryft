@@ -1,7 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CUMULATIVE_OPERATION_NAME, CumulativeKind, CumulativeOperation, DataType, Dimension as CoreDimension,
-    ReductionKind,
+    ArrayType, CUMULATIVE_OPERATION_NAME, CumulativeKind, CumulativeOperation, DataType, Dimension, ReductionKind,
 };
 use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{
@@ -79,7 +78,7 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     // The scanned extent is static by construction, because `ryft-core` type inference rejects a dynamic scanned axis,
     // so a dynamic extent here means the staged program bypassed that rule.
     let extent = match output_array_type.shape().dimensions().get(axis) {
-        Some(CoreDimension::Static(extent)) => *extent,
+        Some(Dimension::Static(extent)) => *extent,
         _ => {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: CUMULATIVE_OPERATION_NAME.to_string(),
@@ -350,9 +349,9 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, ArrayType, Cumulative, CumulativeOperation, DataType,
-        Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Max, Placeholder, Reduce, Shape,
-        Sharding, associative_scan,
+        Array as CoreArray, ArrayOperation, ArrayType, CompiledFunction as CoreCompiledFunction, Cumulative,
+        CumulativeOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Instruction, Max, Placeholder,
+        Reduce, Shape, Sharding, associative_scan,
     };
 
     use crate::lowering::lower_mlir_module_for_program;
@@ -699,7 +698,7 @@ mod tests {
         // which is why reaching the lowering's own guard takes an unchecked instruction whose output type carries a
         // dynamic scanned dimension. The diagnostic names the scan the caller wrote, not the shared window helper.
         let scanned = DimensionVariable::new("scanned", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(scanned)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(scanned)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone());
         let output = builder.add_variable(dynamic_type);
@@ -786,7 +785,7 @@ mod tests {
         // a dynamic unscanned axis whole, so the whole derivative program lowers for every nonlinear kind.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(4)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(4)]));
         for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
@@ -995,7 +994,7 @@ mod tests {
     fn test_lower_cumulative_log_sum_exp_identities() {
         // Invalid unchecked programs still cannot seed a fold with a value that is not an identity.
         for element_type in [DataType::F8E8M0FNU, DataType::F6E2M3FN] {
-            let array_type = ArrayType::new(element_type, Shape::new(vec![CoreDimension::Static(4)]));
+            let array_type = ArrayType::new(element_type, Shape::new(vec![Dimension::Static(4)]));
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(array_type.clone());
             let output = builder.add_variable(array_type);
@@ -1152,7 +1151,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(5)]))
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(5)]))
                 .with_sharding(sharding.clone())
                 .unwrap();
         let staged = crate::stage::<_, ArrayType, ArrayType>(
@@ -1162,7 +1161,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let compiled: CoreCompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         for rows in [2usize, 4] {
             let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();

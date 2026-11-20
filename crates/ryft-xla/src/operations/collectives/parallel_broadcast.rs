@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, DomainTracingContext, EmptyRegionDriver, InterpretableOperation, NamedAxis, Operation as CoreOperation,
+    ArrayType, DomainTracingContext, EmptyRegionDriver, InterpretableOperation, NamedAxis, Operation,
     PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ParallelBroadcastSource, ProgramError,
-    RematerializationOptimizationBarrier, Value as CoreValue, ValueProjection,
+    RematerializationOptimizationBarrier, Value, ValueProjection,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
@@ -152,8 +152,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ConvertElementType, DataType, LogicalMesh, MeshAxis, MeshAxisType, ParallelBroadcast, ShardMapOptions,
-        Sharding, ShardingDimension, shard_map,
+        ConvertElementType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, ParallelBroadcast,
+        ShardMapOptions, Sharding, ShardingDimension, shard_map,
     };
     use ryft_pjrt::Program as PjrtProgram;
 
@@ -235,7 +235,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == format!(
                         "`{PARALLEL_BROADCAST_OPERATION_NAME}` is \
                          not supported by the XLA CPU backend",

@@ -9,7 +9,7 @@
 //! result types, and both branches normalize their results to the refined output types of the condition. Results whose
 //! types place them over explicit mesh axes are constrained to that placement.
 
-use ryft_core::{ArrayType, ConditionOperation, Operation as CoreOperation, ProgramError, TypedProgram};
+use ryft_core::{ArrayType, ConditionOperation, Operation, ProgramError, TypedProgram};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -151,8 +151,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, AddOperation, ArrayOperation, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
-        ComparisonDirection, CompositeTransposeOperation, Condition, DataType, Dimension as CoreDimension,
-        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
+        ComparisonDirection, CompositeTransposeOperation, Condition, DataType, Dimension, DimensionBounds,
+        DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, Error as CoreError,
         GuardOperation, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder,
         PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape,
         Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation, ZeroOperation, batch,
@@ -528,8 +528,7 @@ mod tests {
     fn test_condition_operation_lower_forwards_dimension_extents() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let output_type = dynamic_vector_type.clone();
@@ -1102,7 +1101,7 @@ mod tests {
             ConditionOperation::<ArrayType>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == expected_message,
             ),
         ));
@@ -1113,7 +1112,7 @@ mod tests {
             ConditionOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "operation `condition` declares 2 region slots but 1 regions were attached",
             ),
         ));
@@ -1124,7 +1123,7 @@ mod tests {
             ConditionOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
             ),
         ));
     }
@@ -1783,7 +1782,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let client = execution_client();
-        let batch_type = DimensionType::from(CoreDimension::Static(3));
+        let batch_type = DimensionType::from(Dimension::Static(3));
 
         // A replicated predicate selects one branch for the whole batch, so the batched program keeps the condition.
         let (batched, output_axes) = program

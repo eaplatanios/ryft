@@ -10,33 +10,33 @@
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayIrOperation,
-    ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, Atan2Operation, AxisIndexOperation,
-    BroadcastLikeOperation, BroadcastOperation, CastOperation, CeilOperation, ClampOperation, CompareOperation,
-    ComplexOperation, CompositeConversion, CompositeOperation, CompositeTransposeOperation, ConcatenateOperation,
-    ConditionOperation, ConjugateOperation, ConstantOperation, ConstrainShardingOperation, ConvertElementTypeOperation,
-    CosOperation, CumulativeOperation, CustomCallOperation, Dimension as CoreDimension, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
-    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation,
-    DropoutOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, ErfOperation, ExpM1Operation, ExpOperation, FillLikeOperation, FloorOperation,
-    GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation, LiftedCustomRules,
-    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation as CoreOperation,
-    OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
-    ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, PrintOperation,
-    Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProgramError, RaggedDotOperation, RealOperation,
-    ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
-    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation,
-    SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation,
-    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, UnavailableCustomRules,
-    UpdateSliceOperation, Value as CoreValue, ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation,
-    ZeroOperation,
+    AbsOperation, Accuracy as CoreAccuracy, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array,
+    ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, Atan2Operation,
+    AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, CastOperation, CeilOperation, ClampOperation,
+    CompareOperation, ComplexOperation, CompositeConversion, CompositeOperation, CompositeTransposeOperation,
+    ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation, ConstrainShardingOperation,
+    ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation, Dimension,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
+    DivOperation, DotOperation, DropoutOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpM1Operation, ExpOperation, FillLikeOperation,
+    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation,
+    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
+    MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
+    ParallelAllToAllOperation, ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation,
+    ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
+    PowOperation, PrintOperation, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProgramError,
+    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor,
+    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation,
+    RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
+    RsqrtOperation, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation,
+    ShardMapOperation, SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation,
+    StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation,
+    TransposeOperation, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_mlir::dialects::stable_hlo;
@@ -153,7 +153,7 @@ pub use jit_call::{JIT_CALL_OPERATION_NAME, JitCallOperation, transpose_primal_j
 )]
 pub enum Operation<Payload = Constant>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     /// Portable kernel instruction whose actual body remains attached until explicit XLA compiler selection.
     Kernel(KernelOperation),
@@ -336,7 +336,7 @@ where
 
 impl<Payload> ReferenceAccessOperation for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     type Transform = ArrayReferenceTransform;
 
@@ -404,7 +404,7 @@ where
 
 impl<Payload> KernelReferenceOperation for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     fn swap_output_index(&self) -> Option<usize> {
         match self {
@@ -416,7 +416,7 @@ where
 
 impl<Payload> From<ArrayOperation<Payload::Projected>> for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: ArrayOperation<Payload::Projected>) -> Self {
@@ -429,7 +429,7 @@ where
 
 impl<Payload> From<ArrayIrOperation<Payload::Projected>> for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     fn from(operation: ArrayIrOperation<Payload::Projected>) -> Self {
         match operation {
@@ -501,7 +501,7 @@ where
 // can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
 impl<Payload> From<ConstantOperation<DimensionValue>> for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: ConstantOperation<DimensionValue>) -> Self {
@@ -517,7 +517,7 @@ macro_rules! impl_array_ir_operation_conversion {
     ($operation:ty) => {
         impl<Payload> From<$operation> for Operation<Payload>
         where
-            Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+            Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         {
             #[inline]
             fn from(operation: $operation) -> Self {
@@ -555,7 +555,7 @@ macro_rules! impl_array_operation_conversion {
     ($operation:ty) => {
         impl<Payload> From<$operation> for Operation<Payload>
         where
-            Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+            Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         {
             #[inline]
             fn from(operation: $operation) -> Self {
@@ -567,7 +567,7 @@ macro_rules! impl_array_operation_conversion {
 
 impl_array_operation_conversion!(ZeroLikeOperation<ArrayType>);
 impl_array_operation_conversion!(OneLikeOperation<ArrayType>);
-impl_array_operation_conversion!(ConstantOperation<CoreArray>);
+impl_array_operation_conversion!(ConstantOperation<Array>);
 impl_array_operation_conversion!(FillLikeOperation<ArrayType>);
 impl_array_operation_conversion!(IotaLikeOperation<ArrayType>);
 impl_array_operation_conversion!(AbsOperation<ArrayType>);
@@ -649,7 +649,7 @@ impl_array_operation_conversion!(CastOperation<ArrayType>);
 
 impl<Payload> OperationProvider<Type, ZeroOperation<Type>> for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     type Operation = Self;
 
@@ -660,7 +660,7 @@ where
 
 impl<Payload> OperationProvider<Type, OneOperation<Type>> for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     type Operation = Self;
 
@@ -672,7 +672,7 @@ where
 // Generic cotangent addition requests the dense array member without adding a second Add conversion.
 impl<Payload> OperationProvider<Type, AddOperation<Type>> for Operation<Payload>
 where
-    Payload: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    Payload: Value<Type = Type> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     type Operation = Self;
 
@@ -749,12 +749,12 @@ where
     Ok(input)
 }
 
-/// Returns the StableHLO result accuracy that requests the provided [`ryft_core::Accuracy`] from the backend.
-pub(crate) fn lower_accuracy(accuracy: ryft_core::Accuracy) -> Accuracy {
+/// Returns the StableHLO result accuracy that requests the provided [`CoreAccuracy`] from the backend.
+pub(crate) fn lower_accuracy(accuracy: CoreAccuracy) -> Accuracy {
     match accuracy {
-        ryft_core::Accuracy::Default => Accuracy::Default,
-        ryft_core::Accuracy::Highest => Accuracy::Highest,
-        ryft_core::Accuracy::Tolerance(tolerance) => Accuracy::Tolerance {
+        CoreAccuracy::Default => Accuracy::Default,
+        CoreAccuracy::Highest => Accuracy::Highest,
+        CoreAccuracy::Tolerance(tolerance) => Accuracy::Tolerance {
             absolute_tolerance: tolerance.absolute(),
             relative_tolerance: tolerance.relative(),
             units_of_least_precision: tolerance.units_of_least_precision(),
@@ -782,7 +782,7 @@ where
         .shape()
         .dimensions()
         .iter()
-        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         .count()
         > 1;
     let mut inputs = [input_values[0], input_values[1]];
@@ -839,13 +839,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Abs, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
-        ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
+        Abs, Accuracy, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy,
+        ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation, BatchableOperation,
         BatchingContext, CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection,
         CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, Cos,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, DifferentiableType, Dimension as CoreDimension,
-        DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionType,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, DifferentiableType, Dimension, DimensionBounds,
+        DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionOperations, DimensionType,
         DimensionValue, DimensionVariable, DivOperation, DomainTracingContext, DotsSavable,
         DotsWithNoBatchDimensionsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver,
         ErasedOperation, EverythingSavable, Exp, ExternalReferenceBinding, LiftedCustomRules, Log, MaybeZero, Memory,
@@ -857,7 +857,7 @@ mod tests {
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
         ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
         ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
-        Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
+        Tolerance, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
         TypedProgram, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation, rematerialize,
     };
 
@@ -874,17 +874,13 @@ mod tests {
     fn elementwise_normalization_program() -> PlainProgram {
         let mut builder = PlainProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let left = builder.add_input(ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(1)]),
-        ));
-        let right = builder.add_input(ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(4)]),
-        ));
+        let left = builder
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)])));
+        let right = builder
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)])));
         let condition = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let boolean_vector =
-            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)])));
+            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])));
         let divide = builder.add_instruction(DivOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let atan2 = builder.add_instruction(Atan2Operation::new(), Vec::new(), vec![right, left], None).unwrap()[0];
         let compare = builder
@@ -960,7 +956,7 @@ mod tests {
         // of the operation families they pair with.
         fn requires_array_operations<V: ArrayOperations>() {}
         fn requires_array_ir_operations<V: ArrayIrOperations>() {}
-        fn requires_dimension_operations<V: ryft_core::DimensionOperations>() {}
+        fn requires_dimension_operations<V: DimensionOperations>() {}
 
         requires_array_operations::<Array>();
         requires_array_operations::<ArrayTracer>();
@@ -1202,14 +1198,14 @@ mod tests {
             scan,
             Operation::Scan(operation)
                 if operation.carry_count() == 2
-                    && operation.iteration_count() == &CoreDimension::Static(5)
+                    && operation.iteration_count() == &Dimension::Static(5)
                     && operation.reverse()
         ));
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let zero: Operation<Constant> = ArrayOperation::Zero(ZeroOperation::new(ArrayType::new(
             DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(extent)]),
+            Shape::new(vec![Dimension::Dynamic(extent)]),
         )))
         .into();
         assert!(matches!(zero, Operation::Zero(_)));
@@ -1229,7 +1225,7 @@ mod tests {
             scan,
             Operation::Scan(operation)
                 if operation.carry_count() == 2
-                    && operation.iteration_count() == &CoreDimension::Static(5)
+                    && operation.iteration_count() == &Dimension::Static(5)
                     && operation.reverse()
         ));
     }
@@ -1454,7 +1450,7 @@ mod tests {
     #[test]
     fn test_dynamic_disconnected_pullback_omits_structural_zero_cotangent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::new();
         builder.add_input(dynamic_type.into());
@@ -1482,7 +1478,7 @@ mod tests {
     #[test]
     fn test_residual_zero_provider_materializes_dynamic_zero_from_array_source() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let tangent_type = primal_type.tangent().unwrap();
         let context = TracingContext::<Constant, Operation>::new();
         let primal = context.input(Type::Array(primal_type));
@@ -1514,15 +1510,12 @@ mod tests {
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(7)).unwrap());
         let zero_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Dynamic(columns.clone())]),
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns.clone())]),
         );
         let context = TracingContext::<Constant, Operation>::new();
         let sources = [
-            context.input(Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)])))),
-            context.input(Type::Array(ArrayType::new(
-                DataType::F8E8M0FNU,
-                Shape::new(vec![CoreDimension::Dynamic(rows)]),
-            ))),
+            context.input(Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])))),
+            context.input(Type::Array(ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(rows)])))),
             context.input(Type::Dimension(DimensionType::from(columns))),
         ];
 
@@ -1552,7 +1545,7 @@ mod tests {
     fn test_gateway_region_program_imports_with_fresh_alpha_equivalent_identities() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let branch = || {
@@ -1751,7 +1744,7 @@ mod tests {
     fn test_normalize_elementwise_operand_zero_sized_operands() {
         let mut builder = PlainProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(0)])));
+        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
         let output = builder.add_instruction(DivOperation::new(), Vec::new(), vec![scalar, empty], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
@@ -1861,7 +1854,7 @@ mod tests {
         );
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::Tanh(ryft_core::TanhOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
+                ArrayOperation::Tanh(TanhOperation::new().with_accuracy(Accuracy::Highest)),
                 DataType::F32,
                 vec![2],
             )
@@ -1875,12 +1868,10 @@ mod tests {
                 }
             "#},
         );
-        let tolerance = ryft_core::Tolerance::new(1e-6, 0.0, 2).unwrap();
+        let tolerance = Tolerance::new(1e-6, 0.0, 2).unwrap();
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::Exp(
-                    ryft_core::ExpOperation::new().with_accuracy(ryft_core::Accuracy::Tolerance(tolerance)),
-                ),
+                ArrayOperation::Exp(ExpOperation::new().with_accuracy(Accuracy::Tolerance(tolerance)),),
                 DataType::F32,
                 vec![2],
             )
@@ -1909,8 +1900,8 @@ mod tests {
 
         // XLA compiles every requested result accuracy. Each one only bounds the error of the implementation XLA
         // selects, so results are compared with the reference within that bound.
-        let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
-        for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
+        let tolerance = Accuracy::Tolerance(Tolerance::new(1e-6, 0.0, 0).unwrap());
+        for accuracy in [Accuracy::Highest, tolerance] {
             let sine = input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
             assert_eq!(sine.len(), expected_sine.len());
             for (sine, expected) in sine.iter().zip(&expected_sine) {

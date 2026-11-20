@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Operation as CoreOperation, ParallelPermuteOperation};
+use ryft_core::{ArrayType, Operation, ParallelPermuteOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -74,9 +74,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Context, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis, MeshAxisType,
-        ParallelPermute, ProgramError, Shape, ShardMapOptions, Sharding, ShardingDimension, Value as CoreValue,
-        shard_map,
+        Context, DataType, Device, DeviceMesh, Dimension, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
+        ParallelPermute, ProgramError, Shape, ShardMapOptions, Sharding, ShardingDimension, Value, shard_map,
     };
     use ryft_pjrt::{BufferType, Program};
 
@@ -101,7 +100,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // `parallel_permute` over the manual mesh axis `"x"` with the rotation pairs [(0, 1), (1, 0)] swaps the two
         // local shards without changing their shapes. The staged collective lowers to a channeled
@@ -294,7 +293,7 @@ mod tests {
                 traced.to_mlir_module("main"),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == format!(
                             "collective over axis `x` records size {axis_size}, \
                              but the enclosing mesh axis has size 2",

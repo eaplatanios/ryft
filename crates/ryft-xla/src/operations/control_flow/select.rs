@@ -8,7 +8,7 @@
 //! that carries that axis.
 
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, SELECT_OPERATION_NAME, SelectOperation};
+use ryft_core::{ArrayType, DataType, Dimension, SELECT_OPERATION_NAME, SelectOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, Context as MlirContext, Location, Operation as MlirOperation, TensorTypeRef, Type as MlirType,
@@ -71,7 +71,7 @@ where
         .shape()
         .dimensions()
         .iter()
-        .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         .count()
         > 1;
     // Each dynamic output extent is inherited from a right-aligned input dimension. Cross broadcasts such as
@@ -79,7 +79,7 @@ where
     let mut sources = vec![(input_values[0], 0); output_type.rank()];
     if multiple_dynamic_axes {
         for (output_axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, CoreDimension::Static(_)) {
+            if matches!(dimension, Dimension::Static(_)) {
                 continue;
             }
             let source = input_types.iter().enumerate().find_map(|(index, input_type)| {

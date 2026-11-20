@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension as CoreDimension, DynamicBroadcastOperation,
-    MeshAxisType, Operation as CoreOperation, ProgramError, Sharding, ShardingDimension,
+    ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension, DynamicBroadcastOperation, MeshAxisType,
+    Operation, ProgramError, Sharding, ShardingDimension,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -130,7 +130,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
                 .dimensions()
                 .iter()
                 .zip(output_extents)
-                .filter_map(|(dimension, extent)| matches!(dimension, CoreDimension::Dynamic(_)).then_some(*extent))
+                .filter_map(|(dimension, extent)| matches!(dimension, Dimension::Dynamic(_)).then_some(*extent))
                 .collect::<Vec<_>>();
             let (declared_type, physical_type) =
                 dynamic_constructor_types(self.name(), dynamic_extents.len(), output_types)?;
@@ -231,8 +231,8 @@ pub(crate) fn broadcast_changes_explicit_sharding(
     // Even when the ranked placement labels are unchanged, expanding a unit dimension that is partitioned over an
     // explicit mesh axis changes which partitions own the replicated values and must remain visible to Shardy.
     let expands_explicit_dimension = output_axes.iter().copied().enumerate().any(|(input_axis, output_axis)| {
-        input_type.dimension(input_axis as isize) == CoreDimension::Static(1)
-            && output_type.dimension(output_axis as isize) != CoreDimension::Static(1)
+        input_type.dimension(input_axis as isize) == Dimension::Static(1)
+            && output_type.dimension(output_axis as isize) != Dimension::Static(1)
             && (uses_explicit_axis(&projected_input_sharding.dimensions()[output_axis], &projected_input_sharding)
                 || uses_explicit_axis(&output_sharding.dimensions()[output_axis], output_sharding))
     });
@@ -278,7 +278,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             .iter()
             .enumerate()
             .map(|(axis, dimension)| {
-                if let CoreDimension::Static(extent) = dimension {
+                if let Dimension::Static(extent) = dimension {
                     dimension_extent_i64(*extent)?;
                     Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
                 } else {
@@ -310,7 +310,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
                 .shape()
                 .dimensions()
                 .iter()
-                .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+                .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
                 .count()
                 > 1)
     {
@@ -355,9 +355,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, Broadcast, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds,
-        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation, Layout,
-        LogicalMesh, MeshAxis, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions,
-        StridedLayout, Tile, TileDimension, TiledLayout, TypedProgram,
+        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation,
+        Error as CoreError, Layout, LogicalMesh, MeshAxis, Placeholder, ProgramBuilder as CoreProgramBuilder,
+        ProgramError, Shape, ShardMapOptions, StridedLayout, Tile, TileDimension, TiledLayout, TypedProgram,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -418,7 +418,7 @@ mod tests {
         // verifies only when the dynamic axis carries an upper bound that lowers to a `#stablehlo.bounds` encoding.
         let bounded = dynamic_dimension("n", Some(5));
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![bounded.clone()]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), bounded]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), bounded]));
         let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
@@ -445,7 +445,7 @@ mod tests {
         // Unbounded passthrough dimensions are supplied at runtime to the dynamic StableHLO operation.
         let unbounded = dynamic_dimension("n", None);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![unbounded.clone()]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), unbounded]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), unbounded]));
         let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
@@ -520,7 +520,7 @@ mod tests {
                 donatable: false,
             }];
             for dimension in input_type.shape().dimensions() {
-                if matches!(dimension, CoreDimension::Dynamic(_)) {
+                if matches!(dimension, Dimension::Dynamic(_)) {
                     inputs.push(ExecutionInput {
                         buffer: Arc::new(
                             client
@@ -674,7 +674,7 @@ mod tests {
         // Both static and bounded dynamic outputs constrain the physical result allocation.
         for (dimension, expected) in [
             (
-                CoreDimension::Static(4),
+                Dimension::Static(4),
                 indoc! {r#"
                     module {
                       func.func @main(%arg0: tensor<4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>> {
@@ -713,7 +713,7 @@ mod tests {
             ),
         ] {
             let input_type = ArrayType::new(DataType::C128, Shape::new(vec![dimension.clone()]));
-            let output_type = ArrayType::new(DataType::C128, Shape::new(vec![CoreDimension::Static(2), dimension]))
+            let output_type = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2), dimension]))
                 .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
             let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
             let input = builder.add_input(input_type);
@@ -754,7 +754,7 @@ mod tests {
     fn test_broadcast_operation_lower_dynamic_output_layout_requires_finite_bounds() {
         let size = dynamic_dimension("size", None);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone()]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), size]))
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), size]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
         let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
@@ -933,7 +933,7 @@ mod tests {
             module,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
             ),
         ));
@@ -992,8 +992,8 @@ mod tests {
         // The exemplar provides the logical size of the dynamic output axis, both for a value that the axis
         // replicates and for a value whose own dynamic axis maps to it next to a stretched unit axis.
         let size = dynamic_dimension("size", Some(5));
-        let exemplar_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone(), CoreDimension::Static(3)]));
-        let column_type = ArrayType::new(DataType::F32, Shape::new(vec![size, CoreDimension::Static(1)]));
+        let exemplar_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone(), Dimension::Static(3)]));
+        let column_type = ArrayType::new(DataType::F32, Shape::new(vec![size, Dimension::Static(1)]));
         let mut builder = ProgramBuilder::new();
         let row = builder.add_input(test_vector_type(3));
         let column = builder.add_input(column_type);
@@ -1064,9 +1064,8 @@ mod tests {
         // One compiled program serves every runtime extent of the exemplar, including an empty one, and the
         // exemplar's elements never reach the results.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
-        let exemplar_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![rows.clone().into(), CoreDimension::Static(2)]));
-        let column_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), CoreDimension::Static(1)]));
+        let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.clone().into(), Dimension::Static(2)]));
+        let column_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), Dimension::Static(1)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let row = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
         let column = builder.add_input(column_type.into());
@@ -1146,7 +1145,7 @@ mod tests {
         let shape = Shape::new(vec![dynamic_dimension("size", Some(5))]);
         let integer_type = ArrayType::new(DataType::I64, shape.clone());
         let complex_type = ArrayType::new(DataType::C64, shape.clone());
-        let output_shape = Shape::new(vec![CoreDimension::Static(2), shape.dimensions()[0].clone()]);
+        let output_shape = Shape::new(vec![Dimension::Static(2), shape.dimensions()[0].clone()]);
         let mut builder = ArrayIrProgramBuilder::new();
         let integer_input = builder.add_input(integer_type.clone().into());
         let complex_input = builder.add_input(complex_type.clone().into());

@@ -1,6 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ConstrainShardingOperation, LogicalMesh, ProgramError, Sharding, ShardingDimension, UnreducedKind,
+    ArrayType, ConstrainShardingOperation, LogicalMesh, ProgramError, Sharding, ShardingDimension, ShardingError,
+    UnreducedKind,
 };
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
@@ -92,7 +93,7 @@ fn lower_constraint<'b, 'c: 'b, 't: 'c>(
         sharding
     } else {
         let retain = |axis: &String| !bound_manual_axes.contains(axis);
-        let projected = || -> Result<Sharding, ryft_core::ShardingError> {
+        let projected = || -> Result<Sharding, ShardingError> {
             let mesh = LogicalMesh::new(
                 sharding
                     .mesh()
@@ -141,8 +142,8 @@ fn lower_constraint<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ConstrainSharding, DataType, Dimension as CoreDimension, MeshAxis, MeshAxisType, Operation as CoreOperation,
-        Shape, ShardMapBoundary, Sin,
+        ConstrainSharding, DataType, Dimension, MeshAxis, MeshAxisType, Operation as CoreOperation, Shape,
+        ShardMapBoundary, Sin,
     };
     use ryft_mlir::{Context as MlirContext, Location};
 
@@ -170,7 +171,7 @@ mod tests {
         let sharding =
             Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
-        ArrayType::new_static(ryft_core::DataType::F32, [4, 2]).with_sharding(sharding).unwrap()
+        ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap()
     }
 
     #[test]
@@ -257,7 +258,7 @@ mod tests {
         // Inside a manual region over `m`, the constraint names neither `m` nor its unreduced state. Dropping every
         // unreduced axis also drops the kind of the pending reduction, which falls back to the default sum kind.
         let mesh = test_mesh();
-        let input_type = ArrayType::new_static(ryft_core::DataType::F32, [4, 2])
+        let input_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap()
@@ -302,7 +303,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape);
         let target_sharding = sharded.clone();

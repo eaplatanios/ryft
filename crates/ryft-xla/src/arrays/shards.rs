@@ -15,10 +15,9 @@ use crate::{Error, FromPjrt};
 
 /// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
 /// [`ArrayShard::descriptor`]. They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the
-/// current process, a bufferless marker for the unique value of [`DataType::Zero`](ryft_core::DataType::Zero), or
-/// metadata only when the shard belongs to another process. This lets an array describe its full global layout
-/// without allocating meaningless zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s
-/// so that cloned arrays can share them.
+/// current process, a bufferless marker for the unique value of [`DataType::Zero`], or metadata only when the shard
+/// belongs to another process. This lets an array describe its full global layout without allocating meaningless
+/// zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s so that cloned arrays can share them.
 #[derive(Clone)]
 pub struct ArrayShard {
     /// Refer to the documentation of [`Self::descriptor`] for information on this field.
@@ -37,7 +36,7 @@ impl ArrayShard {
         Self { descriptor, storage }
     }
 
-    /// Creates a process-local bufferless [`DataType::Zero`](ryft_core::DataType::Zero)-valued [`ArrayShard`].
+    /// Creates a process-local bufferless [`DataType::Zero`]-valued [`ArrayShard`].
     #[inline]
     pub fn zero(descriptor: ShardDescriptor) -> Self {
         Self { descriptor, storage: ArrayShardStorage::Zero }
@@ -57,7 +56,7 @@ impl ArrayShard {
     }
 
     /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
-    /// addressable bufferless [`DataType::Zero`](ryft_core::DataType::Zero)-valued shard.
+    /// addressable bufferless [`DataType::Zero`]-valued shard.
     #[inline]
     pub fn buffer(&self) -> Option<&Arc<Buffer<'static>>> {
         match &self.storage {
@@ -98,8 +97,8 @@ impl ArrayShard {
 
     /// Copies the bytes that the device of this [`ArrayShard`] holds to the host and returns them in dense row-major
     /// order, irrespective of the physical layout of the shard's [`Buffer`]. This function blocks the current thread
-    /// until the copy completes. Bufferless [`DataType::Zero`](ryft_core::DataType::Zero) shards and shards with no
-    /// elements produce no bytes and issue no copy.
+    /// until the copy completes. Bufferless [`DataType::Zero`] shards and shards with no elements produce no bytes
+    /// and issue no copy.
     ///
     /// These bytes are a tile of the [`Array`](crate::Array) that this shard belongs to, unless the [`Sharding`] of
     /// that array has unreduced axes, in which case they are the separate value that this device holds for that tile
@@ -161,8 +160,7 @@ pub enum ArrayShardStorage {
     /// The shard belongs to another process and has no process-local storage.
     Remote,
 
-    /// The shard is process-local but represents the unique value of
-    /// [`DataType::Zero`](ryft_core::DataType::Zero) without an underlying buffer.
+    /// The shard is process-local but represents the unique value of [`DataType::Zero`] without an underlying buffer.
     Zero,
 
     /// The shard is process-local and backed by a PJRT [`Buffer`].

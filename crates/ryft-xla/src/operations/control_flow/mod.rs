@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension as CoreDimension,
-    EffectClass, EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
+    ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension, EffectClass,
+    EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
     RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed,
     TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
@@ -182,8 +182,8 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     };
     let dimension_pairs = declared_type.shape().dimensions().iter().zip(input_type.shape().dimensions());
     if !dimension_pairs.clone().any(|pair| match pair {
-        (CoreDimension::Dynamic(_), CoreDimension::Static(_)) => true,
-        (CoreDimension::Dynamic(declared), CoreDimension::Dynamic(input)) => {
+        (Dimension::Dynamic(_), Dimension::Static(_)) => true,
+        (Dimension::Dynamic(declared), Dimension::Dynamic(input)) => {
             declared.bounds().upper() != input.bounds().upper()
         }
         _ => false,
@@ -195,8 +195,8 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     let mut runtime_sizes = Vec::with_capacity(declared_type.rank());
     for (axis, dimensions) in dimension_pairs.enumerate() {
         runtime_sizes.push(match dimensions {
-            (CoreDimension::Static(_), _) => None,
-            (CoreDimension::Dynamic(_), CoreDimension::Static(extent)) => Some(
+            (Dimension::Static(_), _) => None,
+            (Dimension::Dynamic(_), Dimension::Static(extent)) => Some(
                 lower_unplaced_constant_output(
                     &[ArrayType::scalar(DataType::I32)],
                     dimension_extent_i64(*extent)?,
@@ -206,7 +206,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
                 )?
                 .remove(0),
             ),
-            (CoreDimension::Dynamic(_), CoreDimension::Dynamic(_)) => {
+            (Dimension::Dynamic(_), Dimension::Dynamic(_)) => {
                 let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
                 Some(size.result(0).unwrap().as_ref())
             }
@@ -281,10 +281,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             continue;
         };
         let dimension_pairs = declared_type.shape().dimensions().iter().zip(output_type.shape().dimensions());
-        if !dimension_pairs
-            .clone()
-            .any(|pair| matches!(pair, (CoreDimension::Dynamic(_), CoreDimension::Static(_))))
-        {
+        if !dimension_pairs.clone().any(|pair| matches!(pair, (Dimension::Dynamic(_), Dimension::Static(_)))) {
             converted.push(value);
             continue;
         }
@@ -293,7 +290,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
         let mut runtime_sizes = Vec::with_capacity(declared_type.rank());
         for (axis, dimensions) in dimension_pairs.enumerate() {
             runtime_sizes.push(match dimensions {
-                (CoreDimension::Dynamic(_), CoreDimension::Dynamic(_)) => {
+                (Dimension::Dynamic(_), Dimension::Dynamic(_)) => {
                     let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
                     Some(size.result(0).unwrap().as_ref())
                 }
@@ -319,7 +316,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             location,
         )?)?;
         let mut value = sliced.result(0).unwrap().as_ref();
-        let mut dimensions = limits.iter().copied().map(CoreDimension::Static).collect::<Vec<_>>();
+        let mut dimensions = limits.iter().copied().map(Dimension::Static).collect::<Vec<_>>();
         for (axis, size) in runtime_sizes.into_iter().enumerate() {
             let Some(size) = size else { continue };
             dimensions[axis] = output_type.shape().dimensions()[axis].clone();
@@ -511,7 +508,8 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, Placeholder, PrintOperation, Sharding, ZeroLikeOperation,
+        DimensionVariable, Error as CoreError, LogicalMesh, MeshAxis, Placeholder, PrintOperation, Sharding,
+        ZeroLikeOperation,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, Program as PjrtProgram};
@@ -805,7 +803,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
             ),
         ));
         assert!(matches!(
@@ -819,7 +817,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
             ),
         ));
     }
@@ -872,7 +870,7 @@ mod tests {
             lower(EffectClasses::NONE),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == expected_message,
             ),
         ));

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayType, CompilationCacheDomain, CompilationTracer, DeviceMesh, EffectClass,
-    StagedFunction as CoreStagedFunction,
+    EffectsSummary, StagedFunction,
 };
 use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
@@ -180,7 +180,7 @@ impl KernelAotBundle {
         let facts = KernelExecutionFacts::from_target(session.target()?, options.mesh())?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
-        let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
+        let staged = StagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, _, inputs: Vec<CompilationTracer<Session>>| Ok(stage_kernel(inputs[0].context(), definition, &inputs)?),
             vec![],
             definition.operation().input_types(),
@@ -386,7 +386,7 @@ pub struct LoadedKernel {
     execution: Vec<u8>,
 
     /// Canonical source effects, retained for stricter functional distributed admission.
-    effects: ryft_core::EffectsSummary,
+    effects: EffectsSummary,
 }
 
 impl LoadedKernel {
@@ -438,7 +438,9 @@ struct Manifest {
 #[cfg(test)]
 pub(crate) mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{DataType, Device, EffectClass, EffectClasses, Effects, LogicalMesh, Typed};
+    use ryft_core::{
+        DataType, Device, EffectClass, EffectClasses, Effects, Error as CoreError, LogicalMesh, ProgramError, Typed,
+    };
     use ryft_kernels::{Grid, KernelCallOperation};
 
     use crate::kernels::staging::tests::binding;
@@ -508,7 +510,7 @@ pub(crate) mod tests {
         } else {
             vec![]
         };
-        let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
+        let staged = StagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, captures: Vec<CompilationTracer<Session>>, inputs| {
                 // Returning the capture retains a real capture slot without introducing unrelated operations.
                 Ok(if captures.is_empty() { inputs } else { captures })
@@ -531,12 +533,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_error_roundtrip() {
-        let core = Error::from(KernelAotError::from(Error::from(ryft_core::ProgramError::PoisonedValue)));
+        let core = Error::from(KernelAotError::from(Error::from(ProgramError::PoisonedValue)));
         assert!(matches!(
             core,
             Error::Core(core_error) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue),
+                CoreError::Program(ProgramError::PoisonedValue),
             ),
         ));
 

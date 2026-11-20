@@ -1,9 +1,9 @@
 use ryft_core::{
-    ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension as CoreDimension, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
+    ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension, DimensionAddOperation,
+    DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
     DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionSizeOperation,
     DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, EffectClass,
-    Operation as CoreOperation, ProgramError, SaturatingSubOperation,
+    MAX_DIMENSION_EXTENT, Operation, ProgramError, SaturatingSubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -42,16 +42,17 @@ impl LowerableOperation for DimensionSizeOperation {
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         match input_type.shape().dimensions()[self.axis()] {
-            CoreDimension::Static(extent) => {
+            Dimension::Static(extent) => {
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-                let extent = i64::try_from(extent).map_err(|_| {
-                    ryft_core::DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: i64::MAX as usize }
+                let extent = i64::try_from(extent).map_err(|_| DimensionError::ExtentExceedsBackendWidth {
+                    value: extent,
+                    maximum: i64::MAX as usize,
                 })?;
                 let elements = lower_constant_elements_attribute(DataType::I64, output_type, extent, context)?;
                 let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
                 Ok(vec![constant.result(0).unwrap().as_ref()])
             }
-            CoreDimension::Dynamic(_) => {
+            Dimension::Dynamic(_) => {
                 let size = block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
                 let size = size.result(0).unwrap().as_ref();
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
@@ -86,7 +87,7 @@ impl LowerableOperation for DimensionFromScalarOperation {
         let at_least_lower =
             lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, converted, lower, block, location)?;
         // Do not encode an exclusive upper bound, one past the maximum, in the signed runtime extent representation.
-        let predicate = match bounds.upper().filter(|upper| *upper <= ryft_core::MAX_DIMENSION_EXTENT) {
+        let predicate = match bounds.upper().filter(|upper| *upper <= MAX_DIMENSION_EXTENT) {
             Some(upper) => {
                 let upper = lower_static_index_constants(&[upper], block, context, location)?[0];
                 let below_upper =
@@ -439,8 +440,8 @@ mod tests {
         let input_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![
-                CoreDimension::Static(3),
-                CoreDimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap())),
+                Dimension::Static(3),
+                Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap())),
             ]),
         );
         let mut builder = ArrayIrProgramBuilder::new();

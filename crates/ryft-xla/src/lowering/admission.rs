@@ -390,13 +390,13 @@ mod tests {
         AddOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayOperation, ArrayType,
         AttentionConfiguration, AttentionImplementation, AttentionInputs, CompareOperation, ComparisonDirection,
         ConstantOperation, Context, ConvertElementTypeOperation, CumulativeKind, CumulativeOperation,
-        CustomCallOperation, DataType, Differentiate, Dimension as CoreDimension, DimensionAddOperation,
-        DimensionBounds, DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionVariable,
-        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, IotaOperation,
-        NegOperation, OneOperation, Placeholder, PrintOperation, ProgramError, RandomAlgorithm, ReduceOperation,
-        ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation, ScaledDotOperation, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, Shape, SortDirection, SortOperation, StaticShape, SubOperation,
-        Value as CoreValue, differentiable_dot_product_attention,
+        CustomCallOperation, DataType, Differentiate, Dimension, DimensionAddOperation, DimensionBounds,
+        DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionVariable,
+        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, Error as CoreError,
+        IotaOperation, NegOperation, OneOperation, Placeholder, PrintOperation, ProgramError, RandomAlgorithm,
+        ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation, ScaledDotOperation,
+        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection, SortOperation,
+        StaticShape, SubOperation, Value as CoreValue, differentiable_dot_product_attention,
     };
     use ryft_pjrt::Client;
     #[cfg(feature = "cuda-13")]
@@ -447,12 +447,10 @@ mod tests {
 
     /// Builds the kind-sensitive bounded-dynamic padding fixture shared by CPU and CUDA execution tests.
     fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatProgram {
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let index_type = dynamic_type.clone().with_data_type(DataType::U64);
-        let matrix_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(4)]),
-        );
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(4)]));
 
         // The iota and its negation make physical suffix positions numerically distinguishable from every admitted live
         // prefix. This catches both reduction identities and the opposite sentinels needed by ascending and descending
@@ -613,25 +611,25 @@ mod tests {
         let attention_batch = DimensionVariable::new("attention_batch", extent.bounds());
         let scaled_lhs_type = ArrayType::new(
             scaled_element_type,
-            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(scaled_block_size)]),
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(scaled_block_size)]),
         );
         let scaled_lhs_scale_type = ArrayType::new(
             scaled_scale_type,
-            Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(1)]),
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(1)]),
         );
         let scaled_rhs_type = ArrayType::new(
             scaled_element_type,
-            Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(scaled_block_size)]),
+            Shape::new(vec![Dimension::Static(1), Dimension::Static(scaled_block_size)]),
         );
         let scaled_rhs_scale_type =
-            ArrayType::new(scaled_scale_type, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
+            ArrayType::new(scaled_scale_type, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
         let attention_type = ArrayType::new(
             DataType::BF16,
             Shape::new(vec![
-                CoreDimension::Dynamic(attention_batch.clone()),
-                CoreDimension::Dynamic(extent.clone()),
-                CoreDimension::Static(1),
-                CoreDimension::Static(8),
+                Dimension::Dynamic(attention_batch.clone()),
+                Dimension::Dynamic(extent.clone()),
+                Dimension::Static(1),
+                Dimension::Static(8),
             ]),
         );
         let attention = differentiable_dot_product_attention::<Session>(
@@ -722,14 +720,14 @@ mod tests {
             session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                CoreError::Program(ProgramError::InvalidArgument { message })
                     if *message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
                         for XLA compilation",
             ),
         ));
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = ProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
@@ -753,14 +751,14 @@ mod tests {
             session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
                         because custom-call physical-padding semantics are opaque",
             ),
         ));
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = ProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
@@ -779,7 +777,7 @@ mod tests {
             session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
                         because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
             ),
@@ -788,7 +786,7 @@ mod tests {
         // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic operand would
         // become observable.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = ProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
@@ -807,7 +805,7 @@ mod tests {
             session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message
                         == "operation `print` cannot consume data-derived \
                         dimensions during XLA lowering because \
@@ -818,7 +816,7 @@ mod tests {
         // Bit generation over a bounded-dynamic result would advance the functional generator state by the physical
         // upper-bound element count rather than the logical one.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = ProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
@@ -840,7 +838,7 @@ mod tests {
             session.lower_program(&program, 0, &Options::new(mesh.clone())),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
                         lowering because random generation advances state according to physical rather than logical \
                         element count",
@@ -850,10 +848,9 @@ mod tests {
         // Every scatter combiner is unverified against physical padding, so a data-derived operand extent is rejected
         // per kind rather than per operation name.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let size = builder.add_input(size_type.into());
         let indices = builder.add_input(indices_type.into());
@@ -886,7 +883,7 @@ mod tests {
             session.lower_program(&program, 0, &Options::new(mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message
                         == "operation `scatter` cannot consume data-derived \
                         dimensions during XLA lowering because \
@@ -922,7 +919,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             program.regions()[0].atoms()[sum.index()].r#type().as_ref(),
-            &Type::Dimension(DimensionType::from(CoreDimension::Static(8))),
+            &Type::Dimension(DimensionType::from(Dimension::Static(8))),
         );
         assert_eq!(validate_data_dependent_compilation(&program).map_err(|error| error.to_string()), Ok(()));
     }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, AssertOperation, AssertionError, AssertionFailure, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME,
-    DataType, Dimension as CoreDimension, DimensionType, DimensionVariable, EffectClass, GUARD_OPERATION_NAME,
-    GuardOperation, Operation as CoreOperation,
+    DataType, Dimension, DimensionType, DimensionVariable, EffectClass, GUARD_OPERATION_NAME, GuardOperation,
+    Operation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -266,7 +266,7 @@ pub(crate) fn validates_output_extents(
     let dynamic_count = declared_types
         .iter()
         .flat_map(|r#type| r#type.shape().dimensions())
-        .filter_map(CoreDimension::variable)
+        .filter_map(Dimension::variable)
         .count();
     let Some(extent_offset) = input_types.len().checked_sub(dynamic_count) else {
         return Ok(false);
@@ -397,8 +397,8 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     // output declarations can observe the same axis twice, or different values can carry the same actual identity.
     // Retain those actual dimensions so proven equalities require neither a query nor a host callback.
     let mut occurrences =
-        Vec::<(&DimensionVariable, &CoreDimension, Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>)>::new();
-    let mut static_checks = Vec::<(usize, &CoreDimension, (ValueRef<'b, 'c, 't>, Option<usize>))>::new();
+        Vec::<(&DimensionVariable, &Dimension, Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>)>::new();
+    let mut static_checks = Vec::<(usize, &Dimension, (ValueRef<'b, 'c, 't>, Option<usize>))>::new();
     for ((declared, &value), actual) in declared_types.iter().zip(values).zip(actual_types) {
         match (declared, actual) {
             (Type::Array(declared), Type::Array(actual)) if declared.rank() == actual.rank() => {
@@ -407,9 +407,9 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                 {
                     let extent = actual.bounds().extent().ok_or((value, Some(axis)));
                     match (declared, extent) {
-                        (CoreDimension::Dynamic(variable), extent) => occurrences.push((variable, actual, extent)),
-                        (CoreDimension::Static(_), Ok(_)) => {}
-                        (CoreDimension::Static(expected), Err((value, Some(axis)))) => {
+                        (Dimension::Dynamic(variable), extent) => occurrences.push((variable, actual, extent)),
+                        (Dimension::Static(_), Ok(_)) => {}
+                        (Dimension::Static(expected), Err((value, Some(axis)))) => {
                             if static_checks.iter().any(|(extent, dimension, observed)| {
                                 extent == expected
                                     && (*observed == (value, Some(axis)) || dimension.has_equal_extents(actual))
@@ -422,7 +422,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                             let message = format!("input dimension `{actual}` must have the declared extent {site}");
                             lower_check(expected, runtime, message, effect_tokens, block)?;
                         }
-                        (CoreDimension::Static(_), Err((_, None))) => unreachable!(),
+                        (Dimension::Static(_), Err((_, None))) => unreachable!(),
                     }
                 }
             }
@@ -834,7 +834,7 @@ fn output_extent_checks<'o>(
     let dynamic_count = declared_types
         .iter()
         .flat_map(|r#type| r#type.shape().dimensions())
-        .filter_map(CoreDimension::variable)
+        .filter_map(Dimension::variable)
         .count();
     check_count!("input", input_types, dynamic_count, ProgramError);
     let mut inputs = input_types.iter().enumerate();
@@ -844,10 +844,10 @@ fn output_extent_checks<'o>(
         .zip(output_types)
         .flat_map(|(declared, output)| declared.shape().dimensions().iter().zip(output.shape().dimensions()));
     for (declared, output) in dimensions {
-        let CoreDimension::Dynamic(variable) = declared else { continue };
+        let Dimension::Dynamic(variable) = declared else { continue };
         let (index, input_type) = inputs.next().unwrap();
         let input_type = <&DimensionType>::try_from(input_type)?;
-        if let CoreDimension::Static(extent) = *output
+        if let Dimension::Static(extent) = *output
             && input_type.extent() != Some(extent)
         {
             checks.push((index, variable, extent));
@@ -1642,13 +1642,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, AndOperation, ArrayIrBatch, ArrayReferenceDischarge, Assert, AssertOperation, BatchAxis,
-        BatchableOperation, BatchingContext, CompareOperation, Context, ConvertElementType, DimensionBounds,
-        DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionPow, DimensionRemOperation,
-        DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, Div, DynamicBroadcastOperation,
-        EmptyRegionDriver, IotaOperation, PartialValue, Placeholder, PrintOperation, ProgramError,
-        ReferenceReadOperation, ReferenceType, Rem, Reshape, Shape, StagingContext, Sub, TracingContext, Typed,
-        TypedProgram, batch,
+        AddOperation, AndOperation, ArrayIrBatch, ArrayOperation, ArrayReferenceDischarge, Assert, AssertOperation,
+        BatchAxis, BatchableOperation, BatchingContext, CompareOperation, Context, ConvertElementType, DimensionBounds,
+        DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionMaxOperation, DimensionOperation,
+        DimensionPow, DimensionRemOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, Div, DynamicBroadcastOperation, EmptyRegionDriver, IotaOperation,
+        Operation as CoreOperation, PartialValue, Placeholder, PrintOperation, ProgramError, ReferenceReadOperation,
+        ReferenceType, Rem, Reshape, Shape, StagingContext, Sub, TracingContext, Typed, TypedProgram, batch,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
@@ -1671,7 +1671,7 @@ mod tests {
             Shape::new(vec![DimensionType::new("n", bounds).simplified_dimension()]),
         )];
         let symbolic = Type::from(DimensionType::new("m", bounds));
-        let exact = Type::from(DimensionType::from(CoreDimension::Static(3)));
+        let exact = Type::from(DimensionType::from(Dimension::Static(3)));
         let refined = vec![Type::from(ArrayType::new_static(DataType::F32, [3]))];
         let unrefined = vec![Type::from(declared_types[0].clone())];
 
@@ -2669,14 +2669,14 @@ mod tests {
                     )
                     .unwrap();
                 let one_type = DimensionValue::constant(1).unwrap().r#type().into_owned();
-                let maximum = ryft_core::DimensionMaxOperation::new(&right_type, &one_type).unwrap();
+                let maximum = DimensionMaxOperation::new(&right_type, &one_type).unwrap();
                 let safe_type = maximum.infer_output_types(&[right_type.clone(), one_type], &[]).unwrap().remove(0);
                 let safe = builder
-                    .add_instruction(ryft_core::DimensionOperation::Max(maximum), Vec::new(), vec![right, one], None)
+                    .add_instruction(DimensionOperation::Max(maximum), Vec::new(), vec![right, one], None)
                     .unwrap()[0];
                 let remainder = builder
                     .add_instruction(
-                        ryft_core::DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &safe_type).unwrap()),
+                        DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &safe_type).unwrap()),
                         Vec::new(),
                         vec![left, safe],
                         None,
@@ -2684,7 +2684,7 @@ mod tests {
                     .unwrap()[0];
                 output = builder
                     .add_instruction(
-                        ryft_core::DimensionOperation::Div(DimensionDivOperation::new(&left_type, &safe_type).unwrap()),
+                        DimensionOperation::Div(DimensionDivOperation::new(&left_type, &safe_type).unwrap()),
                         Vec::new(),
                         vec![left, safe],
                         None,
@@ -2741,12 +2741,12 @@ mod tests {
             };
             let error = session.execute_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
             let expected = if right_value == 0 {
-                ryft_core::AssertionError::Failed {
+                AssertionError::Failed {
                     message: "divisor must be positive".to_owned(),
                     observations: vec![("right".to_owned(), "0".to_owned())],
                 }
             } else {
-                ryft_core::AssertionError::Failed {
+                AssertionError::Failed {
                     message: message.to_owned(),
                     observations: vec![
                         ("left".to_owned(), left_value.to_string()),
@@ -2806,14 +2806,14 @@ mod tests {
                 session.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
             let compiled = session.compile_program(&lowered).unwrap();
             let error = session.execute_program(&compiled, vec![predicates, observations.clone()]).unwrap_err();
-            let expected = ryft_core::AssertionError::FailedElements {
+            let expected = AssertionError::FailedElements {
                 message: "bounded check".to_owned(),
                 failures: vec![
-                    ryft_core::AssertionFailure {
+                    AssertionFailure {
                         index: if mode == 2 { vec![0, 1] } else { vec![1] },
                         observations: vec![("value".to_owned(), "20".to_owned())],
                     },
-                    ryft_core::AssertionFailure {
+                    AssertionFailure {
                         index: if mode == 2 { vec![1, 0] } else { vec![2] },
                         observations: vec![("value".to_owned(), "30".to_owned())],
                     },
@@ -2862,13 +2862,13 @@ mod tests {
                 session.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
             let compiled = session.compile_program(&lowered).unwrap();
             let error = session.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
-            let expected = ryft_core::AssertionError::FailedElements {
+            let expected = AssertionError::FailedElements {
                 message: "narrow values".to_owned(),
                 failures: values
                     .iter()
                     .take(3)
                     .enumerate()
-                    .map(|(index, value)| ryft_core::AssertionFailure {
+                    .map(|(index, value)| AssertionFailure {
                         index: vec![index],
                         observations: vec![("value".to_owned(), value.to_string())],
                     })
@@ -2937,7 +2937,7 @@ mod tests {
                 if passed {
                     assert!(output.unwrap().is_empty());
                 } else {
-                    let expected = ryft_core::AssertionError::Failed {
+                    let expected = AssertionError::Failed {
                         message: "scalar check".to_owned(),
                         observations: observations
                             .iter()
@@ -2973,7 +2973,7 @@ mod tests {
         let lowered = session.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
         let error = session.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
-        let expected = ryft_core::AssertionError::Failed {
+        let expected = AssertionError::Failed {
             message: "mapped check".to_owned(),
             observations: vec![("value".to_owned(), "20".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
         };
@@ -3009,9 +3009,7 @@ mod tests {
                 .remove(0);
             let predicates = context
                 .bind(
-                    Operation::Array(ryft_core::ArrayOperation::Compare(CompareOperation::new(
-                        ComparisonDirection::LessThan,
-                    ))),
+                    Operation::Array(ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan))),
                     Vec::new(),
                     &[indices.clone(), limits],
                 )
@@ -3055,22 +3053,16 @@ mod tests {
                 .collect::<Vec<_>>();
             let error = session.execute_program(&compiled, inputs).unwrap_err();
             let expected = if bounded {
-                ryft_core::AssertionError::FailedElements {
+                AssertionError::FailedElements {
                     message: "dynamic mapped check".to_owned(),
                     failures: vec![
-                        ryft_core::AssertionFailure {
-                            index: vec![1],
-                            observations: vec![("value".to_owned(), "1".to_owned())],
-                        },
-                        ryft_core::AssertionFailure {
-                            index: vec![2],
-                            observations: vec![("value".to_owned(), "2".to_owned())],
-                        },
+                        AssertionFailure { index: vec![1], observations: vec![("value".to_owned(), "1".to_owned())] },
+                        AssertionFailure { index: vec![2], observations: vec![("value".to_owned(), "2".to_owned())] },
                     ],
                     omitted: 0,
                 }
             } else {
-                ryft_core::AssertionError::Failed {
+                AssertionError::Failed {
                     message: "dynamic mapped check".to_owned(),
                     observations: vec![
                         ("value".to_owned(), "1".to_owned()),
@@ -3128,22 +3120,16 @@ mod tests {
                 Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, 3i64.to_ne_bytes()).unwrap();
             let error = session.execute_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
-                ryft_core::AssertionError::FailedElements {
+                AssertionError::FailedElements {
                     message: "dynamic replicated check".to_owned(),
                     failures: vec![
-                        ryft_core::AssertionFailure {
-                            index: vec![0],
-                            observations: vec![("size".to_owned(), "3".to_owned())],
-                        },
-                        ryft_core::AssertionFailure {
-                            index: vec![1],
-                            observations: vec![("size".to_owned(), "3".to_owned())],
-                        },
+                        AssertionFailure { index: vec![0], observations: vec![("size".to_owned(), "3".to_owned())] },
+                        AssertionFailure { index: vec![1], observations: vec![("size".to_owned(), "3".to_owned())] },
                     ],
                     omitted: 1,
                 }
             } else {
-                ryft_core::AssertionError::Failed {
+                AssertionError::Failed {
                     message: "dynamic replicated check".to_owned(),
                     observations: vec![("size".to_owned(), "3".to_owned())],
                 }

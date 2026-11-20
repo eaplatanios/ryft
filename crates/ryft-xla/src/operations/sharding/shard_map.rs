@@ -385,19 +385,19 @@ pub(crate) mod tests {
         BatchAxisSpecification, BatchedProgram, BatchingContext, BroadcastOperation, CollectiveOptions,
         CompareOperation, ComparisonDirection, CompositeOperation, ConstantOperation, Context, ConvertElementType,
         ConvertElementTypeOperation, Cos, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension as CoreDimension,
-        DimensionValue, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClass, Exp,
-        Fill, Gather, GatherMode, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, NamedAxis,
-        Operation as CoreOperation, OperationPayloadProjection, ParallelAllGather, ParallelAllToAllOperation,
-        ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermuteOperation,
-        ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation, Placeholder,
-        Program as CoreProgram, ProgramBatchingOutputAxesPolicy, ProgramBuilder as CoreProgramBuilder,
-        ProjectedContext, ProjectedValue, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, ReferenceWrite, Reshape, ReshapeOperation, Shape, ShardMap, ShardMapOptions, Sin, Sort,
-        SortDirection, StagingContext, TracingScope, Type as CoreType, Typed, TypedProgram, UnreducedKind,
-        Value as CoreValue, ValueProjection, WhileOperation, batch, composite, differentiable_dot_product_attention,
-        differentiate_at, explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionValue, DomainTracer,
+        DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClass, Error as CoreError, Exp, Fill,
+        Gather, GatherMode, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, NamedAxis, Operation as CoreOperation,
+        OperationPayloadProjection, ParallelAllGather, ParallelAllToAllOperation, ParallelArgExtrema,
+        ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermuteOperation, ParallelReduce,
+        ParallelReduceOperation, ParallelVary, ParallelVaryOperation, Placeholder, Program as CoreProgram,
+        ProgramBatchingOutputAxesPolicy, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProjectedValue,
+        Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, ReferenceWrite, Reshape,
+        ReshapeOperation, Shape, ShardMap, ShardMapOptions, ShardingError, Sin, Sort, SortDirection, StagingContext,
+        TracingScope, Type as CoreType, Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection,
+        WhileOperation, batch, composite, differentiable_dot_product_attention, differentiate_at, explicit_axes,
+        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput,
@@ -535,7 +535,7 @@ pub(crate) mod tests {
     fn nonlinear_reference_shard_map_program(
         mesh: &LogicalMesh,
         replicated_reference: bool,
-    ) -> ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>> {
+    ) -> CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>> {
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let reference_sharding =
             if replicated_reference { Sharding::replicated(mesh.clone(), 1) } else { sharded.clone() };
@@ -580,7 +580,7 @@ pub(crate) mod tests {
     /// reference input is reduced along the manual axis `x`, together with its referent type.
     pub(crate) fn doubling_reduced_reference_program(
         logical_mesh: &LogicalMesh,
-    ) -> (ryft_core::Program<Constant, Operation, Vec<Constant>, Vec<Constant>>, ArrayType) {
+    ) -> (CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>, ArrayType) {
         let reduced = Sharding::replicated(logical_mesh.clone(), 1).with_reduced_axes(["x"]).unwrap();
         let boundary = ShardMapBoundary::new(logical_mesh.clone(), vec![reduced.clone()], Vec::new(), Vec::new())
             .unwrap()
@@ -1036,7 +1036,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map_operation_lower_renders_auto_axes_as_open_dimension_shardings() {
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)]));
         let mesh = test_logical_mesh_data_model();
         let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]);
         let module = shard_map_module::<_, ArrayType, ArrayType>(
@@ -1091,7 +1091,7 @@ pub(crate) mod tests {
                     Ok(nested + x)
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
             mesh,
             outer_sharding.clone(),
             outer_sharding,
@@ -1416,7 +1416,7 @@ pub(crate) mod tests {
             module,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(error)
+                CoreError::Program(error)
                     if error.downcast_custom::<ShardMapError>() == Some(&expected),
             ),
         ));
@@ -1456,7 +1456,7 @@ pub(crate) mod tests {
             module,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(error)
+                CoreError::Program(error)
                     if error.downcast_custom::<ShardMapError>() == Some(&expected),
             ),
         ));
@@ -1480,7 +1480,7 @@ pub(crate) mod tests {
 
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let mlir_program = shard_map_module::<_, ArrayType, ArrayType>(
             |_, x| Ok(x.clone() + x),
             global_input_type,
@@ -2712,8 +2712,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let global_input_types = (
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)])),
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(4)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])),
         );
         let mlir_program = shard_map_module::<_, (ArrayType, ArrayType), ArrayType>(
             |_, (left, right)| left.dot(&right, &DotDimensionNumbers::matmul()),
@@ -3435,7 +3435,7 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
 
         // The boundary is `[r: ref<f32[4]>, x: f32[4]] -> f32[4]`, everything sharded along `x`, and the local body
@@ -3533,9 +3533,9 @@ pub(crate) mod tests {
             .unwrap();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
-        let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
+        let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let replicated_type = referent_type.clone().with_sharding(replicated.clone()).unwrap();
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
 
         // The boundary is `[r: ref<f32[2]>, x: f32[4]] -> f32[4]` with `r` replicated and `x` and the output sharded
@@ -5672,7 +5672,7 @@ pub(crate) mod tests {
                 .unwrap()[0];
             let coordinate = builder
                 .add_instruction(
-                    ReshapeOperation::new(Shape::new(vec![]), Shape::new(vec![CoreDimension::Static(1)])),
+                    ReshapeOperation::new(Shape::new(vec![]), Shape::new(vec![Dimension::Static(1)])),
                     vec![],
                     vec![coordinate],
                     None,
@@ -5730,7 +5730,7 @@ pub(crate) mod tests {
             compile_maps(&mesh, device_mesh(&reordered_mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Sharding(ryft_core::ShardingError::MeshMismatch { expected, actual })
+                CoreError::Sharding(ShardingError::MeshMismatch { expected, actual })
                     if expected == &reordered_mesh && actual == &mesh,
             ),
         ));
@@ -5761,7 +5761,7 @@ pub(crate) mod tests {
             .unwrap()[0];
         let coordinate = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![]), Shape::new(vec![CoreDimension::Static(1)])),
+                ReshapeOperation::new(Shape::new(vec![]), Shape::new(vec![Dimension::Static(1)])),
                 vec![],
                 vec![coordinate],
                 None,

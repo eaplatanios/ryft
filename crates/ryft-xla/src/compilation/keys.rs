@@ -12,8 +12,8 @@ use std::sync::{Arc, LazyLock};
 
 use prost::Message;
 use ryft_core::{
-    ArrayType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionValue, DimensionVariable,
-    DispatchInputs, ProgramError, RegionKey, Shape, Sharding, Typed,
+    ArrayType, DeviceMesh, Dimension, DimensionBounds, DimensionValue, DimensionVariable, DispatchInputs, ProgramError,
+    RegionKey, Shape, Sharding, Typed,
 };
 use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey, CompilationOptions};
 use serde::Serialize;
@@ -453,8 +453,8 @@ impl BucketedDispatchSignature {
                     .dimensions()
                     .iter()
                     .map(|dimension| match dimension {
-                        CoreDimension::Static(extent) => BucketedDimensionKey::Static(*extent),
-                        CoreDimension::Dynamic(variable) => {
+                        Dimension::Static(extent) => BucketedDimensionKey::Static(*extent),
+                        Dimension::Dynamic(variable) => {
                             let index =
                                 variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
                                     variables.push(variable.clone());
@@ -488,7 +488,7 @@ struct BucketedArrayTypeKey {
 enum BucketedDimensionKey {
     /// Statically known extent. Bucketing rewrites every static input axis into a bounded dynamic axis, so this
     /// variant is unreachable for signatures produced today. It is retained so that the normalization stays total over
-    /// [`CoreDimension`](ryft_core::Dimension).
+    /// [`Dimension`].
     Static(usize),
 
     /// Index of the axis' dimension variable in [`BucketedDispatchSignature::variables`].
@@ -737,7 +737,7 @@ fn normalize_dispatch_signature(
             .iter()
             .enumerate()
             .map(|(axis, dimension)| match dimension {
-                CoreDimension::Static(extent) => {
+                Dimension::Static(extent) => {
                     let bound = match bucketing {
                         InputBoundBucketing::PowerOfTwo => extent.checked_next_power_of_two(),
                     }
@@ -749,12 +749,9 @@ fn normalize_dispatch_signature(
                         ),
                     })?;
                     let bounds = DimensionBounds::new(0, Some(bound))?;
-                    Ok(CoreDimension::Dynamic(DimensionVariable::new(
-                        format!("input_{input_index}_axis_{axis}"),
-                        bounds,
-                    )))
+                    Ok(Dimension::Dynamic(DimensionVariable::new(format!("input_{input_index}_axis_{axis}"), bounds)))
                 }
-                CoreDimension::Dynamic(variable) => Ok(CoreDimension::Dynamic(variable.clone())),
+                Dimension::Dynamic(variable) => Ok(Dimension::Dynamic(variable.clone())),
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
@@ -771,10 +768,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer, Compile,
-        CompiledFunctionDispatcher, Context, CustomCallOperation, DataType, Dimension as CoreDimension,
-        DimensionBounds, DimensionFromScalar, DimensionType, DimensionValue, DimensionVariable,
-        DynamicBroadcastOperation, Placeholder, ReduceOperation, ReductionKind, ReferenceType, Shape, Sharding,
-        ShardingDimension, Sin, StaticShape,
+        CompiledFunction, CompiledFunctionDispatcher, Context, CustomCallOperation, DataType,
+        Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionType, DimensionValue,
+        DimensionVariable, DynamicBroadcastOperation, Placeholder, ReduceOperation, ReductionKind, ReferenceType,
+        Shape, Sharding, ShardingDimension, Sin, StaticShape,
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionOverride};
     #[cfg(feature = "cuda-13")]
@@ -827,7 +824,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let compiled: CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         let key = session.compilation_key(compiled.lowered().lowered_program()).unwrap();
         let independent_session = Session::builder().client(client).build().unwrap();
@@ -1087,7 +1084,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let compiled: CompiledFunction<Session, Type, Type> =
             staged.lower(&session).unwrap().compile(&session).unwrap();
         assert_eq!(session.cached_program_count(), 1);
 

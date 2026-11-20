@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, CastOperation, CastType,
-    ConvertElementTypeOperation, DataType, Dimension as CoreDimension, MeshAxisType, ProgramError,
-    ReducePrecisionOperation, ReductionKind, Shape, Sharding,
+    ConvertElementTypeOperation, DataType, Dimension, MeshAxisType, ProgramError, ReducePrecisionOperation,
+    ReductionKind, Shape, Sharding,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -310,8 +310,8 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     if let (Type::Array(input), Type::Array(output)) = (input_type, output_type) {
         let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions()).collect::<Vec<_>>();
         let changed_axis = dimension_pairs.iter().position(|pair| match pair {
-            (CoreDimension::Static(_), CoreDimension::Static(_)) => false,
-            (CoreDimension::Dynamic(input), CoreDimension::Dynamic(output)) => {
+            (Dimension::Static(_), Dimension::Static(_)) => false,
+            (Dimension::Dynamic(input), Dimension::Dynamic(output)) => {
                 input.bounds().upper() != output.bounds().upper()
             }
             _ => true,
@@ -351,7 +351,7 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
                 .iter()
                 .zip(output.shape().dimensions())
                 .map(|(input, output)| match (input, output) {
-                    (CoreDimension::Dynamic(_), CoreDimension::Static(_)) => output.clone(),
+                    (Dimension::Dynamic(_), Dimension::Static(_)) => output.clone(),
                     _ => input.clone(),
                 })
                 .collect();
@@ -802,7 +802,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             shape.push(width / 2);
         }
         let groups_type =
-            ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
+            ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
         let groups = block.append_operation(stable_hlo::bitcast_convert(
             physical_input,
             lower_tensor_type(&groups_type, context, location)?,
@@ -816,7 +816,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let group_rank = shape.len();
         shape.push(2);
         let expanded_type =
-            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
+            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
         let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
         let expanded = block.append_operation(stable_hlo::broadcast(
             groups.result(0).unwrap().as_ref(),
@@ -853,7 +853,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         shape.push(2);
         let reshaped = block.append_operation(stable_hlo::reshape(physical_input, &shape, location)?)?;
         let expanded_type =
-            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(CoreDimension::Static).collect()));
+            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
         let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
         let expanded = block.append_operation(stable_hlo::convert(
             reshaped.result(0).unwrap().as_ref(),
@@ -868,8 +868,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             location,
         )?)?;
         shape.pop();
-        let groups_type =
-            ArrayType::new(DataType::U8, Shape::new(shape.into_iter().map(CoreDimension::Static).collect()));
+        let groups_type = ArrayType::new(DataType::U8, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
         let groups = lower_reduce_to_mlir(
             ReductionKind::Sum,
             &[bit_axis],
@@ -1110,11 +1109,12 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, Array as CoreArray, AssertOperation, BatchAxis, BatchedProgram, Cast, ConditionOperation,
         ConvertElementType, CustomCallOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalar,
-        DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass, GuardOperation, Layout,
-        LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder, PrintOperation,
-        ProgramBatchingOutputAxesPolicy, ProgramError, ProjectedValue, ReducePrecision, ScanOperation, Shape, ShardMap,
-        ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile, TileDimension,
-        TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection, WhileOperation,
+        DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass, Error as CoreError,
+        GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder,
+        PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ProjectedValue, ReducePrecision, ScanOperation,
+        Shape, ShardMap, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile,
+        TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection,
+        WhileOperation,
     };
     use ryft_mlir::{Location, OperationResultRef};
     use ryft_pjrt::extensions::ffi::{
@@ -1469,7 +1469,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let declared_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
                 "count",
                 DimensionBounds::new(0, Some(5)).unwrap(),
             ))]),
@@ -1723,7 +1723,7 @@ mod tests {
         let value = builder.add_input(n.clone().into());
         let output = builder
             .add_instruction(
-                CastOperation::<Type>::checked(DimensionType::from(CoreDimension::Static(2)).into(), vec![n.into()])
+                CastOperation::<Type>::checked(DimensionType::from(Dimension::Static(2)).into(), vec![n.into()])
                     .unwrap(),
                 vec![],
                 vec![value],
@@ -1992,7 +1992,7 @@ mod tests {
                     _ => builder
                         .add_instruction(
                             Operation::Scan(
-                                ScanOperation::new(1, CoreDimension::Static(if entered { 2 } else { 0 }))
+                                ScanOperation::new(1, Dimension::Static(if entered { 2 } else { 0 }))
                                     .with_unroll(if wrapper == 4 { 3 } else { 1 })
                                     .unwrap(),
                             ),
@@ -2053,7 +2053,7 @@ mod tests {
                     |_, inputs: Vec<ArrayTracer>| {
                         let integer = inputs[0].convert_element_type(DataType::I64)?;
                         let dimension = integer.to_dimension(extent.to_variable())?;
-                        let checked = dimension.cast(DimensionType::from(CoreDimension::Static(2)).into(), &[])?;
+                        let checked = dimension.cast(DimensionType::from(Dimension::Static(2)).into(), &[])?;
                         let scalar = checked.to_scalar()?.convert_element_type(DataType::F64)?;
                         Ok(vec![scalar.into_projected()?])
                     },
@@ -2456,8 +2456,7 @@ mod tests {
         );
 
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(); 2]));
-        let actual =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), CoreDimension::Static(3)]));
+        let actual = ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(3)]));
         let mut builder = ProgramBuilder::new();
         let value = builder.add_input(actual);
         let output = builder
@@ -2610,7 +2609,7 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let value = builder.add_input(input_type.clone());
         let witness = builder.add_input(input_type.clone());
@@ -2748,7 +2747,7 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), Dimension::Static(2)]));
         let client = execution_client();
         // An array axis and a first-class dimension can share an actual identity, so a witness of the identity `b`
         // needs no comparison beyond the declared extent of `b`. Equal non-singleton bounds on an independent identity
@@ -2987,9 +2986,9 @@ mod tests {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), CoreDimension::Static(3)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
         let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3), a.simplified_dimension()]));
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]));
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension()]));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
@@ -3045,7 +3044,7 @@ mod tests {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let b = DimensionType::new("b", bounds);
         let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), CoreDimension::Static(3)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension()]));
         let mut builder = ArrayIrProgramBuilder::new();
@@ -3181,8 +3180,7 @@ mod tests {
         // A second cast drops the layout again so that the executable boundary stays row-major.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let exact = ArrayType::new_static(DataType::F64, [2, 3]);
-        let symbolic =
-            ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(3)]));
+        let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
         let laid_out = symbolic.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(exact.clone().into());
@@ -3320,8 +3318,7 @@ mod tests {
             .unwrap();
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let source =
-            ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(3)]));
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
         let laid_out = source.clone().with_layout(layout.clone());
         let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone());
         let copied = ArrayType::new_static(DataType::F64, [6]);
@@ -4262,7 +4259,7 @@ mod tests {
             module,
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
             ),
         ));
@@ -4422,7 +4419,7 @@ mod tests {
         let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
         let partially_exact =
-            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), Dimension::Static(2)]));
         let cases = [
             (
                 unbounded.clone(),

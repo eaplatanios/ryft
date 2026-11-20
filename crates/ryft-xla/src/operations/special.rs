@@ -71,7 +71,7 @@ impl LowerableOperation for ErfOperation<ArrayType> {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Array as CoreArray, ArrayOperation, Erf};
+    use ryft_core::{Array, ArrayOperation, Erf};
 
     use crate::Session;
     use crate::lowering::tests::lowered_unary_module;
@@ -111,7 +111,7 @@ mod tests {
         ];
         let input = replicated_array(&session, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
         let device_values = input.erf().unwrap().copy_to_host().unwrap().elements::<f32>().unwrap();
-        let reference_values = CoreArray::vector(values.to_vec()).unwrap().erf().unwrap().to_f64s();
+        let reference_values = Array::vector(values.to_vec()).unwrap().erf().unwrap().to_f64s();
         assert_eq!(device_values.len(), reference_values.len());
         for ((input, device_value), reference_value) in
             values.iter().zip(device_values.iter()).zip(reference_values.iter())
@@ -143,8 +143,7 @@ mod tests {
         let input = replicated_array(&session, &mesh, DataType::F8E8M0FNU, &[256], &bytes);
         let output = input.erf().unwrap().copy_to_host_bytes().unwrap();
         assert_eq!(&output[..3], &[0, 1, 2]);
-        let reference =
-            CoreArray::new(ArrayType::new_static(DataType::F8E8M0FNU, [256]), bytes).unwrap().erf().unwrap();
+        let reference = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [256]), bytes).unwrap().erf().unwrap();
         assert_eq!(output, reference.logical_bytes());
     }
 }

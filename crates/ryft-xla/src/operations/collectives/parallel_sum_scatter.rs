@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
-    ParallelSumScatterOperation, ProgramError, ReductionKind,
+    ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelSumScatterOperation, ProgramError,
+    ReductionKind,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -122,7 +122,7 @@ fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     let native_output_type = match operation.options().mode() {
         CollectiveMode::Tiled => output_array_type.clone(),
         CollectiveMode::Untiled => output_array_type
-            .with_inserted_dimension(operation.scatter_axis(), CoreDimension::Static(1))
+            .with_inserted_dimension(operation.scatter_axis(), Dimension::Static(1))
             .map_err(ProgramError::from)?,
     };
     let output_type = lower_tensor_type(&native_output_type, context, location)?;
@@ -175,7 +175,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // `parallel_sum_scatter` over the manual mesh axis `"x"` sums the two local `f32[4]` shards elementwise and
         // scatters the sum, leaving each device with its own `f32[2]` chunk, so the sharded global output is `f32[4]`.

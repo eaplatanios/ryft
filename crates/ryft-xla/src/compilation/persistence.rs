@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use prost::Message;
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
-    ExternalReferenceBinding, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, ReferenceSource, Shape, Sharding,
-    ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind,
+    ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, ExternalReferenceBinding,
+    Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, ReferenceSource, Shape, Sharding, ShardingDimension,
+    StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{BufferType, LoadOptions};
@@ -200,8 +200,8 @@ impl PersistentArraySignature {
                 .dimensions()
                 .iter()
                 .map(|dimension| match dimension {
-                    CoreDimension::Static(value) => PersistentDimension::Static(*value as u64),
-                    CoreDimension::Dynamic(variable) => {
+                    Dimension::Static(value) => PersistentDimension::Static(*value as u64),
+                    Dimension::Dynamic(variable) => {
                         let index = variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
                             variables.push(variable.clone());
                             variables.len() - 1
@@ -288,7 +288,7 @@ impl PersistentArraySignature {
                                     reason: format!("value {value} does not fit in `usize`"),
                                 })
                             })
-                            .map(CoreDimension::Static),
+                            .map(Dimension::Static),
                         PersistentDimension::Dynamic { variable } => variables
                             .get(usize::try_from(variable).map_err(|_| {
                                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
@@ -296,7 +296,7 @@ impl PersistentArraySignature {
                                 })
                             })?)
                             .cloned()
-                            .map(CoreDimension::Dynamic)
+                            .map(Dimension::Dynamic)
                             .ok_or_else(|| {
                                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                                     reason: "array type references an unknown dimension variable".into(),
@@ -1439,10 +1439,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, AnalyzableCompilationDomain, ArrayReference, ArrayType, AssertOperation, CompilationCacheDomain,
-        CompilationDomain, DataType, Dimension as CoreDimension, DimensionBounds, DimensionVariable, DiskCache,
-        ExternalReferenceBinding, Memory, Placeholder, PrintOperation, ProgramError, ReferenceAddUpdateOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceType, Shape, Sharding, ShardingDimension, Sin,
-        StagedFunction as CoreStagedFunction, StatefulCompilationDomain, Typed, ValueProjection,
+        CompilationDomain, CompilationTracer, CompiledFunction, DataType, Dimension, DimensionBounds,
+        DimensionVariable, DiskCache, Error as CoreError, ExternalReferenceBinding, Memory, Placeholder,
+        PrintOperation, ProgramError, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSource,
+        ReferenceType, Shape, Sharding, ShardingDimension, Sin, StagedFunction, StatefulCompilationDomain, Typed,
+        ValueProjection,
     };
     use ryft_pjrt::protos::CompilationOptions;
 
@@ -1490,13 +1491,11 @@ mod tests {
     #[test]
     fn test_persistent_array_type_round_trips_zero_space_metadata() {
         let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(4)).unwrap());
-        let array_type = ArrayType::new(
-            DataType::Zero,
-            Shape::new(vec![CoreDimension::Static(2), CoreDimension::Dynamic(batch.clone())]),
-        )
-        .with_memory(Memory::Host { pinned: true });
+        let array_type =
+            ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(batch.clone())]))
+                .with_memory(Memory::Host { pinned: true });
         let output_type =
-            ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
 
         let (restored_inputs, restored_outputs) =
             PersistentArraySignature::encode(std::slice::from_ref(&array_type), std::slice::from_ref(&output_type))
@@ -1505,7 +1504,7 @@ mod tests {
 
         assert_eq!(restored_inputs[0].data_type(), array_type.data_type());
         assert_eq!(restored_inputs[0].memory(), array_type.memory());
-        assert_eq!(restored_inputs[0].dimension(0), CoreDimension::Static(2));
+        assert_eq!(restored_inputs[0].dimension(0), Dimension::Static(2));
         assert_eq!(restored_inputs[0].dimension(1).variable().unwrap().name(), "batch");
         assert_eq!(
             restored_inputs[0].dimension(1).variable().unwrap().bounds(),
@@ -1572,7 +1571,7 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let capture = Array::from_host_buffer(
@@ -1585,15 +1584,15 @@ mod tests {
         .unwrap();
         fn add_capture(
             _: Vec<Constant>,
-            captures: Vec<ryft_core::compilation::CompilationTracer<Session>>,
-            input: ryft_core::compilation::CompilationTracer<Session>,
-        ) -> Result<ryft_core::compilation::CompilationTracer<Session>, Error> {
+            captures: Vec<CompilationTracer<Session>>,
+            input: CompilationTracer<Session>,
+        ) -> Result<CompilationTracer<Session>, Error> {
             let capture = ValueProjection::<ArrayType>::into_projected(captures.into_iter().next().unwrap())
                 .map_err(ProgramError::from)?;
             let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
-        let staged: CoreStagedFunction<Session, Type, Type> = CoreStagedFunction::<Session, Type, Type>::stage(
+        let staged: StagedFunction<Session, Type, Type> = StagedFunction::<Session, Type, Type>::stage(
             add_capture,
             vec![Value::Array(capture.clone())],
             Type::Array(input_type.clone()),
@@ -1679,7 +1678,7 @@ mod tests {
             session.execute(&restored, vec![Value::Array(capture.clone())]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
             ),
         ));
         let wrong_type = f64_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0]);
@@ -1695,7 +1694,7 @@ mod tests {
                 session.execute(&restored, inputs),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    CoreError::Program(ProgramError::InvalidArgument { message })
                         if *message == expected,
                 ),
             ));
@@ -1951,7 +1950,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]))
+        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let lowered = session
@@ -2007,7 +2006,7 @@ mod tests {
             .unwrap();
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(state_sharding.clone())
             .unwrap();
         let mut builder = ProgramBuilder::new();
@@ -2151,7 +2150,7 @@ mod tests {
     fn test_session_deserialize_compiled_program_restores_into_a_fresh_compilation_cache() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let directory = tempdir().unwrap();
@@ -2165,7 +2164,7 @@ mod tests {
         )
         .unwrap()
         .into_inner();
-        let first: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let first: CompiledFunction<Session, Type, Type> =
             staged.lower(&first_session).unwrap().compile(&first_session).unwrap();
         assert_eq!(first_session.compilation_cache().statistics().compilations, 1);
         drop(first);
@@ -2175,7 +2174,7 @@ mod tests {
         let staged = crate::stage::<_, ArrayType, ArrayType>(|x| x.sin().unwrap(), input_type, Options::new(mesh))
             .unwrap()
             .into_inner();
-        let _restored: ryft_core::compilation::CompiledFunction<Session, Type, Type> =
+        let _restored: CompiledFunction<Session, Type, Type> =
             staged.lower(&second_session).unwrap().compile(&second_session).unwrap();
         let statistics = second_session.compilation_cache().statistics();
         assert_eq!(statistics.persistent_hits, 1);

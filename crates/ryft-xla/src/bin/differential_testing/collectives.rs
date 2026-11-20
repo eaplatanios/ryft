@@ -6,10 +6,10 @@ use std::error::Error;
 use serde::Deserialize;
 
 use ryft_core::{
-    ArrayType, AxisIndex, BatchAxis, Broadcast, ConvertElementType, Differentiate, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
-    ParallelSumScatter, ParallelVary, ProgramError, ReductionKind, ShardMapOptions, Sharding, ShardingDimension, Typed,
-    Value as CoreValue, ValueProjection, batch, shard_map,
+    ArrayType, AxisIndex, BatchAxis, Broadcast, CollectiveOptions, ConvertElementType, DataType, Device, DeviceMesh,
+    Differentiate, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance,
+    ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter, ParallelVary, ProgramError, ReductionKind,
+    ShardMapOptions, Sharding, ShardingDimension, TypeError, Typed, Value, ValueProjection, batch, shard_map,
 };
 use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{ArrayTracer, FromPjrt, TracedProgram, trace};
@@ -178,7 +178,7 @@ impl CollectiveCase {
                     )
                     .unwrap()
                 },
-                ArrayType::new_static(ryft_core::DataType::F32, global_shape.clone()),
+                ArrayType::new_static(DataType::F32, global_shape.clone()),
             )?;
             traced.to_mlir_module("main")?
         } else {
@@ -195,8 +195,8 @@ impl CollectiveCase {
                     .unwrap()
                 },
                 (
-                    ArrayType::new_static(ryft_core::DataType::F32, global_shape.clone()),
-                    ArrayType::new_static(ryft_core::DataType::F32, seed_global_shape.clone()),
+                    ArrayType::new_static(DataType::F32, global_shape.clone()),
+                    ArrayType::new_static(DataType::F32, seed_global_shape.clone()),
                 ),
             )?;
             traced.to_mlir_module("main")?
@@ -207,12 +207,8 @@ impl CollectiveCase {
             ..Default::default()
         }))?;
         let client = &*Box::leak(Box::new(client));
-        let devices = client
-            .addressable_devices()?
-            .iter()
-            .map(ryft_core::Device::from_pjrt)
-            .collect::<Result<Vec<_>, _>>()?;
-        let device_mesh = ryft_core::DeviceMesh::new(mesh, devices)?;
+        let devices = client.addressable_devices()?.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
+        let device_mesh = DeviceMesh::new(mesh, devices)?;
         let count = self.local_shape.iter().product::<usize>();
         let values = (0..self.participants)
             .map(|participant| {
@@ -266,7 +262,7 @@ impl CollectiveCase {
             + ParallelSumScatter<ArrayType>
             + ParallelVary<ArrayType>,
     {
-        let mut options = if self.tiled { ryft_core::CollectiveOptions::tiled() } else { Default::default() };
+        let mut options = if self.tiled { CollectiveOptions::tiled() } else { Default::default() };
         if let Some(groups) = &self.groups {
             options = options.with_axis_index_groups(groups.clone());
         }
@@ -316,15 +312,14 @@ impl CollectiveCase {
         match self.transform.as_str() {
             "primal" if self.operation == "axis_index" => {
                 let index = input.domain().axis_index(&self.axis_name)?;
-                let index = index.convert_element_type(ryft_core::DataType::F32)?;
+                let index = index.convert_element_type(DataType::F32)?;
                 let index_sharding = index
                     .r#type()
                     .sharding()
                     .unwrap()
                     .with_broadcasted_dimensions(input.r#type().rank(), &[])
-                    .map_err(ryft_core::TypeError::from)?;
-                let output_type =
-                    input.r#type().into_owned().with_sharding(index_sharding).map_err(ryft_core::TypeError::from)?;
+                    .map_err(TypeError::from)?;
+                let output_type = input.r#type().into_owned().with_sharding(index_sharding).map_err(TypeError::from)?;
                 Ok(vec![index.broadcast(output_type, &[])?])
             }
             "primal" => Ok(vec![self.apply(input)?]),

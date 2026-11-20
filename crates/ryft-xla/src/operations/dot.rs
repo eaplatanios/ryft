@@ -611,11 +611,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, Complex, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
-        Dot, DotAlgorithm, DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep,
-        EinsumPathStrategy, EinsumSpecification, MeshAxisType, Operation as CoreOperation, Placeholder,
-        ProjectedContext, RaggedDot, RaggedDotDimensionNumbers, Sharding, ShardingDimension, Typed, bf16,
-        differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
+        Array as CoreArray, ArrayOperation, Complex, Dimension, DimensionBounds, DimensionVariable, Dot, DotAlgorithm,
+        DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep, EinsumPathStrategy,
+        EinsumSpecification, MeshAxisType, Operation, Placeholder, ProjectedContext, RaggedDot,
+        RaggedDotDimensionNumbers, Sharding, ShardingDimension, Typed, bf16, differentiate_at, einsum, f8e4m3fn,
+        f8e5m2, f16,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -782,9 +782,8 @@ mod tests {
         // type, as XLA's `preferred_element_type` contract requires, with the operands kept at their narrow element
         // type.
         let operand_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let left = builder.add_input(operand_type.clone());
         let right = builder.add_input(operand_type.clone());
@@ -817,7 +816,7 @@ mod tests {
         // A dynamic dimension whose bounds admit one extent contracts with the static dimension of that extent.
         let proven = DimensionVariable::new("proven", DimensionBounds::new(2, Some(3)).unwrap());
         let left_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Dynamic(proven)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(proven)]));
         let right_type = ArrayType::new_static(DataType::F32, [2, 2]);
         let mut builder = ProgramBuilder::new();
         let left = builder.add_input(left_type.clone());

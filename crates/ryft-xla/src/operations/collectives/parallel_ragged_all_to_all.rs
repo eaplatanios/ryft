@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, AxisIndexOperation, DataType, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
-    ParallelRaggedAllToAllOperation, ProgramError, ReductionKind, Shape,
+    ArrayType, AxisIndexOperation, DataType, Dimension, MemberOperation, Operation, ParallelRaggedAllToAllOperation,
+    ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
@@ -298,7 +298,7 @@ fn lower_batched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         let flat_type = input_types[index].clone().with_shape(Shape::new(
             std::iter::once(flat_extent)
                 .chain(dimensions[batch_dimension_count + 1..].iter().copied())
-                .map(CoreDimension::Static)
+                .map(Dimension::Static)
                 .collect(),
         ));
         flat_values.push(reshape(input_values[index], &flat_type, block)?);
@@ -314,10 +314,9 @@ fn lower_batched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
     for index in 2..6 {
         let mut value = input_values[index];
         if batch_dimension_count != 1 {
-            let item_type = input_types[index].clone().with_shape(Shape::new(vec![
-                CoreDimension::Static(item_count),
-                CoreDimension::Static(metadata_length),
-            ]));
+            let item_type = input_types[index]
+                .clone()
+                .with_shape(Shape::new(vec![Dimension::Static(item_count), Dimension::Static(metadata_length)]));
             value = reshape(value, &item_type, block)?;
         }
         if input_types[index].data_type() != DataType::U64 {
@@ -413,7 +412,7 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         )
     })?;
     let mut expanded_dimensions = input_types[1].shape().dimensions().to_vec();
-    expanded_dimensions[0] = CoreDimension::Static(expanded_extent);
+    expanded_dimensions[0] = Dimension::Static(expanded_extent);
     let expanded_output_type = input_types[1].clone().with_shape(Shape::new(expanded_dimensions));
     let expanded_output = if expanded_output_type.static_shape().is_some() {
         lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
@@ -545,8 +544,8 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         location,
     )?;
     let mut copy_dimensions = input_types[1].shape().dimensions().to_vec();
-    copy_dimensions[0] = CoreDimension::Static(output_extent);
-    copy_dimensions.insert(0, CoreDimension::Static(metadata_length));
+    copy_dimensions[0] = Dimension::Static(output_extent);
+    copy_dimensions.insert(0, Dimension::Static(metadata_length));
     let copy_type =
         lower_tensor_type(&input_types[1].clone().with_shape(Shape::new(copy_dimensions)), context, location)?;
     let copies = block.append_operation(stable_hlo::reshape_with_output_type(expanded, copy_type, location)?)?;
@@ -576,9 +575,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchableOperation,
-        BatchingContext, Context, Differentiate, DimensionBounds, DimensionVariable, EmptyRegionDriver, LogicalMesh,
-        MeshAxis, MeshAxisType, ParallelRaggedAllToAll, Reduce, ShardMapOptions, ShardingDimension, StagingContext,
-        TracingContext, Value as CoreValue, batch, shard_map,
+        BatchingContext, Context, Differentiate, DimensionBounds, DimensionVariable, EmptyRegionDriver,
+        Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, ParallelRaggedAllToAll, Reduce, ShardMapOptions,
+        ShardingDimension, StagingContext, TracingContext, Value, batch, shard_map,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_core::{Device, DeviceMesh, Sharding};
@@ -1432,7 +1431,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend",
             ),
         ));
@@ -1459,7 +1458,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message
                         == "`parallel_ragged_all_to_all` lowering does not support the batching-internal \
                             physical operand \
@@ -1475,7 +1474,7 @@ mod tests {
         assert_eq!(operation.batch_dimension_count(), 1);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(4)).unwrap());
         let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Dynamic(rows)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(rows)]));
         let metadata_type = ArrayType::new_static(DataType::I32, [2, 2]);
         let mlir_context = MlirContext::new();
         let location = mlir_context.unknown_location();
@@ -1500,7 +1499,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message
                         == "`parallel_ragged_all_to_all` lowering of batch dimensions requires static input shapes but \
                             input 0 has type `f32[2, rows]`",

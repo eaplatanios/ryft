@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, DataType, Dimension as CoreDimension, EffectClass, Operation as CoreOperation, PadOperation,
-    ProgramError, Shape, Type as RyftType, TypeError,
+    ArrayType, DataType, Dimension, EffectClass, Operation, PadOperation, ProgramError, Shape, Type as CoreType,
+    TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -98,7 +98,7 @@ impl LowerableOperation for PadOperation<Type> {
 /// Lowers a [`PadOperation`] to StableHLO for both `PadOperation<ArrayType>`, which passes no `output_extents`, and
 /// `PadOperation<Type>`, which passes its explicit first-class output extents in `output_extents`.
 #[allow(clippy::too_many_arguments)]
-fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: CoreType, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     operation: &PadOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
@@ -248,7 +248,7 @@ fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c, 't>, L: C
     };
     let mut refined_type = physical_output_type;
     for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, CoreDimension::Static(_)) {
+        if matches!(dimension, Dimension::Static(_)) {
             continue;
         }
         let extent = match output_extents {
@@ -333,8 +333,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ConstantOperation, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, Placeholder,
-        SliceOperation, TypedProgram,
+        ConstantOperation, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, Error as CoreError,
+        Placeholder, SliceOperation, TypedProgram,
     };
     use ryft_mlir::{Operation as MlirOperation, Type as MlirType, Value as MlirValue};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -467,9 +467,9 @@ mod tests {
     fn test_lower_pad_to_mlir() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![CoreDimension::Static(1)]));
+        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(1)]));
         let padding_type = ArrayType::scalar(DataType::I64);
-        let output_type = input_type.clone().with_shape(Shape::new(vec![CoreDimension::Static(3)]));
+        let output_type = input_type.clone().with_shape(Shape::new(vec![Dimension::Static(3)]));
         let input_tensor = lower_tensor_type(&input_type, &context, location).unwrap();
         let padding_tensor = lower_tensor_type(&padding_type, &context, location).unwrap();
         let mut block = context.block(&[(input_tensor, location), (padding_tensor, location)]);
@@ -489,7 +489,7 @@ mod tests {
             .unwrap_err(),
             Error::Core(core_error) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
             ),
         ));
         // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
@@ -571,7 +571,7 @@ mod tests {
             (2, i64::MIN, i64::MAX, 0, vec![i64::MAX]),
             (2, i64::MIN, 0, i64::MAX as usize, vec![i64::MIN]),
         ] {
-            let input_type = ArrayType::new(DataType::I64, Shape::new(vec![CoreDimension::Static(size)]));
+            let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(size)]));
             let padding_type = ArrayType::scalar(DataType::I64);
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type);

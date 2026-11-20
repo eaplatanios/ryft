@@ -1,7 +1,7 @@
 use ryft_core::{
-    ArrayReferenceTransform, ArrayType, Operation as CoreOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation,
+    ArrayReferenceTransform, ArrayType, Operation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation,
 };
 use ryft_mlir::ValueRef;
 

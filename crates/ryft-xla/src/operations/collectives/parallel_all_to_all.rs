@@ -1,7 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
-    ParallelAllToAllOperation, ProgramError,
+    ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelAllToAllOperation, ProgramError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -138,7 +137,7 @@ fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
                 split_axis += 1;
             }
             let expanded_type = input_array_type
-                .with_inserted_dimension(concatenation_axis, CoreDimension::Static(1))
+                .with_inserted_dimension(concatenation_axis, Dimension::Static(1))
                 .map_err(ProgramError::from)?;
             let expanded_type = lower_tensor_type(&expanded_type, context, location)?;
             let broadcast_dimensions =
@@ -175,9 +174,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        CollectiveOptions, DataType, Device, DeviceMesh, DimensionBounds, DimensionType, LogicalMesh, MeshAxis,
-        MeshAxisType, ParallelAllToAll, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
-        TypeError, shard_map,
+        CollectiveOptions, DataType, Device, DeviceMesh, DimensionBounds, DimensionType, Error as CoreError,
+        LogicalMesh, MeshAxis, MeshAxisType, ParallelAllToAll, Shape, ShardMapBoundary, ShardMapOptions, Sharding,
+        ShardingDimension, TypeError, shard_map,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, Program};
@@ -205,7 +204,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // `parallel_all_to_all` over the manual mesh axis `"x"` with both the split and the concatenation axes at 0
         // keeps the local `f32[4]` shape. Each device splits its shard into two chunks, keeps its own chunk, and
@@ -350,7 +349,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(6)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
         )
         .unwrap();
 
@@ -483,7 +482,7 @@ mod tests {
             match (result, expected) {
                 (Ok(outputs), None) => assert_eq!(outputs.len(), 1),
                 (Err(Error::Core(error)), Some(expected)) => {
-                    assert_eq!(error.as_ref(), &ryft_core::Error::Program(expected));
+                    assert_eq!(error.as_ref(), &CoreError::Program(expected));
                     // Rejection happens before a channel is allocated, so the next channel is still the first one.
                     assert_eq!(state.next_channel_id(), 1);
                 }

@@ -5,8 +5,7 @@ use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, Operation as CoreOperation, Parameter, Placeholder, ProgramError,
-    RematerializationOptimizationBarrier, Typed,
+    DifferentiableType, Operation, Parameter, Placeholder, ProgramError, RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -186,7 +185,7 @@ impl<V: Typed + Parameter, RegionOperation, S: CustomRuleSource<V, RegionOperati
     for CompositeOperation<V, RegionOperation, S>
 where
     V::Type: Eq + Hash + DifferentiableType + Into<Type>,
-    Self: CoreOperation<Type = V::Type>,
+    Self: Operation<Type = V::Type>,
 {
     #[inline]
     fn composite_key(&self) -> Option<&CompositeKey> {
@@ -286,7 +285,7 @@ where
 
 impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeTransposeOperation<V, RegionOperation, S>
 where
-    Self: CoreOperation,
+    Self: Operation,
 {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -314,8 +313,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeJvpRule,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Mul, MulOperation,
-        NamedComposite, PrintOperation, Program as CoreProgram, ProjectedContext, Reduce, Softmax, batch, composite,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Error as CoreError, Mul,
+        MulOperation, NamedComposite, PrintOperation, Program, ProjectedContext, Reduce, Softmax, batch, composite,
         differentiate_at, softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
@@ -336,7 +335,7 @@ mod tests {
     /// interned `body`, and returns their outputs.
     fn named_calls_program(
         rules: &CustomRuleRegistration<Constant, Operation>,
-        body: &Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>>,
+        body: &Arc<Program<Constant, Operation, Vec<Constant>, Vec<Constant>>>,
         calls: usize,
     ) -> FlatProgram {
         let vector_type = test_vector_type(4);
@@ -363,7 +362,7 @@ mod tests {
     }
 
     /// Returns the program `x ↦ x + x` over the test vector type, shared as a named composite body.
-    fn doubled_body() -> Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>> {
+    fn doubled_body() -> Arc<Program<Constant, Operation, Vec<Constant>, Vec<Constant>>> {
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -534,7 +533,7 @@ mod tests {
             operation.lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`composite` expected a primal region but got no regions",
             ),
         ));
@@ -544,7 +543,7 @@ mod tests {
             operation.lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`composite` expected 2 attached regions but got 1",
             ),
         ));
@@ -1099,7 +1098,7 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "a `composite_transpose` has no forward program and cannot be lowered to \
                         StableHLO; transpose it before lowering",
             ),

@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CompositeKey, DataType, Dimension as CoreDimension, DomainTracingContext, EmptyRegionDriver,
-    MemberInterpretableOperation, Operation as CoreOperation, ProgramError, ScaledDotOperation, Shape,
-    Value as CoreValue,
+    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver,
+    MemberInterpretableOperation, Operation, ProgramError, ScaledDotOperation, Shape, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -410,11 +409,7 @@ fn scaled_dot_dummy_scale_type(elements: &ArrayType, contracting_dimensions: &[u
                 .enumerate()
                 .map(
                     |(axis, dimension)| {
-                        if contracting_dimensions.contains(&axis) {
-                            CoreDimension::Static(1)
-                        } else {
-                            dimension.clone()
-                        }
+                        if contracting_dimensions.contains(&axis) { Dimension::Static(1) } else { dimension.clone() }
                     },
                 )
                 .collect(),
@@ -442,14 +437,14 @@ fn scaled_dot_uses_cuda_physical_boundary(
     ] {
         if contracting_dimensions
             .iter()
-            .any(|axis| matches!(input_types[element_index].dimension(*axis), CoreDimension::Dynamic(_)))
+            .any(|axis| matches!(input_types[element_index].dimension(*axis), Dimension::Dynamic(_)))
         {
             return Ok(false);
         }
         if has_scale {
             if contracting_dimensions
                 .iter()
-                .any(|axis| matches!(input_types[scale_index].dimension(*axis), CoreDimension::Dynamic(_)))
+                .any(|axis| matches!(input_types[scale_index].dimension(*axis), Dimension::Dynamic(_)))
             {
                 return Ok(false);
             }
@@ -500,7 +495,7 @@ fn block_scaled_dot_custom_call_permutations(
         if rank != batching_dimension_count + 2 {
             return Ok(None);
         }
-        let (CoreDimension::Static(element_extent), CoreDimension::Static(scale_extent)) =
+        let (Dimension::Static(element_extent), Dimension::Static(scale_extent)) =
             (elements.dimension(contracting_dimension), scales.dimension(contracting_dimension))
         else {
             return Ok(None);
@@ -562,11 +557,10 @@ mod tests {
     /// `f4e2m1fn [2, 16]` operands and `f8e4m3fn [2, 1]` scales over blocks of 16.
     fn scaled_dot_fixture_program() -> (Program<Vec<Constant>, Vec<Constant>>, Vec<ArrayType>, Vec<ArrayType>) {
         let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(16)]));
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
         let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone()),
@@ -638,9 +632,8 @@ mod tests {
         // decomposition ignores the identity operands rather than imposing block ratio requirements on an absent
         // scale.
         let element_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let inputs = vec![builder.add_input(element_type.clone()), builder.add_input(element_type.clone())];
         let output = builder
@@ -894,18 +887,18 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let left_type = ArrayType::new(
             DataType::F8E4M3FN,
-            Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Static(32)]),
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(32)]),
         );
         let right_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(32)]));
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(1), Dimension::Static(32)]));
         let left_scale_type = ArrayType::new(
             DataType::F8E8M0FNU,
-            Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Static(1)]),
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(1)]),
         );
         let right_scale_type =
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
         let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(1)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1)]));
         let input_types = vec![left_type, right_type, left_scale_type, right_scale_type];
         let output_types = vec![output_type];
         let mut builder = ProgramBuilder::new();
@@ -982,17 +975,17 @@ mod tests {
             let blocks = DimensionVariable::new("blocks", DimensionBounds::new(1, Some(block_bound)).unwrap());
             let element_type = ArrayType::new(
                 DataType::F8E4M3FN,
-                Shape::new(vec![CoreDimension::Static(1), CoreDimension::Dynamic(elements)]),
+                Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(elements)]),
             );
             let scale_type = ArrayType::new(
                 DataType::F8E8M0FNU,
                 Shape::new(vec![
-                    CoreDimension::Static(1),
-                    if block_bound == 2 { CoreDimension::Static(1) } else { CoreDimension::Dynamic(blocks) },
+                    Dimension::Static(1),
+                    if block_bound == 2 { Dimension::Static(1) } else { Dimension::Dynamic(blocks) },
                 ]),
             );
             let output_type =
-                ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
             let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
             let mut builder = ProgramBuilder::new();
             let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
@@ -1051,11 +1044,10 @@ mod tests {
         // target platform reaches the callee body, while both outer call sites reuse the same function.
 
         let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(16)]));
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
         let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut callee_builder = ProgramBuilder::new();
         let callee_inputs = vec![
             callee_builder.add_input(element_type.clone()),
@@ -1143,7 +1135,7 @@ mod tests {
             [(DataType::F8E4M3FN, DataType::F8E8M0FNU), (DataType::F4E2M1FN, DataType::F8E4M3FN)]
         {
             let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
             let (_, program) = DomainTracingContext::<Session>::trace(
                 |inputs: Vec<Tracer>| {
                     let BlockQuantizedValue { elements, scales, .. } =

@@ -174,8 +174,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        DataType, Device, Dimension as CoreDimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, ShardingDimension, StaticShape,
+        DataType, Device, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        ShardingDimension, StaticShape,
     };
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2};
@@ -204,7 +204,7 @@ mod tests {
 
         // A type without a static shape has no shard layout.
         let dynamic = DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(10)).unwrap());
-        let dynamic_shape = Shape::new(vec![CoreDimension::Dynamic(dynamic)]);
+        let dynamic_shape = Shape::new(vec![Dimension::Dynamic(dynamic)]);
         assert!(matches!(
             ArrayMetadata::new(ArrayType::new(DataType::F32, dynamic_shape.clone()), None, mesh),
             Err(Error::Array(error)) if matches!(error.as_ref(),

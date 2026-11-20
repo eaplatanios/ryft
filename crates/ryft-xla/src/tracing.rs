@@ -255,7 +255,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ConstrainSharding, DataType, Dimension as CoreDimension, EffectClass, LogicalMesh, MeshAxis, MeshAxisType,
+        ConstrainSharding, DataType, Dimension, EffectClass, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
         Print, RegionRole, Reshape, Reshard, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
@@ -328,7 +328,7 @@ mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if message == "traced function failure",
             ),
         ));
@@ -356,7 +356,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
         )
         .unwrap();
 
@@ -392,7 +392,7 @@ mod tests {
     fn test_traced_program_to_mlir_module() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn test_traced_program_to_mlir_module_reshard_then_reshape() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
@@ -430,11 +430,7 @@ mod tests {
                 move |x: ArrayTracer| {
                     x.reshard(&sharding)
                         .unwrap()
-                        .reshape(Shape::new(vec![
-                            CoreDimension::Static(1),
-                            CoreDimension::Static(8),
-                            CoreDimension::Static(1),
-                        ]))
+                        .reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(8), Dimension::Static(1)]))
                         .unwrap()
                 }
             },
@@ -469,7 +465,7 @@ mod tests {
         .unwrap();
         let tracked = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let constraint = test_sharding(&mesh, vec![ShardingDimension::sharded(["a"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(tracked.clone())
             .unwrap();
 

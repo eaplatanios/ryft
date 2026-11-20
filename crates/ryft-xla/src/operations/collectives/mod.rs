@@ -1,4 +1,4 @@
-use ryft_core::{ArrayType, CollectiveAxes, Dimension as CoreDimension, ProgramError, SHARD_MAP_OPERATION_NAME};
+use ryft_core::{ArrayType, CollectiveAxes, Dimension, ProgramError, SHARD_MAP_OPERATION_NAME};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
@@ -174,7 +174,7 @@ fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     for (axis, &extent) in extents.iter().enumerate() {
-        if !matches!(output_type.shape().dimensions()[axis], CoreDimension::Dynamic(_)) {
+        if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
             continue;
         }
         let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
@@ -197,11 +197,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, Array as CoreArray, ArrayOperation, AxisIndex, CollectiveOptions, ConvertElementType, DataType, Device,
-        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, ParallelAllGather,
-        ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelCastOperation,
-        ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelReduce, ParallelSumScatter,
-        ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
-        TypeError, Value as CoreValue, auto_axes, shard_map,
+        DeviceMesh, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation,
+        ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation,
+        ParallelCastOperation, ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelReduce,
+        ParallelSumScatter, ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions, Sharding,
+        ShardingDimension, TypeError, Value, auto_axes, shard_map,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
     use ryft_pjrt::{BufferType, Program};
@@ -332,7 +332,7 @@ mod tests {
             mesh_axis_replica_groups(&state, Vec::<String>::new()),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if message == "collective requires at least one axis name",
             ),
         ));
@@ -340,7 +340,7 @@ mod tests {
             mesh_axis_replica_groups(&state, ["x", "y"]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if message
                         == "collective over axes `(x, y)` spans manual regions whose meshes have different topologies",
             ),
@@ -349,7 +349,7 @@ mod tests {
             mesh_axis_replica_groups(&state, "z"),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if message
                         == "collective over axis `z` cannot lower inside this `shard_map` manual region because the \
                             region does not bind that axis as a manual mesh axis",
@@ -359,7 +359,7 @@ mod tests {
             mesh_axis_replica_groups(&CollectiveLoweringState::new(), "x"),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if message == "collective over axis `x` can only be lowered inside a `shard_map` manual region",
             ),
         ));
@@ -388,7 +388,7 @@ mod tests {
             collective_replica_groups(&state, "y", 2, None),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if message == "collective over axis `y` records size 2, but the enclosing mesh axis has size 4",
             ),
         ));
@@ -396,7 +396,7 @@ mod tests {
             collective_replica_groups(&state, "y", 4, Some(&[vec![0, 4]])),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if message == "collective over axis `y` has group member 4 outside axis size 4",
             ),
         ));
@@ -443,7 +443,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)])),
         )
         .unwrap();
 
@@ -573,7 +573,7 @@ mod tests {
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == format!(
                             "`{}` cannot use tracked mesh metadata inside an unchecked manual binding",
                             operation.name(),
@@ -586,7 +586,7 @@ mod tests {
                 lower_state_cast(&operation, state, input_type.clone(), std::slice::from_ref(&input_type)),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == format!(
                             "`{}` output types do not match the enclosing manual mesh contract",
                             operation.name(),
@@ -606,7 +606,7 @@ mod tests {
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == format!(
                             "`{}` operation mesh does not match the enclosing manual axis `x` mesh",
                             operation.name(),
@@ -619,7 +619,7 @@ mod tests {
                 lower_state_cast(&operation, state, input_type, &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    CoreError::Program(ProgramError::UnsupportedOperation { message })
                         if *message
                             == "collective over axis `x` can only be lowered inside a `shard_map` manual region",
                 ),
@@ -654,7 +654,7 @@ mod tests {
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    CoreError::Program(ProgramError::MalformedProgram(message))
                         if *message == format!(
                             "`{}` cannot use tracked mesh metadata inside an unchecked manual binding",
                             operation.name(),
@@ -667,7 +667,7 @@ mod tests {
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    CoreError::Program(ProgramError::UnsupportedOperation { message })
                         if *message
                             == "collective over axis `x` cannot lower inside this `shard_map` manual region \
                                 because the region does not bind that axis as a manual mesh axis",
@@ -735,7 +735,7 @@ mod tests {
                 match (result, expected) {
                     (Ok(outputs), None) => assert_eq!(outputs.len(), 1),
                     (Err(Error::Core(error)), Some(expected)) => {
-                        assert_eq!(error.as_ref(), &ryft_core::Error::Program(expected));
+                        assert_eq!(error.as_ref(), &CoreError::Program(expected));
                         // Reject the contract before allocating a channel or emitting a communication operation, so
                         // the next channel of the state is still its first one.
                         assert_eq!(state.next_channel_id(), 1);

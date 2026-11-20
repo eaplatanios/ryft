@@ -22,8 +22,8 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, EffectClasses, Operation as CoreOperation,
-    ProgramError, RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
+    ArrayType, ComparisonDirection, DataType, Dimension, EffectClasses, Operation, ProgramError,
+    RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -177,8 +177,8 @@ impl LowerableOperation for ScanOperation<Type> {
             stacked_output_types: array_types(stacked_output_types)?,
             state_types,
             length: match length {
-                CoreDimension::Static(length) => ScanLoopLength::Static(*length),
-                CoreDimension::Dynamic(_) => ScanLoopLength::Dynamic(input_values[stack_end]),
+                Dimension::Static(length) => ScanLoopLength::Static(*length),
+                Dimension::Dynamic(_) => ScanLoopLength::Dynamic(input_values[stack_end]),
             },
             reverse: self.reverse(),
             threaded_effects: lowered_effect_classes(body)?,
@@ -362,8 +362,8 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             let mut physical_dimensions = stack_type.shape().dimensions().to_vec();
             let length = &physical_dimensions[0];
             let physical_length = match length {
-                CoreDimension::Static(length) => *length,
-                CoreDimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
+                Dimension::Static(length) => *length,
+                Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: SCAN_OPERATION_NAME.to_string(),
                         reason: format!(
@@ -373,7 +373,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
                     })
                 })?,
             };
-            physical_dimensions[0] = CoreDimension::Static(physical_length);
+            physical_dimensions[0] = Dimension::Static(physical_length);
             let physical_type = stack_type.clone().with_shape(Shape::new(physical_dimensions));
             let accumulator =
                 lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
@@ -664,11 +664,11 @@ mod tests {
         Add, AddOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, AssertOperation, BatchAxis,
         BatchedProgram, CompositeTransposeOperation, ConditionOperation, ConvertElementType, Device, DeviceMesh,
         DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, Placeholder,
-        PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions, ShardMapBoundary,
-        ShardMapOperation, Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent, TypeError,
-        TypedProgram, WhileOperation, ZeroOperation, batch, scan,
+        Error as CoreError, LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation,
+        OneLikeOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions,
+        ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent,
+        TypeError, TypedProgram, WhileOperation, ZeroOperation, batch, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
@@ -743,7 +743,7 @@ mod tests {
     /// to its carry as a binary digit and stacks the carry that it received, so that both of its results depend on the
     /// order in which its iterations visit the items. The scan takes its initial carry and its stacked items as inputs,
     /// followed by its runtime length when its length is dynamic.
-    fn binary_digits_scan_program(length: CoreDimension, reverse: bool, unroll: usize) -> FlatProgram {
+    fn binary_digits_scan_program(length: Dimension, reverse: bool, unroll: usize) -> FlatProgram {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -762,7 +762,7 @@ mod tests {
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()])).into());
         let mut inputs = vec![carry, items];
-        if let CoreDimension::Dynamic(length) = &length {
+        if let Dimension::Dynamic(length) = &length {
             inputs.push(builder.add_input(DimensionType::from(length.clone()).into()));
         }
         let input_count = inputs.len();
@@ -836,7 +836,7 @@ mod tests {
             ScanOperation::<ArrayType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == expected_message,
             ),
         ));
@@ -847,7 +847,7 @@ mod tests {
             ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "operation `scan` declares 1 region slots but 0 regions were attached",
             ),
         ));
@@ -858,7 +858,7 @@ mod tests {
             ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
             ),
         ));
 
@@ -867,7 +867,7 @@ mod tests {
         let input_types: Vec<Type> = vec![scalar_type.clone().into(), DimensionType::from(length.clone()).into()];
         let output_types: Vec<Type> = vec![
             scalar_type.clone().into(),
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into(),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())])).into(),
         ];
         let block = context.block(
             &input_types
@@ -878,7 +878,7 @@ mod tests {
         let input_values = (0..2).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body]);
         assert!(matches!(
-            ScanOperation::<Type>::new(1, CoreDimension::Dynamic(length)).lower(
+            ScanOperation::<Type>::new(1, Dimension::Dynamic(length)).lower(
                 &mut lowerer,
                 &input_values,
                 &input_types,
@@ -911,7 +911,7 @@ mod tests {
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    Operation::Scan(ScanOperation::new(0, CoreDimension::Static(length))),
+                    Operation::Scan(ScanOperation::new(0, Dimension::Static(length))),
                     vec![body],
                     vec![stack],
                     None,
@@ -1015,7 +1015,7 @@ mod tests {
             lower(EffectClasses::NONE),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == expected_message,
             ),
         ));
@@ -1053,7 +1053,7 @@ mod tests {
             let static_input = builder.add_input(static_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    Operation::Scan(ScanOperation::new(2, CoreDimension::Static(length)).with_unroll(unroll).unwrap()),
+                    Operation::Scan(ScanOperation::new(2, Dimension::Static(length)).with_unroll(unroll).unwrap()),
                     vec![region],
                     vec![dynamic_input, static_input],
                     None,
@@ -1092,7 +1092,7 @@ mod tests {
         // carry refines it only when the runtime length is 3. Neither input type proves that relationship, so an entry
         // guard checks it before the loop. The body `(i, c) -> (c + c)` doubles its carry once per iteration.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
-        let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
+        let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -1109,7 +1109,7 @@ mod tests {
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
                 vec![body_region],
                 vec![carry, runtime_length],
                 None,
@@ -1211,7 +1211,7 @@ mod tests {
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
                 vec![body_region],
                 vec![carry, stack, runtime_length],
                 None,
@@ -1317,9 +1317,8 @@ mod tests {
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
-            let related = builder.add_input(
-                ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into(),
-            );
+            let related = builder
+                .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, sum], None).unwrap()[0];
             builder
@@ -1333,7 +1332,7 @@ mod tests {
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(2, CoreDimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(2, Dimension::Dynamic(length))),
                 vec![body_region],
                 vec![related, sum, runtime_length],
                 None,
@@ -1437,7 +1436,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(1)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
+        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
         let mut body_builder = ArrayIrProgramBuilder::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
@@ -1455,7 +1454,7 @@ mod tests {
         let runtime_length = builder.add_input(length_type.into());
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length)).with_unroll(3).unwrap()),
+                Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(length)).with_unroll(3).unwrap()),
                 vec![body_region],
                 vec![carry, runtime_length],
                 None,
@@ -1647,7 +1646,7 @@ mod tests {
         // straight-line body copy, which reads and writes the stacks at the static index of its iteration, which is
         // index 4 for a forward scan and index 0 for a reversed scan.
         assert_eq!(
-            lowered_mixed_module(&binary_digits_scan_program(CoreDimension::Static(5), true, 2)),
+            lowered_mixed_module(&binary_digits_scan_program(Dimension::Static(5), true, 2)),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<f64>, %arg1: tensor<5xf64>) -> (tensor<f64>, tensor<5xf64>) {
@@ -1710,7 +1709,7 @@ mod tests {
             assert_eq!(
                 execute_mixed_program(
                     client,
-                    &binary_digits_scan_program(CoreDimension::Static(5), false, unroll),
+                    &binary_digits_scan_program(Dimension::Static(5), false, unroll),
                     &[MixedValue::Array(vec![0.0], vec![]), items.clone()],
                     &[],
                 )
@@ -1724,7 +1723,7 @@ mod tests {
             assert_eq!(
                 execute_mixed_program(
                     client,
-                    &binary_digits_scan_program(CoreDimension::Static(5), true, unroll),
+                    &binary_digits_scan_program(Dimension::Static(5), true, unroll),
                     &[MixedValue::Array(vec![0.0], vec![]), items.clone()],
                     &[],
                 )
@@ -1807,7 +1806,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
+        let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
 
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -1827,7 +1826,7 @@ mod tests {
         let runtime_length = builder.add_input(length_type.clone().into());
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
                 vec![body_region],
                 vec![carry, runtime_length],
                 None,
@@ -1921,7 +1920,7 @@ mod tests {
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
         let sum = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(2, CoreDimension::Dynamic(length.clone()))),
+                Operation::Scan(ScanOperation::new(2, Dimension::Dynamic(length.clone()))),
                 vec![body_region],
                 vec![sum, root, runtime_length],
                 None,
@@ -1968,7 +1967,7 @@ mod tests {
             error,
             Error::Core(core_error) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::Type(TypeError::Invalid { message }))
+                CoreError::Program(ProgramError::Type(TypeError::Invalid { message }))
                     if *message == "`dynamic_slice` size 1 is out of bounds for axis 0 with size 0",
             ),
         ));
@@ -1980,8 +1979,7 @@ mod tests {
         // followed by a second loop with one body copy per trip) runs exactly the runtime number of iterations, from
         // none up to the largest number that the bound admits. A reversed scan visits the items backwards while it
         // writes each stacked output at its own iteration index.
-        let length =
-            CoreDimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap()));
+        let length = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap()));
 
         // A reversed scan unrolled by 2 runs iterations `length - 1 - counter` and `length - 2 - counter` per trip of
         // its first loop, and the remaining iteration, if any, in its second loop.
@@ -2129,7 +2127,7 @@ mod tests {
             .add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 4).unwrap()));
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
                 vec![body],
                 vec![carry, stack, runtime_length],
                 None,
@@ -2157,8 +2155,7 @@ mod tests {
         // vector keeps its runtime extent at every extent that its bound admits.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
-        let dynamic_vector_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
 
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -2253,16 +2250,12 @@ mod tests {
         // length is the runtime batch size. Each item of the batch is generated independently of the others.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let batch_type = DimensionType::from(batch.clone());
-        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
-        let stacked_state_type = ArrayType::new(
-            DataType::U64,
-            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Static(2)]),
-        );
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(2)]));
-        let stacked_bits_type = ArrayType::new(
-            DataType::U32,
-            Shape::new(vec![CoreDimension::Dynamic(batch.clone()), CoreDimension::Static(2)]),
-        );
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
+        let stacked_state_type =
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(2)]));
+        let stacked_bits_type =
+            ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
 
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -2291,7 +2284,7 @@ mod tests {
         let runtime_batch = builder.add_input(batch_type.into());
         let outputs = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(0, CoreDimension::Dynamic(batch))),
+                Operation::Scan(ScanOperation::new(0, Dimension::Dynamic(batch))),
                 vec![body_region],
                 vec![states, runtime_batch],
                 None,
@@ -2475,7 +2468,7 @@ mod tests {
             .unwrap();
         let scan = ScanOperation::new(1, 3);
 
-        let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![CoreDimension::Static(3)]));
+        let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
@@ -2630,11 +2623,11 @@ mod tests {
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder
-            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())])).into());
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let sum = builder
             .add_instruction(
-                Operation::Scan(ScanOperation::new(1, CoreDimension::Dynamic(length))),
+                Operation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
                 vec![body_region],
                 vec![sum, items, runtime_length],
                 None,
@@ -2791,7 +2784,7 @@ mod tests {
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    Operation::Scan(ScanOperation::new(0, CoreDimension::Static(length))),
+                    Operation::Scan(ScanOperation::new(0, Dimension::Static(length))),
                     vec![region],
                     vec![stack],
                     None,
@@ -2880,7 +2873,7 @@ mod tests {
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
                 .add_instruction(
-                    Operation::Scan(ScanOperation::new(0, CoreDimension::Static(length))),
+                    Operation::Scan(ScanOperation::new(0, Dimension::Static(length))),
                     vec![region],
                     vec![stack],
                     None,
@@ -3618,7 +3611,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let client = execution_client();
-        let batch_type = DimensionType::from(CoreDimension::Static(2));
+        let batch_type = DimensionType::from(Dimension::Static(2));
 
         // Mapped items make the sum a mapped carry, which the batched scan instantiates at the batch axis, and the
         // running sums stack along a trailing batch axis.
@@ -3739,7 +3732,7 @@ mod tests {
             let carry = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
             let mut inputs = vec![carry, items];
-            if let CoreDimension::Dynamic(length) = scan.iteration_count() {
+            if let Dimension::Dynamic(length) = scan.iteration_count() {
                 inputs.push(builder.add_input(DimensionType::from(length.clone()).into()));
             }
             let input_count = inputs.len();
@@ -3843,9 +3836,8 @@ mod tests {
 
         // A dynamic length runs the same iterations at runtime length 3 and leaves the carry and an empty gradient at
         // runtime length 0.
-        let dynamic_items_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(length.clone())]));
-        let program = value_and_gradient(ScanOperation::new(1, CoreDimension::Dynamic(length)), dynamic_items_type);
+        let dynamic_items_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
+        let program = value_and_gradient(ScanOperation::new(1, Dimension::Dynamic(length)), dynamic_items_type);
         assert_eq!(
             program.to_string(),
             indoc! {"

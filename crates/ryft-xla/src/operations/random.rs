@@ -1,8 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension as CoreDimension, DropoutOperation,
-    Operation as CoreOperation, ProgramError, RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm,
-    RngBitGeneratorOperation,
+    ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension, DropoutOperation, Operation, ProgramError,
+    RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm, RngBitGeneratorOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -67,7 +66,7 @@ impl LowerableOperation for RngBitGeneratorOperation<Type> {
             .shape()
             .dimensions()
             .iter()
-            .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
             .count();
         check_count!("input", input_values, expected_input_count, ProgramError);
         check_count!("input", input_types, expected_input_count, ProgramError);
@@ -252,8 +251,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType, ConvertElementTypeOperation,
-        DataType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Dropout, DropoutOperation, Memory, Placeholder, ProgramError, Random, RandomAlgorithm,
+        DataType, DeviceMesh, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dropout,
+        DropoutOperation, Error as CoreError, Memory, Placeholder, ProgramError, Random, RandomAlgorithm,
         RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram, ZeroOperation,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
@@ -283,8 +282,8 @@ mod tests {
 
     #[test]
     fn test_rng_bit_generator_operation_lower() {
-        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(4)]));
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
         let state = builder.add_input(state_type.clone());
         let outputs = builder
@@ -322,8 +321,8 @@ mod tests {
     fn test_rng_bit_generator_operation_lower_memory_placement() {
         // The generator produces its bits in device memory. Bits that are declared in host memory are therefore
         // transferred there, while the advanced state keeps the placement of the input state.
-        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(4)]))
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4)]))
             .with_memory(Memory::Host { pinned: true });
         let mut builder = ProgramBuilder::new();
         let state = builder.add_input(state_type.clone());
@@ -364,7 +363,7 @@ mod tests {
         // An exact extent refines the declared dynamic bits axis to a static one, so the generator lowers at that
         // static shape and its redundant extent operand does not reach `stablehlo.rng_bit_generator`.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let state_type = RandomAlgorithm::ThreeFry.state_type();
         let mut builder = ArrayIrProgramBuilder::new();
         let state = builder.add_input(state_type.clone().into());
@@ -517,7 +516,7 @@ mod tests {
             operation.lower(&mut lowerer, &inputs, &[], &output_types),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
             ),
         ));
     }
@@ -799,7 +798,7 @@ mod tests {
         // The mask is drawn at the input shape with the broadcast axes replaced by one, compared against the drop
         // threshold, and broadcast to the input shape before it selects between the scaled input and zero.
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let state_type = ryft_core::RandomAlgorithm::Philox.state_type();
+        let state_type = RandomAlgorithm::Philox.state_type();
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let state = builder.add_input(state_type.clone());
@@ -884,7 +883,7 @@ mod tests {
         // without a state, with broadcast axes, and for a mask shape without even extents, for which ThreeFry splits
         // its largest axis.
         let input_type = ArrayType::new_static(DataType::F64, [4, 8]);
-        let state_type = ryft_core::RandomAlgorithm::Philox.state_type();
+        let state_type = RandomAlgorithm::Philox.state_type();
         let values = (0..32).map(|value| f64::from(value) - 7.5).collect::<Vec<_>>();
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());

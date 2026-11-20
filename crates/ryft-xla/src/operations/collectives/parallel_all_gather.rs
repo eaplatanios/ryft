@@ -1,7 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CollectiveMode, Dimension as CoreDimension, MemberOperation, Operation as CoreOperation,
-    ParallelAllGatherOperation, ProgramError, Shape,
+    ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelAllGatherOperation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -138,7 +137,7 @@ fn insert_untiled_all_gather_axis<'b, 'c: 'b, 't: 'c>(
         return Ok(input_value);
     }
     let mut dimensions = output_array_type.shape().dimensions().to_vec();
-    dimensions[operation.concatenation_axis()] = CoreDimension::Static(1);
+    dimensions[operation.concatenation_axis()] = Dimension::Static(1);
     let input_type =
         lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
     let broadcast_dimensions = (0..output_array_type.rank())
@@ -160,7 +159,7 @@ mod tests {
     use ryft_core::{
         CollectiveOptions, DataType, Device, DeviceMesh, Differentiate, LogicalMesh, MeshAxis, MeshAxisType, Mul,
         ParallelAllGather, ParallelAllGatherOutputVariance, Reduce, ReductionKind, ShardMapOptions, Sharding,
-        ShardingDimension, Value as CoreValue, ValueProjection, shard_map,
+        ShardingDimension, Value, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, Program};
 
@@ -185,7 +184,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // `parallel_all_gather` over the manual mesh axis `"x"` extends the local shard from `f32[2]` to the full
         // `f32[4]` concatenation on every device. Its output still varies along the manual axis for the purposes of
@@ -337,7 +336,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])),
         )
         .unwrap();
 
@@ -445,7 +444,7 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
         )
         .unwrap();
 

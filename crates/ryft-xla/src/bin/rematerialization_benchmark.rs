@@ -26,14 +26,12 @@
 use std::env;
 use std::time::{Duration, Instant};
 
-use ryft_core::compilation::AnalyzableCompilationDomain;
 use ryft_core::{
-    ArrayType, Compile, CompiledFunction as CoreCompiledFunction, Context, DataType, Device, DeviceMesh,
-    Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory,
-    MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
+    AnalyzableCompilationDomain, ArrayType, Compile, CompiledFunction, Context, DataType, Device, DeviceMesh,
+    Dimension, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
+    MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, SaveAndOffloadOnlyTheseNames, ScanOperation, Shape, Sharding,
-    StagedFunction as CoreStagedFunction, Tag, Tanh, Typed, Value as CoreValue, ValueProjection, differentiate_at,
-    rematerialize,
+    StagedFunction, Tag, Tanh, Typed, Value as CoreValue, ValueProjection, differentiate_at, rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 #[cfg(feature = "cuda-13")]
@@ -55,10 +53,10 @@ type BenchmarkInput = (Type, Type, Type);
 type BenchmarkOutput = (Type, Type);
 
 /// Staged gradient of a benchmarked function.
-type BenchmarkStagedFunction = CoreStagedFunction<Session, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkStagedFunction = StagedFunction<Session, BenchmarkInput, BenchmarkOutput>;
 
 /// Compiled gradient of a benchmarked function.
-type BenchmarkCompiledFunction = CoreCompiledFunction<Session, BenchmarkInput, BenchmarkOutput>;
+type BenchmarkCompiledFunction = CompiledFunction<Session, BenchmarkInput, BenchmarkOutput>;
 
 /// Rematerialization of a layer.
 #[derive(Copy, Clone, Debug)]
@@ -216,7 +214,7 @@ fn nested_layer(depth: usize, hidden: Tracer, up: Tracer, down: Tracer) -> Resul
 
 /// Returns the type of an `f32` array of the provided shape.
 fn array_type(shape: &[usize]) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(shape.iter().map(|size| CoreDimension::Static(*size)).collect()))
+    ArrayType::new(DataType::F32, Shape::new(shape.iter().map(|size| Dimension::Static(*size)).collect()))
 }
 
 /// Returns the type of an `f32` array of the provided shape that is replicated over `mesh`, which is the type of the

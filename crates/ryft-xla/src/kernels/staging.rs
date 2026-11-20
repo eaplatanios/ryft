@@ -6,20 +6,21 @@ use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, Atom, AtomId,
     BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeJvpRule, CompositeOperation,
-    ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DifferentiableOperation,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Domain as CoreDomain, Effects, GuardOperation, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, LogicalMesh, MaybeZero, MeshAxisType, MeshContext, Operation as CoreOperation,
-    OperationBoundaryPruning, OperationFoldOutput, OperationProvider, OutputRegionProvenance, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder,
-    Program as CoreProgram, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, Region, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
-    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Tracer as CoreTracer, TracingContext,
+    ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DeviceMesh,
+    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, DimensionVariable, Domain, EffectClass, Effects, GuardOperation, InputRegionProvenance,
+    Instruction, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+    MeshContext, NamedAxis, Operation as CoreOperation, OperationBoundaryPruning, OperationFoldOutput,
+    OperationProvider, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder,
+    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    Region, RegionArena, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
+    ShardMapBoundary, ShardMapError, ShardMapOperation, Sharding, ShardingDimension, Tracer, TracingContext,
     TransposableOperation, TranspositionContext, TranspositionDriver, Type as CoreType, TypeError,
-    TypeIdentityRenaming, Typed, TypedProgram, Value as CoreValue,
+    TypeIdentityRenaming, Typed, TypedProgram, Value,
 };
 use ryft_kernels::{
     KernelCallOperation, KernelCompiler, KernelCompletionProtocol, KernelDefinition,
@@ -131,10 +132,7 @@ impl ReferenceAccessOperation for KernelExtension {
 }
 
 impl PortableKernelExtension for KernelExtension {
-    fn semantic_key(
-        &self,
-        identity: &mut dyn FnMut(&ryft_core::DimensionVariable) -> usize,
-    ) -> Result<Vec<u8>, TypeError> {
+    fn semantic_key(&self, identity: &mut dyn FnMut(&DimensionVariable) -> usize) -> Result<Vec<u8>, TypeError> {
         let _ = &identity;
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -497,7 +495,7 @@ impl<C: Context<Type = Type>, P: ReferenceDischargePolicy<C>> ReferenceDischarge
     }
 }
 
-impl<C: CoreDomain<Type = Type>> InterpretableOperation<C> for KernelOperation {
+impl<C: Domain<Type = Type>> InterpretableOperation<C> for KernelOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -592,9 +590,9 @@ where
 /// `bound_axes` are the mesh axes that the enclosing manual regions made manual (refer to
 /// [`MeshContext::manual_axes`]). A batch dimension that is placed on such axes is a local shard, whether or not the
 /// region tracks manual variation, and one that is placed on other axes is a global value.
-fn unbound_batch_placement<V: CoreValue<Type = Type>>(
+fn unbound_batch_placement<V: Value<Type = Type>>(
     inputs: &[ArrayIrBatch<V>],
-    bound_axes: &[(String, ryft_core::NamedAxis)],
+    bound_axes: &[(String, NamedAxis)],
 ) -> Result<Option<(LogicalMesh, Vec<String>)>, BatchingError> {
     let mut placement = None::<Option<(LogicalMesh, Vec<String>)>>;
     for input in inputs {
@@ -606,7 +604,7 @@ fn unbound_batch_placement<V: CoreValue<Type = Type>>(
                 let is_bound = |axis: &&String| {
                     bound_axes.iter().any(|(name, binding)| {
                         name == *axis
-                            && matches!(binding, ryft_core::NamedAxis::Mesh { mesh, .. }
+                            && matches!(binding, NamedAxis::Mesh { mesh, .. }
                                 if mesh.has_same_topology(sharding.mesh()))
                     })
                 };
@@ -655,7 +653,7 @@ fn batch_in_shard_map<C>(
     inputs: &[ArrayIrBatch<C::Value>],
     mesh: &LogicalMesh,
     axes: Vec<String>,
-    bound_axes: &[(String, ryft_core::NamedAxis)],
+    bound_axes: &[(String, NamedAxis)],
 ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = Type, Constant = Constant, Operation = Operation>,
@@ -747,7 +745,7 @@ where
         .enumerate()
         .map(|(index, r#type)| {
             let local = boundary.local_input_type(index, &boundary.global_input_type(index, r#type)?)?;
-            Ok::<_, ryft_core::ShardMapError>(local.with_memory(r#type.memory()))
+            Ok::<_, ShardMapError>(local.with_memory(r#type.memory()))
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(ProgramError::custom)?;
@@ -791,7 +789,7 @@ impl<C: Context<Type = Type>> DifferentiableOperation<C> for KernelOperation {
     }
 }
 
-impl<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>> TransposableOperation<V, O> for KernelOperation
+impl<V: Value<Type = Type>, O: CoreOperation<Type = Type>> TransposableOperation<V, O> for KernelOperation
 where
     O: OperationProvider<Type, GuardOperation<Type>, Operation = O>,
 {
@@ -799,8 +797,8 @@ where
         &self,
         context: &mut TranspositionContext<V, O>,
         driver: &D,
-        inputs: &[PartialValue<CoreTracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<CoreTracer<TracingContext<V, O>>>],
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         let _ = (context, driver, inputs, outputs, accumulators);
@@ -957,7 +955,7 @@ where
         fallback
     } else {
         let (output_types, program) = TracingContext::<Constant, Operation>::trace(
-            |values: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |values: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 let context = values[0].context().clone();
                 fallback.interpret_in_context(&context, values)
             },
@@ -973,7 +971,7 @@ where
     // explicitly (e.g., an external call) is observable, like every other effect class.
     let effects = definition.effects();
     if effects.has_explicit_ordered_state()
-        || effects.classes().into_iter().any(|effect| effect != ryft_core::EffectClass::OrderedState)
+        || effects.classes().into_iter().any(|effect| effect != EffectClass::OrderedState)
     {
         return Err(ProgramError::UnsupportedOperation {
             message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
@@ -1081,7 +1079,7 @@ impl KernelExecutionFacts {
 
     /// Selects the facts of the devices of `mesh`, in mesh order, from the [`Target`] of the execution owner,
     /// without loading an additional device runtime.
-    pub fn from_target(target: &Target, mesh: &ryft_core::DeviceMesh) -> Result<Self, KernelEmbeddingError> {
+    pub fn from_target(target: &Target, mesh: &DeviceMesh) -> Result<Self, KernelEmbeddingError> {
         let devices = mesh
             .devices()
             .iter()
@@ -1350,7 +1348,7 @@ pub(crate) fn select_kernels(
 ) -> Result<Option<FlatProgram>, KernelEmbeddingError> {
     // A selected call owns its entire body. Do not separately select descendants that its compiler consumes.
     // Ordinary computation edges remain visible, and dormant rule edges are retained without being compiled.
-    let mut executable_regions = HashMap::<_, BTreeMap<String, ryft_core::MeshAxis>>::new();
+    let mut executable_regions = HashMap::<_, BTreeMap<String, MeshAxis>>::new();
     let mut pending = vec![(program.entry(), BTreeMap::new())];
     let mut has_kernel = false;
     while let Some((id, mut bound_axes)) = pending.pop() {
@@ -1386,9 +1384,7 @@ pub(crate) fn select_kernels(
                     .iter()
                     .copied()
                     .enumerate()
-                    .filter(|&(index, _)| {
-                        instruction.operation().region_role(index) == Some(ryft_core::RegionRole::Computation)
-                    })
+                    .filter(|&(index, _)| instruction.operation().region_role(index) == Some(RegionRole::Computation))
                     .map(|(_, id)| (id, child_axes.clone())),
             );
         }
@@ -1410,11 +1406,11 @@ pub(crate) fn select_kernels(
                 .instructions()
                 .iter()
                 .map(|instruction| {
-                    if let Some(bound_axes) = executable_regions.get(&ryft_core::RegionId::new(index))
+                    if let Some(bound_axes) = executable_regions.get(&RegionId::new(index))
                         && let Operation::Kernel(KernelOperation(PortableKernelOperation::Call(operation))) =
                             instruction.operation()
                     {
-                        let body = ryft_core::RegionRef::new(program.regions(), instruction.regions()[0])
+                        let body = RegionRef::new(program.regions(), instruction.regions()[0])
                             .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
                         let definition = definition_from_body(operation, body)
                             .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
@@ -1464,9 +1460,9 @@ pub(crate) fn select_kernels(
     if !selected {
         return Ok(None);
     }
-    let arena = ryft_core::RegionArena::from_regions(regions)
+    let arena = RegionArena::from_regions(regions)
         .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
-    let selected = ryft_core::RegionRef::new(&arena, program.entry())
+    let selected = RegionRef::new(&arena, program.entry())
         .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?
         .to_program();
     for region in selected.entry_region_ref().computation_regions() {
@@ -1540,16 +1536,11 @@ fn stage_body<Extension: PortableKernelExtension + Into<KernelExtension>>(
             Ok(Region::new(atoms, region.input_ids().to_vec(), region.output_ids().to_vec(), instructions))
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
-    CoreProgram::new(
-        vec![Placeholder; body.input_count()],
-        vec![Placeholder; body.output_count()],
-        regions,
-        body.entry(),
-    )
+    Program::new(vec![Placeholder; body.input_count()], vec![Placeholder; body.output_count()], regions, body.entry())
 }
 
 /// Returns the types of `inputs`, which are the types that a kernel call on them is staged for.
-fn input_types<V: CoreValue<Type = Type>>(inputs: &[V]) -> Vec<Type> {
+fn input_types<V: Value<Type = Type>>(inputs: &[V]) -> Vec<Type> {
     inputs.iter().map(|input| input.r#type().into_owned()).collect()
 }
 
@@ -1560,7 +1551,7 @@ fn kernel_program<Extension: PortableKernelExtension + Into<KernelExtension>>(
     definition: &KernelDefinition<Extension>,
     input_types: Vec<Type>,
 ) -> Result<FlatProgram, ProgramError> {
-    let mut builder = ryft_core::ProgramBuilder::new();
+    let mut builder = ProgramBuilder::new();
     let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
     let body = stage_body(definition)?;
     let body_region = builder.import_region(body.entry_region_ref());
@@ -1584,7 +1575,7 @@ fn kernel_program<Extension: PortableKernelExtension + Into<KernelExtension>>(
 /// Restores the current attached body for the core verifier. Retained operation metadata is never a body proof.
 fn definition_from_body(
     operation: &KernelCallOperation,
-    body: ryft_core::RegionRef<'_, Constant, Operation>,
+    body: RegionRef<'_, Constant, Operation>,
 ) -> Result<KernelDefinition<KernelExtension>, ProgramError> {
     let body = body.to_program();
     let regions = body
@@ -1598,10 +1589,10 @@ fn definition_from_body(
                     Ok(match atom {
                         Atom::Variable(r#type) => Atom::Variable(r#type.clone()),
                         Atom::Constant(Constant::Dimension(value)) => {
-                            Atom::Constant(ArrayIrValue::<CoreArray>::Dimension(value.clone()))
+                            Atom::Constant(ArrayIrValue::<Array>::Dimension(value.clone()))
                         }
                         Atom::Constant(Constant::Boolean(value)) => {
-                            Atom::Constant(ArrayIrValue::Array(CoreArray::scalar(*value)?))
+                            Atom::Constant(ArrayIrValue::Array(Array::scalar(*value)?))
                         }
                         Atom::Constant(Constant::Captured(_) | Constant::Session(_)) => {
                             return Err(ProgramError::MalformedProgram(
@@ -1617,10 +1608,8 @@ fn definition_from_body(
                 .map(|instruction| {
                     let operation = match instruction.operation() {
                         Operation::Kernel(operation) => operation.0.clone(),
-                        Operation::Array(ryft_core::ArrayOperation::Constant(operation)) => {
-                            PortableKernelOperation::Portable(
-                                ryft_core::ArrayOperation::Constant(operation.clone()).into(),
-                            )
+                        Operation::Array(ArrayOperation::Constant(operation)) => {
+                            PortableKernelOperation::Portable(ArrayOperation::Constant(operation.clone()).into())
                         }
                         operation => {
                             return Err(ProgramError::MalformedProgram(format!(
@@ -1641,7 +1630,7 @@ fn definition_from_body(
             Ok(Region::new(atoms, region.input_ids().to_vec(), region.output_ids().to_vec(), instructions))
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
-    let body = CoreProgram::new(
+    let body = Program::new(
         vec![Placeholder; body.input_count()],
         vec![Placeholder; body.output_count()],
         regions,
@@ -1658,16 +1647,16 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, ArrayType, AssertOperation, AttachedRegions, CompilationTracer,
-        ConditionOperation, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, EffectClass, LiftedCustomRules, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, NamedAxis, NothingSavable, PartialEvaluation, PartitionedProgram,
+        AddOperation, Array as CoreArray, ArrayIrOperation, ArrayOperation, ArrayType, AssertOperation,
+        AttachedRegions, CompilationTracer, ConditionOperation, CotangentDestinationKind, CustomCallOperation,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, DimensionBounds,
+        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass, LiftedCustomRules,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedAxis, NothingSavable, PartialEvaluation, PartitionedProgram,
         ProgramBuilder as CoreProgramBuilder, RecursiveBatchingDriver, ReferenceRead, ReferenceReadOperation,
         ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionDriver, RegionRef, RematerializeOperation,
         ReshapeOperation, ResidualPolicyReference, ReverseModeDifferentiate, ScanOperation, ShardMapBoundary,
-        ShardMapOperation, Sharding, ShardingDimension, StagedFunction as CoreStagedFunction, StagingContext,
-        TransferToMemoryOperation, TypedProgram, WhileOperation,
+        ShardMapOperation, Sharding, ShardingDimension, StagedFunction, StagingContext, TransferToMemoryOperation,
+        TypedProgram, WhileOperation,
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, KernelCompilationError, KernelCompiler, KernelParameter,
@@ -1683,7 +1672,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::{ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, ProgramBuilder, Session};
+    use crate::{Array, ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, ProgramBuilder, Session, Value};
 
     use super::*;
 
@@ -1837,7 +1826,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let staged = CoreStagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
+        let staged = StagedFunction::<Session, Vec<Type>, Vec<Type>>::stage(
             |_, _, inputs| replay(program, inputs),
             vec![],
             program.input_types().into_owned(),
@@ -1850,8 +1839,8 @@ pub(crate) mod tests {
             .zip(program.input_types().into_owned())
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
-                crate::Value::Array(
-                    crate::Array::from_host_buffer(&session, r#type, mesh.clone(), None, value.to_ne_bytes()).unwrap(),
+                Value::Array(
+                    Array::from_host_buffer(&session, r#type, mesh.clone(), None, value.to_ne_bytes()).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1861,7 +1850,7 @@ pub(crate) mod tests {
             .unwrap()
             .into_iter()
             .map(|value| {
-                let crate::Value::Array(value) = value else { panic!("derivative returned a non-array value") };
+                let Value::Array(value) = value else { panic!("derivative returned a non-array value") };
                 value.block_until_ready().unwrap();
                 let bytes = value
                     .addressable_shards()
@@ -1882,7 +1871,7 @@ pub(crate) mod tests {
     fn program() -> FlatProgram {
         let definition = crate::kernels::tests::definition();
         TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel(inputs[0].context(), &definition, &inputs)
             },
             definition.operation().input_types(),
@@ -2011,8 +2000,8 @@ pub(crate) mod tests {
                 &self,
                 _context: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
                 _index: usize,
-                _inputs: Vec<PartialEvaluationValue<CoreTracer<TracingContext<Constant, Operation>>>>,
-            ) -> Result<Vec<PartialEvaluationValue<CoreTracer<TracingContext<Constant, Operation>>>>, ProgramError>
+                _inputs: Vec<PartialEvaluationValue<Tracer<TracingContext<Constant, Operation>>>>,
+            ) -> Result<Vec<PartialEvaluationValue<Tracer<TracingContext<Constant, Operation>>>>, ProgramError>
             {
                 panic!("a kernel call never partially evaluates its body")
             }
@@ -2021,7 +2010,7 @@ pub(crate) mod tests {
                 &self,
                 _context: &PartialEvaluationContext<TracingContext<Constant, Operation>>,
                 _region: RegionRef<'_, Constant, Operation>,
-                _knowledge: &[PartialValue<CoreTracer<TracingContext<Constant, Operation>>>],
+                _knowledge: &[PartialValue<Tracer<TracingContext<Constant, Operation>>>],
             ) -> Result<PartialEvaluation<TracingContext<Constant, Operation>>, ProgramError> {
                 panic!("a kernel call never partially evaluates its body")
             }
@@ -2200,7 +2189,7 @@ pub(crate) mod tests {
         let driver = RecursiveBatchingDriver::new(&regions);
         let vector = Type::Array(ArrayType::new_static(DataType::F32, [3]));
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
                 let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
@@ -2284,7 +2273,7 @@ pub(crate) mod tests {
         let driver = RecursiveBatchingDriver::new(&regions);
         let mut result = None;
         let (_, program) = TracingContext::<Constant, Operation>::trace_with_named_axes(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
                 let extent = parent.constant(Constant::Dimension(DimensionValue::constant(4).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
@@ -2709,7 +2698,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut error = None;
         TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 let parent = inputs[0].context();
                 let extent = parent.constant(Constant::Dimension(DimensionValue::constant(4).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
@@ -2718,7 +2707,7 @@ pub(crate) mod tests {
                 ))
                 .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])
                 .err();
-                Ok::<_, ProgramError>(Vec::<CoreTracer<TracingContext<Constant, Operation>>>::new())
+                Ok::<_, ProgramError>(Vec::<Tracer<TracingContext<Constant, Operation>>>::new())
             },
             vec![Type::Array(packed)],
         )
@@ -2789,10 +2778,10 @@ pub(crate) mod tests {
         })
         .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 // The complete kernel result is deliberately unused by its enclosing computation.
                 stage_kernel(inputs[0].context(), &definition, &inputs)?;
-                Ok(Vec::<CoreTracer<TracingContext<Constant, Operation>>>::new())
+                Ok(Vec::<Tracer<TracingContext<Constant, Operation>>>::new())
             },
             definition.operation().input_types(),
         )
@@ -2831,10 +2820,10 @@ pub(crate) mod tests {
     fn test_stage_kernel_unused_outputs_preserve_mapping_assertions() {
         let definition = crate::kernels::tests::mapping_assertion_definition();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 // The complete kernel result is deliberately unused by its enclosing computation.
                 stage_kernel(inputs[0].context(), &definition, &inputs)?;
-                Ok(Vec::<CoreTracer<TracingContext<Constant, Operation>>>::new())
+                Ok(Vec::<Tracer<TracingContext<Constant, Operation>>>::new())
             },
             definition.operation().input_types(),
         )
@@ -2868,7 +2857,7 @@ pub(crate) mod tests {
         let tangent = builder.add_input(scalar.clone());
         let doubled = builder
             .add_instruction(
-                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
                 vec![],
                 vec![tangent, tangent],
                 None,
@@ -2878,7 +2867,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![primal, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_jvp(inputs[0].context(), &definition, &rule, &inputs)
             },
             vec![scalar],
@@ -2934,7 +2923,7 @@ pub(crate) mod tests {
         let cotangent = backward.add_input(scalar.clone());
         let doubled = backward
             .add_instruction(
-                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
                 vec![],
                 vec![cotangent, cotangent],
                 None,
@@ -2942,7 +2931,7 @@ pub(crate) mod tests {
             .unwrap()[0];
         let tripled = backward
             .add_instruction(
-                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                ArrayOperation::Add(AddOperation::<ArrayType>::new()),
                 vec![],
                 vec![doubled, cotangent],
                 None,
@@ -2952,7 +2941,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![tripled], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_vjp(inputs[0].context(), &definition, &forward, &backward, &inputs)
             },
             vec![scalar],
@@ -3016,7 +3005,7 @@ pub(crate) mod tests {
         let native = CustomRuleRegistration::new(CustomRuleDefinition::<Constant, Operation>::new("double").with_jvp(
             |primals, tangents| {
                 let doubled = tangents[0].context().bind(
-                    ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                    ArrayOperation::Add(AddOperation::<ArrayType>::new()),
                     Vec::new(),
                     &[tangents[0].clone(), tangents[0].clone()],
                 )?;
@@ -3028,14 +3017,14 @@ pub(crate) mod tests {
                 .with_jvp(|primals, tangents| Ok((primals.to_vec(), vec![tangents[0].clone() + tangents[0].clone()]))),
         );
         let (_, native_program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_rules(inputs[0].context(), &definition, native.reference(), &inputs)
             },
             vec![scalar.clone()],
         )
         .unwrap();
         let (_, member_program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_rules(
                     inputs[0].context(),
                     &definition,
@@ -3094,7 +3083,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
             },
             vec![scalar],
@@ -3152,7 +3141,7 @@ pub(crate) mod tests {
         let placed = Type::Array(placed);
         for stage in [true, false] {
             let (output_types, program) = TracingContext::<Constant, Operation>::trace(
-                |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                     if stage {
                         stage_kernel(inputs[0].context(), &definition, &inputs)
                     } else {
@@ -3177,7 +3166,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
             },
             vec![scalar],
@@ -3205,7 +3194,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
             },
             vec![scalar],
@@ -3255,7 +3244,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
             },
             vec![scalar],
@@ -3304,7 +3293,7 @@ pub(crate) mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             TracingContext::<Constant, Operation>::trace(
-                |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                     stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
                 },
                 vec![Type::Array(vector)],
@@ -3352,7 +3341,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
             },
             vec![scalar],
@@ -3376,7 +3365,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
             },
             vec![vector],
@@ -3396,9 +3385,9 @@ pub(crate) mod tests {
             .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
             .unwrap();
         let devices = client.addressable_devices().unwrap();
-        let mesh = ryft_core::DeviceMesh::new(
-            ryft_core::LogicalMesh::new(vec![]).unwrap(),
-            devices.iter().map(|device| ryft_core::Device::from_pjrt(device.clone()).unwrap()).collect(),
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![]).unwrap(),
+            devices.iter().map(|device| Device::from_pjrt(device.clone()).unwrap()).collect(),
         )
         .unwrap();
         let facts = KernelExecutionFacts::from_target(&Target::from_client(client).unwrap(), &mesh).unwrap();
@@ -3522,7 +3511,7 @@ pub(crate) mod tests {
         })
         .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+            |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                 stage_kernel(inputs[0].context(), &definition, &inputs)
             },
             definition.operation().input_types(),
@@ -4177,8 +4166,7 @@ pub(crate) mod tests {
         let doubled = builder
             .add_instruction(
                 Operation::Kernel(KernelOperation::new(PortableKernelOperation::Portable(
-                    ryft_core::ArrayOperation::<CoreArray>::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new())
-                        .into(),
+                    ArrayOperation::<CoreArray>::Add(AddOperation::<ArrayType>::new()).into(),
                 ))),
                 vec![],
                 vec![outputs[0], outputs[0]],
@@ -4263,7 +4251,7 @@ pub(crate) mod tests {
                 if index == 0 {
                     instructions.push(Instruction::new(
                         Operation::Kernel(KernelOperation::new(PortableKernelOperation::Portable(
-                            ryft_core::ArrayOperation::<CoreArray>::CustomCall(
+                            ArrayOperation::<CoreArray>::CustomCall(
                                 CustomCallOperation::new("test.external", vec![])
                                     .with_effect_class(EffectClass::OrderedIo),
                             )
@@ -4282,7 +4270,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let changed = CoreProgram::new(vec![Placeholder], vec![Placeholder], regions, program.entry()).unwrap();
+        let changed = Program::new(vec![Placeholder], vec![Placeholder], regions, program.entry()).unwrap();
         let binding = binding(1);
         assert!(matches!(
             select_kernels(&changed, Some(&binding), facts),
@@ -4312,12 +4300,12 @@ pub(crate) mod tests {
     #[test]
     fn test_stage_body_materializes_array_literals() {
         let operation = crate::kernels::tests::definition().operation().clone();
-        let mut builder = ryft_core::ProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
+        let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
         let reference = builder.add_input(operation.body_input_types()[0].clone());
         let literal = builder.add_constant(ArrayIrValue::Array(CoreArray::scalar(42i32).unwrap()));
         builder
             .add_instruction(
-                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, Type, ArrayReferenceTransform>::new(),
+                ReferenceWriteOperation::<ArrayType, Type, ArrayReferenceTransform>::new(),
                 vec![],
                 vec![reference, literal],
                 None,
@@ -4358,12 +4346,7 @@ pub(crate) mod tests {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let output = builder
-            .add_instruction(
-                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
-                vec![],
-                vec![input, input],
-                None,
-            )
+            .add_instruction(ArrayOperation::Add(AddOperation::<ArrayType>::new()), vec![], vec![input, input], None)
             .unwrap()[0];
         let body = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])

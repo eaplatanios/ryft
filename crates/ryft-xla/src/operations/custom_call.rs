@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CUSTOM_CALL_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation,
-    DataType, Dimension as CoreDimension, EffectClass, Layout, ProgramError, Shape,
+    DataType, Dimension, EffectClass, Layout, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -67,7 +67,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
             .output_types()
             .iter()
             .flat_map(|output_type| output_type.shape().dimensions())
-            .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
+            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
             .count();
         let Some(array_input_count) = input_values.len().checked_sub(dynamic_output_dimension_count) else {
             return Err(ProgramError::InvalidInputCount {
@@ -215,11 +215,11 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
             let mut refined_type = physical_output_types[output_index].clone();
             let refined_dimensions = refined_output_types[output_index].shape().dimensions();
             for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-                if !matches!(dimension, CoreDimension::Dynamic(_)) {
+                if !matches!(dimension, Dimension::Dynamic(_)) {
                     continue;
                 }
                 let extent = *output_extents.next().unwrap();
-                let Some(dimension @ CoreDimension::Dynamic(_)) = refined_dimensions.get(axis).cloned() else {
+                let Some(dimension @ Dimension::Dynamic(_)) = refined_dimensions.get(axis).cloned() else {
                     continue;
                 };
                 let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
@@ -398,12 +398,12 @@ fn custom_call_physical_type(r#type: &ArrayType, role: &str) -> Result<ArrayType
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            CoreDimension::Static(extent) => Ok(CoreDimension::Static(*extent)),
-            CoreDimension::Dynamic(variable) => variable
+            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+            Dimension::Dynamic(variable) => variable
                 .bounds()
                 .upper()
                 .and_then(|upper| upper.checked_sub(1))
-                .map(CoreDimension::Static)
+                .map(Dimension::Static)
                 .ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
@@ -564,10 +564,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         BatchAxis, Composite, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
-        CustomCallOperation, CustomCallUnrolling, DataType, Device, DeviceMesh, Dimension as CoreDimension,
-        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracer,
-        EffectClass, LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ProjectedContext,
-        Reduce, ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StaticShape, StridedLayout, Tile,
+        CustomCallOperation, CustomCallUnrolling, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
+        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracer, EffectClass,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ProjectedContext, Reduce,
+        ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StaticShape, StridedLayout, Tile,
         TileDimension, TiledLayout, Typed, TypedProgram, batch, differentiate_at, shard_map,
     };
     use ryft_mlir::{DialectHandle, Operation as MlirOperation, Value as MlirValue, WalkOrder, WalkResult};
@@ -608,8 +608,7 @@ mod tests {
         // An ordered I/O custom call lowers its typed attributes, complete memory layout lists, buffer alias, and one
         // hidden ordered I/O token. A second ordered I/O call consumes that token even though the first call's array
         // result is unused, while the final pure call remains free of tokens.
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]));
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let column_major_type = array_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
         let mut builder = ProgramBuilder::new();
         let left = builder.add_input(column_major_type.clone());
@@ -682,9 +681,8 @@ mod tests {
         );
 
         // Byte-strided descriptors cannot be represented by StableHLO's custom call layouts, which are permutations.
-        let strided_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(3)]))
-                .with_layout(Some(StridedLayout::new(vec![12, 4]).into()));
+        let strided_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_layout(Some(StridedLayout::new(vec![12, 4]).into()));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(strided_type.clone());
         let output = builder
@@ -1082,7 +1080,7 @@ mod tests {
         // operand enters the FFI call, as its static buffer at the bound. An alias continues to refer to that leading
         // operand, and the static aliased result is refined with the trailing logical extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
@@ -1180,7 +1178,7 @@ mod tests {
         // A bounded dynamic aliased input reaches the handler as its static buffer at the bound, and the aliased
         // result regains the input's runtime extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
@@ -1203,7 +1201,7 @@ mod tests {
     fn test_custom_call_operation_lower_rejects_unbounded_input() {
         // An unbounded dynamic input has no static buffer that could cross the foreign boundary.
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(size)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
@@ -1226,7 +1224,7 @@ mod tests {
         // An exact extent refines the declared dynamic output axis to a static one, so the call allocates that exact
         // extent and its redundant extent operand does not refine the result.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent.clone())]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = ArrayIrProgramBuilder::new();
         let extent =
             builder.add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
@@ -1951,7 +1949,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // The custom call executes per shard inside the manual region. Its declared output type is the local shard
         // type, and the lowered `stablehlo.custom_call` appears inside the `sdy.manual_computation` body.
@@ -2112,7 +2110,7 @@ mod tests {
     fn test_custom_call_physical_type() {
         // Bounded dynamic dimensions widen to their inclusive upper bound, and static dimensions are unchanged.
         let bounded = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![bounded.into(), CoreDimension::Static(2)]));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![bounded.into(), Dimension::Static(2)]));
         assert_eq!(custom_call_physical_type(&r#type, "output").unwrap(), ArrayType::new_static(DataType::F32, [4, 2]));
 
         let unbounded = DimensionVariable::new("size", DimensionBounds::unbounded());

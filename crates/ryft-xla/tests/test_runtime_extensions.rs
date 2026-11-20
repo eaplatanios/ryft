@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use pretty_assertions::assert_eq;
 use ryft_core::{
     ArrayType, CompilationCacheDomain, CompilationDomain, CustomCall, CustomCallOperation, DataType, Device,
-    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, StagedFunction as CoreStagedFunction,
+    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, StagedFunction,
 };
 use ryft_pjrt::extensions::ffi::{
     FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
@@ -201,12 +201,12 @@ fn providers(left: &Arc<Statistics>, right: &Arc<Statistics>, duplicate_binding:
 }
 
 /// Stages a source custom call using only the downstream public compilation API.
-fn staged(mesh: DeviceMesh, requirements: Vec<RuntimeRequirement>) -> CoreStagedFunction<Session, Type, Type> {
+fn staged(mesh: DeviceMesh, requirements: Vec<RuntimeRequirement>) -> StagedFunction<Session, Type, Type> {
     let r#type = ArrayType::scalar(DataType::I32);
     let operation = CustomCallOperation::new(TARGET, vec![r#type.clone()])
         .with_runtime_requirements(requirements)
         .unwrap();
-    CoreStagedFunction::stage(
+    StagedFunction::stage(
         move |_, _, input| Ok(CustomCall::custom_call(&operation, [&input])?.remove(0)),
         Vec::new(),
         Type::Array(r#type),

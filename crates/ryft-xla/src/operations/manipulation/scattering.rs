@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, Dimension as CoreDimension, Operation as CoreOperation, ReductionKind,
-    ScatterMode, ScatterOperation, ScatterReductionKind, Shape,
+    ArrayType, ComparisonDirection, DataType, Dimension, Operation, ReductionKind, ScatterMode, ScatterOperation,
+    ScatterReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -77,7 +77,7 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         .collect::<Vec<_>>();
     for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
         let update_dimension = input_types[2].dimension(update_axis);
-        if matches!(update_dimension, CoreDimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
+        if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: operation.name().to_string(),
                 reason: format!(
@@ -130,7 +130,7 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
                 block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
             );
             if operation.mode() == ScatterMode::Drop {
-                let CoreDimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
+                let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
                 else {
                     unreachable!()
                 };
@@ -408,8 +408,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
-        BatchingContext, ConstantOperation, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSize,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization, Placeholder,
+        BatchingContext, ConstantOperation, DataType, Dimension, DimensionBounds, DimensionSize, DimensionVariable,
+        DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization, Placeholder,
         ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, Scatter, ScatterDimensionNumbers, ScatterMode,
         ScatterOperation, ScatterOptions, ScatterReductionKind, Shape, TypeError, TypedProgram, ValueProjection,
         differentiate_at, i1, u1,
@@ -431,12 +431,9 @@ mod tests {
     fn test_scatter_operation_lower() {
         // Scatter with addition row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is
         // [3, 2], and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
-        let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let updates_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
         let mut builder = ProgramBuilder::new();
@@ -473,12 +470,9 @@ mod tests {
         );
 
         // Complex scatter extrema share the explicit lexicographic combiner used by complex reductions.
-        let operand_type =
-            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let updates_type =
-            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let operand_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Max);
         let mut builder = ProgramBuilder::new();
@@ -530,8 +524,8 @@ mod tests {
         let updates = builder.add_input(ArrayType::new(
             DataType::F32,
             Shape::new(vec![
-                CoreDimension::Static(1),
-                CoreDimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
+                Dimension::Static(1),
+                Dimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
             ]),
         ));
         let output = builder
@@ -567,7 +561,7 @@ mod tests {
                 let input_type = if dynamic_input {
                     ArrayType::new(
                         DataType::I64,
-                        Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                        Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
                             "rows",
                             DimensionBounds::new(2, Some(5)).unwrap(),
                         ))]),
@@ -576,13 +570,13 @@ mod tests {
                     ArrayType::new_static(DataType::I64, [4])
                 };
                 let query = if dynamic_query {
-                    CoreDimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(5)).unwrap()))
+                    Dimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(5)).unwrap()))
                 } else {
-                    CoreDimension::Static(4)
+                    Dimension::Static(4)
                 };
                 let index_data_type = if unsigned { DataType::U64 } else { DataType::I64 };
                 let indices_type =
-                    ArrayType::new(index_data_type, Shape::new(vec![query.clone(), CoreDimension::Static(1)]));
+                    ArrayType::new(index_data_type, Shape::new(vec![query.clone(), Dimension::Static(1)]));
                 let updates_type = ArrayType::new(DataType::I64, Shape::new(vec![query]));
                 let mut builder = ProgramBuilder::new();
                 let inputs = [input_type.clone(), indices_type.clone(), updates_type.clone()]
@@ -777,7 +771,7 @@ mod tests {
         // axis, which `ryft-core` type inference enforces before a program can contain such a scatter.
         let input_type = ArrayType::new(
             DataType::I64,
-            Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
                 "rows",
                 DimensionBounds::new(1, Some(6)).unwrap(),
             ))]),
@@ -1014,14 +1008,11 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let staged_types = vec![
-            ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), CoreDimension::Static(4)])),
-            ArrayType::new(
-                DataType::I32,
-                Shape::new(vec![extent.clone(), CoreDimension::Static(1), CoreDimension::Static(1)]),
-            ),
-            ArrayType::new(DataType::F64, Shape::new(vec![extent, CoreDimension::Static(1)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), Dimension::Static(4)])),
+            ArrayType::new(DataType::I32, Shape::new(vec![extent.clone(), Dimension::Static(1), Dimension::Static(1)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![extent, Dimension::Static(1)])),
         ];
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
         // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any

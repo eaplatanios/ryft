@@ -1,8 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AbsOperation, AddOperation, ArrayType, DataType, DivOperation, MulOperation, NegOperation,
-    Operation as CoreOperation, PowOperation, RemOperation, RsqrtOperation, SaturatingSubOperation, SignOperation,
-    SqrtOperation, SubOperation,
+    AbsOperation, AddOperation, ArrayType, DataType, DivOperation, MulOperation, NegOperation, Operation, PowOperation,
+    RemOperation, RsqrtOperation, SaturatingSubOperation, SignOperation, SqrtOperation, SubOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef};

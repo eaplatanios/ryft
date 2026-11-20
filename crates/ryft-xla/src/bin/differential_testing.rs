@@ -15,13 +15,13 @@ use ryft_core::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchAxis, BatchingContext, BatchingTracer,
     BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration, CollectiveOptions, Compare,
     ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate,
-    Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
-    DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
-    MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute,
-    ParallelReduce, ParallelSumScatter, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError,
-    ProjectedContext, Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions,
-    Sharding, ShardingDimension, TypedProgram, Value as CoreValue, ValueProjection, ZeroLike, block_scaled_dot,
-    differentiate_at, dot_product_attention, shard_map,
+    Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
+    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
+    ParallelSumScatter, Placeholder, Program as CoreProgram, ProgramBuilder, ProgramError, ProjectedContext, Reduce,
+    ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding, ShardingDimension,
+    TypedProgram, Value, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, dot_product_attention,
+    shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -372,7 +372,7 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
                 .unwrap()
             }
         },
-        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)])),
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)])),
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let input_values = (0..4)
@@ -421,7 +421,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
                 .unwrap()
             }
         },
-        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)])),
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let input_values = (0..4)
@@ -492,7 +492,7 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
                 .unwrap()
             }
         },
-        ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16), CoreDimension::Static(2)])),
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16), Dimension::Static(2)])),
     )?;
     let stablehlo = traced.to_mlir_module("main")?;
     let input_values = (0..4)
@@ -519,7 +519,7 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
 
 /// Builds the bounded data-dependent prefix program shared by its eager and staged observations.
 fn data_dependent_prefix_program() -> Result<
-    ryft_core::Program<
+    CoreProgram<
         ArrayIrValue<CoreArray>,
         ArrayIrOperation<CoreArray>,
         Vec<ArrayIrValue<CoreArray>>,
@@ -527,9 +527,9 @@ fn data_dependent_prefix_program() -> Result<
     >,
     ProgramError,
 > {
-    let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new();
-    let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)])).into());
-    let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)])).into());
+    let mut builder = ProgramBuilder::<ArrayIrValue<CoreArray>, ArrayIrOperation<CoreArray>>::new();
+    let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])).into());
+    let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into());
     let mask = builder.add_instruction(
         ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(
             DataType::I64,
@@ -597,7 +597,7 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
 /// Emits generalized scaled dot and rank-3 scaled matmul values plus the StableHLO contract of the named composite.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
     /// Binds the primitive directly so the differential fixture covers its optional block-scale inputs.
-    fn bind_scaled_dot<V: CoreValue<Type = ArrayType>>(
+    fn bind_scaled_dot<V: Value<Type = ArrayType>>(
         left: &V,
         right: &V,
         left_scale: Option<&V>,

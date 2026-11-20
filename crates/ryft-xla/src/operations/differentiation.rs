@@ -1,6 +1,6 @@
 use ryft_core::{
-    ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation as CoreOperation, ProgramError,
-    REMATERIALIZE_OPERATION_NAME, RematerializationOptimizationBarrier, RematerializeOperation, StopGradientOperation,
+    ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation, ProgramError, REMATERIALIZE_OPERATION_NAME,
+    RematerializationOptimizationBarrier, RematerializeOperation, StopGradientOperation,
 };
 use ryft_mlir::ValueRef;
 
@@ -132,9 +132,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, CaptureReference, Context, CosOperation, DataType, DomainTracingContext,
-        EverythingSavable, Memory, MulOperation, NothingSavable, Placeholder, PrintOperation, ResidualPolicyReference,
-        SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation, TypedProgram, Value as CoreValue,
-        differentiate_at, rematerialize,
+        Error as CoreError, EverythingSavable, Memory, MulOperation, NothingSavable, Placeholder, PrintOperation,
+        ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation, TypedProgram,
+        Value, differentiate_at, rematerialize,
     };
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
@@ -238,7 +238,7 @@ mod tests {
                 .lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == "higher-order operation must be stored directly in the enclosing backend operation \
                         family",
             ),
@@ -743,7 +743,7 @@ mod tests {
             LinearCallOperation::<ArrayType>::new(1).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
                     if *message == expected_message,
             ),
         ));

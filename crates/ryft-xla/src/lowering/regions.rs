@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    AtomId, Instruction, Operation as CoreOperation, Parameterized, Program as CoreProgram, ProgramError, RegionRef,
-    RematerializationOptimizationBarrier, Type as RyftType, Typed, Value as CoreValue,
+    AtomId, Instruction, Operation, Parameterized, Program as CoreProgram, ProgramError, RegionRef,
+    RematerializationOptimizationBarrier, Type, Typed, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -230,9 +230,9 @@ fn replay_program_into_block<
     'b,
     'c: 'b,
     't: 'c,
-    T: RyftType,
+    T: Type,
     O,
-    V: CoreValue<Type = T>,
+    V: Value<Type = T>,
     Input,
     Output,
     LiftConstant,
@@ -247,7 +247,7 @@ fn replay_program_into_block<
     mut apply_operation: ApplyOperation,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    O: CoreOperation<Type = T>,
+    O: Operation<Type = T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     LiftConstant: FnMut(
@@ -286,8 +286,8 @@ fn replay_region_ref_into_block<'b, 'c: 'b, 't: 'c, O, V, LiftConstant, ApplyOpe
     mut apply_operation: ApplyOperation,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
-    V: CoreValue,
-    O: CoreOperation<Type = V::Type>,
+    V: Value,
+    O: Operation<Type = V::Type>,
     LiftConstant: FnMut(
         AtomId,
         &V,
@@ -316,7 +316,9 @@ where
 pub(in crate::lowering) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{AddOperation, ArrayType, DataType, MulOperation, Placeholder, PrintOperation};
+    use ryft_core::{
+        AddOperation, ArrayType, DataType, Error as CoreError, MulOperation, Placeholder, PrintOperation, Program,
+    };
     use ryft_mlir::dialects::func;
     use ryft_mlir::{
         Block, Location, Operation as MlirOperation, Region, Type as MlirType, TypeAndAttributes, Value as MlirValue,
@@ -332,7 +334,7 @@ pub(in crate::lowering) mod tests {
     /// Lowers one plain traced program to values inside `block`, whose arguments are the program inputs. This test-only
     /// path supports no attached regions.
     pub(in crate::lowering) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-        program: &CoreProgram<V, O, Input, Output>,
+        program: &Program<V, O, Input, Output>,
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
@@ -572,7 +574,7 @@ pub(in crate::lowering) mod tests {
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
             ),
         ));
     }
