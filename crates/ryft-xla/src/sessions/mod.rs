@@ -980,12 +980,15 @@ impl Context for Session {
                 // can be placed along auto mesh axes differently from what the source of the transposed placement says.
                 // Type inference has already checked the sharding that types do track. A placement that must not alias
                 // its input copies whatever buffers the result still shares with any other array (e.g., the input
-                // itself, which the caller still holds, when the placement leaves it where it is),
-                // as `Session::place` does for an `Array` leaf.
-                let output = array
-                    .run_placement_dispatch(self, operation.target(), false)
-                    .and_then(|output| if operation.may_alias() { Ok(output) } else { output.into_unaliased(self) })
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                // itself, which the caller still holds, when the placement leaves it where it is), as `Session::place`
+                // does for an `Array` leaf. A placement without a target leaves the array where it is, so its result
+                // is the array itself, associated with this session.
+                let output = match operation.target() {
+                    Some(target) => array.run_placement_dispatch(self, target, false),
+                    None => array.with_session(self),
+                }
+                .and_then(|output| if operation.may_alias() { Ok(output) } else { output.into_unaliased(self) })
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 return Ok(vec![Value::Array(output)]);
             }
             Operation::Cast(operation) if matches!(operation.output_type(), Type::Dimension(_)) => {
@@ -2761,7 +2764,7 @@ pub(crate) mod tests {
         let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![mesh.devices()[0]]).unwrap();
         let input = f32_vector(&session, &first_mesh, &[1.0, 2.0, 3.0, 4.0]);
         let place = |target: &Placement, may_alias: bool| {
-            <Array as CoreValue>::Dispatch::place(&input, target, None, may_alias).unwrap()
+            <Array as CoreValue>::Dispatch::place(&input, Some(target), None, may_alias).unwrap()
         };
         let shares_input_buffer = |array: &Array| {
             array

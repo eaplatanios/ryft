@@ -76,7 +76,7 @@ impl LowerableOperation for TransferToMemoryOperation {
 /// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
 /// transfers (i.e., transfers whose destination equals the operand's current space) still lower to the annotation,
 /// because placement round trips are meaningful to `HostOffloader` and must not be optimized away here.
-fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     destination: Memory,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut B,

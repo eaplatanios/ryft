@@ -371,6 +371,30 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
 }
 
+/// Converts the lowered `value`, whose type has the shape of `output_type` but another layout, to the physical layout
+/// of `output_type`, which must name one. The `LayoutConstraint` custom call that enforces the layout takes a static
+/// physical buffer, so the logical sizes of any bounded dynamic axes are kept on the converted value while that buffer
+/// is exposed and are restored after its allocation is constrained. No padding becomes logical data.
+pub(crate) fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    value: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let physical_type = physical_bound_type(output_type)?;
+    let physical =
+        lower_physical_storage(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+    let result = lower_layout_constraint(physical, &physical_type, &mut lowerer.block(), lowerer.location())?;
+    let sources = (0..output_type.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
+    lower_restore_dynamic_dimensions(
+        result,
+        output_type,
+        &sources,
+        &mut lowerer.block(),
+        lowerer.context(),
+        lowerer.location(),
+    )
+}
+
 /// Lowers the same complete [`CastOperation`] contract for native and array IR type families. Witness producers are
 /// explicit dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered after
 /// preceding assertions, because its dependency barrier consumes the current assertion token, without advancing it,
@@ -456,22 +480,8 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     };
     let mut result = value;
     if output_type.layout().is_some() && output_type.layout() != input_type.layout() {
-        // LayoutConstraint takes a static physical buffer. Preserve logical sizes on the converted value while the
-        // buffer is exposed, then restore them after constraining its allocation. No padding becomes logical data.
         // An input that already declares the requested layout was constrained by its producer.
-        let physical_type = physical_bound_type(output_type)?;
-        let physical =
-            lower_physical_storage(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
-        result = lower_layout_constraint(physical, &physical_type, &mut lowerer.block(), lowerer.location())?;
-        let sources = (0..output_type.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
-        result = lower_restore_dynamic_dimensions(
-            result,
-            output_type,
-            &sources,
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )?;
+        result = lower_layout_conversion(value, output_type, lowerer)?;
     }
     if let Some(sharding) = output_type.sharding()
         && cast_changes_explicit_placement(input_type, output_type)

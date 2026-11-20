@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 use ryft_core::{
     Array, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation, CastOperation, CollectiveAxes,
-    CompositeKey, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType, DimensionValue,
+    CompositeKey, ConstrainShardingOperation, DataType, DeviceMesh, DimensionOperation, DimensionType, DimensionValue,
     DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
     FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation, LogicalMesh, Memory,
-    OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized,
-    ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
-    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as CoreType,
-    TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
+    OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME,
+    Parameterized, PlaceOperation, ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation,
+    ReshardOperation, ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
+    Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -110,6 +110,17 @@ pub enum LoweringError {
     #[error("mesh `{actual}` does not have the topology of the module mesh `{expected}`")]
     MismatchedMeshTopology { expected: LogicalMesh, actual: LogicalMesh },
 
+    #[error(
+        "`{}` cannot move a value to the devices {:?} of mesh `{}` inside a program compiled for the devices {:?} of \
+         mesh `{}`",
+        PLACE_OPERATION_NAME,
+        .target.devices().iter().map(|device| device.id()).collect::<Vec<_>>(),
+        .target.logical_mesh(),
+        .mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>(),
+        .mesh.logical_mesh(),
+    )]
+    PlacementOutsideProgramMesh { target: DeviceMesh, mesh: DeviceMesh },
+
     /// A valid operation requests behavior this backend cannot lower.
     #[error("cannot lower `{operation}`: {reason}")]
     UnsupportedOperation { operation: String, reason: String },
@@ -118,8 +129,6 @@ pub enum LoweringError {
     #[error("cannot lower element type `{data_type}` for {context}")]
     UnsupportedElementType { data_type: DataType, context: String },
 
-    /// An argument or a result of the entry function is placed in a memory that programs compiled for the target
-    /// platform can neither read their arguments from nor return their results in.
     #[error("programs compiled for platform `{platform}` cannot take or return values in `{memory}` memory")]
     UnsupportedBoundaryMemory { memory: Memory, platform: String },
 
@@ -782,7 +791,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelBroadcast, ParallelAllToAll,
             ParallelRaggedAllToAll, Compare, Select, Transpose, Reverse, Reshape, Broadcast, BroadcastLike, Pad,
             Concatenate, Gather, Scatter, Slice, UpdateSlice,
-            DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
+            DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Place, Reshard,
             ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
             Dropout, Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
         )
@@ -1595,10 +1604,11 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    // Attached computations share the canonical region arena. Type metadata alone does not require a mesh, because
-    // bounded dynamic replica lowering retains that metadata without emitting Shardy operations.
+    // Only the computation regions that lowering emits contribute, so dormant rule regions (e.g., the transpose region
+    // of a `linear_call`) cannot bring other meshes into the module. Type metadata alone does not require a mesh,
+    // because bounded dynamic replica lowering retains that metadata without emitting Shardy operations.
     let mut mesh = existing;
-    for region in program.regions().iter() {
+    for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
             // Payloads are recognized through their projections, so any family that embeds them declares their meshes.
             let operation = instruction.operation();
@@ -1612,6 +1622,12 @@ where
                     operation
                         .projected_payload::<ConstrainShardingOperation>()
                         .map(|operation| operation.sharding().mesh())
+                })
+                .or_else(|| {
+                    operation
+                        .projected_payload::<PlaceOperation>()
+                        .and_then(PlaceOperation::target)
+                        .map(|target| target.sharding().mesh())
                 });
             let incoming = if let Some(mesh) = declared_mesh {
                 Some(mesh.clone())

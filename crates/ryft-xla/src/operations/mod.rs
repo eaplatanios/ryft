@@ -27,16 +27,16 @@ use ryft_core::{
     Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
-    PowOperation, PrintOperation, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProgramError,
-    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor,
-    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
-    RsqrtOperation, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation,
-    ShardMapOperation, SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation,
-    StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation,
-    TransposeOperation, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
-    XorOperation, ZeroLikeOperation, ZeroOperation,
+    PlaceOperation, PowOperation, PrintOperation, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder,
+    ProgramError, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation, ReshapeOperation,
+    ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
+    SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
+    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, UnavailableCustomRules,
+    UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_mlir::dialects::stable_hlo;
@@ -636,6 +636,7 @@ impl_array_operation_conversion!(SelectOperation<ArrayType>);
 impl_array_operation_conversion!(ConvertElementTypeOperation<ArrayType>);
 impl_array_operation_conversion!(ReducePrecisionOperation<ArrayType>);
 impl_array_operation_conversion!(TransferToMemoryOperation);
+impl_array_operation_conversion!(PlaceOperation);
 impl_array_operation_conversion!(ReshardOperation);
 impl_array_operation_conversion!(ConstrainShardingOperation);
 impl_array_operation_conversion!(StopGradientOperation<ArrayType>);

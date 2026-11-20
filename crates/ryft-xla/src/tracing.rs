@@ -254,9 +254,11 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
-        ConstrainSharding, DataType, Dimension, EffectClass, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
-        Print, RegionRole, Reshape, Reshard, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, shard_map,
+        ConstrainSharding, DataType, Device, DeviceMesh, Dimension, EffectClass, Error as CoreError, LogicalMesh,
+        MeshAxis, MeshAxisType, Place, Placement, Print, RegionRole, Reshape, Reshard, Shape, ShardMapOptions,
+        Sharding, ShardingDimension, Sin, StopGradient, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
 
@@ -485,6 +487,37 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2, "a"=2]>
                   func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x", "a"}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_traced_program_to_mlir_module_annotates_placed_results() {
+        // A result that a `place` produces, also through an operation that returns its input unchanged, is annotated
+        // with the target of that `place`, including its split along the auto axis that the result type drops, as
+        // compilation places it.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh, sharding).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| x.place(&target, None).unwrap().stop_gradient().unwrap(),
+            ArrayType::new_static(DataType::F32, [8]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
                 }

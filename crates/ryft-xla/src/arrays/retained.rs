@@ -69,6 +69,10 @@ pub struct RetainedArray {
     /// Arrays that [`Self::to_array`] creates share it with the retained array.
     send_fence: Option<ExecutionFence>,
 
+    /// Whether the retained array is committed to its devices, which the arrays that [`Self::to_array`] creates keep.
+    /// It is not part of the identity of this retained array. Refer to [`Array::is_committed`] for more information.
+    committed: bool,
+
     /// PJRT [`Client`] that owns the buffers of the retained array.
     client: &'static Client<'static>,
 }
@@ -86,6 +90,7 @@ impl RetainedArray {
             shards: Arc::from(array.parts.shards.as_slice()),
             execution_fence: array.execution_fence.clone(),
             send_fence: array.send_fence.clone(),
+            committed: array.is_committed(),
             client: array.client(),
         }
     }
@@ -112,6 +117,7 @@ impl RetainedArray {
             execution_fence: self.execution_fence.clone(),
             send_fence: self.send_fence.clone(),
             session: session.clone(),
+            committed: self.committed,
         })
     }
 
@@ -222,6 +228,11 @@ mod tests {
         let restored = retained.to_array(&fork).unwrap();
         assert_eq!(restored, array);
         assert!(shares_effect_scope(restored.session(), &fork));
+
+        // The new array keeps the commitment of the retained array, even on a session whose mesh
+        // would commit an upload.
+        assert!(!retained.to_array(&session.with_device_mesh(domain_mesh(client, "x", 1))).unwrap().is_committed());
+        assert!(RetainedArray::new(&array.clone().with_committed(true)).to_array(&fork).unwrap().is_committed());
 
         // Every session of the client that owns the buffers can create the array, and the buffers outlive the session
         // of the array that was retained.

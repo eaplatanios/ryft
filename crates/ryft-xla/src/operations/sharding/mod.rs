@@ -1,5 +1,7 @@
 /// Shardy lowering of sharding constraints.
 pub(crate) mod constrain_sharding;
+/// XLA lowering of `place`.
+pub(crate) mod place;
 /// Shardy lowering of `reshard`.
 pub(crate) mod reshard;
 /// Shardy lowering of `shard_map` to `sdy.manual_computation`.

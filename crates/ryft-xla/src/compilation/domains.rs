@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
-    ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DispatchInputs,
-    ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, Parameterized, ProgramError,
-    ReferenceDischargeResult, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram,
-    Type as CoreType, TypeError, Typed, TypedProgram,
+    ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh, DispatchInputs,
+    ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, OperationPayloadProjection,
+    PLACE_OPERATION_NAME, Parameterized, PlaceOperation, ProgramError, ReferenceDischargeResult,
+    SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError,
+    Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -27,7 +28,9 @@ use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredP
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::{collect_session_constants, contains_unresolved_references, contains_unresolved_state};
-use crate::{Constant, Error, ExecutionError, FlatProgram, OpShardingExtension, Operation, Session, Type, Value};
+use crate::{
+    Constant, Error, ExecutionError, FlatProgram, LoweringError, OpShardingExtension, Operation, Session, Type, Value,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -388,12 +391,33 @@ impl Session {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        // Outputs are placed as an output override requests, including over auto mesh axes, and otherwise as their
-        // types are.
+        // A public output that a `place` in the entry region produces has the placement of its target, which states
+        // the placement along every mesh axis. Its type drops the auto mesh axes of that placement, and its result has
+        // no physical buffer whose placement the compiler could report when it has the zero data type, so the target
+        // is carried to the boundary instead. Only placements in the entry region are carried, because a placement in a
+        // nested region reaches an output only through the result of the operation that owns that region. A `place`
+        // without a target leaves its input where it is, so an output that it produces is placed as its input would be.
+        let instruction_by_output = program.instruction_by_output();
+        let placed_outputs = program.output_ids()[..output_count]
+            .iter()
+            .map(|&output_id| {
+                let mut value_id = output_id;
+                loop {
+                    let instruction = &program.instructions()[instruction_by_output[value_id.index()]?];
+                    match instruction.operation().projected_payload::<PlaceOperation>()?.target() {
+                        Some(target) => return Some(target.sharding().clone()),
+                        None => value_id = instruction.inputs()[0],
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        // Outputs are placed as an output override requests, then as the `place` that produces them requests, both
+        // including over auto mesh axes, and otherwise as their types are.
         let output_placement = |index: usize, array_type: &ArrayType| {
             options
                 .output_shardings()
                 .and_then(|shardings| shardings.get(index).cloned())
+                .or_else(|| placed_outputs[index].clone())
                 .or_else(|| array_type.sharding().cloned())
         };
         // An output without a placement is replicated. These placements are both the result annotations that lowering
@@ -419,9 +443,10 @@ impl Session {
         }
         // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
-        // still has to take the replica path. This is why the whole region arena is inspected instead of just the
+        // still has to take the replica path. This is why every lowered region is inspected instead of just the
         // boundary types, which it already subsumes.
         let use_shardy_partitioner = has_only_static_array_types(program);
+        validate_placements(program, options.mesh(), use_shardy_partitioner)?;
         // A `shard_map` body only ever has static boundary types, so it can coexist with dynamic tensors staged
         // elsewhere in the same program. Its `sdy.manual_computation` lowering is meaningless without Shardy on any
         // device count, and bounded dynamic tensors force Shardy off for the whole module.
@@ -464,9 +489,9 @@ impl Session {
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
         // outputs without `out_shardings`, and compilation reads that placement back from the executable. Axes of size
         // one admit only one placement, so meshes without larger auto axes keep every result closed. Outputs with
-        // reduction state or manual variation, and hidden reference states, are always placed as declared, and
-        // outputs with unconstrained dimensions already leave their whole placement to the compiler, as
-        // `ExecutionPlan` explains.
+        // reduction state or manual variation, outputs that a `place` produces, and hidden reference states, are always
+        // placed as declared, and outputs with unconstrained dimensions already leave their whole placement to the
+        // compiler, as `ExecutionPlan` explains.
         let open_outputs = output_shardings
             .iter()
             .enumerate()
@@ -474,6 +499,7 @@ impl Session {
                 lowered_result_shardings.is_some()
                     && index < output_count
                     && options.output_shardings().is_none()
+                    && placed_outputs[index].is_none()
                     && sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
                     && sharding.unreduced_axes().is_empty()
                     && sharding.reduced_axes().is_empty()
@@ -853,12 +879,14 @@ fn apply_signature_shardings(
     Ok(types)
 }
 
-/// Returns whether every array type that occurs anywhere in `program` has a static shape. The walk covers the whole
-/// region arena, and therefore every region boundary, constant, and instruction result, recursively through attached
-/// regions. First-class atoms of dimension type are ignored because they lower to ordinary scalars. Only dynamically
+/// Returns whether every array type that occurs in a lowered region of `program` has a static shape. The walk covers
+/// the entry region and its executed nested regions, and therefore every region boundary, constant, and instruction
+/// result that lowering emits. Regions that lowering never reaches (e.g., the rule regions of composites or the
+/// transpose region of a `linear_call`) are skipped, so that they cannot change how the rest of the program is
+/// compiled. First-class atoms of dimension type are ignored because they lower to ordinary scalars. Only dynamically
 /// shaped *array* types make the lowered module unacceptable to the Shardy partitioner.
 fn has_only_static_array_types(program: &FlatProgram) -> bool {
-    program.regions().iter().all(|region| {
+    program.entry_region_ref().computation_regions().all(|region| {
         region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
             Type::Array(array_type) => array_type.static_shape().is_some(),
             Type::Dimension(_) => true,
@@ -870,16 +898,71 @@ fn has_only_static_array_types(program: &FlatProgram) -> bool {
     })
 }
 
-/// Returns whether `program` stages a `shard_map` anywhere, including inside nested regions. The documentation of
-/// [`ShardMapOperation`](ryft_core::ShardMapOperation) requires `shard_map` boundaries to be static, so a `shard_map`
-/// can still appear in a program that is bounded dynamic elsewhere, which this predicate detects.
+/// Returns whether `program` lowers a `shard_map`, including inside executed nested regions but not inside regions that
+/// lowering never reaches. The documentation of [`ShardMapOperation`](ryft_core::ShardMapOperation) requires
+/// `shard_map` boundaries to be static, so a `shard_map` can still appear in a program that is bounded dynamic
+/// elsewhere, which this predicate detects.
 fn contains_shard_map(program: &FlatProgram) -> bool {
-    program.regions().iter().any(|region| {
+    program.entry_region_ref().computation_regions().any(|region| {
         region
             .instructions()
             .iter()
             .any(|instruction| matches!(instruction.operation(), Operation::ShardMap(_)))
     })
+}
+
+/// Validates that every `place` that is lowered as part of `program`, including inside executed nested regions,
+/// can be compiled for `mesh`, which is the device mesh that `program` is compiled for, with or without the Shardy
+/// partitioner, depending on `use_shardy_partitioner`.
+///
+/// A compiled program runs on the devices of one mesh, so a `place` inside it can only redistribute a value over those
+/// devices and change its storage. Lowering only knows the logical mesh of the module, so the devices are checked
+/// before lowering, which also reports a target over another mesh topology as such rather than as a less specific
+/// mismatch of the module mesh. JAX instead silently ignores the devices of such a `device_put` target inside `jit`.
+/// Without the Shardy partitioner (i.e., for bounded dynamic programs), the compiler runs one fully replicated replica
+/// of the program on each device and ignores sharding constraints, so it would silently ignore a `place` whose target
+/// is not replicated. A `place` without a target leaves its input where it is and lowers to nothing, so it is not
+/// checked. Regions that lowering never reaches (e.g., the rule regions of composites or the transpose region of a
+/// `linear_call`) are not checked, because they are not part of the compiled program. Entry points that lower a program
+/// without compiling it for a device mesh (e.g., [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module))
+/// know no devices and do not run it.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
+/// the same devices in another order, or another topology than `mesh`, and [`LoweringError::UnsupportedOperation`]
+/// for the first `place` whose target sharding is not fully replicated (refer to [`Sharding::is_replicated`]) when
+/// `use_shardy_partitioner` is not set and `mesh` has more than one device.
+fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_partitioner: bool) -> Result<(), Error> {
+    for region in program.entry_region_ref().computation_regions() {
+        for instruction in region.instructions() {
+            // A `place` without a target leaves its input where it is and lowers to nothing, so it has nothing to
+            // validate, whatever its source says.
+            let Some(target) =
+                instruction.operation().projected_payload::<PlaceOperation>().and_then(PlaceOperation::target)
+            else {
+                continue;
+            };
+            let target_mesh = target.mesh();
+            if target_mesh.devices() != mesh.devices()
+                || !target_mesh.logical_mesh().has_same_topology(mesh.logical_mesh())
+            {
+                return Err(Error::Lowering(LoweringError::PlacementOutsideProgramMesh {
+                    target: target_mesh.clone(),
+                    mesh: mesh.clone(),
+                }));
+            }
+            if !use_shardy_partitioner && mesh.devices().len() > 1 && !target.sharding().is_replicated() {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: PLACE_OPERATION_NAME.to_string(),
+                    reason: "bounded-dynamic multi-device programs currently require fully replicated placement \
+                             targets because Shardy rejects dynamic tensors"
+                        .to_string(),
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the runtime placement of every output of `program` compiled as `executable`. The placement of an output
@@ -939,13 +1022,13 @@ mod tests {
         CompiledFunction, ConditionOperation, ConstantOperation, CotangentDestinationKind, CumulativeKind,
         CumulativeOperation, DataType, Device, DeviceMesh, Dimension, DimensionAddOperation, DimensionBounds,
         DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation, Operation as CoreOperation, Placeholder,
-        ProgramError, Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, Reshard, ScanOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding,
-        ShardingDimension, Sin, SliceOperation, StagedFunction, WhileOperation,
+        DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, LinearCallOperation,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneOperation,
+        Operation as CoreOperation, Placeholder, Placement, ProgramError, Provenance, ProvenanceScope, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshard, ScanOperation, Shape, ShardMapBoundary,
+        ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation, StagedFunction, WhileOperation,
     };
     use ryft_pjrt::protos::Precision;
 
@@ -1504,6 +1587,148 @@ mod tests {
             "cannot lower `shard_map`: bounded-dynamic programs cannot contain `shard_map` regions because \
              `sdy.manual_computation` requires the Shardy partitioner",
         );
+    }
+
+    #[test]
+    fn test_session_lower_program_ignores_placements_in_dormant_regions() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let vector_type = replicated_vector_type(&mesh, 2);
+        let other_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![mesh.devices()[0]],
+        )
+        .unwrap();
+        let other_target =
+            Placement::new(other_mesh.clone(), Sharding::replicated(other_mesh.logical_mesh().clone(), 1)).unwrap();
+
+        // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so a placement there on
+        // the devices and the topology of another mesh neither fails the validation of placements nor contributes its
+        // mesh to the module.
+        let build_region = |place: bool| {
+            let mut builder = ProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone().into());
+            let linear = builder.add_input(vector_type.clone().into());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
+            if place {
+                builder
+                    .add_instruction(PlaceOperation::new(other_target.clone(), None), Vec::new(), vec![linear], None)
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let (forward, transpose) = (build_region(false), build_region(true));
+        let mut builder = ProgramBuilder::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(vector_type.clone().into());
+        let linear = builder.add_input(vector_type.clone().into());
+        let output = builder
+            .add_instruction(
+                Operation::LinearCall(LinearCallOperation::new(1)),
+                vec![forward, transpose],
+                vec![residual, linear],
+                None,
+            )
+            .unwrap()[0];
+        let program: FlatProgram =
+            builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
+            .execute_program(
+                &compiled,
+                vec![f32_vector(&session, &mesh, &[2.0, 3.0]), f32_vector(&session, &mesh, &[4.0, 5.0])],
+            )
+            .unwrap();
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![8.0, 15.0]);
+    }
+
+    #[test]
+    fn test_session_lower_program_ignores_dynamic_types_in_dormant_regions() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let vector_type = replicated_vector_type(&mesh, 2);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+
+        // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so a bounded dynamic
+        // broadcast and sum there leaves the Shardy partitioner enabled for the static split of the primal.
+        let build_region = |dynamic: bool| {
+            let mut builder = ProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone().into());
+            let linear = builder.add_input(vector_type.clone().into());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
+            if dynamic {
+                let size = CoreArray::from_elements(replicated_scalar_type(&mesh, DataType::I64), &[2i64]).unwrap();
+                let size =
+                    builder.add_instruction(ConstantOperation::new(size), Vec::new(), Vec::new(), None).unwrap()[0];
+                let dimension = builder
+                    .add_instruction(
+                        DimensionFromScalarOperation::new(extent.clone().into()),
+                        Vec::new(),
+                        vec![size],
+                        None,
+                    )
+                    .unwrap()[0];
+                let sum = builder
+                    .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![linear], None)
+                    .unwrap()[0];
+                let broadcast = builder
+                    .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![sum, dimension], None)
+                    .unwrap()[0];
+                builder
+                    .add_instruction(
+                        ReduceOperation::new(vec![0], ReductionKind::Sum),
+                        Vec::new(),
+                        vec![broadcast],
+                        None,
+                    )
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        for dynamic in [false, true] {
+            let mut builder = ProgramBuilder::new();
+            let forward = builder.import_region(build_region(false).entry_region_ref());
+            let transpose = builder.import_region(build_region(dynamic).entry_region_ref());
+            let residual = builder.add_input(vector_type.clone().into());
+            let linear = builder.add_input(vector_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    Operation::LinearCall(LinearCallOperation::new(1)),
+                    vec![forward, transpose],
+                    vec![residual, linear],
+                    None,
+                )
+                .unwrap()[0];
+            let output = builder
+                .add_instruction(PlaceOperation::new(target.clone(), None), Vec::new(), vec![output], None)
+                .unwrap()[0];
+            let program: FlatProgram =
+                builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            let executable_options = lowered.compilation_options().executable_build_options.as_ref().unwrap();
+            assert!(executable_options.use_shardy_partitioner);
+            let compiled = session.compile_program(&lowered).unwrap();
+            let outputs = session
+                .execute_program(
+                    &compiled,
+                    vec![f32_vector(&session, &mesh, &[2.0, 3.0]), f32_vector(&session, &mesh, &[4.0, 5.0])],
+                )
+                .unwrap();
+            assert_eq!(outputs[0].sharding(), &sharded);
+            assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![8.0, 15.0]);
+        }
     }
 
     #[test]

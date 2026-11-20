@@ -19,7 +19,10 @@
 //! uploads and the readback of whole arrays, including the combination of the separate values that devices hold along
 //! unreduced mesh axes. [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host
 //! values to other devices or shardings. The [`placement`](mod@placement) module defines what a placement is and how to
-//! request one, and the [`resharding`](mod@resharding) module implements the moves. Array failures are reported through
+//! request one, and the [`resharding`](mod@resharding) module implements the moves. As in JAX, an array is committed to
+//! its devices when they were chosen on purpose (e.g., by a placement with a destination) and uncommitted when they are
+//! only a default (e.g., for a host value that was uploaded to the first device), and eager operations move uncommitted
+//! inputs to the devices of committed ones (refer to [`Array::is_committed`]). Array failures are reported through
 //! [`Error::Array`] with an [`ArrayError`].
 //!
 //! Every session counts the arrays that are created through it, which [`ArrayStatistics`] reports, and can describe
@@ -35,9 +38,9 @@ use ryft_core::{
     Add, And, Array as CoreArray, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType, DeviceId,
     DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
     DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul,
-    Neg, Not, Operation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
-    ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind, Value, ValueDomainDispatch,
-    WhilePredicate, Xor,
+    Neg, Not, Operation, Or, Parameter, ParameterPath, Parameterized, Placed, Placement, ProgramError,
+    ProjectedContext, Select, Shape, ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind,
+    Value, ValueDomainDispatch, WhilePredicate, Xor,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -56,7 +59,9 @@ pub mod retained;
 pub mod shards;
 pub mod statistics;
 
-pub use placement::{ArrayPlacement, ArrayPlacementTarget, Placeable, PlacementOptions};
+pub use placement::{
+    ArrayPlacement, ArrayPlacementTarget, HostOrArray, Placeable, PlaceableParameter, PlacementOptions,
+};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
@@ -95,8 +100,19 @@ pub enum ArrayError {
     #[error("expected source layout `{expected}` but the array declares `{actual:?}`")]
     SourceLayoutMismatch { expected: Layout, actual: Option<Layout> },
 
+    #[error("array `{path}` cannot be donated while `may_alias` is `Some(true)`")]
+    DonatedArrayMayAlias { path: ParameterPath },
+
     #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
     ManualReshardingAxis { axis_name: String },
+
+    #[error(
+        "compiled reshard cannot produce the shards of different sizes of shape `{shape}` with sharding `{sharding}`"
+    )]
+    UnevenReshardingShards { shape: StaticShape, sharding: Sharding },
+
+    #[error("type `{data_type}` has no additive identity to split a host value into summands along unreduced axes")]
+    MissingUnreducedSumIdentity { data_type: DataType },
 
     #[error("device {device_id} is not present in the device mesh")]
     DeviceNotInMesh { device_id: DeviceId },
@@ -204,6 +220,9 @@ pub struct Array {
     /// receiver-based operations on this array execute with. Explicit sessions select their own scope, while
     /// receiver-based operations use this value's session, so `x + y` and `y + x` may select different scopes.
     session: Session,
+
+    /// Whether this array is committed to its devices. Refer to [`Self::is_committed`] for more information.
+    committed: bool,
 }
 
 impl Array {
@@ -333,6 +352,7 @@ impl Array {
             execution_fence: None,
             send_fence: None,
             session: session.clone(),
+            committed: true,
         })
     }
 
@@ -380,6 +400,7 @@ impl Array {
             execution_fence: None,
             send_fence: None,
             session: session.clone(),
+            committed: true,
         })
     }
 
@@ -445,6 +466,7 @@ impl Array {
             execution_fence: Some(fence),
             send_fence: None,
             session: session.clone(),
+            committed: true,
         }
     }
 
@@ -462,6 +484,14 @@ impl Array {
     #[inline]
     pub(crate) fn with_send_fence(mut self, fence: ExecutionFence) -> Self {
         self.send_fence = Some(fence);
+        self
+    }
+
+    /// Returns this [`Array`] with its commitment set to `committed`, keeping its storage, placement, session, and
+    /// completion fences. Refer to [`Self::is_committed`] for what commitment means and which arrays are committed.
+    #[inline]
+    pub(crate) fn with_committed(mut self, committed: bool) -> Self {
+        self.committed = committed;
         self
     }
 
@@ -516,6 +546,46 @@ impl Array {
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         self.parts.metadata.mesh()
+    }
+
+    /// Returns whether this [`Array`] is _committed_ to its devices. This is the Ryft analogue of the commitment of
+    /// JAX arrays (refer to the section on [placement of data on devices][jax-placement] in the JAX documentation).
+    /// A committed array was placed on its devices on purpose, while an uncommitted array lives on its devices only
+    /// because nothing chose any (e.g., a host value that was uploaded to the first device by default). Commitment
+    /// is runtime state of the array, like its placement, and it is not part of its [`ArrayType`].
+    ///
+    /// An array is committed when one of the following holds, and it is uncommitted otherwise:
+    ///
+    ///   - **Explicit Devices:** It was constructed on a [`DeviceMesh`] that its caller provided (e.g., through
+    ///     [`Self::from_addressable_buffers`], [`Self::from_host_shards`], or [`Self::from_host_buffer`] with a mesh).
+    ///   - **Session Mesh:** It was created without a mesh and without array inputs by a [`Session`] that has a
+    ///     [default mesh](Session::device_mesh), which then decides its placement. This covers
+    ///     [`Self::from_host_buffer`] without a mesh, literal constants, and the results of eager operations without
+    ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, such arrays are uncommitted.
+    ///   - **Explicit Placement:** It was placed with a destination by [`Self::to_placement`],
+    ///     [`Self::into_placement`], [`Session::place`], or a [`PlaceOperation`](ryft_core::PlaceOperation) with a
+    ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted.
+    ///   - **Committed Inputs:** It is the result of an operation or of a compiled function that has a committed array
+    ///     input, including the arrays that the function captures.
+    ///
+    /// Clones keep the commitment of their array, and so do the arrays that keep the storage of an array or
+    /// copy it (e.g., a [`Session::place`] without a destination, also when it must not alias its input, and
+    /// a [`RetainedArray`] turned back into an array).
+    ///
+    /// Commitment decides where an eager operation runs when its array inputs live on different devices. Uncommitted
+    /// inputs follow committed ones, so when all committed inputs live on the same devices, the operation moves its
+    /// uncommitted inputs to the mesh of the committed inputs and runs there. A moved input keeps its sharding when
+    /// that sharding is over the logical mesh of the committed inputs, and it is replicated over that mesh when it is
+    /// replicated. A move shares the buffers of the shards that stay on their devices. The operation still fails when
+    /// two committed inputs live on different devices, when inputs on different devices are all uncommitted, and when
+    /// an uncommitted input cannot be moved (i.e., when it is sharded over another logical mesh, or when it or the
+    /// devices of the committed inputs are not fully addressable from this process). Compiled functions always run
+    /// on the devices that they were compiled for and move every input there, whatever its commitment.
+    ///
+    /// [jax-placement]: https://docs.jax.dev/en/latest/faq.html#controlling-data-and-computation-placement-on-devices
+    #[inline]
+    pub fn is_committed(&self) -> bool {
+        self.committed
     }
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
@@ -702,6 +772,21 @@ impl Typed for Array {
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(self.parts.metadata.r#type())
+    }
+}
+
+impl Placed for Array {
+    fn placement(&self) -> Option<Placement> {
+        // An array lives on the devices of its mesh, sharded by its runtime sharding (which may name auto mesh axes),
+        // in the memory that its type records and with its layout when it has one. The sharding of an array is
+        // always over the topology of its mesh, so the placement is always valid.
+        let placement = Placement::new(self.mesh().clone(), self.sharding().clone())
+            .unwrap()
+            .with_memory(self.r#type().memory());
+        Some(match self.layout() {
+            Some(layout) => placement.with_layout(layout.clone()),
+            None => placement,
+        })
     }
 }
 
@@ -1087,8 +1172,8 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh, Dimension,
         DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Neg, ProgramError, Reference, Shape, Sharding, ShardingDimension, StaticShape,
-        TiledLayout, TypeError, Typed, UnreducedKind, Value, WhilePredicate,
+        Memory, MeshAxis, MeshAxisType, Neg, Placed, Placement, ProgramError, Reference, Shape, Sharding,
+        ShardingDimension, StaticShape, TiledLayout, TypeError, Typed, UnreducedKind, Value, WhilePredicate,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
@@ -1825,6 +1910,48 @@ mod tests {
     }
 
     #[test]
+    fn test_array_is_committed() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+
+        // Arrays constructed on a mesh that the caller provides are committed to its devices.
+        let uploaded = Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, bytes.as_slice()).unwrap();
+        assert!(uploaded.is_committed());
+        let shards = mesh.devices().iter().map(|device| (device.id(), bytes.as_slice()));
+        assert!(
+            Array::from_host_shards(&session, r#type.clone(), mesh.clone(), None, shards)
+                .unwrap()
+                .is_committed()
+        );
+        let wrapped =
+            Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), None, Vec::new()).unwrap();
+        assert!(wrapped.is_committed());
+
+        // A host upload without a mesh is committed only when the mesh of its session decides its placement.
+        let uploaded = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
+        assert!(!uploaded.is_committed());
+        let meshed_session = session.with_device_mesh(mesh.clone());
+        assert!(
+            Array::from_host_buffer(&meshed_session, r#type.clone(), None, None, bytes.as_slice())
+                .unwrap()
+                .is_committed()
+        );
+        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+        assert!(!Array::from_host_buffer(&session, zero_type.clone(), None, None, []).unwrap().is_committed());
+        assert!(Array::from_host_buffer(&session, zero_type, mesh.clone(), None, []).unwrap().is_committed());
+
+        // Clones, handles of other sessions, and retained arrays keep the commitment of their array.
+        assert!(!uploaded.clone().is_committed());
+        assert!(!uploaded.clone().with_session(&meshed_session).unwrap().is_committed());
+        assert!(!RetainedArray::new(&uploaded).to_array(&meshed_session).unwrap().is_committed());
+        assert!(!uploaded.clone().with_committed(true).with_committed(false).is_committed());
+        assert!(uploaded.with_committed(true).is_committed());
+    }
+
+    #[test]
     fn test_array_shards() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -2157,6 +2284,46 @@ mod tests {
         let array =
             unreduced_scalar(&session, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
         assert_eq!(Concretizable::<i128>::concretize(&array), Ok(7));
+    }
+
+    #[test]
+    fn test_array_placement() {
+        // The placement records the runtime sharding over the auto axis `x`, which the type of the array omits, and
+        // the memory of the array.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let memory = Memory::Host { pinned: true };
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]).with_memory(memory),
+            mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        assert_eq!(array.placement(), Some(Placement::new(mesh.clone(), sharding).unwrap().with_memory(memory)));
+
+        // An array with a known layout also records that layout.
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 2]).with_layout(layout.clone()),
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        assert_eq!(
+            array.placement(),
+            Some(
+                Placement::new(mesh, array.sharding().clone())
+                    .unwrap()
+                    .with_memory(Memory::Device)
+                    .with_layout(layout)
+            ),
+        );
     }
 
     #[test]
