@@ -12,6 +12,7 @@ use ryft_pjrt::{Buffer, BufferType, Client, Device as PjrtDevice, DeviceId, Erro
 use crate::arrays::placement::ArrayPlacement;
 use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError};
+use crate::devices::PjrtDeviceExtension;
 use crate::types::DataTypeExtension;
 use crate::{CompiledFunction, Error, FromPjrt, Options, Session, ToPjrt};
 
@@ -293,7 +294,7 @@ impl Array {
                     })
                 })?;
             // Copying to the destination device itself would always allocate in its default memory.
-            let copied = source_buffer.copy_to_memory(Self::device_memory(destination_device, memory)?)?;
+            let copied = source_buffer.copy_to_memory(destination_device.memory(memory)?)?;
             work.track_buffer(&copied);
             addressable_buffers.push(Arc::new(copied));
         }
@@ -957,7 +958,7 @@ impl Array {
                             device_id: canonical_source_device.id(),
                         })
                     })?;
-                    let buffer = local_source.copy_to_memory(Self::device_memory(pjrt_device, memory)?)?;
+                    let buffer = local_source.copy_to_memory(pjrt_device.memory(memory)?)?;
                     work.track_buffer(&buffer);
                     local_buffers.insert(destination_device_id, buffer);
                 } else {
@@ -1447,7 +1448,7 @@ fn issue_cross_host_transfers(
                     let buffer = if memory == Memory::Device {
                         buffer
                     } else {
-                        let placed = buffer.copy_to_memory(Array::device_memory(device, memory)?)?;
+                        let placed = buffer.copy_to_memory(device.memory(memory)?)?;
                         receives.track_buffer(&placed);
                         placed
                     };

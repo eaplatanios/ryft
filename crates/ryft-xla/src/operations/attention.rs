@@ -1000,6 +1000,8 @@ mod tests {
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
     use crate::sessions::tests::domain_mesh;
+    #[cfg(feature = "cuda-13")]
+    use crate::tests::values_from_bytes;
     use crate::tests::{cpu_client, execution_client, replicated_array, test_compilation_options, values_to_bytes};
     use crate::{Array, Session, Tracer, to_mlir_module_for_program};
 
@@ -1676,10 +1678,10 @@ mod tests {
             let actual = actual
                 .copy_to_host()
                 .unwrap()
-                .elements::<u16>()
+                .elements::<bf16>()
                 .unwrap()
                 .into_iter()
-                .map(|bits| f64::from(bf16::from_bits(bits).to_f32()))
+                .map(|value| f64::from(value.to_f32()))
                 .collect::<Vec<_>>();
             for (index, (actual, expected)) in actual.iter().zip(expected.to_f64s()).enumerate() {
                 assert!(

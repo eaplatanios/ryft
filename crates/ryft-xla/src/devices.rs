@@ -1,10 +1,10 @@
-//! Conversion of PJRT devices into `ryft-core` [`Device`]s, which identify a device by its identifier and the index
-//! of the process that owns it.
+//! PJRT device conversion and memory placement. A `ryft-core` [`Device`] records the device identifier and owning
+//! process index. Transfers use the live PJRT device to resolve a [`Memory`] placement to a native memory handle.
 
-use ryft_core::Device;
-use ryft_pjrt::Device as PjrtDevice;
+use ryft_core::{Device, Memory};
+use ryft_pjrt::{Device as PjrtDevice, Memory as PjrtMemory};
 
-use crate::FromPjrt;
+use crate::{ArrayError, Error, FromPjrt};
 
 impl FromPjrt<PjrtDevice<'_>> for Device {
     type Output = Result<Self, ryft_pjrt::Error>;
@@ -24,6 +24,54 @@ impl FromPjrt<&PjrtDevice<'_>> for Device {
     }
 }
 
+/// Resolves `ryft-core` memory placements on PJRT devices for XLA uploads and copies.
+pub(crate) trait PjrtDeviceExtension {
+    /// Returns the PJRT memory corresponding to `memory` on this device. [`Memory::Device`] selects the device's
+    /// default memory. [`Memory::Host`] selects its `pinned_host` or `unpinned_host` memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrayError::UnsupportedMemory`] through [`Error::Array`] if the requested host memory kind is
+    /// unavailable. PJRT lookup failures are returned through [`Error::Pjrt`].
+    fn memory(&self, memory: Memory) -> Result<PjrtMemory<'_>, Error>;
+}
+
+impl PjrtDeviceExtension for PjrtDevice<'_> {
+    fn memory(&self, memory: Memory) -> Result<PjrtMemory<'_>, Error> {
+        match memory {
+            Memory::Device => Ok(self.default_memory()?),
+            Memory::Host { .. } => {
+                let kind = memory.placement_kind();
+                for candidate in self.addressable_memories()? {
+                    if candidate.kind()? == kind {
+                        return Ok(candidate);
+                    }
+                }
+                Err(ArrayError::UnsupportedMemory { device_id: self.id()?, memory }.into())
+            }
+        }
+    }
+}
+
+/// Extends [`Memory`] with its XLA placement kind.
+pub(crate) trait MemoryExtension {
+    /// Returns the XLA memory kind used by `mhlo.memory_kind` signature attributes and the `_xla_buffer_placement`
+    /// frontend attribute on `annotate_device_placement` custom calls. PJRT uses the same names for host memories and
+    /// resolves [`Memory::Device`] through the device's default memory.
+    fn placement_kind(self) -> &'static str;
+}
+
+impl MemoryExtension for Memory {
+    #[inline]
+    fn placement_kind(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Host { pinned: true } => "pinned_host",
+            Self::Host { pinned: false } => "unpinned_host",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -39,5 +87,12 @@ mod tests {
         let expected = Device::new(devices[0].id().unwrap(), devices[0].process_index().unwrap());
         assert_eq!(Device::from_pjrt(&devices[0]), Ok(expected));
         assert_eq!(Device::from_pjrt(devices[0].clone()), Ok(expected));
+    }
+
+    #[test]
+    fn test_memory_placement_kind() {
+        assert_eq!(Memory::Device.placement_kind(), "device");
+        assert_eq!(Memory::Host { pinned: true }.placement_kind(), "pinned_host");
+        assert_eq!(Memory::Host { pinned: false }.placement_kind(), "unpinned_host");
     }
 }

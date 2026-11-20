@@ -153,8 +153,28 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
             ),
         }));
     }
+    // A finite log-sum-exp identity is neutral only after rounding each pair. GPU float normalization can widen
+    // the reducer and remove those conversions, so carry the narrow encodings as integers through the window.
+    let carrier_type = match (kind, target_platform, element_type) {
+        (CumulativeKind::LogSumExp, Some("cuda" | "rocm"), DataType::F4E2M1FN) => Some(DataType::U4),
+        (
+            CumulativeKind::LogSumExp,
+            Some("cuda" | "rocm"),
+            DataType::F8E4M3FN | DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ,
+        ) => Some(DataType::U8),
+        _ => None,
+    };
     let initial_value = build_cumulative_initial_value(kind, element_type, block, context, location)?;
-    let body_region = build_cumulative_body_region(kind, element_type, context, location)?;
+    let (input_value, initial_value) = if let Some(carrier_type) = carrier_type {
+        let input_type = lower_tensor_type(&output_array_type.clone().with_data_type(carrier_type), context, location)?;
+        let initial_type = lower_tensor_type(&ArrayType::scalar(carrier_type), context, location)?;
+        let input = block.append_operation(stable_hlo::bitcast_convert(input_value, input_type, location)?)?;
+        let initial = block.append_operation(stable_hlo::bitcast_convert(initial_value, initial_type, location)?)?;
+        (input.result(0).unwrap().as_ref(), initial.result(0).unwrap().as_ref())
+    } else {
+        (input_value, initial_value)
+    };
+    let body_region = build_cumulative_body_region(kind, element_type, carrier_type, context, location)?;
     let rank = output_array_type.rank();
     let mut window_dimensions = vec![1; rank];
     window_dimensions[axis] = extent;
@@ -175,6 +195,11 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let result = result.result(0).unwrap().as_ref();
+    if carrier_type.is_some() {
+        let output_type = lower_tensor_type(output_array_type, context, location)?;
+        let result = block.append_operation(stable_hlo::bitcast_convert(result, output_type, location)?)?;
+        return Ok(result.result(0).unwrap().as_ref());
+    }
     match kind == CumulativeKind::LogSumExp && element_type.is_complex() {
         true => lower_principal_phase_to_mlir(result, output_array_type, block, context, location),
         false => Ok(result),
@@ -233,6 +258,7 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
 fn build_cumulative_body_region<'c, 't>(
     kind: CumulativeKind,
     element_type: DataType,
+    carrier_type: Option<DataType>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
@@ -256,11 +282,23 @@ fn build_cumulative_body_region<'c, 't>(
 
     // Product, log-sum-exp, and one-bit integer combiners build their body over a pair of scalar block arguments.
     let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
-    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let argument_type = if let Some(carrier_type) = carrier_type {
+        lower_tensor_type(&ArrayType::scalar(carrier_type), context, location)?
+    } else {
+        scalar_tensor_type
+    };
+    let block = context.block(&[(argument_type, location), (argument_type, location)]);
     let mut region = context.region();
     let mut block_ref = region.append_block(block)?;
     let left = block_ref.argument(0)?.as_ref();
     let right = block_ref.argument(1)?.as_ref();
+    let (left, right) = if carrier_type.is_some() {
+        let left = block_ref.append_operation(stable_hlo::bitcast_convert(left, scalar_tensor_type, location)?)?;
+        let right = block_ref.append_operation(stable_hlo::bitcast_convert(right, scalar_tensor_type, location)?)?;
+        (left.result(0).unwrap().as_ref(), right.result(0).unwrap().as_ref())
+    } else {
+        (left, right)
+    };
     // One-bit integers use a predicate carrier. Addition wraps modulo two, which is XOR, and signed I1 extrema reverse
     // the Boolean order because the set bit represents -1 rather than +1.
     let body_value = match kind {
@@ -338,6 +376,12 @@ fn build_cumulative_body_region<'c, 't>(
             location,
         )?,
         _ => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, context, location)?,
+    };
+    let body_value = if carrier_type.is_some() {
+        let bits = block_ref.append_operation(stable_hlo::bitcast_convert(body_value, argument_type, location)?)?;
+        bits.result(0).unwrap().as_ref()
+    } else {
+        body_value
     };
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
     Ok(region)

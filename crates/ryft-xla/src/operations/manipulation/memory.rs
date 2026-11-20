@@ -6,20 +6,8 @@ use ryft_mlir::{
     Attribute, Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
+use crate::devices::MemoryExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
-
-/// Returns the XLA memory kind string for `memory`, used by `mhlo.memory_kind` signature attributes and the
-/// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the
-/// lowering on purpose, because the core [`Memory`] type exposes no backend vocabulary and its `Display` rendering is
-/// only meant for diagnostics. This mirrors how [`Sharding`](ryft_core::Sharding) converts to MLIR through conversions
-/// that the backend owns.
-pub(crate) fn memory_placement_kind(memory: Memory) -> &'static str {
-    match memory {
-        Memory::Device => "device",
-        Memory::Host { pinned: true } => "pinned_host",
-        Memory::Host { pinned: false } => "unpinned_host",
-    }
-}
 
 /// Validates that a program compiled for `target_platform` can take its arguments from `memory` and return its
 /// results in it.
@@ -114,7 +102,7 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
         "mhlo.frontend_attributes",
         context.dictionary_attribute(&[context.named_attribute(
             context.identifier("_xla_buffer_placement"),
-            context.string_attribute(memory_placement_kind(destination)),
+            context.string_attribute(destination.placement_kind()),
         )]),
     );
     let operation = block.append_operation(operation)?;
@@ -140,13 +128,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn test_memory_placement_kind() {
-        assert_eq!(memory_placement_kind(Memory::Device), "device");
-        assert_eq!(memory_placement_kind(Memory::Host { pinned: true }), "pinned_host");
-        assert_eq!(memory_placement_kind(Memory::Host { pinned: false }), "unpinned_host");
-    }
 
     #[test]
     fn test_validate_boundary_memory() {

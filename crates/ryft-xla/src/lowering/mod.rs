@@ -46,6 +46,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
+use crate::devices::MemoryExtension;
 use crate::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
@@ -59,7 +60,7 @@ use crate::operations::collectives::collective_replica_groups;
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
-use crate::operations::manipulation::memory::{memory_placement_kind, validate_boundary_memory};
+use crate::operations::manipulation::memory::validate_boundary_memory;
 use crate::sharding::ShardyTensorSharding;
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, FlatProgram, Operation, Program, RaggedDotLoweringStrategy,
@@ -2114,7 +2115,7 @@ where
                 validate_boundary_memory(r#type.memory(), target_platform)?;
                 attributes.insert(
                     "mhlo.memory_kind".into(),
-                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
+                    context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                 );
             }
             if let Some(output_index) = aliases.get(&index) {
@@ -2144,7 +2145,7 @@ where
                 validate_boundary_memory(r#type.memory(), target_platform)?;
                 attributes.insert(
                     "mhlo.memory_kind".into(),
-                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
+                    context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                 );
             }
             if let Some(array_type) = physical_output_types.get(index)
@@ -2383,6 +2384,7 @@ pub(crate) mod tests {
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
     use ryft_mlir::{Attribute, ElementsAttribute, Operation as MlirOperation, Region, Size as MlirSize};
+    use ryft_pjrt::protos::ShapeChecks;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::LoweringError;
@@ -2505,7 +2507,7 @@ pub(crate) mod tests {
                             let attributes = (memory != Memory::Device).then(|| {
                                 HashMap::from([(
                                     "mhlo.memory_kind".into(),
-                                    context.string_attribute(memory_placement_kind(memory)).as_ref(),
+                                    context.string_attribute(memory.placement_kind()).as_ref(),
                                 )])
                             });
                             TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
@@ -2519,7 +2521,7 @@ pub(crate) mod tests {
                             let attributes = (memory != Memory::Device).then(|| {
                                 HashMap::from([(
                                     "mhlo.memory_kind".into(),
-                                    context.string_attribute(memory_placement_kind(memory)).as_ref(),
+                                    context.string_attribute(memory.placement_kind()).as_ref(),
                                 )])
                             });
                             TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
@@ -2672,8 +2674,13 @@ pub(crate) mod tests {
         let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
         // Lowering may synthesize runtime checks (e.g., entry guards of mixed region entries), so register their handler.
         ensure_assertion_handler_registered(client)?;
-        let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))?;
+        let mut options = test_compilation_options(client, None);
+        if client.platform_name()?.eq_ignore_ascii_case("cuda") {
+            // CUDA's DynamicPadder can reject mismatched inputs before the Ryft assertions these fixtures exercise.
+            let debug_options = options.executable_build_options.as_mut().unwrap().debug_options.as_mut().unwrap();
+            debug_options.xla_gpu_shape_checks = Some(ShapeChecks::Ignore as i32);
+        }
+        let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options)?;
         let device = executable.addressable_devices()?.remove(0);
         let mut buffers = Vec::with_capacity(inputs.len() + extents.len());
         for input in inputs {
@@ -3489,23 +3496,21 @@ pub(crate) mod tests {
 
         assert_eq!(
             stablehlo,
-            indoc! {r#"
+            indoc! {"
                 module {
                   func.func @main() {
                     %c = stablehlo.constant dense<false> : tensor<i1>
                     %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
                     %1 = stablehlo.after_all  : !stablehlo.token
-                    %2 = stablehlo.custom_call @ryft.print(%0, %1) {\
-                        api_version = 4 : i32, \
-                        backend_config = {label = "zero", logical_type = "zero"}, \
-                        has_side_effect = true, \
+                    %2 = stablehlo.custom_call @ryft.print(%0, %1) {api_version = 4 : i32, \
+                        backend_config = {label = \"zero\", logical_type = \"zero\"}, has_side_effect = true, \
                         operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
-                        result_layouts = [dense<> : tensor<0xindex>]\
-                    } : (tensor<3xi1>, !stablehlo.token) -> !stablehlo.token
+                        result_layouts = [dense<> : tensor<0xindex>]} : (tensor<3xi1>, !stablehlo.token) \
+                        -> !stablehlo.token
                     return
                   }
                 }
-            "#},
+            "},
         );
     }
 

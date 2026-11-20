@@ -1311,6 +1311,7 @@ mod tests {
         let engine = Session::builder().client(client).build().unwrap();
 
         // Product retains the small growth of each factor, and the larger mean also needs a widened divisor.
+        // Read the F16 result directly so XLA cannot retain excess precision across a following conversion.
         for (kind, count, input, expected) in [
             (ReductionKind::Sum, 4096, 1f32, 4096f32),
             (ReductionKind::Product, 4096, 1.000_976_6_f32, 54.5f32),
@@ -1320,15 +1321,7 @@ mod tests {
         ] {
             let input_type = replicated_vector_type(&mesh, count);
             let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-                |value| {
-                    value
-                        .convert_element_type(DataType::F16)
-                        .unwrap()
-                        .reduce(&[0], kind)
-                        .unwrap()
-                        .convert_element_type(DataType::F32)
-                        .unwrap()
-                },
+                |value| value.convert_element_type(DataType::F16).unwrap().reduce(&[0], kind).unwrap(),
                 input_type.clone(),
                 &engine,
                 mesh.clone(),
@@ -1338,7 +1331,7 @@ mod tests {
                 Array::from_host_buffer(&engine, input_type, mesh.clone(), None, values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
-            assert_eq!(read_first_shard::<f32>(client, &output), vec![expected]);
+            assert_eq!(output.copy_to_host().unwrap().elements::<f16>().unwrap(), vec![f16::from_f32(expected)]);
         }
     }
 

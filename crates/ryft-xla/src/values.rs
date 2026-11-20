@@ -980,7 +980,7 @@ mod tests {
     use crate::tests::{
         cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type,
     };
-    use crate::{Array, FromPjrt, Operation, ProgramBuilder, Session, SessionError};
+    use crate::{Array, Error, ExecutionError, FromPjrt, Operation, ProgramBuilder, Session, SessionError};
 
     use super::*;
 
@@ -1511,10 +1511,17 @@ mod tests {
         let truth = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
         let falsity = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8], &[]));
         assert_eq!(truth.assert("predicate must hold", &[]), Ok(()));
-        assert_eq!(
-            falsity.assert("predicate must hold", &[]),
-            Err(ProgramError::InvalidArgument { message: "assertion failed: predicate must hold".to_string() }),
-        );
+        let message = "assertion failed: predicate must hold";
+        // Inline execution can report the failure from the call. An asynchronous submission reports it at the
+        // effect barrier because the assertion has no result array carrying its completion.
+        match falsity.assert("predicate must hold", &[]) {
+            Err(error) => assert_eq!(error, ProgramError::InvalidArgument { message: message.to_string() }),
+            Ok(()) => assert!(matches!(
+                session.effects_barrier(),
+                Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                    if matches!(failures.as_slice(), [(_, failure)] if failure.as_ref() == message),
+            )),
+        }
     }
 
     #[test]

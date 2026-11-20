@@ -31,8 +31,8 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::metadata::ArrayOutputPlan;
+use crate::devices::MemoryExtension;
 use crate::lowering::signature::ExecutableSignature;
-use crate::operations::manipulation::memory::memory_placement_kind;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::types::DataTypeExtension;
 use crate::{
@@ -216,7 +216,7 @@ impl ExecutionPlan {
         let devices = executable.addressable_devices()?;
         let default_memory_kind = match devices.first() {
             Some(device) => device.default_memory()?.kind()?.into_owned(),
-            None => memory_placement_kind(Memory::Device).to_string(),
+            None => Memory::Device.placement_kind().to_string(),
         };
         let input_memory_kinds = if physical_input_types.is_empty() {
             Some(Vec::new())
@@ -246,7 +246,7 @@ impl ExecutionPlan {
             for (index, array_type) in types.iter().enumerate() {
                 let expected = match array_type.memory() {
                     Memory::Device => default_memory_kind.as_str(),
-                    memory => memory_placement_kind(memory),
+                    memory => memory.placement_kind(),
                 };
                 let actual = memory_kinds.get(index).ok_or_else(|| {
                     Error::Compilation(CompilationError::IncompatibleExecutable {
@@ -1985,7 +1985,9 @@ mod tests {
 
     #[test]
     fn test_execution_plan_new_rejects_compilation_options_with_conflicting_memories() {
-        let client = execution_client();
+        // CPU accepts the conflicting layouts at compilation, so this exercises validation of the compiled ABI.
+        // CUDA can reject the conflicting memory placements during compilation.
+        let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let device_type = ArrayType::new_static(DataType::F64, [2]);

@@ -10,6 +10,7 @@ use ryft_core::{
 use ryft_pjrt::{Buffer, Client, Error as PjrtError};
 
 use crate::arrays::ArrayError;
+use crate::devices::MemoryExtension;
 use crate::types::DataTypeExtension;
 use crate::{Error, FromPjrt};
 
@@ -435,8 +436,6 @@ impl ShardLayout {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates one addressable `buffer` of an array of type `r#type` whose shards are described by `descriptors` and
 /// `shard_index_by_device`, returning the identifier of the device that owns it. The buffer must be owned by `client`,
 /// live on a device of the mesh in the process that the mesh expects, live in the memory that `r#type` requests, and
@@ -450,7 +449,8 @@ pub(super) fn validate_addressable_buffer(
     buffer: &Buffer<'_>,
     validate_zero_carriers: bool,
 ) -> Result<DeviceId, Error> {
-    let device = Device::from_pjrt(buffer.device()?)?;
+    let buffer_device = buffer.device()?;
+    let device = Device::from_pjrt(&buffer_device)?;
     let device_id = device.id();
     if !buffer.is_owned_by(client) {
         return Err(PjrtError::invalid_argument(format!(
@@ -478,17 +478,22 @@ pub(super) fn validate_addressable_buffer(
     // A type's placement must describe the actual buffer, not merely relabel its storage. Device placement
     // means the plugin's default memory, whose kind is platform-dependent (e.g., CPU uses host memory).
     let buffer_memory = buffer.memory()?;
-    let buffer_device = buffer.device()?;
-    let memory_matches = match r#type.memory() {
-        Memory::Device => buffer_memory == buffer_device.default_memory()?,
-        Memory::Host { pinned: true } => buffer_memory.kind()? == "pinned_host",
-        Memory::Host { pinned: false } => buffer_memory.kind()? == "unpinned_host",
+    let expected_memory = r#type.memory();
+    let mismatched_kind = match expected_memory {
+        Memory::Device => buffer_memory.kind_if_different(&buffer_device.default_memory()?)?,
+        Memory::Host { .. } => {
+            // Host placement accepts any memory space of the requested kind. `device.memory(...)`
+            // selects one addressable space for allocation.
+            let kind = buffer_memory.kind()?;
+            (kind != expected_memory.placement_kind()).then_some(kind)
+        }
     };
-    if !memory_matches {
+
+    if let Some(kind) = mismatched_kind {
         return Err(Error::from(ArrayError::BufferMemoryMismatch {
             device_id,
-            expected: r#type.memory(),
-            actual: buffer_memory.kind()?.to_string(),
+            expected: expected_memory,
+            actual: kind.into_owned(),
         }));
     }
 

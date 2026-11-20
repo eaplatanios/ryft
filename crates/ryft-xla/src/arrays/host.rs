@@ -3,40 +3,38 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Memory, Min, Sharding, StaticShape, Typed,
-    UnreducedKind,
+    Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Min, Sharding, StaticShape, Typed, UnreducedKind,
 };
-use ryft_pjrt::{Device as PjrtDevice, DeviceId, ExecutionFence, HostBuffer, HostDestination, Memory as PjrtMemory};
+use ryft_pjrt::{DeviceId, ExecutionFence, HostBuffer, HostDestination};
 
 use crate::arrays::metadata::resolve_placement;
 use crate::arrays::shards::{ArrayShard, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError, ArrayTypeExtension};
+use crate::devices::PjrtDeviceExtension;
 use crate::types::DataTypeExtension;
 use crate::{Error, Session, ToPjrt};
 
-// TODO(eaplatanios): Review this module.
-
 impl Array {
-    /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
-    /// and `mesh`, while avoiding redundant allocations external to the PJRT backend of the session's
+    /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by
+    /// `r#type` and `mesh`, while avoiding redundant allocations external to the PJRT backend of the session's
     /// [`Client`](ryft_pjrt::Client). This function derives the per-device shard slices from the provided type and
     /// mesh, transfers only the shards addressable by that client, and returns an [`Array`] that belongs to `session`
     /// and whose global shard metadata covers the full mesh.
     ///
     /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and replicates the array
-    /// across the selected mesh otherwise. A supplied sharding can place the array over auto mesh axes. After
-    /// removing its auto axes with [`Sharding::without_auto_axes`], it must match any sharding in the type, or the
-    /// function returns [`ArrayError::PlacementTypeMismatch`]. The type of the resulting array records that projection,
-    /// and [`Self::sharding`] returns the full runtime placement.
+    /// across the selected mesh otherwise. A supplied sharding can place the array over auto mesh axes. After removing
+    /// its auto axes with [`Sharding::without_auto_axes`], it must match any sharding in the type, or the function
+    /// returns [`ArrayError::PlacementTypeMismatch`]. The type of the resulting array records that projection, and
+    /// [`Self::sharding`] returns the full runtime placement.
     ///
     /// Passing [`None`] for `mesh` uses the mesh configured on `session` if present. Otherwise, the logical mesh
     /// from the runtime or type sharding is laid out over the client's addressable devices in enumeration order.
     /// Without sharding, the first addressable device forms a mesh with a single axis `x`.
     ///
-    /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
-    /// default memory, and host placements select its `pinned_host` or `unpinned_host` memory. A device without the
-    /// requested host space produces [`ArrayError::UnsupportedMemory`]. Bufferless zero-space arrays require no
-    /// allocation.
+    /// Each addressable shard is uploaded to the memory requested by `r#type`.
+    /// [`Memory::Device`](ryft_core::Memory::Device) uses the device's default memory. Host placements select
+    /// its `pinned_host` or `unpinned_host` memory. A device without the requested host space produces
+    /// [`ArrayError::UnsupportedMemory`]. Bufferless zero-space arrays require no allocation.
     ///
     /// Along an unreduced axis of a sharding of kind [`UnreducedKind::Sum`], the devices hold summands of the logical
     /// value, so the devices at coordinate zero along every unreduced axis receive their shards of the host value and
@@ -55,10 +53,10 @@ impl Array {
     /// # Errors
     ///
     /// Returns an error if placement cannot be resolved, the bytes do not match the type, or a device upload fails.
-    pub fn from_host_buffer<B: AsRef<[u8]>>(
+    pub fn from_host_buffer<M: Into<Option<DeviceMesh>>, B: AsRef<[u8]>>(
         session: &Session,
         r#type: ArrayType,
-        mesh: impl Into<Option<DeviceMesh>>,
+        mesh: M,
         sharding: Option<Sharding>,
         buffer: B,
     ) -> Result<Self, Error> {
@@ -68,6 +66,7 @@ impl Array {
             None => session.device_mesh_for(&[], logical_mesh)?,
         };
         let buffer = buffer.as_ref();
+
         // Normalize missing sharding metadata before any placement-derived work. A dense host buffer with no explicit
         // sharding is interpreted as one replicated logical array over the provided mesh.
         let (r#type, sharding) = resolve_placement(r#type, sharding, &mesh)?;
@@ -80,6 +79,7 @@ impl Array {
                 actual: buffer.len(),
             }));
         }
+
         if r#type.data_type().is_zero() {
             return Self::zero(session, r#type, Some(sharding), mesh);
         }
@@ -102,6 +102,7 @@ impl Array {
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let no_axes = BTreeSet::new();
+
         // Along an unreduced axis of kind sum, the devices hold summands of the logical value. The devices at
         // coordinate zero along every unreduced axis receive the host value and the others receive zeros, so the
         // summands add up to it. Copies of the host value are their own maximum and minimum, so the other kinds need
@@ -134,7 +135,7 @@ impl Array {
 
             // Resolve the requested space explicitly, because passing the device itself would always upload to its
             // default memory and could silently mislabel a host-resident array as pinned or unpinned memory.
-            let memory = Self::device_memory(device, r#type.memory())?;
+            let memory = device.memory(r#type.memory())?;
 
             // Upload the local shard bytes to the PJRT device using the static shape of the shard. For non-scalar
             // shards, the host pointer is moved to the shard's first element in the dense source buffer, and PJRT's
@@ -168,8 +169,10 @@ impl Array {
                     strides[dimension] = stride;
                     stride = stride.checked_mul(shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
                         message: format!(
-                            "row-major stride for array with shape `{shape}` and element type `{buffer_type}` exceeds \
+                            "row-major stride for array with shape `{}` and element type `{}` exceeds \
                              the maximum allowed size of {}",
+                            shape,
+                            buffer_type,
                             usize::MAX,
                         ),
                     })?;
@@ -214,8 +217,10 @@ impl Array {
                                 let byte_stride = stride * element_size_in_bytes;
                                 i64::try_from(byte_stride).map_err(|_| Error::SizeLimitExceeded {
                                     message: format!(
-                                        "row-major byte stride for array with shape `{shape}` and element type \
-                                         `{buffer_type}` exceeds the maximum allowed size of {}",
+                                        "row-major byte stride for array with shape `{}` and element type \
+                                         `{}` exceeds the maximum allowed size of {}",
+                                        shape,
+                                        buffer_type,
                                         i64::MAX,
                                     ),
                                 })
@@ -235,6 +240,7 @@ impl Array {
                     device_layout.clone(),
                 )?
             };
+
             work.track_buffer(&uploaded);
             addressable_buffers.push(uploaded);
         }
@@ -267,15 +273,15 @@ impl Array {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Array`] if the type has a dynamic shape, the type and runtime sharding disagree, or the
-    /// host shards have missing or duplicate entries, unexpected devices, or incorrect byte counts. Other
+    /// Returns [`Error::Array`] if the type has a dynamic shape, the type and runtime sharding disagree, or
+    /// the host shards have missing or duplicate entries, unexpected devices, or incorrect byte counts. Other
     /// placement and PJRT errors propagate from the layout and upload.
-    pub fn from_host_shards<B: AsRef<[u8]> + HostBuffer>(
+    pub fn from_host_shards<B: AsRef<[u8]> + HostBuffer, S: IntoIterator<Item = (DeviceId, B)>>(
         session: &Session,
         r#type: ArrayType,
         mesh: DeviceMesh,
         sharding: Option<Sharding>,
-        shards: impl IntoIterator<Item = (DeviceId, B)>,
+        shards: S,
     ) -> Result<Self, Error> {
         let (r#type, sharding) = resolve_placement(r#type, sharding, &mesh)?;
         let shape = r#type
@@ -288,6 +294,7 @@ impl Array {
         for device in client.addressable_devices()? {
             devices.insert(device.id()?, device);
         }
+
         let mut host_shards = HashMap::new();
         for (device_id, bytes) in shards {
             let index =
@@ -307,21 +314,25 @@ impl Array {
             if descriptor.device().process_index() != process_index {
                 continue;
             }
+
             let device_id = descriptor.device().id();
             let device =
                 devices.get(&device_id).ok_or(ArrayError::NonAddressableDevice { device_id, process_index })?;
             let bytes = host_shards.remove(&device_id).ok_or(ArrayError::MissingHostShard { device_id })?;
             let shape = descriptor.shape();
+
             let expected = ArrayType::new(data_type, shape.clone().into()).size_in_bytes()?;
             let actual = bytes.as_ref().len();
             if actual != expected {
                 return Err(ArrayError::HostShardByteCountMismatch { device_id, expected, actual }.into());
             }
+
             if !data_type.is_zero() {
-                let memory = Self::device_memory(device, r#type.memory())?;
+                let memory = device.memory(r#type.memory())?;
                 uploads.push((bytes, shape, memory));
             }
         }
+
         if data_type.is_zero() {
             return Self::zero(session, r#type, Some(sharding), mesh);
         }
@@ -336,14 +347,14 @@ impl Array {
             work.track_buffer(&buffer);
             buffers.push(buffer);
         }
+
         Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)
     }
 
-    /// Copies the value of this [`Array`] to the host and returns it as a host array of the reference backend (i.e.,
-    /// a [`ryft_core::Array`]) with the data type and shape of this array. The type of the result has no sharding and
-    /// no physical layout, because the host value is one dense row-major array. Read its elements with
+    /// Copies the value of this [`Array`] to the host and returns it as a host array of the reference backend
+    /// (i.e., a [`ryft_core::Array`]) with the data type and shape of this array. The type of the result has no
+    /// sharding and no physical layout, because the host value is one dense row-major array. Read its elements with
     /// [`ryft_core::Array::elements`], which checks the requested element type against the data type of the array.
-    /// This corresponds to converting a `jax.Array` to a NumPy array.
     ///
     /// This function reads the value as [`Self::copy_to_host_bytes`] does, with the same synchronization, shard
     /// selection, and combination of unreduced values, and it then validates the bytes as the storage of the host
@@ -353,6 +364,7 @@ impl Array {
     ///
     /// Returns the errors of [`Self::copy_to_host_bytes`], and an [`Error::Core`] if the bytes that the devices
     /// returned are not a valid encoding of the data type of this array.
+    #[inline]
     pub fn copy_to_host(&self) -> Result<CoreArray, Error> {
         let bytes = self.copy_to_host_bytes()?;
         Ok(CoreArray::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?)
@@ -379,6 +391,7 @@ impl Array {
         let completion = self.execution_fence();
         let global_shape = self.shape();
         let element_type = self.data_type();
+
         // A PJRT size query for an empty dynamic buffer can expose its bound allocation and trailer. Skip transfers
         // for arrays with no payload, and wait for the producer or local buffers so their errors still surface.
         if element_type.is_zero() || global_shape.as_slice().contains(&0) {
@@ -405,6 +418,7 @@ impl Array {
             .filter(|(_, axis)| self.sharding().unreduced_axes().contains(axis.name()))
             .map(|(axis_index, _)| axis_index)
             .collect::<Vec<_>>();
+
         // Select the shards to copy before issuing any copy, so that no copy is in flight when the selection fails.
         // Every shard is needed when some shard lives in another process and the array has unreduced axes, whose
         // per-device values must all be combined. Otherwise, the addressable shards suffice when their distinct tiles
@@ -421,6 +435,7 @@ impl Array {
                         tiles.push(shard.slice());
                     }
                 }
+
                 let covered =
                     tiles.iter().map(|slices| slices.iter().map(|slice| slice.len()).product::<usize>()).sum::<usize>();
                 if !unreduced_axis_indices.is_empty() || covered != global_shape.as_slice().iter().product::<usize>() {
@@ -429,15 +444,17 @@ impl Array {
                         device_id: missing.device().id(),
                     }));
                 }
+
                 addressable
             }
         };
+
         let mut work = self.session().reserve_work();
 
         // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile
-        // suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only the
-        // leading dimension is sharded, or for a replicated array), each is copied directly into that range of one
-        // destination.
+        // suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only
+        // the leading dimension is sharded, or for a replicated array), each is copied directly into that range of
+        // one destination.
         if unreduced_axis_indices.is_empty() {
             let mut tiles = Vec::<(&ArrayShard, Range<usize>)>::new();
             let mut contiguous = true;
@@ -445,6 +462,7 @@ impl Array {
                 if tiles.iter().any(|(tile, _)| tile.slice() == shard.slice()) {
                     continue;
                 }
+
                 match contiguous_tile_byte_range(shard.slice(), global_shape.as_slice(), element_type)? {
                     Some(range) => tiles.push((shard, range)),
                     None => {
@@ -453,6 +471,7 @@ impl Array {
                     }
                 }
             }
+
             if contiguous {
                 let mut destination = HostDestination::new(total_byte_count);
                 let ranges = tiles.iter().map(|(_, range)| range.clone()).collect::<Vec<_>>();
@@ -466,16 +485,20 @@ impl Array {
                         Ok(work.track_host_copy(event))
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
+
                 // Publish the readback to the session after issuing all copies, then check the producer before
                 // consuming the transfer results so any execution error takes precedence.
                 drop(work);
+
                 if let Some(completion) = completion {
                     completion.block_until_ready()?;
                 }
+
                 // Drop each returned slice so the destination can yield its full byte buffer.
                 for copy in copies {
                     drop(copy.wait()?);
                 }
+
                 return Ok(destination.into_bytes().ok().unwrap());
             }
         }
@@ -493,14 +516,16 @@ impl Array {
                 Ok((shard, copy, expected_byte_count))
             })
             .collect::<Result<Vec<_>, Error>>()?;
+
         // Publish the readback before waiting, and check the producer before consuming the transfer results.
         drop(work);
+
         if let Some(completion) = completion {
             completion.block_until_ready()?;
         }
 
-        // Shards with the same slices and unreduced coordinates are replicas of one per-device value. Those with
-        // different unreduced coordinates contribute separate values to the tile and must be combined.
+        // Shards with the same slices and unreduced coordinates are replicas of one per-device value. Those
+        // with different unreduced coordinates contribute separate values to the tile and must be combined.
         let shards = copies
             .into_iter()
             .map(|(shard, copy, expected_byte_count)| {
@@ -550,31 +575,12 @@ impl Array {
                 &mut written_intervals,
             )?;
         }
+
         Ok(global_bytes)
     }
-
-    /// Resolves `memory` to the PJRT memory of `device` that holds the shards of an array placed in it, which is where
-    /// host uploads and copies between devices allocate their buffers. [`Memory::Device`] resolves to the default
-    /// memory of the device, and a host placement resolves to its `pinned_host` or `unpinned_host` memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArrayError::UnsupportedMemory`] if `device` has no memory of the requested host kind.
-    pub(super) fn device_memory<'d>(device: &'d PjrtDevice<'_>, memory: Memory) -> Result<PjrtMemory<'d>, Error> {
-        match memory {
-            Memory::Device => Ok(device.default_memory()?),
-            Memory::Host { pinned } => {
-                let kind = if pinned { "pinned_host" } else { "unpinned_host" };
-                for candidate in device.addressable_memories()? {
-                    if candidate.kind()? == kind {
-                        return Ok(candidate);
-                    }
-                }
-                Err(ArrayError::UnsupportedMemory { device_id: device.id()?, memory }.into())
-            }
-        }
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns row-major element strides for `global_shape`. `strides[i]` is the number of logical elements skipped when
 /// incrementing dimension `i` by one in a dense major-to-minor layout. `element_type` is only used in the error that
@@ -825,8 +831,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, MeshAxis, MeshAxisType, ProgramError,
-        Shape, Sharding, ShardingDimension, TiledLayout,
+        Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        ProgramError, Shape, Sharding, ShardingDimension, TiledLayout,
     };
     use ryft_pjrt::{BufferSpecification, BufferType, Error as PjrtError, ExecutionFence};
 
