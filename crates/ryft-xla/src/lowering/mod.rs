@@ -37,7 +37,8 @@ use ryft_core::{
     OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME,
     Parameterized, PlaceOperation, ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation,
     ReshardOperation, ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
-    Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
+    StopGradientOperation, TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation,
+    ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -240,11 +241,13 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
     }
 }
 
-/// Returns `true` if any operation in `program`'s complete region arena carries unresolved ordered state.
+/// Returns `true` if any operation in a region of `program` that lowering emits (i.e., its entry region and the
+/// executed nested regions of that region) carries unresolved ordered state.
 ///
-/// This scans every region rather than consulting the program's effect summary because that summary intentionally
-/// excludes dormant rule regions. Ordinary XLA cannot preserve state in either computation or rule regions, so both
-/// must be rejected before lowering.
+/// This scans those regions rather than consulting the effect summary of the program, because ordinary XLA cannot
+/// preserve state in any lowered region, including one whose effects the summary of its owner does not expose.
+/// Regions that lowering never reaches (e.g., the rule regions of composites or the transpose region of a
+/// `linear_call`) are not part of the lowered module, so state in them is never lowered and cannot reject the program.
 pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
@@ -252,7 +255,7 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    program.regions().iter().any(|region| {
+    program.entry_region_ref().computation_regions().any(|region| {
         region
             .instructions()
             .iter()
@@ -261,7 +264,10 @@ where
 }
 
 /// Returns `true` if `program` contains a reference-typed atom or a [`CoreOperation`](ryft_core::Operation) whose
-/// [effects](ryft_core::Operation::effects) declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in any region.
+/// [effects](ryft_core::Operation::effects) declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in a region that
+/// lowering emits (i.e., its entry region and the executed nested regions of that region). Regions that lowering never
+/// reaches (e.g., the rule regions of composites or the transpose region of a `linear_call`) are not part of the
+/// lowered module, so references in them neither need discharge nor reject the program.
 ///
 /// This check is independent from [`contains_unresolved_state`], because a pure reference pass-through or a forwarded
 /// reference capture can carry reference values without executing a stateful instruction. Both predicates back the
@@ -277,13 +283,13 @@ where
     // The atom scan dominates for every well-formed program, because reference operations always touch an atom of a
     // reference type. The declaration scan is an independent check that still catches a core discharge bug which
     // retyped the boundary atoms but left a reference operation behind.
-    program.entry_region_ref().contains_atom_type_in_closure(CoreType::is_reference)
-        || program.regions().iter().any(|region| {
-            region
+    program.entry_region_ref().computation_regions().any(|region| {
+        region.atoms().iter().any(|atom| atom.r#type().is_reference())
+            || region
                 .instructions()
                 .iter()
                 .any(|instruction| instruction.operation().effects().has_reference_effects())
-        })
+    })
 }
 
 /// Returns the effect classes that have StableHLO token slots, in canonical token and result order.
@@ -1423,9 +1429,12 @@ where
     )
 }
 
-/// Returns the distinct [`RetainedArray`]s that `program` references in any of its regions, in the order of their
-/// first occurrence in the region arena. Lowering passes their arrays as hidden entry arguments that follow the lifted
-/// captures, in this order, and so the caller that assembles the executable arguments must use the same order.
+/// Returns the distinct [`RetainedArray`]s that `program` references in the regions that lowering emits (i.e., its
+/// entry region and the executed nested regions of that region), in the order of their first occurrence in those
+/// regions. Lowering passes their arrays as hidden entry arguments that follow the lifted captures, in this order, and
+/// so the caller that assembles the executable arguments must use the same order. Regions that lowering never reaches
+/// (e.g., the rule regions of composites or the transpose region of a `linear_call`) are skipped, so that an array
+/// that only they refer to does not become an argument of the executable.
 pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = Type>>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> Vec<RetainedArray>
@@ -1434,7 +1443,7 @@ where
     ProgramOutput: Parameterized<Constant>,
 {
     let mut session_constants = Vec::<RetainedArray>::new();
-    for region in program.regions().iter() {
+    for region in program.entry_region_ref().computation_regions() {
         for atom in region.atoms() {
             if let Some(Constant::Session(constant)) = atom.as_constant()
                 && !session_constants.contains(constant)
@@ -1444,6 +1453,151 @@ where
         }
     }
     session_constants
+}
+
+/// Returns whether any of the [`RetainedArray`]s that `program` references in the regions that lowering emits is
+/// [committed](RetainedArray::is_committed), like the outputs of an operation that captures it. Commitment is not part
+/// of the identity of a retained array, so [`collect_session_constants`] keeps only the first of several handles of the
+/// same buffers, and this function decides over every handle instead, so that the answer does not depend on the order
+/// in which a program references them.
+pub(crate) fn has_committed_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = Type>>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+) -> bool
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    program.entry_region_ref().computation_regions().any(|region| {
+        region
+            .atoms()
+            .iter()
+            .any(|atom| matches!(atom.as_constant(), Some(Constant::Session(constant)) if constant.is_committed()))
+    })
+}
+
+/// Placement that the entry region of a program gives one of its results, as [`entry_result_placements`] returns it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EntryResultPlacement {
+    /// The result is produced by a `place` whose target has this sharding.
+    Target(Sharding),
+
+    /// The result is the entry argument at this index, which it returns where that argument enters the program.
+    Argument(usize),
+}
+
+/// Returns the placement that `program` itself gives each of its first `output_count` results, or [`None`] for a
+/// result that it gives no placement. A result that a `place` in the entry region produces has the placement of its
+/// target, which states the placement along every mesh axis, including the auto mesh axes that the result type drops.
+/// Only placements in the entry region count, because a placement in a nested region reaches a result only through the
+/// result of the operation that owns that region. A result that is an entry argument is placed where that argument
+/// enters the program, which the caller knows and which also covers arguments without buffers (i.e., of the zero data
+/// type), whose placement the compiler cannot report.
+///
+/// Operations that return the value of an input together with its placement are followed back to that input, so that a
+/// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
+/// target, which leaves its input where it is, and `stop_gradient` and `tag`, which only mark values for program
+/// transforms and lower to nothing. Other operations that return a value equal to an input are not followed, because
+/// they change its placement (e.g., `reshard` and `constrain_sharding`) or because the compiler is free to place their
+/// results differently (e.g., the `optimization_barrier` of rematerialization).
+pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+    output_count: usize,
+) -> Vec<Option<EntryResultPlacement>>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    let instruction_by_output = program.instruction_by_output();
+    program.output_ids()[..output_count]
+        .iter()
+        .map(|&output_id| {
+            let mut value_id = output_id;
+            loop {
+                let Some(instruction_index) = instruction_by_output[value_id.index()] else {
+                    return program
+                        .input_ids()
+                        .iter()
+                        .position(|input_id| *input_id == value_id)
+                        .map(EntryResultPlacement::Argument);
+                };
+                let instruction = &program.instructions()[instruction_index];
+                let operation = instruction.operation();
+                let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
+                    match operation.target() {
+                        Some(target) => return Some(EntryResultPlacement::Target(target.sharding().clone())),
+                        None => 0,
+                    }
+                } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
+                    || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
+                {
+                    // Both operations return each of their inputs as the output at the same position.
+                    instruction.outputs().iter().position(|output| *output == value_id)?
+                } else {
+                    return None;
+                };
+                value_id = instruction.inputs()[input_index];
+            }
+        })
+        .collect()
+}
+
+/// Returns the sharding with which the entry function of a program annotates each of its results, whose types are
+/// `output_types`, and which describes the buffers that the results are returned in. These are the `result_shardings`
+/// overrides when they are provided, and otherwise the placement that the program gives each result (i.e., the
+/// corresponding element of `placements`, as [`entry_result_placements`] returns them, where an entry argument is
+/// placed as the corresponding element of `argument_shardings`), or the sharding of the result type when the program
+/// gives it none (e.g., when that argument has no sharding). A result without either has no sharding. Compilation for
+/// a [`Session`](crate::Session) and the StableHLO export of a [`TracedProgram`](crate::TracedProgram) both choose the
+/// shardings of results with this function, so that an exported module places its results as the executable that a
+/// session compiles for it does.
+///
+/// An override, a `place` target, or an argument placement may leave dimensions unconstrained, but the runtime
+/// placement of an array reads such a dimension as replicated, and the result type records it exactly, so it cannot
+/// record the placement that the compiler would choose for it. These dimensions are therefore replicated here, so that
+/// the executable returns the buffers that the runtime placement of the result describes, while the dimensions that
+/// they constrain keep their placement. Unconstrained dimensions of result types are kept, because such results leave
+/// their whole placement to the compiler. Provided overrides are not checked against `output_types`, so that a count
+/// mismatch is still reported when the module is lowered.
+pub(crate) fn entry_result_shardings(
+    output_types: &[ArrayType],
+    result_shardings: Option<&[Sharding]>,
+    placements: &[Option<EntryResultPlacement>],
+    argument_shardings: &[Option<Sharding>],
+) -> Result<Vec<Option<Sharding>>, Error> {
+    let closed = |sharding: &Sharding| -> Result<Option<Sharding>, Error> {
+        if !sharding.dimensions().contains(&ShardingDimension::Unconstrained) {
+            return Ok(Some(sharding.clone()));
+        }
+        let dimensions = sharding
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+                dimension => dimension.clone(),
+            })
+            .collect();
+        Ok(Some(sharding.with_dimensions(dimensions)?))
+    };
+    match result_shardings {
+        Some(shardings) => shardings.iter().map(closed).collect(),
+        None => output_types
+            .iter()
+            .zip(placements)
+            .map(|(output_type, placement)| {
+                let placement = match placement {
+                    Some(EntryResultPlacement::Target(sharding)) => Some(sharding),
+                    Some(EntryResultPlacement::Argument(index)) => {
+                        argument_shardings.get(*index).and_then(Option::as_ref)
+                    }
+                    None => None,
+                };
+                match placement {
+                    Some(sharding) => closed(sharding),
+                    None => Ok(output_type.sharding().cloned()),
+                }
+            })
+            .collect(),
+    }
 }
 
 /// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
@@ -2390,12 +2544,13 @@ pub(crate) mod tests {
         AddOperation, Array, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation, ConstantOperation,
         Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation, DimensionType,
         DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClasses,
-        Error as CoreError, Layout, MeshAxis, MeshAxisType, NegOperation, OneLike, ParallelReduce, ParameterizedFamily,
-        Placeholder, PrintOperation, Program, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope,
-        ReduceOperation, ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceType, ReferenceWriteOperation, ReshapeOperation, ReverseModeDifferentiate, ShardMap,
-        ShardMapOperation, ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, ZeroLike, i1, i2,
-        i4, shard_map, u1, u2, u4,
+        Error as CoreError, Layout, LinearCallOperation, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneLike,
+        ParallelReduce, ParameterizedFamily, Placeholder, PrintOperation, Program,
+        ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, ReduceOperation, ReductionKind,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
+        ReferenceWriteOperation, ReshapeOperation, ReverseModeDifferentiate, ShardMap, ShardMapOperation,
+        ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, ZeroLike, i1, i2, i4, shard_map, u1,
+        u2, u4,
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -2406,6 +2561,7 @@ pub(crate) mod tests {
     use crate::lowering::LoweringError;
     use crate::lowering::regions::tests::lower_plain_program_outputs;
     use crate::operations::assertions::ensure_assertion_handler_registered;
+    use crate::sessions::tests::{domain_mesh, f32_scalar};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         ArrayTracer, FlatProgram, JitCallOperation, ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram,
@@ -2896,6 +3052,92 @@ pub(crate) mod tests {
         let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
         let attribute = literal.to_dense_elements_attribute(tensor_type, &context).unwrap();
         unsafe { std::slice::from_raw_parts(attribute.raw_data().cast::<u8>(), byte_count).to_vec() }
+    }
+
+    /// Builds a region over two inputs of `scalar_type` (i.e., a residual and a linear input) whose output is the
+    /// product of its inputs, and that also runs the instructions that `extend` adds to it when `extended` is set.
+    fn scalar_linear_region(
+        scalar_type: &ArrayType,
+        extended: bool,
+        extend: impl Fn(&mut ArrayIrProgramBuilder, AtomId, AtomId) -> AtomId,
+    ) -> FlatProgram {
+        let scalar_type = Type::Array(scalar_type.clone());
+        let mut builder = ArrayIrProgramBuilder::new();
+        let residual = builder.add_input(scalar_type.clone());
+        let linear = builder.add_input(scalar_type);
+        let mut output =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
+        if extended {
+            output = extend(&mut builder, residual, output);
+        }
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Builds a program over the two inputs of the `forward` region that calls a `linear_call` of the `forward` and
+    /// `transpose` regions, the second of which is a dormant rule region that lowering never emits.
+    fn linear_call_program(forward: &FlatProgram, transpose: &FlatProgram) -> FlatProgram {
+        let scalar_type = forward.input_types()[0].clone();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(scalar_type.clone());
+        let linear = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(
+                Operation::LinearCall(LinearCallOperation::new(1)),
+                vec![forward, transpose],
+                vec![residual, linear],
+                None,
+            )
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap()
+    }
+
+    /// Extends a [`scalar_linear_region`] with a reference that is allocated with its `value`, overwritten with its
+    /// `residual`, and frozen into its output.
+    fn add_reference_state(builder: &mut ArrayIrProgramBuilder, residual: AtomId, value: AtomId) -> AtomId {
+        let reference = builder
+            .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                Operation::ReferenceWrite(ReferenceWriteOperation::new()),
+                Vec::new(),
+                vec![reference, residual],
+                None,
+            )
+            .unwrap();
+        builder
+            .add_instruction(
+                Operation::ReferenceFreeze(ReferenceFreezeOperation::new()),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0]
+    }
+
+    #[test]
+    fn test_contains_unresolved_state_ignores_dormant_regions() {
+        let stateful =
+            |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
+
+        // State in the dormant transpose region of a `linear_call` is never lowered, unlike state in its forward region.
+        assert!(!contains_unresolved_state(&linear_call_program(&stateful(false), &stateful(true))));
+        assert!(contains_unresolved_state(&linear_call_program(&stateful(true), &stateful(false))));
+    }
+
+    #[test]
+    fn test_contains_unresolved_references_ignores_dormant_regions() {
+        let stateful =
+            |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
+
+        // References in the dormant transpose region of a `linear_call` are never lowered, unlike references in its
+        // forward region.
+        assert!(!contains_unresolved_references(&linear_call_program(&stateful(false), &stateful(true))));
+        assert!(contains_unresolved_references(&linear_call_program(&stateful(true), &stateful(false))));
     }
 
     #[test]
@@ -4266,6 +4508,31 @@ pub(crate) mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_collect_session_constants_ignores_dormant_regions() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
+        let scalar_type = constant.r#type().into_owned();
+        let with_constant = |extended| {
+            scalar_linear_region(&scalar_type, extended, |builder, _, value| {
+                let constant = builder.add_constant(Constant::Session(constant.clone()));
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, constant], None).unwrap()[0]
+            })
+        };
+
+        // A session constant that only the dormant transpose region of a `linear_call` refers to is never lowered, so
+        // it does not become a hidden argument of the entry function, unlike one that its forward region refers to.
+        assert_eq!(
+            collect_session_constants(&linear_call_program(&with_constant(false), &with_constant(true))),
+            vec![],
+        );
+        assert_eq!(
+            collect_session_constants(&linear_call_program(&with_constant(true), &with_constant(false))),
+            vec![constant],
         );
     }
 

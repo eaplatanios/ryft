@@ -23,7 +23,9 @@ use crate::{Error, FlatProgram, Operation, Type};
 /// owns those transformations. [`RyftMasked`] operations instead materialize their physical kernel inputs and restore
 /// logical extents in the lowering of Ryft.
 /// Only configurations with execution evidence are admitted, and unbounded gateways and unsupported consumers are
-/// rejected before MLIR construction.
+/// rejected before MLIR construction. Only the regions that lowering emits (i.e., the entry region and its executed
+/// nested regions) are validated. Regions that lowering never reaches (e.g., the rule regions of composites or the
+/// transpose region of a `linear_call`) are not part of the compiled program, so they cannot keep it from compiling.
 ///
 /// # Errors
 ///
@@ -32,7 +34,7 @@ use crate::{Error, FlatProgram, Operation, Type};
 /// consumes a data-derived dimension.
 pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Result<(), Error> {
     let mut variables = HashSet::new();
-    for region in program.regions() {
+    for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
             if let Operation::DimensionFromScalar(operation) = instruction.operation() {
                 // A static output defines no identity and is checked against its extent.
@@ -61,7 +63,7 @@ pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Resu
     // instruction outputs before classifying the array operations that consume those identities.
     loop {
         let count = variables.len();
-        for region in program.regions() {
+        for region in program.entry_region_ref().computation_regions() {
             for instruction in region.instructions() {
                 if !instruction.inputs().iter().any(|input| {
                     references_data_derived_dimension(region.atoms()[input.index()].r#type().as_ref(), &variables)
@@ -83,7 +85,7 @@ pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Resu
         }
     }
 
-    for region in program.regions() {
+    for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
             let consumes_data_derived_extent = instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
                 references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)
@@ -394,10 +396,10 @@ mod tests {
         CustomCallOperation, DataType, Differentiate, Dimension, DimensionAddOperation, DimensionBounds,
         DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionVariable,
         DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, Error as CoreError,
-        IotaOperation, NegOperation, OneOperation, Placeholder, PrintOperation, ProgramError, RandomAlgorithm,
-        ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation, ScaledDotOperation,
-        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection, SortOperation,
-        StaticShape, SubOperation, Value as CoreValue, differentiable_dot_product_attention,
+        IotaOperation, LinearCallOperation, MulOperation, NegOperation, OneOperation, Placeholder, PrintOperation,
+        ProgramError, RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation,
+        ScaledDotOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection,
+        SortOperation, StaticShape, SubOperation, Value as CoreValue, differentiable_dot_product_attention,
     };
     use ryft_pjrt::Client;
     #[cfg(feature = "cuda-13")]
@@ -405,7 +407,9 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::sessions::tests::{domain_mesh, read_booleans, read_first_shard, replicated_scalar_type};
+    use crate::sessions::tests::{
+        domain_mesh, f32_vector, read_booleans, read_first_shard, replicated_scalar_type, replicated_vector_type,
+    };
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
     use crate::{
         Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Type, Value,
@@ -923,6 +927,94 @@ mod tests {
             &Type::Dimension(DimensionType::from(Dimension::Static(8))),
         );
         assert_eq!(validate_data_dependent_compilation(&program).map_err(|error| error.to_string()), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_data_dependent_compilation_ignores_dormant_regions() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap();
+        let vector_type = replicated_vector_type(&mesh, 2);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+
+        // Returns a region that multiplies its residual and linear inputs, which also takes the mean of a bounded
+        // dynamic broadcast of the sum of its linear input when `dynamic` is set. That mean consumes a data-derived
+        // dimension, which admission rejects in a region that lowering emits.
+        let build_region = |dynamic: bool| {
+            let mut builder = ProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone().into());
+            let linear = builder.add_input(vector_type.clone().into());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
+            if dynamic {
+                let size = CoreArray::from_elements(replicated_scalar_type(&mesh, DataType::I64), &[2i64]).unwrap();
+                let size =
+                    builder.add_instruction(ConstantOperation::new(size), Vec::new(), Vec::new(), None).unwrap()[0];
+                let dimension = builder
+                    .add_instruction(
+                        DimensionFromScalarOperation::new(extent.clone().into()),
+                        Vec::new(),
+                        vec![size],
+                        None,
+                    )
+                    .unwrap()[0];
+                let sum = builder
+                    .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![linear], None)
+                    .unwrap()[0];
+                let broadcast = builder
+                    .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![sum, dimension], None)
+                    .unwrap()[0];
+                builder
+                    .add_instruction(
+                        ReduceOperation::new(vec![0], ReductionKind::Mean),
+                        Vec::new(),
+                        vec![broadcast],
+                        None,
+                    )
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let build_program = |forward: &FlatProgram, transpose: &FlatProgram| -> FlatProgram {
+            let mut builder = ProgramBuilder::new();
+            let forward = builder.import_region(forward.entry_region_ref());
+            let transpose = builder.import_region(transpose.entry_region_ref());
+            let residual = builder.add_input(vector_type.clone().into());
+            let linear = builder.add_input(vector_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    Operation::LinearCall(LinearCallOperation::new(1)),
+                    vec![forward, transpose],
+                    vec![residual, linear],
+                    None,
+                )
+                .unwrap()[0];
+            builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
+        };
+
+        // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so the mean there does
+        // not keep the static primal from compiling.
+        let program = build_program(&build_region(false), &build_region(true));
+        assert_eq!(validate_data_dependent_compilation(&program).map_err(|error| error.to_string()), Ok(()));
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
+            .execute_program(
+                &compiled,
+                vec![f32_vector(&session, &mesh, &[2.0, 3.0]), f32_vector(&session, &mesh, &[4.0, 5.0])],
+            )
+            .unwrap();
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![8.0, 15.0]);
+
+        // The same mean in the forward region, which lowering emits, is rejected.
+        let program = build_program(&build_region(true), &build_region(false));
+        assert_eq!(
+            validate_data_dependent_compilation(&program).unwrap_err().to_string(),
+            "operation `reduce` cannot consume data-derived dimensions during XLA lowering because mean over a \
+             dynamically sized reduction axis is not supported by the XLA lowering",
+        );
     }
 
     #[test]

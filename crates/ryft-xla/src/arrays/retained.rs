@@ -123,7 +123,7 @@ impl RetainedArray {
     /// Returns a [`ProgramError::Type`] error if the buffers are owned by another PJRT client than the one
     /// of `session`, which cannot use them.
     pub fn to_array(&self, session: &Session) -> Result<Array, ProgramError> {
-        self.validate_session_client(session)?;
+        self.validate_client(session.client())?;
 
         // The new array has storage of its own, and its shards refer to the same device buffers.
         // The parts need no validation because they come from an array that was already validated.
@@ -145,13 +145,13 @@ impl RetainedArray {
         Ok(Self { declared_type: self.declared_type.rename_identities(renaming)?, ..self.clone() })
     }
 
-    /// Validates that `session` can use the buffers of this retained array.
+    /// Validates that `client` owns the buffers of this retained array.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError::Type`] error if the buffers belong to a different PJRT client.
-    pub(crate) fn validate_session_client(&self, session: &Session) -> Result<(), ProgramError> {
-        if !std::ptr::eq(self.client, session.client()) {
+    pub(crate) fn validate_client(&self, client: &Client<'_>) -> Result<(), ProgramError> {
+        if !std::ptr::eq(self.client, client) {
             return Err(TypeError::invalid(format!(
                 "session constant `{self}` retains an array of a different PJRT client \
                  than the client of this session",

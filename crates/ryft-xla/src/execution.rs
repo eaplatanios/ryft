@@ -466,6 +466,7 @@ impl Session {
         // therefore already carry state values as plain arrays (e.g., as ABI tests do), and its hidden outputs that
         // carry final reference states are returned verbatim.
         let mut resources = Some(self.prepare_execution_resources(program)?);
+        let committed = inputs.iter().any(Array::is_committed);
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
         let (arguments, input_refinements, physical_output_count) = prepared.into_arguments()?;
         let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, &mut resources, |_| {})?;
@@ -476,6 +477,7 @@ impl Session {
             &mut physical_outputs,
             fence.clone(),
             0..program.all_output_types().len(),
+            committed,
         )?;
         // Static outputs cannot disagree with the input refinements, so only builds with debug assertions re-validate
         // them.
@@ -890,6 +892,10 @@ impl Session {
             let mut resources = Some(self.prepare_execution_resources(program)?);
             let donation_overrides =
                 reference_state_input_indices.iter().map(|&index| (index, false)).collect::<Vec<_>>();
+
+            // The outputs are committed when an input of the attempt that is submitted, including a reference snapshot,
+            // is committed. Each attempt sets this before it can be submitted.
+            let mut committed;
             let (
                 execution,
                 input_refinements,
@@ -928,6 +934,7 @@ impl Session {
                     .map(ValueProjection::<ArrayType>::into_projected)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(ProgramError::from)?;
+                committed = arrays.iter().any(Array::is_committed);
                 let prepared_execution =
                     self.prepare_compiled_execution(program, arrays, donation_overrides.as_slice())?;
 
@@ -1054,6 +1061,7 @@ impl Session {
                     &mut physical_outputs,
                     fence.clone(),
                     program.output_count()..program.all_output_types().len(),
+                    committed,
                 )?;
                 let mut hidden_outputs = (program.output_count()..program.all_output_types().len())
                     .zip(hidden_outputs)
@@ -1134,6 +1142,7 @@ impl Session {
                     &mut physical_outputs,
                     fence,
                     0..program.output_count(),
+                    committed,
                 )?;
                 validate_compiled_output_refinements(
                     program,
@@ -1485,14 +1494,21 @@ impl Session {
             .collect()
     }
 
-    /// Reconstructs selected logical outputs from one submitted execution's physical buffers.
+    /// Reconstructs selected logical outputs from one submitted execution's physical buffers. The outputs are
+    /// [committed](Array::is_committed) to their devices when `committed` is `true`, which is the case when any array
+    /// input of the execution, including the arrays that the program captures, is committed. The outputs that
+    /// [`CompiledProgram::committed_outputs`] flags (e.g., those whose placement the program requests explicitly, or
+    /// all of them when the program captures a committed array through any of its handles) are committed in either
+    /// case, which both the plain and the stateful execution paths rely on.
     fn reconstruct_compiled_outputs(
         &self,
         program: &CompiledProgram,
         physical_outputs: &mut [Option<Vec<Buffer<'static>>>],
         fence: ExecutionFence,
         logical_indices: impl IntoIterator<Item = usize>,
+        committed: bool,
     ) -> Result<Vec<Array>, Error> {
+        let committed = |logical_index: usize| committed || program.committed_outputs()[logical_index];
         // Programs with only static outputs build each output directly from its plan, without querying the returned
         // buffers or re-deriving their placement.
         if let Some(output_plans) = &program.plan().output_plans {
@@ -1510,7 +1526,9 @@ impl Session {
                         }
                         None => Vec::new(),
                     };
-                    Ok(Array::from_execution_output(self, &output_plans[logical_index], buffers, fence.clone()))
+                    let output =
+                        Array::from_execution_output(self, &output_plans[logical_index], buffers, fence.clone());
+                    Ok(output.with_committed(committed(logical_index)))
                 })
                 .collect();
         }
@@ -1595,7 +1613,8 @@ impl Session {
                                 ))
                             })?,
                         )?
-                        .with_execution_fence(fence.clone()))
+                        .with_execution_fence(fence.clone())
+                        .with_committed(committed(logical_index)))
                     }
                     None => Ok(Array::zero(
                         self,
@@ -1603,7 +1622,8 @@ impl Session {
                         Some(program.output_shardings()[logical_index].clone()),
                         program.mesh().clone(),
                     )?
-                    .with_execution_fence(fence.clone())),
+                    .with_execution_fence(fence.clone())
+                    .with_committed(committed(logical_index))),
                 }
             })
             .collect()
@@ -1748,12 +1768,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
-        CompiledFunction, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation, Error as CoreError,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError, StagedFunction,
-        StaticShape, TiledLayout, Typed,
+        CompiledFunction, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation,
+        Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis, MeshAxisType, Place, Placeholder,
+        Placement, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceError, ReferenceRead, ReferenceReadOperation, ReferenceType, Shape, ShardMapBoundary, Sharding,
+        ShardingDimension, ShardingError, StagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::Shape as ShapeProto;
@@ -1767,9 +1787,10 @@ mod tests {
     };
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET, Platform,
-        ProgramBuilder, Reference, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, ToMlir,
-        Type, Value, compile_statefully, compile_statefully_with_captures,
+        Array, ArrayPlacement, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options,
+        PRINT_CUSTOM_CALL_TARGET, Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension,
+        RuntimeExtensions, RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully,
+        compile_statefully_with_captures,
     };
 
     use super::*;
@@ -2539,6 +2560,154 @@ mod tests {
             Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
                 if identifier == PRINT_CUSTOM_CALL_TARGET && reason == "test runtime rejected the invocation",
         ));
+    }
+
+    #[test]
+    fn test_session_execute_compiled_async_commits_outputs_of_committed_inputs() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
+        let scalar_type = replicated_scalar_type(&second_mesh, DataType::F32);
+        let staged = crate::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
+            |(left, right)| (right, left),
+            (scalar_type.clone(), scalar_type.clone()),
+            Options::new(second_mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: CompiledFunction<Session, (Type, Type), (Type, Type)> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
+        let committed = f32_scalar(&session, &second_mesh, 1.0);
+        let uncommitted =
+            Array::from_host_buffer(&session, scalar_type, None, None, 2f32.to_ne_bytes().as_slice()).unwrap();
+        assert_eq!(uncommitted.mesh().devices(), [wide_mesh.devices()[0]]);
+        assert!(!uncommitted.is_committed());
+
+        // The function moves both inputs to the devices that it was compiled for, and its outputs are committed when
+        // one of its inputs is, whichever of them an output comes from.
+        let inputs = (Value::Array(committed.clone()), Value::Array(uncommitted.clone()));
+        let (first, second) = compiled.executable().execute(&session, inputs).unwrap();
+        for output in [program_array(&first), program_array(&second)] {
+            assert_eq!(output.mesh(), &second_mesh);
+            assert!(output.is_committed());
+        }
+        assert_eq!(read_sharded_f32_array(program_array(&first)), vec![2.0]);
+        assert_eq!(read_sharded_f32_array(program_array(&second)), vec![1.0]);
+
+        // Without a committed input, the outputs are uncommitted.
+        let inputs = (Value::Array(committed.with_committed(false)), Value::Array(uncommitted));
+        let (first, second) = compiled.executable().execute(&session, inputs).unwrap();
+        assert!(!program_array(&first).is_committed());
+        assert!(!program_array(&second).is_committed());
+    }
+
+    #[test]
+    fn test_session_execute_compiled_async_commits_outputs_of_explicit_placements() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let uncommitted =
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        assert!(!uncommitted.is_committed());
+
+        // Staged types record no placement over auto mesh axes, so overrides and runtime placements over them leave
+        // the same staged input type.
+        let staged_type = vector_type.with_sharding(sharded.without_auto_axes()).unwrap();
+        let lower = |function: fn(CompileTracer, &Placement) -> CompileTracer, options: Options| {
+            let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
+            crate::stage::<_, ArrayType, ArrayType>(move |input| function(input, &target), staged_type.clone(), options)
+                .unwrap()
+                .into_inner()
+                .lower(&session)
+                .unwrap()
+        };
+        let execute = |lowered: &LoweredFunction<Session, Type, Type>| {
+            let compiled: CompiledFunction<Session, Type, Type> = lowered.compile(&session).unwrap();
+            let output = compiled.executable().execute(&session, Value::Array(uncommitted.clone())).unwrap();
+            assert_eq!(program_array(&output).copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.0, 4.0]);
+            program_array(&output).is_committed()
+        };
+        let double = |input: CompileTracer, _: &Placement| input.clone() + input;
+        let double_and_place =
+            |input: CompileTracer, target: &Placement| (input.clone() + input).place(target, None).unwrap();
+
+        // The outputs of a function on uncommitted inputs are committed when the function requests their placement
+        // explicitly, through a `place` with a target that produces them or through any sharding override, as in JAX.
+        assert!(execute(&lower(double_and_place, Options::new(mesh.clone()))));
+        assert!(execute(&lower(double, Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]))));
+        assert!(execute(&lower(double, Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]))));
+
+        // Without an explicit request, the outputs keep the rule for the commitment of the inputs.
+        assert!(!execute(&lower(double, Options::new(mesh.clone()))));
+
+        // A function that places its input as an override requests and one that places it as its runtime array is
+        // placed compile to the same executable, which the second one reuses from the cache, but only the first one
+        // requests the placement of its output explicitly.
+        let requested = lower(double, Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]));
+        let observed =
+            lower(double, Options::new(mesh.clone()).with_input_placements(vec![Some(sharded.clone())].into()));
+        assert_eq!(
+            session.compilation_key(requested.lowered_program()).unwrap(),
+            session.compilation_key(observed.lowered_program()).unwrap(),
+        );
+        session.clear_cache();
+        assert!(execute(&requested));
+        assert!(!execute(&observed));
+        session.clear_cache();
+        assert!(!execute(&observed));
+        assert!(execute(&requested));
+    }
+
+    #[test]
+    fn test_session_execute_compiled_async_commits_outputs_of_committed_captures() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let uncommitted =
+            Array::from_host_buffer(&session, scalar_type.clone(), None, None, 1f32.to_ne_bytes().as_slice()).unwrap();
+        let placement = ArrayPlacement::mesh(uncommitted.mesh().clone(), uncommitted.sharding().clone()).unwrap();
+        let committed = uncommitted.to_placement(&session, placement).unwrap();
+        assert!(!uncommitted.is_committed());
+        assert!(committed.is_committed());
+        assert_eq!(RetainedArray::new(&uncommitted), RetainedArray::new(&committed));
+        let execute = |first: &Array, second: &Array| {
+            let (first, second) = (RetainedArray::new(first), RetainedArray::new(second));
+            let staged = crate::stage::<_, ArrayType, ArrayType>(
+                move |input: CompileTracer| {
+                    let context = input.value().context().clone();
+                    let first = context.lift(Constant::Session(first)).unwrap();
+                    let second = context.lift(Constant::Session(second)).unwrap();
+                    let first = ValueProjection::<ArrayType>::into_projected(first).unwrap();
+                    let second = ValueProjection::<ArrayType>::into_projected(second).unwrap();
+                    input + first + second
+                },
+                scalar_type.clone(),
+                Options::new(uncommitted.mesh().clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let compiled: CompiledFunction<Session, Type, Type> =
+                staged.lower(&session).unwrap().compile(&session).unwrap();
+            let output = compiled.executable().execute(&session, Value::Array(uncommitted.clone())).unwrap();
+            assert_eq!(program_array(&output).copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.0]);
+            program_array(&output).is_committed()
+        };
+
+        // A committed capture commits the outputs whichever of two aliases of the same buffers the function captures
+        // first, although the executable receives the buffers only once, and the second function reuses the executable
+        // of the first one from the cache.
+        assert!(execute(&uncommitted, &committed));
+        assert!(execute(&committed, &uncommitted));
+        session.clear_cache();
+        assert!(execute(&committed, &uncommitted));
+        assert!(execute(&uncommitted, &committed));
+
+        // Without a committed capture or input, the outputs are uncommitted.
+        assert!(!execute(&uncommitted, &uncommitted));
     }
 
     #[test]

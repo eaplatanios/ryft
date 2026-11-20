@@ -83,7 +83,7 @@ mod tests {
     use ryft_core::{
         BatchAxis, DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
         MeshAxis, MeshAxisType, Place, PlaceDispatch, Placement, Reduce, ReductionKind, Shape, Sharding,
-        ShardingDimension, TiledLayout, Typed, Value as CoreValue, batch, differentiate_at,
+        ShardingDimension, StopGradient, TiledLayout, Typed, Value as CoreValue, batch, differentiate_at,
     };
     use ryft_pjrt::Client;
 
@@ -173,7 +173,8 @@ mod tests {
         );
 
         // A target states the placement along auto mesh axes as well, which types do not track, so the constraint is
-        // closed over the dimensions of the target and the compiler cannot shard them along further auto axes.
+        // closed over the dimensions of the target and the compiler cannot shard them along further auto axes. The
+        // result is annotated with the target, as compilation places it, rather than with its type.
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![Device::new(0, 0), Device::new(1, 0)],
@@ -195,7 +196,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4x2xf32>) -> (tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) {
+                  func.func @main(%arg0: tensor<4x2xf32>) -> (tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}, {}]> : tensor<4x2xf32>
                     return %0 : tensor<4x2xf32>
                   }
@@ -545,6 +546,61 @@ mod tests {
     }
 
     #[test]
+    fn test_place_operation_lower_executes_auto_splits_with_unconstrained_dimensions_over_other_auto_axes() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let input_type = ArrayType::new_static(DataType::I32, [4, 4]);
+        let input_sharding = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["r"])],
+        )
+        .unwrap();
+        let target_sharding =
+            Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()])
+                .unwrap();
+
+        // The compiler would keep the split of the input along `r` on the unconstrained dimension, but the runtime
+        // placement of the result reads that dimension as replicated, so the executable returns the result with the
+        // split along `x` that the target requires and the unconstrained dimension replicated.
+        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            move |input| input.place(&target, None).unwrap(),
+            input_type.clone(),
+            &session,
+            Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]),
+        )
+        .unwrap();
+        let values = (0..16).collect::<Vec<i32>>();
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh, Some(input_sharding.clone()), values_to_bytes(&values))
+                .unwrap();
+        let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.sharding(), &target_sharding);
+        assert_eq!(
+            output
+                .shards()
+                .iter()
+                .map(|shard| values_from_bytes::<i32>(&shard.copy_to_host_bytes().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0..8).collect::<Vec<_>>(),
+                (0..8).collect::<Vec<_>>(),
+                (8..16).collect::<Vec<_>>(),
+                (8..16).collect::<Vec<_>>(),
+            ],
+        );
+        assert_eq!(output.copy_to_host().unwrap().elements::<i32>().unwrap(), values);
+    }
+
+    #[test]
     fn test_place_operation_lower_executes_auto_splits_of_zero_arrays() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -582,6 +638,66 @@ mod tests {
         .unwrap();
         let output = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(output.sharding(), &sharded);
+    }
+
+    #[test]
+    fn test_place_operation_lower_executes_auto_splits_through_identity_operations() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+
+        // An operation that returns its input unchanged (i.e., `stop_gradient`) keeps the placement of a result of the
+        // zero data type, which has no buffer whose placement the compiler could report.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let input_type = ArrayType::new_static(DataType::Zero, [4]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            move |input: CompileTracer| input.place(&target, None).unwrap().stop_gradient().unwrap(),
+            input_type.clone(),
+            &session,
+            Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(&session, input_type, mesh, Some(replicated), []).unwrap();
+        let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.sharding(), &sharded);
+
+        // It also keeps the split along an auto axis of a result whose reduction state along an explicit axis keeps
+        // the compiler from choosing its placement.
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let input_sharding = Sharding::replicated(logical_mesh.clone(), 1).with_reduced_axes(["r"]).unwrap();
+        let reduced = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_reduced_axes(["r"])
+            .unwrap();
+        let input_type = ArrayType::new_static(DataType::I32, [4]).with_sharding(input_sharding.clone()).unwrap();
+        let target = Placement::new(mesh.clone(), reduced.clone()).unwrap();
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
+            move |input: CompileTracer| input.place(&target, None).unwrap().stop_gradient().unwrap(),
+            input_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            input_type,
+            mesh,
+            Some(input_sharding),
+            values_to_bytes(&[1i32, 2, 3, 4]),
+        )
+        .unwrap();
+        let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.sharding(), &reduced);
+        assert_eq!(output.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -715,5 +831,56 @@ mod tests {
         .unwrap();
         assert_eq!(gradient.mesh(), &source_mesh);
         assert_eq!(shard_values(&gradient), vec![vec![1., 1., 1., 1., 1., 1.]]);
+    }
+
+    #[test]
+    fn test_place_operation_eager_batch_vjp_across_device_sets() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let source_mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
+        let target_mesh = DeviceMesh::new(logical_mesh.clone(), devices[2..].to_vec()).unwrap();
+        let sharding = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            source_mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
+        let target = Placement::new(target_mesh.clone(), Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
+
+        // The batch is split along `x` on the first two devices, so each batch item lives on one of them. The
+        // placement that a batch item reports records that split, and the pullback restores it, so a cotangent that
+        // differs for each item comes back on the first two devices with the batch still split along `x`. The primal
+        // of each item is replicated on the last two devices, as its explicit target says.
+        let (value, cotangent): (Array, Array) = batch(
+            |x| {
+                let (value, pullback) = differentiate_at(x).vjp(|x| x.place(&target, None))?;
+                let cotangent = pullback.apply_materialized(value.clone())?;
+                Ok((value, cotangent))
+            },
+            input,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(value.mesh(), &target_mesh);
+        assert_eq!(value.sharding(), &Sharding::replicated(logical_mesh, 2));
+        assert_eq!(cotangent.mesh(), &source_mesh);
+        assert_eq!(cotangent.sharding(), &sharding);
+        assert_eq!(shard_values(&cotangent), vec![vec![1., 2., 3.], vec![4., 5., 6.]]);
     }
 }

@@ -35,9 +35,9 @@ pub mod types;
 pub mod values;
 
 pub use arrays::{
-    Array, ArrayError, ArrayPlacement, ArrayPlacementTarget, ArrayShard, ArrayShardStorage, ArrayStatistics, LiveArray,
-    Placeable, PlacementLeaf, PlacementOptions, RetainedArray, ShardDescriptor, ShardIndex, ShardLayout,
-    block_until_ready, ready,
+    Array, ArrayError, ArrayPlacement, ArrayPlacementTarget, ArrayShard, ArrayShardStorage, ArrayStatistics,
+    HostOrArray, LiveArray, Placeable, PlaceableParameter, PlacementOptions, RetainedArray, ShardDescriptor,
+    ShardIndex, ShardLayout, block_until_ready, ready,
 };
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,

@@ -692,18 +692,20 @@ impl Session {
     }
 
     /// Moves the uncommitted arrays among `inputs` to the mesh that an eager operation runs on, given the arrays that
-    /// the operation captures, `captures`, and returns the inputs after the move, or [`None`] if nothing moved. This is
-    /// how uncommitted inputs follow committed operands (refer to [`Array::is_committed`]), where the operands are the
-    /// inputs and the captures, which take part exactly as inputs do. The target mesh is the mesh of the first
-    /// committed input or, without one, of the first committed capture. Without committed operands, uncommitted
-    /// operands on different devices move to the default mesh of this session, as in JAX, which is the mesh of this
-    /// handle or, without one, the mesh of the first device of the client (refer to [`Self::device_mesh_for`]), and
-    /// uncommitted operands on the same devices stay where they are. An input moves when it is uncommitted and its
-    /// mesh differs from the target mesh. It keeps its sharding when that sharding is over the logical mesh of the
-    /// target, and it is replicated over that logical mesh when it is replicated. The move uses device work only,
-    /// never donates the input, and shares the buffers of shards that stay on their devices, so an input on the same
-    /// devices is not copied. The moved arrays stay uncommitted. Captures are not moved here, because they are passed
-    /// to the compiled program as constants, which execution places on the mesh of the program.
+    /// the operation captures, `captures`. When it returns a replacement list, that list contains one array per input
+    /// in the same order, including arrays that stayed in place.
+    ///
+    /// This is how uncommitted inputs follow committed operands (refer to [`Array::is_committed`]). Inputs and
+    /// captures both take part in selecting the target mesh, which is the mesh of the first committed input or,
+    /// without one, the first committed capture. Without committed operands, uncommitted operands on different devices
+    /// move to the default mesh of this session, as in JAX. That is the mesh of this handle or, without one, the mesh
+    /// of the first device of the client (refer to [`Self::device_mesh_for`]). Uncommitted operands on the same devices
+    /// stay where they are. An uncommitted input moves if its mesh differs from the target mesh. It keeps its sharding
+    /// when that sharding is over the logical mesh of the target, and it is replicated over that logical mesh when it
+    /// is replicated. The move uses device work only, never donates the input, and shares the buffers of shards that
+    /// stay on their devices, so an input on the same devices is not copied. The moved arrays stay uncommitted.
+    /// Captures are not moved here, because they are passed to the compiled program as constants, which execution
+    /// places on the mesh of the program.
     ///
     /// Nothing moves when all operands share one mesh, which is the common case and costs one comparison of meshes
     /// for each operand, when an operand belongs to another PJRT client, when two committed operands live on different
@@ -1021,14 +1023,22 @@ impl Context for Session {
             });
         }
 
-        // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone would
-        // miss a pure pass-through or capture of a reference type. The regions that are scanned are the ones that
-        // lowering emits, which are also the ones that the compiler admits (refer to `contains_unresolved_state` and
-        // `contains_unresolved_references` in the lowering module). Dormant rule regions (e.g., a derivative rule that
-        // no transform calls) never run in this eager bind, and a transform that activates them handles their
-        // references itself.
+        // Lowering and admission visit attached computation regions and their computation descendants. Dormant rule
+        // regions (e.g., derivative rules that no transform calls) are skipped at every level. Transforms that
+        // activate those regions handle their references themselves.
+        let computation_regions = || {
+            regions
+                .regions()
+                .enumerate()
+                .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
+                .flat_map(|(_, region)| region.computation_regions())
+        };
+
+        // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone
+        // would miss a pure pass-through or capture of a reference type. See `contains_unresolved_state` and
+        // `contains_unresolved_references` in the lowering module for the corresponding admission checks.
         if operation.effects().classes().contains(EffectClass::OrderedState)
-            || lowered_regions(&operation, &regions).any(|region| {
+            || computation_regions().any(|region| {
                 region.atoms().iter().any(|atom| atom.r#type().is_reference())
                     || region.instructions().iter().any(|instruction| {
                         let effects = instruction.operation().effects();
@@ -1058,7 +1068,7 @@ impl Context for Session {
         // from the regions of this application before any deduplication, because the commitment of a handle is not part
         // of the identity of its session constant, and a cached program may have been built from other handles of the
         // same arrays.
-        let captures = lowered_regions(&operation, &regions)
+        let captures = computation_regions()
             .flat_map(|region| {
                 region.atoms().iter().filter_map(|atom| match atom.as_constant() {
                     Some(Constant::Session(constant)) => Some(constant.clone()),
@@ -1071,18 +1081,20 @@ impl Context for Session {
         // anything observes their placement. Everything that follows, including type inference, the eager dispatch
         // cache key, and the mesh that `Self::device_mesh_for` selects, sees the inputs after the move.
         let moved_array_inputs = self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice())?;
-        let moved_inputs = moved_array_inputs.map(|moved_array_inputs| {
-            let mut moved_arrays = moved_array_inputs.iter();
-            let moved_inputs = inputs
-                .iter()
-                .map(|input| match input {
-                    Value::Array(_) => Value::Array(moved_arrays.next().unwrap().clone()),
-                    input => input.clone(),
-                })
-                .collect::<Vec<_>>();
+        let moved_inputs = if let Some(moved_array_inputs) = moved_array_inputs {
+            // `array_inputs` contains exactly the array slots of `inputs`, in order. Placement preserves that
+            // order, so each replacement goes back into its original slot.
+            check_count!("input", moved_array_inputs, array_inputs.len(), ProgramError);
+            let mut moved_inputs = inputs.to_vec();
+            let array_slots = moved_inputs.iter_mut().filter(|input| matches!(input, Value::Array(_)));
+            for (slot, array) in array_slots.zip(&moved_array_inputs) {
+                *slot = Value::Array(array.clone());
+            }
             array_inputs = moved_array_inputs;
-            moved_inputs
-        });
+            Some(moved_inputs)
+        } else {
+            None
+        };
         let inputs = moved_inputs.as_deref().unwrap_or(inputs);
 
         // These operations are decided on the host and return without compiling a program. `Context::bind` has already
@@ -1494,23 +1506,6 @@ impl Context for Session {
         let _ = scope;
         function()
     }
-}
-
-// TODO(eaplatanios): Why do we need this helper?
-/// Returns the regions of an application of `operation` to `regions` that lowering emits, which are its attached
-/// computation regions and their own computation regions (i.e., the regions that [`RegionRef::computation_regions`]
-/// visits from the entry region of the program that eager binding compiles for the application). Dormant rule regions
-/// (e.g., derivative rules that no transform has called) are excluded, as they are from the admission checks and the
-/// session constants of the compiler.
-fn lowered_regions<'s>(
-    operation: &'s Operation,
-    regions: &'s AttachedRegions<'_, Constant, Operation>,
-) -> impl Iterator<Item = RegionRef<'s, Constant, Operation>> {
-    regions
-        .regions()
-        .enumerate()
-        .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
-        .flat_map(|(_, region)| region.computation_regions())
 }
 
 impl Zero<Value> for Session {

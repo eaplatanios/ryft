@@ -89,6 +89,10 @@ pub struct LoweredProgram {
     /// over them, as JAX does for outputs without `out_shardings`.
     open_outputs: Arc<[bool]>,
 
+    /// Whether executions commit each logical output to its devices whatever the commitment of their inputs (refer to
+    /// [`CompiledProgram::committed_outputs`]).
+    committed_outputs: Arc<[bool]>,
+
     /// Concrete mesh against which the module was lowered.
     mesh: DeviceMesh,
 
@@ -131,6 +135,7 @@ impl LoweredProgram {
     ///   - `expected_argument_shardings`: Sharding that each physical argument must have at the call boundary.
     ///   - `output_shardings`: Declared sharding of each output.
     ///   - `open_outputs`: Whether the compiler chooses the placement of each output over auto mesh axes.
+    ///   - `committed_outputs`: Whether executions commit each output whatever the commitment of their inputs.
     ///   - `mesh`: Device mesh that the program is compiled for and executes on.
     ///   - `target`: Target of the session that lowered the program.
     ///   - `kernel_execution_facts`: Configuration key of the live execution facts when the module embeds kernels.
@@ -148,6 +153,7 @@ impl LoweredProgram {
         expected_argument_shardings: Arc<[Sharding]>,
         output_shardings: Arc<[Sharding]>,
         open_outputs: Arc<[bool]>,
+        committed_outputs: Arc<[bool]>,
         mesh: DeviceMesh,
         target: &Target,
         kernel_execution_facts: Option<Vec<u8>>,
@@ -169,6 +175,7 @@ impl LoweredProgram {
             expected_argument_shardings,
             output_shardings,
             open_outputs,
+            committed_outputs,
             platform_name: target.platform_name().into(),
             platform_version: target.platform_version().into(),
             device_kinds: target.mesh_device_kinds(&mesh)?.into(),
@@ -431,6 +438,10 @@ pub struct CompiledProgram {
     /// never record. It also covers the hidden final reference states after the public result.
     output_shardings: Arc<[Sharding]>,
 
+    /// Whether executions of the lowering that this program serves commit each logical output to its devices whatever
+    /// the commitment of their inputs (refer to [`Self::committed_outputs`]).
+    committed_outputs: Arc<[bool]>,
+
     /// Concrete device mesh used for compilation and execution.
     mesh: DeviceMesh,
 
@@ -497,6 +508,7 @@ impl CompiledProgram {
             capture_count: program.capture_count,
             expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
             output_shardings,
+            committed_outputs: Arc::clone(&program.committed_outputs),
             mesh: program.mesh.clone(),
             compilation_options: program.compilation_options.clone(),
             platform_name: Arc::clone(&program.platform_name),
@@ -512,7 +524,10 @@ impl CompiledProgram {
     }
 
     /// Creates a compiled program from an `executable` that was loaded from its serialized form and from the
-    /// invocation contract that was persisted with it.
+    /// invocation contract that was persisted with it. Which outputs executions always commit is a property of the
+    /// lowering that a program serves rather than of its executable (refer to [`Self::committed_outputs`]), so it is
+    /// not persisted, and the result commits no output by itself until it is rebound to a lowering (refer to
+    /// [`Self::rebound_to`]).
     ///
     /// # Parameters
     ///
@@ -575,6 +590,7 @@ impl CompiledProgram {
             donation_flags,
             capture_count,
             expected_argument_shardings,
+            committed_outputs: vec![false; output_shardings.len()].into(),
             output_shardings,
             mesh,
             compilation_options,
@@ -590,16 +606,21 @@ impl CompiledProgram {
         }
     }
 
-    /// Returns `program` itself if it already has the boundary of `lowered`, and otherwise a program that takes its
-    /// boundary types, reference states, and signature from `lowered` and shares everything else with `program`. A
-    /// program that was compiled for another lowering has the same boundary up to the identities of its dimension
-    /// variables, and callers compare boundary types by identity.
+    /// Returns `program` itself if it already has the boundary of `lowered` and commits the same outputs, and otherwise
+    /// a program that takes its boundary types, reference states, signature, and committed outputs from `lowered` and
+    /// shares everything else, including its executable, with `program`. A program that was compiled for another
+    /// lowering has the same boundary up to the identities of its dimension variables, and callers compare boundary
+    /// types by identity. Which outputs executions always commit is not part of the compilation key, because it does
+    /// not change the executable (e.g., an input sharding override and a runtime input placement with the same
+    /// sharding, or two aliases of the same captured buffers of which only one is committed, compile to the same
+    /// executable), so it comes from `lowered` as well.
     pub(super) fn rebound_to(program: Arc<Self>, lowered: &LoweredProgram) -> Arc<Self> {
         let same_inputs =
             Arc::ptr_eq(&program.input_types, &lowered.input_types) || program.input_types == lowered.input_types;
         let same_outputs =
             Arc::ptr_eq(&program.output_types, &lowered.output_types) || program.output_types == lowered.output_types;
-        if same_inputs && same_outputs {
+        let same_committed_outputs = program.committed_outputs == lowered.committed_outputs;
+        if same_inputs && same_outputs && same_committed_outputs {
             program
         } else {
             Arc::new(Self {
@@ -607,6 +628,7 @@ impl CompiledProgram {
                 output_types: Arc::clone(&lowered.output_types),
                 reference_states: Arc::clone(&lowered.reference_states),
                 signature: lowered.signature.clone(),
+                committed_outputs: Arc::clone(&lowered.committed_outputs),
                 ..Self::clone(&program)
             })
         }
@@ -699,6 +721,17 @@ impl CompiledProgram {
     #[inline]
     pub(crate) fn output_shardings(&self) -> &[Sharding] {
         &self.output_shardings
+    }
+
+    /// Returns whether executions of the lowering that this program serves commit each logical output to its devices
+    /// whatever the commitment of their inputs. This is the case for a public output whose placement the lowering
+    /// requests explicitly, through a `place` with a target that produces the output in its entry region, an output
+    /// sharding override, or any input sharding override, as JAX commits the results of `jit` functions with explicit
+    /// shardings, and for every output of a lowering that captures a committed array through any of its handles,
+    /// like the outputs of an operation that has a committed input.
+    #[inline]
+    pub(crate) fn committed_outputs(&self) -> &[bool] {
+        &self.committed_outputs
     }
 
     /// Returns the execution facts that selected kernels were compiled against, or [`None`] for a program without
