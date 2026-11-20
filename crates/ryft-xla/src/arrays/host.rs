@@ -671,26 +671,28 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Returns row-major element strides for `global_shape`. `strides[i]` is the number of logical elements skipped when
-/// incrementing dimension `i` by one in a dense major-to-minor layout. `element_type` is only used in the error that
-/// reports a stride that overflows [`usize`].
-fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> Result<Vec<usize>, Error> {
-    let mut strides = vec![1usize; global_shape.len()];
+/// Returns row-major element strides for `shape`. `strides[i]` is the number of logical elements skipped when
+/// incrementing dimension `i` by one in a dense major-to-minor layout. `element_type` is only used in the error
+/// that reports a stride that overflows [`usize`].
+fn row_major_element_strides(shape: &[usize], element_type: DataType) -> Result<Vec<usize>, Error> {
+    let mut strides = vec![1usize; shape.len()];
     let mut stride = 1usize;
-    for dimension in (0..global_shape.len()).rev() {
+    for dimension in (0..shape.len()).rev() {
         strides[dimension] = stride;
-        stride = stride.checked_mul(global_shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
+        stride = stride.checked_mul(shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
-                "row-major stride for array with shape `{global_shape:?}` and element type `{element_type}` exceeds \
+                "row-major stride for array with shape `{:?}` and element type `{}` exceeds \
                  the maximum allowed size of {}",
+                shape,
+                element_type,
                 usize::MAX,
             ),
         })?;
     }
     Ok(strides)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
 /// element offsets `base_global_element_offset` and `base_shard_element_offset`. The strides are row-major element
